@@ -70,12 +70,7 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<storage_v1::VerifyRequest>,
     ) -> Result<Response<storage_v1::VerifyResponse>, Status> {
-        verify::handler(
-            request,
-            self.local_immutable_store().clone(),
-            self.immutable_store().clone(),
-        )
-        .await
+        verify::handler(request, self.local_immutable_store().clone()).await
     }
 
     async fn mutable_load(

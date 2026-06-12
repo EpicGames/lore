@@ -23,7 +23,6 @@ use crate::util::setup_execution;
 pub async fn handler(
     request: Request<storage_v1::VerifyRequest>,
     local_immutable_store: Arc<dyn lore_storage::ImmutableStore>,
-    immutable_store: Arc<dyn lore_storage::ImmutableStore>,
 ) -> Result<Response<storage_v1::VerifyResponse>, Status> {
     let repository = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
@@ -51,7 +50,6 @@ pub async fn handler(
                     correlation_id,
                     user_id,
                     local_immutable_store,
-                    immutable_store,
                 )
                 .await
                 .map(|resp| {

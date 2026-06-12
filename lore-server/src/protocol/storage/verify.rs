@@ -10,14 +10,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
-use lore_base::types::FragmentFlags;
 use lore_base::types::HealResult;
 use lore_revision::lore::RepositoryId;
 use lore_storage::ImmutableStore;
 use lore_storage::LocalImmutableStore;
 use lore_storage::StoreError;
 use lore_storage::StoreMatch;
-use lore_storage::decompress;
 use tracing::debug;
 use tracing::info;
 use tracing::warn;
@@ -62,7 +60,6 @@ pub async fn handle_verify(
     correlation_id: String,
     user_id: String,
     local_store: Arc<dyn ImmutableStore>,
-    immutable_store: Arc<dyn ImmutableStore>,
 ) -> Result<LoreResponse, MessageHandleError> {
     let execution = setup_execution(module_path!(), correlation_id, user_id);
     let heal = heal_flag != 0;
@@ -92,61 +89,12 @@ pub async fn handle_verify(
                 Ok(result) => {
                     info!(%address, "Verify result: {result:?}");
 
-                    let mut did_zstd_decompress = false;
-                    for m in &result.matches {
-                        if FragmentFlags::from_bits_retain(m.data.flags)
-                            .contains(FragmentFlags::PayloadCompressedZstd)
-                        {
-                            info!(%address, partition = %m.partition, "Attempting Zstd decompress");
-                            let (fragment, compressed) = immutable_store
-                                .clone()
-                                .get(m.partition, m.address, StoreMatch::MatchFull)
-                                .await
-                                .map_err(|e| {
-                                    warn!(%address, error = ?e, "Failed to get compressed fragment from store");
-                                    MessageHandleError::StoreFailure
-                                })?;
-                            let (decompressed_fragment, decompressed) =
-                                decompress(fragment, &compressed)
-                                    .map_err(|e| {
-                                        warn!(%address, error = ?e, "Failed to decompress zstd fragment");
-                                        MessageHandleError::StoreFailure
-                                    })?;
-                            immutable_store
-                                .clone()
-                                .put(
-                                    m.partition,
-                                    m.address,
-                                    decompressed_fragment,
-                                    Some(decompressed.freeze()),
-                                    true,
-                                )
-                                .await
-                                .map_err(|e| {
-                                    warn!(%address, error = ?e, "Failed to write decompressed fragment to durable store");
-                                    MessageHandleError::StoreFailure
-                                })?;
-                            did_zstd_decompress = true;
-                            info!(%address, partition = %m.partition, "Completed Zstd uncompress");
-                        }
-                    }
-
                     match result.verification_result {
                         Ok(()) =>
                             {
-                                let corrupted;
-                                let healed;
-                                if did_zstd_decompress {
-                                    corrupted = 1;
-                                    healed = HealResult::Healed;
-                                } else {
-                                    corrupted = 0;
-                                    healed = HealResult::NotAttempted;
-                                }
-
                                 Ok(LoreResponse::Verify(VerifyResponse {
-                                    corrupted,
-                                    healed,
+                                    corrupted: 0,
+                                    healed: HealResult::NotAttempted,
                                 }))
                             }
                         Err(err) => {
@@ -179,11 +127,10 @@ pub async fn handle_verify(
 #[async_trait]
 impl Message for Verify {
     #[tracing::instrument(name = "Verify::handle", skip_all)]
-    async fn handle_verify(
+    async fn handle(
         &self,
         context: Arc<AttributeMap>,
         local_immutable_store: Arc<dyn ImmutableStore>,
-        immutable_store: Arc<dyn ImmutableStore>,
     ) -> Result<LoreResponse, MessageHandleError> {
         let repository = *context
             .get_or::<RepositoryId, MessageHandleError>(MessageHandleError::NotConnected)?;
@@ -196,7 +143,6 @@ impl Message for Verify {
             correlation_id.to_string(),
             user_id,
             local_immutable_store,
-            immutable_store,
         )
         .await
     }
@@ -218,24 +164,22 @@ impl Response for VerifyResponse {
 #[cfg(test)]
 mod tests {
     use lore_base::types::Context;
-    use lore_base::types::Fragment;
     use lore_base::types::Hash;
     use lore_revision::fragment::generate_random;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::relay::EventDispatcher;
-    use lore_storage::CompressionMode;
-    use lore_storage::compress;
-    use lore_storage::hash_slice;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
     use rand::distr::SampleString;
     use rand::random;
-    use zerocopy::IntoBytes;
 
     use super::*;
     use crate::store::test_store_create;
 
     fn make_verify_bytes(address: Address, heal: bool) -> Bytes {
+        #[allow(unused_imports)]
+        use zerocopy::IntoBytes;
+
         let mut bytes = address.as_bytes().to_vec();
         bytes.push(if heal { 1 } else { 0 });
         Bytes::from(bytes)
@@ -309,10 +253,7 @@ mod tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let message = Verify { address, heal: 0 };
-                match message
-                    .handle_verify(context_map, immutable_store.clone(), immutable_store)
-                    .await
-                {
+                match message.handle(context_map, immutable_store).await {
                     Err(MessageHandleError::NotConnected) => (),
                     Err(e) => panic!("Expected NotConnected error, got {e:?}"),
                     Ok(_) => panic!("Expected NotConnected error, got Ok"),
@@ -365,10 +306,7 @@ mod tests {
                     heal: 0,
                 };
 
-                match message
-                    .handle_verify(context_map, store.clone(), store)
-                    .await
-                {
+                match message.handle(context_map, store).await {
                     Err(MessageHandleError::FragmentNotFound) => (),
                     Err(e) => panic!("Expected FragmentNotFound error, got {e:?}"),
                     Ok(_) => panic!("Expected FragmentNotFound error, got Ok"),
@@ -410,10 +348,7 @@ mod tests {
 
                 let message = Verify { address, heal: 0 };
 
-                match message
-                    .handle_verify(context_map, store.clone(), store)
-                    .await
-                {
+                match message.handle(context_map, store).await {
                     Ok(LoreResponse::Verify(resp)) => {
                         assert_eq!(resp.corrupted, 0);
                         assert_eq!(resp.healed, HealResult::NotAttempted);
@@ -515,10 +450,7 @@ mod tests {
                 context_map.insert(repository);
 
                 let message = Verify { address, heal: 1 };
-                match message
-                    .handle_verify(context_map, store.clone(), store)
-                    .await
-                {
+                match message.handle(context_map, store).await {
                     Ok(LoreResponse::Verify(resp)) => {
                         assert_eq!(resp.corrupted, 1);
                         assert_eq!(resp.healed, HealResult::Healed);
@@ -586,10 +518,7 @@ mod tests {
                 context_map.insert(repository);
 
                 let message = Verify { address, heal: 0 };
-                match message
-                    .handle_verify(context_map, store.clone(), store)
-                    .await
-                {
+                match message.handle(context_map, store).await {
                     Ok(LoreResponse::Verify(resp)) => {
                         assert_eq!(resp.corrupted, 1);
                         assert_eq!(resp.healed, HealResult::NotAttempted);
@@ -601,138 +530,5 @@ mod tests {
             .await;
 
         let _ = std::fs::remove_dir_all(&dir_cleanup);
-    }
-
-    /// Verifies that a zstd-compressed fragment in the durable store is decompressed and
-    /// force-written back as a raw payload when `handle_verify` encounters it.
-    #[tokio::test]
-    async fn test_zstd_decompressed_in_durable_store() {
-        let local_dir = generate_tempdir();
-        let durable_dir = generate_tempdir();
-        let local_dir_cleanup = local_dir.clone();
-        let durable_dir_cleanup = durable_dir.clone();
-        let execution = setup_test_execution();
-
-        LORE_CONTEXT
-            .scope(execution, async move {
-                let local_store = lore_storage::LocalImmutableStore::new(
-                    Some(local_dir),
-                    ImmutableStoreSettings::default(),
-                )
-                .await
-                .expect("Failed to create local store");
-
-                let durable_store = lore_storage::LocalImmutableStore::new(
-                    Some(durable_dir),
-                    ImmutableStoreSettings::default(),
-                )
-                .await
-                .expect("Failed to create durable store");
-
-                let repository: RepositoryId = random();
-                // Use a large repetitive payload so zstd can compress it efficiently.
-                let content_vec: Vec<u8> = b"abcdefgh".iter().cycle().take(4096).copied().collect();
-                let content = content_vec.as_slice();
-                let hash = hash_slice(content);
-                let address = Address {
-                    hash,
-                    context: random(),
-                };
-
-                let uncompressed_fragment = Fragment {
-                    flags: 0,
-                    size_payload: content.len() as u32,
-                    size_content: content.len() as u64,
-                };
-
-                let (compressed_fragment, compressed_payload) =
-                    compress(uncompressed_fragment, content, CompressionMode::Zstd)
-                        .expect("Failed to compress payload");
-
-                assert!(
-                    FragmentFlags::from_bits_retain(compressed_fragment.flags)
-                        .contains(FragmentFlags::PayloadCompressedZstd),
-                    "Expected PayloadCompressedZstd flag after compression"
-                );
-
-                // Write the compressed fragment to both the local store (for verify_fragment)
-                // and the durable store (for the decompression rewrite loop).
-                local_store
-                    .clone()
-                    .put(
-                        repository,
-                        address,
-                        compressed_fragment,
-                        Some(compressed_payload.clone()),
-                        false,
-                    )
-                    .await
-                    .expect("Failed to put compressed fragment in local store");
-                local_store
-                    .clone()
-                    .flush(true)
-                    .await
-                    .expect("Failed to flush local store");
-
-                durable_store
-                    .clone()
-                    .put(
-                        repository,
-                        address,
-                        compressed_fragment,
-                        Some(compressed_payload),
-                        false,
-                    )
-                    .await
-                    .expect("Failed to put compressed fragment in durable store");
-                durable_store
-                    .clone()
-                    .flush(true)
-                    .await
-                    .expect("Failed to flush durable store");
-
-                let context_map = Arc::new(AttributeMap::default());
-                context_map.insert(repository);
-
-                let message = Verify { address, heal: 0 };
-                match message
-                    .handle_verify(context_map, local_store, durable_store.clone())
-                    .await
-                {
-                    Ok(LoreResponse::Verify(resp)) => {
-                        assert_eq!(resp.corrupted, 1);
-                        assert_eq!(resp.healed, HealResult::Healed);
-                    }
-                    Ok(other) => panic!("Expected Verify response, got {other:?}"),
-                    Err(e) => panic!("Expected success, got error: {e:?}"),
-                }
-
-                // The durable store should now hold the uncompressed payload.
-                let (fragment_after, payload_after) = durable_store
-                    .clone()
-                    .get(repository, address, StoreMatch::MatchFull)
-                    .await
-                    .expect("Failed to get fragment from durable store after verify");
-
-                assert!(
-                    !FragmentFlags::from_bits_retain(fragment_after.flags)
-                        .contains(FragmentFlags::PayloadCompressed),
-                    "Expected compression flags to be cleared after decompression rewrite"
-                );
-                assert_eq!(
-                    payload_after.as_ref(),
-                    content,
-                    "Decompressed payload should match original content"
-                );
-                assert_eq!(
-                    hash_slice(&payload_after),
-                    address.hash,
-                    "Decompressed payload hash should match the fragment address hash"
-                );
-            })
-            .await;
-
-        let _ = std::fs::remove_dir_all(&local_dir_cleanup);
-        let _ = std::fs::remove_dir_all(&durable_dir_cleanup);
     }
 }

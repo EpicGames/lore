@@ -290,7 +290,6 @@ impl QuicService for StorageServiceV4 {
                             correlation_id,
                             user_id,
                             self.local_store.clone(),
-                            self.immutable_store.clone(),
                         )
                         .await
                     }

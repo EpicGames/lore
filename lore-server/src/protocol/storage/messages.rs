@@ -105,15 +105,6 @@ impl From<StoreError> for MessageHandleError {
 #[async_trait]
 #[enum_dispatch]
 pub trait Message: Debug + Send + Sync {
-    async fn handle_verify(
-        &self,
-        _context: Arc<AttributeMap>,
-        _local_store: Arc<dyn ImmutableStore>,
-        _immutable_store: Arc<dyn ImmutableStore>,
-    ) -> Result<LoreResponse, MessageHandleError> {
-        Err(MessageHandleError::NotImplemented)
-    }
-
     async fn handle(
         &self,
         _context: Arc<AttributeMap>,

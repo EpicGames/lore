@@ -193,7 +193,7 @@ typedef struct lore_context_t lore_branch_id_t;
 // A unique identity for a repository instance (a local checkout).
 //
 // Each instance gets a stable `UUIDv7` generated once at creation time
-// and stored in `.urc/instance`. The instance ID is used to derive
+// and stored in `.lore/instance`. The instance ID is used to derive
 // per-instance anchor keys in the mutable store, distinguishing one
 // instance's checkout state from another when sharing a shared store.
 typedef struct lore_instance_id_t {

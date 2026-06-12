@@ -424,13 +424,7 @@ impl QuicService for StorageService {
                     .await
             }
             ParsedStorageRequest::Verify(verify) => {
-                verify
-                    .handle_verify(
-                        context,
-                        self.local_store.clone(),
-                        self.immutable_store.clone(),
-                    )
-                    .await
+                verify.handle(context, self.local_store.clone()).await
             }
             other => other.handle(context, self.immutable_store.clone()).await,
         }?;
