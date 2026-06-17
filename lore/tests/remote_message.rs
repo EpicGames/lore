@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 glitch-ux
 // SPDX-License-Identifier: MIT
 use lore::remote::command::LoreCommand;
 use lore::remote::message::MessageError;
@@ -27,6 +28,20 @@ fn header_to_and_from_bytes() {
     let bad_processed_header = V1Header::from_bytes(&bad_bytes);
 
     assert!(bad_processed_header.is_err());
+}
+
+#[test]
+fn errors_on_invalid_serialization_type_in_header() {
+    // A valid V1 version byte (0), a zero payload size, and 0xff as the
+    // serialization-type byte, which is not a valid SerializationType. Reading a
+    // message with such a header must surface a recoverable error rather than
+    // panicking the process.
+    let bytes: [u8; 6] = [0, 0, 0, 0, 0, 0xff];
+
+    let result: Result<Option<(V1Header, MessageToServer)>, MessageError> =
+        blocking_read_v1_message(&mut bytes.as_slice());
+
+    assert!(result.is_err());
 }
 
 #[tokio::test]
