@@ -306,7 +306,7 @@ pub struct QuicSettings {
     pub port: i32,
     pub transport_bits_per_second: Option<usize>,
     pub transport_rtt: Option<usize>,
-    /// Keep below a threshold for whatever Load Balancer sits infront of the server
+    /// Keep below a threshold for whatever Load Balancer sits in front of the server
     /// or is expecting responses. If request handlers exceed this reasonable threshold
     /// then assume something has gone wrong and return a timeout response so we can get metrics
     /// and clients don't hang forever
