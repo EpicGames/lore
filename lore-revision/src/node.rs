@@ -1861,9 +1861,7 @@ impl NodeFileMetadataBlockData {
         address: Address,
         cache: bool,
     ) -> Result<Box<Self>, ImmutableError> {
-        match Self::read_box_from_immutable(repository.clone(), address, cache)
-            .await
-        {
+        match Self::read_box_from_immutable(repository.clone(), address, cache).await {
             Ok(block) => Ok(block),
             Err(original_err) if original_err.is_internal() => {
                 match NodeFileMetadataBlockDataV0::read_box_from_immutable(

@@ -70,10 +70,7 @@ impl TopologyProvider {
     /// Built-in providers return `None`, plugin-based providers return the plugin name.
     pub fn plugin_name(&self) -> Option<&'static str> {
         match self {
-            Self::None
-            | Self::Fixed
-            | Self::RotatingIdFixed
-            | Self::Composite => None, // Built-in, no plugin needed
+            Self::None | Self::Fixed | Self::RotatingIdFixed | Self::Composite => None, // Built-in, no plugin needed
             Self::Consul => Some("consul"),
         }
     }

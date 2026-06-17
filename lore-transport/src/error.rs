@@ -38,12 +38,8 @@ impl From<ProtocolError> for tonic::Status {
     fn from(value: ProtocolError) -> Self {
         let msg = value.to_string();
         match value {
-            ProtocolError::NotAuthenticated(_) => {
-                Self::new(tonic::Code::Unauthenticated, msg)
-            }
-            ProtocolError::NotAuthorized(_) => {
-                Self::new(tonic::Code::PermissionDenied, msg)
-            }
+            ProtocolError::NotAuthenticated(_) => Self::new(tonic::Code::Unauthenticated, msg),
+            ProtocolError::NotAuthorized(_) => Self::new(tonic::Code::PermissionDenied, msg),
             ProtocolError::SlowDown(_) => Self::new(tonic::Code::ResourceExhausted, msg),
             ProtocolError::NotFound(_) => Self::new(tonic::Code::NotFound, msg),
             ProtocolError::Oversized(_) => Self::new(tonic::Code::OutOfRange, msg),

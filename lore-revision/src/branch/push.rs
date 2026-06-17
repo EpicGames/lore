@@ -260,14 +260,12 @@ impl EventError for PushError {
             Self::SlowDown(_) => LoreError::SlowDown,
             Self::Oversized(_) => LoreError::Oversized,
             Self::FileNotFound(_) => LoreError::FileNotFound,
-            Self::NotFound(_)
-            | Self::LayerNotFound(_)
-            | Self::RevisionNotFound(_) => LoreError::NotFound,
+            Self::NotFound(_) | Self::LayerNotFound(_) | Self::RevisionNotFound(_) => {
+                LoreError::NotFound
+            }
             Self::AddressNotFound(_) => LoreError::AddressNotFound,
             Self::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            Self::InvalidPath(_) | Self::InvalidArguments(_) => {
-                LoreError::InvalidArguments
-            }
+            Self::InvalidPath(_) | Self::InvalidArguments(_) => LoreError::InvalidArguments,
             _ => LoreError::Internal,
         }
     }

@@ -201,9 +201,7 @@ impl From<tonic::Status> for ReplicationClientError {
     fn from(status: tonic::Status) -> Self {
         info!(?status, "Replication gRPC request failed");
         match status.code() {
-            tonic::Code::Unavailable | tonic::Code::ResourceExhausted => {
-                Self::SlowDown
-            }
+            tonic::Code::Unavailable | tonic::Code::ResourceExhausted => Self::SlowDown,
             _ => Self::RequestFailed(status),
         }
     }

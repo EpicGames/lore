@@ -354,9 +354,7 @@ impl InstanceOperation for StaticDispatchInstanceOperation {
         node_hint: Option<&Node>,
     ) -> Result<Hash, FsError> {
         match self {
-            Self::Os(this) => {
-                this.file_hash(repository, path, node_hint).await
-            }
+            Self::Os(this) => this.file_hash(repository, path, node_hint).await,
         }
     }
 

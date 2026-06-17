@@ -86,9 +86,9 @@ pub enum WriteError {
 impl EventError for WriteError {
     fn translated(&self) -> LoreError {
         match self {
-            Self::InvalidArguments(_)
-            | Self::InvalidPath(_)
-            | Self::InvalidAddress(_) => LoreError::InvalidArguments,
+            Self::InvalidArguments(_) | Self::InvalidPath(_) | Self::InvalidAddress(_) => {
+                LoreError::InvalidArguments
+            }
             Self::RevisionNotFound(_) | Self::NotFound(_) => LoreError::NotFound,
             Self::FileNotFound(_) => LoreError::FileNotFound,
             _ => LoreError::Internal,

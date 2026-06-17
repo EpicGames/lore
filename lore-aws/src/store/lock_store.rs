@@ -139,15 +139,11 @@ impl std::fmt::Debug for LockKey {
 impl DynamoDbQuery for LockQuery {
     fn index_name(&self) -> Option<String> {
         match self {
-            Self::Owner(_)
-            | Self::OwnerRepository(_, _)
-            | Self::OwnerRepositoryBranch(_, _, _) => Some(OWNER_REPO_BRANCH_GSI.to_string()),
-            Self::Repository(_) | Self::RepositoryBranch(_, _) => {
-                Some(REPO_BRANCH_GSI.to_string())
+            Self::Owner(_) | Self::OwnerRepository(_, _) | Self::OwnerRepositoryBranch(_, _, _) => {
+                Some(OWNER_REPO_BRANCH_GSI.to_string())
             }
-            Self::RepositoryBranchDescription(_, _, _) => {
-                Some(REPO_BRANCH_DESC_GSI.to_string())
-            }
+            Self::Repository(_) | Self::RepositoryBranch(_, _) => Some(REPO_BRANCH_GSI.to_string()),
+            Self::RepositoryBranchDescription(_, _, _) => Some(REPO_BRANCH_DESC_GSI.to_string()),
             _ => None,
         }
     }
@@ -171,19 +167,15 @@ impl DynamoDbQuery for LockQuery {
     fn expression_attribute_names(&self) -> HashMap<String, String> {
         match self {
             Self::Hash(_) => HashMap::from([("#pk".to_string(), HASH_KEY.to_string())]),
-            Self::HashRepository(_, _) | Self::HashRepositoryBranch(_, _, _) => {
-                HashMap::from([
-                    ("#pk".to_string(), HASH_KEY.to_string()),
-                    ("#sk".to_string(), REPO_BRANCH_KEY.to_string()),
-                ])
-            }
+            Self::HashRepository(_, _) | Self::HashRepositoryBranch(_, _, _) => HashMap::from([
+                ("#pk".to_string(), HASH_KEY.to_string()),
+                ("#sk".to_string(), REPO_BRANCH_KEY.to_string()),
+            ]),
             Self::Owner(_) => HashMap::from([("#pk".to_string(), OWNER_KEY.to_string())]),
-            Self::OwnerRepository(_, _) | Self::OwnerRepositoryBranch(_, _, _) => {
-                HashMap::from([
-                    ("#pk".to_string(), OWNER_KEY.to_string()),
-                    ("#sk".to_string(), REPO_BRANCH_KEY.to_string()),
-                ])
-            }
+            Self::OwnerRepository(_, _) | Self::OwnerRepositoryBranch(_, _, _) => HashMap::from([
+                ("#pk".to_string(), OWNER_KEY.to_string()),
+                ("#sk".to_string(), REPO_BRANCH_KEY.to_string()),
+            ]),
             Self::Repository(_) => HashMap::from([("#pk".to_string(), REPO_KEY.to_string())]),
             Self::RepositoryBranch(_, _) => HashMap::from([
                 ("#pk".to_string(), REPO_KEY.to_string()),
@@ -267,25 +259,23 @@ impl DynamoDbQuery for LockQuery {
                     AttributeValue::B(Blob::new(branch.as_bytes())),
                 ),
             ]),
-            Self::RepositoryBranchDescription(repository, branch, description) => {
-                HashMap::from([
-                    (
-                        ":repoBranch".to_string(),
-                        AttributeValue::B(Blob::new(
-                            repository
-                                .data()
-                                .iter()
-                                .chain(branch.data().iter())
-                                .copied()
-                                .collect::<Vec<u8>>(),
-                        )),
-                    ),
-                    (
-                        ":description".to_string(),
-                        AttributeValue::S(description.clone()),
-                    ),
-                ])
-            }
+            Self::RepositoryBranchDescription(repository, branch, description) => HashMap::from([
+                (
+                    ":repoBranch".to_string(),
+                    AttributeValue::B(Blob::new(
+                        repository
+                            .data()
+                            .iter()
+                            .chain(branch.data().iter())
+                            .copied()
+                            .collect::<Vec<u8>>(),
+                    )),
+                ),
+                (
+                    ":description".to_string(),
+                    AttributeValue::S(description.clone()),
+                ),
+            ]),
         }
     }
 }

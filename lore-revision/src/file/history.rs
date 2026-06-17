@@ -142,13 +142,11 @@ pub enum FileHistoryError {
 impl EventError for FileHistoryError {
     fn translated(&self) -> LoreError {
         match self {
-            Self::InvalidArguments(_) | Self::InvalidPath(_) => {
-                LoreError::InvalidArguments
-            }
+            Self::InvalidArguments(_) | Self::InvalidPath(_) => LoreError::InvalidArguments,
             Self::FileNotFound(_) => LoreError::FileNotFound,
-            Self::RevisionNotFound(_)
-            | Self::BranchNotFound(_)
-            | Self::NotFound(_) => LoreError::NotFound,
+            Self::RevisionNotFound(_) | Self::BranchNotFound(_) | Self::NotFound(_) => {
+                LoreError::NotFound
+            }
             _ => LoreError::Internal,
         }
     }

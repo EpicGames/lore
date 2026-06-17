@@ -249,10 +249,7 @@ impl From<&str> for LoreString {
 
 impl From<Option<String>> for LoreString {
     fn from(value: Option<String>) -> Self {
-        value
-            .as_deref()
-            .map(Self::from_str)
-            .unwrap_or_default()
+        value.as_deref().map(Self::from_str).unwrap_or_default()
     }
 }
 
@@ -266,10 +263,7 @@ impl From<Option<&String>> for LoreString {
 
 impl From<&Option<String>> for LoreString {
     fn from(value: &Option<String>) -> Self {
-        value
-            .as_deref()
-            .map(Self::from_str)
-            .unwrap_or_default()
+        value.as_deref().map(Self::from_str).unwrap_or_default()
     }
 }
 

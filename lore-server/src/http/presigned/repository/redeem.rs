@@ -71,9 +71,7 @@ impl IntoResponse for RedeemError {
                 StatusCode::UNAUTHORIZED,
                 "invalid or expired token".to_string(),
             ),
-            Self::ReadStream(ref e)
-                if e.is_address_not_found() || e.is_payload_not_found() =>
-            {
+            Self::ReadStream(ref e) if e.is_address_not_found() || e.is_payload_not_found() => {
                 (StatusCode::NOT_FOUND, "address not found".to_string())
             }
             Self::NotConfigured => (

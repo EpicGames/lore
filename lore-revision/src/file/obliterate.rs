@@ -87,9 +87,9 @@ pub enum ObliterateError {
 impl EventError for ObliterateError {
     fn translated(&self) -> LoreError {
         match self {
-            Self::InvalidArguments(_)
-            | Self::InvalidPath(_)
-            | Self::InvalidAddress(_) => LoreError::InvalidArguments,
+            Self::InvalidArguments(_) | Self::InvalidPath(_) | Self::InvalidAddress(_) => {
+                LoreError::InvalidArguments
+            }
             Self::FileNotFound(_) => LoreError::FileNotFound,
             _ => LoreError::Internal,
         }

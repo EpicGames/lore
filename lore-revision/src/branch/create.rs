@@ -81,9 +81,7 @@ impl EventError for CreateError {
             | Self::LayerNotFound(_) => LoreError::NotFound,
             Self::AddressNotFound(_) => LoreError::AddressNotFound,
             Self::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            Self::InvalidPath(_) | Self::InvalidArguments(_) => {
-                LoreError::InvalidArguments
-            }
+            Self::InvalidPath(_) | Self::InvalidArguments(_) => LoreError::InvalidArguments,
             Self::BranchAlreadyExists(_) => LoreError::AlreadyExists,
             _ => LoreError::Internal,
         }

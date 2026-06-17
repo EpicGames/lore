@@ -24,11 +24,7 @@ pub struct ChaosRunner {
 }
 
 impl ChaosRunner {
-    pub fn new(
-        config: RunnerConfig,
-        probability: ProbabilityEngine,
-        urc: LoreInterface,
-    ) -> Self {
+    pub fn new(config: RunnerConfig, probability: ProbabilityEngine, urc: LoreInterface) -> Self {
         let config = Rc::new(config);
         let probability = Rc::new(RefCell::new(probability));
         let picker: Box<dyn Picker> = if let Some(replay_file) = config.replay_operations.as_ref() {

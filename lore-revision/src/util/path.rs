@@ -281,10 +281,7 @@ impl RelativePath {
         RelativePathBuf::new_from_clean_parts(root, tail).freeze()
     }
 
-    pub fn new_from_user_path(
-        repository_path: &Path,
-        user_path: &str,
-    ) -> Result<Self, PathError> {
+    pub fn new_from_user_path(repository_path: &Path, user_path: &str) -> Result<Self, PathError> {
         RelativePathBuf::new_from_user_path(repository_path, user_path).map(|p| p.freeze())
     }
 
@@ -636,10 +633,7 @@ impl RelativePathBuf {
 
     /// Construct from a user-provided path relative to a repository path.
     /// Makes the user path absolute if needed, then computes the relative portion.
-    pub fn new_from_user_path(
-        repository_path: &Path,
-        user_path: &str,
-    ) -> Result<Self, PathError> {
+    pub fn new_from_user_path(repository_path: &Path, user_path: &str) -> Result<Self, PathError> {
         if user_path == "." || user_path.is_empty() {
             return Ok(Self::new());
         }

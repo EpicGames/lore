@@ -350,9 +350,9 @@ impl EventError for BranchError {
             | Self::NodeNotFound(_) => LoreError::NotFound,
             Self::AddressNotFound(_) => LoreError::AddressNotFound,
             Self::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            Self::InvalidPath(_)
-            | Self::InvalidArguments(_)
-            | Self::Divergent(_) => LoreError::InvalidArguments,
+            Self::InvalidPath(_) | Self::InvalidArguments(_) | Self::Divergent(_) => {
+                LoreError::InvalidArguments
+            }
             Self::BranchAlreadyExists(_) => LoreError::AlreadyExists,
             _ => LoreError::Internal,
         }

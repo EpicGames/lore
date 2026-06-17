@@ -1088,11 +1088,10 @@ impl EventError for RepositoryError {
             | Self::NodeNotFound(_) => LoreError::NotFound,
             Self::AddressNotFound(_) => LoreError::AddressNotFound,
             Self::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            Self::InvalidPath(_) | Self::InvalidArguments(_) => {
-                LoreError::InvalidArguments
+            Self::InvalidPath(_) | Self::InvalidArguments(_) => LoreError::InvalidArguments,
+            Self::RepositoryAlreadyExists(_) | Self::BranchAlreadyExists(_) => {
+                LoreError::AlreadyExists
             }
-            Self::RepositoryAlreadyExists(_)
-            | Self::BranchAlreadyExists(_) => LoreError::AlreadyExists,
             _ => LoreError::Internal,
         }
     }

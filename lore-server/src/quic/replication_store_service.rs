@@ -92,9 +92,7 @@ impl TryFrom<QuicOpCode> for Command {
             v if v == Self::ImmutablePut as u8 => Ok(Self::ImmutablePut),
             v if v == Self::ImmutableObliterate as u8 => Ok(Self::ImmutableObliterate),
             v if v == Self::ImmutableQuery as u8 => Ok(Self::ImmutableQuery),
-            v if v == Self::ImmutableLocalExistBatch as u8 => {
-                Ok(Self::ImmutableLocalExistBatch)
-            }
+            v if v == Self::ImmutableLocalExistBatch as u8 => Ok(Self::ImmutableLocalExistBatch),
             v if v == Self::ImmutableLocalGet as u8 => Ok(Self::ImmutableLocalGet),
             v if v == Self::ImmutableLocalQuery as u8 => Ok(Self::ImmutableLocalQuery),
             v if v == Self::ImmutableLocalPut as u8 => Ok(Self::ImmutableLocalPut),

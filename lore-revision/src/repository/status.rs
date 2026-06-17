@@ -358,14 +358,12 @@ impl EventError for StatusError {
             Self::SlowDown(_) => LoreError::SlowDown,
             Self::Oversized(_) => LoreError::Oversized,
             Self::FileNotFound(_) => LoreError::FileNotFound,
-            Self::NotFound(_)
-            | Self::LayerNotFound(_)
-            | Self::RevisionNotFound(_) => LoreError::NotFound,
+            Self::NotFound(_) | Self::LayerNotFound(_) | Self::RevisionNotFound(_) => {
+                LoreError::NotFound
+            }
             Self::AddressNotFound(_) => LoreError::AddressNotFound,
             Self::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            Self::InvalidArguments(_) | Self::InvalidPath(_) => {
-                LoreError::InvalidArguments
-            }
+            Self::InvalidArguments(_) | Self::InvalidPath(_) => LoreError::InvalidArguments,
             _ => LoreError::Internal,
         }
     }

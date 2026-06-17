@@ -617,9 +617,7 @@ impl From<&Bytes> for FragmentReference {
 
 impl From<&[u8]> for FragmentReference {
     fn from(bytes: &[u8]) -> Self {
-        Self::read_from_prefix(bytes)
-            .unwrap_or_default()
-            .0
+        Self::read_from_prefix(bytes).unwrap_or_default().0
     }
 }
 

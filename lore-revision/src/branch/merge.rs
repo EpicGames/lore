@@ -361,9 +361,7 @@ impl EventError for MergeError {
             | Self::RevisionNotFound(_) => LoreError::NotFound,
             Self::AddressNotFound(_) => LoreError::AddressNotFound,
             Self::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            Self::InvalidPath(_) | Self::InvalidArguments(_) => {
-                LoreError::InvalidArguments
-            }
+            Self::InvalidPath(_) | Self::InvalidArguments(_) => LoreError::InvalidArguments,
             _ => LoreError::Internal,
         }
     }

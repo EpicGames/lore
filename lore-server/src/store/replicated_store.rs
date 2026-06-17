@@ -95,10 +95,7 @@ where
         Ok(store)
     }
 
-    fn setup_periodic_refresh(
-        store: &Arc<Self>,
-        periodic_client_refresh: Duration,
-    ) {
+    fn setup_periodic_refresh(store: &Arc<Self>, periodic_client_refresh: Duration) {
         let weak = Arc::downgrade(store);
         let task = lore_spawn!({
             async move {
@@ -124,10 +121,7 @@ where
         *write = Some(AbortOnDropHandle::new(task));
     }
 
-    fn setup_client_stats_monitor(
-        store: &Arc<Self>,
-        monitor_interval: Duration,
-    ) {
+    fn setup_client_stats_monitor(store: &Arc<Self>, monitor_interval: Duration) {
         let quic_instruments = ClientMetrics::new(
             "replicated_store",
             store.instruments.provider.labels().to_vec(),

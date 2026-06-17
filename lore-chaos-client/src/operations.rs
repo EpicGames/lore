@@ -27,8 +27,7 @@ impl RepoOperationKind {
         Self::BranchInfo,
     ];
 
-    pub const ALL_READ_ONLY: &'static [Self] =
-        &[Self::Status, Self::BranchInfo];
+    pub const ALL_READ_ONLY: &'static [Self] = &[Self::Status, Self::BranchInfo];
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,11 +72,7 @@ pub enum FileMergeOperationKind {
 }
 
 impl FileMergeOperationKind {
-    pub const ALL: &'static [Self] = &[
-        Self::Mine,
-        Self::Theirs,
-        Self::New,
-    ];
+    pub const ALL: &'static [Self] = &[Self::Mine, Self::Theirs, Self::New];
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

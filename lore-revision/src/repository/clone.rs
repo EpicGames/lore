@@ -134,9 +134,7 @@ impl EventError for CloneError {
             | Self::NodeNotFound(_) => LoreError::NotFound,
             Self::AddressNotFound(_) => LoreError::AddressNotFound,
             Self::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            Self::InvalidPath(_) | Self::InvalidArguments(_) => {
-                LoreError::InvalidArguments
-            }
+            Self::InvalidPath(_) | Self::InvalidArguments(_) => LoreError::InvalidArguments,
             _ => LoreError::Internal,
         }
     }
