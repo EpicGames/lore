@@ -27,6 +27,7 @@ resource "aws_iam_role_policy" "task_s3" {
         "s3:GetObject",
         "s3:PutObject",
         "s3:DeleteObject",
+        "s3:DeleteObjectVersion",
         "s3:ListBucket",
         "s3:ListBucketVersions",
       ]

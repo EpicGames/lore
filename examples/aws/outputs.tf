@@ -4,8 +4,18 @@ output "cluster_name" {
 }
 
 output "service_name" {
-  description = "ECS service name"
+  description = "ECS service name (primary)"
   value       = aws_ecs_service.lore.name
+}
+
+output "edge_service_name" {
+  description = "ECS service name (edge)"
+  value       = aws_ecs_service.edge.name
+}
+
+output "primary_dns" {
+  description = "Cloud Map DNS for primary (used by edge pods)"
+  value       = "primary.${aws_service_discovery_private_dns_namespace.this.name}"
 }
 
 output "s3_bucket" {

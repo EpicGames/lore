@@ -121,6 +121,36 @@ resource "aws_vpc_security_group_ingress_rule" "client_http" {
   description       = "Client HTTP"
 }
 
+# Internal: QUIC replication (edge → primary on 41340 UDP)
+resource "aws_vpc_security_group_ingress_rule" "replication_quic" {
+  security_group_id            = aws_security_group.lore.id
+  from_port                    = 41340
+  to_port                      = 41340
+  ip_protocol                  = "udp"
+  referenced_security_group_id = aws_security_group.lore.id
+  description                  = "QUIC replication between Lore nodes"
+}
+
+# Internal: gRPC (edge → primary on 41337 TCP for remote mutable store)
+resource "aws_vpc_security_group_ingress_rule" "internal_grpc" {
+  security_group_id            = aws_security_group.lore.id
+  from_port                    = 41337
+  to_port                      = 41337
+  ip_protocol                  = "tcp"
+  referenced_security_group_id = aws_security_group.lore.id
+  description                  = "gRPC between Lore nodes"
+}
+
+# Internal: QUIC (edge → primary on 41337 UDP for replicated immutable store)
+resource "aws_vpc_security_group_ingress_rule" "internal_quic" {
+  security_group_id            = aws_security_group.lore.id
+  from_port                    = 41337
+  to_port                      = 41337
+  ip_protocol                  = "udp"
+  referenced_security_group_id = aws_security_group.lore.id
+  description                  = "QUIC between Lore nodes"
+}
+
 resource "aws_vpc_security_group_egress_rule" "all" {
   security_group_id = aws_security_group.lore.id
   ip_protocol       = "-1"
