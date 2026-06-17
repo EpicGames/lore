@@ -26,6 +26,11 @@ docker tag loreserver:latest <ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/lorese
 docker push <ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/loreserver:latest
 ```
 
+The Dockerfile builds the `loreserver` binary from the workspace, which includes
+the `lore-aws` crate. The server's `main()` calls `register_all_plugins()` at
+startup, registering the AWS (S3 + DynamoDB) and HashiCorp (Consul) plugins
+automatically. No custom binary or fork is needed.
+
 ## Deploy
 
 ```sh
@@ -38,7 +43,10 @@ terraform apply
 
 ## Connect
 
-Get the task IP (Fargate assigns a private IP in the VPC):
+The ECS service runs in private subnets. You must connect from within the VPC
+(e.g., an EC2 instance, VPN, AWS Client VPN, or SSM port-forwarding session).
+
+Get the task IP:
 
 ```sh
 TASK_ARN=$(aws ecs list-tasks --cluster lore-cluster --service-name lore --query 'taskArns[0]' --output text)
@@ -47,13 +55,15 @@ TASK_IP=$(aws ecs describe-tasks --cluster lore-cluster --tasks "$TASK_ARN" \
 echo "$TASK_IP"
 ```
 
-The server generates an ephemeral self-signed certificate on startup. For local testing, skip TLS verification or use `lore://` (plain gRPC, QUIC still has TLS):
+From a host inside the VPC:
 
 ```sh
 lore clone lore://${TASK_IP}:41337/my-repo
 ```
 
-For production, configure real TLS certificates (see Customize below) and use `lores://`.
+The server generates an ephemeral self-signed certificate on startup. Use
+`lore://` (plain gRPC control plane — QUIC data path still uses TLS) or
+configure real certificates and use `lores://` (see Customize below).
 
 ## Verify
 
@@ -74,6 +84,7 @@ aws logs tail /ecs/lore --since 5m
 
 This example uses the simplest viable configuration. For production:
 
+- **Ingress** — add an NLB, AWS Client VPN, or bastion host for access from outside the VPC.
 - **TLS** — mount real certificates and set `LORE__SERVER__QUIC__CERTIFICATE__CERT_FILE` / `PKEY_FILE` (and the same for `GRPC`). See [Server configuration reference](https://epicgames.github.io/lore/reference/lore-server-config/#certificate-block).
 - **Auth** — configure `LORE__SERVER__AUTH__JWK__ENDPOINT` to validate JWTs. See [Authentication](https://epicgames.github.io/lore/reference/lore-server-config/#authentication).
 - **Caching** — switch from Fargate to EC2 with NVMe instances and use `LORE__IMMUTABLE_STORE__MODE=composite` for a local cache in front of S3.
