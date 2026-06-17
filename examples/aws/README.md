@@ -7,7 +7,10 @@ Terraform configuration that deploys a Lore server on AWS with durable S3/Dynamo
 - VPC with public and private subnets (2 AZs)
 - S3 bucket for fragment storage (immutable store)
 - 4 DynamoDB tables (fragments, metadata, mutable store, locks)
-- ECS Fargate service running the loreserver container
+- ECS Fargate primary service with S3/DynamoDB storage
+- ECS Fargate edge service with replicated storage (caches from primary)
+- Cloud Map private DNS for edge → primary service discovery
+- Self-signed TLS CA + server certificate (inter-node trust)
 - VPC endpoints for S3 and DynamoDB (reduces NAT costs)
 - CloudWatch log group
 
@@ -88,7 +91,7 @@ This example uses the simplest viable configuration. For production:
 - **TLS** — mount real certificates and set `LORE__SERVER__QUIC__CERTIFICATE__CERT_FILE` / `PKEY_FILE` (and the same for `GRPC`). See [Server configuration reference](https://epicgames.github.io/lore/reference/lore-server-config/#certificate-block).
 - **Auth** — configure `LORE__SERVER__AUTH__JWK__ENDPOINT` to validate JWTs. See [Authentication](https://epicgames.github.io/lore/reference/lore-server-config/#authentication).
 - **Caching** — switch from Fargate to EC2 with NVMe instances and use `LORE__IMMUTABLE_STORE__MODE=composite` for a local cache in front of S3.
-- **Replication** — add edge nodes with `LORE__IMMUTABLE_STORE__MODE=replicated` for multi-region. See [Topology](https://epicgames.github.io/lore/reference/lore-server-config/#topology-settings).
+- **Replication** — add more edge nodes or deploy to other regions. See [Topology](https://epicgames.github.io/lore/reference/lore-server-config/#topology-settings).
 - **HMAC** — set `LORE__SERVER__HTTP__PRESIGNED_URL_HMAC_KEY` (hex, ≥32 bytes) to enable presigned URLs for direct client-to-S3 transfers.
 
 ## Destroy
@@ -97,4 +100,4 @@ This example uses the simplest viable configuration. For production:
 terraform destroy
 ```
 
-Teardown takes 2–3 minutes (VPC, NAT gateway deletion).
+Teardown includes VPC and NAT gateway deletion.

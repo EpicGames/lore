@@ -27,3 +27,9 @@ output "log_group" {
   description = "CloudWatch log group"
   value       = aws_cloudwatch_log_group.lore.name
 }
+
+output "ca_certificate_pem" {
+  description = "CA certificate — clients need this to trust the server's TLS cert"
+  value       = local.ca_pem
+  sensitive   = true
+}
