@@ -1,0 +1,3 @@
+region          = "us-west-2"
+container_image = "123456789012.dkr.ecr.us-west-2.amazonaws.com/loreserver:latest"
+allowed_cidrs   = ["10.0.0.0/8"]
