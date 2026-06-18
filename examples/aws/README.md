@@ -1,93 +1,82 @@
 # Lore on AWS
 
-Terraform configuration that deploys a Lore server on AWS with durable S3/DynamoDB storage using ECS Fargate.
+Deploy a Lore server on AWS with durable S3/DynamoDB storage and an edge node for client access.
 
 > Region is configurable via `var.region` (default: `us-west-2`).
 
-## What this creates
+## Quick start
 
-- VPC with public and private subnets (2 AZs)
-- S3 bucket for fragment storage (immutable store)
-- 4 DynamoDB tables (fragments, metadata, mutable store, locks)
-- ECS Fargate primary service with S3/DynamoDB storage
-- ECS Fargate edge service with replicated storage (caches from primary)
-- Cloud Map private DNS for edge → primary service discovery
-- Self-signed TLS CA + server certificate (inter-node trust)
-- VPC endpoints for S3 and DynamoDB (reduces NAT costs)
-- CloudWatch log group
+### 1. Build and push the container image
 
-## Prerequisites
-
-- [Terraform](https://developer.hashicorp.com/terraform/install) >= 1.5
-- AWS credentials configured (`aws configure` or environment variables)
-- A `loreserver` container image in ECR — build from the repo root:
+From the Lore repo root:
 
 ```sh
 docker build -f lore-server/Dockerfile -t loreserver .
-
-aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com
-aws ecr create-repository --repository-name loreserver --region us-west-2
-docker tag loreserver:latest <ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/loreserver:latest
-docker push <ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/loreserver:latest
 ```
 
-The Dockerfile builds the `loreserver` binary from the workspace, which includes
-the `lore-aws` crate. The server's `main()` calls `register_all_plugins()` at
-startup, registering the AWS (S3 + DynamoDB) and HashiCorp (Consul) plugins
-automatically. No custom binary or fork is needed.
+Push to ECR (replace `<ACCOUNT_ID>` and `<REGION>`):
 
-## Deploy
+```sh
+aws ecr get-login-password --region <REGION> | docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com
+aws ecr create-repository --repository-name loreserver --region <REGION>
+docker tag loreserver:latest <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/loreserver:latest
+docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/loreserver:latest
+```
+
+### 2. Deploy
 
 ```sh
 cd examples/aws
 cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars — set your container_image URI and allowed_cidrs
+```
+
+Edit `terraform.tfvars`:
+
+```hcl
+region          = "us-west-2"
+container_image = "<ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/loreserver:latest"
+allowed_cidrs   = ["10.0.0.0/8"]  # Your VPC or VPN CIDR
+```
+
+```sh
 terraform init
 terraform apply
 ```
 
-## Connect
+### 3. Connect
 
-The ECS services run in private subnets. Connect from within the VPC
-(e.g., an EC2 instance, VPN, or AWS Client VPN).
-
-Export the CA certificate so the client trusts the server's QUIC endpoint:
+The services run in private subnets — connect from within the VPC (EC2 instance, VPN, or Client VPN).
 
 ```sh
+# Export the CA so the client trusts the server
 terraform output -raw ca_certificate_pem > lore-ca.pem
 export SSL_CERT_FILE=lore-ca.pem
-```
 
-Clients connect to the **edge** service (it replicates from the primary
-automatically). Get the edge task IP:
-
-```sh
+# Get the edge node IP
 TASK_ARN=$(aws ecs list-tasks --cluster lore-cluster --service-name lore-edge --query 'taskArns[0]' --output text)
 TASK_IP=$(aws ecs describe-tasks --cluster lore-cluster --tasks "$TASK_ARN" \
   --query 'tasks[0].attachments[0].details[?name==`privateIPv4Address`].value' --output text)
-echo "$TASK_IP"
-```
 
-From a host inside the VPC:
-
-```sh
+# Clone a repository
 lore clone lore://${TASK_IP}:41337/my-repo
 ```
 
-> `lore://` uses QUIC (TLS) for data and plain gRPC for the control plane.
-> The edge pod's gRPC is not TLS-configured, so `lore://` works directly.
-> For `lores://` (gRPC+TLS), configure certificates on the edge pod (see Customize).
+## What gets deployed
+
+| Component | Purpose |
+|-----------|---------|
+| Primary (ECS Fargate) | Stores fragments in S3 and metadata in DynamoDB |
+| Edge (ECS Fargate) | Client-facing node that replicates from primary |
+| Cloud Map DNS | Edge → primary service discovery |
+| VPC | Private subnets, NAT, S3/DynamoDB gateway endpoints |
+| TLS CA | Self-signed; establishes trust between nodes |
 
 ## Verify
 
-Check the service is running:
-
 ```sh
-aws ecs describe-services --cluster lore-cluster --services lore \
-  --query 'services[0].{status:status,running:runningCount}'
+aws ecs describe-services --cluster lore-cluster --services lore lore-edge \
+  --query 'services[].{name:serviceName,running:runningCount}'
 ```
-
-Check server logs:
 
 ```sh
 aws logs tail /ecs/lore --since 5m
@@ -95,14 +84,16 @@ aws logs tail /ecs/lore --since 5m
 
 ## Customize
 
-This example uses the simplest viable configuration. For production:
+| Need | What to change |
+|------|----------------|
+| External access | Add an NLB or AWS Client VPN |
+| gRPC TLS for clients | Configure edge certificates, use `lores://` |
+| Authentication | Set `LORE__SERVER__AUTH__JWK__ENDPOINT` ([docs](https://epicgames.github.io/lore/reference/lore-server-config/#authentication)) |
+| NVMe caching | Switch to EC2, use `composite` store mode |
+| More edge nodes | Duplicate the edge service definition |
+| Presigned URLs | Set `LORE__SERVER__HTTP__PRESIGNED_URL_HMAC_KEY` (hex, ≥32 bytes) |
 
-- **Ingress** — add an NLB, AWS Client VPN, or bastion host for access from outside the VPC.
-- **TLS** — mount real certificates and set `LORE__SERVER__QUIC__CERTIFICATE__CERT_FILE` / `PKEY_FILE` (and the same for `GRPC`). See [Server configuration reference](https://epicgames.github.io/lore/reference/lore-server-config/#certificate-block).
-- **Auth** — configure `LORE__SERVER__AUTH__JWK__ENDPOINT` to validate JWTs. See [Authentication](https://epicgames.github.io/lore/reference/lore-server-config/#authentication).
-- **Caching** — switch from Fargate to EC2 with NVMe instances and use `LORE__IMMUTABLE_STORE__MODE=composite` for a local cache in front of S3.
-- **Replication** — add more edge nodes or deploy to other regions. See [Topology](https://epicgames.github.io/lore/reference/lore-server-config/#topology-settings).
-- **HMAC** — set `LORE__SERVER__HTTP__PRESIGNED_URL_HMAC_KEY` (hex, ≥32 bytes) to enable presigned URLs for direct client-to-S3 transfers.
+Full server configuration: [Lore Server config reference](https://epicgames.github.io/lore/reference/lore-server-config/)
 
 ## Destroy
 
@@ -110,4 +101,8 @@ This example uses the simplest viable configuration. For production:
 terraform destroy
 ```
 
-Teardown includes VPC and NAT gateway deletion.
+## Prerequisites
+
+- [Terraform](https://developer.hashicorp.com/terraform/install) >= 1.5
+- AWS credentials with VPC, ECS, S3, DynamoDB, IAM, Secrets Manager, Cloud Map permissions
+- Docker (to build the container image)
