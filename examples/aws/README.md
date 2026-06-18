@@ -2,6 +2,8 @@
 
 Terraform configuration that deploys a Lore server on AWS with durable S3/DynamoDB storage using ECS Fargate.
 
+> Region is configurable via `var.region` (default: `us-west-2`).
+
 ## What this creates
 
 - VPC with public and private subnets (2 AZs)
@@ -46,13 +48,21 @@ terraform apply
 
 ## Connect
 
-The ECS service runs in private subnets. You must connect from within the VPC
-(e.g., an EC2 instance, VPN, AWS Client VPN, or SSM port-forwarding session).
+The ECS services run in private subnets. Connect from within the VPC
+(e.g., an EC2 instance, VPN, or AWS Client VPN).
 
-Get the task IP:
+Export the CA certificate so the client trusts the server's QUIC endpoint:
 
 ```sh
-TASK_ARN=$(aws ecs list-tasks --cluster lore-cluster --service-name lore --query 'taskArns[0]' --output text)
+terraform output -raw ca_certificate_pem > lore-ca.pem
+export SSL_CERT_FILE=lore-ca.pem
+```
+
+Clients connect to the **edge** service (it replicates from the primary
+automatically). Get the edge task IP:
+
+```sh
+TASK_ARN=$(aws ecs list-tasks --cluster lore-cluster --service-name lore-edge --query 'taskArns[0]' --output text)
 TASK_IP=$(aws ecs describe-tasks --cluster lore-cluster --tasks "$TASK_ARN" \
   --query 'tasks[0].attachments[0].details[?name==`privateIPv4Address`].value' --output text)
 echo "$TASK_IP"
@@ -64,9 +74,9 @@ From a host inside the VPC:
 lore clone lore://${TASK_IP}:41337/my-repo
 ```
 
-The server generates an ephemeral self-signed certificate on startup. Use
-`lore://` (plain gRPC control plane — QUIC data path still uses TLS) or
-configure real certificates and use `lores://` (see Customize below).
+> `lore://` uses QUIC (TLS) for data and plain gRPC for the control plane.
+> The edge pod's gRPC is not TLS-configured, so `lore://` works directly.
+> For `lores://` (gRPC+TLS), configure certificates on the edge pod (see Customize).
 
 ## Verify
 
