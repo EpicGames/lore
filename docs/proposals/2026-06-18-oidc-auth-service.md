@@ -6,7 +6,7 @@ authors:
 status: Draft
 created: 2026-06-18
 updated: 2026-06-18
-discussion: <TBD — fill in CR link when the discussion CR is opened>
+discussion: https://github.com/EpicGames/lore/pull/22
 ---
 
 # OIDC Authentication Service for Lore Server
