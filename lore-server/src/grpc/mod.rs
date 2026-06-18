@@ -22,11 +22,12 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-mod replication_server;
+mod grpc_internal_server;
 mod replication_service;
 pub mod tower;
 
 pub use admin_service::LoreAdminService;
+pub use grpc_internal_server::GrpcInternalServerBuilder;
 use lore_base::types::Context;
 use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::MetadataError;
@@ -36,7 +37,6 @@ use lore_revision::state::StateError;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use lore_transport::grpc::PARTITION_ID_KEY;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
-pub use replication_server::GrpcReplicationServerBuilder;
 pub use repository::LoreRepositoryV1Service;
 pub use revision::LoreRevisionV1Service;
 pub use revision_service::LoreRevisionService;
@@ -49,7 +49,7 @@ use tonic::Code;
 use tonic::Extensions;
 use tonic::Status;
 use tonic::metadata::MetadataMap;
-use tracing::error;
+use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
@@ -66,10 +66,7 @@ use crate::util::resources_from_token;
 /// Matches the Infrastructure alerting rule regex
 /// for what counts as an internal status code error
 pub fn is_code_considered_server_error(code: &Code) -> bool {
-    matches!(
-        code,
-        Code::Internal | Code::Unavailable | Code::Unknown | Code::Cancelled
-    )
+    matches!(code, Code::Internal | Code::Unavailable | Code::Cancelled)
 }
 
 pub(crate) fn simple_map_message_handle_error(error: MessageHandleError) -> Status {
@@ -247,6 +244,17 @@ pub(crate) fn metadata_to_attribute(
     Ok(attr_map)
 }
 
+pub fn interpret_streaming_error(err: Status) -> Status {
+    // Surfaced from tonic crate src/codec/decode.rs
+    // An abrupt client error has occurred where they were streaming data then suddenly
+    // they have dropped.
+    if err.code() == Code::Internal && err.message() == "Unexpected EOF decoding stream." {
+        return Status::invalid_argument(format!("Probable client disconnect: {}", err.message()));
+    }
+
+    err
+}
+
 pub(crate) async fn send_err<T>(status: Status, tx: Sender<Result<T, Status>>) {
     let rpc_status_code = rpc_code_to_str(&status.code());
 
@@ -256,7 +264,7 @@ pub(crate) async fn send_err<T>(status: Status, tx: Sender<Result<T, Status>>) {
         info!(response = ?status, rpc_status_code, "GRPC service send_err - user error");
     }
     if let Err(e) = tx.send(Err(status)).await {
-        error!(send_error = ?e, "GRPC service error performing send_err");
+        debug!(send_error = ?e, "GRPC service error performing send_err");
     }
 }
 

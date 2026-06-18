@@ -86,6 +86,12 @@ pub async fn handler(
             // NotFound / Internal before the stream opens.
             let (signature, identifier) = resolve_to_identifier(&repository, query.into()).await?;
 
+            if signature.is_zero() {
+                return Err(Status::invalid_argument(
+                    "Cannot get the tree of a zeroed revision",
+                ));
+            }
+
             let (tx, rx) = mpsc::channel(64);
             let header = thin_client_v1::RevisionTreeHeader {
                 identifier: Some(identifier),
@@ -645,6 +651,35 @@ mod test {
                 Err(err) => err,
             };
             assert_eq!(err.code(), tonic::Code::NotFound);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn zero_signature_returns_invalid_argument() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let err = match handler(
+                make_request(
+                    repository,
+                    Query::Signature(Hash::default().into()),
+                    None,
+                    None,
+                ),
+                immutable_store,
+                mutable_store,
+            )
+            .await
+            {
+                Ok(_) => panic!("zeroed revision should fail"),
+                Err(err) => err,
+            };
+
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert_eq!(err.message(), "Cannot get the tree of a zeroed revision");
         }))
         .await;
     }

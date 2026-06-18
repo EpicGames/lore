@@ -144,7 +144,7 @@ This field is optional. When it's absent, the server starts with the presigned U
 
 ### gRPC endpoints
 
-`[server.grpc]` is the public gRPC API (HTTP/2 over TCP) serving the admin, storage, revision, repository, environment, lock, and notification services. It runs whenever the server is in normal (non-maintenance) mode. `[server.replication]` is the opt-in server-to-server replication endpoint; it is disabled by default and requires mutual TLS. Both tables share the same field set.
+`[server.grpc]` is the public gRPC API (HTTP/2 over TCP) serving the admin, storage, revision, repository, environment, lock, and notification services. It runs whenever the server is in normal (non-maintenance) mode. `[server.grpc_internal]` is the opt-in server-to-server gRPC internal endpoint; it is disabled by default and requires mutual TLS. Both tables share the same field set.
 
 > [!NOTE]
 > `[server.grpc]`'s default port `41337` is the same number as `[server.quic]`, but the two do not conflict: gRPC listens on TCP and QUIC on UDP.
@@ -152,13 +152,13 @@ This field is optional. When it's absent, the server starts with the presigned U
 | Field | Default (`server.grpc`) | Description |
 | --- | --- | --- |
 | `host` | `0.0.0.0` | Bind address. |
-| `port` | `41337` (`grpc`), `41340` (`replication`) | Listen port. |
+| `port` | `41337` (`grpc`), `41340` (`grpc_internal`) | Listen port. |
 | `request_handler_timeout_seconds` | `50` | Per-request handler timeout in seconds. Keep below any upstream load-balancer timeout. |
 | `http2_keepalive_interval_seconds` | none | HTTP/2 keep-alive PING interval in seconds. Unset by default. |
 | `http2_keepalive_timeout_seconds` | none | HTTP/2 keep-alive PING timeout in seconds. Unset by default. |
-| `certificate` | none | Optional `[server.grpc.certificate]` / `[server.replication.certificate]` block — same fields as the [Certificate block](#certificate-block). When present, the endpoint serves TLS. |
+| `certificate` | none | Optional `[server.grpc.certificate]` / `[server.grpc_internal.certificate]` block — same fields as the [Certificate block](#certificate-block). When present, the endpoint serves TLS. |
 
-`[server.replication]` additionally honors two fields that `[server.grpc]` ignores:
+`[server.grpc_internal]` additionally honors two fields that `[server.grpc]` ignores:
 
 | Field | Default | Description |
 | --- | --- | --- |

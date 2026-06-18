@@ -1,4 +1,4 @@
-exclude: /thirdparty/|lore-server/src/protocol/test_data/|tps/|.github/
+exclude: /thirdparty/|lore-server/src/protocol/test_data/|tps/
 
 repos:
   - repo: local
@@ -68,4 +68,3 @@ repos:
     hooks:
       - id: actionlint
         files: ^\.github/workflows/
-        args: [ "--config-file", ".github/actionlint.yaml" ]

@@ -64,7 +64,7 @@ use tracing::warn;
 
 use crate::auth::jwk::JwkServiceImpl;
 use crate::auth::jwt::JwtVerifier;
-use crate::grpc::GrpcReplicationServerBuilder;
+use crate::grpc::GrpcInternalServerBuilder;
 use crate::grpc::GrpcServerBuilder;
 use crate::grpc::notification_service::NotificationService;
 use crate::hooks::HookDispatcher;
@@ -506,13 +506,13 @@ enum EndpointSecurity {
 }
 
 /// Decide whether a server-to-server endpoint may start, and on what
-/// terms. Used by the gRPC replication service and the internal QUIC
+/// terms. Used by the gRPC internal server and the internal QUIC
 /// listener — both grant blanket access to the storage layer and rely
 /// solely on mTLS for authentication. The only way to start without
 /// mTLS is the explicit `verify_client_certs = false` opt-in.
 ///
 /// `label` is the config-section path used in error messages
-/// (e.g. `"[server.replication]"` or `"[server.quic_internal]"`).
+/// (e.g. `"[server.grpc_internal]"` or `"[server.quic_internal]"`).
 ///
 /// Returns:
 /// - `Ok(Mtls)` when `verify_client_certs = true` and `certificate`
@@ -546,20 +546,20 @@ fn validate_endpoint_security(
     }
 }
 
-async fn launch_replication_grpc_server(
+async fn launch_grpc_internal_server(
     settings: Settings,
     user_agent_filter: Arc<UserAgentFilter>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let grpc_settings = settings
         .server
-        .replication
-        .ok_or(anyhow!("Missing gRPC replication settings"))?;
+        .grpc_internal
+        .ok_or(anyhow!("Missing gRPC internal settings"))?;
 
     let addr =
         SocketAddr::from_str(format!("{}:{}", grpc_settings.host, grpc_settings.port).as_str())?;
 
-    info!("Starting Lore replication gRPC Server: {}", &addr);
+    info!("Starting Lore gRPC internal server: {}", &addr);
 
     let (cert_path, key_path, cert_chain_path) =
         if let Some(cert_settings) = grpc_settings.certificate {
@@ -572,9 +572,9 @@ async fn launch_replication_grpc_server(
             (None, None, None)
         };
 
-    GrpcReplicationServerBuilder::new()
+    GrpcInternalServerBuilder::new()
         .with_local_immutable_store(local_store().ok_or(anyhow!(
-            "Cannot configure replication server, no local store"
+            "Cannot configure gRPC internal server, no local store"
         ))?)?
         .with_tls_config(cert_path, key_path, cert_chain_path)?
         .with_http2_config(
@@ -1803,18 +1803,18 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         });
     }
 
-    if let Some(replication_server) = &settings.server.replication
-        && replication_server.enabled
+    if let Some(grpc_internal) = &settings.server.grpc_internal
+        && grpc_internal.enabled
     {
         let security = validate_endpoint_security(
-            "[server.replication]",
-            replication_server.certificate.as_ref(),
-            replication_server.verify_client_certs,
+            "[server.grpc_internal]",
+            grpc_internal.certificate.as_ref(),
+            grpc_internal.verify_client_certs,
         )?;
         if security == EndpointSecurity::Untrusted {
             warn!(
-                "[server.replication] starting WITHOUT mTLS because verify_client_certs=false. \
-                 The replication endpoint grants blanket access to every storage partition; \
+                "[server.grpc_internal] starting WITHOUT mTLS because verify_client_certs=false. \
+                 The gRPC internal endpoint grants blanket access to every storage partition; \
                  only safe on isolated networks with no untrusted clients"
             );
         }
@@ -1822,7 +1822,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let settings = settings.clone();
             let user_agent_filter = user_agent_filter.clone();
             let shutdown_rx = _shutdown_rx.clone();
-            launch_replication_grpc_server(settings, user_agent_filter, shutdown_rx)
+            launch_grpc_internal_server(settings, user_agent_filter, shutdown_rx)
         });
     }
 
@@ -1934,7 +1934,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 )),
                 frequency,
                 quic_settings,
-                // Internal replication endpoint requires a real (mTLS) certificate;
+                // Internal QUIC endpoint requires a real (mTLS) certificate;
                 // never fall back to an ephemeral one.
                 false,
                 shutdown_rx,

@@ -12,7 +12,7 @@ import logging
 import os
 
 import pytest
-from lore_parsers import parse_status_json, parse_status_summary_json
+from lore_parsers import parse_jsonl, parse_status_json, parse_status_summary_json
 from test_utils import to_posix
 
 from lore import Lore
@@ -690,7 +690,9 @@ def test_scan_clears_stale_dirty_on_reverted_file(new_lore_repo):
 
     # Verify dirty
     entries = get_status_files(repo)
-    assert find_status_entry(entries, "file.txt") is not None, "Should be dirty before revert"
+    assert find_status_entry(entries, "file.txt") is not None, (
+        "Should be dirty before revert"
+    )
 
     # Revert the file back to original content
     with repo.open_file("file.txt", "w+") as f:
@@ -767,9 +769,11 @@ def test_scan_after_commit_shows_remaining_dirty(new_lore_repo):
     assert entry is not None, "remaining.txt should still appear after commit + scan"
     assert entry["flagDirty"] is True
 
+
 # ===========================================================================
 # Stage from dirty-marked files
 # ===========================================================================
+
 
 @pytest.mark.smoke
 def test_stage_from_dirty_marks(new_lore_repo):
@@ -937,14 +941,112 @@ def test_stage_directory_recurses_dirty_added_subdirectory(new_lore_repo):
     repo.status(reset=True, offline=True)
     dump = repo.repository_dump()
     for name in ("alpha.txt", "beta.txt"):
-        assert name in dump, (
-            f"{name} should appear in the committed revision:\n{dump}"
+        assert name in dump, f"{name} should appear in the committed revision:\n{dump}"
+
+
+@pytest.mark.smoke
+def test_dirty_stage_commit_empty_directories(new_lore_repo):
+    """Empty directories flagged dirty stage and commit as directory adds.
+
+    A base revision commits a root file and a subdirectory holding a file. Two
+    brand-new empty directories are then created -- one in the repository root
+    and one inside the committed subdirectory -- and flagged with the dirty API
+    (no scan). Each empty directory is its own change with no child file to
+    anchor it.
+
+    Plain `status` (no scan) must report exactly those two directories as
+    unstaged adds and nothing else (the committed `subdir` parent gaining a
+    child is not itself a reported change). `status --check-dirty` must report
+    the exact same set. Staging the two directories must report two directory
+    adds and no files, after which plain `status` reports them as staged adds.
+    Committing then succeeds and leaves a clean status.
+    """
+    repo: Lore = new_lore_repo()
+
+    # Base revision: a root file and a subdirectory with a file.
+    with repo.open_file("file.txt", "w+") as f:
+        f.write("root content\n")
+    repo.make_dirs("subdir")
+    with repo.open_file("subdir/sub_file.txt", "w+") as f:
+        f.write("sub content\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    # Empty directory in the root and an empty directory inside the committed
+    # subdirectory, both absent from the base revision.
+    empty_dirs = ["empty_root", "subdir/empty_sub"]
+    for path in empty_dirs:
+        repo.make_dirs(path)
+
+    repo.dirty(empty_dirs, offline=True)
+
+    expected = {to_posix(p) for p in empty_dirs}
+
+    def assert_empty_dir_adds(entries: list[dict], *, staged: bool, label: str) -> None:
+        by_path = {to_posix(e["path"]): e for e in entries}
+        assert set(by_path) == expected, (
+            f"{label}: status should report exactly the two empty directories, "
+            f"got {sorted(by_path)}"
         )
+        for path in expected:
+            entry = by_path[path]
+            assert entry["type"] == "directory", (
+                f"{label}: {path} should be a directory: {entry}"
+            )
+            assert entry["action"] == "add", (
+                f"{label}: {path} should be an add: {entry}"
+            )
+            assert entry["flagDirty"] is True, (
+                f"{label}: {path} should be dirty: {entry}"
+            )
+            assert entry["flagStaged"] is staged, (
+                f"{label}: {path} flagStaged should be {staged}: {entry}"
+            )
+
+    # Expect: plain status (no scan) reports exactly the two empty directories
+    # as unstaged dirty adds -- and nothing else.
+    assert_empty_dir_adds(get_status_files(repo), staged=False, label="plain status")
+
+    # Expect: --check-dirty re-verifies the dirty markers against the filesystem
+    # and reports the exact same two unstaged dirty adds (a dir add is never
+    # cleared as "unmodified").
+    assert_empty_dir_adds(
+        get_status_files(repo, check_dirty=True), staged=False, label="--check-dirty"
+    )
+
+    # Stage both directories by their own paths. Expect: the stage summary
+    # counts exactly two directory adds and nothing else -- no files, and no
+    # modify of the committed `subdir` parent that one of them lives under.
+    stage_output = repo.stage(empty_dirs, json=True, offline=True)
+    stage_ends = parse_jsonl(stage_output, "fileStageEnd")
+    assert stage_ends, f"stage should emit a fileStageEnd event:\n{stage_output}"
+    count = stage_ends[-1]["count"]
+    assert count["directoryAddCount"] == 2, count
+    assert count["directoryModifyCount"] == 0, count
+    assert count["directoryDeleteCount"] == 0, count
+    assert count["directoryMoveCount"] == 0, count
+    assert count["fileAddCount"] == 0, count
+    assert count["fileModifyCount"] == 0, count
+    assert count["fileDeleteCount"] == 0, count
+    assert count["fileMoveCount"] == 0, count
+    assert count["totalCount"] == 2, count
+
+    # Expect: plain status now reports the same two directories, still adds, but
+    # flagged staged.
+    assert_empty_dir_adds(get_status_files(repo), staged=True, label="after stage")
+
+    # Expect: the commit succeeds and, with nothing left pending, a following
+    # plain status reports no changes at all.
+    repo.commit(offline=True)
+    assert get_status_files(repo) == [], (
+        "status should report no changes after committing the empty directories"
+    )
 
 
 # ===========================================================================
 # Dirty add in new directories, nonexistent paths, ignored paths
 # ===========================================================================
+
 
 @pytest.mark.smoke
 def test_dirty_add_in_new_directory(new_lore_repo):
@@ -1504,15 +1606,11 @@ def test_status_scan_partial_revert_with_remaining(new_lore_repo):
     )
 
     entries = get_status_files(repo, scan=True)
-    by_path = {
-        to_posix(e["path"]): e for e in entries if e.get("type") == "file"
-    }
+    by_path = {to_posix(e["path"]): e for e in entries if e.get("type") == "file"}
 
     for p in paths_to_keep:
         entry = by_path.get(to_posix(p))
-        assert entry is not None, (
-            f"kept dirty-add {p} should still appear in status"
-        )
+        assert entry is not None, f"kept dirty-add {p} should still appear in status"
         assert entry.get("flagDirty") is True, (
             f"kept dirty-add {p} should still be flagDirty, got {entry}"
         )
@@ -1716,9 +1814,11 @@ def test_branch_merge_abort_keeps_dirty_carry(new_lore_repo):
         "staged_post.txt should be clean after commit"
     )
     carry = find_status_entry(entries, "base.txt")
-    assert carry is not None and carry["flagDirty"] is True and carry["flagStaged"] is False, (
-        "merge abort preserves the pre-existing dirty-only carry"
-    )
+    assert (
+        carry is not None
+        and carry["flagDirty"] is True
+        and carry["flagStaged"] is False
+    ), "merge abort preserves the pre-existing dirty-only carry"
 
 
 # ===========================================================================
@@ -1914,9 +2014,13 @@ def test_cherry_pick_abort_keeps_dirty_carry(new_lore_repo):
         "staged_post.txt should be clean after commit"
     )
     carry = find_status_entry(entries, "base.txt")
-    assert carry is not None and carry["flagDirty"] is True and carry["flagStaged"] is False, (
-        "cherry-pick abort preserves the pre-existing dirty-only carry"
-    )
+    assert (
+        carry is not None
+        and carry["flagDirty"] is True
+        and carry["flagStaged"] is False
+    ), "cherry-pick abort preserves the pre-existing dirty-only carry"
+
+
 # ===========================================================================
 # Branch reset with dirty-only tracking
 # ===========================================================================
@@ -2188,9 +2292,11 @@ def test_revert_abort_keeps_dirty_carry(new_lore_repo):
         "staged_post.txt should be clean after commit"
     )
     carry = find_status_entry(entries, "base.txt")
-    assert carry is not None and carry["flagDirty"] is True and carry["flagStaged"] is False, (
-        "revert abort preserves the pre-existing dirty-only carry"
-    )
+    assert (
+        carry is not None
+        and carry["flagDirty"] is True
+        and carry["flagStaged"] is False
+    ), "revert abort preserves the pre-existing dirty-only carry"
 
 
 def write_view_filter(repo: Lore, lines: list[str]) -> None:
@@ -2503,12 +2609,16 @@ def test_dirty_add_repeated_is_idempotent(new_lore_repo):
             f"{label}: duplicate file nodes reported: "
             f"{sorted(to_posix(e['path']) for e in files)}"
         )
-        assert set(by_path) == expected, f"{label}: wrong file set, got {sorted(by_path)}"
+        assert set(by_path) == expected, (
+            f"{label}: wrong file set, got {sorted(by_path)}"
+        )
         for p in expected:
             entry = by_path[p]
             assert entry["action"] == "add", f"{label}: {p} should be add: {entry}"
             assert entry["flagDirty"] is True, f"{label}: {p} should be dirty: {entry}"
-            assert entry["flagStaged"] is False, f"{label}: {p} should be unstaged: {entry}"
+            assert entry["flagStaged"] is False, (
+                f"{label}: {p} should be unstaged: {entry}"
+            )
         all_paths = [to_posix(e["path"]) for e in entries]
         assert len(all_paths) == len(set(all_paths)), (
             f"{label}: duplicate nodes reported: {sorted(all_paths)}"

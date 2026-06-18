@@ -53,11 +53,11 @@ type GrpcRouter = tonic::transport::server::Router<
 >;
 
 #[derive(Debug, Default)]
-pub struct GrpcReplicationServerBuilder<State>(State);
+pub struct GrpcInternalServerBuilder<State>(State);
 
 pub struct WantsImmutableStore(());
 
-impl GrpcReplicationServerBuilder<WantsImmutableStore> {
+impl GrpcInternalServerBuilder<WantsImmutableStore> {
     pub fn new() -> Self {
         Self(WantsImmutableStore(()))
     }
@@ -65,12 +65,12 @@ impl GrpcReplicationServerBuilder<WantsImmutableStore> {
     pub fn with_local_immutable_store(
         self,
         immutable_store: Arc<dyn ImmutableStore>,
-    ) -> anyhow::Result<GrpcReplicationServerBuilder<WantsTlsConfig>> {
+    ) -> anyhow::Result<GrpcInternalServerBuilder<WantsTlsConfig>> {
         if !immutable_store.is_local() {
             return Err(anyhow!("Immutable store must be a local store"));
         }
 
-        Ok(GrpcReplicationServerBuilder(WantsTlsConfig {
+        Ok(GrpcInternalServerBuilder(WantsTlsConfig {
             local_immutable_store: immutable_store,
         }))
     }
@@ -80,8 +80,8 @@ pub struct WantsTlsConfig {
     local_immutable_store: Arc<dyn ImmutableStore>,
 }
 
-impl GrpcReplicationServerBuilder<WantsTlsConfig> {
-    /// Configure TLS. The replication endpoint only supports two modes:
+impl GrpcInternalServerBuilder<WantsTlsConfig> {
+    /// Configure TLS. The gRPC internal endpoint only supports two modes:
     /// either all three of `cert_path`, `key_path`, `cert_chain_path` are
     /// supplied (mTLS) or all three are `None` (untrusted; the caller is
     /// responsible for having validated that this is acceptable, e.g. via
@@ -92,7 +92,7 @@ impl GrpcReplicationServerBuilder<WantsTlsConfig> {
         cert_path: Option<PathBuf>,
         key_path: Option<PathBuf>,
         cert_chain_path: Option<PathBuf>,
-    ) -> anyhow::Result<GrpcReplicationServerBuilder<WantsHttp2Config>> {
+    ) -> anyhow::Result<GrpcInternalServerBuilder<WantsHttp2Config>> {
         let tls_config = match (cert_path, key_path, cert_chain_path) {
             (Some(cert_path), Some(key_path), Some(cert_chain_path)) => {
                 info!("Loading TLS certs - cert: {cert_path:?} key: {key_path:?}");
@@ -111,7 +111,7 @@ impl GrpcReplicationServerBuilder<WantsTlsConfig> {
             (None, None, None) => None,
             (cert, key, chain) => {
                 return Err(anyhow!(
-                    "Replication TLS is partially configured: cert={}, key={}, cert_chain={}. \
+                    "gRPC internal TLS is partially configured: cert={}, key={}, cert_chain={}. \
                      Provide all three or none",
                     cert.is_some(),
                     key.is_some(),
@@ -120,7 +120,7 @@ impl GrpcReplicationServerBuilder<WantsTlsConfig> {
             }
         };
 
-        Ok(GrpcReplicationServerBuilder(WantsHttp2Config {
+        Ok(GrpcInternalServerBuilder(WantsHttp2Config {
             local_immutable_store: self.0.local_immutable_store,
             tls_config,
         }))
@@ -132,13 +132,13 @@ pub struct WantsHttp2Config {
     tls_config: Option<ServerTlsConfig>,
 }
 
-impl GrpcReplicationServerBuilder<WantsHttp2Config> {
+impl GrpcInternalServerBuilder<WantsHttp2Config> {
     pub fn with_http2_config(
         self,
         http2_keep_alive_interval: Option<Duration>,
         http2_keep_alive_timeout: Option<Duration>,
         user_agent_filter: Arc<UserAgentFilter>,
-    ) -> anyhow::Result<GrpcReplicationServerBuilder<WantsAddress>> {
+    ) -> anyhow::Result<GrpcInternalServerBuilder<WantsAddress>> {
         let metrics_layer =
             tower::ServiceBuilder::new().layer(GrpcMetricsLayer::new(user_agent_filter));
         let mut server = Server::builder()
@@ -161,7 +161,7 @@ impl GrpcReplicationServerBuilder<WantsHttp2Config> {
                 self.0.local_immutable_store,
             )?));
 
-        Ok(GrpcReplicationServerBuilder(WantsAddress { router }))
+        Ok(GrpcInternalServerBuilder(WantsAddress { router }))
     }
 }
 
@@ -169,7 +169,7 @@ pub struct WantsAddress {
     router: GrpcRouter,
 }
 
-impl GrpcReplicationServerBuilder<WantsAddress> {
+impl GrpcInternalServerBuilder<WantsAddress> {
     pub async fn serve(
         self,
         addr: SocketAddr,

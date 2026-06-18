@@ -200,6 +200,14 @@ async fn stream_diff(
             "RevisionDiff: same branch → 2-way",
         );
         true
+    } else if from_branch.is_zero() || to_branch.is_zero() {
+        debug!(
+            {REPOSITORY_ID} = %repository.id,
+            from_branch = %from_branch,
+            to_branch = %to_branch,
+            "RevisionDiff: a branch is zeroed → 2-way",
+        );
+        true
     } else {
         match is_branch_point_of_other(&repository, from_sig, to_branch, to_sig, from_branch).await
         {
@@ -1110,6 +1118,147 @@ mod test {
                 Err(err) => err,
             };
             assert_eq!(err.code(), tonic::Code::NotFound);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn zero_from_signature_diffs_as_two_way_showing_all_adds() {
+        // State::deserialize returns an empty state for the zero hash,
+        // so every file in rev1 appears as an ADD in the diff.
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let rev1 = {
+                let repository_context = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository,
+                ));
+                let main = create_branch(&repository_context, "main", vec![]).await;
+                push_revision(
+                    &repository_context,
+                    main,
+                    Hash::default(),
+                    1,
+                    &[("a.txt", b"hello".as_slice())],
+                )
+                .await
+            };
+
+            let response = handler(
+                make_request(
+                    repository,
+                    QueryFrom::SignatureFrom(Hash::default().into()),
+                    QueryTo::SignatureTo(rev1.into()),
+                    false,
+                ),
+                immutable_store,
+                mutable_store,
+                RevisionDiffConfig::default(),
+            )
+            .await
+            .expect("handler ok");
+
+            let items: Vec<_> = collect(response)
+                .await
+                .into_iter()
+                .map(|r| r.expect("stream item"))
+                .collect();
+
+            let header = match &items[0].payload {
+                Some(Payload::Header(h)) => h,
+                other => panic!("expected header first, got {other:?}"),
+            };
+            assert_eq!(Hash::from(header.signature_from.as_ref()), Hash::default());
+            assert_eq!(Hash::from(header.signature_to.as_ref()), rev1);
+            assert!(header.identifier_base.is_none(), "2-way: no base");
+
+            let changes: Vec<&thin_client_v1::DiffChange> = items[1..]
+                .iter()
+                .filter_map(|item| match &item.payload {
+                    Some(Payload::Change(c)) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                changes
+                    .iter()
+                    .any(|c| c.path == "a.txt" && c.action == thin_client_v1::Action::Add as i32),
+                "expected a.txt ADD, got {changes:?}",
+            );
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn zero_to_signature_diffs_as_two_way_showing_all_adds() {
+        // State::deserialize returns an empty state for the zero hash,
+        // so every file in rev1 appears as an DELETE in the diff.
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let rev1 = {
+                let repository_context = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository,
+                ));
+                let main = create_branch(&repository_context, "main", vec![]).await;
+                push_revision(
+                    &repository_context,
+                    main,
+                    Hash::default(),
+                    1,
+                    &[("a.txt", b"hello".as_slice())],
+                )
+                .await
+            };
+
+            let response = handler(
+                make_request(
+                    repository,
+                    QueryFrom::SignatureFrom(rev1.into()),
+                    QueryTo::SignatureTo(Hash::default().into()),
+                    false,
+                ),
+                immutable_store,
+                mutable_store,
+                RevisionDiffConfig::default(),
+            )
+            .await
+            .expect("handler ok");
+
+            let items: Vec<_> = collect(response)
+                .await
+                .into_iter()
+                .map(|r| r.expect("stream item"))
+                .collect();
+
+            let header = match &items[0].payload {
+                Some(Payload::Header(h)) => h,
+                other => panic!("expected header first, got {other:?}"),
+            };
+            assert_eq!(Hash::from(header.signature_from.as_ref()), rev1);
+            assert_eq!(Hash::from(header.signature_to.as_ref()), Hash::default());
+            assert!(header.identifier_base.is_none(), "2-way: no base");
+
+            let changes: Vec<&thin_client_v1::DiffChange> = items[1..]
+                .iter()
+                .filter_map(|item| match &item.payload {
+                    Some(Payload::Change(c)) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                    changes
+                        .iter()
+                        .any(|c| c.path == "a.txt"
+                            && c.action == thin_client_v1::Action::Delete as i32),
+                    "expected a.txt DELETE, got {changes:?}",
+                );
         }))
         .await;
     }

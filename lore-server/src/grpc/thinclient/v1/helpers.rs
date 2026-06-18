@@ -161,6 +161,13 @@ pub(super) async fn identifier_for_signature(
     repository: &Arc<RepositoryContext>,
     signature: Hash,
 ) -> Result<model_v1::RevisionIdentifier, Status> {
+    if signature.is_zero() {
+        return Ok(model_v1::RevisionIdentifier {
+            branch_id: BranchId::default().into(),
+            number: 0,
+        });
+    }
+
     let state = State::deserialize(repository.clone(), signature)
         .await
         .filter_slow_down()?

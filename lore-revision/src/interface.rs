@@ -399,8 +399,9 @@ impl<T> LoreArray<T> {
     }
 
     fn new(count: usize) -> Self {
+        let layout =
+            std::alloc::Layout::array::<T>(count).expect("layout overflow in LoreArray<T>::new");
         unsafe {
-            let layout = std::alloc::Layout::from_size_align_unchecked(count * size_of::<T>(), 1);
             let ptr = std::alloc::alloc(layout).cast::<T>();
             if ptr.is_null() {
                 panic!("unable to alloc for LoreArray<T>::new");
@@ -444,10 +445,8 @@ impl<T> Drop for LoreArray<T> {
             unsafe {
                 let items = std::ptr::slice_from_raw_parts_mut(self.ptr.cast_mut(), self.count);
                 std::ptr::drop_in_place(items);
-                let layout = std::alloc::Layout::from_size_align_unchecked(
-                    self.count * size_of::<LoreString>(),
-                    1,
-                );
+                let layout = std::alloc::Layout::array::<T>(self.count)
+                    .expect("layout overflow in LoreArray<T>::drop");
                 std::alloc::dealloc(self.ptr as *mut u8, layout);
             }
             self.ptr = std::ptr::null();

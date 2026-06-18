@@ -2280,10 +2280,9 @@ impl State {
         Ok(())
     }
 
-    /// Collect paths of all dirty file nodes under a subtree.
-    ///
-    /// Walks the state tree from `root_node`, recursing into dirty directories,
-    /// and returns the relative paths of all dirty file (leaf) nodes.
+    /// Collect the repository-relative paths of all dirty nodes at or under
+    /// `root_node`, the set to stage. `base_path` is `root_node`'s path and the
+    /// prefix of every returned path.
     pub async fn collect_dirty_paths(
         &self,
         repository: Arc<RepositoryContext>,
@@ -2303,6 +2302,17 @@ impl State {
                 .node_children(repository.clone(), node_id)
                 .await
                 .internal("Failed to get children for dirty path collection")?;
+
+            if node_id == root_node && children.is_empty() && !path.is_empty() {
+                let node = self.node(repository.clone(), node_id).await?;
+                if node.is_dirty_add()
+                    && node.is_directory()
+                    && (force || !repository.filter.excludes(&path, true, FilterMode::Full))
+                {
+                    result.push(path);
+                }
+                continue;
+            }
 
             for &child_id in &children {
                 let child = self.node(repository.clone(), child_id).await?;
