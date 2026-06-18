@@ -1,0 +1,115 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+
+name: DCO
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions: {}
+
+concurrency:
+  group: dco-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # Read commit history to validate sign-offs
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check DCO sign-off
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DCO_DOC: ${{ github.server_url }}/${{ github.repository }}/blob/${{ github.event.pull_request.base.ref }}/CONTRIBUTING.md#dco-sign-off
+        run: |
+          set -euo pipefail
+
+          # --no-merges drops PR merge commits; they aren't authored by the contributor.
+          commits=$(git rev-list --no-merges "$BASE_SHA".."$HEAD_SHA")
+
+          if [ -z "$commits" ]; then
+            echo "No non-merge commits to check." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          pass=0
+          skip=0
+          fail=0
+          failures=""
+
+          for sha in $commits; do
+            IFS=$'\x1f' read -r -d '' short author_name author_email subject body \
+              < <(git show -s --format='%h%x1f%an%x1f%ae%x1f%s%x1f%B' "$sha") || true
+
+            # Bots (dependabot[bot], github-actions[bot], ...) don't sign off.
+            case "$author_name|$author_email" in
+              *'[bot]|'* | *'[bot]@users.noreply.github.com')
+                skip=$((skip + 1))
+                echo "skip (bot): $short $subject"
+                continue
+                ;;
+            esac
+
+            expected="${author_name} <${author_email}>"
+            matched=0
+            present=0
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              present=1
+              # Strip the "Signed-off-by:" key, keeping the name/email value.
+              value=${line#*:}
+              value=${value# }
+              [ "$value" = "$expected" ] && matched=1
+            done < <(printf '%s\n' "$body" | grep -i '^[[:space:]]*Signed-off-by:[[:space:]]' || true)
+
+            if [ "$matched" -eq 1 ]; then
+              pass=$((pass + 1))
+              echo "ok: $short $subject"
+            else
+              fail=$((fail + 1))
+              if [ "$present" -eq 1 ]; then
+                reason="sign-off present but does not match author ($expected)"
+              else
+                reason="missing Signed-off-by for $expected"
+              fi
+              echo "::error::$short $subject — $reason"
+              failures="${failures}- \`$short\` ${subject} — ${reason}"$'\n'
+            fi
+          done
+
+          {
+            echo "## DCO sign-off check"
+            echo ""
+            echo "Verifies every commit in this PR carries a \`Signed-off-by\` line"
+            echo "matching its author, certifying the [Developer Certificate of Origin]($DCO_DOC)."
+            echo "Merge commits and bot authors are exempt."
+            echo ""
+            echo "Passed: $pass · Skipped (bots): $skip · Failed: $fail"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$fail" -gt 0 ]; then
+            {
+              echo ""
+              echo "### Commits missing a valid sign-off"
+              echo ""
+              printf '%s' "$failures"
+              echo ""
+              echo "Every commit must carry a \`Signed-off-by\` line matching its author. To fix:"
+              echo ""
+              echo '```sh'
+              echo "# single commit"
+              echo "git commit --amend -s --no-edit && git push --force-with-lease"
+              echo ""
+              echo "# several commits (sign off the whole PR range)"
+              echo "git rebase --signoff $BASE_SHA && git push --force-with-lease"
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
