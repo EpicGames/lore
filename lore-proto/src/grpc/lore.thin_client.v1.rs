@@ -75,6 +75,12 @@ pub struct TreeNode {
     /// Content address for FILE / LINK entries; unused for DIRECTORY.
     #[prost(message, optional, tag = "3")]
     pub address: ::core::option::Option<crate::lore::model::v1::Address>,
+    /// Original size in bytes. For DIRECTORY entries, this is the cumulative size of its descendant files.
+    #[prost(uint64, tag = "4")]
+    pub size: u64,
+    /// True when the FILE entry has the executable bit set.
+    #[prost(bool, tag = "5")]
+    pub executable: bool,
 }
 impl ::prost::Name for TreeNode {
     const NAME: &'static str = "TreeNode";

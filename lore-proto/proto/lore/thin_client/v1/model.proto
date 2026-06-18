@@ -90,6 +90,10 @@ message TreeNode {
   NodeType node_type = 2;
   // Content address for FILE / LINK entries; unused for DIRECTORY.
   lore.model.v1.Address address = 3;
+  // Original size in bytes. For DIRECTORY entries, this is the cumulative size of its descendant files.
+  uint64 size = 4;
+  // True when the FILE entry has the executable bit set.
+  bool executable = 5;
 }
 
 // Self-describing revision record. Carries the resolved RevisionIdentifier
