@@ -20,6 +20,7 @@ use tracing::warn;
 use zerocopy::IntoBytes;
 
 use crate::protocol::replication_store::REPLICATION_SERVICE_USER_ID;
+use crate::protocol::replication_store::header::REPLICATION_HEADER_SIZE;
 use crate::protocol::replication_store::header::ReplicationHeader;
 use crate::protocol::storage::messages::MessageParseError;
 use crate::quic::replication_store_service::client::ReplicationStoreClientError;
@@ -27,7 +28,7 @@ use crate::quic::replication_store_service::server::ParsedReplicationStoreReques
 use crate::quic::replication_store_service::server::RequestHandler;
 use crate::util::setup_execution;
 
-pub const BASE_REQUEST_SIZE: usize = size_of::<ReplicationHeader>() +
+pub const BASE_REQUEST_SIZE: usize = REPLICATION_HEADER_SIZE +
         size_of::<Address>() +
         // match_required byte
         1;
@@ -44,7 +45,7 @@ impl Get {
         let match_required_num: u8 = self.match_required.into();
         [
             Bytes::default(), // command header
-            Bytes::from_owner(self.header),
+            self.header.to_bytes(),
             Bytes::from_owner(self.address),
             Bytes::copy_from_slice(&[match_required_num]),
         ]
@@ -55,7 +56,7 @@ impl Get {
             return Err(MessageParseError::InvalidFieldLength);
         };
 
-        let header: ReplicationHeader = bytes.split_to(size_of::<ReplicationHeader>()).into();
+        let header: ReplicationHeader = bytes.split_to(REPLICATION_HEADER_SIZE).into();
         let address: Address = bytes.split_to(size_of::<Address>()).into();
         let match_required: StoreMatch = {
             let raw_value = bytes[0];

@@ -20,6 +20,7 @@ use zerocopy::FromBytes;
 use zerocopy::IntoBytes;
 
 use crate::protocol::replication_store::REPLICATION_SERVICE_USER_ID;
+use crate::protocol::replication_store::header::REPLICATION_HEADER_SIZE;
 use crate::protocol::replication_store::header::ReplicationHeader;
 use crate::protocol::storage::messages::MessageParseError;
 use crate::quic::replication_store_service::client::ReplicationStoreClientError;
@@ -27,7 +28,7 @@ use crate::quic::replication_store_service::server::ParsedReplicationStoreReques
 use crate::quic::replication_store_service::server::RequestHandler;
 use crate::util::setup_execution;
 
-pub const BASE_REQUEST_SIZE: usize = size_of::<ReplicationHeader>() + size_of::<Address>();
+pub const BASE_REQUEST_SIZE: usize = REPLICATION_HEADER_SIZE + size_of::<Address>();
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Obliterate {
@@ -39,7 +40,7 @@ impl Obliterate {
     pub fn to_quic_chunks(self) -> [Bytes; 3] {
         [
             Bytes::default(), // command header
-            Bytes::from_owner(self.header),
+            self.header.to_bytes(),
             Bytes::from_owner(self.address),
         ]
     }
@@ -50,7 +51,7 @@ pub fn parse(mut bytes: Bytes) -> Result<Obliterate, MessageParseError> {
         return Err(MessageParseError::InvalidFieldLength);
     };
 
-    let header: ReplicationHeader = bytes.split_to(size_of::<ReplicationHeader>()).into();
+    let header: ReplicationHeader = bytes.split_to(REPLICATION_HEADER_SIZE).into();
     let address: Address = bytes.split_to(size_of::<Address>()).into();
 
     Ok(Obliterate { header, address })

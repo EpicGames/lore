@@ -105,6 +105,7 @@ use crate::settings::Settings;
 use crate::store::replica_factory::ReplicationStoreTargetFactory;
 use crate::store::replicated_store::ReplicatedStore;
 use crate::store::resolve_plugin_config_with_fallback;
+#[cfg(tokio_unstable)]
 use crate::telemetry::OtelTokioRuntimeMetrics;
 use crate::telemetry::ResourceDetectorProvider;
 use crate::telemetry::TelemetryInitializer;
@@ -1606,17 +1607,20 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // Enforce repository isolation in local store by default
     lore_storage::concurrency::LOCAL_ISOLATION.store(true, std::sync::atomic::Ordering::Release);
 
-    let execution = execution_context();
-    let runtime_monitor = tokio_metrics::RuntimeMonitor::new(&runtime);
-
-    let metrics_bridge = OtelTokioRuntimeMetrics::new(&lore_telemetry::meter("tokio_runtime"));
     let frequency = Duration::from_millis(metrics_config.export_interval_millis);
-    runtime.spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-        for metrics in runtime_monitor.intervals() {
-            metrics_bridge.record(metrics);
-            tokio::time::sleep(frequency).await;
-        }
-    }));
+    #[cfg(tokio_unstable)]
+    {
+        let execution = execution_context();
+        let runtime_monitor = tokio_metrics::RuntimeMonitor::new(&runtime);
+
+        let metrics_bridge = OtelTokioRuntimeMetrics::new(&lore_telemetry::meter("tokio_runtime"));
+        runtime.spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+            for metrics in runtime_monitor.intervals() {
+                metrics_bridge.record(metrics);
+                tokio::time::sleep(frequency).await;
+            }
+        }));
+    }
 
     if let Some(mode) = settings
         .environment

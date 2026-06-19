@@ -19,6 +19,7 @@ use tracing::info_span;
 use tracing::warn;
 
 use crate::protocol::replication_store::REPLICATION_SERVICE_USER_ID;
+use crate::protocol::replication_store::header::REPLICATION_HEADER_SIZE;
 use crate::protocol::replication_store::header::ReplicationHeader;
 use crate::protocol::storage::messages::MessageParseError;
 use crate::quic::replication_store_service::client::ReplicationStoreClientError;
@@ -28,7 +29,7 @@ use crate::util::setup_execution;
 
 pub const MAX_ADDRESSES: usize = 100;
 
-pub const BASE_REQUEST_SIZE: usize = size_of::<ReplicationHeader>() +
+pub const BASE_REQUEST_SIZE: usize = REPLICATION_HEADER_SIZE +
         // store match byte
         1 +
         // at least 1 address
@@ -46,7 +47,7 @@ impl ExistsBatch {
         let store_match_num: u8 = self.store_match.into();
         [
             Bytes::default(), // command header
-            Bytes::from_owner(self.header),
+            self.header.to_bytes(),
             Bytes::copy_from_slice(&[store_match_num]),
             Bytes::from_owner(VecBytes(self.addresses)),
         ]
@@ -57,7 +58,7 @@ impl ExistsBatch {
             return Err(MessageParseError::InvalidFieldLength);
         };
 
-        let header: ReplicationHeader = bytes.split_to(size_of::<ReplicationHeader>()).into();
+        let header: ReplicationHeader = bytes.split_to(REPLICATION_HEADER_SIZE).into();
         let store_match: StoreMatch = {
             let raw_value = bytes[0];
             bytes.advance(1);

@@ -17,13 +17,14 @@ use tracing::debug;
 use tracing::info_span;
 
 use crate::protocol::replication_store::REPLICATION_SERVICE_USER_ID;
+use crate::protocol::replication_store::header::REPLICATION_HEADER_SIZE;
 use crate::protocol::replication_store::header::ReplicationHeader;
 use crate::protocol::storage::messages::MessageParseError;
 use crate::quic::replication_store_service::server::ParsedReplicationStoreRequest;
 use crate::quic::replication_store_service::server::RequestHandler;
 use crate::util::setup_execution;
 
-pub const BASE_REQUEST_SIZE: usize = size_of::<ReplicationHeader>() +
+pub const BASE_REQUEST_SIZE: usize = REPLICATION_HEADER_SIZE +
         size_of::<Address>() +
         size_of::<Fragment>() +
         // flags
@@ -42,7 +43,7 @@ impl Put {
     pub fn to_quic_chunks(self) -> [Bytes; 6] {
         [
             Bytes::default(), // command header
-            Bytes::from_owner(self.header),
+            self.header.to_bytes(),
             Bytes::from_owner(self.address),
             Bytes::from_owner(self.fragment),
             Bytes::copy_from_slice(&[self.flags]),
@@ -73,7 +74,7 @@ pub fn parse(mut bytes: Bytes) -> Result<Put, MessageParseError> {
         return Err(MessageParseError::InvalidFieldLength);
     };
 
-    let header: ReplicationHeader = bytes.split_to(size_of::<ReplicationHeader>()).into();
+    let header: ReplicationHeader = bytes.split_to(REPLICATION_HEADER_SIZE).into();
     let address: Address = bytes.split_to(size_of::<Address>()).into();
     let fragment: Fragment = bytes.split_to(size_of::<Fragment>()).into();
     let flags: u8 = {
