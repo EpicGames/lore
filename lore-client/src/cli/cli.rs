@@ -17,7 +17,6 @@ use crate::println;
 use crate::styling::cli_styles;
 use crate::util::get_repository_path;
 
-// TODO(UCS-12558): Cleanup logging args
 #[derive(Parser)]
 #[command(name = "lore", styles = cli_styles())]
 #[clap(about, long_about = None)]
@@ -31,15 +30,15 @@ pub struct LoreCli {
     pub repository: Option<String>,
 
     /// Set the logging level
-    #[clap(global = true, long = "log-level", value_name = "level")]
+    #[clap(global = true, long = "log-level", value_name = "level", conflicts_with_all = ["debug", "silent"])]
     pub level: Option<String>,
 
     /// Enable debug output
-    #[clap(global = true, long, short, action)]
+    #[clap(global = true, long, short, action, conflicts_with_all = ["level", "silent"])]
     pub debug: bool,
 
     /// Suppress all output
-    #[clap(global = true, hide = true, long, short, action)]
+    #[clap(global = true, hide = true, long, short, action, conflicts_with_all = ["level", "debug"])]
     pub silent: bool,
 
     /// Time execution of command
