@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let path_sep = MAIN_SEPARATOR;
 
-    let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let crate_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set");
 
     // list all .rs files in `lore` so that we run this script to update the c header
     for entry in glob("src/**/*.rs").expect("glob syntax error") {
@@ -32,10 +32,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     // list input configuration files so that we run this script to update the c header
     println!("cargo:rerun-if-changed=cbindgen.toml");
 
-    let out_dir = env::var("OUT_DIR").unwrap();
+    let out_dir = env::var("OUT_DIR").expect("OUT_DIR must be set");
     let header_gen = format!("{out_dir}{path_sep}lore.h");
     let source_gen = format!("{out_dir}{path_sep}lore.c");
-    let config = cbindgen::Config::from_file("cbindgen.toml").unwrap();
+    let config = cbindgen::Config::from_file("cbindgen.toml").expect("Failed to read cbindgen.toml");
 
     // run cbindgen to generate `lore.h`
     match cbindgen::Builder::new()
