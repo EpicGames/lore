@@ -90,41 +90,56 @@ impl JwkServiceImpl {
             return Ok(());
         }
 
-        let client = reqwest::Client::builder()
-            .user_agent(user_agent())
-            .build()
-            .map_err(|e| {
-                warn!("Failed to construct HTTP client: {e:?}");
-                JWKServiceError::InternalError
-            })?;
-
-        let response = timed!(
-            self.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME),
-            &self.get_labels_for_operation_context("get_keys"),
-            {
-                client
-                    .get(&self.settings.endpoint)
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        warn!("Failed to fetch JWKS endpoint: {e:?}");
-                        JWKServiceError::InternalError
-                    })
-            }
-        )
-        .result?;
-
-        let status = response.status();
-        let response_body = response.text().await.map_err(|e| {
-            warn!("Failed to get response body from JWKS endpoint result: {e:?}");
+        let endpoint = reqwest::Url::parse(&self.settings.endpoint).map_err(|e| {
+            warn!("failed to parse JWKS endpoint as a URL: {e:?}");
             JWKServiceError::InternalError
         })?;
 
-        if !status.is_success() {
-            warn!("JWKS endpoint returned error. Status: {status}, response: {response_body}");
+        let response_body = if endpoint.scheme() == "file" {
+            let path = endpoint.to_file_path().map_err(|_err| {
+                warn!("failed to resolve JWKS file:// endpoint to a path: {endpoint}");
+                JWKServiceError::InternalError
+            })?;
 
-            return Err(JWKServiceError::InternalError);
-        }
+            tokio::fs::read_to_string(&path).await.map_err(|e| {
+                warn!("failed to read JWKS file at {}: {e:?}", path.display());
+                JWKServiceError::InternalError
+            })?
+        } else {
+            let client = reqwest::Client::builder()
+                .user_agent(user_agent())
+                .build()
+                .map_err(|e| {
+                    warn!("failed to construct HTTP client: {e:?}");
+                    JWKServiceError::InternalError
+                })?;
+
+            let response = timed!(
+                self.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME),
+                &self.get_labels_for_operation_context("get_keys"),
+                {
+                    client.get(endpoint).send().await.map_err(|e| {
+                        warn!("failed to fetch JWKS endpoint: {e:?}");
+                        JWKServiceError::InternalError
+                    })
+                }
+            )
+            .result?;
+
+            let status = response.status();
+            let body = response.text().await.map_err(|e| {
+                warn!("failed to get response body from JWKS endpoint result: {e:?}");
+                JWKServiceError::InternalError
+            })?;
+
+            if !status.is_success() {
+                warn!("JWKS endpoint returned error. Status: {status}, response: {body}");
+
+                return Err(JWKServiceError::InternalError);
+            }
+
+            body
+        };
 
         let new_jwks: JwkSet = serde_json::from_str(response_body.as_str()).map_err(|e| {
             warn!("Failed to parse JWKS response: {response_body}");
@@ -187,5 +202,51 @@ impl JWKService for JwkServiceImpl {
 impl InstrumentProvider for JwkServiceImpl {
     fn namespace(&self) -> &'static str {
         "urc.auth.jwk_service"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn loads_keys_from_file_url() {
+        let temp_dir = std::env::temp_dir();
+        let jwks_path = temp_dir.join("jwk_test_loads_keys_from_file_url.json");
+
+        std::fs::write(
+            &jwks_path,
+            r#"{"keys":[{"kty":"EC","crv":"P-256","x":"MKBCTNIcKUSDii11ySs3526iDZ8AiTo7Tu6KPAqv7D4","y":"4Etl6SRW2YiLUrN5vfvVHuhp7x8PxltmWWlbbM4IFGI","alg":"ES256","kid":"test-key-1"}]}"#,
+        )
+        .unwrap();
+
+        let endpoint = reqwest::Url::from_file_path(&jwks_path)
+            .unwrap()
+            .to_string();
+        let settings = JWKServiceSettings { endpoint };
+        let service = JwkServiceImpl::new(settings);
+
+        let result = service.fetch_new_keys(None).await;
+        assert!(result.is_ok(), "{result:?}");
+
+        let (_, algorithm) = service
+            .get_key("test-key-1")
+            .await
+            .expect("key should be cached after loading from file");
+        assert_eq!(algorithm, jsonwebtoken::Algorithm::ES256);
+
+        std::fs::remove_file(&jwks_path).ok();
+    }
+
+    #[tokio::test]
+    async fn file_url_missing_file_returns_error() {
+        let settings = JWKServiceSettings {
+            endpoint: "file:///tmp/jwk_test_file_that_does_not_exist.json".to_string(),
+        };
+        let service = JwkServiceImpl::new(settings);
+
+        let result = service.fetch_new_keys(None).await;
+
+        assert!(result.is_err());
     }
 }
