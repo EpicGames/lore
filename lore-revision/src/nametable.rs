@@ -219,7 +219,7 @@ impl NameTable {
     /// (entries are never removed or relocated), and all callers immediately
     /// copy the result to an owned `String` before the borrow expires.
     pub fn load(&self, hash: u64) -> &str {
-        // TODO(mjansson): Garbage collect nametable by iterating entire merkle tree and rebuiling
+        // TODO(mjansson): Garbage collect nametable by iterating entire merkle tree and rebuilding
         // nametable, cleaning out stale entries
         let data = self.data.read();
         let entry = data.entry_buffer.as_type_slice::<NameTableEntry>();
