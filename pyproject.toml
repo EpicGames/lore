@@ -25,3 +25,10 @@ markers = [
     "smoke: marks as smoke test",
     "slow: marks as a slow running test",
 ]
+
+[tool.codespell]
+# Ref: https://github.com/codespell-project/codespell#using-a-config-file
+skip = '.git,.gitignore,.gitattributes,*.svg,vendor,*.lock,*.css'
+check-hidden = true
+# ignore-regex = ''
+# ignore-words-list = ''
