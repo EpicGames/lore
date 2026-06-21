@@ -28,7 +28,22 @@ markers = [
 
 [tool.codespell]
 # Ref: https://github.com/codespell-project/codespell#using-a-config-file
-skip = '.git,.gitignore,.gitattributes,*.svg,vendor,*.lock,*.css'
+# Keep options here in sync with the pre-commit `exclude:` regex for codespell —
+# pre-commit passes file paths explicitly, which bypasses these `skip` patterns.
+skip = '.git,.gitignore,.gitattributes,*.svg,vendor,*.lock,*.css,Cargo.*,*/thirdparty/*,*/vale/styles/*'
 check-hidden = true
-# ignore-regex = ''
-# ignore-words-list = ''
+# Ignore camelCase identifiers (e.g. test path components like `pathC/subB/`)
+ignore-regex = '\b[a-z]+[A-Z]\w*\b'
+# crate    - Rust keyword (e.g. `crate::`)
+# ratatui  - Rust TUI library name (https://ratatui.rs)
+# ser      - `serde::ser` module / serializer abbreviation
+# noes     - intentional "Oh noes" in test error message
+# keep-alives - HTTP keep-alive (plural form used in some configs)
+# thirdparty - directory name used in path strings (e.g. `native/thirdparty/`)
+# requestor - alt spelling used in lore-transport / system-design docs
+# numer    - numerator abbreviation (preserved from prior inline config)
+# ue, ect  - preserved from prior inline pre-commit config (legacy false positives)
+# collet   - surname (Yann Collet, author of Zstandard) cited in system-design.md
+# accomplis - French loanword in English ("faits accomplis")
+# disjointness - mathematical property of being disjoint (≠ "disjointedness")
+ignore-words-list = 'crate,ratatui,ser,noes,keep-alives,thirdparty,requestor,numer,ue,ect,collet,accomplis,disjointness'
