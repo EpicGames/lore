@@ -86,7 +86,7 @@ Triggers when the change adds a new ADR or updates the `status` or `date` fields
 *See [`../canon/doc-types.md`](../canon/doc-types.md) § ADR.*
 
 - [ ] New ADR: uses a `status` / `date` header block (not a title/description block).
-- [ ] New ADR: filename follows `NNNNN-<slug>.md` with the next available sequence number; no number is re-used.
+- [ ] New ADR: filename follows `NNNNN-<slug>.md` with the next available sequence number; no number is reused.
 - [ ] Status update on an accepted ADR: only `status` and `date` fields changed — body is untouched.
 - [ ] Change of decision: a new ADR is written (not an edit to the existing body); the prior ADR's `status` is updated to `superseded by ADR-NNNNN` and its body is left unchanged.
 - [ ] Change of decision: the new ADR links to the prior (superseded) ADR in its `More Information` section.
