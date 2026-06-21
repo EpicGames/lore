@@ -37,6 +37,7 @@ use crate::grpc::get_user_id;
 use crate::grpc::interpret_streaming_error;
 use crate::grpc::log_server_error;
 use crate::grpc::map_message_handle_error_to_status;
+use crate::grpc::require_write_permission;
 use crate::grpc::rpc_code_to_str;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::put::UnvalidatedPut;
@@ -57,6 +58,7 @@ pub async fn handler(
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<PutResponseStream>, Status> {
     let repository = get_repository(request.metadata())?;
+    require_write_permission(request.extensions(), repository)?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
 

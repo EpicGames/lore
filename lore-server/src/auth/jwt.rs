@@ -18,6 +18,11 @@ use tracing::warn;
 use super::jwk::JWKServiceError;
 use crate::auth::jwk::JWKService;
 
+pub const PERMISSION_ADMIN: &str = "admin";
+pub const PERMISSION_OWNER: &str = "owner";
+pub const PERMISSION_READ: &str = "read";
+pub const PERMISSION_WRITE: &str = "write";
+
 #[serde_as]
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
 pub struct JWTUserInfo {
@@ -52,6 +57,12 @@ impl ResourcePermission {
 
     pub fn matches_repository(&self, repository_id: &String) -> bool {
         self.resource_id == *repository_id || self.is_wildcard_resource()
+    }
+
+    pub fn has_any_permission(&self, permissions: &[&str]) -> bool {
+        permissions
+            .iter()
+            .any(|permission| self.permission.iter().any(|item| item == permission))
     }
 }
 
@@ -168,13 +179,65 @@ pub fn verify_authorization(
     authorization: &AuthorizationToken,
     repository: lore_revision::lore::RepositoryId,
 ) -> Result<(), JwtVerifierError> {
+    if has_repository_read_permission(authorization, repository) {
+        return Ok(());
+    }
+
+    Err(JwtVerifierError::NotAuthorized)
+}
+
+pub fn has_repository_read_permission(
+    authorization: &AuthorizationToken,
+    repository: lore_revision::lore::RepositoryId,
+) -> bool {
+    has_any_repository_permission(
+        authorization,
+        repository,
+        &[
+            PERMISSION_READ,
+            PERMISSION_WRITE,
+            PERMISSION_ADMIN,
+            PERMISSION_OWNER,
+        ],
+    )
+}
+
+pub fn has_repository_write_permission(
+    authorization: &AuthorizationToken,
+    repository: lore_revision::lore::RepositoryId,
+) -> bool {
+    has_any_repository_permission(
+        authorization,
+        repository,
+        &[PERMISSION_WRITE, PERMISSION_ADMIN, PERMISSION_OWNER],
+    )
+}
+
+pub fn has_any_repository_permission(
+    authorization: &AuthorizationToken,
+    repository: lore_revision::lore::RepositoryId,
+    permissions: &[&str],
+) -> bool {
     if let Some(resources) = authorization.resources.as_ref() {
         let checked_repository = format!("urc-{repository}");
         for authorized_resource in resources.iter() {
-            if authorized_resource.matches_repository(&checked_repository) {
-                return Ok(());
+            if authorized_resource.matches_repository(&checked_repository)
+                && authorized_resource.has_any_permission(permissions)
+            {
+                return true;
             }
         }
+    }
+
+    false
+}
+
+pub fn verify_repository_write_authorization(
+    authorization: &AuthorizationToken,
+    repository: lore_revision::lore::RepositoryId,
+) -> Result<(), JwtVerifierError> {
+    if has_repository_write_permission(authorization, repository) {
+        return Ok(());
     }
 
     Err(JwtVerifierError::NotAuthorized)
@@ -227,7 +290,7 @@ mod tests {
     fn verify_authorization_allows_repo_from_token() {
         let allowed_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
         let resource_permission = ResourcePermission {
-            permission: vec![],
+            permission: vec![PERMISSION_READ.to_string()],
             resource_id: allowed_repository_id.clone(),
         };
         let authorization_token = AuthorizationToken {
@@ -259,7 +322,7 @@ mod tests {
     #[test]
     fn verify_authorization_allows_all_repos_for_wildcard_token() {
         let resource_permission = ResourcePermission {
-            permission: vec![],
+            permission: vec![PERMISSION_READ.to_string()],
             resource_id: "urc-*".to_string(),
         };
         let wildcard_authorization_token = AuthorizationToken {
@@ -292,6 +355,35 @@ mod tests {
             verify_authorization(&wildcard_authorization_token, context)
                 .expect("verify auth failed");
         }
+    }
+
+    #[test]
+    fn verify_authorization_rejects_repo_without_read_permission() {
+        let repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
+        let resource_permission = ResourcePermission {
+            permission: vec![],
+            resource_id: repository_id.clone(),
+        };
+        let authorization_token = AuthorizationToken {
+            audience: vec!["test".to_string()],
+            env: "test".to_string(),
+            expires: 1234,
+            user_id: "test".to_string(),
+            idp: "test".to_string(),
+            issuer: "test".to_string(),
+            name: "test".to_string(),
+            preferred_username: "test".to_string(),
+            groups: None,
+            is_service_account: Some(false),
+            issued_at: 123,
+            resources: Some(vec![resource_permission]),
+        };
+        let repository: RepositoryId = Context::from_str("0194b726b34e72b0b45550b88a967076")
+            .unwrap()
+            .into();
+
+        verify_authorization(&authorization_token, repository)
+            .expect_err("resource without read-like permission must be rejected");
     }
 
     mod jwt_verifier {

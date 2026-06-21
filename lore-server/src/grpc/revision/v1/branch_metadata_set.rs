@@ -26,6 +26,7 @@ use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::handlers::branch_metadata_set::validate_binary_blobs;
 use crate::grpc::handlers::branch_metadata_set::validate_read_only_fields;
+use crate::grpc::require_write_permission;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
@@ -47,6 +48,7 @@ pub async fn handler(
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<BranchMetadataSetResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
+    require_write_permission(request.extensions(), repository_id)?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner();

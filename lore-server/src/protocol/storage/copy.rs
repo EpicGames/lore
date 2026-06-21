@@ -14,6 +14,7 @@ use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::verify_authorization;
+use crate::auth::jwt::verify_repository_write_authorization;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::get_user_id_from_context;
@@ -140,6 +141,8 @@ impl Message for Copy {
             .get_or::<RepositoryId, MessageHandleError>(MessageHandleError::NotConnected)?;
 
         if let Some(token) = context.get::<AuthorizationToken>() {
+            verify_repository_write_authorization(&token, destination_repository)
+                .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
             verify_authorization(&token, self.source_repository)
                 .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
         }

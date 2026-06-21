@@ -34,6 +34,7 @@ use crate::grpc::handlers::branch_push::dispatch_response_message;
 use crate::grpc::handlers::branch_push::extract_client_ip;
 use crate::grpc::handlers::branch_push::push;
 use crate::grpc::hook_error_to_status;
+use crate::grpc::require_write_permission;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
@@ -65,6 +66,7 @@ pub async fn handler(
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let repository_id = get_repository(request.metadata())?;
+    require_write_permission(request.extensions(), repository_id)?;
 
     // Service accounts bypass branch-protection (mirroring path).
     let mut bypass_protection = false;
@@ -419,6 +421,10 @@ mod test {
             .insert(crate::auth::jwt::AuthorizationToken {
                 user_id: "service-bot".into(),
                 is_service_account: Some(true),
+                resources: Some(vec![crate::auth::jwt::ResourcePermission {
+                    permission: vec![crate::auth::jwt::PERMISSION_WRITE.to_string()],
+                    resource_id: format!("urc-{repository}"),
+                }]),
                 ..crate::auth::jwt::AuthorizationToken::default()
             });
         request

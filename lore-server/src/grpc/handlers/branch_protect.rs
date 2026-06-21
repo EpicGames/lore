@@ -17,6 +17,7 @@ use tracing::warn;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
+use crate::grpc::require_write_permission;
 use crate::util::setup_execution;
 
 #[tracing::instrument(name = "BranchProtect::handle", skip_all)]
@@ -26,6 +27,7 @@ pub async fn handler(
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<BranchProtectResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
+    require_write_permission(request.extensions(), repository_id)?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner();

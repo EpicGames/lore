@@ -1079,7 +1079,7 @@ mod test {
                 repos
                     .iter()
                     .map(|id| ResourcePermission {
-                        permission: vec![],
+                        permission: vec!["read".to_string()],
                         resource_id: format!("urc-{id}"),
                     })
                     .collect(),

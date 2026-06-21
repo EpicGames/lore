@@ -39,6 +39,7 @@ use crate::grpc::get_user_id;
 use crate::grpc::interpret_streaming_error;
 use crate::grpc::log_server_error;
 use crate::grpc::map_message_handle_error_to_status;
+use crate::grpc::require_write_permission;
 use crate::grpc::rpc_code_to_str;
 use crate::protocol::storage::copy::handle_copy;
 use crate::protocol::storage::messages::LoreResponse;
@@ -59,6 +60,7 @@ pub async fn handler(
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<CopyResponseStream>, Status> {
     let destination_repository = get_repository(request.metadata())?;
+    require_write_permission(request.extensions(), destination_repository)?;
     let auth_token = get_authorization(request.extensions()).ok();
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();

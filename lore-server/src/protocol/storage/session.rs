@@ -13,6 +13,7 @@ pub struct SessionEntry {
     pub repository: RepositoryId,
     pub correlation_id: String,
     pub user_id: String,
+    pub can_write: bool,
 }
 
 /// Per-connection session state for the `lore-storage/0.4` protocol.
@@ -52,6 +53,16 @@ impl SessionMap {
         correlation_id: String,
         user_id: String,
     ) -> Result<(u32, String), SessionError> {
+        self.start_with_permissions(repository, correlation_id, user_id, true)
+    }
+
+    pub fn start_with_permissions(
+        &self,
+        repository: RepositoryId,
+        correlation_id: String,
+        user_id: String,
+        can_write: bool,
+    ) -> Result<(u32, String), SessionError> {
         if self.entries.len() >= MAX_CONCURRENT_SESSIONS as usize {
             return Err(SessionError::LimitReached);
         }
@@ -75,6 +86,7 @@ impl SessionMap {
                 repository,
                 correlation_id: correlation_id.clone(),
                 user_id,
+                can_write,
             },
         );
 
@@ -188,6 +200,18 @@ mod tests {
         assert_eq!(entry.repository, repo);
         assert_eq!(entry.correlation_id, "corr-1");
         assert_eq!(entry.user_id, "user-42");
+        assert!(entry.can_write);
+    }
+
+    #[test]
+    fn start_with_permissions_records_write_access() {
+        let map = SessionMap::default();
+        let repo = random::<RepositoryId>();
+        let (id, _) = map
+            .start_with_permissions(repo, "corr-1".into(), "user-42".into(), false)
+            .unwrap();
+        let entry = map.get(id).unwrap();
+        assert!(!entry.can_write);
     }
 
     #[test]

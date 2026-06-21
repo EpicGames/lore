@@ -55,6 +55,7 @@ use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::ResourcePermission;
+use crate::auth::jwt::has_any_repository_permission;
 use crate::auth::jwt::verify_authorization;
 use crate::hooks::traits::HookError;
 use crate::hooks::traits::StatusCode;
@@ -291,6 +292,25 @@ pub fn can_obliterate(extensions: &Extensions, repository: RepositoryId) -> bool
 
 pub fn can_admin_lock(extensions: &Extensions, repository: RepositoryId) -> bool {
     has_required_permission(extensions, repository, "migrate")
+}
+
+pub fn can_write(extensions: &Extensions, repository: RepositoryId) -> bool {
+    get_authorization(extensions)
+        .ok()
+        .is_some_and(|authorization| {
+            has_any_repository_permission(&authorization, repository, &["write", "admin", "owner"])
+        })
+}
+
+pub fn require_write_permission(
+    extensions: &Extensions,
+    repository: RepositoryId,
+) -> Result<(), Status> {
+    if get_authorization(extensions).is_err() || can_write(extensions, repository) {
+        Ok(())
+    } else {
+        Err(Status::permission_denied("Write permission required"))
+    }
 }
 
 pub fn get_matching_permissions(

@@ -409,12 +409,10 @@ where
                     } else {
                         info!(command_header = ?header, handler_error_label = error.message_handle_label, response_error_code = error.response_error_code, "non-internal error handling message");
                     }
+                } else if error.is_internal_error {
+                    debug!(command_header = ?header, handler_error_label = error.message_handle_label, response_error_code = error.response_error_code, "internal error handling message");
                 } else {
-                    if error.is_internal_error {
-                        debug!(command_header = ?header, handler_error_label = error.message_handle_label, response_error_code = error.response_error_code, "internal error handling message");
-                    } else {
-                        debug!(command_header = ?header, handler_error_label = error.message_handle_label, response_error_code = error.response_error_code, "non-internal error handling message");
-                    }
+                    debug!(command_header = ?header, handler_error_label = error.message_handle_label, response_error_code = error.response_error_code, "non-internal error handling message");
                 }
                 let response_header = header.response_error(error.response_error_code);
                 let (header_buf, header_len) = response_header.response_bytes();

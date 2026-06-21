@@ -27,6 +27,7 @@ use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
+use crate::grpc::require_write_permission;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
@@ -71,6 +72,7 @@ pub async fn handler(
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<BranchCreateResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
+    require_write_permission(request.extensions(), repository_id)?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner();
@@ -226,6 +228,9 @@ mod test {
 
     use super::*;
     use crate::auth::jwt::AuthorizationToken;
+    use crate::auth::jwt::PERMISSION_READ;
+    use crate::auth::jwt::PERMISSION_WRITE;
+    use crate::auth::jwt::ResourcePermission;
     use crate::hooks::HookDispatcher;
     use crate::notification::testing::MockNotificationSender;
     use crate::store::test_store_create;
@@ -362,6 +367,10 @@ mod test {
             );
             request.extensions_mut().insert(AuthorizationToken {
                 user_id: "jwt-user".into(),
+                resources: Some(vec![ResourcePermission {
+                    permission: vec![PERMISSION_WRITE.to_string()],
+                    resource_id: format!("urc-{repository}"),
+                }]),
                 ..AuthorizationToken::default()
             });
 
@@ -382,6 +391,54 @@ mod test {
                 .branch
                 .expect("response should include Branch");
             assert_eq!(branch.creator, "jwt-user");
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn read_only_jwt_cannot_create_branch() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let notification_sender = Arc::new(MockNotificationSender::new());
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let branch_id = BranchId::from(uuid::Uuid::now_v7());
+            let mut request = Request::new(BranchCreateRequest {
+                id: branch_id.into(),
+                name: "main".into(),
+                creator: Some("alice".into()),
+                category: "default".into(),
+                stack: vec![],
+            });
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+            request.extensions_mut().insert(AuthorizationToken {
+                user_id: "jwt-user".into(),
+                resources: Some(vec![ResourcePermission {
+                    permission: vec![PERMISSION_READ.to_string()],
+                    resource_id: format!("urc-{repository}"),
+                }]),
+                ..AuthorizationToken::default()
+            });
+
+            let hook_dispatcher = HookDispatcher::empty();
+            let err = handler(
+                request,
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &hook_dispatcher,
+                &instrument_provider,
+            )
+            .await
+            .expect_err("read-only token should not create branches");
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+            assert_eq!(err.message(), "Write permission required");
         }))
         .await;
     }

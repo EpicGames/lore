@@ -48,6 +48,7 @@ use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
+use crate::grpc::require_write_permission;
 use crate::grpc::warn_error_to_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
@@ -87,6 +88,7 @@ pub async fn handler(
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let repository = get_repository(request.metadata())?;
+    require_write_permission(request.extensions(), repository)?;
 
     // TODO(mjansson): Once we have authz permission model with read/write/admin
     // this should be upgraded to check for the correct permission rather than
