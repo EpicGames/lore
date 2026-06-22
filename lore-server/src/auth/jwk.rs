@@ -95,7 +95,9 @@ impl JwkServiceImpl {
             JWKServiceError::InternalError
         })?;
 
-        let response_body = if endpoint.scheme() == "file" {
+        let is_file = endpoint.scheme() == "file";
+
+        let response_body = if is_file {
             let path = endpoint.to_file_path().map_err(|_err| {
                 warn!("failed to resolve JWKS file:// endpoint to a path: {endpoint}");
                 JWKServiceError::InternalError
@@ -142,7 +144,11 @@ impl JwkServiceImpl {
         };
 
         let new_jwks: JwkSet = serde_json::from_str(response_body.as_str()).map_err(|e| {
-            warn!("Failed to parse JWKS response: {response_body}");
+            if is_file {
+                warn!("invalid JWKS file contents: {response_body}");
+            } else {
+                warn!("failed to parse JWKS response: {response_body}");
+            }
             JWKServiceError::ParseError(e)
         })?;
 
