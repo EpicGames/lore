@@ -125,12 +125,12 @@ use crate::layer::LoreLayerStagedEntryEventData;
 use crate::link::LoreLinkChangeEventData;
 use crate::link::LoreLinkEntryEventData;
 use crate::link::list::LoreLinkStagedEntryEventData;
-use crate::lock::file::acquire::LoreLockFileAcquireBeginEventData;
 use crate::lock::file::acquire::LoreLockFileAcquireEventData;
+use crate::lock::file::acquire::LoreLockFileAcquireIgnoreEventData;
 use crate::lock::file::query::LoreLockFileQueryBeginEventData;
 use crate::lock::file::query::LoreLockFileQueryEventData;
-use crate::lock::file::release::LoreLockFileReleaseBeginEventData;
 use crate::lock::file::release::LoreLockFileReleaseEventData;
+use crate::lock::file::release::LoreLockFileReleaseNotFoundEventData;
 use crate::lock::file::status::LoreLockFileStatusBeginEventData;
 use crate::lock::file::status::LoreLockFileStatusEventData;
 use crate::lore::execution_context;
@@ -693,10 +693,10 @@ pub enum LoreEvent {
     LinkChange(LoreLinkChangeEventData),
     /// One entry in a link listing.
     LinkEntry(LoreLinkEntryEventData),
-    /// The start of a file lock acquire report.
-    LockFileAcquireBegin(LoreLockFileAcquireBeginEventData),
-    /// A file concerning the lock acquire report.
+    /// A file lock was acquired.
     LockFileAcquire(LoreLockFileAcquireEventData),
+    /// A file lock acquisition was ignored.
+    LockFileAcquireIgnore(LoreLockFileAcquireIgnoreEventData),
     /// The start of a file lock status report.
     LockFileStatusBegin(LoreLockFileStatusBeginEventData),
     /// One file lock status entry.
@@ -705,10 +705,10 @@ pub enum LoreEvent {
     LockFileQueryBegin(LoreLockFileQueryBeginEventData),
     /// One file lock query result.
     LockFileQuery(LoreLockFileQueryEventData),
-    /// The start of a file lock release report.
-    LockFileReleaseBegin(LoreLockFileReleaseBeginEventData),
-    /// A file concerning the lock release report.
+    /// A file lock was released.
     LockFileRelease(LoreLockFileReleaseEventData),
+    /// A file lock to release was not found.
+    LockFileReleaseNotFound(LoreLockFileReleaseNotFoundEventData),
     /// Metadata was cleared on a file.
     MetadataClearFile(LoreMetadataClearFileEventData),
     /// Metadata was cleared on a revision.

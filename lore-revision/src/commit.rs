@@ -360,7 +360,6 @@ pub async fn commit_impl(
 
     let context = execution_context();
     let globals = context.globals();
-    let dry_run = globals.dry_run();
 
     let layers = layer::list(repository.clone()).await.unwrap_or_default();
     let mut layer_staged = false;
@@ -490,7 +489,7 @@ pub async fn commit_impl(
         let _ = event::metadata::send(&metadata);
     }
 
-    if !dry_run && !dirty_paths.is_empty() {
+    if !dirty_paths.is_empty() {
         crate::file::dirty::dirty_relative_paths(repository.clone(), dirty_paths)
             .await
             .forward::<CommitError>("Failed to re-apply dirty paths after commit")?;
@@ -499,21 +498,19 @@ pub async fn commit_impl(
     // Apply any merge dirty-tracking carry. `take_matching` only returns
     // paths when the blob's parents match the merge we just committed, and
     // always clears the blob so a stale carry can't outlive this commit.
-    if !dry_run {
-        let carry = crate::merge_carry::take_matching(
-            repository.clone(),
-            merge_parent_self,
-            merge_parent_other,
-        )
-        .await
-        .forward::<CommitError>("Failed reading merge dirty-tracking carry")?;
-        if let Some(paths) = carry
-            && !paths.is_empty()
-        {
-            crate::file::dirty::dirty_relative_paths(repository.clone(), paths)
-                .await
-                .forward::<CommitError>("Failed to apply merge dirty-tracking carry")?;
-        }
+    let carry = crate::merge_carry::take_matching(
+        repository.clone(),
+        merge_parent_self,
+        merge_parent_other,
+    )
+    .await
+    .forward::<CommitError>("Failed reading merge dirty-tracking carry")?;
+    if let Some(paths) = carry
+        && !paths.is_empty()
+    {
+        crate::file::dirty::dirty_relative_paths(repository.clone(), paths)
+            .await
+            .forward::<CommitError>("Failed to apply merge dirty-tracking carry")?;
     }
 
     for layer in layers {
@@ -563,18 +560,16 @@ pub async fn commit_impl(
             .branch(layer_repository.clone())
             .await;
 
-        if !dry_run {
-            layer::store_layer_current(
-                repository.clone(),
-                token,
-                layer.target_path.as_str(),
-                layer.repository,
-                layer_signature,
-                Some(Hash::default()),
-            )
-            .await
-            .forward::<CommitError>("Failed to store layer configuration")?;
-        }
+        layer::store_layer_current(
+            repository.clone(),
+            token,
+            layer.target_path.as_str(),
+            layer.repository,
+            layer_signature,
+            Some(Hash::default()),
+        )
+        .await
+        .forward::<CommitError>("Failed to store layer configuration")?;
 
         event::LoreEvent::RevisionCommitRevision(LoreRevisionCommitRevisionEventData {
             repository: layer_repository.id,
@@ -697,18 +692,16 @@ async fn commit_layer_only(
         .branch(layer_state.repository.clone())
         .await;
 
-    if !globals.dry_run() {
-        layer::store_layer_current(
-            repository.clone(),
-            &token,
-            layer.target_path.as_str(),
-            layer.repository,
-            layer_signature,
-            Some(Hash::default()),
-        )
-        .await
-        .forward::<CommitError>("Failed to store layer configuration")?;
-    }
+    layer::store_layer_current(
+        repository.clone(),
+        &token,
+        layer.target_path.as_str(),
+        layer.repository,
+        layer_signature,
+        Some(Hash::default()),
+    )
+    .await
+    .forward::<CommitError>("Failed to store layer configuration")?;
 
     event::LoreEvent::RevisionCommitRevision(LoreRevisionCommitRevisionEventData {
         repository: layer_repository_ctx.id,
@@ -903,16 +896,14 @@ async fn commit_link_only(
         .await
         .forward::<CommitError>("Failed to mark link node as staged")?;
 
-    if !execution_context().globals().dry_run() {
-        let parent_signature = state_parent_staged
-            .serialize(repository.clone(), &token)
-            .await
-            .forward::<CommitError>("Failed to serialize parent state")?;
+    let parent_signature = state_parent_staged
+        .serialize(repository.clone(), &token)
+        .await
+        .forward::<CommitError>("Failed to serialize parent state")?;
 
-        crate::instance::store_staged_anchor(&repository, parent_signature)
-            .await
-            .forward::<CommitError>("Failed to store staged anchor")?;
-    }
+    crate::instance::store_staged_anchor(&repository, parent_signature)
+        .await
+        .forward::<CommitError>("Failed to store staged anchor")?;
 
     Ok(link_signature)
 }
@@ -978,41 +969,37 @@ async fn finalize_commit(
     branch: BranchId,
     token: &RepositoryWriteToken,
 ) -> Result<(), CommitError> {
-    let dry_run = execution_context().globals().dry_run();
+    store_branch_latest_and_make_current(repository.clone(), signature, branch).await?;
 
-    if !dry_run {
-        store_branch_latest_and_make_current(repository.clone(), signature, branch).await?;
+    // Check if any dirty-only nodes remain in the staged state.
+    // If so, preserve them in a new staged anchor re-parented to the new revision.
+    let has_dirty = state_staged
+        .node_has_dirty_children(repository.clone(), crate::node::ROOT_NODE)
+        .await
+        .forward::<CommitError>("Failed deserializing state node block")?;
 
-        // Check if any dirty-only nodes remain in the staged state.
-        // If so, preserve them in a new staged anchor re-parented to the new revision.
-        let has_dirty = state_staged
-            .node_has_dirty_children(repository.clone(), crate::node::ROOT_NODE)
-            .await
-            .forward::<CommitError>("Failed deserializing state node block")?;
+    if has_dirty {
+        lore_debug!("Dirty nodes remain after commit, preserving in new staged anchor");
+        state_staged.set_parent_self(signature);
+        state_staged.set_revision_number(0);
+        state_staged.set_parent_other(Hash::default());
+        state_staged.set_metadata_hash(Hash::default());
+        state_staged.mark_dirty();
 
-        if has_dirty {
-            lore_debug!("Dirty nodes remain after commit, preserving in new staged anchor");
-            state_staged.set_parent_self(signature);
-            state_staged.set_revision_number(0);
-            state_staged.set_parent_other(Hash::default());
-            state_staged.set_metadata_hash(Hash::default());
-            state_staged.mark_dirty();
-
-            let staged_signature =
-                state_staged
-                    .serialize(repository.clone(), token)
-                    .await
-                    .forward::<CommitError>("Failed to serialize staged revision state")?;
-            crate::instance::store_staged_anchor(&repository, staged_signature)
+        let staged_signature =
+            state_staged
+                .serialize(repository.clone(), token)
                 .await
-                .forward::<CommitError>("Failed to serialize staged anchor")?;
-        } else {
-            let _ = crate::instance::delete_staged_anchor(&repository).await;
-        }
+                .forward::<CommitError>("Failed to serialize staged revision state")?;
+        crate::instance::store_staged_anchor(&repository, staged_signature)
+            .await
+            .forward::<CommitError>("Failed to serialize staged anchor")?;
+    } else {
+        let _ = crate::instance::delete_staged_anchor(&repository).await;
+    }
 
-        if state_staged.parent_other() == state_current.revision() && state_staged.is_merge() {
-            branch::store_last_sync(repository.clone(), branch, state_staged.parent_self()).await;
-        }
+    if state_staged.parent_other() == state_current.revision() && state_staged.is_merge() {
+        branch::store_last_sync(repository.clone(), branch, state_staged.parent_self()).await;
     }
 
     event::LoreEvent::RevisionCommitRevision(LoreRevisionCommitRevisionEventData {
@@ -1904,9 +1891,7 @@ async fn commit_file(
             .into());
         }
         // Clean up theirs/base files
-        if !execution_context().globals().dry_run() {
-            sync::unlink_merge_mine_theirs_base(absolute_path.as_path()).await;
-        }
+        sync::unlink_merge_mine_theirs_base(absolute_path.as_path()).await;
     }
 
     lore_trace!(
@@ -2326,16 +2311,14 @@ async fn commit_link(
                 .await
                 .forward::<CommitError>("Failed to serialize revision state")?;
 
-            if !execution_context().globals().dry_run() {
-                branch::store_latest(
-                    repository.clone(),
-                    branch,
-                    signature,
-                    BranchLatestStatus::Divergent,
-                )
-                .await
-                .forward::<CommitError>("Failed to store current branch latest")?;
-            }
+            branch::store_latest(
+                repository.clone(),
+                branch,
+                signature,
+                BranchLatestStatus::Divergent,
+            )
+            .await
+            .forward::<CommitError>("Failed to store current branch latest")?;
 
             Ok(Some(signature))
         }
@@ -2892,7 +2875,7 @@ pub(crate) async fn weave_history(
         }
     }
 
-    if history_count > 0 && !execution_context().globals().dry_run() {
+    if history_count > 0 {
         lore_info!("Stored history for {history_count} nodes");
     }
 
