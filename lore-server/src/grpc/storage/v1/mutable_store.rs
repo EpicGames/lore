@@ -14,6 +14,7 @@ use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::log_server_error;
+use crate::grpc::require_write_permission;
 use crate::grpc::simple_map_message_handle_error;
 use crate::protocol::storage::mutable_store_handler::handle_mutable_store;
 use crate::util::setup_execution;
@@ -24,6 +25,7 @@ pub async fn handler(
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<storage_v1::MutableStoreResponse>, Status> {
     let repository = get_repository(request.metadata())?;
+    require_write_permission(request.extensions(), repository)?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());

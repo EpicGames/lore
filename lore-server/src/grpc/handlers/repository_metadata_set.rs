@@ -22,6 +22,7 @@ use tonic::Status;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
+use crate::grpc::require_write_permission;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
@@ -97,12 +98,12 @@ pub async fn handler(
 ) -> Result<Response<RepositoryMetadataSetResponse>, Status> {
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-    let req = request.into_inner();
-
-    let repository_id: Context = req.repository_id.into();
+    let repository_id: Context = request.get_ref().repository_id.clone().into();
     if repository_id == Context::default() {
         return Err(Status::invalid_argument("Missing repository ID"));
     }
+    require_write_permission(request.extensions(), repository_id.into())?;
+    let req = request.into_inner();
 
     let expected_hash: Hash = req.expected_hash.into();
     let new_hash: Hash = req.new_hash.into();

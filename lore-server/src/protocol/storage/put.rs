@@ -22,6 +22,8 @@ use opentelemetry::metrics::Histogram;
 use tracing::debug;
 use tracing::warn;
 
+use crate::auth::jwt::AuthorizationToken;
+use crate::auth::jwt::verify_repository_write_authorization;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::get_user_id_from_context;
@@ -282,6 +284,10 @@ impl Message for Put {
     ) -> Result<LoreResponse, MessageHandleError> {
         let repository = *context
             .get_or::<RepositoryId, MessageHandleError>(MessageHandleError::NotConnected)?;
+        if let Some(token) = context.get::<AuthorizationToken>() {
+            verify_repository_write_authorization(&token, repository)
+                .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
+        }
         let user_id = get_user_id_from_context(&context);
         let correlation_id = context.get::<CorrelationId>().unwrap_or_default();
         handle_put(

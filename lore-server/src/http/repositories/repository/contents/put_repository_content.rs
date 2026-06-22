@@ -24,6 +24,7 @@ use tracing::debug;
 use tracing::info;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::auth::jwt::verify_repository_write_authorization;
 use crate::http::server::ServerState;
 use crate::util::get_user_id_from_token;
 use crate::util::setup_execution;
@@ -56,16 +57,12 @@ pub async fn handler(
         .and_then(|header_value| header_value.to_str().map(str::to_string).ok())
         .unwrap_or_default();
 
-    let user_id = get_user_id_from_token(user_info);
+    let user_id = get_user_id_from_token(user_info.clone());
     let execution = setup_execution(module_path!(), correlation_id, user_id);
     LORE_CONTEXT
         .scope(execution, async move {
-            let repository = match repository_id.parse::<Context>() {
-                Ok(repository_id) => Arc::new(RepositoryContext::new_server_context(
-                    state.immutable_store.clone(),
-                    state.mutable_store.clone(),
-                    repository_id.into(),
-                )),
+            let repository_id = match repository_id.parse::<Context>() {
+                Ok(repository_id) => repository_id,
                 Err(error) => {
                     debug!("Error parsing the repository ID {}", error);
                     return (
@@ -76,6 +73,23 @@ pub async fn handler(
                         .into_response();
                 }
             };
+
+            if let Some(token) = user_info.as_ref()
+                && verify_repository_write_authorization(token, repository_id.into()).is_err()
+            {
+                return (
+                    StatusCode::FORBIDDEN,
+                    header_error,
+                    Body::from("Write permission required"),
+                )
+                    .into_response();
+            }
+
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                state.immutable_store.clone(),
+                state.mutable_store.clone(),
+                repository_id.into(),
+            ));
 
             let context = uuid::Uuid::now_v7().into();
             let (address, _fragment) = match immutable::write(

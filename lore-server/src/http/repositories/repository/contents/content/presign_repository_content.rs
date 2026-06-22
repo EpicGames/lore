@@ -24,6 +24,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::auth::jwt::verify_authorization;
 use crate::http::presign_token::CURRENT_TOKEN_VERSION;
 use crate::http::presign_token::PresignTokenPayload;
 use crate::http::presign_token::sign;
@@ -39,6 +40,8 @@ pub enum PresignError {
     ParseAddress(FromHexError),
     #[error("Presign feature is not configured")]
     NotConfigured,
+    #[error("Read permission required")]
+    Forbidden,
     #[error("Content not found")]
     NotFound,
     #[error("Store error checking content existence")]
@@ -59,6 +62,7 @@ impl IntoResponse for PresignError {
                 StatusCode::NOT_FOUND,
                 "presigned URL feature is not enabled".to_string(),
             ),
+            PresignError::Forbidden => (StatusCode::FORBIDDEN, "Read permission required".into()),
             PresignError::StoreError | PresignError::SystemTime(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong. See server log for more info.".to_string(),
@@ -102,6 +106,11 @@ pub async fn handler(
     let repository = repository_id
         .parse::<RepositoryId>()
         .map_err(PresignError::ParseRepository)?;
+    if let Some(token) = user_info.as_ref()
+        && verify_authorization(token, repository).is_err()
+    {
+        return Err(PresignError::Forbidden);
+    }
     let parsed_address = address
         .parse::<Address>()
         .map_err(PresignError::ParseAddress)?;

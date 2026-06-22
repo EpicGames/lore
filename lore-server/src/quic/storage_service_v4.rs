@@ -18,6 +18,7 @@ use tracing::Span;
 use tracing::debug;
 
 use crate::auth::jwt::JwtVerifier;
+use crate::auth::jwt::has_repository_write_permission;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
 use crate::protocol::storage::authorize::AuthorizeAction;
@@ -169,6 +170,7 @@ impl QuicService for StorageServiceV4 {
                 auth_token,
             } => {
                 let mut user_id = String::new();
+                let mut can_write = true;
 
                 if let Some(jwt_verifier) = self.jwt_verifier.as_ref() {
                     let token_str = String::from_utf8(auth_token).map_err(|err| {
@@ -189,11 +191,17 @@ impl QuicService for StorageServiceV4 {
                     crate::auth::jwt::verify_authorization(&authorization, repository)
                         .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
 
+                    can_write = has_repository_write_permission(&authorization, repository);
                     user_id = crate::util::get_user_id_from_token(Some(authorization));
                 }
 
                 let session_map = self.session_map.clone();
-                match session_map.start(repository, correlation_id, user_id) {
+                match session_map.start_with_permissions(
+                    repository,
+                    correlation_id,
+                    user_id,
+                    can_write,
+                ) {
                     Ok((session_id, correlation_id)) => {
                         debug!(
                             session_id,
@@ -234,6 +242,7 @@ impl QuicService for StorageServiceV4 {
                 let repository = session.repository;
                 let correlation_id = session.correlation_id.clone();
                 let user_id = session.user_id.clone();
+                let can_write = session.can_write;
                 drop(session);
 
                 // Parse the storage command payload using v4-aware parsers — Copy carries an
@@ -266,6 +275,11 @@ impl QuicService for StorageServiceV4 {
                         .await
                     }
                     crate::quic::storage_service::ParsedStorageRequest::Put(put) => {
+                        if !can_write {
+                            return Err(MessageHandleError::AuthorizationFailure(
+                                "write permission required".to_string(),
+                            ));
+                        }
                         handle_put(
                             &put,
                             repository,
@@ -294,6 +308,11 @@ impl QuicService for StorageServiceV4 {
                         .await
                     }
                     crate::quic::storage_service::ParsedStorageRequest::Copy(copy) => {
+                        if !can_write {
+                            return Err(MessageHandleError::AuthorizationFailure(
+                                "write permission required".to_string(),
+                            ));
+                        }
                         handle_copy(
                             copy.source_repository,
                             copy.source_address,
@@ -318,6 +337,11 @@ impl QuicService for StorageServiceV4 {
                         .await
                     }
                     crate::quic::storage_service::ParsedStorageRequest::MutableStoreOp(store) => {
+                        if !can_write {
+                            return Err(MessageHandleError::AuthorizationFailure(
+                                "write permission required".to_string(),
+                            ));
+                        }
                         handle_mutable_store(
                             store.key,
                             store.value,
@@ -330,6 +354,11 @@ impl QuicService for StorageServiceV4 {
                         .await
                     }
                     crate::quic::storage_service::ParsedStorageRequest::MutableCas(cas) => {
+                        if !can_write {
+                            return Err(MessageHandleError::AuthorizationFailure(
+                                "write permission required".to_string(),
+                            ));
+                        }
                         handle_mutable_cas(
                             cas.key,
                             cas.expected,
