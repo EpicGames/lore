@@ -839,10 +839,7 @@ pub fn handle_file_diff(globals: LoreGlobalArgs, args: &FileDiffArgs) -> u8 {
             LoreEvent::FileDiff(data) => {
                 // Always show unified diff patches for all actions
                 match data.action {
-                    LoreFileAction::Keep
-                    | LoreFileAction::Delete
-                    | LoreFileAction::Add
-                    | LoreFileAction::Move => {
+                    LoreFileAction::Keep | LoreFileAction::Delete | LoreFileAction::Add => {
                         // Show patch content
                         println!();
                         println!(
@@ -871,8 +868,8 @@ pub fn handle_file_diff(globals: LoreGlobalArgs, args: &FileDiffArgs) -> u8 {
                         }
                         println!();
                     }
-                    LoreFileAction::Copy => {
-                        // Status format for Copy
+                    _ => {
+                        // Status format for Copy/Move
                         println!(
                             "{}{}{} {}",
                             FileActionStyle::from_action(data.action),
