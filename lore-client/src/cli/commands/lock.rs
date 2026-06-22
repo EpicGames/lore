@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use chrono::DateTime;
 use clap::Args;
@@ -105,19 +107,30 @@ fn handle_lock_acquire(globals: LoreGlobalArgs, args: &FileLockAcquireArgs) -> u
         branch: LoreString::from(&args.branch),
     };
 
+    let first_lock_acquire: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
+    let first_lock_acquire_ignore: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
-            LoreEvent::LockFileAcquireBegin(data) if data.count > 0 => {
-                let header = if data.ignored != 0 {
-                    "Lock already owned on files:"
-                } else if data.dry_run != 0 {
-                    "Lock would be acquired on files:"
-                } else {
-                    "Lock acquired on files:"
-                };
-                println!("{}{}{}", CommonStyles::HEADERS, header, anstyle::Reset);
-            }
             LoreEvent::LockFileAcquire(data) => {
+                if first_lock_acquire.load(Ordering::Relaxed) {
+                    first_lock_acquire.store(false, Ordering::Relaxed);
+                    println!(
+                        "{}Lock acquired on files:{}",
+                        CommonStyles::HEADERS,
+                        anstyle::Reset
+                    );
+                }
+                println!("{}", data.path.as_str());
+            }
+            LoreEvent::LockFileAcquireIgnore(data) => {
+                if first_lock_acquire_ignore.load(Ordering::Relaxed) {
+                    first_lock_acquire_ignore.store(false, Ordering::Relaxed);
+                    println!(
+                        "{}Lock already owned on files:{}",
+                        CommonStyles::HEADERS,
+                        anstyle::Reset
+                    );
+                }
                 println!("{}", data.path.as_str());
             }
             _ => {}
@@ -244,26 +257,26 @@ fn handle_lock_release(globals: LoreGlobalArgs, args: &FileLockReleaseArgs) -> u
 
     let globals = globals.clone();
 
+    let first_event: Arc<AtomicBool> = Arc::new(AtomicBool::new(true));
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
-            LoreEvent::LockFileReleaseBegin(data) => {
-                if data.not_found != 0 {
+            LoreEvent::LockFileRelease(data) => {
+                if first_event.load(Ordering::Relaxed) {
+                    first_event.store(false, Ordering::Relaxed);
                     println!(
-                        "{}Lock does not exist for requested files{}",
-                        LogStyles::WARNING,
+                        "{}Lock released on files:{}",
+                        CommonStyles::HEADERS,
                         anstyle::Reset
                     );
-                } else if data.count > 0 {
-                    let header = if data.dry_run != 0 {
-                        "Lock would be released on files:"
-                    } else {
-                        "Lock released on files:"
-                    };
-                    println!("{}{}{}", CommonStyles::HEADERS, header, anstyle::Reset);
                 }
-            }
-            LoreEvent::LockFileRelease(data) => {
                 println!("{}", data.path.as_str());
+            }
+            LoreEvent::LockFileReleaseNotFound(_) => {
+                println!(
+                    "{}Lock does not exist for requested files{}",
+                    LogStyles::WARNING,
+                    anstyle::Reset
+                );
             }
             _ => {}
         }) as EventCallbackFn)

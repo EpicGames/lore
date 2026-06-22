@@ -1459,21 +1459,17 @@ typedef struct lore_link_entry_event_data_t {
   uint32_t flags;
 } lore_link_entry_event_data_t;
 
-// Data for an event that marks the start of a lock acquire report.
-typedef struct lore_lock_file_acquire_begin_event_data_t {
-  // Number of acquire entries that follow.
-  uint64_t count;
-  // Whether this is a dry-run preview.
-  uint8_t dry_run;
-  // Whether the entries that follow were already owned.
-  uint8_t ignored;
-} lore_lock_file_acquire_begin_event_data_t;
-
-// Data for an event reporting a path whose lock is being acquired.
+// Data for an event reporting a path whose lock was acquired.
 typedef struct lore_lock_file_acquire_event_data_t {
-  // The path whose lock is being acquired.
+  // Path whose lock was acquired.
   struct lore_string_t path;
 } lore_lock_file_acquire_event_data_t;
+
+// Data for an event reporting a path that was skipped because its lock was already held.
+typedef struct lore_lock_file_acquire_ignore_event_data_t {
+  // Path that was skipped.
+  struct lore_string_t path;
+} lore_lock_file_acquire_ignore_event_data_t;
 
 // Data for an event that marks the start of a lock status report.
 typedef struct lore_lock_file_status_begin_event_data_t {
@@ -1509,21 +1505,17 @@ typedef struct lore_lock_file_query_event_data_t {
   uint64_t locked_at;
 } lore_lock_file_query_event_data_t;
 
-// Data for an event that marks the start of a lock release report.
-typedef struct lore_lock_file_release_begin_event_data_t {
-  // Number of release entries that follow.
-  uint64_t count;
-  // Whether this is a dry-run preview.
-  uint8_t dry_run;
-  // Whether no matching lock was found to release.
-  uint8_t not_found;
-} lore_lock_file_release_begin_event_data_t;
-
-// Data for an event reporting a path whose lock is being released.
+// Data for an event reporting a path whose lock was released.
 typedef struct lore_lock_file_release_event_data_t {
-  // The path whose lock is being released.
+  // Path whose lock was released.
   struct lore_string_t path;
 } lore_lock_file_release_event_data_t;
+
+// Data for an event reporting that no matching lock was found to release.
+typedef struct lore_lock_file_release_not_found_event_data_t {
+  // Placeholder field; carries no meaningful value.
+  uint32_t _unused;
+} lore_lock_file_release_not_found_event_data_t;
 
 // Data for an event reporting that a file's metadata was cleared.
 typedef struct lore_metadata_clear_file_event_data_t {
@@ -2871,10 +2863,10 @@ enum lore_event_id_t {
   LORE_EVENT_LINK_CHANGE,
   // One entry in a link listing.
   LORE_EVENT_LINK_ENTRY,
-  // The start of a file lock acquire report.
-  LORE_EVENT_LOCK_FILE_ACQUIRE_BEGIN,
-  // A file concerning the lock acquire report.
+  // A file lock was acquired.
   LORE_EVENT_LOCK_FILE_ACQUIRE,
+  // A file lock acquisition was ignored.
+  LORE_EVENT_LOCK_FILE_ACQUIRE_IGNORE,
   // The start of a file lock status report.
   LORE_EVENT_LOCK_FILE_STATUS_BEGIN,
   // One file lock status entry.
@@ -2883,10 +2875,10 @@ enum lore_event_id_t {
   LORE_EVENT_LOCK_FILE_QUERY_BEGIN,
   // One file lock query result.
   LORE_EVENT_LOCK_FILE_QUERY,
-  // The start of a file lock release report.
-  LORE_EVENT_LOCK_FILE_RELEASE_BEGIN,
-  // A file concerning the lock release report.
+  // A file lock was released.
   LORE_EVENT_LOCK_FILE_RELEASE,
+  // A file lock to release was not found.
+  LORE_EVENT_LOCK_FILE_RELEASE_NOT_FOUND,
   // Metadata was cleared on a file.
   LORE_EVENT_METADATA_CLEAR_FILE,
   // Metadata was cleared on a revision.
@@ -3183,14 +3175,14 @@ typedef struct lore_event_t {
     struct lore_layer_staged_entry_event_data_t layer_staged_entry;
     struct lore_link_change_event_data_t link_change;
     struct lore_link_entry_event_data_t link_entry;
-    struct lore_lock_file_acquire_begin_event_data_t lock_file_acquire_begin;
     struct lore_lock_file_acquire_event_data_t lock_file_acquire;
+    struct lore_lock_file_acquire_ignore_event_data_t lock_file_acquire_ignore;
     struct lore_lock_file_status_begin_event_data_t lock_file_status_begin;
     struct lore_lock_file_status_event_data_t lock_file_status;
     struct lore_lock_file_query_begin_event_data_t lock_file_query_begin;
     struct lore_lock_file_query_event_data_t lock_file_query;
-    struct lore_lock_file_release_begin_event_data_t lock_file_release_begin;
     struct lore_lock_file_release_event_data_t lock_file_release;
+    struct lore_lock_file_release_not_found_event_data_t lock_file_release_not_found;
     struct lore_metadata_clear_file_event_data_t metadata_clear_file;
     struct lore_metadata_clear_revision_event_data_t metadata_clear_revision;
     struct lore_path_ignore_event_data_t path_ignore;

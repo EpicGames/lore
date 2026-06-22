@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let path_sep = MAIN_SEPARATOR;
 
-    let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let crate_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set");
 
     // list all .rs files in `lore` so that we run this script to update the c header
     for entry in glob("src/**/*.rs").expect("glob syntax error") {
@@ -32,10 +32,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     // list input configuration files so that we run this script to update the c header
     println!("cargo:rerun-if-changed=cbindgen.toml");
 
-    let out_dir = env::var("OUT_DIR").unwrap();
+    let out_dir = env::var("OUT_DIR").expect("OUT_DIR must be set");
     let header_gen = format!("{out_dir}{path_sep}lore.h");
     let source_gen = format!("{out_dir}{path_sep}lore.c");
-    let config = cbindgen::Config::from_file("cbindgen.toml").unwrap();
+    let config = cbindgen::Config::from_file("cbindgen.toml").expect("Failed to read cbindgen.toml");
 
     // run cbindgen to generate `lore.h`
     match cbindgen::Builder::new()
@@ -143,46 +143,40 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     cc_builder.clone().file(source_gen).compile("headertest");
 
-    // Also validate the header is C++ compatible by compiling a C++ file
-    // including it. Skipped for musl targets: the CI musl toolchain
-    // (musl-tools) ships only a C compiler (musl-gcc), no musl g++, and this is
-    // purely a header-compatibility check — the gnu/macOS/Windows builds still
-    // exercise the C++ path, so coverage is unchanged.
-    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("musl") {
-        let cpp_source_gen = format!("{out_dir}{path_sep}lore.cpp");
-        let mut cxx_base_builder = cc::Build::new();
-        let cxx_builder = cxx_base_builder
-            .cpp(true)
-            .cargo_metadata(false)
-            .static_crt(true)
-            .force_frame_pointer(false)
-            .opt_level(3);
+    // Also validate the header is C++ compatible by compiling a C++ file including it
+    let cpp_source_gen = format!("{out_dir}{path_sep}lore.cpp");
+    let mut cxx_base_builder = cc::Build::new();
+    let cxx_builder = cxx_base_builder
+        .cpp(true)
+        .cargo_metadata(false)
+        .static_crt(true)
+        .force_frame_pointer(false)
+        .opt_level(3);
 
-        if cxx_builder.get_compiler().is_like_msvc() {
-            cxx_builder.flag("/std:c++14");
-        }
-
-        std::fs::write(
-            cpp_source_gen.as_str(),
-            "\
-            extern \"C\" {
-            #include \"lore.h\"
-            }
-            int main(void) {
-                const struct lore_global_args_t globals = {};
-                const struct lore_repository_clone_args_t args = {};
-                struct lore_event_callback_config_t callback = {};
-                return lore_repository_clone(&globals, &args, callback);
-            }
-            ",
-        )
-        .expect("Unable to write C++ test source file");
-
-        cxx_builder
-            .clone()
-            .file(cpp_source_gen)
-            .compile("headertest_cpp");
+    if cxx_builder.get_compiler().is_like_msvc() {
+        cxx_builder.flag("/std:c++14");
     }
+
+    std::fs::write(
+        cpp_source_gen.as_str(),
+        "\
+        extern \"C\" {
+        #include \"lore.h\"
+        }
+        int main(void) {
+            const struct lore_global_args_t globals = {};
+            const struct lore_repository_clone_args_t args = {};
+            struct lore_event_callback_config_t callback = {};
+            return lore_repository_clone(&globals, &args, callback);
+        }
+        ",
+    )
+    .expect("Unable to write C++ test source file");
+
+    cxx_builder
+        .clone()
+        .file(cpp_source_gen)
+        .compile("headertest_cpp");
 
     // if the header contents changed, copy it to the /lore-capi directory
     let header_target = format!("{crate_dir}{path_sep}..{path_sep}lore-capi{path_sep}lore.h");
