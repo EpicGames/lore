@@ -50,7 +50,7 @@ impl Get {
         ]
     }
 
-    pub fn parse(mut bytes: Bytes) -> Result<Get, MessageParseError> {
+    pub fn parse(mut bytes: Bytes) -> Result<Self, MessageParseError> {
         if bytes.len() < BASE_REQUEST_SIZE {
             return Err(MessageParseError::InvalidFieldLength);
         };
@@ -66,7 +66,7 @@ impl Get {
             })?
         };
 
-        Ok(Get {
+        Ok(Self {
             header,
             address,
             match_required,
@@ -91,7 +91,7 @@ impl GetResponse {
     pub fn parse(mut bytes: Bytes) -> Result<Self, ReplicationStoreClientError> {
         let fragment: Fragment = bytes.split_to(size_of::<Fragment>()).into();
 
-        Ok(GetResponse {
+        Ok(Self {
             fragment,
             payload: bytes,
         })

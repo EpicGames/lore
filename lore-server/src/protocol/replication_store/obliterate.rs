@@ -84,7 +84,7 @@ impl ObliterateResponse {
             })?
             .0;
 
-        Ok(ObliterateResponse {
+        Ok(Self {
             num_fragments,
             num_payloads,
         })

@@ -26,8 +26,8 @@ pub enum AnchorError {
 impl EventError for AnchorError {
     fn translated(&self) -> LoreError {
         match self {
-            AnchorError::InvalidArguments(_) => LoreError::InvalidArguments,
-            AnchorError::WriteRequired(_) | AnchorError::Internal(_) => LoreError::Internal,
+            Self::InvalidArguments(_) => LoreError::InvalidArguments,
+            Self::WriteRequired(_) | Self::Internal(_) => LoreError::Internal,
         }
     }
 

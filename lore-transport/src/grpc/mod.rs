@@ -98,7 +98,7 @@ impl GRPCAuth {
         let (authentication_token, authorization_token, resolved_identity) =
             auth_exchange(auth_url, &remote_domain, identity, repository).await;
 
-        let auth = Arc::new(parking_lot::RwLock::new(GRPCAuth {
+        let auth = Arc::new(parking_lot::RwLock::new(Self {
             remote_domain: remote_domain.clone(),
             authentication_token,
             authorization_token,
@@ -136,7 +136,7 @@ impl GRPCAuth {
         let (authentication_token, authorization_token, resolved_identity) =
             auth_exchange_custom_resource(auth_url, &remote_domain, identity, resource_id).await;
 
-        let auth = Arc::new(parking_lot::RwLock::new(GRPCAuth {
+        let auth = Arc::new(parking_lot::RwLock::new(Self {
             remote_domain: remote_domain.clone(),
             authentication_token,
             authorization_token,
@@ -897,7 +897,7 @@ struct RequestScopedCounter {
 impl RequestScopedCounter {
     pub fn new(counter: Arc<AtomicU64>) -> Self {
         counter.fetch_add(1, std::sync::atomic::Ordering::Release);
-        RequestScopedCounter { counter }
+        Self { counter }
     }
 }
 

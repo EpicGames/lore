@@ -38,7 +38,7 @@ enum FlushError {}
 impl EventError for FlushError {
     fn translated(&self) -> LoreError {
         match self {
-            FlushError::Internal(_) => LoreError::Internal,
+            Self::Internal(_) => LoreError::Internal,
         }
     }
 

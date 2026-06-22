@@ -35,7 +35,7 @@ pub struct CliConfig {
 
 impl Default for CliConfig {
     fn default() -> Self {
-        CliConfig {
+        Self {
             json: false,
             log_level: LoreLogLevel::default(),
             pager: DEFAULT_PAGER.to_string(),
@@ -54,7 +54,7 @@ struct CliUserConfig {
 
 impl Default for CliUserConfig {
     fn default() -> Self {
-        CliUserConfig {
+        Self {
             pager: DEFAULT_PAGER.to_string(),
         }
     }

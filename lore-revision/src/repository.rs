@@ -199,7 +199,7 @@ pub struct StoreConfig {
 
 impl StoreConfig {
     fn client_default() -> Self {
-        StoreConfig {
+        Self {
             max_capacity: Some(10 * 1024 * 1024),
             eviction_delay: Some(10),
             max_size: Some(10 * 1024 * 1024 * 1024),
@@ -209,7 +209,7 @@ impl StoreConfig {
     }
 
     pub fn global_default() -> Self {
-        StoreConfig {
+        Self {
             max_capacity: Some(10 * 1024 * 1024),
             eviction_delay: Some(10),
             max_size: Some(10 * 1024 * 1024 * 1024),
@@ -245,7 +245,7 @@ pub struct FileConfig {
 
 impl Default for FileConfig {
     fn default() -> Self {
-        FileConfig {
+        Self {
             direct_write: Some(false),
             direct_io: Some(false),
             flush_write: Some(false),
@@ -266,13 +266,13 @@ impl SharedStoreToUseConfig {
         global_config: &GlobalConfig,
         use_shared_store: u8,
         path: &LoreString,
-    ) -> Result<Option<SharedStoreToUseConfig>, PathError> {
+    ) -> Result<Option<Self>, PathError> {
         if global_config
             .use_shared_store_automatically
             .unwrap_or(false)
             || use_shared_store != 0
         {
-            Ok(Some(SharedStoreToUseConfig {
+            Ok(Some(Self {
                 use_shared_store: Some(true),
                 shared_store_path: if let Some(path_string) = Into::<Option<&str>>::into(path) {
                     Some(make_absolute(path_string)?.to_string_lossy().to_string())
@@ -299,7 +299,7 @@ pub struct RepositoryRuntimeSettings {
 
 impl Default for RepositoryRuntimeSettings {
     fn default() -> Self {
-        RepositoryRuntimeSettings {
+        Self {
             disable_upload: AtomicBool::new(true),
             disable_cache: AtomicBool::new(true),
             direct_file_write: AtomicBool::new(false),
@@ -310,7 +310,7 @@ impl Default for RepositoryRuntimeSettings {
 
 impl Clone for RepositoryRuntimeSettings {
     fn clone(&self) -> Self {
-        RepositoryRuntimeSettings {
+        Self {
             disable_upload: AtomicBool::new(self.disable_upload.load(Ordering::Relaxed)),
             disable_cache: AtomicBool::new(self.disable_cache.load(Ordering::Relaxed)),
             direct_file_write: AtomicBool::new(self.direct_file_write.load(Ordering::Relaxed)),
@@ -481,9 +481,9 @@ impl RemoteState {
     /// reflects "no remote configured" rather than a failure, so it becomes `Offline`.
     fn from_result(remote: Result<Arc<Connection>, ProtocolError>) -> Self {
         match remote {
-            Ok(conn) => RemoteState::Connected(conn),
-            Err(ProtocolError::NoRemote(_)) => RemoteState::Offline,
-            Err(err) => RemoteState::Failed(err),
+            Ok(conn) => Self::Connected(conn),
+            Err(ProtocolError::NoRemote(_)) => Self::Offline,
+            Err(err) => Self::Failed(err),
         }
     }
 }
@@ -528,7 +528,7 @@ impl RepositoryContext {
         format: RepositoryFormat,
     ) -> Self {
         let file_system = Self::default_filesystem(path.as_deref().unwrap_or(Path::new("")));
-        RepositoryContext {
+        Self {
             path,
             immutable_store,
             mutable_store,
@@ -737,7 +737,7 @@ impl RepositoryContext {
         mutable_store: Arc<dyn MutableStore>,
         id: RepositoryId,
     ) -> Self {
-        RepositoryContext {
+        Self {
             file_system: Self::default_filesystem(Path::new("")),
             path: None,
             immutable_store,
@@ -756,7 +756,7 @@ impl RepositoryContext {
     }
 
     pub fn to_server_context(&self, id: RepositoryId) -> Self {
-        RepositoryContext {
+        Self {
             path: self.path.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
@@ -778,7 +778,7 @@ impl RepositoryContext {
         immutable_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
     ) -> Self {
-        RepositoryContext {
+        Self {
             file_system: Self::default_filesystem(Path::new("")),
             path: None,
             immutable_store,
@@ -797,7 +797,7 @@ impl RepositoryContext {
     }
 
     pub fn to_null_context(&self) -> Self {
-        RepositoryContext {
+        Self {
             path: self.path.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
@@ -829,7 +829,7 @@ impl RepositoryContext {
         filter: Arc<Filter>,
         remote: Result<Arc<Connection>, ProtocolError>,
     ) -> Self {
-        RepositoryContext {
+        Self {
             path: self.path.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
@@ -855,7 +855,7 @@ impl RepositoryContext {
             remote
         };
         let settings = self.settings.clone();
-        RepositoryContext {
+        Self {
             path: self.path.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
@@ -881,7 +881,7 @@ impl RepositoryContext {
             remote
         };
         let settings = self.settings.clone();
-        RepositoryContext {
+        Self {
             path: self.path.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
@@ -900,7 +900,7 @@ impl RepositoryContext {
     }
 
     pub fn to_filter_context(&self, filter: Arc<Filter>) -> Self {
-        RepositoryContext {
+        Self {
             path: self.path.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
@@ -1075,24 +1075,23 @@ pub enum RepositoryError {
 impl EventError for RepositoryError {
     fn translated(&self) -> LoreError {
         match self {
-            RepositoryError::Disconnected(_) => LoreError::Connection,
-            RepositoryError::SlowDown(_) => LoreError::SlowDown,
-            RepositoryError::Oversized(_) => LoreError::Oversized,
-            RepositoryError::FileNotFound(_) => LoreError::FileNotFound,
-            RepositoryError::NotFound(_)
-            | RepositoryError::RepositoryNotFound(_)
-            | RepositoryError::BranchNotFound(_)
-            | RepositoryError::RevisionNotFound(_)
-            | RepositoryError::LayerNotFound(_)
-            | RepositoryError::LinkNotFound(_)
-            | RepositoryError::NodeNotFound(_) => LoreError::NotFound,
-            RepositoryError::AddressNotFound(_) => LoreError::AddressNotFound,
-            RepositoryError::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            RepositoryError::InvalidPath(_) | RepositoryError::InvalidArguments(_) => {
-                LoreError::InvalidArguments
+            Self::Disconnected(_) => LoreError::Connection,
+            Self::SlowDown(_) => LoreError::SlowDown,
+            Self::Oversized(_) => LoreError::Oversized,
+            Self::FileNotFound(_) => LoreError::FileNotFound,
+            Self::NotFound(_)
+            | Self::RepositoryNotFound(_)
+            | Self::BranchNotFound(_)
+            | Self::RevisionNotFound(_)
+            | Self::LayerNotFound(_)
+            | Self::LinkNotFound(_)
+            | Self::NodeNotFound(_) => LoreError::NotFound,
+            Self::AddressNotFound(_) => LoreError::AddressNotFound,
+            Self::PayloadNotFound(_) => LoreError::PayloadNotFound,
+            Self::InvalidPath(_) | Self::InvalidArguments(_) => LoreError::InvalidArguments,
+            Self::RepositoryAlreadyExists(_) | Self::BranchAlreadyExists(_) => {
+                LoreError::AlreadyExists
             }
-            RepositoryError::RepositoryAlreadyExists(_)
-            | RepositoryError::BranchAlreadyExists(_) => LoreError::AlreadyExists,
             _ => LoreError::Internal,
         }
     }

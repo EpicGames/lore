@@ -48,10 +48,10 @@ impl Display for ReplicationServiceErrorCode {
 impl From<&StoreError> for ReplicationServiceErrorCode {
     fn from(err: &StoreError) -> Self {
         match err {
-            StoreError::AddressNotFound(_) => ReplicationServiceErrorCode::AddressNotFound,
-            StoreError::PayloadNotFound(_) => ReplicationServiceErrorCode::PayloadNotFound,
-            StoreError::SlowDown(_) => ReplicationServiceErrorCode::SlowDown,
-            StoreError::Oversized(_) => ReplicationServiceErrorCode::Oversized,
+            StoreError::AddressNotFound(_) => Self::AddressNotFound,
+            StoreError::PayloadNotFound(_) => Self::PayloadNotFound,
+            StoreError::SlowDown(_) => Self::SlowDown,
+            StoreError::Oversized(_) => Self::Oversized,
             StoreError::NotFound(_)
             | StoreError::Disconnected(_)
             | StoreError::NotAuthorized(_)
@@ -59,7 +59,7 @@ impl From<&StoreError> for ReplicationServiceErrorCode {
             | StoreError::Maintenance(_)
             | StoreError::NoRemote(_)
             | StoreError::NotSupported(_)
-            | StoreError::Internal(_) => ReplicationServiceErrorCode::Internal,
+            | StoreError::Internal(_) => Self::Internal,
         }
     }
 }
@@ -80,24 +80,22 @@ pub enum Command {
 
 impl From<Command> for QuicOpCode {
     fn from(value: Command) -> Self {
-        value as QuicOpCode
+        value as Self
     }
 }
 impl TryFrom<QuicOpCode> for Command {
     type Error = UnknownCommand;
     fn try_from(value: QuicOpCode) -> Result<Self, Self::Error> {
         match value {
-            v if v == Command::ImmutableExistBatch as u8 => Ok(Command::ImmutableExistBatch),
-            v if v == Command::ImmutableGet as u8 => Ok(Command::ImmutableGet),
-            v if v == Command::ImmutablePut as u8 => Ok(Command::ImmutablePut),
-            v if v == Command::ImmutableObliterate as u8 => Ok(Command::ImmutableObliterate),
-            v if v == Command::ImmutableQuery as u8 => Ok(Command::ImmutableQuery),
-            v if v == Command::ImmutableLocalExistBatch as u8 => {
-                Ok(Command::ImmutableLocalExistBatch)
-            }
-            v if v == Command::ImmutableLocalGet as u8 => Ok(Command::ImmutableLocalGet),
-            v if v == Command::ImmutableLocalQuery as u8 => Ok(Command::ImmutableLocalQuery),
-            v if v == Command::ImmutableLocalPut as u8 => Ok(Command::ImmutableLocalPut),
+            v if v == Self::ImmutableExistBatch as u8 => Ok(Self::ImmutableExistBatch),
+            v if v == Self::ImmutableGet as u8 => Ok(Self::ImmutableGet),
+            v if v == Self::ImmutablePut as u8 => Ok(Self::ImmutablePut),
+            v if v == Self::ImmutableObliterate as u8 => Ok(Self::ImmutableObliterate),
+            v if v == Self::ImmutableQuery as u8 => Ok(Self::ImmutableQuery),
+            v if v == Self::ImmutableLocalExistBatch as u8 => Ok(Self::ImmutableLocalExistBatch),
+            v if v == Self::ImmutableLocalGet as u8 => Ok(Self::ImmutableLocalGet),
+            v if v == Self::ImmutableLocalQuery as u8 => Ok(Self::ImmutableLocalQuery),
+            v if v == Self::ImmutableLocalPut as u8 => Ok(Self::ImmutableLocalPut),
             _ => Err(UnknownCommand(value)),
         }
     }

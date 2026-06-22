@@ -188,7 +188,7 @@ bitflagsops!(NodeFlags, u16);
 
 impl NodeFlags {
     pub fn is_directory(&self) -> bool {
-        !(self.contains(NodeFlags::File) || self.contains(NodeFlags::Link))
+        !(self.contains(Self::File) || self.contains(Self::Link))
     }
 }
 
@@ -1119,7 +1119,7 @@ unsafe impl Send for NodeNameLock {}
 
 impl NodeBlock {
     pub fn new(data: Box<NodeBlockData>) -> Self {
-        NodeBlock {
+        Self {
             data: Arc::new(RwLock::new(NodeBlockRuntimeData {
                 data,
                 name: BytesMut::new(),
@@ -1129,7 +1129,7 @@ impl NodeBlock {
     }
 
     pub fn new_with_name(data: Box<NodeBlockData>, name: BytesMut) -> Self {
-        NodeBlock {
+        Self {
             data: Arc::new(RwLock::new(NodeBlockRuntimeData { data, name })),
             name_deserialized: AtomicBool::new(true),
         }
@@ -1271,7 +1271,7 @@ impl NodeBlock {
         repository: Arc<RepositoryContext>,
         state: &State,
         address: Address,
-    ) -> Result<NodeBlock, StateError> {
+    ) -> Result<Self, StateError> {
         // Normal path, expect latest data format version
         if let Ok(mut block_data) =
             NodeBlockData::read_box_from_immutable(repository.clone(), address, true).await
@@ -1284,7 +1284,7 @@ impl NodeBlock {
             }
             block_data.flags &= !NodeBlockFlags::Dirty;
             block_data.flags &= !NodeBlockFlags::DeferRepackNametable;
-            Ok(NodeBlock::new(block_data))
+            Ok(Self::new(block_data))
         } else {
             Self::deserialize_other_version(repository, state, address).await
         }
@@ -1294,7 +1294,7 @@ impl NodeBlock {
         repository: Arc<RepositoryContext>,
         state: &State,
         address: Address,
-    ) -> Result<NodeBlock, StateError> {
+    ) -> Result<Self, StateError> {
         // Try load old data format
         if let Ok(block_data_v0) =
             NodeBlockDataV0::read_box_from_immutable(repository.clone(), address, true).await
@@ -1306,7 +1306,7 @@ impl NodeBlock {
             block_data.flags &= !NodeBlockFlags::Dirty;
             block_data.flags &= !NodeBlockFlags::DeferRepackNametable;
 
-            return Ok(NodeBlock::new_with_name(block_data, name));
+            return Ok(Self::new_with_name(block_data, name));
         };
 
         let block_data_v2 =
@@ -1324,7 +1324,7 @@ impl NodeBlock {
         block_data.flags &= !NodeBlockFlags::Dirty;
         block_data.flags &= !NodeBlockFlags::DeferRepackNametable;
 
-        Ok(NodeBlock::new(block_data))
+        Ok(Self::new(block_data))
     }
 
     pub async fn convert_block_v0(
@@ -1681,7 +1681,7 @@ impl NodeLink {
     }
 
     pub fn invalid() -> Self {
-        NodeLink {
+        Self {
             node: INVALID_NODE,
             ..Default::default()
         }
@@ -1728,7 +1728,7 @@ impl NodeDelta {
             change_flags |= change::Flags::Merge;
         }
 
-        NodeDelta {
+        Self {
             node,
             _unused: 0,
             action: change::FileAction::from_node_flags(node_flags) as u16,
@@ -1743,7 +1743,7 @@ impl NodeDelta {
                 change.to.node
             }
         };
-        NodeDelta {
+        Self {
             node,
             _unused: 0,
             action: change.action as u16,
@@ -1860,10 +1860,8 @@ impl NodeFileMetadataBlockData {
         repository: Arc<RepositoryContext>,
         address: Address,
         cache: bool,
-    ) -> Result<Box<NodeFileMetadataBlockData>, ImmutableError> {
-        match NodeFileMetadataBlockData::read_box_from_immutable(repository.clone(), address, cache)
-            .await
-        {
+    ) -> Result<Box<Self>, ImmutableError> {
+        match Self::read_box_from_immutable(repository.clone(), address, cache).await {
             Ok(block) => Ok(block),
             Err(original_err) if original_err.is_internal() => {
                 match NodeFileMetadataBlockDataV0::read_box_from_immutable(
@@ -1904,7 +1902,7 @@ impl Default for NodeFileMetadataBlock {
 
 impl NodeFileMetadataBlock {
     pub fn new(data: Box<NodeFileMetadataBlockData>) -> Self {
-        NodeFileMetadataBlock {
+        Self {
             data: RwLock::new(data),
         }
     }

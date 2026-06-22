@@ -102,21 +102,19 @@ pub enum LinkError {
 impl EventError for LinkError {
     fn translated(&self) -> LoreError {
         match self {
-            LinkError::Disconnected(_) => LoreError::Connection,
-            LinkError::SlowDown(_) => LoreError::SlowDown,
-            LinkError::Oversized(_) => LoreError::Oversized,
-            LinkError::FileNotFound(_) => LoreError::FileNotFound,
-            LinkError::NotFound(_)
-            | LinkError::LayerNotFound(_)
-            | LinkError::RevisionNotFound(_)
-            | LinkError::BranchNotFound(_)
-            | LinkError::LinkNotFound(_)
-            | LinkError::LinkPathNotFound(_) => LoreError::NotFound,
-            LinkError::AddressNotFound(_) => LoreError::AddressNotFound,
-            LinkError::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            LinkError::InvalidPath(_) | LinkError::InvalidArguments(_) => {
-                LoreError::InvalidArguments
-            }
+            Self::Disconnected(_) => LoreError::Connection,
+            Self::SlowDown(_) => LoreError::SlowDown,
+            Self::Oversized(_) => LoreError::Oversized,
+            Self::FileNotFound(_) => LoreError::FileNotFound,
+            Self::NotFound(_)
+            | Self::LayerNotFound(_)
+            | Self::RevisionNotFound(_)
+            | Self::BranchNotFound(_)
+            | Self::LinkNotFound(_)
+            | Self::LinkPathNotFound(_) => LoreError::NotFound,
+            Self::AddressNotFound(_) => LoreError::AddressNotFound,
+            Self::PayloadNotFound(_) => LoreError::PayloadNotFound,
+            Self::InvalidPath(_) | Self::InvalidArguments(_) => LoreError::InvalidArguments,
             _ => LoreError::Internal,
         }
     }

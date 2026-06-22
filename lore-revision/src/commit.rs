@@ -2398,7 +2398,7 @@ struct NodeHashData {
 
 impl NodeHashData {
     fn from_node(node: &Node) -> Self {
-        NodeHashData {
+        Self {
             name_hash: node.name_hash,
             mode: node.mode as u32,
             address: node.address,

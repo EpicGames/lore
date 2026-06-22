@@ -95,9 +95,9 @@ impl From<StoreError> for MessageHandleError {
     fn from(value: StoreError) -> Self {
         warn!("Received store error: {value:?}");
         match value {
-            StoreError::SlowDown(_) => MessageHandleError::SlowDown,
-            StoreError::Oversized(_) => MessageHandleError::Oversized,
-            _ => MessageHandleError::StoreFailure,
+            StoreError::SlowDown(_) => Self::SlowDown,
+            StoreError::Oversized(_) => Self::Oversized,
+            _ => Self::StoreFailure,
         }
     }
 }

@@ -73,7 +73,7 @@ pub struct TaskQueueSettings {
 
 impl Default for TaskQueueSettings {
     fn default() -> Self {
-        TaskQueueSettings {
+        Self {
             quota_per_second: default_quota_per_second(),
             concurrency_limit: default_concurrency_limit(),
             submission_limit: default_submission_limit(),
@@ -251,7 +251,7 @@ pub struct WantsTables {
 }
 
 impl AwsClientBuilder<WantsTables> {
-    pub fn ensure_table(mut self, table_name: impl Into<String>) -> AwsClientBuilder<WantsTables> {
+    pub fn ensure_table(mut self, table_name: impl Into<String>) -> Self {
         self.0.tables.push(table_name.into());
 
         self
@@ -294,7 +294,7 @@ pub struct WantsBuckets {
 }
 
 impl AwsClientBuilder<WantsBuckets> {
-    pub fn ensure_bucket(mut self, bucket: impl Into<String>) -> AwsClientBuilder<WantsBuckets> {
+    pub fn ensure_bucket(mut self, bucket: impl Into<String>) -> Self {
         self.0.buckets.push(bucket.into());
 
         self

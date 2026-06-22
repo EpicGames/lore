@@ -25,13 +25,13 @@ impl TryFrom<u8> for KeyType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(KeyType::Untyped),
-            1 => Ok(KeyType::BranchMetadata),
-            2 => Ok(KeyType::BranchId),
-            3 => Ok(KeyType::BranchLatestPointer),
-            4 => Ok(KeyType::RepositoryMetadata),
-            5 => Ok(KeyType::RepositoryId),
-            6 => Ok(KeyType::Instance),
+            0 => Ok(Self::Untyped),
+            1 => Ok(Self::BranchMetadata),
+            2 => Ok(Self::BranchId),
+            3 => Ok(Self::BranchLatestPointer),
+            4 => Ok(Self::RepositoryMetadata),
+            5 => Ok(Self::RepositoryId),
+            6 => Ok(Self::Instance),
             other => Err(other),
         }
     }
@@ -44,6 +44,6 @@ impl TryFrom<u32> for KeyType {
         if value > u8::MAX as u32 {
             return Err(value);
         }
-        KeyType::try_from(value as u8).map_err(|_unknown| value)
+        Self::try_from(value as u8).map_err(|_unknown| value)
     }
 }

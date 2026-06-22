@@ -184,7 +184,7 @@ pub struct RelativePath {
 
 impl RelativePath {
     pub fn new() -> Self {
-        RelativePath {
+        Self {
             data: Arc::new(RelativePathData {
                 path: String::new(),
                 path_lower: String::new(),
@@ -272,19 +272,16 @@ impl RelativePath {
         &self.data.path_lower[self.start_lower..self.end_lower]
     }
 
-    pub fn new_from_initial_path(name: impl AsRef<str>) -> Result<RelativePath, PathError> {
+    pub fn new_from_initial_path(name: impl AsRef<str>) -> Result<Self, PathError> {
         RelativePathBuf::new_from_initial_path(name).map(|p| p.freeze())
     }
 
     /// Construct a path from two parts. Parts are required to be clean.
-    pub fn new_from_clean_parts(root: &str, tail: &str) -> RelativePath {
+    pub fn new_from_clean_parts(root: &str, tail: &str) -> Self {
         RelativePathBuf::new_from_clean_parts(root, tail).freeze()
     }
 
-    pub fn new_from_user_path(
-        repository_path: &Path,
-        user_path: &str,
-    ) -> Result<RelativePath, PathError> {
+    pub fn new_from_user_path(repository_path: &Path, user_path: &str) -> Result<Self, PathError> {
         RelativePathBuf::new_from_user_path(repository_path, user_path).map(|p| p.freeze())
     }
 
@@ -292,7 +289,7 @@ impl RelativePath {
         repository_path.as_ref().join(self.as_str())
     }
 
-    pub fn join(&self, suffix: impl AsRef<str>) -> RelativePath {
+    pub fn join(&self, suffix: impl AsRef<str>) -> Self {
         self.push_into_buf(suffix).freeze()
     }
 
@@ -414,7 +411,7 @@ impl RelativePath {
     ///
     /// Comparison is structural on the canonical `/`-separated form
     /// (case-sensitive). The returned paths are in lexicographic order.
-    pub fn dedup_to_supersets(paths: Vec<RelativePath>) -> Vec<RelativePath> {
+    pub fn dedup_to_supersets(paths: Vec<Self>) -> Vec<Self> {
         if paths.iter().any(|p| p.is_empty()) {
             return Vec::new();
         }
@@ -422,7 +419,7 @@ impl RelativePath {
         let mut sorted = paths;
         sorted.sort_by(|a, b| a.as_str().cmp(b.as_str()));
 
-        let mut result: Vec<RelativePath> = Vec::with_capacity(sorted.len());
+        let mut result: Vec<Self> = Vec::with_capacity(sorted.len());
         for path in sorted {
             if !result
                 .iter()
@@ -539,7 +536,7 @@ impl FromStr for RelativePath {
         let path_lower = path.to_lowercase();
         let end = path.len();
         let end_lower = path_lower.len();
-        Ok(RelativePath {
+        Ok(Self {
             data: Arc::new(RelativePathData {
                 path: path.to_owned(),
                 path_lower,
@@ -587,7 +584,7 @@ impl Default for RelativePathBuf {
 impl RelativePathBuf {
     /// Create a new empty `RelativePathBuf`.
     pub fn new() -> Self {
-        RelativePathBuf {
+        Self {
             path: String::with_capacity(256),
             path_lower: String::with_capacity(256),
         }
@@ -595,7 +592,7 @@ impl RelativePathBuf {
 
     /// Construct from an initial path string.
     /// Validates that the path is not absolute and cleans it.
-    pub fn new_from_initial_path(name: impl AsRef<str>) -> Result<RelativePathBuf, PathError> {
+    pub fn new_from_initial_path(name: impl AsRef<str>) -> Result<Self, PathError> {
         let name = name.as_ref();
         if name.starts_with("..") || (name.len() >= 2 && name.as_bytes()[1] == b':') {
             return Err(InvalidPath {
@@ -603,7 +600,7 @@ impl RelativePathBuf {
             }
             .into());
         }
-        let mut initial_path = RelativePathBuf::new();
+        let mut initial_path = Self::new();
         let name = name.trim_matches('/');
         let name = name.replace('\\', "/").replace("//", "/");
         let name = name.trim_start_matches("./");
@@ -617,8 +614,8 @@ impl RelativePathBuf {
 
     /// Construct a path from two clean parts (root and tail).
     /// Parts are required to be clean.
-    pub fn new_from_clean_parts(mut root: &str, mut tail: &str) -> RelativePathBuf {
-        let mut path = RelativePathBuf::new();
+    pub fn new_from_clean_parts(mut root: &str, mut tail: &str) -> Self {
+        let mut path = Self::new();
         if root.ends_with('/') {
             root = &root[..(root.len() - 1)];
         }
@@ -636,12 +633,9 @@ impl RelativePathBuf {
 
     /// Construct from a user-provided path relative to a repository path.
     /// Makes the user path absolute if needed, then computes the relative portion.
-    pub fn new_from_user_path(
-        repository_path: &Path,
-        user_path: &str,
-    ) -> Result<RelativePathBuf, PathError> {
+    pub fn new_from_user_path(repository_path: &Path, user_path: &str) -> Result<Self, PathError> {
         if user_path == "." || user_path.is_empty() {
-            return Ok(RelativePathBuf::new());
+            return Ok(Self::new());
         }
 
         let mut absolute_path = Path::new(user_path).to_path_buf();
@@ -673,10 +667,10 @@ impl RelativePathBuf {
             .1
             .trim_matches('/');
         if relative_path.is_empty() || relative_path == "." {
-            return Ok(RelativePathBuf::new());
+            return Ok(Self::new());
         }
 
-        let mut out_path = RelativePathBuf::new();
+        let mut out_path = Self::new();
         out_path.push(relative_path);
         Ok(out_path)
     }

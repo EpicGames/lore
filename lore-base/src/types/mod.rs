@@ -339,7 +339,7 @@ pub fn validate_fragment_response(fragment: &Fragment) -> Result<(), &'static st
 
 impl From<Hash> for Bytes {
     fn from(hash: Hash) -> Self {
-        Bytes::from_owner(hash.data)
+        Self::from_owner(hash.data)
     }
 }
 
@@ -357,7 +357,7 @@ impl From<Hash> for [u8; 32] {
 
 impl From<[u8; 32]> for Hash {
     fn from(data: [u8; 32]) -> Self {
-        Hash { data }
+        Self { data }
     }
 }
 
@@ -375,25 +375,25 @@ impl From<&Bytes> for Hash {
 
 impl From<&[u8]> for Hash {
     fn from(bytes: &[u8]) -> Self {
-        Hash::read_from_prefix(bytes).unwrap_or_default().0
+        Self::read_from_prefix(bytes).unwrap_or_default().0
     }
 }
 
-impl From<&[u8; size_of::<Hash>()]> for Hash {
-    fn from(bytes: &[u8; size_of::<Hash>()]) -> Self {
-        Hash::read_from_bytes(bytes).unwrap_or_default()
+impl From<&[u8; size_of::<Self>()]> for Hash {
+    fn from(bytes: &[u8; size_of::<Self>()]) -> Self {
+        Self::read_from_bytes(bytes).unwrap_or_default()
     }
 }
 
 impl From<[u8; 16]> for Context {
     fn from(data: [u8; 16]) -> Self {
-        Context { data }
+        Self { data }
     }
 }
 
 impl From<Context> for Bytes {
     fn from(context: Context) -> Self {
-        Bytes::from_owner(context.data)
+        Self::from_owner(context.data)
     }
 }
 
@@ -411,7 +411,7 @@ impl From<&Bytes> for Context {
 
 impl From<&[u8]> for Context {
     fn from(bytes: &[u8]) -> Self {
-        Context::read_from_prefix(bytes).unwrap_or_default().0
+        Self::read_from_prefix(bytes).unwrap_or_default().0
     }
 }
 
@@ -421,9 +421,9 @@ impl AsRef<[u8]> for Context {
     }
 }
 
-impl From<&[u8; size_of::<Context>()]> for Context {
-    fn from(bytes: &[u8; size_of::<Context>()]) -> Self {
-        Context::read_from_bytes(bytes).unwrap_or_default()
+impl From<&[u8; size_of::<Self>()]> for Context {
+    fn from(bytes: &[u8; size_of::<Self>()]) -> Self {
+        Self::read_from_bytes(bytes).unwrap_or_default()
     }
 }
 
@@ -441,13 +441,13 @@ impl From<uuid::Uuid> for Context {
 
 impl From<&Context> for uuid::Uuid {
     fn from(context: &Context) -> Self {
-        uuid::Uuid::from_bytes(context.data)
+        Self::from_bytes(context.data)
     }
 }
 
 impl From<Context> for uuid::Uuid {
     fn from(context: Context) -> Self {
-        uuid::Uuid::from_bytes(context.data)
+        Self::from_bytes(context.data)
     }
 }
 
@@ -459,7 +459,7 @@ impl From<Context> for [u8; 16] {
 
 impl From<Partition> for Bytes {
     fn from(partition: Partition) -> Self {
-        Bytes::from_owner(partition.data)
+        Self::from_owner(partition.data)
     }
 }
 
@@ -471,7 +471,7 @@ impl From<Bytes> for Partition {
 
 impl From<&[u8]> for Partition {
     fn from(bytes: &[u8]) -> Self {
-        Partition::read_from_prefix(bytes).unwrap_or_default().0
+        Self::read_from_prefix(bytes).unwrap_or_default().0
     }
 }
 
@@ -495,7 +495,7 @@ impl From<uuid::Uuid> for Partition {
 
 impl From<Partition> for uuid::Uuid {
     fn from(partition: Partition) -> Self {
-        uuid::Uuid::from_bytes(partition.into())
+        Self::from_bytes(partition.into())
     }
 }
 
@@ -507,13 +507,13 @@ impl From<Partition> for [u8; 16] {
 
 impl From<[u8; 16]> for Partition {
     fn from(data: [u8; 16]) -> Self {
-        Partition { data }
+        Self { data }
     }
 }
 
-impl From<&[u8; size_of::<Partition>()]> for Partition {
-    fn from(bytes: &[u8; size_of::<Partition>()]) -> Self {
-        Partition::read_from_bytes(bytes).unwrap_or_default()
+impl From<&[u8; size_of::<Self>()]> for Partition {
+    fn from(bytes: &[u8; size_of::<Self>()]) -> Self {
+        Self::read_from_bytes(bytes).unwrap_or_default()
     }
 }
 
@@ -525,13 +525,13 @@ impl From<&Bytes> for Partition {
 
 impl From<Context> for Partition {
     fn from(context: Context) -> Self {
-        Partition { data: context.data }
+        Self { data: context.data }
     }
 }
 
 impl From<Partition> for Context {
     fn from(partition: Partition) -> Self {
-        Context {
+        Self {
             data: partition.data,
         }
     }
@@ -539,7 +539,7 @@ impl From<Partition> for Context {
 
 impl From<Address> for Bytes {
     fn from(address: Address) -> Self {
-        Bytes::from_owner(address)
+        Self::from_owner(address)
     }
 }
 
@@ -557,7 +557,7 @@ impl From<&Bytes> for Address {
 
 impl From<&[u8]> for Address {
     fn from(bytes: &[u8]) -> Self {
-        Address::read_from_prefix(bytes).unwrap_or_default().0
+        Self::read_from_prefix(bytes).unwrap_or_default().0
     }
 }
 
@@ -569,7 +569,7 @@ impl AsRef<[u8]> for Address {
 
 impl From<Fragment> for Bytes {
     fn from(fragment: Fragment) -> Self {
-        Bytes::from_owner(fragment)
+        Self::from_owner(fragment)
     }
 }
 
@@ -587,7 +587,7 @@ impl From<&Bytes> for Fragment {
 
 impl From<&[u8]> for Fragment {
     fn from(bytes: &[u8]) -> Self {
-        Fragment::read_from_prefix(bytes).unwrap_or_default().0
+        Self::read_from_prefix(bytes).unwrap_or_default().0
     }
 }
 
@@ -599,7 +599,7 @@ impl AsRef<[u8]> for Fragment {
 
 impl From<FragmentReference> for Bytes {
     fn from(reference: FragmentReference) -> Self {
-        Bytes::from_owner(reference)
+        Self::from_owner(reference)
     }
 }
 
@@ -617,9 +617,7 @@ impl From<&Bytes> for FragmentReference {
 
 impl From<&[u8]> for FragmentReference {
     fn from(bytes: &[u8]) -> Self {
-        FragmentReference::read_from_prefix(bytes)
-            .unwrap_or_default()
-            .0
+        Self::read_from_prefix(bytes).unwrap_or_default().0
     }
 }
 
@@ -689,7 +687,7 @@ impl Address {
     }
 
     pub fn zero_context_hash(hash: Hash) -> Self {
-        Address {
+        Self {
             context: Context::default(),
             hash,
         }
@@ -713,7 +711,7 @@ impl Partition {
 impl Hash {
     pub fn hash_buffer(buffer: &[u8]) -> Self {
         let hash = blake3::hash(buffer);
-        Hash {
+        Self {
             data: *hash.as_bytes(),
         }
     }
@@ -731,7 +729,7 @@ impl Hash {
     }
 
     pub fn from_u64(value: u64) -> Self {
-        let mut hash = Hash::default();
+        let mut hash = Self::default();
         hash.data[..std::mem::size_of::<u64>()].copy_from_slice(u64::to_le_bytes(value).as_slice());
         hash
     }
@@ -741,7 +739,7 @@ impl Hash {
     }
 
     pub fn from_context(value: Context) -> Self {
-        let mut hash = Hash::default();
+        let mut hash = Self::default();
         hash.data[..16].copy_from_slice(value.data().as_slice());
         hash
     }
@@ -846,7 +844,7 @@ impl FromStr for Hash {
     type Err = hex::FromHexError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        from_hex::<Hash>(s)
+        from_hex::<Self>(s)
     }
 }
 
@@ -854,7 +852,7 @@ impl FromStr for Context {
     type Err = hex::FromHexError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        from_hex::<Context>(s)
+        from_hex::<Self>(s)
     }
 }
 
@@ -862,7 +860,7 @@ impl FromStr for Partition {
     type Err = hex::FromHexError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        from_hex::<Partition>(s)
+        from_hex::<Self>(s)
     }
 }
 
@@ -872,12 +870,12 @@ impl FromStr for Address {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let parts: Vec<&str> = s.split('-').collect();
         match parts.len() {
-            0 => Ok(Address::default()),
-            1 => Ok(Address {
+            0 => Ok(Self::default()),
+            1 => Ok(Self {
                 hash: Hash::from_str(parts[0])?,
                 context: Context::default(),
             }),
-            2 => Ok(Address {
+            2 => Ok(Self {
                 hash: Hash::from_str(parts[0])?,
                 context: Context::from_str(parts[1])?,
             }),
@@ -1022,13 +1020,13 @@ impl From<Address> for AddressNotFound {
             buf[32..].copy_from_slice(address.context.data());
             buf
         };
-        AddressNotFound { address: bytes }
+        Self { address: bytes }
     }
 }
 
 impl From<Hash> for PayloadNotFound {
     fn from(hash: Hash) -> Self {
-        PayloadNotFound { hash: *hash.data() }
+        Self { hash: *hash.data() }
     }
 }
 

@@ -106,7 +106,7 @@ pub struct ReadOptions {
 
 impl Default for ReadOptions {
     fn default() -> Self {
-        ReadOptions {
+        Self {
             isolate: LOCAL_ISOLATION.load(atomic::Ordering::Relaxed),
             decompress: true,
             verify: true,

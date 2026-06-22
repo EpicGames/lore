@@ -114,7 +114,7 @@ impl LoreRepositoryStatusRevisionEventData {
         remote_authorized: bool,
         remote_branch_exist: bool,
     ) -> Self {
-        LoreRepositoryStatusRevisionEventData {
+        Self {
             repository,
             branch,
             branch_name: branch_name.into(),
@@ -196,7 +196,7 @@ impl LoreRepositoryStatusFileEventData {
         } else {
             LoreNodeType::Directory
         };
-        LoreRepositoryStatusFileEventData {
+        Self {
             path: LoreString::from(&change.path),
             size,
             action: LoreFileAction::from(change.action),
@@ -354,18 +354,16 @@ pub enum StatusError {
 impl EventError for StatusError {
     fn translated(&self) -> LoreError {
         match self {
-            StatusError::Disconnected(_) => LoreError::Connection,
-            StatusError::SlowDown(_) => LoreError::SlowDown,
-            StatusError::Oversized(_) => LoreError::Oversized,
-            StatusError::FileNotFound(_) => LoreError::FileNotFound,
-            StatusError::NotFound(_)
-            | StatusError::LayerNotFound(_)
-            | StatusError::RevisionNotFound(_) => LoreError::NotFound,
-            StatusError::AddressNotFound(_) => LoreError::AddressNotFound,
-            StatusError::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            StatusError::InvalidArguments(_) | StatusError::InvalidPath(_) => {
-                LoreError::InvalidArguments
+            Self::Disconnected(_) => LoreError::Connection,
+            Self::SlowDown(_) => LoreError::SlowDown,
+            Self::Oversized(_) => LoreError::Oversized,
+            Self::FileNotFound(_) => LoreError::FileNotFound,
+            Self::NotFound(_) | Self::LayerNotFound(_) | Self::RevisionNotFound(_) => {
+                LoreError::NotFound
             }
+            Self::AddressNotFound(_) => LoreError::AddressNotFound,
+            Self::PayloadNotFound(_) => LoreError::PayloadNotFound,
+            Self::InvalidArguments(_) | Self::InvalidPath(_) => LoreError::InvalidArguments,
             _ => LoreError::Internal,
         }
     }

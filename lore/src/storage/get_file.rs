@@ -94,8 +94,8 @@ enum GetFileError {
 impl EventError for GetFileError {
     fn translated(&self) -> LoreError {
         match self {
-            GetFileError::InvalidArguments(_) => LoreError::InvalidArguments,
-            GetFileError::Internal(_) => LoreError::Internal,
+            Self::InvalidArguments(_) => LoreError::InvalidArguments,
+            Self::Internal(_) => LoreError::Internal,
         }
     }
 

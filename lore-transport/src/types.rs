@@ -91,7 +91,7 @@ pub struct CompressionMode(u32);
 
 impl CompressionMode {
     pub fn from_u32(value: u32) -> Self {
-        CompressionMode(value)
+        Self(value)
     }
 
     pub fn as_u32(&self) -> u32 {
@@ -165,13 +165,13 @@ pub struct RevisionListIdentifier {
 
 impl From<RevisionListIdentifier> for RevisionListStart {
     fn from(value: RevisionListIdentifier) -> Self {
-        RevisionListStart::Identifier(value)
+        Self::Identifier(value)
     }
 }
 
 impl From<Hash> for RevisionListStart {
     fn from(value: Hash) -> Self {
-        RevisionListStart::Signature(value)
+        Self::Signature(value)
     }
 }
 

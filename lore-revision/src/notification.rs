@@ -146,7 +146,7 @@ pub struct NotificationSubscription {
 
 impl NotificationSubscription {
     pub fn new(task: JoinHandle<()>, cancellation_token: CancellationToken) -> Self {
-        NotificationSubscription {
+        Self {
             task,
             cancellation_token,
         }

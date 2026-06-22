@@ -126,13 +126,13 @@ pub enum HookPoint {
 
 impl HookPoint {
     /// Returns all defined hook points.
-    pub fn all() -> &'static [HookPoint] {
+    pub fn all() -> &'static [Self] {
         &[
-            HookPoint::BranchPush,
-            HookPoint::BranchCreate,
-            HookPoint::BranchDelete,
-            HookPoint::RepositoryCreate,
-            HookPoint::Obliterate,
+            Self::BranchPush,
+            Self::BranchCreate,
+            Self::BranchDelete,
+            Self::RepositoryCreate,
+            Self::Obliterate,
         ]
     }
 }
@@ -140,11 +140,11 @@ impl HookPoint {
 impl std::fmt::Display for HookPoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            HookPoint::BranchPush => write!(f, "BranchPush"),
-            HookPoint::BranchCreate => write!(f, "BranchCreate"),
-            HookPoint::BranchDelete => write!(f, "BranchDelete"),
-            HookPoint::RepositoryCreate => write!(f, "RepositoryCreate"),
-            HookPoint::Obliterate => write!(f, "Obliterate"),
+            Self::BranchPush => write!(f, "BranchPush"),
+            Self::BranchCreate => write!(f, "BranchCreate"),
+            Self::BranchDelete => write!(f, "BranchDelete"),
+            Self::RepositoryCreate => write!(f, "RepositoryCreate"),
+            Self::Obliterate => write!(f, "Obliterate"),
         }
     }
 }
@@ -185,12 +185,12 @@ pub enum StatusCode {
 impl std::fmt::Display for StatusCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StatusCode::PermissionDenied => write!(f, "PERMISSION_DENIED"),
-            StatusCode::FailedPrecondition => write!(f, "FAILED_PRECONDITION"),
-            StatusCode::ResourceExhausted => write!(f, "RESOURCE_EXHAUSTED"),
-            StatusCode::InvalidArgument => write!(f, "INVALID_ARGUMENT"),
-            StatusCode::Aborted => write!(f, "ABORTED"),
-            StatusCode::Internal => write!(f, "INTERNAL"),
+            Self::PermissionDenied => write!(f, "PERMISSION_DENIED"),
+            Self::FailedPrecondition => write!(f, "FAILED_PRECONDITION"),
+            Self::ResourceExhausted => write!(f, "RESOURCE_EXHAUSTED"),
+            Self::InvalidArgument => write!(f, "INVALID_ARGUMENT"),
+            Self::Aborted => write!(f, "ABORTED"),
+            Self::Internal => write!(f, "INTERNAL"),
         }
     }
 }

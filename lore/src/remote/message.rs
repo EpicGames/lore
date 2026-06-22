@@ -126,8 +126,8 @@ impl TryFrom<u8> for SerializationType {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(SerializationType::Bincode),
-            1 => Ok(SerializationType::Json),
+            0 => Ok(Self::Bincode),
+            1 => Ok(Self::Json),
             _ => Err(()),
         }
     }
@@ -148,7 +148,7 @@ impl V1Header {
         }
     }
 
-    pub fn from_bytes(bytes: &[u8; V1Header::SIZE]) -> Result<Self, MessageError> {
+    pub fn from_bytes(bytes: &[u8; Self::SIZE]) -> Result<Self, MessageError> {
         Ok(Self::new(
             bytes[0] as u32
                 | (bytes[1] as u32) << 8
@@ -163,7 +163,7 @@ impl V1Header {
         ))
     }
 
-    pub fn to_bytes(&self) -> [u8; V1Header::SIZE] {
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
         [
             (self.payload_size & 0xff) as u8,
             (self.payload_size >> 8 & 0xff) as u8,

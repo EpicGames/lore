@@ -13,8 +13,8 @@ pub enum UnhandledError {
 impl EventError for UnhandledError {
     fn translated(&self) -> LoreError {
         match self {
-            UnhandledError::InvalidArguments(_) => LoreError::InvalidArguments,
-            UnhandledError::Internal(_) => LoreError::Internal,
+            Self::InvalidArguments(_) => LoreError::InvalidArguments,
+            Self::Internal(_) => LoreError::Internal,
         }
     }
 

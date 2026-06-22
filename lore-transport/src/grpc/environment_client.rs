@@ -18,7 +18,7 @@ use crate::types::EnvironmentServerConfig;
 
 impl From<lore_proto::lore::environment::v1::Environment> for EnvironmentConfig {
     fn from(value: lore_proto::lore::environment::v1::Environment) -> Self {
-        EnvironmentConfig {
+        Self {
             endpoint: value.endpoint.map(|endpoint| Endpoint {
                 auth_url: if !endpoint.auth_url.is_empty() {
                     Some(endpoint.auth_url.clone())

@@ -77,7 +77,7 @@ pub enum ReplicationStoreClientError {
 
 impl From<ReplicationServiceErrorCode> for ReplicationStoreClientError {
     fn from(code: ReplicationServiceErrorCode) -> Self {
-        ReplicationStoreClientError::ServiceError(code)
+        Self::ServiceError(code)
     }
 }
 
@@ -209,11 +209,11 @@ impl ReplicationStoreClient {
         let quinn = connect(
             &EndpointConfig {
                 remote_url: remote_url.to_string(),
-                default_port: ReplicationStoreClient::DEFAULT_PORT,
+                default_port: Self::DEFAULT_PORT,
                 sni_override: sni_override.clone(),
             },
             auth.client_certs(),
-            ReplicationStoreClient::ALPN,
+            Self::ALPN,
             transport_config.clone(),
         )
         .await?;
@@ -221,7 +221,7 @@ impl ReplicationStoreClient {
         let mut quic = QuicConnection::new(quinn, MAX_CHUNK_SIZE);
         quic.set_max_reconnects(max_reconnects);
 
-        let client = ReplicationStoreClient {
+        let client = Self {
             remote_url: remote_url.to_string(),
             sni_override,
             auth,

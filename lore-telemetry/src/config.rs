@@ -18,7 +18,7 @@ pub struct TelemetryConfig {
 
 impl TelemetryConfig {
     pub fn new() -> Self {
-        TelemetryConfig::default()
+        Self::default()
     }
 
     pub fn with_exporter(self, exporter: ExporterConfig) -> Self {

@@ -59,15 +59,13 @@ impl IntoResponse for GetContentError {
         warn!("get_repository_content error: {:?} ", &self);
 
         let (status, msg) = match self {
-            e @ (GetContentError::ParseContext(_) | GetContentError::ParseAddress(_)) => {
+            e @ (Self::ParseContext(_) | Self::ParseAddress(_)) => {
                 (StatusCode::BAD_REQUEST, e.to_string())
             }
-            GetContentError::ReadStream(ref e)
-                if e.is_address_not_found() || e.is_payload_not_found() =>
-            {
+            Self::ReadStream(ref e) if e.is_address_not_found() || e.is_payload_not_found() => {
                 (StatusCode::NOT_FOUND, "address not found".to_string())
             }
-            GetContentError::ReadStream(_) | GetContentError::HeaderGeneration(_) => (
+            Self::ReadStream(_) | Self::HeaderGeneration(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong. See server log for more info.".to_string(),
             ),

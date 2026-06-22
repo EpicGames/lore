@@ -51,7 +51,7 @@ pub enum SharedStoreError {
 impl EventError for SharedStoreError {
     fn translated(&self) -> LoreError {
         match self {
-            SharedStoreError::InvalidPath(_) => LoreError::InvalidArguments,
+            Self::InvalidPath(_) => LoreError::InvalidArguments,
             _ => LoreError::Internal,
         }
     }

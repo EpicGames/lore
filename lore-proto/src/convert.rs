@@ -12,7 +12,7 @@ use lore_base::types::LockResource;
 
 impl From<Address> for crate::model::Address {
     fn from(address: Address) -> Self {
-        crate::model::Address {
+        Self {
             hash: address.hash.into(),
             context: address.context.into(),
         }
@@ -21,7 +21,7 @@ impl From<Address> for crate::model::Address {
 
 impl From<&Address> for crate::model::Address {
     fn from(address: &Address) -> Self {
-        crate::model::Address {
+        Self {
             hash: address.hash.into(),
             context: address.context.into(),
         }
@@ -30,7 +30,7 @@ impl From<&Address> for crate::model::Address {
 
 impl From<crate::model::Address> for Address {
     fn from(address: crate::model::Address) -> Self {
-        Address {
+        Self {
             hash: Hash::from(address.hash),
             context: Context::from(address.context),
         }
@@ -39,7 +39,7 @@ impl From<crate::model::Address> for Address {
 
 impl From<&crate::model::Address> for Address {
     fn from(address: &crate::model::Address) -> Self {
-        Address {
+        Self {
             hash: address.hash.as_ref().into(),
             context: address.context.as_ref().into(),
         }
@@ -48,7 +48,7 @@ impl From<&crate::model::Address> for Address {
 
 impl From<Fragment> for crate::model::Fragment {
     fn from(fragment: Fragment) -> Self {
-        crate::model::Fragment {
+        Self {
             flags: fragment.flags,
             size_payload: fragment.size_payload,
             size_content: fragment.size_content,
@@ -58,7 +58,7 @@ impl From<Fragment> for crate::model::Fragment {
 
 impl From<&Fragment> for crate::model::Fragment {
     fn from(fragment: &Fragment) -> Self {
-        crate::model::Fragment {
+        Self {
             flags: fragment.flags,
             size_payload: fragment.size_payload,
             size_content: fragment.size_content,
@@ -68,7 +68,7 @@ impl From<&Fragment> for crate::model::Fragment {
 
 impl From<crate::model::Fragment> for Fragment {
     fn from(fragment: crate::model::Fragment) -> Self {
-        Fragment {
+        Self {
             flags: fragment.flags,
             size_payload: fragment.size_payload,
             size_content: fragment.size_content,
@@ -78,7 +78,7 @@ impl From<crate::model::Fragment> for Fragment {
 
 impl From<&crate::model::Fragment> for Fragment {
     fn from(fragment: &crate::model::Fragment) -> Self {
-        Fragment {
+        Self {
             flags: fragment.flags,
             size_payload: fragment.size_payload,
             size_content: fragment.size_content,
@@ -90,7 +90,7 @@ impl From<&crate::model::Fragment> for Fragment {
 
 impl From<&BranchPoint> for crate::model::BranchPoint {
     fn from(point: &BranchPoint) -> Self {
-        crate::model::BranchPoint {
+        Self {
             branch: point.branch.into(),
             revision: point.revision.into(),
         }
@@ -99,7 +99,7 @@ impl From<&BranchPoint> for crate::model::BranchPoint {
 
 impl From<crate::model::BranchPoint> for BranchPoint {
     fn from(point: crate::model::BranchPoint) -> Self {
-        BranchPoint {
+        Self {
             branch: point.branch.into(),
             revision: point.revision.into(),
         }
@@ -122,7 +122,7 @@ impl From<BranchMetadata> for crate::model::Branch {
             .map(|parent| parent.branch.clone())
             .or(Some(Context::default().into()));
 
-        crate::model::Branch {
+        Self {
             id: metadata.id.into(),
             name: metadata.name,
             category: metadata.category,
@@ -149,7 +149,7 @@ impl From<crate::model::Branch> for BranchMetadata {
                 revision: branch_point.into(),
             });
         }
-        BranchMetadata {
+        Self {
             id: metadata.id.into(),
             name: metadata.name.clone(),
             category: metadata.category.clone(),
@@ -165,7 +165,7 @@ impl From<crate::model::Branch> for BranchMetadata {
 
 impl From<&BranchPoint> for crate::lore::model::v1::BranchPoint {
     fn from(point: &BranchPoint) -> Self {
-        crate::lore::model::v1::BranchPoint {
+        Self {
             branch_id: point.branch.into(),
             revision_signature: point.revision.into(),
         }
@@ -174,7 +174,7 @@ impl From<&BranchPoint> for crate::lore::model::v1::BranchPoint {
 
 impl From<crate::lore::model::v1::BranchPoint> for BranchPoint {
     fn from(point: crate::lore::model::v1::BranchPoint) -> Self {
-        BranchPoint {
+        Self {
             branch: point.branch_id.into(),
             revision: point.revision_signature.into(),
         }
@@ -183,7 +183,7 @@ impl From<crate::lore::model::v1::BranchPoint> for BranchPoint {
 
 impl From<Address> for crate::lore::model::v1::Address {
     fn from(address: Address) -> Self {
-        crate::lore::model::v1::Address {
+        Self {
             hash: address.hash.into(),
             context: address.context.into(),
         }
@@ -192,7 +192,7 @@ impl From<Address> for crate::lore::model::v1::Address {
 
 impl From<&Address> for crate::lore::model::v1::Address {
     fn from(address: &Address) -> Self {
-        crate::lore::model::v1::Address {
+        Self {
             hash: address.hash.into(),
             context: address.context.into(),
         }
@@ -201,7 +201,7 @@ impl From<&Address> for crate::lore::model::v1::Address {
 
 impl From<crate::lore::model::v1::Address> for Address {
     fn from(address: crate::lore::model::v1::Address) -> Self {
-        Address {
+        Self {
             hash: Hash::from(address.hash),
             context: Context::from(address.context),
         }
@@ -210,7 +210,7 @@ impl From<crate::lore::model::v1::Address> for Address {
 
 impl From<&crate::lore::model::v1::Address> for Address {
     fn from(address: &crate::lore::model::v1::Address) -> Self {
-        Address {
+        Self {
             hash: address.hash.as_ref().into(),
             context: address.context.as_ref().into(),
         }
@@ -219,7 +219,7 @@ impl From<&crate::lore::model::v1::Address> for Address {
 
 impl From<Fragment> for crate::lore::model::v1::Fragment {
     fn from(fragment: Fragment) -> Self {
-        crate::lore::model::v1::Fragment {
+        Self {
             flags: fragment.flags,
             size_payload: fragment.size_payload,
             size_content: fragment.size_content,
@@ -229,7 +229,7 @@ impl From<Fragment> for crate::lore::model::v1::Fragment {
 
 impl From<&Fragment> for crate::lore::model::v1::Fragment {
     fn from(fragment: &Fragment) -> Self {
-        crate::lore::model::v1::Fragment {
+        Self {
             flags: fragment.flags,
             size_payload: fragment.size_payload,
             size_content: fragment.size_content,
@@ -239,7 +239,7 @@ impl From<&Fragment> for crate::lore::model::v1::Fragment {
 
 impl From<crate::lore::model::v1::Fragment> for Fragment {
     fn from(fragment: crate::lore::model::v1::Fragment) -> Self {
-        Fragment {
+        Self {
             flags: fragment.flags,
             size_payload: fragment.size_payload,
             size_content: fragment.size_content,
@@ -249,7 +249,7 @@ impl From<crate::lore::model::v1::Fragment> for Fragment {
 
 impl From<&crate::lore::model::v1::Fragment> for Fragment {
     fn from(fragment: &crate::lore::model::v1::Fragment) -> Self {
-        Fragment {
+        Self {
             flags: fragment.flags,
             size_payload: fragment.size_payload,
             size_content: fragment.size_content,
@@ -261,7 +261,7 @@ impl From<&crate::lore::model::v1::Fragment> for Fragment {
 
 impl From<LockData> for crate::lock::Lock {
     fn from(lock: LockData) -> Self {
-        crate::lock::Lock {
+        Self {
             resource: Some(crate::lock::Resource {
                 branch: lock.resource.branch.into(),
                 hash: lock.resource.hash.into(),
@@ -278,7 +278,7 @@ impl From<LockData> for crate::lock::Lock {
 
 impl From<&LockData> for crate::lock::Lock {
     fn from(lock: &LockData) -> Self {
-        crate::lock::Lock {
+        Self {
             resource: Some(crate::lock::Resource {
                 branch: lock.resource.branch.into(),
                 hash: lock.resource.hash.into(),
@@ -296,7 +296,7 @@ impl From<&LockData> for crate::lock::Lock {
 impl From<crate::lock::Lock> for LockData {
     fn from(lock: crate::lock::Lock) -> Self {
         let resource = lock.resource.unwrap_or_default();
-        LockData {
+        Self {
             resource: LockResource {
                 branch: resource.branch.into(),
                 hash: resource.hash.into(),
@@ -322,7 +322,7 @@ impl From<&crate::lock::Lock> for LockData {
                 description: resource.description.clone(),
             })
             .unwrap_or_default();
-        LockData {
+        Self {
             resource,
             owner: lock.owner.clone(),
             locked_at: lock
@@ -335,7 +335,7 @@ impl From<&crate::lock::Lock> for LockData {
 
 impl From<LockResource> for crate::lock::Resource {
     fn from(resource: LockResource) -> Self {
-        crate::lock::Resource {
+        Self {
             branch: resource.branch.into(),
             hash: resource.hash.into(),
             description: resource.description,
@@ -345,7 +345,7 @@ impl From<LockResource> for crate::lock::Resource {
 
 impl From<&LockResource> for crate::lock::Resource {
     fn from(resource: &LockResource) -> Self {
-        crate::lock::Resource {
+        Self {
             branch: resource.branch.into(),
             hash: resource.hash.into(),
             description: resource.description.clone(),
@@ -355,7 +355,7 @@ impl From<&LockResource> for crate::lock::Resource {
 
 impl From<crate::lock::Resource> for LockResource {
     fn from(resource: crate::lock::Resource) -> Self {
-        LockResource {
+        Self {
             branch: resource.branch.into(),
             hash: resource.hash.into(),
             description: resource.description,
@@ -365,7 +365,7 @@ impl From<crate::lock::Resource> for LockResource {
 
 impl From<&crate::lock::Resource> for LockResource {
     fn from(resource: &crate::lock::Resource) -> Self {
-        LockResource {
+        Self {
             branch: BranchId::from(resource.branch.as_ref()),
             hash: Hash::from(resource.hash.as_ref()),
             description: resource.description.clone(),

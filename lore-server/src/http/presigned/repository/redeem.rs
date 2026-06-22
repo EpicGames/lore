@@ -64,23 +64,21 @@ impl IntoResponse for RedeemError {
         warn!("get_presigned_content error: {:?}", &self);
 
         let (status, msg) = match self {
-            e @ (RedeemError::ParseRepository(_) | RedeemError::ParseAddress(_)) => {
+            e @ (Self::ParseRepository(_) | Self::ParseAddress(_)) => {
                 (StatusCode::BAD_REQUEST, e.to_string())
             }
-            RedeemError::InvalidToken(_) | RedeemError::TokenMismatch => (
+            Self::InvalidToken(_) | Self::TokenMismatch => (
                 StatusCode::UNAUTHORIZED,
                 "invalid or expired token".to_string(),
             ),
-            RedeemError::ReadStream(ref e)
-                if e.is_address_not_found() || e.is_payload_not_found() =>
-            {
+            Self::ReadStream(ref e) if e.is_address_not_found() || e.is_payload_not_found() => {
                 (StatusCode::NOT_FOUND, "address not found".to_string())
             }
-            RedeemError::NotConfigured => (
+            Self::NotConfigured => (
                 StatusCode::NOT_FOUND,
                 "presigned URL feature is not enabled".to_string(),
             ),
-            RedeemError::ReadStream(_) | RedeemError::HeaderGeneration(_) => (
+            Self::ReadStream(_) | Self::HeaderGeneration(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong. See server log for more info.".to_string(),
             ),

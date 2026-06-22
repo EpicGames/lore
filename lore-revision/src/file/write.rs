@@ -86,11 +86,11 @@ pub enum WriteError {
 impl EventError for WriteError {
     fn translated(&self) -> LoreError {
         match self {
-            WriteError::InvalidArguments(_)
-            | WriteError::InvalidPath(_)
-            | WriteError::InvalidAddress(_) => LoreError::InvalidArguments,
-            WriteError::RevisionNotFound(_) | WriteError::NotFound(_) => LoreError::NotFound,
-            WriteError::FileNotFound(_) => LoreError::FileNotFound,
+            Self::InvalidArguments(_) | Self::InvalidPath(_) | Self::InvalidAddress(_) => {
+                LoreError::InvalidArguments
+            }
+            Self::RevisionNotFound(_) | Self::NotFound(_) => LoreError::NotFound,
+            Self::FileNotFound(_) => LoreError::FileNotFound,
             _ => LoreError::Internal,
         }
     }

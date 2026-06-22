@@ -16,7 +16,7 @@ pub struct RsConsul(Consul);
 
 impl From<rs_consul::Consul> for RsConsul {
     fn from(value: rs_consul::Consul) -> Self {
-        RsConsul(value)
+        Self(value)
     }
 }
 

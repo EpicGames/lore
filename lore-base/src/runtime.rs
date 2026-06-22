@@ -545,7 +545,7 @@ pub struct TokioSettings {
 
 impl Default for TokioSettings {
     fn default() -> Self {
-        TokioSettings {
+        Self {
             max_blocking_threads: default_blocking_threads(),
             thread_keep_alive_seconds: default_thread_keep_alive(),
             worker_threads: None,

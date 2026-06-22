@@ -61,7 +61,7 @@ pub struct ProgressBarOptions {
 
 impl Default for ProgressBarOptions {
     fn default() -> Self {
-        ProgressBarOptions {
+        Self {
             units: None,
             max_len: 20,
             fg_color: CommonStyles::PROGRESS_FG,
@@ -90,11 +90,11 @@ impl ProgressBar {
     /// `Drop` does not signal stop, so dropping the temporary does not stop
     /// the render thread.
     fn new_non_owner(data: Arc<Mutex<ProgressBarData>>) -> Self {
-        ProgressBar { data, owner: false }
+        Self { data, owner: false }
     }
 
     pub fn new_spinner(message: impl Into<String>) -> Self {
-        let pb = ProgressBar {
+        let pb = Self {
             data: Arc::new(Mutex::new(ProgressBarData {
                 progress: 0,
                 max_progress: 0,
@@ -116,7 +116,7 @@ impl ProgressBar {
     }
 
     pub fn new_with_options(max_progress: u64, options: ProgressBarOptions) -> Self {
-        let pb = ProgressBar {
+        let pb = Self {
             data: Arc::new(Mutex::new(ProgressBarData {
                 progress: 0,
                 max_progress,
@@ -278,13 +278,13 @@ impl Drop for ProgressBarSuspendToken {
 
 impl WeakProgressBar {
     fn new(pb: &ProgressBar) -> Self {
-        WeakProgressBar {
+        Self {
             data: Arc::downgrade(&pb.data),
         }
     }
 
     const fn empty() -> Self {
-        WeakProgressBar { data: Weak::new() }
+        Self { data: Weak::new() }
     }
 
     fn upgrade(&self) -> Option<ProgressBar> {

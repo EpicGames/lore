@@ -493,7 +493,7 @@ struct StateRuntime {
 
 impl StateRuntime {
     pub fn new(signature: Hash, rehash_node_names: bool) -> Self {
-        StateRuntime {
+        Self {
             signature,
             tree: None,
             block_address: Bytes::default(),
@@ -537,7 +537,7 @@ impl State {
             .await
             .internal("Failed to deserialize anchor")?;
         Ok((
-            State::deserialize(repository.clone(), current_revision).await?,
+            Self::deserialize(repository.clone(), current_revision).await?,
             branch,
         ))
     }
@@ -552,7 +552,7 @@ impl State {
         let (current_revision, branch) = crate::instance::load_current_anchor(&repository)
             .await
             .internal("Failed to deserialize anchor")?;
-        let state_current = State::deserialize(repository.clone(), current_revision).await?;
+        let state_current = Self::deserialize(repository.clone(), current_revision).await?;
 
         let state_staged = match crate::instance::load_staged_revision(&repository)
             .await
@@ -560,7 +560,7 @@ impl State {
             .flatten()
         {
             Some(staged_revision) if staged_revision != current_revision => {
-                Some(State::deserialize(repository.clone(), staged_revision).await?)
+                Some(Self::deserialize(repository.clone(), staged_revision).await?)
             }
             _ => None,
         };
@@ -573,7 +573,7 @@ impl State {
         signature: Hash,
     ) -> Result<Arc<Self>, StateError> {
         if signature.is_zero() {
-            return Ok(Arc::new(State::new()));
+            return Ok(Arc::new(Self::new()));
         }
         let address = Address::zero_context_hash(signature);
         let options = read_options_from_repository(&repository);
@@ -605,7 +605,7 @@ impl State {
             let rehash_node_names = data.format < StateFormat::LowerCaseHash as u32;
             // Clean flags
             data.flags &= !StateFlags::Dirty;
-            Ok(Arc::new(State {
+            Ok(Arc::new(Self {
                 data: parking_lot::RwLock::new(data),
                 runtime: parking_lot::RwLock::new(StateRuntime::new(signature, rehash_node_names)),
                 unused: tokio::sync::Semaphore::new(1),
@@ -1996,7 +1996,7 @@ impl State {
         } else if node.is_link() {
             let link = node.linked_node();
             let linked_repository = Arc::new(repository.to_link_context(link.repository).await);
-            let link_state = State::deserialize(linked_repository.clone(), link.revision).await?;
+            let link_state = Self::deserialize(linked_repository.clone(), link.revision).await?;
             Box::pin(link_state.node_children(linked_repository.clone(), link.node)).await
         } else {
             Ok(vec![])
@@ -2429,7 +2429,7 @@ impl State {
                 if node.is_link() {
                     let link = node.linked_node();
                     repository = Arc::new(repository.to_link_context(link.repository).await);
-                    let link_state = State::deserialize(repository.clone(), link.revision).await?;
+                    let link_state = Self::deserialize(repository.clone(), link.revision).await?;
                     return Box::pin(link_state.find_relative_node_link(
                         repository,
                         link.node,
@@ -2501,7 +2501,7 @@ impl State {
             Ok(*block_reader.node(inode))
         } else {
             let repository = Arc::new(repository.to_link_context(node_link.repository).await);
-            let state = State::deserialize(repository.clone(), node_link.revision).await?;
+            let state = Self::deserialize(repository.clone(), node_link.revision).await?;
             let block = state.block(repository, iblock).await?;
             let block_reader = block.read();
             Ok(*block_reader.node(inode))
@@ -2607,7 +2607,7 @@ impl State {
             let signature = link.revision;
             let link_node = link.node;
             let linked_repository = Arc::new(repository.to_link_context(linked_repository).await);
-            let link_state = State::deserialize(linked_repository.clone(), signature)
+            let link_state = Self::deserialize(linked_repository.clone(), signature)
                 .await
                 .internal("Link error")?;
 
@@ -2679,7 +2679,7 @@ impl State {
             let signature = link.revision;
             let link_node = link.node;
             let linked_repository = Arc::new(repository.to_link_context(linked_repository).await);
-            let link_state = State::deserialize(linked_repository.clone(), signature)
+            let link_state = Self::deserialize(linked_repository.clone(), signature)
                 .await
                 .internal("Link error")?;
 
@@ -4465,7 +4465,7 @@ pub struct FilesystemDiffStats {
 }
 
 impl FilesystemDiffStats {
-    fn append(&mut self, stats: FilesystemDiffStats) {
+    fn append(&mut self, stats: Self) {
         self.file_add
             .fetch_add(stats.file_add.load(Ordering::Relaxed), Ordering::Relaxed);
         self.file_delete

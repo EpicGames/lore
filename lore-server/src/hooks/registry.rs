@@ -297,7 +297,7 @@ impl<'de> serde::Deserialize<'de> for HookSettings {
         // Keep remaining config
         let config = toml::Value::Table(table);
 
-        Ok(HookSettings { enabled, config })
+        Ok(Self { enabled, config })
     }
 }
 

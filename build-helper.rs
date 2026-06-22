@@ -86,7 +86,7 @@ impl Default for LoreVergen {
             warning = revision_info.warning;
         }
 
-        LoreVergen {
+        Self {
             lore_library_version_name: format!("{package_version}+{lib_version}"),
             warning,
         }

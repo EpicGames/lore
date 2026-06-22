@@ -21,7 +21,7 @@ impl CorrelationId {
 
 impl Default for CorrelationId {
     fn default() -> Self {
-        CorrelationId::new(uuid::Uuid::new_v4())
+        Self::new(uuid::Uuid::new_v4())
     }
 }
 

@@ -351,19 +351,17 @@ pub enum MergeError {
 impl EventError for MergeError {
     fn translated(&self) -> LoreError {
         match self {
-            MergeError::Disconnected(_) => LoreError::Connection,
-            MergeError::SlowDown(_) => LoreError::SlowDown,
-            MergeError::Oversized(_) => LoreError::Oversized,
-            MergeError::FileNotFound(_) => LoreError::FileNotFound,
-            MergeError::NotFound(_)
-            | MergeError::BranchNotFound(_)
-            | MergeError::LayerNotFound(_)
-            | MergeError::RevisionNotFound(_) => LoreError::NotFound,
-            MergeError::AddressNotFound(_) => LoreError::AddressNotFound,
-            MergeError::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            MergeError::InvalidPath(_) | MergeError::InvalidArguments(_) => {
-                LoreError::InvalidArguments
-            }
+            Self::Disconnected(_) => LoreError::Connection,
+            Self::SlowDown(_) => LoreError::SlowDown,
+            Self::Oversized(_) => LoreError::Oversized,
+            Self::FileNotFound(_) => LoreError::FileNotFound,
+            Self::NotFound(_)
+            | Self::BranchNotFound(_)
+            | Self::LayerNotFound(_)
+            | Self::RevisionNotFound(_) => LoreError::NotFound,
+            Self::AddressNotFound(_) => LoreError::AddressNotFound,
+            Self::PayloadNotFound(_) => LoreError::PayloadNotFound,
+            Self::InvalidPath(_) | Self::InvalidArguments(_) => LoreError::InvalidArguments,
             _ => LoreError::Internal,
         }
     }

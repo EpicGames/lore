@@ -96,8 +96,8 @@ enum PutError {
 impl EventError for PutError {
     fn translated(&self) -> LoreError {
         match self {
-            PutError::InvalidArguments(_) => LoreError::InvalidArguments,
-            PutError::Internal(_) => LoreError::Internal,
+            Self::InvalidArguments(_) => LoreError::InvalidArguments,
+            Self::Internal(_) => LoreError::Internal,
         }
     }
 

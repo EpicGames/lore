@@ -192,7 +192,7 @@ where
                             // ensure we have capacity to process it. If not, wait until we acquire
                             // a permit before executing the task.
                             #[cfg(not(test))]
-                            let permit_future = TaskQueue::<T>::permit(
+                            let permit_future = Self::permit(
                                 task_limit.clone(),
                                 "concurrency",
                                 worker_otel.clone(),
@@ -339,7 +339,7 @@ where
         work: BoxFuture<'static, T>,
     ) -> Result<TaskProgress<T>, TaskQueueError> {
         #[cfg(not(test))]
-        let permit_future = TaskQueue::<T>::permit(
+        let permit_future = Self::permit(
             self.submission_limit.clone(),
             "submission",
             self.otel.clone(),

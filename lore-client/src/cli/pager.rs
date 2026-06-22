@@ -40,7 +40,7 @@ impl Default for Pager {
 
 impl Pager {
     pub fn new() -> Self {
-        let pager = Pager {
+        let pager = Self {
             process: PagerProcess::new().map(|pd| Arc::new(Mutex::new(pd))),
         };
         #[cfg(debug_assertions)]
@@ -80,7 +80,7 @@ impl PagerProcess {
             .and_then(|mut cmd| cmd.stdin(Stdio::piped()).spawn().ok())
         };
 
-        child.map(|child| PagerProcess { child })
+        child.map(|child| Self { child })
     }
 
     fn stdin(&self) -> std::io::Result<&ChildStdin> {

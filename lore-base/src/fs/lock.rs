@@ -16,7 +16,7 @@ pub struct FSLock {
 }
 
 impl FSLock {
-    pub fn acquire_file_lock(path: impl AsRef<Path>) -> std::io::Result<FSLock> {
+    pub fn acquire_file_lock(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let mut path = path.as_ref().to_path_buf();
         let mut file_name = path
             .file_name()
@@ -33,12 +33,12 @@ impl FSLock {
         })
     }
 
-    pub fn acquire_directory_lock(path: impl AsRef<Path>) -> std::io::Result<FSLock> {
+    pub fn acquire_directory_lock(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().canonicalize()?.join("lock");
         Self::acquire_exact_path(&path)
     }
 
-    fn acquire_exact_path(path: impl AsRef<Path> + Copy) -> std::io::Result<FSLock> {
+    fn acquire_exact_path(path: impl AsRef<Path> + Copy) -> std::io::Result<Self> {
         let mut retry = 2;
         let file = loop {
             let file = OpenOptions::new()

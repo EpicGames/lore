@@ -92,12 +92,12 @@ pub enum CreateError {
 impl EventError for CreateError {
     fn translated(&self) -> LoreError {
         match self {
-            CreateError::Disconnected(_) => LoreError::Connection,
-            CreateError::SlowDown(_) => LoreError::SlowDown,
-            CreateError::Oversized(_) => LoreError::Oversized,
-            CreateError::NotFound(_) => LoreError::NotFound,
-            CreateError::RepositoryAlreadyExists(_) => LoreError::AlreadyExists,
-            CreateError::InvalidPath(_) => LoreError::InvalidArguments,
+            Self::Disconnected(_) => LoreError::Connection,
+            Self::SlowDown(_) => LoreError::SlowDown,
+            Self::Oversized(_) => LoreError::Oversized,
+            Self::NotFound(_) => LoreError::NotFound,
+            Self::RepositoryAlreadyExists(_) => LoreError::AlreadyExists,
+            Self::InvalidPath(_) => LoreError::InvalidArguments,
             _ => LoreError::Internal,
         }
     }

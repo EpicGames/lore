@@ -77,8 +77,8 @@ enum UploadError {
 impl EventError for UploadError {
     fn translated(&self) -> LoreError {
         match self {
-            UploadError::InvalidArguments(_) => LoreError::InvalidArguments,
-            UploadError::Internal(_) => LoreError::Internal,
+            Self::InvalidArguments(_) => LoreError::InvalidArguments,
+            Self::Internal(_) => LoreError::Internal,
         }
     }
 

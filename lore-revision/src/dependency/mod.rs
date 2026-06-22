@@ -101,8 +101,8 @@ pub enum DependencyError {
 impl EventError for DependencyError {
     fn translated(&self) -> crate::interface::LoreError {
         match self {
-            DependencyError::FileNotFound(_) => crate::interface::LoreError::NotFound,
-            DependencyError::Disconnected(_) => crate::interface::LoreError::Connection,
+            Self::FileNotFound(_) => crate::interface::LoreError::NotFound,
+            Self::Disconnected(_) => crate::interface::LoreError::Connection,
             _ => crate::interface::LoreError::Internal,
         }
     }
@@ -542,7 +542,7 @@ impl DependencyData {
             });
         }
 
-        Ok(DependencyData { entries })
+        Ok(Self { entries })
     }
 
     /// Returns the exact byte count that [`serialize`](Self::serialize) will

@@ -74,18 +74,16 @@ pub enum ResetError {
 impl EventError for ResetError {
     fn translated(&self) -> LoreError {
         match self {
-            ResetError::Disconnected(_) => LoreError::Connection,
-            ResetError::SlowDown(_) => LoreError::SlowDown,
-            ResetError::Oversized(_) => LoreError::Oversized,
-            ResetError::FileNotFound(_) => LoreError::FileNotFound,
-            ResetError::NotFound(_)
-            | ResetError::BranchNotFound(_)
-            | ResetError::RevisionNotFound(_) => LoreError::NotFound,
-            ResetError::AddressNotFound(_) => LoreError::AddressNotFound,
-            ResetError::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            ResetError::InvalidPath(_) | ResetError::InvalidArguments(_) => {
-                LoreError::InvalidArguments
+            Self::Disconnected(_) => LoreError::Connection,
+            Self::SlowDown(_) => LoreError::SlowDown,
+            Self::Oversized(_) => LoreError::Oversized,
+            Self::FileNotFound(_) => LoreError::FileNotFound,
+            Self::NotFound(_) | Self::BranchNotFound(_) | Self::RevisionNotFound(_) => {
+                LoreError::NotFound
             }
+            Self::AddressNotFound(_) => LoreError::AddressNotFound,
+            Self::PayloadNotFound(_) => LoreError::PayloadNotFound,
+            Self::InvalidPath(_) | Self::InvalidArguments(_) => LoreError::InvalidArguments,
             _ => LoreError::Internal,
         }
     }

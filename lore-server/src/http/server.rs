@@ -68,7 +68,7 @@ impl ServerHealth {
     pub fn new_without_availability(
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     ) -> Self {
-        ServerHealth {
+        Self {
             immutable_store: Arc::downgrade(&immutable_store),
             available: AtomicBool::new(true),
             interval_timeout: None,

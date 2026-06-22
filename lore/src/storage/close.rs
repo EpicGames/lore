@@ -72,8 +72,8 @@ enum CloseError {
 impl EventError for CloseError {
     fn translated(&self) -> LoreError {
         match self {
-            CloseError::InvalidArguments(_) => LoreError::InvalidArguments,
-            CloseError::Internal(_) => LoreError::Internal,
+            Self::InvalidArguments(_) => LoreError::InvalidArguments,
+            Self::Internal(_) => LoreError::Internal,
         }
     }
 

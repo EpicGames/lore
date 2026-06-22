@@ -52,7 +52,7 @@ impl ExistsBatch {
         ]
     }
 
-    pub fn parse(mut bytes: Bytes) -> Result<ExistsBatch, MessageParseError> {
+    pub fn parse(mut bytes: Bytes) -> Result<Self, MessageParseError> {
         if bytes.len() < BASE_REQUEST_SIZE {
             return Err(MessageParseError::InvalidFieldLength);
         };
@@ -72,7 +72,7 @@ impl ExistsBatch {
             return Err(MessageParseError::InvalidFieldLength);
         }
 
-        Ok(ExistsBatch {
+        Ok(Self {
             header,
             store_match,
             addresses,
@@ -105,7 +105,7 @@ impl ExistsBatchResponse {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(ExistsBatchResponse { matches })
+        Ok(Self { matches })
     }
 }
 

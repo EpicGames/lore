@@ -99,7 +99,7 @@ impl CommandHeader {
             bytes
         });
 
-        CommandHeader {
+        Self {
             cmd,
             error,
             size_or_status: size_status,

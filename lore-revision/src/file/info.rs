@@ -91,11 +91,9 @@ pub enum InfoError {
 impl EventError for InfoError {
     fn translated(&self) -> LoreError {
         match self {
-            InfoError::InvalidArguments(_) | InfoError::InvalidPath(_) => {
-                LoreError::InvalidArguments
-            }
-            InfoError::RevisionNotFound(_) | InfoError::NotFound(_) => LoreError::NotFound,
-            InfoError::FileNotFound(_) => LoreError::FileNotFound,
+            Self::InvalidArguments(_) | Self::InvalidPath(_) => LoreError::InvalidArguments,
+            Self::RevisionNotFound(_) | Self::NotFound(_) => LoreError::NotFound,
+            Self::FileNotFound(_) => LoreError::FileNotFound,
             _ => LoreError::Internal,
         }
     }

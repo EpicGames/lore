@@ -101,8 +101,8 @@ enum CopyError {
 impl EventError for CopyError {
     fn translated(&self) -> LoreError {
         match self {
-            CopyError::InvalidArguments(_) => LoreError::InvalidArguments,
-            CopyError::Internal(_) => LoreError::Internal,
+            Self::InvalidArguments(_) => LoreError::InvalidArguments,
+            Self::Internal(_) => LoreError::Internal,
         }
     }
 

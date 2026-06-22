@@ -86,9 +86,9 @@ const CHUNK_SIZE_ENTRY: usize = 8;
 struct Key(Hash);
 
 impl Key {
-    fn make_typed(mut hash: Hash, key: KeyType) -> Key {
+    fn make_typed(mut hash: Hash, key: KeyType) -> Self {
         hash.data_mut()[2] = key as u8;
-        Key(hash)
+        Self(hash)
     }
 
     fn hash(&self) -> Hash {
@@ -318,7 +318,7 @@ impl MutableStoreBucket {
     }
 
     fn serialize_files(
-        bucket: OwnedRwLockReadGuard<MutableStoreBucket, MutableStoreBucket>,
+        bucket: OwnedRwLockReadGuard<Self, Self>,
         group: Arc<MutableStoreGroup>,
         bucket_index: usize,
         path: PathBuf,
@@ -410,7 +410,7 @@ impl MutableStoreBucket {
     }
 
     pub async fn serialize(
-        bucket: OwnedRwLockReadGuard<MutableStoreBucket, MutableStoreBucket>,
+        bucket: OwnedRwLockReadGuard<Self, Self>,
         group: Arc<MutableStoreGroup>,
         path: &Path,
         group_index: usize,
@@ -460,7 +460,7 @@ impl MutableStoreBucket {
     /// Reuses `serialize_files` internally; with `sync_data = true`, the path becomes
     /// `index_<bb>.new.tmp` → atomic rename → `index_<bb>.new`.
     pub async fn serialize_to_new(
-        bucket: OwnedRwLockReadGuard<MutableStoreBucket, MutableStoreBucket>,
+        bucket: OwnedRwLockReadGuard<Self, Self>,
         group: Arc<MutableStoreGroup>,
         path: &Path,
         group_index: usize,
@@ -787,7 +787,7 @@ impl LocalMutableStore {
             MutableStoreVersion::TypedItems as u32
         };
 
-        let mut store = LocalMutableStore {
+        let mut store = Self {
             path: mutable_path,
             lock,
             group: Vec::with_capacity(GROUP_COUNT),
@@ -845,7 +845,7 @@ impl LocalMutableStore {
     }
 
     fn flush_delayed(
-        weak_ref: Weak<LocalMutableStore>,
+        weak_ref: Weak<Self>,
         group_index: usize,
         bucket_index: usize,
         delay: u64,

@@ -52,18 +52,18 @@ impl IntoResponse for PresignError {
         warn!("presign_repository_content error: {:?}", &self);
 
         let (status, msg) = match self {
-            e @ (PresignError::ParseRepository(_) | PresignError::ParseAddress(_)) => {
+            e @ (Self::ParseRepository(_) | Self::ParseAddress(_)) => {
                 (StatusCode::BAD_REQUEST, e.to_string())
             }
-            PresignError::NotConfigured => (
+            Self::NotConfigured => (
                 StatusCode::NOT_FOUND,
                 "presigned URL feature is not enabled".to_string(),
             ),
-            PresignError::StoreError | PresignError::SystemTime(_) => (
+            Self::StoreError | Self::SystemTime(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong. See server log for more info.".to_string(),
             ),
-            PresignError::NotFound => (StatusCode::NOT_FOUND, "address not found".to_string()),
+            Self::NotFound => (StatusCode::NOT_FOUND, "address not found".to_string()),
         };
 
         let mut headers = HeaderMap::new();

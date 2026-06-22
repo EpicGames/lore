@@ -13,11 +13,11 @@ pub struct Weighting<T: Clone> {
 }
 
 impl<T: Clone> Weighting<T> {
-    pub fn new(weighted_values: Vec<(f32, T)>) -> Weighting<T> {
+    pub fn new(weighted_values: Vec<(f32, T)>) -> Self {
         let weights: Vec<f32> = weighted_values.iter().map(|&(weight, _)| weight).collect();
         let values = weighted_values.into_iter().map(|(_, t)| t).collect();
         let table = WeightedAliasIndex::new(weights).unwrap();
-        Weighting { values, table }
+        Self { values, table }
     }
 
     pub fn generate(&mut self, rng: &mut impl Rng) -> T {
@@ -46,8 +46,8 @@ impl ProbabilityWeighting {
 }
 
 impl Default for ProbabilityWeighting {
-    fn default() -> ProbabilityWeighting {
-        ProbabilityWeighting {
+    fn default() -> Self {
+        Self {
             repo_operation: RepoOperationWeighting::new(
                 RepoOperationKind::ALL
                     .iter()
@@ -75,7 +75,7 @@ pub struct FileOperationWeights {
 }
 
 impl Default for FileOperationWeights {
-    fn default() -> FileOperationWeights {
+    fn default() -> Self {
         Self {
             proportion_to_modify: 0.25,
             // Deletes are currently defaulted to off because tracking them across merges is difficult.

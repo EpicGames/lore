@@ -181,7 +181,7 @@ pub struct PackStore {
 
 impl PackStore {
     pub fn new(path: Option<PathBuf>, min_count: usize) -> Self {
-        PackStore {
+        Self {
             path: path.map(|path| {
                 let mut path = path;
                 path.push("pack");

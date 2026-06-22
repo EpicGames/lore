@@ -51,8 +51,8 @@ pub enum SetError {
 impl event::EventError for SetError {
     fn translated(&self) -> crate::interface::LoreError {
         match self {
-            SetError::InvalidArguments(_) => crate::interface::LoreError::InvalidArguments,
-            SetError::Disconnected(_) => crate::interface::LoreError::Connection,
+            Self::InvalidArguments(_) => crate::interface::LoreError::InvalidArguments,
+            Self::Disconnected(_) => crate::interface::LoreError::Connection,
             _ => crate::interface::LoreError::Internal,
         }
     }

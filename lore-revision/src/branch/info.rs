@@ -72,7 +72,7 @@ pub enum InfoError {
 impl EventError for InfoError {
     fn translated(&self) -> LoreError {
         match self {
-            InfoError::NotFound(_) => LoreError::NotFound,
+            Self::NotFound(_) => LoreError::NotFound,
             _ => LoreError::Internal,
         }
     }

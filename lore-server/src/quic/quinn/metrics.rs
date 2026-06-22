@@ -53,9 +53,9 @@ impl QuinnConnectionInstruments {
         }
     }
 
-    pub fn instance() -> &'static QuinnConnectionInstruments {
+    pub fn instance() -> &'static Self {
         static INSTANCE: OnceLock<QuinnConnectionInstruments> = OnceLock::new();
-        INSTANCE.get_or_init(QuinnConnectionInstruments::new)
+        INSTANCE.get_or_init(Self::new)
     }
 }
 

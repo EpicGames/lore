@@ -45,7 +45,7 @@ pub struct LoreRevisionInfoEventData {
 
 impl LoreRevisionInfoEventData {
     pub fn new(repository: RepositoryId, state: Arc<State>) -> Self {
-        LoreRevisionInfoEventData {
+        Self {
             repository,
             revision: state.revision(),
             revision_number: state.revision_number(),
@@ -78,7 +78,7 @@ pub struct LoreRevisionInfoDeltaEventData {
 
 impl LoreRevisionInfoDeltaEventData {
     pub fn new(path: &str, delta: &NodeDelta, file: bool, size: u64) -> Self {
-        LoreRevisionInfoDeltaEventData {
+        Self {
             path: path.into(),
             size,
             action: LoreFileAction::from(delta.action),

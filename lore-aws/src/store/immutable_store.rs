@@ -75,7 +75,7 @@ struct FragmentsEntry {
 
 impl From<&FragmentsEntry> for Address {
     fn from(value: &FragmentsEntry) -> Self {
-        Address {
+        Self {
             hash: value.hash,
             context: Context::from(&value.repository_context[size_of::<Context>()..]),
         }
@@ -233,14 +233,14 @@ enum FragmentsQuery {
 impl DynamoDbQuery for FragmentsQuery {
     fn key_condition_expression(&self) -> &str {
         match self {
-            FragmentsQuery::Repository(_, _) => "#pk = :hash and begins_with(#sk, :repository)",
-            FragmentsQuery::Hash(_) | FragmentsQuery::HashCount(_) => "#pk = :hash",
+            Self::Repository(_, _) => "#pk = :hash and begins_with(#sk, :repository)",
+            Self::Hash(_) | Self::HashCount(_) => "#pk = :hash",
         }
     }
 
     fn expression_attribute_names(&self) -> HashMap<String, String> {
         match self {
-            FragmentsQuery::Repository(_, _) => HashMap::from([
+            Self::Repository(_, _) => HashMap::from([
                 (
                     "#pk".to_string(),
                     FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
@@ -250,7 +250,7 @@ impl DynamoDbQuery for FragmentsQuery {
                     FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE.to_string(),
                 ),
             ]),
-            FragmentsQuery::Hash(_) | FragmentsQuery::HashCount(_) => HashMap::from([(
+            Self::Hash(_) | Self::HashCount(_) => HashMap::from([(
                 "#pk".to_string(),
                 FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
             )]),
@@ -259,7 +259,7 @@ impl DynamoDbQuery for FragmentsQuery {
 
     fn expression_attribute_values(&self) -> HashMap<String, AttributeValue> {
         match self {
-            FragmentsQuery::Repository(hash, repository) => HashMap::from([
+            Self::Repository(hash, repository) => HashMap::from([
                 (
                     ":hash".to_string(),
                     AttributeValue::B(Blob::new(hash.data())),
@@ -269,7 +269,7 @@ impl DynamoDbQuery for FragmentsQuery {
                     AttributeValue::B(Blob::new(repository.data())),
                 ),
             ]),
-            FragmentsQuery::Hash(hash) | FragmentsQuery::HashCount(hash) => HashMap::from([(
+            Self::Hash(hash) | Self::HashCount(hash) => HashMap::from([(
                 ":hash".to_string(),
                 AttributeValue::B(Blob::new(hash.data())),
             )]),
@@ -278,20 +278,20 @@ impl DynamoDbQuery for FragmentsQuery {
 
     fn limit(&self) -> Option<i32> {
         match self {
-            FragmentsQuery::Repository(_, _) | FragmentsQuery::Hash(_) => Some(1),
-            FragmentsQuery::HashCount(_) => None,
+            Self::Repository(_, _) | Self::Hash(_) => Some(1),
+            Self::HashCount(_) => None,
         }
     }
 
     fn select(&self) -> Option<Select> {
         match self {
-            FragmentsQuery::Repository(_, _) | FragmentsQuery::Hash(_) => None,
-            FragmentsQuery::HashCount(_) => Some(Select::Count),
+            Self::Repository(_, _) | Self::Hash(_) => None,
+            Self::HashCount(_) => Some(Select::Count),
         }
     }
 
     fn consistent_read(&self) -> bool {
-        matches!(self, FragmentsQuery::HashCount(_))
+        matches!(self, Self::HashCount(_))
     }
 }
 

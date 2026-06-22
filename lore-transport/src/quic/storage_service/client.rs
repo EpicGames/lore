@@ -99,7 +99,7 @@ impl StorageClient {
         quinn: quinn::Connection,
     ) -> Self {
         let quic = QuicConnection::with_v4(quinn, MAX_CHUNK_SIZE, true);
-        StorageClient {
+        Self {
             connection,
             remote_url: remote_url.to_string(),
             transport_config,
@@ -153,7 +153,7 @@ impl StorageClient {
         .await?;
         let connection_id = quinn.stable_id();
 
-        let storage = StorageClient::new(
+        let storage = Self::new(
             connection,
             remote_url,
             transport_config,

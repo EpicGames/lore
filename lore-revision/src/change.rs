@@ -30,25 +30,25 @@ pub enum FileAction {
 impl FileAction {
     pub fn as_string_short(self) -> &'static str {
         match self {
-            FileAction::Add => "A",
-            FileAction::Delete => "D",
-            FileAction::Move => "V",
-            FileAction::Copy => "C",
-            FileAction::Keep => "M",
+            Self::Add => "A",
+            Self::Delete => "D",
+            Self::Move => "V",
+            Self::Copy => "C",
+            Self::Keep => "M",
         }
     }
 
     pub fn from_node_flags(flags: u16) -> Self {
         if flags & NodeFlags::StagedDelete == NodeFlags::StagedDelete {
-            FileAction::Delete
+            Self::Delete
         } else if flags & NodeFlags::StagedAdd == NodeFlags::StagedAdd {
-            FileAction::Add
+            Self::Add
         } else if flags & NodeFlags::StagedMove == NodeFlags::StagedMove {
-            FileAction::Move
+            Self::Move
         } else if flags & NodeFlags::StagedCopy == NodeFlags::StagedCopy {
-            FileAction::Copy
+            Self::Copy
         } else {
-            FileAction::Keep
+            Self::Keep
         }
     }
 }
@@ -86,35 +86,35 @@ bitflagsops!(Flags, u16);
 
 impl Flags {
     pub fn is_stage(&self) -> bool {
-        self.contains(Flags::Staged)
+        self.contains(Self::Staged)
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.contains(Flags::Dirty)
+        self.contains(Self::Dirty)
     }
 
     pub fn is_merge(&self) -> bool {
-        self.contains(Flags::Merge)
+        self.contains(Self::Merge)
     }
 
     pub fn is_conflict(&self) -> bool {
-        self.contains(Flags::Conflict)
+        self.contains(Self::Conflict)
     }
 
     pub fn is_conflict_automerged(&self) -> bool {
-        self.contains(Flags::ConflictAutomerged)
+        self.contains(Self::ConflictAutomerged)
     }
 
     pub fn is_conflict_mine(&self) -> bool {
-        self.contains(Flags::ConflictMine)
+        self.contains(Self::ConflictMine)
     }
 
     pub fn is_conflict_theirs(&self) -> bool {
-        self.contains(Flags::ConflictTheirs)
+        self.contains(Self::ConflictTheirs)
     }
 
     pub fn is_conflict_unresolved(&self) -> bool {
-        self.contains(Flags::Conflict) && !self.contains(Flags::ConflictResolved)
+        self.contains(Self::Conflict) && !self.contains(Self::ConflictResolved)
     }
 }
 
@@ -129,7 +129,7 @@ pub struct NodeChangeState {
 
 impl NodeChangeState {
     pub fn invalid(&self) -> Self {
-        NodeChangeState {
+        Self {
             repository: self.repository.clone(),
             state: self.state.clone(),
             node: INVALID_NODE,
@@ -140,7 +140,7 @@ impl NodeChangeState {
 
     /// Create a `NodeChangeState` for a child node, inheriting repository and state from parent.
     pub fn from_child(&self, child_id: NodeID, child_node: &Node) -> Self {
-        NodeChangeState {
+        Self {
             repository: self.repository.clone(),
             state: self.state.clone(),
             node: child_id,
@@ -158,7 +158,7 @@ impl NodeChangeState {
         else {
             return self.invalid();
         };
-        NodeChangeState {
+        Self {
             repository: self.repository.clone(),
             state: self.state.clone(),
             node: node_id,

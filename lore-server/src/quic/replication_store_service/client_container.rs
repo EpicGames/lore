@@ -111,7 +111,7 @@ where
         config: ClientContainerConfig,
     ) -> Result<Self, ProtocolError> {
         let client = client_factory.make_client().await?;
-        let container = ClientContainer {
+        let container = Self {
             client_factory,
             generate_client_semaphore: Semaphore::new(1),
             client: client.into(),

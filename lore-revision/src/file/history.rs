@@ -78,7 +78,7 @@ impl LoreFileHistoryEventData {
             file_action = FileAction::Copy;
         }
 
-        LoreFileHistoryEventData {
+        Self {
             path: path.into(),
             repository: repository.id,
             revision: state.revision(),
@@ -142,13 +142,11 @@ pub enum FileHistoryError {
 impl EventError for FileHistoryError {
     fn translated(&self) -> LoreError {
         match self {
-            FileHistoryError::InvalidArguments(_) | FileHistoryError::InvalidPath(_) => {
-                LoreError::InvalidArguments
+            Self::InvalidArguments(_) | Self::InvalidPath(_) => LoreError::InvalidArguments,
+            Self::FileNotFound(_) => LoreError::FileNotFound,
+            Self::RevisionNotFound(_) | Self::BranchNotFound(_) | Self::NotFound(_) => {
+                LoreError::NotFound
             }
-            FileHistoryError::FileNotFound(_) => LoreError::FileNotFound,
-            FileHistoryError::RevisionNotFound(_)
-            | FileHistoryError::BranchNotFound(_)
-            | FileHistoryError::NotFound(_) => LoreError::NotFound,
             _ => LoreError::Internal,
         }
     }

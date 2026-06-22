@@ -446,7 +446,7 @@ pub trait FilterSlowDownExt<T, E> {
 }
 
 impl<T> FilterSlowDownExt<T, StateError> for Result<T, StateError> {
-    fn filter_slow_down(self) -> Result<Result<T, StateError>, Status> {
+    fn filter_slow_down(self) -> Result<Self, Status> {
         if let Err(err) = &self
             && err.is_slow_down()
         {
@@ -457,7 +457,7 @@ impl<T> FilterSlowDownExt<T, StateError> for Result<T, StateError> {
 }
 
 impl<T> FilterSlowDownExt<T, MetadataError> for Result<T, MetadataError> {
-    fn filter_slow_down(self) -> Result<Result<T, MetadataError>, Status> {
+    fn filter_slow_down(self) -> Result<Self, Status> {
         if let Err(err) = &self
             && err.is_slow_down()
         {

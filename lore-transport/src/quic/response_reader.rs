@@ -45,7 +45,7 @@ impl ResponseReader {
     ) -> Self {
         let pending = Arc::new(PendingCommandMap::new());
         let pending_clone = pending.clone();
-        ResponseReader {
+        Self {
             task: lore_spawn!({
                 async move {
                     let pending = pending_clone;

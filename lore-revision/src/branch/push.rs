@@ -256,18 +256,16 @@ pub struct PushOptions {
 impl EventError for PushError {
     fn translated(&self) -> LoreError {
         match self {
-            PushError::Disconnected(_) => LoreError::Connection,
-            PushError::SlowDown(_) => LoreError::SlowDown,
-            PushError::Oversized(_) => LoreError::Oversized,
-            PushError::FileNotFound(_) => LoreError::FileNotFound,
-            PushError::NotFound(_)
-            | PushError::LayerNotFound(_)
-            | PushError::RevisionNotFound(_) => LoreError::NotFound,
-            PushError::AddressNotFound(_) => LoreError::AddressNotFound,
-            PushError::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            PushError::InvalidPath(_) | PushError::InvalidArguments(_) => {
-                LoreError::InvalidArguments
+            Self::Disconnected(_) => LoreError::Connection,
+            Self::SlowDown(_) => LoreError::SlowDown,
+            Self::Oversized(_) => LoreError::Oversized,
+            Self::FileNotFound(_) => LoreError::FileNotFound,
+            Self::NotFound(_) | Self::LayerNotFound(_) | Self::RevisionNotFound(_) => {
+                LoreError::NotFound
             }
+            Self::AddressNotFound(_) => LoreError::AddressNotFound,
+            Self::PayloadNotFound(_) => LoreError::PayloadNotFound,
+            Self::InvalidPath(_) | Self::InvalidArguments(_) => LoreError::InvalidArguments,
             _ => LoreError::Internal,
         }
     }

@@ -71,20 +71,18 @@ pub enum CreateError {
 impl EventError for CreateError {
     fn translated(&self) -> LoreError {
         match self {
-            CreateError::Disconnected(_) => LoreError::Connection,
-            CreateError::SlowDown(_) => LoreError::SlowDown,
-            CreateError::Oversized(_) => LoreError::Oversized,
-            CreateError::FileNotFound(_) => LoreError::FileNotFound,
-            CreateError::NotFound(_)
-            | CreateError::BranchNotFound(_)
-            | CreateError::RevisionNotFound(_)
-            | CreateError::LayerNotFound(_) => LoreError::NotFound,
-            CreateError::AddressNotFound(_) => LoreError::AddressNotFound,
-            CreateError::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            CreateError::InvalidPath(_) | CreateError::InvalidArguments(_) => {
-                LoreError::InvalidArguments
-            }
-            CreateError::BranchAlreadyExists(_) => LoreError::AlreadyExists,
+            Self::Disconnected(_) => LoreError::Connection,
+            Self::SlowDown(_) => LoreError::SlowDown,
+            Self::Oversized(_) => LoreError::Oversized,
+            Self::FileNotFound(_) => LoreError::FileNotFound,
+            Self::NotFound(_)
+            | Self::BranchNotFound(_)
+            | Self::RevisionNotFound(_)
+            | Self::LayerNotFound(_) => LoreError::NotFound,
+            Self::AddressNotFound(_) => LoreError::AddressNotFound,
+            Self::PayloadNotFound(_) => LoreError::PayloadNotFound,
+            Self::InvalidPath(_) | Self::InvalidArguments(_) => LoreError::InvalidArguments,
+            Self::BranchAlreadyExists(_) => LoreError::AlreadyExists,
             _ => LoreError::Internal,
         }
     }

@@ -32,7 +32,7 @@ pub struct LoreRevisionHistoryEventData {
 
 impl LoreRevisionHistoryEventData {
     pub fn new(repository: RepositoryId, branch: BranchId) -> Self {
-        LoreRevisionHistoryEventData { repository, branch }
+        Self { repository, branch }
     }
 }
 
@@ -52,7 +52,7 @@ pub struct LoreRevisionHistoryEntryEventData {
 
 impl LoreRevisionHistoryEntryEventData {
     pub fn new(state: Arc<State>) -> Self {
-        LoreRevisionHistoryEntryEventData {
+        Self {
             revision: state.revision(),
             revision_number: state.revision_number(),
             parent: [state.parent_self(), state.parent_other()],

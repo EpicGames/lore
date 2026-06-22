@@ -42,7 +42,7 @@ pub struct LoreRevisionDiffFileEventData {
 
 impl LoreRevisionDiffFileEventData {
     pub fn from_node_change(change: &NodeChange, old_is_file: bool, new_is_file: bool) -> Self {
-        LoreRevisionDiffFileEventData {
+        Self {
             path: LoreString::from(&change.path),
             action: LoreFileAction::from(change.action),
             old_is_file: old_is_file.into(),

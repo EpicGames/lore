@@ -39,11 +39,11 @@ pub enum CompressionMode {
 impl CompressionMode {
     pub fn from_u32(value: u32) -> Self {
         match value {
-            1 => CompressionMode::NoCompression,
-            2 => CompressionMode::Lz4,
-            3 => CompressionMode::Oodle,
-            4 => CompressionMode::Zstd,
-            _ => CompressionMode::NotSpecified,
+            1 => Self::NoCompression,
+            2 => Self::Lz4,
+            3 => Self::Oodle,
+            4 => Self::Zstd,
+            _ => Self::NotSpecified,
         }
     }
 }

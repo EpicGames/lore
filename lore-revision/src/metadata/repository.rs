@@ -67,7 +67,7 @@ pub enum RepositoryMetadataError {
 impl EventError for RepositoryMetadataError {
     fn translated(&self) -> LoreError {
         match self {
-            RepositoryMetadataError::Disconnected(_) => LoreError::Connection,
+            Self::Disconnected(_) => LoreError::Connection,
             _ => LoreError::Internal,
         }
     }

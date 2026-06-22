@@ -87,11 +87,11 @@ pub enum BisectError {
 impl EventError for BisectError {
     fn translated(&self) -> LoreError {
         match self {
-            BisectError::Disconnected(_) => LoreError::Connection,
-            BisectError::SlowDown(_) => LoreError::SlowDown,
-            BisectError::Oversized(_) => LoreError::Oversized,
-            BisectError::NotFound(_) => LoreError::NotFound,
-            BisectError::AddressNotFound(_) => LoreError::AddressNotFound,
+            Self::Disconnected(_) => LoreError::Connection,
+            Self::SlowDown(_) => LoreError::SlowDown,
+            Self::Oversized(_) => LoreError::Oversized,
+            Self::NotFound(_) => LoreError::NotFound,
+            Self::AddressNotFound(_) => LoreError::AddressNotFound,
             _ => LoreError::Internal,
         }
     }

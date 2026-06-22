@@ -65,7 +65,7 @@ pub struct JwkServiceImpl {
 
 impl JwkServiceImpl {
     pub fn new(settings: JWKServiceSettings) -> Self {
-        JwkServiceImpl {
+        Self {
             cached_set: Default::default(),
             settings,
         }

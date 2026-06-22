@@ -108,7 +108,7 @@ impl ImmutableData {
     /// Assign the relevant data to make this instance of a fragment point to the same
     /// deduplicated payload as another fragment. Synchronizes `PayloadStoredLocal` with the
     /// resulting `pack_file` so the flag and the pointer it describes always agree.
-    fn assign_deduplicated_payload(&mut self, deduplicated: ImmutableData) {
+    fn assign_deduplicated_payload(&mut self, deduplicated: Self) {
         debug_assert!(
             self.size_content == deduplicated.size_content,
             "Invalid deduplication, content size do not match"
@@ -134,7 +134,7 @@ impl ImmutableData {
     /// `self`'s pre-existing Durable bit is preserved.
     ///
     /// `last_access` is left untouched; the caller stamps it on paths that modify the entry.
-    fn merge_from_copy_source(&mut self, source: ImmutableData, durable: bool) {
+    fn merge_from_copy_source(&mut self, source: Self, durable: bool) {
         self.size_content = source.size_content;
         self.assign_deduplicated_payload(source);
         if durable {
@@ -638,7 +638,7 @@ impl ImmutableStoreBucket {
     }
 
     fn serialize_files(
-        bucket: OwnedRwLockReadGuard<ImmutableStoreBucket, ImmutableStoreBucket>,
+        bucket: OwnedRwLockReadGuard<Self, Self>,
         group: Arc<ImmutableStoreGroup>,
         bucket_index: usize,
         path: PathBuf,
@@ -772,7 +772,7 @@ impl ImmutableStoreBucket {
     }
 
     async fn serialize(
-        bucket: OwnedRwLockReadGuard<ImmutableStoreBucket, ImmutableStoreBucket>,
+        bucket: OwnedRwLockReadGuard<Self, Self>,
         group: Arc<ImmutableStoreGroup>,
         path: &Path,
         group_index: usize,
@@ -815,7 +815,7 @@ impl ImmutableStoreBucket {
     /// dirty=true while we hold it, so any post-release write will correctly re-set dirty and
     /// be picked up by the next flush, matching the regular `serialize` path's semantics.
     pub async fn serialize_to_new(
-        bucket: OwnedRwLockReadGuard<ImmutableStoreBucket, ImmutableStoreBucket>,
+        bucket: OwnedRwLockReadGuard<Self, Self>,
         group: Arc<ImmutableStoreGroup>,
         path: &Path,
         group_index: usize,
@@ -942,7 +942,7 @@ impl LocalImmutableStore {
             None
         };
 
-        let mut store = LocalImmutableStore {
+        let mut store = Self {
             path: immutable_path.clone(),
             lock,
             group: Vec::with_capacity(GROUP_COUNT),
@@ -4025,7 +4025,7 @@ pub struct ImmutableStoreVerifyResult {
 
 impl Default for ImmutableStoreVerifyResult {
     fn default() -> Self {
-        ImmutableStoreVerifyResult {
+        Self {
             hash: Default::default(),
             partition: Default::default(),
             context: Default::default(),

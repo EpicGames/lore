@@ -139,30 +139,26 @@ impl std::fmt::Debug for LockKey {
 impl DynamoDbQuery for LockQuery {
     fn index_name(&self) -> Option<String> {
         match self {
-            LockQuery::Owner(_)
-            | LockQuery::OwnerRepository(_, _)
-            | LockQuery::OwnerRepositoryBranch(_, _, _) => Some(OWNER_REPO_BRANCH_GSI.to_string()),
-            LockQuery::Repository(_) | LockQuery::RepositoryBranch(_, _) => {
-                Some(REPO_BRANCH_GSI.to_string())
+            Self::Owner(_) | Self::OwnerRepository(_, _) | Self::OwnerRepositoryBranch(_, _, _) => {
+                Some(OWNER_REPO_BRANCH_GSI.to_string())
             }
-            LockQuery::RepositoryBranchDescription(_, _, _) => {
-                Some(REPO_BRANCH_DESC_GSI.to_string())
-            }
+            Self::Repository(_) | Self::RepositoryBranch(_, _) => Some(REPO_BRANCH_GSI.to_string()),
+            Self::RepositoryBranchDescription(_, _, _) => Some(REPO_BRANCH_DESC_GSI.to_string()),
             _ => None,
         }
     }
 
     fn key_condition_expression(&self) -> &str {
         match self {
-            LockQuery::Hash(_) => "#pk = :hash",
-            LockQuery::HashRepository(_, _) => "#pk = :hash and begins_with(#sk, :repo)",
-            LockQuery::HashRepositoryBranch(_, _, _) => "#pk = :hash and #sk = :repoBranch",
-            LockQuery::Owner(_) => "#pk = :owner",
-            LockQuery::OwnerRepository(_, _) => "#pk = :owner and begins_with(#sk, :repo)",
-            LockQuery::OwnerRepositoryBranch(_, _, _) => "#pk = :owner and #sk = :repoBranch",
-            LockQuery::Repository(_) => "#pk = :repo",
-            LockQuery::RepositoryBranch(_, _) => "#pk = :repo and #sk = :branch",
-            LockQuery::RepositoryBranchDescription(_, _, _) => {
+            Self::Hash(_) => "#pk = :hash",
+            Self::HashRepository(_, _) => "#pk = :hash and begins_with(#sk, :repo)",
+            Self::HashRepositoryBranch(_, _, _) => "#pk = :hash and #sk = :repoBranch",
+            Self::Owner(_) => "#pk = :owner",
+            Self::OwnerRepository(_, _) => "#pk = :owner and begins_with(#sk, :repo)",
+            Self::OwnerRepositoryBranch(_, _, _) => "#pk = :owner and #sk = :repoBranch",
+            Self::Repository(_) => "#pk = :repo",
+            Self::RepositoryBranch(_, _) => "#pk = :repo and #sk = :branch",
+            Self::RepositoryBranchDescription(_, _, _) => {
                 "#pk = :repoBranch and #sk = :description"
             }
         }
@@ -170,26 +166,22 @@ impl DynamoDbQuery for LockQuery {
 
     fn expression_attribute_names(&self) -> HashMap<String, String> {
         match self {
-            LockQuery::Hash(_) => HashMap::from([("#pk".to_string(), HASH_KEY.to_string())]),
-            LockQuery::HashRepository(_, _) | LockQuery::HashRepositoryBranch(_, _, _) => {
-                HashMap::from([
-                    ("#pk".to_string(), HASH_KEY.to_string()),
-                    ("#sk".to_string(), REPO_BRANCH_KEY.to_string()),
-                ])
-            }
-            LockQuery::Owner(_) => HashMap::from([("#pk".to_string(), OWNER_KEY.to_string())]),
-            LockQuery::OwnerRepository(_, _) | LockQuery::OwnerRepositoryBranch(_, _, _) => {
-                HashMap::from([
-                    ("#pk".to_string(), OWNER_KEY.to_string()),
-                    ("#sk".to_string(), REPO_BRANCH_KEY.to_string()),
-                ])
-            }
-            LockQuery::Repository(_) => HashMap::from([("#pk".to_string(), REPO_KEY.to_string())]),
-            LockQuery::RepositoryBranch(_, _) => HashMap::from([
+            Self::Hash(_) => HashMap::from([("#pk".to_string(), HASH_KEY.to_string())]),
+            Self::HashRepository(_, _) | Self::HashRepositoryBranch(_, _, _) => HashMap::from([
+                ("#pk".to_string(), HASH_KEY.to_string()),
+                ("#sk".to_string(), REPO_BRANCH_KEY.to_string()),
+            ]),
+            Self::Owner(_) => HashMap::from([("#pk".to_string(), OWNER_KEY.to_string())]),
+            Self::OwnerRepository(_, _) | Self::OwnerRepositoryBranch(_, _, _) => HashMap::from([
+                ("#pk".to_string(), OWNER_KEY.to_string()),
+                ("#sk".to_string(), REPO_BRANCH_KEY.to_string()),
+            ]),
+            Self::Repository(_) => HashMap::from([("#pk".to_string(), REPO_KEY.to_string())]),
+            Self::RepositoryBranch(_, _) => HashMap::from([
                 ("#pk".to_string(), REPO_KEY.to_string()),
                 ("#sk".to_string(), BRANCH_KEY.to_string()),
             ]),
-            LockQuery::RepositoryBranchDescription(_, _, _) => HashMap::from([
+            Self::RepositoryBranchDescription(_, _, _) => HashMap::from([
                 ("#pk".to_string(), REPO_BRANCH_KEY.to_string()),
                 ("#sk".to_string(), DESC_KEY.to_string()),
             ]),
@@ -198,11 +190,11 @@ impl DynamoDbQuery for LockQuery {
 
     fn expression_attribute_values(&self) -> HashMap<String, AttributeValue> {
         match self {
-            LockQuery::Hash(hash) => HashMap::from([(
+            Self::Hash(hash) => HashMap::from([(
                 ":hash".to_string(),
                 AttributeValue::B(Blob::new(hash.as_bytes())),
             )]),
-            LockQuery::HashRepository(hash, repository) => HashMap::from([
+            Self::HashRepository(hash, repository) => HashMap::from([
                 (
                     ":hash".to_string(),
                     AttributeValue::B(Blob::new(hash.as_bytes())),
@@ -212,7 +204,7 @@ impl DynamoDbQuery for LockQuery {
                     AttributeValue::B(Blob::new(repository.as_bytes())),
                 ),
             ]),
-            LockQuery::HashRepositoryBranch(hash, repository, branch) => HashMap::from([
+            Self::HashRepositoryBranch(hash, repository, branch) => HashMap::from([
                 (
                     ":hash".to_string(),
                     AttributeValue::B(Blob::new(hash.as_bytes())),
@@ -229,17 +221,17 @@ impl DynamoDbQuery for LockQuery {
                     )),
                 ),
             ]),
-            LockQuery::Owner(owner) => {
+            Self::Owner(owner) => {
                 HashMap::from([(":owner".to_string(), AttributeValue::S(owner.clone()))])
             }
-            LockQuery::OwnerRepository(owner, repository) => HashMap::from([
+            Self::OwnerRepository(owner, repository) => HashMap::from([
                 (":owner".to_string(), AttributeValue::S(owner.clone())),
                 (
                     ":repo".to_string(),
                     AttributeValue::B(Blob::new(repository.as_bytes())),
                 ),
             ]),
-            LockQuery::OwnerRepositoryBranch(owner, repository, branch) => HashMap::from([
+            Self::OwnerRepositoryBranch(owner, repository, branch) => HashMap::from([
                 (":owner".to_string(), AttributeValue::S(owner.clone())),
                 (
                     ":repoBranch".to_string(),
@@ -253,11 +245,11 @@ impl DynamoDbQuery for LockQuery {
                     )),
                 ),
             ]),
-            LockQuery::Repository(repository) => HashMap::from([(
+            Self::Repository(repository) => HashMap::from([(
                 ":repo".to_string(),
                 AttributeValue::B(Blob::new(repository.as_bytes())),
             )]),
-            LockQuery::RepositoryBranch(repository, branch) => HashMap::from([
+            Self::RepositoryBranch(repository, branch) => HashMap::from([
                 (
                     ":repo".to_string(),
                     AttributeValue::B(Blob::new(repository.as_bytes())),
@@ -267,25 +259,23 @@ impl DynamoDbQuery for LockQuery {
                     AttributeValue::B(Blob::new(branch.as_bytes())),
                 ),
             ]),
-            LockQuery::RepositoryBranchDescription(repository, branch, description) => {
-                HashMap::from([
-                    (
-                        ":repoBranch".to_string(),
-                        AttributeValue::B(Blob::new(
-                            repository
-                                .data()
-                                .iter()
-                                .chain(branch.data().iter())
-                                .copied()
-                                .collect::<Vec<u8>>(),
-                        )),
-                    ),
-                    (
-                        ":description".to_string(),
-                        AttributeValue::S(description.clone()),
-                    ),
-                ])
-            }
+            Self::RepositoryBranchDescription(repository, branch, description) => HashMap::from([
+                (
+                    ":repoBranch".to_string(),
+                    AttributeValue::B(Blob::new(
+                        repository
+                            .data()
+                            .iter()
+                            .chain(branch.data().iter())
+                            .copied()
+                            .collect::<Vec<u8>>(),
+                    )),
+                ),
+                (
+                    ":description".to_string(),
+                    AttributeValue::S(description.clone()),
+                ),
+            ]),
         }
     }
 }

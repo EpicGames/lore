@@ -30,7 +30,7 @@ pub enum FsError {}
 
 impl From<std::io::Error> for FsError {
     fn from(value: std::io::Error) -> Self {
-        FsError::internal(value.to_string())
+        Self::internal(value.to_string())
     }
 }
 
@@ -311,7 +311,7 @@ impl InstanceOperation for StaticDispatchInstanceOperation {
         filter_mode: FilterMode,
     ) -> Result<(Vec<NodeChange>, FilesystemDiffStats), FsError> {
         match self {
-            StaticDispatchInstanceOperation::Os(this) => {
+            Self::Os(this) => {
                 this.changes_from_filesystem_to_state(
                     repository_from,
                     state_from,
@@ -329,7 +329,7 @@ impl InstanceOperation for StaticDispatchInstanceOperation {
 
     async fn file_info(&self, path: FilesystemPath<'_>) -> Result<FileInfo, FsError> {
         match self {
-            StaticDispatchInstanceOperation::Os(this) => this.file_info(path).await,
+            Self::Os(this) => this.file_info(path).await,
         }
     }
 
@@ -340,7 +340,7 @@ impl InstanceOperation for StaticDispatchInstanceOperation {
         force_full_check: bool,
     ) -> Result<FileModifiedCheck, FsError> {
         match self {
-            StaticDispatchInstanceOperation::Os(this) => {
+            Self::Os(this) => {
                 this.is_file_modified(repository, node_change, force_full_check)
                     .await
             }
@@ -354,9 +354,7 @@ impl InstanceOperation for StaticDispatchInstanceOperation {
         node_hint: Option<&Node>,
     ) -> Result<Hash, FsError> {
         match self {
-            StaticDispatchInstanceOperation::Os(this) => {
-                this.file_hash(repository, path, node_hint).await
-            }
+            Self::Os(this) => this.file_hash(repository, path, node_hint).await,
         }
     }
 
@@ -368,7 +366,7 @@ impl InstanceOperation for StaticDispatchInstanceOperation {
         known_disk_file_size: u64,
     ) -> Result<bool, FsError> {
         match self {
-            StaticDispatchInstanceOperation::Os(this) => {
+            Self::Os(this) => {
                 this.file_compare(repository, address, path, known_disk_file_size)
                     .await
             }
@@ -377,19 +375,19 @@ impl InstanceOperation for StaticDispatchInstanceOperation {
 
     async fn make_executable(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
         match self {
-            StaticDispatchInstanceOperation::Os(this) => this.make_executable(path).await,
+            Self::Os(this) => this.make_executable(path).await,
         }
     }
 
     async fn create_dir_all(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
         match self {
-            StaticDispatchInstanceOperation::Os(this) => this.create_dir_all(path).await,
+            Self::Os(this) => this.create_dir_all(path).await,
         }
     }
 
     async fn create_file(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
         match self {
-            StaticDispatchInstanceOperation::Os(this) => this.create_file(path).await,
+            Self::Os(this) => this.create_file(path).await,
         }
     }
 
@@ -399,19 +397,19 @@ impl InstanceOperation for StaticDispatchInstanceOperation {
         to: FilesystemPath<'_>,
     ) -> Result<(), FsError> {
         match self {
-            StaticDispatchInstanceOperation::Os(this) => this.unify_case_rename(from, to).await,
+            Self::Os(this) => this.unify_case_rename(from, to).await,
         }
     }
 
     async fn remove(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
         match self {
-            StaticDispatchInstanceOperation::Os(this) => this.remove(path).await,
+            Self::Os(this) => this.remove(path).await,
         }
     }
 
     async fn remove_recursive(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
         match self {
-            StaticDispatchInstanceOperation::Os(this) => this.remove_recursive(path).await,
+            Self::Os(this) => this.remove_recursive(path).await,
         }
     }
 
@@ -422,7 +420,7 @@ impl InstanceOperation for StaticDispatchInstanceOperation {
         path: FilesystemPath<'_>,
     ) -> Result<(), FsError> {
         match self {
-            StaticDispatchInstanceOperation::Os(this) => {
+            Self::Os(this) => {
                 this.set_file_to_immutable_store_contents(repository, node, path)
                     .await
             }
@@ -435,7 +433,7 @@ impl InstanceOperation for StaticDispatchInstanceOperation {
         destination_path: impl AsRef<Path> + Send,
     ) -> Result<(), FsError> {
         match self {
-            StaticDispatchInstanceOperation::Os(this) => {
+            Self::Os(this) => {
                 this.copy_to_scratch_file(source_path, destination_path)
                     .await
             }
@@ -451,7 +449,7 @@ impl InstanceOperation for StaticDispatchInstanceOperation {
         mode: MergeTextMode<'_>,
     ) -> Result<bool, FsError> {
         match self {
-            StaticDispatchInstanceOperation::Os(this) => {
+            Self::Os(this) => {
                 this.merge3_text_by_path(base, mine, theirs, result, mode)
                     .await
             }
@@ -460,13 +458,13 @@ impl InstanceOperation for StaticDispatchInstanceOperation {
 
     async fn infer_is_diffable(&self, path: FilesystemPath<'_>) -> Result<bool, FsError> {
         match self {
-            StaticDispatchInstanceOperation::Os(this) => this.infer_is_diffable(path).await,
+            Self::Os(this) => this.infer_is_diffable(path).await,
         }
     }
 
     async fn finalize(&self, changes_made: bool) -> Result<(), FsError> {
         match self {
-            StaticDispatchInstanceOperation::Os(this) => this.finalize(changes_made).await,
+            Self::Os(this) => this.finalize(changes_made).await,
         }
     }
 }

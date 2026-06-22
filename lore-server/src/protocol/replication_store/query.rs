@@ -38,7 +38,7 @@ impl Query {
         ExistsBatch::to_quic_chunks(self.0)
     }
 
-    pub fn parse(bytes: Bytes) -> Result<Query, MessageParseError> {
+    pub fn parse(bytes: Bytes) -> Result<Self, MessageParseError> {
         let inner = ExistsBatch::parse(bytes)?;
 
         // not possible unless clients we control are malicious for some reason
@@ -47,7 +47,7 @@ impl Query {
             return Err(MessageParseError::InvalidFieldLength);
         }
 
-        Ok(Query(inner))
+        Ok(Self(inner))
     }
 }
 
@@ -77,7 +77,7 @@ impl QueryResponse {
             })?
         };
 
-        Ok(QueryResponse {
+        Ok(Self {
             fragment,
             match_made,
         })

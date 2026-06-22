@@ -36,8 +36,8 @@ enum DispatchError {
 impl EventError for DispatchError {
     fn translated(&self) -> LoreError {
         match self {
-            DispatchError::InvalidArguments(_) => LoreError::InvalidArguments,
-            DispatchError::Internal(_) => LoreError::Internal,
+            Self::InvalidArguments(_) => LoreError::InvalidArguments,
+            Self::Internal(_) => LoreError::Internal,
         }
     }
 

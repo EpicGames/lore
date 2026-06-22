@@ -302,7 +302,7 @@ async fn listen_for_termination(shutdown_tx: tokio::sync::watch::Sender<bool>) -
 
 impl From<QuicSettings> for QuinnConfigBuilder {
     fn from(settings: QuicSettings) -> Self {
-        let mut builder = QuinnConfigBuilder::default().num_listeners(settings.num_listeners);
+        let mut builder = Self::default().num_listeners(settings.num_listeners);
 
         if let Some(v) = settings.idle_timeout {
             builder = builder.idle_timeout(Duration::from_millis(v));

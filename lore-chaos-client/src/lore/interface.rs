@@ -43,7 +43,7 @@ pub struct LoreInterface {
 }
 
 impl LoreInterface {
-    pub fn new(repo_path: LoreString, offline: bool) -> LoreInterface {
+    pub fn new(repo_path: LoreString, offline: bool) -> Self {
         Self {
             global_args: LoreGlobalArgs {
                 repository_path: repo_path.clone(),

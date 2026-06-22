@@ -18,17 +18,16 @@ pub enum RepoOperationKind {
 }
 
 impl RepoOperationKind {
-    pub const ALL: &'static [RepoOperationKind] = &[
-        RepoOperationKind::Commit,
-        RepoOperationKind::GoToBranch,
-        RepoOperationKind::CreateBranch,
-        RepoOperationKind::Merge,
-        RepoOperationKind::Status,
-        RepoOperationKind::BranchInfo,
+    pub const ALL: &'static [Self] = &[
+        Self::Commit,
+        Self::GoToBranch,
+        Self::CreateBranch,
+        Self::Merge,
+        Self::Status,
+        Self::BranchInfo,
     ];
 
-    pub const ALL_READ_ONLY: &'static [RepoOperationKind] =
-        &[RepoOperationKind::Status, RepoOperationKind::BranchInfo];
+    pub const ALL_READ_ONLY: &'static [Self] = &[Self::Status, Self::BranchInfo];
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,11 +72,7 @@ pub enum FileMergeOperationKind {
 }
 
 impl FileMergeOperationKind {
-    pub const ALL: &'static [FileMergeOperationKind] = &[
-        FileMergeOperationKind::Mine,
-        FileMergeOperationKind::Theirs,
-        FileMergeOperationKind::New,
-    ];
+    pub const ALL: &'static [Self] = &[Self::Mine, Self::Theirs, Self::New];
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -90,9 +85,9 @@ pub enum FileMergeOperation {
 impl FileMergeOperation {
     pub fn from_kind(kind: FileMergeOperationKind, contents: impl FnOnce() -> String) -> Self {
         match kind {
-            FileMergeOperationKind::Mine => FileMergeOperation::Mine,
-            FileMergeOperationKind::Theirs => FileMergeOperation::Theirs,
-            FileMergeOperationKind::New => FileMergeOperation::New(contents()),
+            FileMergeOperationKind::Mine => Self::Mine,
+            FileMergeOperationKind::Theirs => Self::Theirs,
+            FileMergeOperationKind::New => Self::New(contents()),
         }
     }
 }

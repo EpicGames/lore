@@ -57,7 +57,7 @@ impl From<NameTableFlags> for u32 {
 impl BitAnd<NameTableFlags> for u32 {
     type Output = Self;
 
-    fn bitand(self, rhs: NameTableFlags) -> u32 {
+    fn bitand(self, rhs: NameTableFlags) -> Self {
         self & rhs.bits()
     }
 }
@@ -71,7 +71,7 @@ impl BitAndAssign<NameTableFlags> for u32 {
 impl BitOr<NameTableFlags> for u32 {
     type Output = Self;
 
-    fn bitor(self, rhs: NameTableFlags) -> u32 {
+    fn bitor(self, rhs: NameTableFlags) -> Self {
         self | rhs.bits()
     }
 }
@@ -133,7 +133,7 @@ impl Default for NameTable {
     fn default() -> Self {
         let entry_capacity = PRIME_TABLE[0];
         let data_capacity = FRAGMENT_SIZE_THRESHOLD;
-        NameTable {
+        Self {
             data: parking_lot::RwLock::new(NameTableData {
                 entry_buffer: BytesMut::zeroed_count::<NameTableEntry>(entry_capacity),
                 data_buffer: BytesMut::with_capacity(data_capacity),
@@ -146,7 +146,7 @@ impl NameTable {
     pub async fn deserialize(
         repository: Arc<RepositoryContext>,
         hash: Hash,
-    ) -> Result<NameTable, NameTableError> {
+    ) -> Result<Self, NameTableError> {
         let state = NameTableState::read_from_immutable(
             repository.clone(),
             Address::zero_context_hash(hash),
@@ -192,7 +192,7 @@ impl NameTable {
             .internal("reading name table data buffer")?,
         );
 
-        Ok(NameTable {
+        Ok(Self {
             data: parking_lot::RwLock::new(NameTableData {
                 entry_buffer,
                 data_buffer,

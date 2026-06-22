@@ -70,7 +70,7 @@ impl RotatingIdFixedTopology {
             })
             .collect();
 
-        Arc::new(RotatingIdFixedTopology {
+        Arc::new(Self {
             peers,
             rotation_interval: Duration::from_secs(config.rotation_interval_seconds),
             peers_updated_broadcaster,

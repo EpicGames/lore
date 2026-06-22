@@ -52,7 +52,7 @@ impl From<FragmentFlags> for u32 {
 
 impl From<u32> for FragmentFlags {
     fn from(value: u32) -> Self {
-        FragmentFlags::from_bits_truncate(value)
+        Self::from_bits_truncate(value)
     }
 }
 
@@ -65,7 +65,7 @@ impl std::cmp::PartialEq<FragmentFlags> for u32 {
 impl std::ops::BitAnd<FragmentFlags> for u32 {
     type Output = Self;
 
-    fn bitand(self, rhs: FragmentFlags) -> u32 {
+    fn bitand(self, rhs: FragmentFlags) -> Self {
         self & rhs.bits()
     }
 }
@@ -79,7 +79,7 @@ impl std::ops::BitAndAssign<FragmentFlags> for u32 {
 impl std::ops::BitOr<FragmentFlags> for u32 {
     type Output = Self;
 
-    fn bitor(self, rhs: FragmentFlags) -> u32 {
+    fn bitor(self, rhs: FragmentFlags) -> Self {
         self | rhs.bits()
     }
 }

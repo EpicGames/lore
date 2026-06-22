@@ -35,7 +35,7 @@ pub enum Command {
 
 impl From<Command> for QuicOpCode {
     fn from(value: Command) -> Self {
-        value as QuicOpCode
+        value as Self
     }
 }
 
@@ -44,16 +44,16 @@ impl TryFrom<QuicOpCode> for Command {
 
     fn try_from(value: QuicOpCode) -> Result<Self, Self::Error> {
         match value {
-            v if v == Command::Authorize as u8 => Ok(Command::Authorize),
-            v if v == Command::Get as u8 => Ok(Command::Get),
-            v if v == Command::Put as u8 => Ok(Command::Put),
-            v if v == Command::Query as u8 => Ok(Command::Query),
-            v if v == Command::Verify as u8 => Ok(Command::Verify),
-            v if v == Command::Copy as u8 => Ok(Command::Copy),
-            v if v == Command::MutableLoad as u8 => Ok(Command::MutableLoad),
-            v if v == Command::MutableStore as u8 => Ok(Command::MutableStore),
-            v if v == Command::MutableCas as u8 => Ok(Command::MutableCas),
-            v if v == Command::GetMetadata as u8 => Ok(Command::GetMetadata),
+            v if v == Self::Authorize as u8 => Ok(Self::Authorize),
+            v if v == Self::Get as u8 => Ok(Self::Get),
+            v if v == Self::Put as u8 => Ok(Self::Put),
+            v if v == Self::Query as u8 => Ok(Self::Query),
+            v if v == Self::Verify as u8 => Ok(Self::Verify),
+            v if v == Self::Copy as u8 => Ok(Self::Copy),
+            v if v == Self::MutableLoad as u8 => Ok(Self::MutableLoad),
+            v if v == Self::MutableStore as u8 => Ok(Self::MutableStore),
+            v if v == Self::MutableCas as u8 => Ok(Self::MutableCas),
+            v if v == Self::GetMetadata as u8 => Ok(Self::GetMetadata),
             _ => Err(UnknownCommand(value)),
         }
     }
@@ -117,9 +117,9 @@ impl Display for QueryStatus {
             f,
             "{}",
             match self {
-                QueryStatus::ExistFullMatch => "Full match",
-                QueryStatus::ExistHashMatch => "Hash match",
-                QueryStatus::NotFound => "Not found",
+                Self::ExistFullMatch => "Full match",
+                Self::ExistHashMatch => "Hash match",
+                Self::NotFound => "Not found",
             }
         )
     }

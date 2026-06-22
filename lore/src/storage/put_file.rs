@@ -98,8 +98,8 @@ enum PutFileError {
 impl EventError for PutFileError {
     fn translated(&self) -> LoreError {
         match self {
-            PutFileError::InvalidArguments(_) => LoreError::InvalidArguments,
-            PutFileError::Internal(_) => LoreError::Internal,
+            Self::InvalidArguments(_) => LoreError::InvalidArguments,
+            Self::Internal(_) => LoreError::Internal,
         }
     }
 

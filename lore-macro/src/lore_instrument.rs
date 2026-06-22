@@ -13,7 +13,7 @@ struct LoreInstrumentArgs {
 impl Parse for LoreInstrumentArgs {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         if input.is_empty() {
-            return Ok(LoreInstrumentArgs { state_path: None });
+            return Ok(Self { state_path: None });
         }
 
         let ident: syn::Ident = input.parse()?;
@@ -23,7 +23,7 @@ impl Parse for LoreInstrumentArgs {
         let _eq: syn::Token![=] = input.parse()?;
         let lit: syn::LitStr = input.parse()?;
         let path: syn::Path = lit.parse()?;
-        Ok(LoreInstrumentArgs {
+        Ok(Self {
             state_path: Some(path),
         })
     }

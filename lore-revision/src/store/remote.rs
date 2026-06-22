@@ -46,7 +46,7 @@ pub struct RemoteImmutableStore {
 
 impl RemoteImmutableStore {
     pub fn new(remote_url: &str, identity: Option<&str>) -> Self {
-        RemoteImmutableStore {
+        Self {
             remote_url: remote_url.to_string(),
             identity: identity.map(|url| url.to_string()),
             connections: Mutex::new(HashMap::new()),
@@ -330,7 +330,7 @@ pub struct RemoteMutableStore {
 
 impl RemoteMutableStore {
     pub fn new(remote_url: &str, identity: Option<&str>) -> Self {
-        RemoteMutableStore {
+        Self {
             remote_url: remote_url.to_string(),
             identity: identity.map(|identity| identity.to_string()),
             connections: Mutex::new(HashMap::new()),

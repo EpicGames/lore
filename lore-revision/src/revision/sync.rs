@@ -187,7 +187,7 @@ impl EventError for SyncError {
 
 impl From<FsError> for SyncError {
     fn from(value: FsError) -> Self {
-        SyncError::internal_with_context(value, "Failed during internal filesystem operation")
+        Self::internal_with_context(value, "Failed during internal filesystem operation")
     }
 }
 

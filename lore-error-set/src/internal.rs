@@ -107,7 +107,7 @@ impl From<Internal> for Traced<Internal> {
         let caller = std::panic::Location::caller();
         let mut trace = Trace::new();
         trace.push(Location::new(caller.file(), caller.line(), caller.column()));
-        Traced::new(internal, trace)
+        Self::new(internal, trace)
     }
 }
 

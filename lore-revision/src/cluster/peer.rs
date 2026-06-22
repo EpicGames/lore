@@ -14,8 +14,8 @@ pub enum Locality {
 impl Locality {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Locality::SameRegion => "SameRegion",
-            Locality::OtherRegion => "OtherRegion",
+            Self::SameRegion => "SameRegion",
+            Self::OtherRegion => "OtherRegion",
         }
     }
 }

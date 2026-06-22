@@ -80,8 +80,8 @@ enum GetMetadataError {
 impl EventError for GetMetadataError {
     fn translated(&self) -> LoreError {
         match self {
-            GetMetadataError::InvalidArguments(_) => LoreError::InvalidArguments,
-            GetMetadataError::Internal(_) => LoreError::Internal,
+            Self::InvalidArguments(_) => LoreError::InvalidArguments,
+            Self::Internal(_) => LoreError::Internal,
         }
     }
 

@@ -82,9 +82,9 @@ pub enum MetadataErrors {
 impl EventError for MetadataErrors {
     fn translated(&self) -> LoreError {
         match self {
-            MetadataErrors::FileNotFound(_) => LoreError::NotFound,
-            MetadataErrors::Oversized(_) => LoreError::Oversized,
-            MetadataErrors::Disconnected(_) => LoreError::Connection,
+            Self::FileNotFound(_) => LoreError::NotFound,
+            Self::Oversized(_) => LoreError::Oversized,
+            Self::Disconnected(_) => LoreError::Connection,
             _ => LoreError::Internal,
         }
     }
@@ -171,13 +171,13 @@ pub enum MetadataType {
 impl MetadataType {
     pub fn from(num: u32) -> Self {
         match num {
-            1 => MetadataType::Address,
-            2 => MetadataType::Boolean,
-            3 => MetadataType::Context,
-            4 => MetadataType::Hash,
-            5 => MetadataType::Numeric,
-            6 => MetadataType::String,
-            _ => MetadataType::Binary,
+            1 => Self::Address,
+            2 => Self::Boolean,
+            3 => Self::Context,
+            4 => Self::Hash,
+            5 => Self::Numeric,
+            6 => Self::String,
+            _ => Self::Binary,
         }
     }
 }
@@ -214,7 +214,7 @@ static DEFAULT_METADATA_CAPACITY: usize = if FRAGMENT_SIZE_THRESHOLD > 64 * 1024
 
 impl Clone for Metadata {
     fn clone(&self) -> Self {
-        Metadata::new_with_buffer(self.buffer.clone())
+        Self::new_with_buffer(self.buffer.clone())
     }
 
     fn clone_from(&mut self, source: &Self) {
@@ -257,7 +257,7 @@ impl Metadata {
         .await
         .forward::<MetadataError>("reading metadata")?;
 
-        let metadata = Metadata::new_with_buffer(BytesMut::from(buffer));
+        let metadata = Self::new_with_buffer(BytesMut::from(buffer));
         metadata.check_header()?;
 
         Ok(metadata)

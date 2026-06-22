@@ -345,17 +345,17 @@ pub enum PathListingResult {
 impl PathListingResult {
     /// Returns true if the path was a directory.
     pub fn is_directory(&self) -> bool {
-        matches!(self, PathListingResult::Directory { .. })
+        matches!(self, Self::Directory { .. })
     }
 
     /// Returns true if the path was a file.
     pub fn is_file(&self) -> bool {
-        matches!(self, PathListingResult::File { .. })
+        matches!(self, Self::File { .. })
     }
 
     /// Returns true if the path was not found or not accessible.
     pub fn is_not_found(&self) -> bool {
-        matches!(self, PathListingResult::NotFound)
+        matches!(self, Self::NotFound)
     }
 }
 

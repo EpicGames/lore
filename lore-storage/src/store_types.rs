@@ -32,24 +32,24 @@ pub enum StoreMatch {
 impl StoreMatch {
     pub fn next(&self) -> Option<Self> {
         match self {
-            StoreMatch::MatchNone => Some(StoreMatch::MatchHash),
-            StoreMatch::MatchHash => Some(StoreMatch::MatchPartition),
-            StoreMatch::MatchPartition => Some(StoreMatch::MatchFull),
-            StoreMatch::MatchFull => None,
+            Self::MatchNone => Some(Self::MatchHash),
+            Self::MatchHash => Some(Self::MatchPartition),
+            Self::MatchPartition => Some(Self::MatchFull),
+            Self::MatchFull => None,
         }
     }
 
     pub fn prev(&self) -> Option<Self> {
         match self {
-            StoreMatch::MatchNone => None,
-            StoreMatch::MatchHash => Some(StoreMatch::MatchNone),
-            StoreMatch::MatchPartition => Some(StoreMatch::MatchHash),
-            StoreMatch::MatchFull => Some(StoreMatch::MatchPartition),
+            Self::MatchNone => None,
+            Self::MatchHash => Some(Self::MatchNone),
+            Self::MatchPartition => Some(Self::MatchHash),
+            Self::MatchFull => Some(Self::MatchPartition),
         }
     }
 
     pub fn is_partial(&self) -> bool {
-        self != &StoreMatch::MatchFull
+        self != &Self::MatchFull
     }
 }
 
@@ -69,10 +69,10 @@ impl TryFrom<u8> for StoreMatch {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         match value {
-            0 => Ok(StoreMatch::MatchNone),
-            1 => Ok(StoreMatch::MatchHash),
-            2 => Ok(StoreMatch::MatchPartition),
-            3 => Ok(StoreMatch::MatchFull),
+            0 => Ok(Self::MatchNone),
+            1 => Ok(Self::MatchHash),
+            2 => Ok(Self::MatchPartition),
+            3 => Ok(Self::MatchFull),
             unknown => Err(format!("Unknown store match '{unknown}'")),
         }
     }

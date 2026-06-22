@@ -127,7 +127,7 @@ impl LoreString {
             let buffer = std::alloc::alloc(layout);
             std::ptr::copy_nonoverlapping(source.as_ptr(), buffer, length);
             *buffer.add(length) = 0;
-            LoreString {
+            Self {
                 string: buffer as *const std::os::raw::c_char,
                 length,
             }
@@ -148,7 +148,7 @@ impl LoreString {
 
 impl Default for LoreString {
     fn default() -> Self {
-        LoreString {
+        Self {
             string: core::ptr::null(),
             length: 0usize,
         }
@@ -157,7 +157,7 @@ impl Default for LoreString {
 
 impl Clone for LoreString {
     fn clone(&self) -> Self {
-        LoreString::from_str(self.as_str())
+        Self::from_str(self.as_str())
     }
 
     fn clone_from(&mut self, source: &Self) {
@@ -231,81 +231,75 @@ impl<'a> From<&'a LoreString> for Option<&'a str> {
 
 impl From<String> for LoreString {
     fn from(value: String) -> Self {
-        LoreString::from_str(value.as_str())
+        Self::from_str(value.as_str())
     }
 }
 
 impl From<&String> for LoreString {
     fn from(value: &String) -> Self {
-        LoreString::from_str(value.as_str())
+        Self::from_str(value.as_str())
     }
 }
 
 impl From<&str> for LoreString {
     fn from(value: &str) -> Self {
-        LoreString::from_str(value)
+        Self::from_str(value)
     }
 }
 
 impl From<Option<String>> for LoreString {
     fn from(value: Option<String>) -> Self {
-        value
-            .as_deref()
-            .map(LoreString::from_str)
-            .unwrap_or_default()
+        value.as_deref().map(Self::from_str).unwrap_or_default()
     }
 }
 
 impl From<Option<&String>> for LoreString {
     fn from(value: Option<&String>) -> Self {
         value
-            .map(|value| LoreString::from_str(value.as_str()))
+            .map(|value| Self::from_str(value.as_str()))
             .unwrap_or_default()
     }
 }
 
 impl From<&Option<String>> for LoreString {
     fn from(value: &Option<String>) -> Self {
-        value
-            .as_deref()
-            .map(LoreString::from_str)
-            .unwrap_or_default()
+        value.as_deref().map(Self::from_str).unwrap_or_default()
     }
 }
 
 impl From<Option<&str>> for LoreString {
     fn from(value: Option<&str>) -> Self {
-        value.map(LoreString::from_str).unwrap_or_default()
+        value.map(Self::from_str).unwrap_or_default()
     }
 }
 
 impl From<&Path> for LoreString {
     fn from(value: &Path) -> Self {
-        LoreString::from_path(value)
+        Self::from_path(value)
     }
 }
 
 impl From<PathBuf> for LoreString {
     fn from(value: PathBuf) -> Self {
-        LoreString::from_path(value.as_path())
+        Self::from_path(value.as_path())
     }
 }
 
 impl From<&PathBuf> for LoreString {
     fn from(value: &PathBuf) -> Self {
-        LoreString::from_path(value.as_path())
+        Self::from_path(value.as_path())
     }
 }
 
 impl From<&RelativePath> for LoreString {
     fn from(value: &RelativePath) -> Self {
-        LoreString::from_str(value.as_str())
+        Self::from_str(value.as_str())
     }
 }
 
 impl From<RelativePath> for LoreString {
     fn from(value: RelativePath) -> Self {
-        LoreString::from_str(value.as_str())
+        Self::from_str(value.as_str())
     }
 }
 
@@ -324,7 +318,7 @@ impl<'de> Deserialize<'de> for LoreString {
         D: serde::Deserializer<'de>,
     {
         let value: String = Deserialize::deserialize(deserializer)?;
-        Ok(LoreString::from_str(&value))
+        Ok(Self::from_str(&value))
     }
 }
 
@@ -374,7 +368,7 @@ impl<T> LoreArray<T> {
 
     /// Moves the strings from the vec in the string array
     pub fn from_vec(vec: Vec<T>) -> Self {
-        let target = LoreArray::<T>::new(vec.len());
+        let target = Self::new(vec.len());
 
         // SAFETY: target is created to the same count as the vec and we're going to initialise
         // every element.
@@ -480,7 +474,7 @@ where
         D: serde::Deserializer<'de>,
     {
         let value: Vec<T> = Deserialize::deserialize(deserializer)?;
-        Ok(LoreArray::from_vec(value))
+        Ok(Self::from_vec(value))
     }
 }
 
@@ -823,7 +817,7 @@ impl Default for ExecutionContext {
     fn default() -> Self {
         execution_initialize();
 
-        ExecutionContext {
+        Self {
             globals: LoreGlobalArgs::default(),
             dispatcher: EventDispatcher::default(),
             log_level: LoreLogLevel::Error,
@@ -983,8 +977,8 @@ pub enum LoreBranchLocation {
 impl Display for LoreBranchLocation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LoreBranchLocation::Local => write!(f, "local"),
-            LoreBranchLocation::Remote => write!(f, "remote"),
+            Self::Local => write!(f, "local"),
+            Self::Remote => write!(f, "remote"),
         }
     }
 }
@@ -1001,7 +995,7 @@ pub struct LoreBranchPoint {
 
 impl From<&BranchPoint> for LoreBranchPoint {
     fn from(branch_point: &BranchPoint) -> Self {
-        LoreBranchPoint {
+        Self {
             branch: branch_point.branch,
             revision: branch_point.revision,
         }
@@ -1010,40 +1004,40 @@ impl From<&BranchPoint> for LoreBranchPoint {
 
 impl From<FileAction> for LoreFileAction {
     fn from(value: FileAction) -> Self {
-        LoreFileAction::from(value as u32)
+        Self::from(value as u32)
     }
 }
 
 impl From<u16> for LoreFileAction {
     fn from(value: u16) -> Self {
-        LoreFileAction::from(value as u32)
+        Self::from(value as u32)
     }
 }
 
 impl From<u32> for LoreFileAction {
     fn from(value: u32) -> Self {
         if value == FileAction::Add as u32 {
-            return LoreFileAction::Add;
+            return Self::Add;
         } else if value == FileAction::Delete as u32 {
-            return LoreFileAction::Delete;
+            return Self::Delete;
         } else if value == FileAction::Move as u32 {
-            return LoreFileAction::Move;
+            return Self::Move;
         } else if value == FileAction::Copy as u32 {
-            return LoreFileAction::Copy;
+            return Self::Copy;
         }
 
-        LoreFileAction::Keep
+        Self::Keep
     }
 }
 
 impl LoreFileAction {
     pub fn as_string_short(&self) -> &'static str {
         match self {
-            LoreFileAction::Add => "A",
-            LoreFileAction::Delete => "D",
-            LoreFileAction::Move => "V",
-            LoreFileAction::Copy => "C",
-            LoreFileAction::Keep => "M",
+            Self::Add => "A",
+            Self::Delete => "D",
+            Self::Move => "V",
+            Self::Copy => "C",
+            Self::Keep => "M",
         }
     }
 }

@@ -331,7 +331,7 @@ impl QuicConnection {
     }
 
     pub fn with_v4(connection: quinn::Connection, max_chunk_size: usize, v4: bool) -> Self {
-        QuicConnection {
+        Self {
             connection: RwLock::new(QuicQuinnConnection {
                 connection,
                 writer: vec![],

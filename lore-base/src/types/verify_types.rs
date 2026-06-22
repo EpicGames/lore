@@ -17,16 +17,16 @@ pub enum HealResult {
 impl From<u8> for HealResult {
     fn from(value: u8) -> Self {
         match value {
-            0 => HealResult::NotAttempted,
-            1 => HealResult::Healed,
-            _ => HealResult::Failed,
+            0 => Self::NotAttempted,
+            1 => Self::Healed,
+            _ => Self::Failed,
         }
     }
 }
 
 impl From<i32> for HealResult {
     fn from(value: i32) -> Self {
-        HealResult::from(value as u8)
+        Self::from(value as u8)
     }
 }
 

@@ -152,8 +152,8 @@ enum OpenError {
 impl EventError for OpenError {
     fn translated(&self) -> LoreError {
         match self {
-            OpenError::InvalidArguments(_) => LoreError::InvalidArguments,
-            OpenError::Internal(_) => LoreError::Internal,
+            Self::InvalidArguments(_) => LoreError::InvalidArguments,
+            Self::Internal(_) => LoreError::Internal,
         }
     }
 

@@ -37,11 +37,11 @@ pub enum OwnedChangeSink {
 impl OwnedChangeSink {
     pub async fn emit(&mut self, change: NodeChange) -> Result<(), StateError> {
         match self {
-            OwnedChangeSink::Vec(v) => {
+            Self::Vec(v) => {
                 v.push(change);
                 Ok(())
             }
-            OwnedChangeSink::Channel(tx) => tx
+            Self::Channel(tx) => tx
                 .send(Ok(change))
                 .await
                 .map_err(|_send_err| StateError::internal("Diff receiver dropped")),
@@ -50,8 +50,8 @@ impl OwnedChangeSink {
 
     pub fn as_sink(&mut self) -> ChangeSink<'_> {
         match self {
-            OwnedChangeSink::Vec(v) => ChangeSink::Vec(v),
-            OwnedChangeSink::Channel(tx) => ChangeSink::Channel(tx),
+            Self::Vec(v) => ChangeSink::Vec(v),
+            Self::Channel(tx) => ChangeSink::Channel(tx),
         }
     }
 }

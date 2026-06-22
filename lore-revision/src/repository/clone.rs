@@ -122,21 +122,19 @@ pub enum CloneError {
 impl EventError for CloneError {
     fn translated(&self) -> LoreError {
         match self {
-            CloneError::Disconnected(_) => LoreError::Connection,
-            CloneError::SlowDown(_) => LoreError::SlowDown,
-            CloneError::Oversized(_) => LoreError::Oversized,
-            CloneError::FileNotFound(_) => LoreError::FileNotFound,
-            CloneError::NotFound(_)
-            | CloneError::BranchNotFound(_)
-            | CloneError::RevisionNotFound(_)
-            | CloneError::LayerNotFound(_)
-            | CloneError::LinkNotFound(_)
-            | CloneError::NodeNotFound(_) => LoreError::NotFound,
-            CloneError::AddressNotFound(_) => LoreError::AddressNotFound,
-            CloneError::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            CloneError::InvalidPath(_) | CloneError::InvalidArguments(_) => {
-                LoreError::InvalidArguments
-            }
+            Self::Disconnected(_) => LoreError::Connection,
+            Self::SlowDown(_) => LoreError::SlowDown,
+            Self::Oversized(_) => LoreError::Oversized,
+            Self::FileNotFound(_) => LoreError::FileNotFound,
+            Self::NotFound(_)
+            | Self::BranchNotFound(_)
+            | Self::RevisionNotFound(_)
+            | Self::LayerNotFound(_)
+            | Self::LinkNotFound(_)
+            | Self::NodeNotFound(_) => LoreError::NotFound,
+            Self::AddressNotFound(_) => LoreError::AddressNotFound,
+            Self::PayloadNotFound(_) => LoreError::PayloadNotFound,
+            Self::InvalidPath(_) | Self::InvalidArguments(_) => LoreError::InvalidArguments,
             _ => LoreError::Internal,
         }
     }
@@ -282,7 +280,7 @@ pub struct CloneStats {
 
 impl Default for CloneStats {
     fn default() -> Self {
-        CloneStats {
+        Self {
             discovery: DiscoveryStats::default(),
             complete: CloneCompleteStats::default(),
             file_inflight: Arc::new(Semaphore::new(CLONE_FILE_DISCOVERY)),

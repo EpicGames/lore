@@ -42,7 +42,7 @@ pub struct RebacClientHelper {
 }
 
 impl RebacClientHelper {
-    async fn new(auth_url: String) -> Result<RebacClientHelper, Status> {
+    async fn new(auth_url: String) -> Result<Self, Status> {
         let mut endpoint = tonic::transport::Endpoint::from_shared(auth_url.clone())
             .warn_map_err(|_| Status::internal("Failed to create rebac endpoint"))?;
         if auth_url.starts_with("https://") {
@@ -59,7 +59,7 @@ impl RebacClientHelper {
             .await
             .warn_map_err(|_| Status::internal("Failed to connect to rebac service"))?;
         let client = RebacApiGrpcClient::with_interceptor(channel, CorrelationInterceptor);
-        Ok(RebacClientHelper { client })
+        Ok(Self { client })
     }
 }
 

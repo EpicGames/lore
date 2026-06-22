@@ -86,7 +86,7 @@ impl FixedTopology {
             })
             .collect();
 
-        Arc::new(FixedTopology {
+        Arc::new(Self {
             peers,
             peers_updated_broadcaster,
         })

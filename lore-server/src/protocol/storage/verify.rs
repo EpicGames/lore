@@ -49,7 +49,7 @@ impl Verify {
     where
         Self: Sized,
     {
-        Verify::read_from_bytes(bytes.as_ref()).map_err(|_e| MessageParseError::InvalidFieldLength)
+        Self::read_from_bytes(bytes.as_ref()).map_err(|_e| MessageParseError::InvalidFieldLength)
     }
 }
 

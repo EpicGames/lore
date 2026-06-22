@@ -30,7 +30,7 @@ impl TypedBytes for bytes::Bytes {
     where
         T: zerocopy::IntoBytes + zerocopy::Immutable,
     {
-        bytes::Bytes::from_static(slice.as_bytes())
+        Self::from_static(slice.as_bytes())
     }
 
     fn count<T>(&self) -> usize
@@ -124,14 +124,14 @@ impl TypedBytesMut for bytes::BytesMut {
     where
         T: zerocopy::IntoBytes,
     {
-        bytes::BytesMut::zeroed(count * std::mem::size_of::<T>())
+        Self::zeroed(count * std::mem::size_of::<T>())
     }
 
     fn with_count_capacity<T>(count: usize) -> bytes::BytesMut
     where
         T: zerocopy::IntoBytes,
     {
-        bytes::BytesMut::with_capacity(count * std::mem::size_of::<T>())
+        Self::with_capacity(count * std::mem::size_of::<T>())
     }
 
     fn count<T>(&self) -> usize

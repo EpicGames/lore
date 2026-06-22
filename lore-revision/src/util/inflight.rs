@@ -83,7 +83,7 @@ where
     Output: Debug,
 {
     fn default() -> Self {
-        InflightOutput {
+        Self {
             requests: Default::default(),
         }
     }

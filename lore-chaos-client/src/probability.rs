@@ -34,7 +34,7 @@ pub enum ProbabilityType {
 }
 
 impl ProbabilityEngine {
-    pub fn new(weights: ProbabilityWeighting, seed: Option<u64>) -> ProbabilityEngine {
+    pub fn new(weights: ProbabilityWeighting, seed: Option<u64>) -> Self {
         info!("Probability using seed {seed:?}");
         let seed = seed.unwrap_or_else(|| rand::rng().random());
         let mut root_rng = StdRng::seed_from_u64(seed);

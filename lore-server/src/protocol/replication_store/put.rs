@@ -58,7 +58,7 @@ pub struct PutFlags {
 
 impl From<u8> for PutFlags {
     fn from(value: u8) -> Self {
-        PutFlags { force: value == 1 }
+        Self { force: value == 1 }
     }
 }
 

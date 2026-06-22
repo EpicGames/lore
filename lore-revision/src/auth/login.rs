@@ -50,10 +50,10 @@ pub enum LoginError {
 impl EventError for LoginError {
     fn translated(&self) -> LoreError {
         match self {
-            LoginError::Disconnected(_) => LoreError::Connection,
-            LoginError::SlowDown(_) => LoreError::SlowDown,
-            LoginError::Oversized(_) => LoreError::Oversized,
-            LoginError::NotFound(_) => LoreError::NotFound,
+            Self::Disconnected(_) => LoreError::Connection,
+            Self::SlowDown(_) => LoreError::SlowDown,
+            Self::Oversized(_) => LoreError::Oversized,
+            Self::NotFound(_) => LoreError::NotFound,
             _ => LoreError::Internal,
         }
     }
@@ -80,10 +80,10 @@ pub enum InteractiveLoginError {
 impl EventError for InteractiveLoginError {
     fn translated(&self) -> LoreError {
         match self {
-            InteractiveLoginError::Disconnected(_) => LoreError::Connection,
-            InteractiveLoginError::SlowDown(_) => LoreError::SlowDown,
-            InteractiveLoginError::Oversized(_) => LoreError::Oversized,
-            InteractiveLoginError::NotFound(_) => LoreError::NotFound,
+            Self::Disconnected(_) => LoreError::Connection,
+            Self::SlowDown(_) => LoreError::SlowDown,
+            Self::Oversized(_) => LoreError::Oversized,
+            Self::NotFound(_) => LoreError::NotFound,
             _ => LoreError::Internal,
         }
     }

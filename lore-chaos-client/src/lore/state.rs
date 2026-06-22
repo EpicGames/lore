@@ -20,7 +20,7 @@ pub struct BranchState {
 
 impl Default for LoreState {
     fn default() -> Self {
-        LoreState {
+        Self {
             branches: vec![BranchState {
                 name: "main".to_string(),
                 files: Vec::new(),

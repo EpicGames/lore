@@ -164,9 +164,7 @@ pub enum UnstageError {
 impl EventError for UnstageError {
     fn translated(&self) -> LoreError {
         match self {
-            UnstageError::InvalidArguments(_) | UnstageError::InvalidPath(_) => {
-                LoreError::InvalidArguments
-            }
+            Self::InvalidArguments(_) | Self::InvalidPath(_) => LoreError::InvalidArguments,
             _ => LoreError::Internal,
         }
     }

@@ -338,22 +338,22 @@ pub enum BranchError {
 impl EventError for BranchError {
     fn translated(&self) -> LoreError {
         match self {
-            BranchError::Disconnected(_) => LoreError::Connection,
-            BranchError::SlowDown(_) => LoreError::SlowDown,
-            BranchError::Oversized(_) => LoreError::Oversized,
-            BranchError::FileNotFound(_) => LoreError::FileNotFound,
-            BranchError::NotFound(_)
-            | BranchError::BranchNotFound(_)
-            | BranchError::RevisionNotFound(_)
-            | BranchError::LayerNotFound(_)
-            | BranchError::LinkNotFound(_)
-            | BranchError::NodeNotFound(_) => LoreError::NotFound,
-            BranchError::AddressNotFound(_) => LoreError::AddressNotFound,
-            BranchError::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            BranchError::InvalidPath(_)
-            | BranchError::InvalidArguments(_)
-            | BranchError::Divergent(_) => LoreError::InvalidArguments,
-            BranchError::BranchAlreadyExists(_) => LoreError::AlreadyExists,
+            Self::Disconnected(_) => LoreError::Connection,
+            Self::SlowDown(_) => LoreError::SlowDown,
+            Self::Oversized(_) => LoreError::Oversized,
+            Self::FileNotFound(_) => LoreError::FileNotFound,
+            Self::NotFound(_)
+            | Self::BranchNotFound(_)
+            | Self::RevisionNotFound(_)
+            | Self::LayerNotFound(_)
+            | Self::LinkNotFound(_)
+            | Self::NodeNotFound(_) => LoreError::NotFound,
+            Self::AddressNotFound(_) => LoreError::AddressNotFound,
+            Self::PayloadNotFound(_) => LoreError::PayloadNotFound,
+            Self::InvalidPath(_) | Self::InvalidArguments(_) | Self::Divergent(_) => {
+                LoreError::InvalidArguments
+            }
+            Self::BranchAlreadyExists(_) => LoreError::AlreadyExists,
             _ => LoreError::Internal,
         }
     }
@@ -2278,7 +2278,7 @@ pub struct RevisionListItem {
 
 impl From<&RevisionListItem> for lore_proto::Revision {
     fn from(revision: &RevisionListItem) -> Self {
-        let mut proto_revision = lore_proto::Revision {
+        let mut proto_revision = Self {
             id: revision.revision.into(),
             commit_message: String::default(),
             timestamp: 0,

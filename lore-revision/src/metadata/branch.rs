@@ -74,7 +74,7 @@ pub enum BranchMetadataError {
 impl EventError for BranchMetadataError {
     fn translated(&self) -> LoreError {
         match self {
-            BranchMetadataError::Disconnected(_) => LoreError::Connection,
+            Self::Disconnected(_) => LoreError::Connection,
             _ => LoreError::Internal,
         }
     }

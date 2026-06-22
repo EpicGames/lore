@@ -532,7 +532,7 @@ pub enum InstanceError {
 impl EventError for InstanceError {
     fn translated(&self) -> LoreError {
         match self {
-            InstanceError::Disconnected(_) => LoreError::Connection,
+            Self::Disconnected(_) => LoreError::Connection,
             _ => LoreError::Internal,
         }
     }

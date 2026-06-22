@@ -28,7 +28,7 @@ pub struct LoreAuthClientHelper {
 }
 
 impl LoreAuthClientHelper {
-    async fn new(auth_url: String) -> Result<LoreAuthClientHelper, Status> {
+    async fn new(auth_url: String) -> Result<Self, Status> {
         let mut endpoint = tonic::transport::Endpoint::from_shared(auth_url.clone())
             .warn_map_err(|_| Status::internal("Failed to create lore auth endpoint"))?;
         if auth_url.starts_with("https://") {
@@ -45,7 +45,7 @@ impl LoreAuthClientHelper {
             .await
             .warn_map_err(|_| Status::internal("Failed to connect to lore auth service"))?;
         let client = UrcAuthApiClient::with_interceptor(channel, CorrelationInterceptor);
-        Ok(LoreAuthClientHelper { client })
+        Ok(Self { client })
     }
 
     pub async fn lookup_user_permissions(

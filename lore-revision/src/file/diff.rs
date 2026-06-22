@@ -88,11 +88,9 @@ pub enum DiffError {
 impl EventError for DiffError {
     fn translated(&self) -> LoreError {
         match self {
-            DiffError::InvalidArguments(_) | DiffError::InvalidPath(_) => {
-                LoreError::InvalidArguments
-            }
-            DiffError::RevisionNotFound(_) | DiffError::NotFound(_) => LoreError::NotFound,
-            DiffError::FileNotFound(_) => LoreError::FileNotFound,
+            Self::InvalidArguments(_) | Self::InvalidPath(_) => LoreError::InvalidArguments,
+            Self::RevisionNotFound(_) | Self::NotFound(_) => LoreError::NotFound,
+            Self::FileNotFound(_) => LoreError::FileNotFound,
             _ => LoreError::Internal,
         }
     }
@@ -906,11 +904,11 @@ impl DiffContent {
     /// An absent side (file missing on this revision / `/dev/null`). Treated as
     /// empty text, never binary.
     fn empty() -> Self {
-        DiffContent::Text(String::new())
+        Self::Text(String::new())
     }
 
     fn is_binary(&self) -> bool {
-        matches!(self, DiffContent::Binary)
+        matches!(self, Self::Binary)
     }
 
     /// The decoded text for a text side; `""` for binary. Callers short-circuit
@@ -918,8 +916,8 @@ impl DiffContent {
     /// in practice.
     fn text(&self) -> &str {
         match self {
-            DiffContent::Text(s) => s,
-            DiffContent::Binary => "",
+            Self::Text(s) => s,
+            Self::Binary => "",
         }
     }
 }

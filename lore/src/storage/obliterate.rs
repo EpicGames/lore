@@ -70,8 +70,8 @@ enum ObliterateError {
 impl EventError for ObliterateError {
     fn translated(&self) -> LoreError {
         match self {
-            ObliterateError::InvalidArguments(_) => LoreError::InvalidArguments,
-            ObliterateError::Internal(_) => LoreError::Internal,
+            Self::InvalidArguments(_) => LoreError::InvalidArguments,
+            Self::Internal(_) => LoreError::Internal,
         }
     }
 

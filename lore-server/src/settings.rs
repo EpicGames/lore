@@ -159,7 +159,7 @@ impl Settings {
             settings_builder.add_source(config::Environment::with_prefix("lore").separator("__"));
 
         let settings = settings_builder.build()?;
-        let settings: Settings = settings.try_deserialize()?;
+        let settings: Self = settings.try_deserialize()?;
         validate_trace_config(&settings)?;
         validate_feature_config(&settings)?;
         let settings_string = format!("{settings:?}");

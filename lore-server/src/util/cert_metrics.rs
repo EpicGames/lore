@@ -57,9 +57,9 @@ impl CertificateMetricsInstruments {
         }
     }
 
-    pub fn instance() -> &'static CertificateMetricsInstruments {
+    pub fn instance() -> &'static Self {
         static INSTANCE: OnceLock<CertificateMetricsInstruments> = OnceLock::new();
-        INSTANCE.get_or_init(CertificateMetricsInstruments::new)
+        INSTANCE.get_or_init(Self::new)
     }
 }
 

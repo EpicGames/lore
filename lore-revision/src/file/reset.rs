@@ -155,12 +155,10 @@ pub enum ResetError {
 impl EventError for ResetError {
     fn translated(&self) -> LoreError {
         match self {
-            ResetError::InvalidArguments(_) | ResetError::InvalidPath(_) => {
-                LoreError::InvalidArguments
+            Self::InvalidArguments(_) | Self::InvalidPath(_) => LoreError::InvalidArguments,
+            Self::RevisionNotFound(_) | Self::BranchNotFound(_) | Self::NotFound(_) => {
+                LoreError::NotFound
             }
-            ResetError::RevisionNotFound(_)
-            | ResetError::BranchNotFound(_)
-            | ResetError::NotFound(_) => LoreError::NotFound,
             _ => LoreError::Internal,
         }
     }

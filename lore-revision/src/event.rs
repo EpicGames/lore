@@ -404,7 +404,7 @@ impl LoreMetadataEventData {
             MetadataType::Binary => return Err(MetadataError::internal("metadata type mismatch")),
         };
 
-        Ok(LoreMetadataEventData { key, value })
+        Ok(Self { key, value })
     }
 }
 

@@ -73,7 +73,7 @@ impl CompositeTopology {
 
         let (peers_updated_broadcaster, _) =
             broadcast::channel::<HashSet<PeerInfo>>(PEERS_UPDATED_NOTIFICATION_BUFFER_CAPACITY);
-        let composite_topology = CompositeTopology {
+        let composite_topology = Self {
             composite_sources,
             peers_updated_broadcaster,
         };

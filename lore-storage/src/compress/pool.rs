@@ -58,7 +58,7 @@ impl CompressionWork {
     // dev/test builds and any future profile change to unwind.
     fn execute(self) {
         match self {
-            CompressionWork::Compress {
+            Self::Compress {
                 fragment,
                 payload,
                 mode,
@@ -83,7 +83,7 @@ impl CompressionWork {
                 });
                 let _ = tx.send(result);
             }
-            CompressionWork::Decompress {
+            Self::Decompress {
                 fragment,
                 compressed,
                 output_buffer,

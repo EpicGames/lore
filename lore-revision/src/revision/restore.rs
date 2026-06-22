@@ -187,18 +187,16 @@ pub enum RestoreError {
 impl EventError for RestoreError {
     fn translated(&self) -> LoreError {
         match self {
-            RestoreError::Disconnected(_) => LoreError::Connection,
-            RestoreError::SlowDown(_) => LoreError::SlowDown,
-            RestoreError::Oversized(_) => LoreError::Oversized,
-            RestoreError::FileNotFound(_) => LoreError::FileNotFound,
-            RestoreError::NotFound(_)
-            | RestoreError::LayerNotFound(_)
-            | RestoreError::RevisionNotFound(_) => LoreError::NotFound,
-            RestoreError::AddressNotFound(_) => LoreError::AddressNotFound,
-            RestoreError::PayloadNotFound(_) => LoreError::PayloadNotFound,
-            RestoreError::InvalidPath(_) | RestoreError::InvalidArguments(_) => {
-                LoreError::InvalidArguments
+            Self::Disconnected(_) => LoreError::Connection,
+            Self::SlowDown(_) => LoreError::SlowDown,
+            Self::Oversized(_) => LoreError::Oversized,
+            Self::FileNotFound(_) => LoreError::FileNotFound,
+            Self::NotFound(_) | Self::LayerNotFound(_) | Self::RevisionNotFound(_) => {
+                LoreError::NotFound
             }
+            Self::AddressNotFound(_) => LoreError::AddressNotFound,
+            Self::PayloadNotFound(_) => LoreError::PayloadNotFound,
+            Self::InvalidPath(_) | Self::InvalidArguments(_) => LoreError::InvalidArguments,
             _ => LoreError::Internal,
         }
     }

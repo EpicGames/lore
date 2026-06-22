@@ -19,17 +19,17 @@ pub enum ProtocolError {
 impl From<tonic::Status> for ProtocolError {
     fn from(value: tonic::Status) -> Self {
         match value.code() {
-            tonic::Code::Unavailable | tonic::Code::Unknown => ProtocolError::from(Disconnected),
-            tonic::Code::PermissionDenied => ProtocolError::from(NotAuthorized),
-            tonic::Code::NotFound => ProtocolError::from(NotFound),
-            tonic::Code::ResourceExhausted => ProtocolError::from(SlowDown),
-            tonic::Code::OutOfRange => ProtocolError::from(Oversized {
+            tonic::Code::Unavailable | tonic::Code::Unknown => Self::from(Disconnected),
+            tonic::Code::PermissionDenied => Self::from(NotAuthorized),
+            tonic::Code::NotFound => Self::from(NotFound),
+            tonic::Code::ResourceExhausted => Self::from(SlowDown),
+            tonic::Code::OutOfRange => Self::from(Oversized {
                 context: value.message().to_string(),
             }),
-            tonic::Code::Unimplemented => ProtocolError::from(NotSupported {
+            tonic::Code::Unimplemented => Self::from(NotSupported {
                 operation: value.message().to_string(),
             }),
-            _ => ProtocolError::internal(value.to_string()),
+            _ => Self::internal(value.to_string()),
         }
     }
 }
@@ -38,21 +38,17 @@ impl From<ProtocolError> for tonic::Status {
     fn from(value: ProtocolError) -> Self {
         let msg = value.to_string();
         match value {
-            ProtocolError::NotAuthenticated(_) => {
-                tonic::Status::new(tonic::Code::Unauthenticated, msg)
-            }
-            ProtocolError::NotAuthorized(_) => {
-                tonic::Status::new(tonic::Code::PermissionDenied, msg)
-            }
-            ProtocolError::SlowDown(_) => tonic::Status::new(tonic::Code::ResourceExhausted, msg),
-            ProtocolError::NotFound(_) => tonic::Status::new(tonic::Code::NotFound, msg),
-            ProtocolError::Oversized(_) => tonic::Status::new(tonic::Code::OutOfRange, msg),
+            ProtocolError::NotAuthenticated(_) => Self::new(tonic::Code::Unauthenticated, msg),
+            ProtocolError::NotAuthorized(_) => Self::new(tonic::Code::PermissionDenied, msg),
+            ProtocolError::SlowDown(_) => Self::new(tonic::Code::ResourceExhausted, msg),
+            ProtocolError::NotFound(_) => Self::new(tonic::Code::NotFound, msg),
+            ProtocolError::Oversized(_) => Self::new(tonic::Code::OutOfRange, msg),
             ProtocolError::Disconnected(_) | ProtocolError::Maintenance(_) => {
-                tonic::Status::new(tonic::Code::Unavailable, msg)
+                Self::new(tonic::Code::Unavailable, msg)
             }
-            ProtocolError::NotSupported(_) => tonic::Status::new(tonic::Code::Unimplemented, msg),
+            ProtocolError::NotSupported(_) => Self::new(tonic::Code::Unimplemented, msg),
             ProtocolError::NoRemote(_) | ProtocolError::Internal(_) => {
-                tonic::Status::new(tonic::Code::Internal, msg)
+                Self::new(tonic::Code::Internal, msg)
             }
         }
     }

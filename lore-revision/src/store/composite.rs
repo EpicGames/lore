@@ -140,21 +140,21 @@ enum CompositeStoreHit<T> {
 impl<T> CompositeStoreHit<T> {
     fn inner(&self) -> &T {
         match self {
-            CompositeStoreHit::Local(v)
-            | CompositeStoreHit::Durable(v)
-            | CompositeStoreHit::Replica(v)
-            | CompositeStoreHit::Mixed(v)
-            | CompositeStoreHit::Miss(v) => v,
+            Self::Local(v)
+            | Self::Durable(v)
+            | Self::Replica(v)
+            | Self::Mixed(v)
+            | Self::Miss(v) => v,
         }
     }
 
     fn map<U, F: FnOnce(T) -> U>(self, op: F) -> CompositeStoreHit<U> {
         match self {
-            CompositeStoreHit::Local(v) => CompositeStoreHit::Local(op(v)),
-            CompositeStoreHit::Durable(v) => CompositeStoreHit::Durable(op(v)),
-            CompositeStoreHit::Replica(v) => CompositeStoreHit::Replica(op(v)),
-            CompositeStoreHit::Mixed(v) => CompositeStoreHit::Mixed(op(v)),
-            CompositeStoreHit::Miss(v) => CompositeStoreHit::Miss(op(v)),
+            Self::Local(v) => CompositeStoreHit::Local(op(v)),
+            Self::Durable(v) => CompositeStoreHit::Durable(op(v)),
+            Self::Replica(v) => CompositeStoreHit::Replica(op(v)),
+            Self::Mixed(v) => CompositeStoreHit::Mixed(op(v)),
+            Self::Miss(v) => CompositeStoreHit::Miss(op(v)),
         }
     }
 
@@ -162,11 +162,11 @@ impl<T> CompositeStoreHit<T> {
     /// with the type of hit.
     fn into_counted_result<E>(self, counter: &Counter<u64>) -> Result<T, E> {
         let (kind, value) = match self {
-            CompositeStoreHit::Local(v) => ("local", v),
-            CompositeStoreHit::Durable(v) => ("durable", v),
-            CompositeStoreHit::Replica(v) => ("replica", v),
-            CompositeStoreHit::Mixed(v) => ("mixed", v),
-            CompositeStoreHit::Miss(v) => ("miss", v),
+            Self::Local(v) => ("local", v),
+            Self::Durable(v) => ("durable", v),
+            Self::Replica(v) => ("replica", v),
+            Self::Mixed(v) => ("mixed", v),
+            Self::Miss(v) => ("miss", v),
         };
 
         counter.add(1, &[STORE_ATTRIBUTE.clone(), KeyValue::new("found", kind)]);
