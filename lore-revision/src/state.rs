@@ -3306,7 +3306,7 @@ pub struct TreePath {
     pub address: Option<Address>,
     pub flags: NodeFlags,
     pub size: u64,
-    pub executable: bool,
+    pub mode: u64,
 }
 
 pub type CanReadRepository = Arc<dyn Fn(RepositoryId) -> bool + Send + Sync>;
@@ -3469,7 +3469,7 @@ async fn gather_tree_paths_node(
         address,
         flags,
         size: node.size,
-        executable: node.mode & NodeFileMode::Executable == NodeFileMode::Executable,
+        mode: node.mode as u64,
     });
 
     let depth_remaining = max_depth == 0 || depth + 1 < max_depth;

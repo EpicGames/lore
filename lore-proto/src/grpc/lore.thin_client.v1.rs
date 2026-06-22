@@ -78,9 +78,9 @@ pub struct TreeNode {
     /// Original size in bytes. For DIRECTORY entries, this is the cumulative size of its descendant files.
     #[prost(uint64, tag = "4")]
     pub size: u64,
-    /// True when the FILE entry has the executable bit set.
-    #[prost(bool, tag = "5")]
-    pub executable: bool,
+    /// File mode for this entry. For possible flags and values, see enum FileMode.
+    #[prost(uint64, tag = "5")]
+    pub mode: u64,
 }
 impl ::prost::Name for TreeNode {
     const NAME: &'static str = "TreeNode";

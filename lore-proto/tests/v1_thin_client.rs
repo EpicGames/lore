@@ -109,7 +109,7 @@ fn v1_thin_client_field_shapes() {
         node_type: _,
         address: _,
         size: _,
-        executable: _,
+        mode: _,
     } = TreeNode::default();
 
     // Revision + nested Parent + Metadata
