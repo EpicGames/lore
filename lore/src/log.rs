@@ -64,14 +64,16 @@ pub fn log_level() -> LoreLogLevel {
 pub fn configure(config: &LoreLogConfig) {
     initialize();
 
-    if config.file == 0 {
-        return;
-    }
-
     let mut config = config.clone();
 
     if config.level == LoreLogLevel::None {
         config.level = LoreLogLevel::Info;
+    }
+
+    lore_base::log::set_log_level(config.level);
+
+    if config.file == 0 {
+        return;
     }
 
     let prefix = if !config.file_prefix.is_empty() {
