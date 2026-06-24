@@ -1,4 +1,4 @@
-# Configure Loreignore for Unreal Engine
+# Configure loreignore for Unreal Engine
 
 In this tutorial, you will set up a `.loreignore` file tailored for Unreal Engine projects to ensure that only source assets are tracked, while temporary build files and caches are ignored.
 
@@ -56,7 +56,7 @@ In this tutorial, you will set up a `.loreignore` file tailored for Unreal Engin
 
 ## Verify
 
-Check that the ignored directories do not appear in the staged or untracked file list.
+Check that the ignored directories don't appear in the staged or untracked file list.
 
 ```bash
 lore status
@@ -72,5 +72,5 @@ Changes not staged for commit:
 
 ## Next steps
 
-- [Stage and commit your project](./add-unreal-project.md#step-6)
+- [Stage and commit your project](./add-unreal-project.md#steps)
 - [Set up your Lore identity](./setup-identity.md)

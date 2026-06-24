@@ -42,7 +42,7 @@ In this tutorial, you will migrate an existing Unreal Engine or UEFN project fro
 
 5. **Commit the ignore file.**
 
-   Commit the `.loreignore` file first so it is active before you stage the rest of the project.
+   Commit the `.loreignore` file first so it's active before you stage the rest of the project.
 
    ```bash
    lore stage .loreignore
@@ -61,7 +61,7 @@ In this tutorial, you will migrate an existing Unreal Engine or UEFN project fro
 
 ## Verify
 
-Check that your project is safely stored on the server.
+Check that your project is stored on the server.
 
 ```bash
 lore status

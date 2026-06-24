@@ -13,12 +13,12 @@ Tutorials are lessons. They teach by doing. You'll work through realistic exampl
 - **Writing a new Tutorial?** Start at the [doc-standards walkthrough](../developing/doc-standards/writing-a-doc.md).
 - [Tutorial template](tutorial-template.md). Copy this when starting a new Tutorial.
 
-## Core Tutorials
+## Core tutorials
 
 - [Setup Identity](setup-identity.md) — configure your user identity for commits.
 - [Configure Loreignore](loreignore.md) — set up a .loreignore file for your project.
 
-## Advanced Connectivity
+## Advanced connectivity
 
 - [No-Auth (Internal)](auth-none.md) — connecting to unauthenticated internal servers.
 - [mTLS (High Security)](auth-mtls.md) — high-security certificate-based authentication.

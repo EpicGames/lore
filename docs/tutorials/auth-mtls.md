@@ -1,8 +1,8 @@
-# Guide: High-Security mTLS Authentication
+# Guide: High-security mTLS authentication
 
 mTLS (Mutual TLS) requires every user to have a unique certificate signed by a Root Authority (CA) that the server trusts. This is the most secure method but has the highest management overhead.
 
-## 1. Create a Root CA
+## 1. Create a root CA
 
 If you don't have one, create a CA to sign user certificates:
 
@@ -25,7 +25,7 @@ pkey_file = "/opt/loreserver/certs/key.pem"
 cert_chain = "/opt/loreserver/certs/ca.pem" # The Trusted CA
 ```
 
-## 3. Generate User Certificates
+## 3. Generate user certificates
 
 For **each person** on the team, you must generate a keypair and sign it:
 
@@ -33,6 +33,6 @@ For **each person** on the team, you must generate a keypair and sign it:
 2. **Request:** `openssl req -new -key user-key.pem -out user.csr`
 3. **Sign:** `openssl x509 -req -in user.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial -out user-cert.pem -days 365`
 
-## 4. Distribute to User
+## 4. Distribute to user
 
 The user must place `user-cert.pem` and `user-key.pem` on their machine and configure their Lore client to use them (refer to Lore CLI advanced config).
