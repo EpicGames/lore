@@ -1476,24 +1476,38 @@ mod open_tests {
         assert_eq!(data_blue, b"blue partition payload");
     }
 
-    /// Save/restore guard for the process-wide `LOCAL_ISOLATION` flag so
-    /// a test can toggle it without leaking the change to parallel tests.
-    /// Other storage tests target matching `(partition, address)` pairs,
-    /// so the toggle does not change their outcome.
+    /// Serializes the tests that toggle the process-wide `LOCAL_ISOLATION` flag. Cargo runs
+    /// tests in parallel; the flag's only writer of `false` is `IsolationGuard::drop`, so two
+    /// overlapping guard windows let one test's drop clear the flag mid-`get` of the other.
+    /// Held for the lifetime of an [`IsolationGuard`], the two windows can never overlap.
+    static ISOLATION_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Save/restore guard for the process-wide `LOCAL_ISOLATION` flag so a test can toggle it
+    /// without leaking the change to parallel tests. Acquiring [`ISOLATION_SERIAL`] keeps the
+    /// isolation-sensitive tests from running their toggle windows concurrently. Other storage
+    /// tests target matching `(partition, address)` pairs, so the flag being set does not change
+    /// their outcome.
     struct IsolationGuard {
         previous: bool,
+        _serial: tokio::sync::MutexGuard<'static, ()>,
     }
 
     impl IsolationGuard {
-        fn force_on() -> Self {
+        async fn force_on() -> Self {
+            let serial = ISOLATION_SERIAL.lock().await;
             let previous =
                 lore_storage::LOCAL_ISOLATION.swap(true, std::sync::atomic::Ordering::AcqRel);
-            Self { previous }
+            Self {
+                previous,
+                _serial: serial,
+            }
         }
     }
 
     impl Drop for IsolationGuard {
         fn drop(&mut self) {
+            // Runs before `_serial` is dropped, so the flag is restored while the serial lock is
+            // still held — the next guard observes a settled flag.
             lore_storage::LOCAL_ISOLATION
                 .store(self.previous, std::sync::atomic::Ordering::Release);
         }
@@ -1509,7 +1523,7 @@ mod open_tests {
         use lore_base::types::Context;
         use lore_base::types::Partition;
 
-        let _guard = IsolationGuard::force_on();
+        let _guard = IsolationGuard::force_on().await;
 
         let (open_sink, open_cb) = make_sink();
         assert_eq!(open_in_memory(open_cb).await, 0);
@@ -2651,7 +2665,7 @@ mod open_tests {
         assert_eq!(complete.5, address.context);
 
         // Verify the target carries the payload locally without Durable.
-        let _guard = IsolationGuard::force_on();
+        let _guard = IsolationGuard::force_on().await;
         let (q_status, q_events) = get_metadata_items(
             handle,
             vec![lore::storage::get_metadata::LoreStorageGetMetadataItem {
@@ -4545,12 +4559,12 @@ mod open_tests {
         assert!(take_opened(&events).is_none());
     }
 
-    /// Open a disk-backed handle with `gc=1` and explicit `cache_target_*` values. The
-    /// underlying evictor's internal floor prevents the targets from being arbitrarily small,
-    /// so this test is structural — verify that the handle accepts the field, the spawn does
-    /// not panic, the handle survives an op cycle, and the close path tears the spawned tasks
-    /// down cleanly (proves the spawn happened — without spawn, `compact_stop` would have no
-    /// counterpart to stop).
+    /// Open a disk-backed handle with explicit `cache_target_*` values, which enable the
+    /// handle's incremental GC. The underlying evictor's internal floor prevents the targets
+    /// from being arbitrarily small, so this test is structural — verify that the handle
+    /// accepts the fields, the spawn does not panic, the handle survives an op cycle, and the
+    /// close path tears the spawned tasks down cleanly (proves the spawn happened — without
+    /// spawn, `compact_stop` would have no counterpart to stop)
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn open_with_gc_and_cache_target_round_trips_an_op_cycle() {
         use lore_base::types::Context;
@@ -4561,8 +4575,7 @@ mod open_tests {
         create_repo(repo_path).await;
 
         let (open_sink, open_cb) = make_sink();
-        let mut g = globals();
-        g.gc = 1;
+        let g = globals();
         let status = open::open(
             g,
             LoreStorageOpenArgs {
@@ -4575,7 +4588,7 @@ mod open_tests {
             open_cb,
         )
         .await;
-        assert_eq!(status, 0, "open with gc=1 and cache_target_* must succeed");
+        assert_eq!(status, 0, "open with cache_target_* must succeed");
         let id = take_opened(&open_sink.lock().unwrap()).expect("open should have emitted Opened");
         let handle = lore::storage::handle::LoreStore { handle_id: id };
 
@@ -4725,9 +4738,10 @@ mod open_tests {
         );
     }
 
-    /// Open with `gc=0`: no evictor or compactor is spawned. Putting many fragments must not
-    /// cause the count to drop. We verify the negative — fragment count climbs and stays —
-    /// to prove the evictor is genuinely off (rather than just slow).
+    /// Open with `no_gc=1`: no evictor or compactor is spawned even though `cache_target_*`
+    /// are set. Putting many fragments must not cause the count to drop. We verify the
+    /// negative — fragment count climbs and stays — to prove the evictor is genuinely off
+    /// (rather than just slow).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn open_without_gc_does_not_spawn_evictor() {
         use lore_base::types::Context;
@@ -4739,7 +4753,7 @@ mod open_tests {
 
         let (open_sink, open_cb) = make_sink();
         let mut g = globals();
-        g.gc = 0;
+        g.no_gc = 1;
         let status = open::open(
             g,
             LoreStorageOpenArgs {
@@ -4793,7 +4807,7 @@ mod open_tests {
         let count = immutable.fragment_count().await.unwrap_or(0);
         assert!(
             count >= 16,
-            "with gc=0 no evictor should run; expected >= 16 fragments, got {count}",
+            "with no_gc=1 no evictor should run; expected >= 16 fragments, got {count}",
         );
 
         let (_, close_cb) = make_sink();

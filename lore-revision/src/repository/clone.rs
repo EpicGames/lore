@@ -364,6 +364,8 @@ struct BlockDiscoverItem {
     depth: u32,
     /// Cycle detector state, carried across block boundaries.
     cycle: SiblingCycleGuard,
+    /// Whether any child has been visited, carried across block boundaries.
+    visited_child: bool,
 }
 
 const BLOCK_DISCOVER_CHANNEL_CAPACITY: usize = 100;
@@ -537,6 +539,20 @@ async fn block_discover_task(
     }
 }
 
+/// Create `relative_path` and any missing ancestors, materializing a directory
+/// the view filter left without in-view content: one empty in the revision, or
+/// one whose children were all filtered out.
+async fn create_empty_directory(
+    repository: &Arc<RepositoryContext>,
+    relative_path: &RelativePath,
+) -> Result<(), CloneError> {
+    let absolute = relative_path.to_absolute_path(repository.require_path()?);
+    tokio::fs::create_dir_all(&absolute)
+        .await
+        .internal_with(|| format!("Failed to create directory {}", absolute.display()))?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_block_item(
     dispatcher: &Arc<BlockDiscoverDispatcher>,
@@ -551,6 +567,7 @@ async fn process_block_item(
     let mut current_node_id = item.node_id;
     let expected_parent = item.expected_parent;
     let mut cycle = item.cycle;
+    let mut visited_child = item.visited_child;
 
     loop {
         let node_index = Node::index(current_node_id);
@@ -575,6 +592,7 @@ async fn process_block_item(
             node.is_directory(),
             FilterMode::View,
         ) {
+            visited_child = true;
             if node.is_file() {
                 dispatcher
                     .stats
@@ -630,7 +648,6 @@ async fn process_block_item(
                     d.item_complete();
                 });
             } else if node.is_directory() {
-                // Serializing mkdirs in the discovery walk bottlenecks the whole rate; defer to clone_file's cached just-in-time parent-dir setup instead.
                 if execution_context().globals().dry_run() {
                     let node_path_absolute =
                         node_path_relative.to_absolute_path(dispatcher.repository.require_path()?);
@@ -646,16 +663,10 @@ async fn process_block_item(
                         follow_deps: false,
                         depth: 0,
                         cycle: SiblingCycleGuard::new(current_node_id),
+                        visited_child: false,
                     });
                 } else if !execution_context().globals().dry_run() {
-                    // Empty dir -- no descendant will materialize the path; rare enough to skip caching.
-                    let absolute =
-                        node_path_relative.to_absolute_path(dispatcher.repository.require_path()?);
-                    tokio::fs::create_dir_all(&absolute)
-                        .await
-                        .internal_with(|| {
-                            format!("Failed to create directory {}", absolute.display())
-                        })?;
+                    create_empty_directory(&dispatcher.repository, &node_path_relative).await?;
                 }
             }
         }
@@ -675,10 +686,19 @@ async fn process_block_item(
                     follow_deps: false,
                     depth: 0,
                     cycle,
+                    visited_child,
                 });
                 break;
             }
-            None => break,
+            None => {
+                if !visited_child
+                    && !item.relative_path.is_empty()
+                    && !execution_context().globals().dry_run()
+                {
+                    create_empty_directory(&dispatcher.repository, &item.relative_path).await?;
+                }
+                break;
+            }
         }
     }
 
@@ -797,6 +817,7 @@ async fn process_block_item_dependency(
                 follow_deps: dep_ctx.recursive,
                 depth: item.depth + 1,
                 cycle: SiblingCycleGuard::new(INVALID_NODE),
+                visited_child: false,
             });
         }
     }
@@ -1383,6 +1404,7 @@ async fn clone_in_path(
                 follow_deps: false,
                 depth: 0,
                 cycle: SiblingCycleGuard::new(ROOT_NODE),
+                visited_child: false,
             });
         }
     } else {
@@ -1426,6 +1448,7 @@ async fn clone_in_path(
                 follow_deps: true,
                 depth: 0,
                 cycle: SiblingCycleGuard::new(INVALID_NODE),
+                visited_child: false,
             });
         }
 
@@ -1550,6 +1573,7 @@ async fn clone_discover_link(
                     follow_deps: false,
                     depth: 0,
                     cycle: SiblingCycleGuard::new(link_node),
+                    visited_child: false,
                 });
             }
 

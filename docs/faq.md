@@ -38,13 +38,13 @@ Lore has basic locking today: users can place locks on files to signal to collab
 
 What isn’t yet in place is enforcement — the current implementation informs rather than blocks, and lock state is queried globally across the repository, which doesn’t scale to very large projects.
 
-The next iteration of locking, currently in design, will focus on cross-branch lock scalability in repositories with millions of files and thousands of concurrent users. We’ll share updates on progress through the public roadmap and Discord.
+The next iteration of locking, currently in design, will focus on cross-branch lock scalability in repositories with millions of files and thousands of concurrent users. We’ll share updates on progress through the [public roadmap](roadmap.md) and Discord.
 
 ## What infrastructure do I need to run a Lore server?
 
 For local use, none — Lore’s zero-config local mode runs as a single server executable with no external dependencies, no certificates, and no cloud account required.
 
-For team-wide deployments, Lore’s storage backends are designed to be replaceable: the reference implementations ship with AWS S3 for durable immutable storage and DynamoDB for the mutable key-value store (branch pointers and metadata), but the storage and transport layers sit behind documented interfaces that third-party backends can implement. The server can be deployed via Docker or a pre-built binary and scaled horizontally with edge cache and read replica tiers in front of durable storage. The initial release supports a two-level server hierarchy; broader multi-level topologies are on the roadmap.
+For team-wide deployments, Lore’s storage backends are designed to be replaceable: the reference implementations ship with AWS S3 for durable immutable storage and DynamoDB for the mutable key-value store (branch pointers and metadata), but the storage and transport layers sit behind documented interfaces that third-party backends can implement. The server can be deployed via Docker or a pre-built binary and scaled horizontally with edge cache and read replica tiers in front of durable storage. The initial release supports a two-level server hierarchy; broader multi-level topologies are [on the roadmap](roadmap.md).
 
 ## How does Lore handle merge conflicts?
 
@@ -52,7 +52,7 @@ Lore is binary-first by design: all content flows through the same storage primi
 
 For text files, the version control layer ships a standard three-way merge implementation that handles the common case of two contributors editing different parts of the same file.
 
-For binary assets — where automatic merging is rarely meaningful — conflicts surface as explicit divergence: the system detects that two branches have modified the same file and surfaces the conflict for the user to resolve by choosing which version to carry forward. File locking is the recommended workflow for binary assets where two people should never be editing simultaneously in the first place. More advanced capabilities — such as partial binary merges exploiting Lore’s fragment-level storage, and pluggable custom resolvers by content type — are part of the longer-term roadmap.
+For binary assets — where automatic merging is rarely meaningful — conflicts surface as explicit divergence: the system detects that two branches have modified the same file and surfaces the conflict for the user to resolve by choosing which version to carry forward. File locking is the recommended workflow for binary assets where two people should never be editing simultaneously in the first place. More advanced capabilities — such as partial binary merges exploiting Lore’s fragment-level storage, and pluggable custom resolvers by content type — are part of the [longer-term roadmap](roadmap.md).
 
 ## How do I report a security vulnerability?
 
@@ -86,8 +86,8 @@ Yes. Our principle is that contributors must have equal access to Lore’s featu
 
 ## What’s on the roadmap?
 
-Planned additions include expanded large-repository workflows (VFS, Windows Service), OAuth integration, scalable locking, multi-server replication, client and server-side hooks, a VS Code plugin, and an open source desktop and web client.
+Planned additions include expanded large-repository workflows (VFS, Windows Service), OAuth integration, scalable locking, edge instances and advanced server topologies, client and server-side hooks, a VS Code plugin, and an open source desktop and web client. The [roadmap](roadmap.md) lays out these big-rock themes by time horizon, with the reasoning behind each one.
 
 ## Who maintains Lore?
 
-At initial release, Lore is maintained by a dedicated team at Epic Games, but we intend for governance to evolve toward a diverse technical steering group drawn from both internal and external contributors, operating through public roadmaps, RFCs, and open meetings.
+At initial release, Lore is maintained by a dedicated team at Epic Games, but we intend for governance to evolve toward a diverse technical steering group drawn from both internal and external contributors, operating through [public roadmaps](roadmap.md), RFCs, and open meetings.

@@ -203,6 +203,8 @@ pub struct TransportConfig {
     pub max_bytes_bandwidth_per_second: u64,
     pub expected_rtt_ms: u64,
     pub congestion_algorithm: CongestionAlgorithm,
+    /// Warm-start hint for Congestion Algorithms: seed the initial congestion window
+    pub initial_cwnd: Option<u64>,
 }
 
 /// When working within a QUIC connection, these are the opportunities
@@ -737,8 +739,21 @@ pub async fn connect(
 
     let congestion_controller: Arc<dyn congestion::ControllerFactory + Send + Sync + 'static> =
         match transport.congestion_algorithm {
-            CongestionAlgorithm::Bbr => Arc::new(congestion::BbrConfig::default()),
-            CongestionAlgorithm::Cubic => Arc::new(congestion::CubicConfig::default()),
+            CongestionAlgorithm::Bbr => {
+                let mut bbr = congestion::BbrConfig::default();
+                if let Some(cwnd) = transport.initial_cwnd {
+                    bbr.initial_window(cwnd);
+                }
+                Arc::new(bbr)
+            }
+            CongestionAlgorithm::Cubic => {
+                let mut cubic = congestion::CubicConfig::default();
+                if let Some(cwnd) = transport.initial_cwnd {
+                    cubic.initial_window(cwnd);
+                }
+
+                Arc::new(cubic)
+            }
         };
     transport_config.congestion_controller_factory(congestion_controller);
 

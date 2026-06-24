@@ -924,13 +924,13 @@ async fn reset_local(
         callback,
         args,
         reset,
-        move |repository, _token, args| {
+        move |repository, token, args| async move {
             let options = ResetOptions {
                 purge: args.purge != 0,
                 single_node: false,
             };
 
-            file::reset::reset(repository, args.paths, args.revision, options)
+            file::reset::reset(repository, &token, args.paths, args.revision, options).await
         },
     )
     .await

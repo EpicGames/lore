@@ -403,12 +403,12 @@ mod tests {
         store_dyn.clone().flush(true).await.unwrap();
 
         // evict_oldest with generous capacity: no actual eviction, but the bucket-iteration path runs at every level.
-        let _evicted = store.evict_oldest(1_000_000_000).await;
+        let _evicted = store.evict_oldest(1_000_000_000, None).await;
 
         // compact with small max_size: forces compact_packfiles → compact_group_packfiles → evict_group_sized to iterate per-group bucket arrays at the actual bucket_count. We don't care whether it evicts anything; we only care that all three paths complete without error or panic at every group level.
         let _compact_step = store_dyn
             .clone()
-            .compact(1, None, false)
+            .compact(1, None, false, None)
             .await
             .expect("compact must complete without error at mixed bucket levels");
 

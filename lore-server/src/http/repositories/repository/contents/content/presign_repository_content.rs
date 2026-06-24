@@ -24,6 +24,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::http::log_http_error;
 use crate::http::presign_token::CURRENT_TOKEN_VERSION;
 use crate::http::presign_token::PresignTokenPayload;
 use crate::http::presign_token::sign;
@@ -49,11 +50,9 @@ pub enum PresignError {
 
 impl IntoResponse for PresignError {
     fn into_response(self) -> axum::response::Response {
-        warn!("presign_repository_content error: {:?}", &self);
-
-        let (status, msg) = match self {
-            e @ (PresignError::ParseRepository(_) | PresignError::ParseAddress(_)) => {
-                (StatusCode::BAD_REQUEST, e.to_string())
+        let (status, msg) = match &self {
+            PresignError::ParseRepository(_) | PresignError::ParseAddress(_) => {
+                (StatusCode::BAD_REQUEST, self.to_string())
             }
             PresignError::NotConfigured => (
                 StatusCode::NOT_FOUND,
@@ -65,6 +64,8 @@ impl IntoResponse for PresignError {
             ),
             PresignError::NotFound => (StatusCode::NOT_FOUND, "address not found".to_string()),
         };
+
+        log_http_error(&self, status);
 
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "text/plain".parse().unwrap());
@@ -177,20 +178,17 @@ pub async fn handler(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use axum::Extension;
-    use axum::Router;
     use axum::http::StatusCode;
-    use axum::routing;
     use axum_test::TestServer;
     use lore_base::runtime::LORE_CONTEXT;
     use rand::random;
     use serde_json::json;
 
-    use crate::auth::jwt::AuthorizationToken;
+    use crate::http::server::LoreHttpServerSettings;
     use crate::http::server::PresignConfig;
+    use crate::http::server::ServerHealth;
     use crate::http::server::ServerState;
+    use crate::http::server::create_router;
     use crate::store::test_store_create;
 
     fn test_presign_config() -> PresignConfig {
@@ -204,16 +202,6 @@ mod tests {
         }
     }
 
-    fn handler_router(state: ServerState) -> Router {
-        Router::new()
-            .route(
-                "/repository/{repository_id}/content/{address}/presign",
-                routing::post(super::handler),
-            )
-            .layer(Extension(None::<AuthorizationToken>))
-            .with_state(Arc::new(state))
-    }
-
     #[tokio::test]
     async fn returns_404_when_address_not_found() {
         let (immutable_store, mutable_store, execution) =
@@ -223,6 +211,7 @@ mod tests {
                 let repository = random::<lore_revision::lore::RepositoryId>();
                 let address = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff-ffffffffffffffffffffffffffffffff";
 
+                let test_health = ServerHealth::new_without_availability(immutable_store.clone());
                 let state = ServerState {
                     immutable_store,
                     mutable_store,
@@ -231,11 +220,12 @@ mod tests {
                     presign_config: Some(test_presign_config()),
                 };
                 let repo_hex = format!("{repository}");
-                let app = handler_router(state);
+                let settings = LoreHttpServerSettings::default();
+                let app = create_router(state, test_health, &settings);
                 let server = TestServer::new(app).unwrap();
 
                 let response = server
-                    .post(&format!("/repository/{repo_hex}/content/{address}/presign"))
+                    .post(&format!("/v1/repository/{repo_hex}/content/{address}/presign"))
                     .json(&json!({"ttl_seconds": 3600}))
                     .await;
 

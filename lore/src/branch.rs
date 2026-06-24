@@ -17,6 +17,7 @@ use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreEventCallback;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::interface::LoreMetadataType;
+use lore_revision::lore::BranchId;
 use lore_revision::lore::execution_context;
 use lore_revision::lore_debug;
 use lore_revision::lore_error;
@@ -1307,6 +1308,30 @@ pub struct LoreBranchMetadataGetArgs {
     pub key: LoreString,
 }
 
+/// Resolve a branch name or identifier to its id, defaulting to the current branch when the
+/// name is empty. Branch metadata commands accept an optional branch and operate on the
+/// instance's current branch when none is given.
+async fn resolve_branch_id_or_current(
+    repository: Arc<RepositoryContext>,
+    branch: &str,
+) -> Result<BranchId, BranchMetadataError> {
+    if branch.is_empty() {
+        let (_revision, current_branch) = lore_revision::instance::load_current_anchor(&repository)
+            .await
+            .map_err(|_err| lore_base::error::InvalidArguments {
+                reason: "no current branch to operate on; specify --branch".into(),
+            })?;
+        return Ok(current_branch);
+    }
+
+    let status = branch::resolve(repository, branch).await.map_err(|_err| {
+        lore_base::error::InvalidArguments {
+            reason: format!("branch '{branch}' not found"),
+        }
+    })?;
+    Ok(status.id)
+}
+
 /// Retrieves branch metadata. If `key` is non-empty, returns that single key's value.
 /// If `key` is empty, returns all metadata entries.
 pub async fn metadata_get(
@@ -1335,15 +1360,12 @@ async fn metadata_get_local(
                 Some(args.key.to_string())
             };
             async move {
-                let branch = branch::resolve(repository.clone(), &branch_name)
-                    .await
-                    .map_err(|_err| lore_base::error::InvalidArguments {
-                        reason: format!("branch '{branch_name}' not found"),
-                    })?;
+                let branch_id =
+                    resolve_branch_id_or_current(repository.clone(), &branch_name).await?;
 
                 lore_revision::metadata::branch::get(
                     repository,
-                    branch.id,
+                    branch_id,
                     key.as_deref(),
                     execution_context().globals().local(),
                 )
@@ -1400,11 +1422,7 @@ async fn metadata_set_impl(
     use lore_revision::metadata::Metadata;
     use lore_revision::metadata::MetadataType;
 
-    let branch = branch::resolve(repository.clone(), args.branch.as_str())
-        .await
-        .map_err(|_err| lore_base::error::InvalidArguments {
-            reason: format!("branch '{}' not found", args.branch.as_str()),
-        })?;
+    let branch_id = resolve_branch_id_or_current(repository.clone(), args.branch.as_str()).await?;
 
     let keys: Vec<_> = args
         .keys
@@ -1433,7 +1451,7 @@ async fn metadata_set_impl(
     }
     let values: Vec<&[u8]> = encoded_values.iter().map(|v| v.as_slice()).collect();
 
-    lore_revision::metadata::branch::set(repository, branch.id, &keys, &values, &formats).await
+    lore_revision::metadata::branch::set(repository, branch_id, &keys, &values, &formats).await
 }
 
 #[repr(C)]
@@ -1470,14 +1488,11 @@ async fn metadata_clear_local(
             let branch_name = args.branch.to_string();
             let keys: Vec<String> = args.keys.as_slice().iter().map(|k| k.to_string()).collect();
             async move {
-                let branch = branch::resolve(repository.clone(), &branch_name)
-                    .await
-                    .map_err(|_err| lore_base::error::InvalidArguments {
-                        reason: format!("branch '{branch_name}' not found"),
-                    })?;
+                let branch_id =
+                    resolve_branch_id_or_current(repository.clone(), &branch_name).await?;
 
                 let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-                lore_revision::metadata::branch::clear(repository, branch.id, &key_refs).await
+                lore_revision::metadata::branch::clear(repository, branch_id, &key_refs).await
             }
         },
     )

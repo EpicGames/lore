@@ -399,8 +399,9 @@ impl<T> LoreArray<T> {
     }
 
     fn new(count: usize) -> Self {
+        let layout =
+            std::alloc::Layout::array::<T>(count).expect("layout overflow in LoreArray<T>::new");
         unsafe {
-            let layout = std::alloc::Layout::from_size_align_unchecked(count * size_of::<T>(), 1);
             let ptr = std::alloc::alloc(layout).cast::<T>();
             if ptr.is_null() {
                 panic!("unable to alloc for LoreArray<T>::new");
@@ -444,10 +445,8 @@ impl<T> Drop for LoreArray<T> {
             unsafe {
                 let items = std::ptr::slice_from_raw_parts_mut(self.ptr.cast_mut(), self.count);
                 std::ptr::drop_in_place(items);
-                let layout = std::alloc::Layout::from_size_align_unchecked(
-                    self.count * size_of::<LoreString>(),
-                    1,
-                );
+                let layout = std::alloc::Layout::array::<T>(self.count)
+                    .expect("layout overflow in LoreArray<T>::drop");
                 std::alloc::dealloc(self.ptr as *mut u8, layout);
             }
             self.ptr = std::ptr::null();
@@ -533,8 +532,8 @@ pub struct LoreGlobalArgs {
     pub search_limit: u32,
     /// Allow matching to the nearest matching revision when a perfect match is not available
     pub search_nearest: u8,
-    /// Run store compaction and eviction in the background
-    pub gc: u8,
+    /// Prevent the automatic incremental/step GC for this operation; it otherwise runs in the background on write operations. `repository gc` always runs a full pass regardless
+    pub no_gc: u8,
     /// Use in-memory stores instead of file-backed stores. No store data is
     /// read from or written to the .urc/immutable/ and .urc/mutable/ directories.
     pub in_memory: u8,
@@ -625,8 +624,8 @@ impl LoreGlobalArgs {
         self.search_nearest != 0
     }
 
-    pub fn gc(&self) -> bool {
-        self.gc != 0
+    pub fn no_gc(&self) -> bool {
+        self.no_gc != 0
     }
 
     pub fn in_memory(&self) -> bool {

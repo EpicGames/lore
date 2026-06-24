@@ -15,9 +15,9 @@
 <p>
   <a href="https://github.com/EpicGames/lore/releases">Download Lore</a>
   &nbsp;&middot;&nbsp;
-  <a href="docs/tutorials/quickstart.md">Quickstart</a>
+  <a href="https://epicgames.github.io/lore/tutorials/quickstart/">Quickstart</a>
   &nbsp;&middot;&nbsp;
-  <a href="docs/README.md">Read the docs</a>
+  <a href="https://epicgames.github.io/lore/">Read the docs</a>
   &nbsp;&middot;&nbsp;
   <a href="https://discord.gg/E4SFJKRPbg">Join the conversation</a>
 </p>
@@ -55,9 +55,10 @@ Lore is an open source version control system designed for unprecedented scalabi
 
 ## Get started with Lore
 
-- **Quickstart** — install Lore and make your first commit by following the [quickstart guide](docs/tutorials/quickstart.md).
-- **Read the docs** — delve into Lore's ethos and architecture in the [Lore documentation](docs/README.md).
-- **Have questions?** — the [FAQ](docs/faq.md) covers licensing, supported platforms, production readiness, and how Lore compares to other version control systems.
+- **Quickstart** — install Lore and make your first commit by following the [quickstart guide](https://epicgames.github.io/lore/tutorials/quickstart/).
+- **Read the docs** — delve into Lore's ethos and architecture in the [Lore documentation](https://epicgames.github.io/lore/).
+- **Have questions?** — the [FAQ](https://epicgames.github.io/lore/faq/) covers licensing, supported platforms, production readiness, and how Lore compares to other version control systems.
+- **See where Lore is headed** — the [roadmap](https://epicgames.github.io/lore/roadmap/) lays out the big-rock features by time horizon, from scalable locking to an open source desktop client.
 - **Join the conversation** — chat with us and our community on [Discord](https://discord.gg/E4SFJKRPbg).
 
 Or try it right now — install Lore and start a local server in demo mode:
@@ -92,7 +93,7 @@ $env:LORE_DEMO=1; irm https://raw.githubusercontent.com/EpicGames/lore/main/scri
 
 ## Lore's architecture
 
-Lore is a centralized, content-addressed version control system that represents repository state as Merkle trees and an immutable revision chain, optimized for binary-first storage, deduplication, and sparse/on-demand data hydration at scale. For the full model—on-disk formats, chunking internals, and the mechanics of the Merkle tree—read the [system design doc](docs/explanation/system-design.md).
+Lore is a centralized, content-addressed version control system that represents repository state as Merkle trees and an immutable revision chain, optimized for binary-first storage, deduplication, and sparse/on-demand data hydration at scale. For the full model—on-disk formats, chunking internals, and the mechanics of the Merkle tree—read the [system design doc](https://epicgames.github.io/lore/explanation/system-design/).
 
 ### Highlights
 

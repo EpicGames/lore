@@ -125,12 +125,12 @@ use crate::layer::LoreLayerStagedEntryEventData;
 use crate::link::LoreLinkChangeEventData;
 use crate::link::LoreLinkEntryEventData;
 use crate::link::list::LoreLinkStagedEntryEventData;
+use crate::lock::file::acquire::LoreLockFileAcquireBeginEventData;
 use crate::lock::file::acquire::LoreLockFileAcquireEventData;
-use crate::lock::file::acquire::LoreLockFileAcquireIgnoreEventData;
 use crate::lock::file::query::LoreLockFileQueryBeginEventData;
 use crate::lock::file::query::LoreLockFileQueryEventData;
+use crate::lock::file::release::LoreLockFileReleaseBeginEventData;
 use crate::lock::file::release::LoreLockFileReleaseEventData;
-use crate::lock::file::release::LoreLockFileReleaseNotFoundEventData;
 use crate::lock::file::status::LoreLockFileStatusBeginEventData;
 use crate::lock::file::status::LoreLockFileStatusEventData;
 use crate::lore::execution_context;
@@ -220,6 +220,11 @@ use crate::store::event::LoreStorageGetDataEventData;
 use crate::store::event::LoreStorageGetHeaderEventData;
 use crate::store::event::LoreStorageGetItemCompleteEventData;
 use crate::store::event::LoreStorageGetMetadataItemCompleteEventData;
+use crate::store::event::LoreStorageMutableCompareAndSwapItemCompleteEventData;
+use crate::store::event::LoreStorageMutableListEntryEventData;
+use crate::store::event::LoreStorageMutableListItemCompleteEventData;
+use crate::store::event::LoreStorageMutableLoadItemCompleteEventData;
+use crate::store::event::LoreStorageMutableStoreItemCompleteEventData;
 use crate::store::event::LoreStorageObliterateItemCompleteEventData;
 use crate::store::event::LoreStorageOpenedEventData;
 use crate::store::event::LoreStoragePutItemCompleteEventData;
@@ -441,6 +446,60 @@ pub struct LoreEndEventData {
 pub struct LoreMaintenanceEventData {
     /// The maintenance message text.
     pub message: LoreString,
+}
+
+/// Data for the start of a store eviction pass.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreEvictionBeginEventData {
+    /// Fragment capacity the pass is reducing the store toward.
+    pub target_fragments: u64,
+}
+
+/// Data for one bucket evicted during a store eviction pass.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreEvictionProgressEventData {
+    /// Fragments evicted from this bucket.
+    pub evicted: u64,
+}
+
+/// Data for the end of a store eviction pass.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreEvictionEndEventData {
+    /// Total fragments evicted across the pass.
+    pub total_evicted: u64,
+}
+
+/// Data for the start of a store compaction pass.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreCompactionBeginEventData {
+    /// Store size in bytes the pass is reducing the store toward.
+    pub target_bytes: u64,
+}
+
+/// Data for one group compacted during a store compaction pass.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreCompactionProgressEventData {
+    /// Bytes reclaimed from this group.
+    pub compacted_bytes: u64,
+}
+
+/// Data for the end of a store compaction pass.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreCompactionEndEventData {
+    /// Total bytes reclaimed across the pass.
+    pub total_compacted_bytes: u64,
 }
 
 /// cbindgen:prefix-with-name
@@ -693,10 +752,10 @@ pub enum LoreEvent {
     LinkChange(LoreLinkChangeEventData),
     /// One entry in a link listing.
     LinkEntry(LoreLinkEntryEventData),
-    /// A file lock was acquired.
+    /// The start of a file lock acquire report.
+    LockFileAcquireBegin(LoreLockFileAcquireBeginEventData),
+    /// A file concerning the lock acquire report.
     LockFileAcquire(LoreLockFileAcquireEventData),
-    /// A file lock acquisition was ignored.
-    LockFileAcquireIgnore(LoreLockFileAcquireIgnoreEventData),
     /// The start of a file lock status report.
     LockFileStatusBegin(LoreLockFileStatusBeginEventData),
     /// One file lock status entry.
@@ -705,10 +764,10 @@ pub enum LoreEvent {
     LockFileQueryBegin(LoreLockFileQueryBeginEventData),
     /// One file lock query result.
     LockFileQuery(LoreLockFileQueryEventData),
-    /// A file lock was released.
+    /// The start of a file lock release report.
+    LockFileReleaseBegin(LoreLockFileReleaseBeginEventData),
+    /// A file concerning the lock release report.
     LockFileRelease(LoreLockFileReleaseEventData),
-    /// A file lock to release was not found.
-    LockFileReleaseNotFound(LoreLockFileReleaseNotFoundEventData),
     /// Metadata was cleared on a file.
     MetadataClearFile(LoreMetadataClearFileEventData),
     /// Metadata was cleared on a revision.
@@ -881,6 +940,31 @@ pub enum LoreEvent {
     RevisionTreeCommitComplete(LoreRevisionTreeCommitCompleteEventData),
     /// A close call completed.
     RevisionTreeCloseComplete(LoreRevisionTreeCloseCompleteEventData),
+    // Mutable-store API events are appended here rather than grouped with the other storage
+    // events above so that adding them does not renumber the `#[repr(C, u32)]` discriminants of
+    // the existing variants — new variants go at the end of this enum.
+    /// A mutable-load item completed.
+    StorageMutableLoadItemComplete(LoreStorageMutableLoadItemCompleteEventData),
+    /// A mutable-store item completed.
+    StorageMutableStoreItemComplete(LoreStorageMutableStoreItemCompleteEventData),
+    /// A mutable-compare-and-swap item completed.
+    StorageMutableCompareAndSwapItemComplete(LoreStorageMutableCompareAndSwapItemCompleteEventData),
+    /// One key-value entry in a mutable listing.
+    StorageMutableListEntry(LoreStorageMutableListEntryEventData),
+    /// A mutable-list item completed.
+    StorageMutableListItemComplete(LoreStorageMutableListItemCompleteEventData),
+    /// A store eviction pass began.
+    EvictionBegin(LoreEvictionBeginEventData),
+    /// One bucket was evicted during a store eviction pass.
+    EvictionProgress(LoreEvictionProgressEventData),
+    /// A store eviction pass ended.
+    EvictionEnd(LoreEvictionEndEventData),
+    /// A store compaction pass began.
+    CompactionBegin(LoreCompactionBeginEventData),
+    /// One group was compacted during a store compaction pass.
+    CompactionProgress(LoreCompactionProgressEventData),
+    /// A store compaction pass ended.
+    CompactionEnd(LoreCompactionEndEventData),
 }
 
 impl LoreEvent {

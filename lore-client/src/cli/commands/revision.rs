@@ -889,10 +889,18 @@ impl FragmentStats {
                 * (lore_base::types::FRAGMENT_SIZE_THRESHOLD as f64))
                 as usize;
 
-            let count_frac = ((1 + count) as f64) / (max_count as f64);
-            let count_percent = 100.0 * (*count as f64) / (total_written_count as f64);
-            let count_len = 40.0 * count_frac;
-            let stars = "*".to_string().repeat(count_len as usize);
+            let count_len = if max_count == 0 {
+                0
+            } else {
+                let count_frac = ((1 + count) as f64) / (max_count as f64);
+                (40.0 * count_frac).clamp(0.0, 40.0) as usize
+            };
+            let count_percent = if total_written_count == 0 {
+                0.0
+            } else {
+                100.0 * (*count as f64) / (total_written_count as f64)
+            };
+            let stars = "*".repeat(count_len);
             println!(
                 "{start_size:>6} - {end_size:>6}: {stars:<40} ({count:<6}) {count_percent:.2}%"
             );
@@ -1204,6 +1212,7 @@ fn resolve_layer_messages(
 }
 
 pub fn handle_revision_commit(globals: LoreGlobalArgs, args: &RevisionCommitArgs) -> u8 {
+    let dry_run = globals.dry_run();
     let mut fragment_stats = FragmentStats::default();
     fragment_stats.size_count.resize(STATS_SIZE_BUCKETS, 0);
 
@@ -1228,6 +1237,7 @@ pub fn handle_revision_commit(globals: LoreGlobalArgs, args: &RevisionCommitArgs
         layer: LoreString::from(args.layer.as_deref().unwrap_or("")),
         layer_paths: LoreArray::from_vec(layer_paths),
         layer_messages: LoreArray::from_vec(layer_msgs),
+        stats: args.stats,
     };
 
     let commit_entry_data: Arc<Mutex<Vec<RevisionEntryData>>> =
@@ -1240,7 +1250,11 @@ pub fn handle_revision_commit(globals: LoreGlobalArgs, args: &RevisionCommitArgs
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::RevisionCommitBegin(_data) => {
-                println!("Committing staged changes");
+                if dry_run {
+                    println!("Previewing commit of staged changes");
+                } else {
+                    println!("Committing staged changes");
+                }
             }
             LoreEvent::RevisionCommitProgress(data) => {
                 let estimate = if data.count.discovery_complete != 0 {
@@ -1287,7 +1301,8 @@ pub fn handle_revision_commit(globals: LoreGlobalArgs, args: &RevisionCommitArgs
                         String::new()
                     };
                     println!(
-                        "Committed {}/{} directories, {}/{} files{} ({} modified, {} deleted)",
+                        "{} {}/{} directories, {}/{} files{} ({} modified, {} deleted)",
+                        if dry_run { "Would commit" } else { "Committed" },
                         data.count.directory_count,
                         data.count.directory_total,
                         data.count.file_count,
@@ -1334,8 +1349,13 @@ pub fn handle_revision_commit(globals: LoreGlobalArgs, args: &RevisionCommitArgs
     for entry in describe_entry_data.iter() {
         entry.print_description(Some(&auth_data));
         println!(
-            "{}Commit succeeded{}",
+            "{}{}{}",
             CommonStyles::SUCCESS,
+            if dry_run {
+                "Dry-run commit succeeded"
+            } else {
+                "Commit succeeded"
+            },
             anstyle::Reset
         );
         println!();
@@ -2380,6 +2400,12 @@ pub fn handle_revision_metadata_set(globals: LoreGlobalArgs, args: &RevisionMeta
     };
 
     let elements = convert_paths_and_targets(&args.pairs, &None);
+    if !elements.as_slice().len().is_multiple_of(2) {
+        println!(
+            "error: metadata set requires <key> <value> pairs; each key must be followed by a value"
+        );
+        return 1;
+    }
 
     let mut keys = vec![];
     let mut values = vec![];

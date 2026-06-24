@@ -11,6 +11,7 @@ use std::os::windows::fs::FileExt;
 #[cfg(target_family = "windows")]
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
@@ -177,10 +178,18 @@ pub struct PackStore {
     min_count: usize,
     packfile: RwLock<Vec<RwLock<PackFile>>>,
     writeable: RwLock<Vec<u32>>,
+    /// Shared per-store GC counters; `resume()` feeds loaded packfile sizes into them
+    /// so an over-cap store fires compaction without a startup scan. `None` for stores
+    /// that don't participate in automatic GC (e.g. migration/scratch packstores).
+    gc_counters: Option<Arc<crate::maintenance::GcCounters>>,
 }
 
 impl PackStore {
-    pub fn new(path: Option<PathBuf>, min_count: usize) -> Self {
+    pub fn new(
+        path: Option<PathBuf>,
+        min_count: usize,
+        gc_counters: Option<Arc<crate::maintenance::GcCounters>>,
+    ) -> Self {
         PackStore {
             path: path.map(|path| {
                 let mut path = path;
@@ -190,6 +199,7 @@ impl PackStore {
             min_count,
             packfile: RwLock::default(),
             writeable: RwLock::default(),
+            gc_counters,
         }
     }
 
@@ -200,6 +210,8 @@ impl PackStore {
         if !writeable.is_empty() {
             return Ok(());
         }
+
+        let mut loaded_size: u64 = 0;
 
         if let Some(path) = self.path.as_ref() {
             let path = path.clone();
@@ -281,6 +293,7 @@ impl PackStore {
                 };
 
                 packfile.push(RwLock::new(file));
+                loaded_size += file_size;
 
                 if file_size < PACKSTORE_SIZE_LIMIT {
                     lore_base::lore_trace!("Packfile {file_id} is writeable");
@@ -292,6 +305,10 @@ impl PackStore {
         lore_base::lore_trace!("{} writable packfiles", writeable.len());
 
         let _ = self.fill_writeable(packfile, writeable);
+
+        if let Some(gc) = &self.gc_counters {
+            gc.add_loaded_size(loaded_size);
+        }
 
         Ok(())
     }

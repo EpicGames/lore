@@ -6,15 +6,12 @@ Set up Lore on your machine and run through the core loop in under 10 minutes. B
 
 - A terminal (macOS/Linux) or PowerShell (Windows).
 - Ports 41337 and 41339 free on your machine.
-- Python 3, available as `python3` (used to create a small binary file in Step 3; most systems include it — if yours doesn't, the Troubleshooting section has an alternative).
 
 You don't need a Rust toolchain, a cloned repository, or Docker for this tutorial. The install script fetches both prebuilt binaries for you.
 
 ## Step 1 — Install Lore and start a local server
 
 Run Lore's install script in demo mode. It downloads the prebuilt `lore` CLI and `loreserver` binaries, puts them on your PATH, and starts a local server. With no configuration, the server starts a single-node instance, generating an ephemeral self-signed certificate and a temporary store under your system temporary directory.
-
-<!-- TODO: EpicGames/lore raw URLs are a placeholder pending the public binary release; this documents the release-day happy path. -->
 
 <!-- tabs:start -->
 
@@ -48,16 +45,48 @@ The server keeps running in this terminal, listening on port 41337 for QUIC and 
 
 In your new terminal, first confirm the server is healthy:
 
+<!-- tabs:start -->
+
+<!-- tab -->
+**macOS / Linux**
+
 ```bash
 curl -i http://127.0.0.1:41339/health_check
 ```
+
+<!-- tab -->
+**Windows**
+
+```powershell
+curl.exe -i http://127.0.0.1:41339/health_check
+```
+
+<!-- tabs:end -->
 
 A healthy server returns `HTTP/1.1 200 OK` with an empty body. The server starts with auth disabled — no credentials are needed for this tutorial.
 
 Now create a repository:
 
+<!-- tabs:start -->
+
+<!-- tab -->
+**macOS / Linux**
+
 ```bash
 mkdir ~/my-project && cd ~/my-project
+```
+
+<!-- tab -->
+**Windows**
+
+```powershell
+mkdir ~/my-project
+cd ~/my-project
+```
+
+<!-- tabs:end -->
+
+```bash
 lore repository create lore://127.0.0.1:41337/my-project
 ```
 
@@ -76,14 +105,28 @@ Lore initializes the repository on the server and creates a working tree in the 
 Create a text file:
 
 ```bash
-echo "Hello, Lore!" > hello.txt
+echo "Hello, Lore" > hello.txt
 ```
 
-Create a small binary file. Python works on macOS, Linux, and Windows without installing anything extra:
+Create a small binary file:
+
+<!-- tabs:start -->
+
+<!-- tab -->
+**macOS / Linux**
 
 ```bash
 python3 -c "import os; open('sample.bin', 'wb').write(os.urandom(256))"
 ```
+
+<!-- tab -->
+**Windows**
+
+```powershell
+fsutil file createnew sample.bin 256
+```
+
+<!-- tabs:end -->
 
 Stage both files:
 
@@ -94,7 +137,7 @@ lore stage hello.txt sample.bin
 Confirm the staged state:
 
 ```bash
-lore status --unstaged
+lore status --scan
 ```
 
 Expected output (no revisions yet, so the revision number is 0 and its hash is all zeros):
@@ -199,9 +242,25 @@ Clone complete in 0.12s
 
 The clone already contains the committed files — confirm it:
 
+<!-- tabs:start -->
+
+<!-- tab -->
+**macOS / Linux**
+
 ```bash
 cd ~/my-project-b && lore status && ls
 ```
+
+<!-- tab -->
+**Windows**
+
+```powershell
+cd ~/my-project-b
+lore status
+ls
+```
+
+<!-- tabs:end -->
 
 ```text
 Repository 3f2a1b4c5d6e7f8a...
@@ -221,7 +280,7 @@ cd ~/my-project
 ```
 
 > [!CAUTION]
-> If a step fails with a connection error, check that the server is still running: `curl -i http://127.0.0.1:41339/health_check`. If it's not responding, restart the `loreserver` process by re-running the install command from Step 1, then check the health endpoint again.
+> If a step fails with a connection error, check that the server is still running: `curl -i http://127.0.0.1:41339/health_check` (`curl.exe` on Windows). If it's not responding, restart the `loreserver` process by re-running the install command from Step 1, then check the health endpoint again.
 
 ## Step 7 — Create a branch and commit on it
 
@@ -371,10 +430,26 @@ Remote revision 3 -> c7d1e8b3...
 Local branch in sync with remote
 ```
 
+<!-- tabs:start -->
+
+<!-- tab -->
+**macOS / Linux**
+
 ```bash
 # In ~/my-project-b
 cd ~/my-project-b && lore status
 ```
+
+<!-- tab -->
+**Windows**
+
+```powershell
+# In ~/my-project-b
+cd ~/my-project-b
+lore status
+```
+
+<!-- tabs:end -->
 
 ```text
 Repository 3f2a1b4c5d6e7f8a...
@@ -387,11 +462,11 @@ Your revision hash will differ from `c7d1e8b3...`. Both working trees at revisio
 
 ## Troubleshooting
 
-**Server not reachable.** Run `curl -i http://127.0.0.1:41339/health_check`. A healthy server returns `HTTP/1.1 200 OK`. If it doesn't respond, the `loreserver` process has stopped — re-run the install command from Step 1 to start it again, then check the health endpoint again.
+**Server not reachable.** Run `curl -i http://127.0.0.1:41339/health_check` (`curl.exe` on Windows). A healthy server returns `HTTP/1.1 200 OK`. If it doesn't respond, the `loreserver` process has stopped — re-run the install command from Step 1 to start it again, then check the health endpoint again.
 
 **Push rejected with a conflict.** If `lore push` reports the remote branch has moved, run `lore sync`, resolve any conflicts, commit, then push again.
 
-**`python3` not found.** On some Windows installs `python3` is `python` — try `python -c "..."` with the same arguments. Any binary-format file works; copy any small image or compiled artifact you have on hand if you prefer.
+**`python3` not found.** On macOS/Linux, if `python3` isn't installed try `python -c "..."` with the same arguments, or `head -c 256 /dev/urandom > sample.bin`. Any binary-format file works; copy any small image or compiled artifact you have on hand if you prefer.
 
 ## Next steps
 

@@ -22,9 +22,7 @@ use tracing::debug;
 
 use super::branch_record::build_branch;
 use crate::grpc::ServerResultExt;
-use crate::grpc::extract_correlation_id;
-use crate::grpc::get_repository;
-use crate::grpc::get_user_id;
+use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
 use crate::hooks::HookContext;
@@ -70,14 +68,33 @@ pub async fn handler(
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<BranchCreateResponse>, Status> {
-    let repository_id = get_repository(request.metadata())?;
-    let user_id = get_user_id(request.extensions());
-    let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+    let caller_context = CallerContext::from_original_request(&request)?;
     let req = request.into_inner();
+    branch_create_implementation(
+        req,
+        caller_context,
+        immutable_store,
+        mutable_store,
+        notification_sender,
+        hook_dispatcher,
+        instrument_provider,
+    )
+    .await
+}
 
+/// This `BranchCreateRequest` should be fulfilled by this server.
+pub async fn branch_create_implementation(
+    req: BranchCreateRequest,
+    context: CallerContext,
+    immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    mutable_store: Arc<dyn lore_storage::MutableStore>,
+    notification_sender: Arc<dyn NotificationSender>,
+    hook_dispatcher: &HookDispatcher,
+    instrument_provider: &impl InstrumentProvider,
+) -> Result<Response<BranchCreateResponse>, Status> {
     let name = req.name;
     let category = req.category;
-    let creator = req.creator.unwrap_or_else(|| user_id.clone());
+    let creator = req.creator.unwrap_or_else(|| context.user_id.clone());
     let stack: Vec<BranchPoint> = req.stack.into_iter().map(BranchPoint::from).collect();
 
     let branch = BranchId::from(req.id);
@@ -87,20 +104,24 @@ pub async fn handler(
         .map(|d| d.as_secs())
         .unwrap_or_default();
 
-    let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
+    let execution = setup_execution(
+        module_path!(),
+        context.correlation_id.clone(),
+        context.user_id.clone(),
+    );
     let repository = Arc::new(RepositoryContext::new_server_context(
         immutable_store,
         mutable_store,
-        repository_id,
+        context.repository_id,
     ));
 
     LORE_CONTEXT
         .scope(execution, async move {
             let hook_ctx = HookContext::builder()
-                .correlation_id(correlation_id)
+                .correlation_id(&context.correlation_id)
                 .hook_point(HookPoint::BranchCreate)
-                .repository(repository_id)
-                .user(user_id)
+                .repository(context.repository_id)
+                .user(&context.user_id)
                 .branch(branch)
                 .build();
 
@@ -135,7 +156,7 @@ pub async fn handler(
             })?;
 
             notification_sender
-                .branch_created(repository_id, branch_id)
+                .branch_created(context.repository_id, branch_id)
                 .await;
             hook_dispatcher.spawn_post(HookPoint::BranchCreate, hook_ctx);
 

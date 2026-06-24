@@ -200,20 +200,20 @@ pub struct StoreConfig {
 impl StoreConfig {
     fn client_default() -> Self {
         StoreConfig {
-            max_capacity: Some(10 * 1024 * 1024),
-            eviction_delay: Some(10),
+            max_capacity: Some(2_000_000),
+            eviction_delay: Some(30),
             max_size: Some(10 * 1024 * 1024 * 1024),
-            compaction_delay: Some(30),
+            compaction_delay: Some(50),
             verify_write: None,
         }
     }
 
     pub fn global_default() -> Self {
         StoreConfig {
-            max_capacity: Some(10 * 1024 * 1024),
-            eviction_delay: Some(10),
+            max_capacity: Some(2_000_000),
+            eviction_delay: Some(30),
             max_size: Some(10 * 1024 * 1024 * 1024),
-            compaction_delay: Some(30),
+            compaction_delay: Some(50),
             verify_write: None,
         }
     }
@@ -233,6 +233,70 @@ impl StoreConfig {
                     .unwrap_or_default(),
             ),
         }
+    }
+}
+
+/// Decides whether the automatic incremental background GC (evictor + compactor) is
+/// spawned for a freshly opened store, returning the caps to spawn it with or
+/// [`ImmutableStoreCreateOptions::none`] to leave it unspawned.
+///
+/// Incremental GC is the default on write operations (`!read_only`). It is
+/// suppressed by `--no-gc` and on dry-run commands (`suppress_incremental`, which
+/// the caller folds together), since a dry run persists nothing and its background
+/// tasks would otherwise race the dry run's own teardown. Read-only opens never
+/// spawn it. When enabled but the repository has no `[store]` config, the built-in
+/// [`StoreConfig::client_default`] caps apply.
+fn incremental_gc_options(
+    read_only: bool,
+    suppress_incremental: bool,
+    config_store: Option<&StoreConfig>,
+) -> ImmutableStoreCreateOptions {
+    if !read_only && !suppress_incremental {
+        config_store
+            .cloned()
+            .unwrap_or_else(StoreConfig::client_default)
+            .to_options()
+    } else {
+        ImmutableStoreCreateOptions::none()
+    }
+}
+
+#[cfg(test)]
+mod store_config_tests {
+    use super::StoreConfig;
+    use super::incremental_gc_options;
+
+    /// The default GC caps that back the automatic incremental GC on writes when a
+    /// repository has no `[store]` config must be populated and non-zero; otherwise the
+    /// evictor and compactor would be spawned with zero caps (`Some(0)`) and never run.
+    #[test]
+    fn client_default_yields_nonzero_gc_caps() {
+        let options = StoreConfig::client_default().to_options();
+        assert!(options.max_capacity.is_some_and(|c| c > 0));
+        assert!(options.max_size.is_some_and(|s| s > 0));
+    }
+
+    #[test]
+    fn write_op_spawns_incremental_gc_by_default() {
+        // Write op, `--no-gc` not set, no `[store]` config: incremental GC on with
+        // the non-zero `client_default` caps.
+        let options = incremental_gc_options(false, false, None);
+        assert!(options.max_capacity.is_some_and(|c| c > 0));
+        assert!(options.max_size.is_some_and(|s| s > 0));
+    }
+
+    #[test]
+    fn no_gc_suppresses_incremental_gc() {
+        let options = incremental_gc_options(false, true, None);
+        assert!(options.max_capacity.is_none());
+        assert!(options.max_size.is_none());
+    }
+
+    #[test]
+    fn read_only_op_never_spawns_incremental_gc() {
+        let options = incremental_gc_options(true, false, None);
+        assert!(options.max_capacity.is_none());
+        assert!(options.max_size.is_none());
     }
 }
 
@@ -1421,6 +1485,74 @@ pub fn repository_release(path: impl AsRef<Path>) {
     }
 }
 
+/// Forwards [`lore_storage::gc_event::GcEventSink`] callbacks to a captured
+/// execution context's dispatcher as the public eviction/compaction event
+/// series. Carrying the context explicitly (rather than reading task-local
+/// state) keeps routing correct when GC passes for different stores run
+/// concurrently in one process.
+struct GcEventForwarder {
+    context: Arc<crate::interface::ExecutionContext>,
+}
+
+impl lore_storage::gc_event::GcEventSink for GcEventForwarder {
+    fn eviction_begin(&self, target_fragments: u64) {
+        self.context
+            .dispatcher
+            .send(event::LoreEvent::EvictionBegin(
+                event::LoreEvictionBeginEventData { target_fragments },
+            ));
+    }
+
+    fn eviction_progress(&self, evicted: u64) {
+        self.context
+            .dispatcher
+            .send(event::LoreEvent::EvictionProgress(
+                event::LoreEvictionProgressEventData { evicted },
+            ));
+    }
+
+    fn eviction_end(&self, total_evicted: u64) {
+        self.context.dispatcher.send(event::LoreEvent::EvictionEnd(
+            event::LoreEvictionEndEventData { total_evicted },
+        ));
+    }
+
+    fn compaction_begin(&self, target_bytes: u64) {
+        self.context
+            .dispatcher
+            .send(event::LoreEvent::CompactionBegin(
+                event::LoreCompactionBeginEventData { target_bytes },
+            ));
+    }
+
+    fn compaction_progress(&self, compacted_bytes: u64) {
+        self.context
+            .dispatcher
+            .send(event::LoreEvent::CompactionProgress(
+                event::LoreCompactionProgressEventData { compacted_bytes },
+            ));
+    }
+
+    fn compaction_end(&self, total_compacted_bytes: u64) {
+        self.context
+            .dispatcher
+            .send(event::LoreEvent::CompactionEnd(
+                event::LoreCompactionEndEventData {
+                    total_compacted_bytes,
+                },
+            ));
+    }
+}
+
+/// Builds a GC event sink bound to the current execution context, if one is
+/// active. Returns `None` outside a command, where there is no callback to
+/// forward to.
+pub(crate) fn gc_event_sink() -> Option<lore_storage::gc_event::GcEventSinkRef> {
+    crate::runtime::try_execution_context().map(|context| {
+        Arc::new(GcEventForwarder { context }) as lore_storage::gc_event::GcEventSinkRef
+    })
+}
+
 pub async fn create_client_immutable_store(
     config: &RepositoryConfig,
     dotpath: impl AsRef<Path>,
@@ -1476,6 +1608,11 @@ pub async fn create_client_immutable_store(
     )
     .await
     .forward::<RepositoryError>("Failed to create local store")?;
+
+    // Let storage-layer load-triggered GC passes obtain a sink bound to the calling
+    // command's context (idempotent; first registration wins).
+    lore_storage::gc_event::set_gc_event_sink_provider(gc_event_sink);
+    lore_storage::maintenance::spawn_gc(&store, &create_options);
 
     cache_immutable_store(path, store.clone());
 
@@ -1779,14 +1916,8 @@ pub async fn load_and_connect_with_token(
         .unwrap_or_default();
     let read_only = access != RepositoryAccess::ReadWrite;
 
-    let options = if !read_only
-        && global.gc()
-        && let Some(config_store) = config_store
-    {
-        config_store.to_options()
-    } else {
-        ImmutableStoreCreateOptions::none()
-    };
+    let options =
+        incremental_gc_options(read_only, global.no_gc() || global.dry_run(), config_store);
 
     // Create stores — disk-backed mutable store may need deferred upgrade
     let mut needs_upgrade = false;
@@ -3182,6 +3313,7 @@ pub async fn gc(repository: Arc<RepositoryContext>) -> Result<(), RepositoryErro
             .map(|config| config.max_size.unwrap_or_default())
             .unwrap_or_default(),
         sync_data,
+        gc_event_sink(),
     )
     .await;
 

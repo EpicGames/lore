@@ -129,10 +129,15 @@ async fn upload_local(
             }
 
             let total = items.len();
+            let mut reuse = crate::storage::store::SessionReuse::default();
             let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
             for item in items {
+                let session = reuse.session_for(&store, item.partition, true);
                 let store = store.clone();
-                lore_spawn!(tasks, async move { upload_item(store, item).await });
+                lore_spawn!(
+                    tasks,
+                    async move { upload_item(store, item, session).await }
+                );
             }
             let codes = crate::storage::drain_codes(tasks).await;
             crate::storage::build_call_error(&codes, total, "upload")
@@ -141,14 +146,16 @@ async fn upload_local(
     .await
 }
 
-async fn upload_item(store: Arc<StoreInternal>, item: LoreStorageUploadItem) -> LoreErrorCode {
+async fn upload_item(
+    store: Arc<StoreInternal>,
+    item: LoreStorageUploadItem,
+    session: Option<Arc<lore_transport::StorageSession>>,
+) -> LoreErrorCode {
     if item.partition == Partition::default() {
-        emit_complete(&item, 0, LoreErrorCode::InvalidArguments);
-        return LoreErrorCode::InvalidArguments;
+        return emit_complete(&item, 0, LoreErrorCode::InvalidArguments);
     }
     if item.address.hash == Hash::default() {
-        emit_complete(&item, 1, LoreErrorCode::None);
-        return LoreErrorCode::None;
+        return emit_complete(&item, 1, LoreErrorCode::None);
     }
 
     // Anything weaker than `MatchFull` means the local entry is incomplete and must be
@@ -168,12 +175,10 @@ async fn upload_item(store: Arc<StoreInternal>, item: LoreStorageUploadItem) -> 
     };
 
     if already_durable {
-        emit_complete(&item, 1, LoreErrorCode::None);
-        return LoreErrorCode::None;
+        return emit_complete(&item, 1, LoreErrorCode::None);
     }
     if !has_local_payload {
-        emit_complete(&item, 0, LoreErrorCode::AddressNotFound);
-        return LoreErrorCode::AddressNotFound;
+        return emit_complete(&item, 0, LoreErrorCode::AddressNotFound);
     }
 
     // `no_remote()` is load-bearing: we must not pull from a third party to satisfy a
@@ -189,13 +194,10 @@ async fn upload_item(store: Arc<StoreInternal>, item: LoreStorageUploadItem) -> 
     let (fragment, payload) = match load {
         Ok(pair) => pair,
         Err(err) => {
-            let code = crate::storage::storage_error_to_code(&err);
-            emit_complete(&item, 0, code);
-            return code;
+            return emit_complete(&item, 0, crate::storage::storage_error_to_code(&err));
         }
     };
 
-    let session = store.remote_session_for(item.partition);
     let permit = acquire_fragment_memory_permit(payload.len()).await;
 
     match store_fragment(
@@ -211,19 +213,18 @@ async fn upload_item(store: Arc<StoreInternal>, item: LoreStorageUploadItem) -> 
     )
     .await
     {
-        Ok(_) => {
-            emit_complete(&item, 0, LoreErrorCode::None);
-            LoreErrorCode::None
-        }
-        Err(err) => {
-            let code = crate::storage::storage_error_to_code(&err);
-            emit_complete(&item, 0, code);
-            code
-        }
+        Ok(_) => emit_complete(&item, 0, LoreErrorCode::None),
+        Err(err) => emit_complete(&item, 0, crate::storage::storage_error_to_code(&err)),
     }
 }
 
-fn emit_complete(item: &LoreStorageUploadItem, already_durable: u8, error_code: LoreErrorCode) {
+/// Emit the item's terminal event and return the `error_code` that was sent, so callers can
+/// `return emit_complete(..)` directly.
+fn emit_complete(
+    item: &LoreStorageUploadItem,
+    already_durable: u8,
+    error_code: LoreErrorCode,
+) -> LoreErrorCode {
     let address = if error_code == LoreErrorCode::None {
         item.address
     } else {
@@ -236,4 +237,5 @@ fn emit_complete(item: &LoreStorageUploadItem, already_durable: u8, error_code: 
         error_code,
     })
     .send();
+    error_code
 }

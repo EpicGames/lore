@@ -8,11 +8,11 @@ SIL Open Font License, Version 1.1 (OFL-1.1):
 - **Recursive Mono** — Copyright 2019 The Recursive Project
   Authors (<https://github.com/arrowtype/recursive>).
 
-The full OFL-1.1 text and per-font metadata live in the
-canonical license records:
+The full OFL-1.1 text, with each font's copyright notice,
+lives beside the binaries in this directory:
 
-- `legal/tps/licenses/inter_v3.019.license`
-- `legal/tps/licenses/recursive-mono_v1.085.license`
+- `inter_v3.019.license`
+- `recursive-mono_v1.085.license`
 
 The OFL-1.1 license name, copyright, and license URL
 (`http://scripts.sil.org/OFL`) are also embedded in each

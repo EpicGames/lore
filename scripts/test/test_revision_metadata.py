@@ -4,6 +4,7 @@ import logging
 
 import pytest
 
+from error_types import ImproperArgumentsError
 from lore import Lore
 
 logger = logging.getLogger(__name__)
@@ -190,3 +191,22 @@ def test_revision_metadata_get_across_branches(new_lore_repo):
         f"Expected main second commit message via main@LATEST.\n"
         f"Expected: {main_second_message}\nGot: {main_metadata}"
     )
+
+
+@pytest.mark.smoke
+def test_revision_metadata_set_single_arg_rejected(new_lore_repo):
+    """A lone argument has no value; the set must be rejected, not panic."""
+    repo: Lore = new_lore_repo()
+
+    with pytest.raises(ImproperArgumentsError):
+        repo.revision_metadata_set(["lonely-key"])
+
+
+@pytest.mark.smoke
+def test_revision_metadata_set_odd_args_rejected(new_lore_repo):
+    """An odd number of arguments leaves the trailing key without a value and
+    must be rejected rather than dropping the key or panicking."""
+    repo: Lore = new_lore_repo()
+
+    with pytest.raises(ImproperArgumentsError):
+        repo.revision_metadata_set(["key1", "value1", "key2"])

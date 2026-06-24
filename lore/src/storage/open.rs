@@ -71,11 +71,12 @@ pub struct LoreStorageOpenArgs {
     pub remote_config: LoreStorageRemoteConfig,
     /// Activate `remote_config`; otherwise the handle has no remote
     pub has_remote_config: u8,
-    /// Soft cap on total immutable-store bytes (compactor target); honored only when `globals.gc`
-    /// is set. `0` selects the default; shared disk backends inherit the first opener's value
+    /// Soft cap on total immutable-store bytes (compactor target). A non-zero cache target enables
+    /// incremental background GC for the handle; `0` then selects the default. Shared disk backends
+    /// inherit the first opener's value
     pub cache_target_bytes: u64,
-    /// Soft cap on immutable-store fragment count (evictor target); honored only when `globals.gc`
-    /// is set. `0` selects the default
+    /// Soft cap on immutable-store fragment count (evictor target). A non-zero cache target enables
+    /// incremental background GC for the handle; `0` then selects the default
     pub cache_target_fragments: u64,
 }
 
@@ -107,18 +108,18 @@ const DEFAULT_CACHE_TARGET_FRAGMENTS: usize = 1 << 20;
 /// unnoticed.
 const EVICTOR_MIN_CAPACITY: usize = 1 << 20;
 
-/// Build the `ImmutableStoreCreateOptions` for a handle from `globals.gc` and the caller's
-/// cache targets. With `gc_enabled = false` the result is `none()` — no evictor or compactor
-/// spawn, regardless of the cache target values. With `gc_enabled = true`, a `0` target field
-/// resolves to the built-in default; a non-zero target below the evictor's internal floor
-/// (`EVICTOR_MIN_CAPACITY`) is passed through but logged at `warn` so the caller knows the
-/// effective cap is the floor, not the value they asked for.
+/// Build the `ImmutableStoreCreateOptions` for a handle from the caller's cache targets.
+/// Incremental background GC (evictor + compactor) is opt-in per handle: with both targets
+/// `0` the result is `none()` — no evictor or compactor spawn. When either target is non-zero,
+/// GC is enabled and a `0` field resolves to the built-in default; a non-zero
+/// `cache_target_fragments` below the evictor's internal floor (`EVICTOR_MIN_CAPACITY`) is
+/// passed through but logged at `warn` so the caller knows the effective cap is the floor, not
+/// the value they asked for.
 fn build_create_options(
-    gc_enabled: bool,
     cache_target_bytes: u64,
     cache_target_fragments: u64,
 ) -> ImmutableStoreCreateOptions {
-    if !gc_enabled {
+    if cache_target_bytes == 0 && cache_target_fragments == 0 {
         return ImmutableStoreCreateOptions::none();
     }
     let max_size = if cache_target_bytes == 0 {
@@ -193,12 +194,11 @@ async fn open_local(
                 reason: "`globals.remote=1` requires `has_remote_config != 0`".into(),
             }));
         }
-        let gc_enabled = execution_context().globals().gc();
-        let create_options = build_create_options(
-            gc_enabled,
-            args.cache_target_bytes,
-            args.cache_target_fragments,
-        );
+        let create_options = if execution_context().globals().no_gc() {
+            ImmutableStoreCreateOptions::none()
+        } else {
+            build_create_options(args.cache_target_bytes, args.cache_target_fragments)
+        };
 
         let identity = execution_context()
             .globals()
@@ -216,6 +216,7 @@ async fn open_local(
                 )
                 .await
                 .internal("creating in-memory immutable store")?;
+                lore_storage::maintenance::spawn_gc(&immutable, &create_options);
                 let mutable: Arc<dyn MutableStore> = Arc::new(
                     LocalMutableStore::new(
                         Option::<&std::path::Path>::None,
@@ -311,35 +312,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gc_disabled_yields_no_evictor_or_compactor() {
-        let options = build_create_options(false, 1024, 8);
+    fn both_zero_targets_yield_no_evictor_or_compactor() {
+        let options = build_create_options(0, 0);
         assert!(options.max_capacity.is_none());
         assert!(options.max_size.is_none());
     }
 
     #[test]
-    fn gc_enabled_with_zero_targets_falls_back_to_defaults() {
-        let options = build_create_options(true, 0, 0);
-        assert_eq!(options.max_size, Some(DEFAULT_CACHE_TARGET_BYTES));
-        assert_eq!(options.max_capacity, Some(DEFAULT_CACHE_TARGET_FRAGMENTS));
-    }
-
-    #[test]
-    fn gc_enabled_with_explicit_targets_passes_them_through() {
-        let options = build_create_options(true, 512, 16);
+    fn explicit_targets_pass_through() {
+        let options = build_create_options(512, 16);
         assert_eq!(options.max_size, Some(512));
         assert_eq!(options.max_capacity, Some(16));
     }
 
     #[test]
-    fn gc_enabled_with_one_zero_field_only_defaults_that_field() {
-        let bytes_only = build_create_options(true, 4096, 0);
+    fn one_zero_field_only_defaults_that_field() {
+        let bytes_only = build_create_options(4096, 0);
         assert_eq!(bytes_only.max_size, Some(4096));
         assert_eq!(
             bytes_only.max_capacity,
             Some(DEFAULT_CACHE_TARGET_FRAGMENTS),
         );
-        let frags_only = build_create_options(true, 0, 32);
+        let frags_only = build_create_options(0, 32);
         assert_eq!(frags_only.max_size, Some(DEFAULT_CACHE_TARGET_BYTES));
         assert_eq!(frags_only.max_capacity, Some(32));
     }
@@ -351,7 +345,7 @@ mod tests {
     /// The test installs a `fn`-pointer log callback that toggles a static flag when the
     /// expected message lands.
     #[test]
-    fn gc_enabled_below_floor_emits_warn() {
+    fn below_floor_emits_warn() {
         use std::sync::atomic::AtomicBool;
         use std::sync::atomic::Ordering;
 
@@ -370,7 +364,7 @@ mod tests {
         lore_base::log::set_log_callback(Some(capture));
         SAW_WARN.store(false, Ordering::Release);
 
-        let options = build_create_options(true, 0, 4);
+        let options = build_create_options(0, 4);
 
         // Restore the previous logger state regardless of the assert outcome.
         lore_base::log::set_log_callback(None);

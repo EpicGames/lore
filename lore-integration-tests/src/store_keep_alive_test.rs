@@ -55,6 +55,7 @@ mod store_keep_alive_tests {
             layer: Default::default(),
             layer_paths: Default::default(),
             layer_messages: Default::default(),
+            stats: Default::default(),
         }
     }
 

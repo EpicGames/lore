@@ -72,6 +72,8 @@ mod remote_store_tests {
             Arc::new(lore_server::notification::local::NotificationSender::default());
         let hook_dispatcher = Arc::new(HookDispatcher::empty());
 
+        // Background server task in a test; LORE_CONTEXT propagation is unnecessary here.
+        #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
             GrpcServerBuilder::new()
                 .with_environment(EnvironmentConfig::default())

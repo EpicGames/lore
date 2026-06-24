@@ -6,7 +6,7 @@ Before you begin, read our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Ways to contribute
 
-We welcome code contributions — bug fixes, features, performance improvements. There are also plenty of ways to help beyond writing code:
+We welcome code contributions — bug fixes, features, performance improvements. The [roadmap](docs/roadmap.md) shows the big-rock themes we're working toward — a good place to find where help is wanted. There are also plenty of ways to help beyond writing code:
 
 - **Report a bug** — open a GitHub Issue with steps to reproduce
 - **Request a feature** — post in [#feature-requests on Discord](https://discord.gg/QYbNFVFv) or open a GitHub Issue

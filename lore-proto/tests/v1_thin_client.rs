@@ -10,6 +10,7 @@ use lore_proto::lore::thin_client::v1::ContentDiffRequest;
 use lore_proto::lore::thin_client::v1::ContentDiffResponse;
 use lore_proto::lore::thin_client::v1::DiffChange;
 use lore_proto::lore::thin_client::v1::DiffConflict;
+use lore_proto::lore::thin_client::v1::DiffPartition;
 use lore_proto::lore::thin_client::v1::Metadata;
 use lore_proto::lore::thin_client::v1::MetadataType;
 use lore_proto::lore::thin_client::v1::NodeType;
@@ -40,6 +41,7 @@ fn v1_thin_client_model_types_default() {
     let _ = ContentDiffChunkResponse::default();
     let _ = DiffChange::default();
     let _ = DiffConflict::default();
+    let _ = DiffPartition::default();
     let _ = TreeNode::default();
     let _ = Revision::default();
     let _ = Metadata::default();
@@ -99,11 +101,16 @@ fn v1_thin_client_field_shapes() {
         content_from: _,
         content_to: _,
         automerged: _,
+        link_repository_index: _,
     } = DiffChange::default();
     let DiffConflict {
         change_from: _,
         change_to: _,
     } = DiffConflict::default();
+    let DiffPartition {
+        index: _,
+        link_partition: _,
+    } = DiffPartition::default();
     let TreeNode {
         path: _,
         node_type: _,
@@ -161,6 +168,7 @@ fn v1_thin_client_field_shapes() {
     let _ = RevisionDiffPayload::Header(Default::default());
     let _ = RevisionDiffPayload::Change(Default::default());
     let _ = RevisionDiffPayload::Conflict(Default::default());
+    let _ = RevisionDiffPayload::Partition(Default::default());
 
     // RevisionTree
     let RevisionTreeRequest {

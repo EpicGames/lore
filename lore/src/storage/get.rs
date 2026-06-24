@@ -135,10 +135,14 @@ async fn get_local(
             let effective = store.effective_flags(per_call)?;
 
             let total = items.len();
+            let mut reuse = crate::storage::store::SessionReuse::default();
             let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
             for item in items {
+                let session = reuse.session_for(&store, item.partition, !effective.no_remote);
                 let store = store.clone();
-                lore_spawn!(tasks, async move { get_item(store, item, effective).await });
+                lore_spawn!(tasks, async move {
+                    get_item(store, item, effective, session).await
+                });
             }
             let codes = crate::storage::drain_codes(tasks).await;
             crate::storage::build_call_error(&codes, total, "get")
@@ -153,6 +157,7 @@ async fn get_item(
     store: Arc<StoreInternal>,
     item: LoreStorageGetItem,
     effective: crate::storage::store::EffectiveFlags,
+    remote_session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
     if item.partition == Partition::default() {
         emit_item_complete(&item, LoreErrorCode::InvalidArguments);
@@ -167,14 +172,9 @@ async fn get_item(
     }
 
     if item.streaming != 0 {
-        return get_item_streaming(store, item, effective).await;
+        return get_item_streaming(store, item, effective, remote_session).await;
     }
 
-    let remote_session = if effective.no_remote {
-        None
-    } else {
-        store.remote_session_for(item.partition)
-    };
     let mut read_options = effective.read_options(remote_session.is_some());
     if item.local_cache != 0 {
         read_options = read_options.with_cache();
@@ -214,13 +214,9 @@ async fn get_item_streaming(
     store: Arc<StoreInternal>,
     item: LoreStorageGetItem,
     effective: crate::storage::store::EffectiveFlags,
+    remote_session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(256);
-    let remote_session = if effective.no_remote {
-        None
-    } else {
-        store.remote_session_for(item.partition)
-    };
     let mut read_options = effective.read_options(remote_session.is_some());
     if item.local_cache != 0 {
         read_options = read_options.with_cache();

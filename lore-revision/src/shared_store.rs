@@ -70,7 +70,7 @@ pub struct SharedStoreConfig {
 // Name of the shared store directory created inside the user provided directory
 pub const SHARED_STORE_DIR: &str = "shared_store";
 // Inside SHARED_STORE_DIR
-pub const SHARED_STORE_CONFIG: &str = "global.toml";
+pub const SHARED_STORE_CONFIG: &str = "shared_store.toml";
 
 pub fn find_existing_shared_store_in_dir(
     containing_dir_path: impl AsRef<Path>,
@@ -203,6 +203,8 @@ async fn create_shared_store_at(
     .await
     .forward::<SharedStoreError>("creating immutable store")?;
 
+    lore_storage::maintenance::spawn_gc(&immutable_store, &options);
+
     mutable::create(
         Some(shared_store_path),
         mutable::MutableStoreSettings::default(),
@@ -282,10 +284,9 @@ async fn migrate_legacy_store_in_base(
     let Ok(legacy_store_path) = find_existing_shared_store_in_dir(base) else {
         return Ok(false);
     };
-    let legacy_config =
-        global::load_config::<SharedStoreConfig>(legacy_store_path.join(SHARED_STORE_CONFIG))
-            .await
-            .unwrap_or_default();
+    let legacy_config = load_shared_store_config(&legacy_store_path)
+        .await
+        .unwrap_or_default();
     if !remote_urls_equivalent(&legacy_config.remote_url, repository_url).unwrap_or(false) {
         return Ok(false);
     }
@@ -385,13 +386,12 @@ pub async fn get_shared_store_path_for_repo(
             let directory_with_shared_store =
                 resolve_shared_store_dir(shared_store_to_use_config, &config.remote_url).await?;
             let shared_store_path = find_existing_shared_store_in_dir(directory_with_shared_store)?;
-            let shared_store_config = global::load_config::<SharedStoreConfig>(
-                shared_store_path.join(SHARED_STORE_CONFIG),
-            )
-            .await
-            .map_err(|_err| SharedStoreNotFound {
-                path: shared_store_path.display().to_string(),
-            })?;
+            let shared_store_config =
+                load_shared_store_config(&shared_store_path)
+                    .await
+                    .map_err(|_err| SharedStoreNotFound {
+                        path: shared_store_path.display().to_string(),
+                    })?;
             if !remote_urls_equivalent(&shared_store_config.remote_url, &config.remote_url)? {
                 return Err(SharedStoreError::internal(format!(
                     "Loading the shared store for a repo with remote url \"{}\" but the shared store had the remote url \"{}\"",
@@ -404,6 +404,39 @@ pub async fn get_shared_store_path_for_repo(
             None
         },
     )
+}
+
+async fn load_shared_store_config(
+    shared_store_path: impl AsRef<Path>,
+) -> Result<SharedStoreConfig, SharedStoreError> {
+    let shared_store_path = shared_store_path.as_ref();
+    let config_path = shared_store_path.join(SHARED_STORE_CONFIG);
+    let legacy_config_path = shared_store_path.join("global.toml");
+    if config_path.exists() {
+        global::load_config::<SharedStoreConfig>(config_path)
+            .await
+            .forward::<SharedStoreError>("Loading shared store config")
+    } else if legacy_config_path.exists() {
+        // If a config is found at the old location, save it to the correct location and delete the
+        // original
+        let legacy_config = global::load_config::<SharedStoreConfig>(&legacy_config_path)
+            .await
+            .forward::<SharedStoreError>("Loading legacy shared store config");
+        if let Ok(legacy_config) = legacy_config.as_ref() {
+            save_config(legacy_config, config_path)
+                .await
+                .forward::<SharedStoreError>("migrating global config")?;
+            util::fs::unlink(&legacy_config_path)
+                .await
+                .internal("removing redundant legacy global config")?;
+        }
+        legacy_config
+    } else {
+        Err(SharedStoreNotFound {
+            path: shared_store_path.display().to_string(),
+        }
+        .into())
+    }
 }
 
 /// Data for an event describing the configured shared stores.

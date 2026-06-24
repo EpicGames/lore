@@ -32,6 +32,8 @@ Documentation for installing, using, and understanding Lore.
 
 </div>
 
+New here? The [FAQ](faq.md) answers the common questions, and the [roadmap](roadmap.md) shows where Lore is headed next.
+
 ## Working on Lore
 
 Documentation for contributors and maintainers. These pages cover Lore's internals, the conventions its code follows, and the reasoning behind major design decisions.

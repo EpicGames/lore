@@ -38,7 +38,12 @@ async fn chunk_boundaries(
             .collect())
     } else {
         let chunker = {
-            // SAFETY: buffer lives until after the chunker finishes, so the reference is safe.
+            // The chunker borrows `buffer` via a forged `'static` slice (see
+            // `extend_lifetime`). The compute-pool task is detached and is not
+            // cancelled if this future is dropped at the `rx.await` below, so
+            // we must keep the buffer allocation alive for the whole task.
+            // `Bytes::clone` bumps the refcount with a stable data pointer,
+            // guaranteeing the slice stays valid until the task finishes.
             let slice: &[u8] = unsafe { extend_lifetime(buffer.as_ref()) };
             fastcdc::v2020::FastCDC::with_level(
                 slice,
@@ -48,9 +53,11 @@ async fn chunk_boundaries(
                 fastcdc::v2020::Normalization::Level1,
             )
         };
+        let buffer_guard = buffer.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         lore_base::runtime::compute_pool().spawn(move || {
             let _ = tx.send(chunker.collect::<Vec<_>>());
+            drop(buffer_guard);
         });
         let chunks = rx
             .await

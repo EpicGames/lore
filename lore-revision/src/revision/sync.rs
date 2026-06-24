@@ -808,16 +808,20 @@ async fn sync_realize(
     state_target: Arc<State>,
     options: SyncOptions,
 ) -> Result<(), SyncError> {
-    shim_with_operation(repository.file_system(), false, async |operation| {
-        crate::fs::realize::realize_state(
-            repository,
-            operation,
-            state_current,
-            state_target,
-            options,
-        )
-        .await
-    })
+    Box::pin(shim_with_operation(
+        repository.file_system(),
+        false,
+        async |operation| {
+            crate::fs::realize::realize_state(
+                repository,
+                operation,
+                state_current,
+                state_target,
+                options,
+            )
+            .await
+        },
+    ))
     .await?
 }
 

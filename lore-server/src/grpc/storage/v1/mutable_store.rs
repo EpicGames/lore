@@ -14,7 +14,7 @@ use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::log_server_error;
-use crate::grpc::map_message_handle_error;
+use crate::grpc::simple_map_message_handle_error;
 use crate::protocol::storage::mutable_store_handler::handle_mutable_store;
 use crate::util::setup_execution;
 
@@ -49,7 +49,7 @@ pub async fn handler(
             )
             .await
             .map(|_| Response::new(storage_v1::MutableStoreResponse {}))
-            .map_err(map_message_handle_error)
+            .map_err(simple_map_message_handle_error)
             .inspect_err(log_server_error)
         })
         .await

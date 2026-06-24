@@ -8,6 +8,7 @@ pub mod errors;
 pub mod fragment_engine;
 pub mod fragment_flags;
 pub mod fs_util;
+pub mod gc_event;
 
 use std::sync::OnceLock;
 

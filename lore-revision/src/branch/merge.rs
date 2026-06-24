@@ -923,6 +923,7 @@ async fn merge_start_link(
             link: None,
             layer_messages: std::collections::HashMap::new(),
             layer: None,
+            stats: false,
         };
         let signature = Box::pin(commit::commit(repository, token, commit_options))
             .await
@@ -1504,6 +1505,7 @@ async fn auto_commit_merge(
         link: None,
         layer_messages: std::collections::HashMap::new(),
         layer: None,
+        stats: false,
     };
     Box::pin(commit::commit(repository, token, commit_options))
         .await

@@ -205,6 +205,7 @@ class Lore:
         urc_args: list[str] | None = None,
         use_os_dir: bool = False,
         path: str | None = None,
+        cwd: str | None = None,
         check: bool = True,
         level: str | None = None,
         debug: bool = False,
@@ -222,7 +223,7 @@ class Lore:
         compress_limit: int | None = None,
         search_limit: int | None = None,
         search_nearest: bool = False,
-        gc: bool = False,
+        no_gc: bool = False,
         non_interactive: bool = False,
     ):
         if urc_args is None:
@@ -256,12 +257,23 @@ class Lore:
             + (["--compress-limit", str(compress_limit)] if compress_limit else [])
             + (["--search-limit", str(search_limit)] if search_limit else [])
             + (["--search-nearest"] if search_nearest else [])
-            + (["--gc"] if gc else [])
+            + (["--no-gc"] if no_gc else [])
             + (["--non-interactive"] if non_interactive else [])
             + urc_args
         )
         command_string = " ".join(command_args)
         logger.info("Executing Lore command: %s", command_string)
+        # Run from the repository root so commands behave like a real user
+        # invoking lore inside the working tree. This matters for output that
+        # is rendered relative to the current directory (e.g. `lore status`
+        # paths). When `use_os_dir` is set the test deliberately controls the
+        # cwd (e.g. via monkeypatch.chdir) to exercise repository discovery, so
+        # leave the inherited cwd untouched in that case.
+        run_cwd = cwd
+        if run_cwd is None and not use_os_dir:
+            target_dir = path if path is not None else self.path
+            if target_dir and os.path.isdir(target_dir):
+                run_cwd = target_dir
         attempt = 0
         max_attempts = 3
         while True:
@@ -279,6 +291,7 @@ class Lore:
                     text=True,
                     check=check,
                     env=env,
+                    cwd=run_cwd,
                 )
                 logger.info(output.stdout + output.stderr)
                 return output.stdout + output.stderr
@@ -727,6 +740,49 @@ class Lore:
         return self.run(
             ["branch", "latest", "list"]
             + ([str(limit)] if limit else [])
+            + (["--branch", branch] if branch else []),
+            **kwargs,
+        )
+
+    def branch_metadata_set(
+        self,
+        pairs: list[str] | None = None,
+        branch: str | None = None,
+        binary: bool = False,
+        numeric: bool = False,
+        **kwargs: Unpack[GlobalOptions],
+    ):
+        return self.run(
+            ["branch", "metadata", "set"]
+            + (pairs if pairs else [])
+            + (["--branch", branch] if branch else [])
+            + (["--binary"] if binary else [])
+            + (["--numeric"] if numeric else []),
+            **kwargs,
+        )
+
+    def branch_metadata_get(
+        self,
+        key: str | None = None,
+        branch: str | None = None,
+        **kwargs: Unpack[GlobalOptions],
+    ):
+        return self.run(
+            ["branch", "metadata", "get"]
+            + ([key] if key else [])
+            + (["--branch", branch] if branch else []),
+            **kwargs,
+        )
+
+    def branch_metadata_clear(
+        self,
+        keys: list[str] | None = None,
+        branch: str | None = None,
+        **kwargs: Unpack[GlobalOptions],
+    ):
+        return self.run(
+            ["branch", "metadata", "clear"]
+            + (keys if keys else [])
             + (["--branch", branch] if branch else []),
             **kwargs,
         )
@@ -2380,6 +2436,7 @@ class Lore:
 
 class GlobalOptionsParseable(TypedDict, total=False):
     path: str
+    cwd: str
     use_os_dir: bool
     check: bool
     level: str
@@ -2396,11 +2453,12 @@ class GlobalOptionsParseable(TypedDict, total=False):
     compress_limit: int
     search_limit: int
     search_nearest: bool
-    gc: bool
+    no_gc: bool
 
 
 class GlobalOptions(TypedDict, total=False):
     path: str
+    cwd: str
     use_os_dir: bool
     check: bool
     level: str
@@ -2419,5 +2477,5 @@ class GlobalOptions(TypedDict, total=False):
     compress_limit: int
     search_limit: int
     search_nearest: bool
-    gc: bool
+    no_gc: bool
     non_interactive: bool

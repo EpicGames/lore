@@ -731,14 +731,16 @@ pub async fn gc(
     dispatch_call(globals, args, callback, gc_local).await
 }
 
+/// Runs a single full GC pass. `repository gc` always runs a full pass, so it
+/// forces `globals.no_gc = 1` to suppress the automatic incremental tasks (which
+/// would otherwise race the full pass), then runs the pass explicitly.
 async fn gc_local(
     globals: LoreGlobalArgs,
     args: LoreRepositoryGcArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    // We run gc loop explicitly, disable automatic
     let mut globals = globals;
-    globals.gc = 0;
+    globals.no_gc = 1;
 
     repository_call_write(
         globals,

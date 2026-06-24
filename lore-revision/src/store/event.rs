@@ -15,6 +15,7 @@
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Fragment;
+use lore_base::types::Hash;
 use lore_base::types::Partition;
 use serde::Deserialize;
 use serde::Serialize;
@@ -172,6 +173,72 @@ pub struct LoreStorageUploadItemCompleteEventData {
     pub address: Address,
     /// 1 when the item was already durable and no upload was performed.
     pub already_durable: u8,
+    /// The outcome for the item.
+    pub error_code: LoreErrorCode,
+}
+
+/// Terminal per-item event for `mutable_load`. On success `error_code == None` and `value` is
+/// the loaded value hash (`Hash::default()` when the key holds a null/removed value); on miss
+/// `error_code == ADDRESS_NOT_FOUND` and `value` is zero.
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreStorageMutableLoadItemCompleteEventData {
+    /// Correlation id of the item.
+    pub id: u64,
+    /// The value stored for the key.
+    pub value: Hash,
+    /// The outcome for the item.
+    pub error_code: LoreErrorCode,
+}
+
+/// Terminal per-item event for `mutable_store`. `error_code == None` on a successful store.
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreStorageMutableStoreItemCompleteEventData {
+    /// Correlation id of the item.
+    pub id: u64,
+    /// The outcome for the item.
+    pub error_code: LoreErrorCode,
+}
+
+/// Terminal per-item event for `mutable_compare_and_swap`. `previous` is the value the key held
+/// before the swap (equal to the caller's `expected` when the swap took effect, otherwise the
+/// actual current value). `error_code == None` on success.
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreStorageMutableCompareAndSwapItemCompleteEventData {
+    /// Correlation id of the item.
+    pub id: u64,
+    /// The value the key held before the swap.
+    pub previous: Hash,
+    /// The outcome for the item.
+    pub error_code: LoreErrorCode,
+}
+
+/// One `(key, value)` pair emitted by `mutable_list`, before the item's terminal event.
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreStorageMutableListEntryEventData {
+    /// Correlation id of the listing item.
+    pub id: u64,
+    /// The key of this entry.
+    pub key: Hash,
+    /// The value stored for the key.
+    pub value: Hash,
+}
+
+/// Terminal per-item event for `mutable_list`, emitted after every `MUTABLE_LIST_ENTRY` for the
+/// item. `error_code == None` once the listing completes.
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreStorageMutableListItemCompleteEventData {
+    /// Correlation id of the listing item.
+    pub id: u64,
     /// The outcome for the item.
     pub error_code: LoreErrorCode,
 }

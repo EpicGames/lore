@@ -23,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 LORE_GLOBAL_PATH_VAR = "LORE_GLOBAL_PATH"
 
+CONFIG_TOML = "shared_store.toml"
+
 
 class CreationType(enum.Enum):
     CREATE = 1
@@ -41,16 +43,21 @@ def create_repo(
     def create_repo_impl(
         use_shared_store: bool | None = None,
         shared_store_path: str | None = None,
+        **kwargs,
     ):
         if request.param == CreationType.CREATE:
             repo = new_lore_repo(create_repo=False)
             repo.repository_create(
-                use_shared_store=use_shared_store, shared_store_path=shared_store_path
+                use_shared_store=use_shared_store,
+                shared_store_path=shared_store_path,
+                **kwargs,
             )
             return repo
         else:
             return new_lore_repo().clone(
-                use_shared_store=use_shared_store, shared_store_path=shared_store_path
+                use_shared_store=use_shared_store,
+                shared_store_path=shared_store_path,
+                **kwargs,
             )
 
     return create_repo_impl
@@ -298,14 +305,20 @@ def test_create_repo_relative_path(
     non_default_store_path = str(
         tmp_path_factory.getbasetemp() / Lore.generate_random_name("non_default_store")
     )
-    non_default_store_relative_path = os.path.relpath(
-        non_default_store_path, os.getcwd()
-    )
+    try:
+        non_default_store_relative_path = os.path.relpath(
+            non_default_store_path, os.getcwd()
+        )
+    except ValueError:
+        pytest.skip("No relative path between test location and temp path location")
+        return
     repo.shared_store_create(repo.remote, non_default_store_path, make_default=False)
 
     # Create a repo using the non-default shared store and verify it used the correct immutable store
     repo = create_repo(
-        use_shared_store=True, shared_store_path=non_default_store_relative_path
+        use_shared_store=True,
+        shared_store_path=non_default_store_relative_path,
+        cwd=os.getcwd(),
     )
 
     monkeypatch.chdir(repo.path)
@@ -395,13 +408,13 @@ def test_create_two_repos(new_lore_repo, tmp_path_factory, create_repo):
 @pytest.mark.smoke
 def test_shared_store_remote_mismatch_rejected(new_lore_repo, tmp_path_factory):
     """If a store's recorded remote URL does not match the repo's (e.g. a
-    hand-edited or corrupted global.toml), loading it is rejected rather than
+    hand-edited or corrupted shared_store.toml), loading it is rejected rather than
     serving another endpoint's data."""
     base = str(tmp_path_factory.getbasetemp() / Lore.generate_random_name("mismatch"))
     repo: Lore = new_lore_repo(create_repo=False)
     repo.repository_create(use_shared_store=True, shared_store_path=base)
 
-    config_path = os.path.join(_per_url_store_path(base, repo.remote), "global.toml")
+    config_path = os.path.join(_per_url_store_path(base, repo.remote), CONFIG_TOML)
     with open(config_path, "r+") as f:
         contents = f.read().replace(_strip_protocol(repo.remote), "some.other.host")
         f.seek(0)
@@ -555,8 +568,9 @@ def test_explicit_base_hosts_multiple_endpoints(
 
 
 @pytest.mark.smoke
+@pytest.mark.parametrize("legacy_config_file", [True, False])
 def test_legacy_store_migrated_to_per_url_dir(
-    new_lore_repo, tmp_path_factory, create_repo
+    new_lore_repo, tmp_path_factory, create_repo, legacy_config_file
 ):
     """A pre-per-URL store at <base>/shared_store whose recorded remote matches is
     moved into <base>/<remote>/shared_store on the next clone/create and loaded
@@ -573,6 +587,11 @@ def test_legacy_store_migrated_to_per_url_dir(
     shutil.move(per_url_store, legacy_store)
     assert not os.path.exists(per_url_store)
     assert os.path.isdir(legacy_store)
+    if legacy_config_file:
+        shutil.move(
+            os.path.join(legacy_store, "shared_store.toml"),
+            os.path.join(legacy_store, CONFIG_TOML),
+        )
 
     repo = create_repo(use_shared_store=True, shared_store_path=base)
 
@@ -608,7 +627,7 @@ def test_legacy_store_not_migrated_for_different_remote(
     assert os.path.isdir(legacy_store), (
         "Mismatched legacy store should be left in place"
     )
-    with open(os.path.join(legacy_store, "global.toml")) as f:
+    with open(os.path.join(legacy_store, CONFIG_TOML)) as f:
         assert other_remote in f.read(), (
             "Legacy store should be untouched and keep its own remote"
         )
@@ -1320,3 +1339,63 @@ def test_backwards_compatible_repo(new_lore_repo, tmp_path_factory):
     verify_shared_store_repo(
         repo.path, legacy_global_store_path, previous_data_size=immutable_store_bytes
     )
+
+
+@pytest.mark.smoke
+def test_backwards_compatible_config_file(new_lore_repo, tmp_path_factory):
+    """A shared store with a config with the old file name will have it moved to the new file name when used"""
+    repo: Lore = new_lore_repo(create_repo=False)
+    repo.shared_store_create(repo.remote)
+    shared_store_path = get_shared_store_info(repo).path
+
+    # Move the shared store config file to the old location
+    legacy_config_path = os.path.join(shared_store_path, "global.toml")
+    config_path = os.path.join(shared_store_path, CONFIG_TOML)
+    with open(config_path, "r") as config:
+        config_contents = config.read()
+    os.remove(config_path)
+    with open(legacy_config_path, "w") as legacy_config:
+        legacy_config.write(config_contents)
+
+    # Create a repo using the shared store and verify it correctly behaved
+    repo: Lore = new_lore_repo(create_repo=False)
+    repo.repository_create(use_shared_store=True)
+    verify_shared_store_repo(repo.path, shared_store_path)
+
+    # Assert the config contents are in the correct file only
+    assert os.path.exists(config_path)
+    assert not os.path.exists(legacy_config_path)
+    with open(config_path, "r") as config:
+        assert config.read() == config_contents
+
+
+@pytest.mark.smoke
+def test_backwards_compatible_config_file_broken(new_lore_repo, tmp_path_factory):
+    """A shared store with a config with the old file name that fails to migrate due to not parsing will still have the
+    old file left alone"""
+    repo: Lore = new_lore_repo(create_repo=False)
+    repo.shared_store_create(repo.remote)
+    shared_store_path = get_shared_store_info(repo).path
+
+    # Move the shared store config file to the old location but with bad contents so it won't parse correctly
+    legacy_config_path = os.path.join(shared_store_path, "global.toml")
+    config_path = os.path.join(shared_store_path, CONFIG_TOML)
+
+    with open(config_path, "r") as config:
+        config_contents = config.read()
+    os.remove(config_path)
+
+    config_contents += "\nNon toml gibberish"
+    with open(legacy_config_path, "w") as legacy_config:
+        legacy_config.write(config_contents)
+
+    # Create a repo using the shared store which should fail due to failing to parse the bad config file
+    repo: Lore = new_lore_repo(create_repo=False)
+    with pytest.raises(MissingSharedStore):
+        repo.repository_create(use_shared_store=True)
+
+    # Assert the config contents are in the legacy file as they were before they failed to read
+    assert not os.path.exists(config_path)
+    assert os.path.exists(legacy_config_path)
+    with open(legacy_config_path, "r") as legacy_config:
+        assert legacy_config.read() == config_contents

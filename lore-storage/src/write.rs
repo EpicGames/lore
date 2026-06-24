@@ -251,7 +251,8 @@ pub async fn store_fragment(
         )));
     }
 
-    match tracker {
+    let observer = tracker.clone();
+    let result = match tracker {
         None => {
             store_fragment_inline(
                 store,
@@ -279,7 +280,12 @@ pub async fn store_fragment(
             )
             .await
         }
+    };
+
+    if let (Some(tracker), Ok(result)) = (observer, &result) {
+        tracker.notify_fragment(&result.fragment, result.deduplicated);
     }
+    result
 }
 
 /// Backward-compatible synchronous fragment store. Acquires the in-flight
@@ -1380,8 +1386,12 @@ mod tests {
             self: Arc<Self>,
             max_capacity: usize,
             sync_data: bool,
+            sink: Option<crate::gc_event::GcEventSinkRef>,
         ) -> Result<usize, StoreError> {
-            self.inner.clone().evict(max_capacity, sync_data).await
+            self.inner
+                .clone()
+                .evict(max_capacity, sync_data, sink)
+                .await
         }
 
         async fn compact(
@@ -1389,8 +1399,12 @@ mod tests {
             max_size: usize,
             at: Option<usize>,
             sync_data: bool,
+            sink: Option<crate::gc_event::GcEventSinkRef>,
         ) -> Result<Option<usize>, StoreError> {
-            self.inner.clone().compact(max_size, at, sync_data).await
+            self.inner
+                .clone()
+                .compact(max_size, at, sync_data, sink)
+                .await
         }
 
         async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
@@ -1670,8 +1684,12 @@ mod tests {
             self: Arc<Self>,
             max_capacity: usize,
             sync_data: bool,
+            sink: Option<crate::gc_event::GcEventSinkRef>,
         ) -> Result<usize, StoreError> {
-            self.inner.clone().evict(max_capacity, sync_data).await
+            self.inner
+                .clone()
+                .evict(max_capacity, sync_data, sink)
+                .await
         }
 
         async fn compact(
@@ -1679,8 +1697,12 @@ mod tests {
             max_size: usize,
             at: Option<usize>,
             sync_data: bool,
+            sink: Option<crate::gc_event::GcEventSinkRef>,
         ) -> Result<Option<usize>, StoreError> {
-            self.inner.clone().compact(max_size, at, sync_data).await
+            self.inner
+                .clone()
+                .compact(max_size, at, sync_data, sink)
+                .await
         }
 
         async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
@@ -1915,8 +1937,12 @@ mod tests {
             self: Arc<Self>,
             max_capacity: usize,
             sync_data: bool,
+            sink: Option<crate::gc_event::GcEventSinkRef>,
         ) -> Result<usize, StoreError> {
-            self.inner.clone().evict(max_capacity, sync_data).await
+            self.inner
+                .clone()
+                .evict(max_capacity, sync_data, sink)
+                .await
         }
 
         async fn compact(
@@ -1924,8 +1950,12 @@ mod tests {
             max_size: usize,
             at: Option<usize>,
             sync_data: bool,
+            sink: Option<crate::gc_event::GcEventSinkRef>,
         ) -> Result<Option<usize>, StoreError> {
-            self.inner.clone().compact(max_size, at, sync_data).await
+            self.inner
+                .clone()
+                .compact(max_size, at, sync_data, sink)
+                .await
         }
 
         async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {

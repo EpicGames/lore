@@ -1096,8 +1096,12 @@ impl ImmutableStore for CompositeStore {
         self: Arc<Self>,
         max_capacity: usize,
         sync_data: bool,
+        sink: Option<lore_storage::gc_event::GcEventSinkRef>,
     ) -> Result<usize, StoreError> {
-        self.local.store().evict(max_capacity, sync_data).await
+        self.local
+            .store()
+            .evict(max_capacity, sync_data, sink)
+            .await
     }
 
     async fn compact(
@@ -1105,8 +1109,12 @@ impl ImmutableStore for CompositeStore {
         max_size: usize,
         at: Option<usize>,
         sync_data: bool,
+        sink: Option<lore_storage::gc_event::GcEventSinkRef>,
     ) -> Result<Option<usize>, StoreError> {
-        self.local.store().compact(max_size, at, sync_data).await
+        self.local
+            .store()
+            .compact(max_size, at, sync_data, sink)
+            .await
     }
 
     async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {

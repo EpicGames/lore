@@ -65,9 +65,11 @@ def test_lock_query(new_lore_repo):
     output = repo.lock_query("release", path="subdir_b/file_b.txt")
     assert "subdir_b/file_b.txt" in output[0].file and len(output) == 1
 
+    outside_repo_path = os.path.join(os.path.dirname(repo.path), "ignore.txt")
+
     # Fails because path is not relative to repo
     with pytest.raises(LockInvalidPath):
-        repo.run(["lock", "query", "--branch", "main", "--path", "ignore.txt"])
+        repo.run(["lock", "query", "--branch", "main", "--path", outside_repo_path])
 
     # Fails because the call to auth::userinfo::user_id returns UserInfoError::Authenticate
     with pytest.raises(UserNotAuthenticated):

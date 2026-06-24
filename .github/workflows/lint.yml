@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Lint
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions: {}
+
+concurrency:
+  group: lint-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pre-commit:
+    name: pre-commit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # Check out the PR head to lint it
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: .pre-commit-config.yaml
+
+      # cargo-clippy, cargo-fmt and cargo-deny run as Rust pre-commit hooks.
+      # Lore formats with nightly; clippy and cargo-deny run on stable.
+      - name: Install Rust toolchains
+        run: |
+          rustup toolchain install nightly --profile minimal -c rustfmt
+          rustup component add clippy rustfmt
+
+      - name: Cache cargo registry and build artifacts
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Cache pre-commit hook environments
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: |
+            pre-commit-
+
+      - name: Install pre-commit
+        run: python -m pip install --upgrade pre-commit
+
+      - name: Run pre-commit
+        run: pre-commit run --all-files --show-diff-on-failure --color=always

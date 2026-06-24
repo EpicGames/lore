@@ -4,6 +4,8 @@ use futures::FutureExt;
 pub mod admin_service;
 pub mod environment;
 pub mod environment_service;
+pub mod forwarded_requests;
+pub mod forwarded_revision;
 pub mod handlers;
 pub mod lock_service;
 pub mod notification_service;
@@ -19,11 +21,15 @@ pub mod thinclient;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-mod replication_server;
+
+use bytes::Bytes;
+
+mod grpc_internal_server;
 mod replication_service;
 pub mod tower;
 
 pub use admin_service::LoreAdminService;
+pub use grpc_internal_server::GrpcInternalServerBuilder;
 use lore_base::types::Context;
 use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::MetadataError;
@@ -33,7 +39,6 @@ use lore_revision::state::StateError;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use lore_transport::grpc::PARTITION_ID_KEY;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
-pub use replication_server::GrpcReplicationServerBuilder;
 pub use repository::LoreRepositoryV1Service;
 pub use revision::LoreRevisionV1Service;
 pub use revision_service::LoreRevisionService;
@@ -46,7 +51,7 @@ use tonic::Code;
 use tonic::Extensions;
 use tonic::Status;
 use tonic::metadata::MetadataMap;
-use tracing::error;
+use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
@@ -63,46 +68,114 @@ use crate::util::resources_from_token;
 /// Matches the Infrastructure alerting rule regex
 /// for what counts as an internal status code error
 pub fn is_code_considered_server_error(code: &Code) -> bool {
-    matches!(
-        code,
-        Code::Internal | Code::Unavailable | Code::Unknown | Code::Cancelled
-    )
+    matches!(code, Code::Internal | Code::Unavailable | Code::Cancelled)
 }
 
-pub(crate) fn map_message_handle_error(error: MessageHandleError) -> Status {
-    match error {
-        MessageHandleError::AuthorizationFailure(err) => {
-            Status::permission_denied(format!("Authorization failed {err}"))
-        }
-        MessageHandleError::MissingToken => Status::unauthenticated("Missing auth token"),
-        MessageHandleError::AlreadyConnected => Status::failed_precondition("Already connected"),
-        MessageHandleError::BranchExists => Status::already_exists("Branch already exists"),
-        MessageHandleError::BranchMismatch => Status::invalid_argument("Branch mismatch"),
-        MessageHandleError::BranchProtected => Status::permission_denied("Branch is protected"),
-        MessageHandleError::FragmentNotFound => Status::not_found("Fragment not found"),
-        MessageHandleError::HashMismatch => Status::invalid_argument("Hash mismatch"),
-        MessageHandleError::InvalidParentBranch => {
-            Status::invalid_argument("Invalid parent branch")
-        }
-        MessageHandleError::InternalError => Status::internal("Internal error"),
-        MessageHandleError::MutableDataNotFound(hash) => {
-            Status::not_found(format!("No data found for hash: {hash}"))
-        }
-        MessageHandleError::NoSuchBranch => Status::not_found("No such branch"),
-        MessageHandleError::NotConnected => Status::failed_precondition("Not connected"),
-        MessageHandleError::NotImplemented => Status::internal("Operation not implemented"),
-        MessageHandleError::QueryResultSizeMismatch => {
-            Status::internal("Query result size mismatch")
-        }
-        MessageHandleError::StoreFailure => Status::internal("Store failure"),
-        MessageHandleError::SlowDown => Status::unavailable("slowdown"),
-        MessageHandleError::Oversized => Status::out_of_range("Oversized fragment or blob"),
-        MessageHandleError::Metadata => Status::internal("Metadata failure"),
-        MessageHandleError::HashFailed => Status::invalid_argument("Hash failed"),
-        MessageHandleError::InvalidFragment => Status::invalid_argument("Invalid fragment"),
-        MessageHandleError::HandlerTimeout => Status::cancelled("Request Handler Timeout"),
-        MessageHandleError::SessionLimitReached => Status::unavailable("Session limit reached"),
-    }
+pub(crate) fn simple_map_message_handle_error(error: MessageHandleError) -> Status {
+    map_message_handle_error_to_status(&error, None, None)
+}
+
+pub fn map_message_handle_error_to_status(
+    error: &MessageHandleError,
+    message: Option<String>,
+    details: Option<Bytes>,
+) -> Status {
+    let (code, message) = match error {
+        MessageHandleError::AuthorizationFailure(err) => (
+            Code::PermissionDenied,
+            message.unwrap_or_else(|| format!("Authorization failed {err}")),
+        ),
+        MessageHandleError::MissingToken => (
+            Code::Unauthenticated,
+            message.unwrap_or_else(|| "Missing auth token".into()),
+        ),
+        MessageHandleError::AlreadyConnected => (
+            Code::FailedPrecondition,
+            message.unwrap_or_else(|| "Already connected".into()),
+        ),
+        MessageHandleError::BranchExists => (
+            Code::AlreadyExists,
+            message.unwrap_or_else(|| "Branch already exists".into()),
+        ),
+        MessageHandleError::BranchMismatch => (
+            Code::InvalidArgument,
+            message.unwrap_or_else(|| "Branch mismatch".into()),
+        ),
+        MessageHandleError::BranchProtected => (
+            Code::PermissionDenied,
+            message.unwrap_or_else(|| "Branch protected".into()),
+        ),
+        MessageHandleError::FragmentNotFound => (
+            Code::NotFound,
+            message.unwrap_or_else(|| "Fragment not found".into()),
+        ),
+        MessageHandleError::HashMismatch => (
+            Code::InvalidArgument,
+            message.unwrap_or_else(|| "Hash mismatch".into()),
+        ),
+        MessageHandleError::InvalidParentBranch => (
+            Code::InvalidArgument,
+            message.unwrap_or_else(|| "Invalid parent branch".into()),
+        ),
+        MessageHandleError::InternalError => (
+            Code::Internal,
+            message.unwrap_or_else(|| "Internal error".into()),
+        ),
+        MessageHandleError::MutableDataNotFound(hash) => (
+            Code::NotFound,
+            message.unwrap_or_else(|| format!("No data found for hash: {hash}")),
+        ),
+        MessageHandleError::NoSuchBranch => (
+            Code::NotFound,
+            message.unwrap_or_else(|| "No such branch".into()),
+        ),
+        MessageHandleError::NotConnected => (
+            Code::FailedPrecondition,
+            message.unwrap_or_else(|| "Not connected".into()),
+        ),
+        MessageHandleError::NotImplemented => (
+            Code::Internal,
+            message.unwrap_or_else(|| "Operation not implemented".into()),
+        ),
+        MessageHandleError::QueryResultSizeMismatch => (
+            Code::Internal,
+            message.unwrap_or_else(|| "Query result size mismatch".into()),
+        ),
+        MessageHandleError::StoreFailure => (
+            Code::Internal,
+            message.unwrap_or_else(|| "Store failure".into()),
+        ),
+        MessageHandleError::SlowDown => (
+            Code::ResourceExhausted,
+            message.unwrap_or_else(|| "slowdown".into()),
+        ),
+        MessageHandleError::Oversized => (
+            Code::OutOfRange,
+            message.unwrap_or_else(|| "Oversized fragment or blob".into()),
+        ),
+        MessageHandleError::Metadata => (
+            Code::Internal,
+            message.unwrap_or_else(|| "Metadata failure".into()),
+        ),
+        MessageHandleError::HashFailed => (
+            Code::InvalidArgument,
+            message.unwrap_or_else(|| "Hash failed".into()),
+        ),
+        MessageHandleError::InvalidFragment => (
+            Code::InvalidArgument,
+            message.unwrap_or_else(|| "Invalid fragment".into()),
+        ),
+        MessageHandleError::HandlerTimeout => (
+            Code::Cancelled,
+            message.unwrap_or_else(|| "Request Handler Timeout".into()),
+        ),
+        MessageHandleError::SessionLimitReached => (
+            Code::Unavailable,
+            message.unwrap_or_else(|| "Session limit reached".into()),
+        ),
+    };
+
+    Status::with_details(code, message, details.unwrap_or_default())
 }
 
 pub fn get_repository(metadata: &MetadataMap) -> Result<RepositoryId, Status> {
@@ -173,6 +246,17 @@ pub(crate) fn metadata_to_attribute(
     Ok(attr_map)
 }
 
+pub fn interpret_streaming_error(err: Status) -> Status {
+    // Surfaced from tonic crate src/codec/decode.rs
+    // An abrupt client error has occurred where they were streaming data then suddenly
+    // they have dropped.
+    if err.code() == Code::Internal && err.message() == "Unexpected EOF decoding stream." {
+        return Status::invalid_argument(format!("Probable client disconnect: {}", err.message()));
+    }
+
+    err
+}
+
 pub(crate) async fn send_err<T>(status: Status, tx: Sender<Result<T, Status>>) {
     let rpc_status_code = rpc_code_to_str(&status.code());
 
@@ -182,7 +266,7 @@ pub(crate) async fn send_err<T>(status: Status, tx: Sender<Result<T, Status>>) {
         info!(response = ?status, rpc_status_code, "GRPC service send_err - user error");
     }
     if let Err(e) = tx.send(Err(status)).await {
-        error!(send_error = ?e, "GRPC service error performing send_err");
+        debug!(send_error = ?e, "GRPC service error performing send_err");
     }
 }
 

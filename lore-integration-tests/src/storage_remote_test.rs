@@ -39,6 +39,7 @@ mod storage_remote_tests {
     struct TestServer {
         url: String,
         backend_immutable: Arc<dyn lore_storage::ImmutableStore>,
+        backend_mutable: Arc<dyn lore_storage::MutableStore>,
         _shutdown: tokio::sync::oneshot::Sender<()>,
     }
 
@@ -65,6 +66,7 @@ mod storage_remote_tests {
         .await
         .unwrap();
         let backend_for_test = backend_immutable.clone();
+        let backend_mutable_for_test: Arc<dyn lore_storage::MutableStore> = backend_mutable.clone();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
@@ -79,6 +81,8 @@ mod storage_remote_tests {
             Arc::new(lore_server::notification::local::NotificationSender::default());
         let hook_dispatcher = Arc::new(HookDispatcher::empty());
 
+        // Background server task in a test; LORE_CONTEXT propagation is unnecessary here.
+        #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
             GrpcServerBuilder::new()
                 .with_environment(EnvironmentConfig::default())
@@ -115,6 +119,7 @@ mod storage_remote_tests {
         TestServer {
             url: format!("grpc://127.0.0.1:{}", addr.port()),
             backend_immutable: backend_for_test,
+            backend_mutable: backend_mutable_for_test,
             _shutdown: shutdown_tx,
         }
     }
@@ -1074,6 +1079,7 @@ mod storage_remote_tests {
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
+        #[allow(clippy::type_complexity)]
         let captured: Arc<
             Mutex<
                 Vec<(
@@ -1310,6 +1316,7 @@ mod storage_remote_tests {
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
 
+        #[allow(clippy::type_complexity)]
         let captured: Arc<Mutex<Vec<(u64, lore_base::types::Address, u8, LoreErrorCode)>>> =
             Arc::new(Mutex::new(Vec::new()));
         let captured_for_cb = captured.clone();
@@ -1620,7 +1627,7 @@ mod storage_remote_tests {
     }
 
     /// `put_file` with `remote_write=1` against a remote-configured handle must upload to the
-    /// server. Exercises the path that previously hardcoded `None` for the remote_session and
+    /// server. Exercises the path that previously hardcoded `None` for the `remote_session` and
     /// silently dropped the upload.
     #[tokio::test]
     async fn put_file_with_remote_write_uploads_file_to_server() -> TestResult {
@@ -1855,8 +1862,10 @@ mod storage_remote_tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let server = start_test_server().await;
-                let mut bound = LoreGlobalArgs::default();
-                bound.offline = 1;
+                let bound = LoreGlobalArgs {
+                    offline: 1,
+                    ..Default::default()
+                };
                 let handle_id = open_remote_handle_with_globals(&server, bound).await;
 
                 let payload = b"bound-offline must not upload".to_vec();
@@ -1965,8 +1974,10 @@ mod storage_remote_tests {
                     .await
                     .expect("seed server backend");
 
-                let mut bound = LoreGlobalArgs::default();
-                bound.local = 1;
+                let bound = LoreGlobalArgs {
+                    local: 1,
+                    ..Default::default()
+                };
                 let handle_id = open_remote_handle_with_globals(&server, bound).await;
 
                 let captured: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> =
@@ -2048,9 +2059,11 @@ mod storage_remote_tests {
                     fixed_size_chunk: 0,
                 };
                 // Per-call `local=1 && remote=1` must be rejected up front; status=1.
-                let mut bad = LoreGlobalArgs::default();
-                bad.local = 1;
-                bad.remote = 1;
+                let bad = LoreGlobalArgs {
+                    local: 1,
+                    remote: 1,
+                    ..Default::default()
+                };
                 let status = put::put(
                     bad,
                     LoreStoragePutArgs {
@@ -2123,8 +2136,10 @@ mod storage_remote_tests {
                 let server = start_test_server().await;
                 let (partition, address) =
                     seed_server_only(&server, 0xc1, b"bound-offline get-miss target").await;
-                let mut bound = LoreGlobalArgs::default();
-                bound.offline = 1;
+                let bound = LoreGlobalArgs {
+                    offline: 1,
+                    ..Default::default()
+                };
                 let handle_id = open_remote_handle_with_globals(&server, bound).await;
 
                 let captured: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> =
@@ -2163,7 +2178,7 @@ mod storage_remote_tests {
             .await
     }
 
-    /// Suppression-on-get_metadata: bound `local=1` makes get_metadata against a server-only
+    /// Suppression on `get_metadata`: bound `local=1` makes `get_metadata` against a server-only
     /// address miss without consulting the remote.
     #[tokio::test]
     async fn bound_local_suppresses_remote_fetch_on_get_metadata_miss() -> TestResult {
@@ -2179,8 +2194,10 @@ mod storage_remote_tests {
                 let server = start_test_server().await;
                 let (partition, address) =
                     seed_server_only(&server, 0xc2, b"bound-local getmd-miss target").await;
-                let mut bound = LoreGlobalArgs::default();
-                bound.local = 1;
+                let bound = LoreGlobalArgs {
+                    local: 1,
+                    ..Default::default()
+                };
                 let handle_id = open_remote_handle_with_globals(&server, bound).await;
 
                 let captured: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> =
@@ -2234,8 +2251,10 @@ mod storage_remote_tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let server = start_test_server().await;
-                let mut bound = LoreGlobalArgs::default();
-                bound.offline = 1;
+                let bound = LoreGlobalArgs {
+                    offline: 1,
+                    ..Default::default()
+                };
                 let handle_id = open_remote_handle_with_globals(&server, bound).await;
 
                 let item = LoreStorageUploadItem {
@@ -2280,10 +2299,13 @@ mod storage_remote_tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let server = start_test_server().await;
-                let mut bound = LoreGlobalArgs::default();
-                bound.local = 1;
+                let bound = LoreGlobalArgs {
+                    local: 1,
+                    ..Default::default()
+                };
                 let handle_id = open_remote_handle_with_globals(&server, bound).await;
 
+                #[allow(clippy::type_complexity)]
                 let captured: Arc<Mutex<Vec<(u8, u8, u8, u8)>>> = Arc::new(Mutex::new(Vec::new()));
                 let captured_for_cb = captured.clone();
                 let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
@@ -2344,8 +2366,10 @@ mod storage_remote_tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let server = start_test_server().await;
-                let mut bound = LoreGlobalArgs::default();
-                bound.offline = 1;
+                let bound = LoreGlobalArgs {
+                    offline: 1,
+                    ..Default::default()
+                };
                 let handle_id = open_remote_handle_with_globals(&server, bound).await;
 
                 // Seed source partition locally via a put. With offline bound, the put is
@@ -2463,8 +2487,10 @@ mod storage_remote_tests {
 
                 // Bound-remote handle. The handle's local in-memory store is empty for the
                 // address; with bypass-local semantics the read MUST reach the remote.
-                let mut bound = LoreGlobalArgs::default();
-                bound.remote = 1;
+                let bound = LoreGlobalArgs {
+                    remote: 1,
+                    ..Default::default()
+                };
                 let handle_id = open_remote_handle_with_globals(&server, bound).await;
 
                 let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2531,8 +2557,10 @@ mod storage_remote_tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let server = start_test_server().await;
-                let mut bound = LoreGlobalArgs::default();
-                bound.remote = 1;
+                let bound = LoreGlobalArgs {
+                    remote: 1,
+                    ..Default::default()
+                };
                 let handle_id = open_remote_handle_with_globals(&server, bound).await;
 
                 let captured: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2620,5 +2648,355 @@ mod storage_remote_tests {
         .await;
         assert_eq!(status, 0, "put failed");
         captured.lock().unwrap()[0]
+    }
+
+    // ----- Mutable store remote-path tests -----
+    //
+    // `globals.remote = 1` routes each op to the remote mutable store over the shared storage
+    // session — the same session-based authz the immutable ops use. The default (local) routing
+    // is covered by `storage_mutable_test`; here a local-vs-remote pair pins the explicit
+    // selection.
+
+    use lore_base::types::Hash;
+    use lore_base::types::KeyType;
+    use lore_revision::event::LoreErrorCode;
+
+    const REMOTE_KEY_TYPE: KeyType = KeyType::BranchLatestPointer;
+
+    fn remote_globals() -> LoreGlobalArgs {
+        LoreGlobalArgs {
+            remote: 1,
+            ..Default::default()
+        }
+    }
+
+    /// Store a key-value pair through the handle, routed by `globals`. Returns the per-item
+    /// `(id, error_code)` outcomes.
+    async fn mutable_store_via_handle(
+        handle_id: u64,
+        globals: LoreGlobalArgs,
+        partition: lore_base::types::Partition,
+        key: Hash,
+        value: Hash,
+    ) -> (i32, Vec<(u64, lore_revision::event::LoreErrorCode)>) {
+        use lore::storage::mutable_store;
+        use lore::storage::mutable_store::LoreStorageMutableStoreArgs;
+        use lore::storage::mutable_store::LoreStorageMutableStoreItem;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let captured: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_cb = captured.clone();
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+            if let LoreEvent::StorageMutableStoreItemComplete(data) = event {
+                captured_for_cb
+                    .lock()
+                    .unwrap()
+                    .push((data.id, data.error_code));
+            }
+        }));
+        let status = mutable_store::mutable_store(
+            globals,
+            LoreStorageMutableStoreArgs {
+                handle: lore::storage::handle::LoreStore { handle_id },
+                items: LoreArray::from_vec(vec![LoreStorageMutableStoreItem {
+                    id: 1,
+                    partition,
+                    key,
+                    value,
+                    key_type: REMOTE_KEY_TYPE,
+                }]),
+            },
+            callback,
+        )
+        .await;
+        let events = captured.lock().unwrap().clone();
+        (status, events)
+    }
+
+    /// Load a key through the handle, routed by `globals`. Returns the per-item `(value,
+    /// error_code)`.
+    async fn mutable_load_via_handle(
+        handle_id: u64,
+        globals: LoreGlobalArgs,
+        partition: lore_base::types::Partition,
+        key: Hash,
+    ) -> (i32, Hash, lore_revision::event::LoreErrorCode) {
+        use lore::storage::mutable_load;
+        use lore::storage::mutable_load::LoreStorageMutableLoadArgs;
+        use lore::storage::mutable_load::LoreStorageMutableLoadItem;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let captured: Arc<Mutex<Vec<(Hash, LoreErrorCode)>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_cb = captured.clone();
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+            if let LoreEvent::StorageMutableLoadItemComplete(data) = event {
+                captured_for_cb
+                    .lock()
+                    .unwrap()
+                    .push((data.value, data.error_code));
+            }
+        }));
+        let status = mutable_load::mutable_load(
+            globals,
+            LoreStorageMutableLoadArgs {
+                handle: lore::storage::handle::LoreStore { handle_id },
+                items: LoreArray::from_vec(vec![LoreStorageMutableLoadItem {
+                    id: 7,
+                    partition,
+                    key,
+                    key_type: REMOTE_KEY_TYPE,
+                }]),
+            },
+            callback,
+        )
+        .await;
+        let events = captured.lock().unwrap().clone();
+        assert_eq!(events.len(), 1, "exactly one load complete event");
+        (status, events[0].0, events[0].1)
+    }
+
+    #[tokio::test]
+    async fn mutable_store_and_load_via_remote_round_trips() -> TestResult {
+        let execution = setup_execution("storage-remote-mutable-roundtrip".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let handle_id = open_remote_handle(&server).await;
+                let partition = lore_base::types::Partition::from([0xe1u8; 16]);
+                let key = Hash::from([0xe2u8; 32]);
+                let value = Hash::from([0xe3u8; 32]);
+
+                let (status, completes) =
+                    mutable_store_via_handle(handle_id, remote_globals(), partition, key, value)
+                        .await;
+                assert_eq!(status, 0, "remote mutable store must succeed");
+                assert_eq!(completes, vec![(1, LoreErrorCode::None)]);
+
+                // The value landed on the server's mutable store under the session's repository.
+                let on_server = server
+                    .backend_mutable
+                    .clone()
+                    .load(partition, key, REMOTE_KEY_TYPE)
+                    .await
+                    .expect("server backend must hold the stored key");
+                assert_eq!(on_server, value, "server value must match the stored value");
+
+                // Reading it back through the remote path returns the same value.
+                let (load_status, loaded, code) =
+                    mutable_load_via_handle(handle_id, remote_globals(), partition, key).await;
+                assert_eq!(load_status, 0);
+                assert_eq!(code, LoreErrorCode::None);
+                assert_eq!(loaded, value);
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn mutable_compare_and_swap_via_remote() -> TestResult {
+        use lore::storage::mutable_compare_and_swap;
+        use lore::storage::mutable_compare_and_swap::LoreStorageMutableCompareAndSwapArgs;
+        use lore::storage::mutable_compare_and_swap::LoreStorageMutableCompareAndSwapItem;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-mutable-cas".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let handle_id = open_remote_handle(&server).await;
+                let partition = lore_base::types::Partition::from([0xf1u8; 16]);
+                let key = Hash::from([0xf2u8; 32]);
+                let current = Hash::from([0xf3u8; 32]);
+                let next = Hash::from([0xf4u8; 32]);
+
+                let (status, _) =
+                    mutable_store_via_handle(handle_id, remote_globals(), partition, key, current)
+                        .await;
+                assert_eq!(status, 0);
+
+                let captured: Arc<Mutex<Vec<(Hash, LoreErrorCode)>>> =
+                    Arc::new(Mutex::new(Vec::new()));
+                let captured_for_cb = captured.clone();
+                let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                    if let LoreEvent::StorageMutableCompareAndSwapItemComplete(data) = event {
+                        captured_for_cb
+                            .lock()
+                            .unwrap()
+                            .push((data.previous, data.error_code));
+                    }
+                }));
+                let cas_status = mutable_compare_and_swap::mutable_compare_and_swap(
+                    remote_globals(),
+                    LoreStorageMutableCompareAndSwapArgs {
+                        handle: lore::storage::handle::LoreStore { handle_id },
+                        items: LoreArray::from_vec(vec![LoreStorageMutableCompareAndSwapItem {
+                            id: 1,
+                            partition,
+                            key,
+                            expected: current,
+                            value: next,
+                            key_type: REMOTE_KEY_TYPE,
+                        }]),
+                    },
+                    callback,
+                )
+                .await;
+                assert_eq!(cas_status, 0, "remote CAS must succeed");
+                let (previous, code) = captured.lock().unwrap()[0];
+                assert_eq!(code, LoreErrorCode::None);
+                assert_eq!(
+                    previous, current,
+                    "previous must equal the matched expected"
+                );
+
+                let on_server = server
+                    .backend_mutable
+                    .clone()
+                    .load(partition, key, REMOTE_KEY_TYPE)
+                    .await
+                    .expect("server must hold the swapped value");
+                assert_eq!(on_server, next, "server value must reflect the swap");
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn mutable_load_via_remote_missing_returns_not_found() -> TestResult {
+        let execution = setup_execution("storage-remote-mutable-miss".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let handle_id = open_remote_handle(&server).await;
+                let partition = lore_base::types::Partition::from([0xa1u8; 16]);
+                let key = Hash::from([0xa2u8; 32]);
+
+                let (status, value, code) =
+                    mutable_load_via_handle(handle_id, remote_globals(), partition, key).await;
+                assert_eq!(status, 1);
+                assert_eq!(code, LoreErrorCode::AddressNotFound);
+                assert_eq!(value, Hash::default());
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn mutable_default_routing_is_local_not_remote() -> TestResult {
+        let execution = setup_execution("storage-remote-mutable-localdefault".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let handle_id = open_remote_handle(&server).await;
+                let partition = lore_base::types::Partition::from([0xb1u8; 16]);
+                let key = Hash::from([0xb2u8; 32]);
+                let value = Hash::from([0xb3u8; 32]);
+
+                // Default globals route to the handle's local mutable store, even though the
+                // handle has a remote configured.
+                let (status, completes) = mutable_store_via_handle(
+                    handle_id,
+                    LoreGlobalArgs::default(),
+                    partition,
+                    key,
+                    value,
+                )
+                .await;
+                assert_eq!(status, 0);
+                assert_eq!(completes, vec![(1, LoreErrorCode::None)]);
+
+                // The server's mutable store must not have seen it.
+                let server_result = server
+                    .backend_mutable
+                    .clone()
+                    .load(partition, key, REMOTE_KEY_TYPE)
+                    .await;
+                assert!(
+                    server_result.is_err(),
+                    "default-routed store must stay local, not reach the server",
+                );
+
+                // A local load sees it; a remote load misses.
+                let (_s, local_value, local_code) =
+                    mutable_load_via_handle(handle_id, LoreGlobalArgs::default(), partition, key)
+                        .await;
+                assert_eq!(local_code, LoreErrorCode::None);
+                assert_eq!(local_value, value);
+                let (_s2, _v, remote_code) =
+                    mutable_load_via_handle(handle_id, remote_globals(), partition, key).await;
+                assert_eq!(remote_code, LoreErrorCode::AddressNotFound);
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn mutable_list_via_remote_returns_error() -> TestResult {
+        use lore::storage::mutable_list;
+        use lore::storage::mutable_list::LoreStorageMutableListArgs;
+        use lore::storage::mutable_list::LoreStorageMutableListItem;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-mutable-list".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let handle_id = open_remote_handle(&server).await;
+                let partition = lore_base::types::Partition::from([0xc1u8; 16]);
+
+                let entries: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+                let complete: Arc<Mutex<Option<LoreErrorCode>>> = Arc::new(Mutex::new(None));
+                let entries_for_cb = entries.clone();
+                let complete_for_cb = complete.clone();
+                let callback: LoreEventCallback =
+                    Some(Box::new(move |event: &LoreEvent| match event {
+                        LoreEvent::StorageMutableListEntry(_) => {
+                            *entries_for_cb.lock().unwrap() += 1;
+                        }
+                        LoreEvent::StorageMutableListItemComplete(data) => {
+                            *complete_for_cb.lock().unwrap() = Some(data.error_code);
+                        }
+                        _ => {}
+                    }));
+                let status = mutable_list::mutable_list(
+                    remote_globals(),
+                    LoreStorageMutableListArgs {
+                        handle: lore::storage::handle::LoreStore { handle_id },
+                        items: LoreArray::from_vec(vec![LoreStorageMutableListItem {
+                            id: 5,
+                            partition,
+                            key_type: REMOTE_KEY_TYPE,
+                        }]),
+                    },
+                    callback,
+                )
+                .await;
+                // Listing has no remote wire protocol, so a remote-targeted list is rejected up
+                // front — the whole call fails with no per-item entry or terminal events.
+                assert_eq!(status, 1, "remote list must fail the call");
+                assert_eq!(
+                    *entries.lock().unwrap(),
+                    0,
+                    "no entries on a rejected remote list"
+                );
+                assert!(
+                    complete.lock().unwrap().is_none(),
+                    "no per-item terminal event on a pre-dispatch rejection"
+                );
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
     }
 }

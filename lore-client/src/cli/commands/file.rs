@@ -839,7 +839,10 @@ pub fn handle_file_diff(globals: LoreGlobalArgs, args: &FileDiffArgs) -> u8 {
             LoreEvent::FileDiff(data) => {
                 // Always show unified diff patches for all actions
                 match data.action {
-                    LoreFileAction::Keep | LoreFileAction::Delete | LoreFileAction::Add => {
+                    LoreFileAction::Keep
+                    | LoreFileAction::Delete
+                    | LoreFileAction::Add
+                    | LoreFileAction::Move => {
                         // Show patch content
                         println!();
                         println!(
@@ -868,8 +871,8 @@ pub fn handle_file_diff(globals: LoreGlobalArgs, args: &FileDiffArgs) -> u8 {
                         }
                         println!();
                     }
-                    _ => {
-                        // Status format for Copy/Move
+                    LoreFileAction::Copy => {
+                        // Status format for Copy
                         println!(
                             "{}{}{} {}",
                             FileActionStyle::from_action(data.action),
@@ -1003,6 +1006,12 @@ pub fn handle_file_metadata_set(globals: LoreGlobalArgs, args: &FileMetadataSetA
     };
 
     let elements = convert_paths_and_targets(&args.pairs, &None);
+    if !elements.as_slice().len().is_multiple_of(2) {
+        println!(
+            "error: metadata set requires <key> <value> pairs; each key must be followed by a value"
+        );
+        return 1;
+    }
 
     let mut paths = vec![];
     let mut keys = vec![];

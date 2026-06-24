@@ -45,8 +45,8 @@ pub struct LoreLockFileAcquireArgs {
 ///
 /// | Event | Description |
 /// |-------|-------------|
-/// | [`LoreEvent::LockFileAcquire`](crate::interface::LoreEvent::LockFileAcquire) | Emitted for each file for which a lock was successfully acquired |
-/// | [`LoreEvent::LockFileAcquireIgnore`](crate::interface::LoreEvent::LockFileAcquireIgnore) | Emitted for each file for which a lock was ignored (already owned) |
+/// | [`LoreEvent::LockFileAcquireBegin`](crate::interface::LoreEvent::LockFileAcquireBegin) | Emitted before each group of lock-acquire results |
+/// | [`LoreEvent::LockFileAcquire`](crate::interface::LoreEvent::LockFileAcquire) | Emitted for each file related to the lock-acquired report |
 pub async fn file_acquire(
     globals: LoreGlobalArgs,
     args: LoreLockFileAcquireArgs,
@@ -263,8 +263,8 @@ pub struct LoreLockFileReleaseArgs {
 ///
 /// | Event | Description |
 /// |-------|-------------|
-/// | [`LoreEvent::LockFileRelease`](crate::interface::LoreEvent::LockFileRelease) | Emitted for each file lock successfully released |
-/// | [`LoreEvent::LockFileReleaseNotFound`](crate::interface::LoreEvent::LockFileReleaseNotFound) | Emitted for each file whose lock was not found |
+/// | [`LoreEvent::LockFileReleaseBegin`](crate::interface::LoreEvent::LockFileReleaseBegin) | Emitted before each group of lock-release results |
+/// | [`LoreEvent::LockFileRelease`](crate::interface::LoreEvent::LockFileRelease) | Emitted for each file related to the lock-released report |
 pub async fn file_release(
     globals: LoreGlobalArgs,
     args: LoreLockFileReleaseArgs,

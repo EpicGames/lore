@@ -65,6 +65,9 @@ pub struct LoreRevisionCommitArgs {
     /// Array of messages corresponding to each layer path (parallel array with `layer_paths`)
     #[serde(default)]
     pub layer_messages: LoreArray<LoreString>,
+    /// Emit per-fragment write stats during the commit
+    #[serde(default)]
+    pub stats: bool,
 }
 
 /// Commits all staged changes to the current branch as a new revision.
@@ -158,6 +161,7 @@ async fn commit_local(
                 link_messages,
                 layer,
                 layer_messages,
+                stats: args.stats,
             };
 
             // Enable upload to remote during commit unless offline or local

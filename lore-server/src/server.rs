@@ -64,7 +64,7 @@ use tracing::warn;
 
 use crate::auth::jwk::JwkServiceImpl;
 use crate::auth::jwt::JwtVerifier;
-use crate::grpc::GrpcReplicationServerBuilder;
+use crate::grpc::GrpcInternalServerBuilder;
 use crate::grpc::GrpcServerBuilder;
 use crate::grpc::notification_service::NotificationService;
 use crate::hooks::HookDispatcher;
@@ -506,13 +506,13 @@ enum EndpointSecurity {
 }
 
 /// Decide whether a server-to-server endpoint may start, and on what
-/// terms. Used by the gRPC replication service and the internal QUIC
+/// terms. Used by the gRPC internal server and the internal QUIC
 /// listener — both grant blanket access to the storage layer and rely
 /// solely on mTLS for authentication. The only way to start without
 /// mTLS is the explicit `verify_client_certs = false` opt-in.
 ///
 /// `label` is the config-section path used in error messages
-/// (e.g. `"[server.replication]"` or `"[server.quic_internal]"`).
+/// (e.g. `"[server.grpc_internal]"` or `"[server.quic_internal]"`).
 ///
 /// Returns:
 /// - `Ok(Mtls)` when `verify_client_certs = true` and `certificate`
@@ -546,20 +546,25 @@ fn validate_endpoint_security(
     }
 }
 
-async fn launch_replication_grpc_server(
+#[allow(clippy::too_many_arguments)]
+async fn launch_grpc_internal_server(
     settings: Settings,
     user_agent_filter: Arc<UserAgentFilter>,
+    immutable_store: Arc<dyn ImmutableStore>,
+    mutable_store: Arc<dyn MutableStore>,
+    notification_sender: Arc<dyn NotificationSender>,
+    hook_dispatcher: Arc<HookDispatcher>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let grpc_settings = settings
         .server
-        .replication
-        .ok_or(anyhow!("Missing gRPC replication settings"))?;
+        .grpc_internal
+        .ok_or(anyhow!("Missing gRPC internal settings"))?;
 
     let addr =
         SocketAddr::from_str(format!("{}:{}", grpc_settings.host, grpc_settings.port).as_str())?;
 
-    info!("Starting Lore replication gRPC Server: {}", &addr);
+    info!("Starting Lore gRPC internal server: {}", &addr);
 
     let (cert_path, key_path, cert_chain_path) =
         if let Some(cert_settings) = grpc_settings.certificate {
@@ -572,10 +577,18 @@ async fn launch_replication_grpc_server(
             (None, None, None)
         };
 
-    GrpcReplicationServerBuilder::new()
-        .with_local_immutable_store(local_store().ok_or(anyhow!(
-            "Cannot configure replication server, no local store"
-        ))?)?
+    let rpc_timeout = Duration::from_secs(grpc_settings.request_handler_timeout_seconds);
+
+    GrpcInternalServerBuilder::new()
+        .with_components(
+            local_store().ok_or(anyhow!(
+                "Cannot configure gRPC internal server, no local store"
+            ))?,
+            immutable_store,
+            mutable_store,
+            notification_sender,
+            hook_dispatcher,
+        )?
         .with_tls_config(cert_path, key_path, cert_chain_path)?
         .with_http2_config(
             grpc_settings
@@ -585,6 +598,7 @@ async fn launch_replication_grpc_server(
                 .http2_keepalive_timeout_seconds
                 .map(Duration::from_secs),
             user_agent_filter,
+            rpc_timeout,
         )?
         .serve(addr, async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
@@ -1025,18 +1039,20 @@ async fn create_local_store(
     let default_settings = lore_storage::local::immutable_store::ImmutableStoreSettings::default();
     let store_path = resolve_local_store_path(&settings.path, "immutable");
 
-    lore_storage::local::immutable_store::create(
+    let options = ImmutableStoreCreateOptions {
+        max_capacity: settings.max_capacity,
+        eviction_delay: settings
+            .eviction_delay
+            .map(|ms| std::time::Duration::from_millis(ms as u64)),
+        max_size: settings.max_size,
+        compaction_delay: settings
+            .compaction_delay
+            .map(|ms| std::time::Duration::from_millis(ms as u64)),
+    };
+
+    let store = lore_storage::local::immutable_store::create(
         Some(store_path.as_path()),
-        ImmutableStoreCreateOptions {
-            max_capacity: settings.max_capacity,
-            eviction_delay: settings
-                .eviction_delay
-                .map(|ms| std::time::Duration::from_millis(ms as u64)),
-            max_size: settings.max_size,
-            compaction_delay: settings
-                .compaction_delay
-                .map(|ms| std::time::Duration::from_millis(ms as u64)),
-        },
+        options,
         true,  /* Server mode, deserialize all buckets immediately */
         lore_storage::local::immutable_store::ImmutableStoreSettings {
             allow_partial_fragment: false, /* Server mode, partial fragments not allowed */
@@ -1051,8 +1067,14 @@ async fn create_local_store(
             atime: false,
             initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX, /* Server mode, full 256-bucket layout from the start */
             fan_out_threshold: lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
-        }
-    ).await.map_err(anyhow::Error::from)
+        },
+    )
+    .await
+    .map_err(anyhow::Error::from)?;
+
+    lore_storage::maintenance::spawn_gc(&store, &options);
+
+    Ok(store)
 }
 
 async fn configure_local_immutable_store(
@@ -1790,39 +1812,51 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 settings,
                 notification,
                 notification_service,
-                hook_dispatcher,
+                hook_dispatcher.clone(),
                 user_agent_filter,
                 shutdown_rx,
             )
         });
+
+        if let Some(grpc_internal) = &settings.server.grpc_internal
+            && grpc_internal.enabled
+        {
+            let security = validate_endpoint_security(
+                "[server.grpc_internal]",
+                grpc_internal.certificate.as_ref(),
+                grpc_internal.verify_client_certs,
+            )?;
+            if security == EndpointSecurity::Untrusted {
+                warn!(
+                    "[server.grpc_internal] starting WITHOUT mTLS because verify_client_certs=false. \
+                     The gRPC internal endpoint grants blanket access to every storage partition; \
+                     only safe on isolated networks with no untrusted clients"
+                );
+            }
+            lore_spawn!(endpoints, {
+                let settings = settings.clone();
+                let user_agent_filter = user_agent_filter.clone();
+                let immutable_store = immutable_store.clone();
+                let mutable_store = mutable_store.clone();
+                let notification_sender = notification.clone();
+                let hook_dispatcher = hook_dispatcher.clone();
+                let shutdown_rx = _shutdown_rx.clone();
+                launch_grpc_internal_server(
+                    settings,
+                    user_agent_filter,
+                    immutable_store,
+                    mutable_store,
+                    notification_sender,
+                    hook_dispatcher,
+                    shutdown_rx,
+                )
+            });
+        }
     } else {
         lore_spawn!(endpoints, {
             let settings = settings.clone();
             let shutdown_rx = _shutdown_rx.clone();
             launch_maintenance_grpc_server(settings, shutdown_rx)
-        });
-    }
-
-    if let Some(replication_server) = &settings.server.replication
-        && replication_server.enabled
-    {
-        let security = validate_endpoint_security(
-            "[server.replication]",
-            replication_server.certificate.as_ref(),
-            replication_server.verify_client_certs,
-        )?;
-        if security == EndpointSecurity::Untrusted {
-            warn!(
-                "[server.replication] starting WITHOUT mTLS because verify_client_certs=false. \
-                 The replication endpoint grants blanket access to every storage partition; \
-                 only safe on isolated networks with no untrusted clients"
-            );
-        }
-        lore_spawn!(endpoints, {
-            let settings = settings.clone();
-            let user_agent_filter = user_agent_filter.clone();
-            let shutdown_rx = _shutdown_rx.clone();
-            launch_replication_grpc_server(settings, user_agent_filter, shutdown_rx)
         });
     }
 
@@ -1934,7 +1968,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 )),
                 frequency,
                 quic_settings,
-                // Internal replication endpoint requires a real (mTLS) certificate;
+                // Internal QUIC endpoint requires a real (mTLS) certificate;
                 // never fall back to an ephemeral one.
                 false,
                 shutdown_rx,

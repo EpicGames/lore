@@ -14,7 +14,7 @@ use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::log_server_error;
-use crate::grpc::map_message_handle_error;
+use crate::grpc::simple_map_message_handle_error;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::messages::MessageHandleError;
 use crate::protocol::storage::mutable_load::handle_mutable_load;
@@ -60,7 +60,7 @@ pub async fn handler(
                 MessageHandleError::MutableDataNotFound(_) => {
                     Status::not_found("Mutable key not found")
                 }
-                other => map_message_handle_error(other),
+                other => simple_map_message_handle_error(other),
             })
             .inspect_err(log_server_error)
         })

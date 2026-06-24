@@ -6411,6 +6411,186 @@ pub extern "C" fn lore_storage_obliterate_async(
     );
 }
 
+pub type LoreStorageMutableLoadItem = crate::storage::mutable_load::LoreStorageMutableLoadItem;
+pub type LoreStorageMutableLoadArgs = crate::storage::mutable_load::LoreStorageMutableLoadArgs;
+
+/// Read one or more mutable key values.
+///
+/// Each item acts on the local mutable store by default, or the remote mutable store when
+/// `globals.remote` is set (or the handle was opened remote-bound), over the shared storage
+/// session.
+///
+/// # Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_STORAGE_MUTABLE_LOAD_ITEM_COMPLETE` | `lore_storage_mutable_load_item_complete_event_data_t` | Per-item terminal event carrying the value; `error_code == ADDRESS_NOT_FOUND` on a miss |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status: 0` iff every item succeeded |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_mutable_load(
+    globals: &LoreGlobalArgs,
+    args: &LoreStorageMutableLoadArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::mutable_load::mutable_load,
+    )
+}
+
+/// Read one or more mutable key values (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_mutable_load_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreStorageMutableLoadArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::mutable_load::mutable_load,
+    );
+}
+
+pub type LoreStorageMutableStoreItem = crate::storage::mutable_store::LoreStorageMutableStoreItem;
+pub type LoreStorageMutableStoreArgs = crate::storage::mutable_store::LoreStorageMutableStoreArgs;
+
+/// Write one or more mutable key-value pairs. Storing the null value removes the key.
+///
+/// Each item acts on the local mutable store by default, or the remote mutable store when
+/// `globals.remote` is set (or the handle was opened remote-bound), over the shared storage
+/// session.
+///
+/// # Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_STORAGE_MUTABLE_STORE_ITEM_COMPLETE` | `lore_storage_mutable_store_item_complete_event_data_t` | Per-item terminal event |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status: 0` iff every item succeeded |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_mutable_store(
+    globals: &LoreGlobalArgs,
+    args: &LoreStorageMutableStoreArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::mutable_store::mutable_store,
+    )
+}
+
+/// Write one or more mutable key-value pairs (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_mutable_store_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreStorageMutableStoreArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::mutable_store::mutable_store,
+    );
+}
+
+pub type LoreStorageMutableCompareAndSwapItem =
+    crate::storage::mutable_compare_and_swap::LoreStorageMutableCompareAndSwapItem;
+pub type LoreStorageMutableCompareAndSwapArgs =
+    crate::storage::mutable_compare_and_swap::LoreStorageMutableCompareAndSwapArgs;
+
+/// Conditionally swap one or more mutable key values. Each item updates the key to `value` when
+/// its current value matches `expected`, and reports the value the key held before the swap.
+///
+/// Each item acts on the local mutable store by default, or the remote mutable store when
+/// `globals.remote` is set (or the handle was opened remote-bound), over the shared storage
+/// session.
+///
+/// # Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_STORAGE_MUTABLE_COMPARE_AND_SWAP_ITEM_COMPLETE` | `lore_storage_mutable_compare_and_swap_item_complete_event_data_t` | Per-item terminal event carrying `previous`; the swap took effect when `previous == expected` |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status: 0` iff every item succeeded |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_mutable_compare_and_swap(
+    globals: &LoreGlobalArgs,
+    args: &LoreStorageMutableCompareAndSwapArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::mutable_compare_and_swap::mutable_compare_and_swap,
+    )
+}
+
+/// Conditionally swap one or more mutable key values (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_mutable_compare_and_swap_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreStorageMutableCompareAndSwapArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::mutable_compare_and_swap::mutable_compare_and_swap,
+    );
+}
+
+pub type LoreStorageMutableListItem = crate::storage::mutable_list::LoreStorageMutableListItem;
+pub type LoreStorageMutableListArgs = crate::storage::mutable_list::LoreStorageMutableListArgs;
+
+/// List the mutable key-value pairs of a given type for one or more partitions.
+///
+/// Acts on the local mutable store only; a remote-targeted call (`globals.remote`, or a
+/// remote-bound handle) is rejected with `INVALID_ARGUMENTS`. A zero/default partition lists
+/// every partition the caller can access.
+///
+/// # Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_STORAGE_MUTABLE_LIST_ENTRY` | `lore_storage_mutable_list_entry_event_data_t` | One `(key, value)` pair, emitted before the item's terminal event |
+/// | `LORE_EVENT_STORAGE_MUTABLE_LIST_ITEM_COMPLETE` | `lore_storage_mutable_list_item_complete_event_data_t` | Per-item terminal event |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status: 0` iff every item succeeded |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_mutable_list(
+    globals: &LoreGlobalArgs,
+    args: &LoreStorageMutableListArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::mutable_list::mutable_list,
+    )
+}
+
+/// List mutable key-value pairs (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_mutable_list_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreStorageMutableListArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::mutable_list::mutable_list,
+    );
+}
+
 pub type LoreStorageCopyArgs = crate::storage::copy::LoreStorageCopyArgs;
 
 /// Copy content from one partition to another within the same store.

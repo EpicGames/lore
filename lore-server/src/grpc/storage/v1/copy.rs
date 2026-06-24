@@ -29,7 +29,6 @@ use tonic::Status;
 use tonic::Streaming;
 use tracing::Instrument;
 use tracing::debug;
-use tracing::info;
 use tracing::info_span;
 
 use crate::auth::jwt::verify_authorization;
@@ -37,7 +36,9 @@ use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
+use crate::grpc::interpret_streaming_error;
 use crate::grpc::log_server_error;
+use crate::grpc::map_message_handle_error_to_status;
 use crate::grpc::rpc_code_to_str;
 use crate::protocol::storage::copy::handle_copy;
 use crate::protocol::storage::messages::LoreResponse;
@@ -106,25 +107,31 @@ pub async fn handler(
                             let start = Instant::now();
                             let metric_context = create_operation_context_attribute("copy");
 
-                            let parsed = req.and_then(|r| {
-                                let source_repository_id = r.source_repository_id.clone();
-                                let target_context_bytes = r.target_context.clone();
-                                r.source_address
-                                    .ok_or_else(|| {
-                                        Status::invalid_argument(
-                                            "CopyRequest.source_address is required",
-                                        )
-                                    })
-                                    .map(|addr| {
-                                        let source_address: lore_storage::Address = addr.into();
-                                        let target_context = if target_context_bytes.is_empty() {
-                                            source_address.context
-                                        } else {
-                                            lore_storage::Context::from(&target_context_bytes[..])
-                                        };
-                                        (source_repository_id, source_address, target_context)
-                                    })
-                            });
+                            let parsed;
+                            if let Err(stream_error) = req {
+                                parsed = Err(interpret_streaming_error(stream_error));
+                            }
+                            else {
+                                parsed = req.and_then(|r| {
+                                    let source_repository_id = r.source_repository_id.clone();
+                                    let target_context_bytes = r.target_context.clone();
+                                    r.source_address
+                                        .ok_or_else(|| {
+                                            Status::invalid_argument(
+                                                "CopyRequest.source_address is required",
+                                            )
+                                        })
+                                        .map(|addr| {
+                                            let source_address: lore_storage::Address = addr.into();
+                                            let target_context = if target_context_bytes.is_empty() {
+                                                source_address.context
+                                            } else {
+                                                lore_storage::Context::from(&target_context_bytes[..])
+                                            };
+                                            (source_repository_id, source_address, target_context)
+                                        })
+                                });
+                            };
 
                             let response = match parsed {
                                 Ok((source_repo_id, source_address, target_context)) => {
@@ -183,10 +190,10 @@ pub async fn handler(
                                                         source_address.into(),
                                                     )
                                                 }
-                                                _ => Status::with_details(
-                                                    Code::Internal,
-                                                    format!("Error copying fragment: {err}"),
-                                                    source_address.into(),
+                                                err => map_message_handle_error_to_status(
+                                                    err,
+                                                    Some(format!("Error copying fragment: {err}")),
+                                                    Some(source_address.into()),
                                                 ),
                                             }),
                                         }
@@ -212,7 +219,7 @@ pub async fn handler(
                             );
 
                             if let Err(err) = tx.send(response).await {
-                                info!("Error sending copy response: {err}");
+                                debug!("Error sending copy response: {err}");
                             }
                             drop(permit);
                         }

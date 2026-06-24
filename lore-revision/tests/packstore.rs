@@ -12,7 +12,7 @@ mod tests {
         let execution = setup_test_execution();
         LORE_CONTEXT
             .scope(execution, async move {
-                let store = PackStore::new(None, 4);
+                let store = PackStore::new(None, 4, None);
 
                 let arr = [0, 1, 2, 3];
                 let packref = store
@@ -50,7 +50,7 @@ mod tests {
             .scope(execution, async move {
                 let tempdir = generate_tempdir();
                 let dir = tempdir.to_path_buf();
-                let store = PackStore::new(Some(dir), 4);
+                let store = PackStore::new(Some(dir), 4, None);
 
                 let arr = [0, 1, 2, 3];
                 let packref = store

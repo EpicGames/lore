@@ -36,16 +36,16 @@ use tonic::Status;
 use tonic::Streaming;
 use tracing::Instrument;
 use tracing::debug;
-use tracing::error;
 use tracing::info_span;
 use tracing::instrument;
 use zerocopy::IntoBytes;
 
 use super::extract_correlation_id;
-use super::map_message_handle_error;
+use super::interpret_streaming_error;
 use super::metadata_to_attribute;
 use super::rpc_code_to_str;
 use super::send_err;
+use super::simple_map_message_handle_error;
 use super::warn_error_to_status;
 use crate::grpc::get_user_id;
 use crate::legacy::rpc::storage_service_server::StorageService;
@@ -160,6 +160,7 @@ impl StorageService for LoreStorageService {
                                     address: address.into(),
                                 },
                                 Err(status) => {
+                                    let status = interpret_streaming_error(status);
                                     let elapsed_ms = start.elapsed().as_millis() as f64;
                                     histogram.record(
                                         elapsed_ms,
@@ -212,7 +213,7 @@ impl StorageService for LoreStorageService {
                             );
 
                             if let Err(err) = tx.send(response).await {
-                                error!(err = ?err,
+                                debug!(err = ?err,
                                     {{ ADDRESS }} = %request.address,
                                     "Error sending response for fragment"
                                 );
@@ -298,20 +299,26 @@ impl StorageService for LoreStorageService {
                                     let start = Instant::now();
                                     let metric_context = create_operation_context_attribute("put");
 
-                                    let request = req.and_then(|r| {
-                                        r.address
-                            .zip(r.fragment)
-                            .map(|(address, fragment)| UnvalidatedPut {
-                                address: address.into(),
-                                fragment: fragment.into(),
-                                payload: r.payload,
-                            })
-                            .ok_or(Status::invalid_argument(
-                                "Missing required field, both address and fragment must be present",
-                            )).and_then(|unvalidated| {
-                                            unvalidated.validate().map_err(|_e| Status::invalid_argument("Payload failed validation"))
+                            let request;
+                            if let Err(streaming_error) = req {
+                                request = Err(interpret_streaming_error(streaming_error));
+                            }
+                            else {
+                                request = req.and_then(|r| {
+                                    r.address
+                                        .zip(r.fragment)
+                                        .map(|(address, fragment)| UnvalidatedPut {
+                                            address: address.into(),
+                                            fragment: fragment.into(),
+                                            payload: r.payload,
                                         })
-                                    });
+                                        .ok_or(Status::invalid_argument(
+                                            "Missing required field, both address and fragment must be present",
+                                        )).and_then(|unvalidated| {
+                                        unvalidated.validate().map_err(|_e| Status::invalid_argument("Payload failed validation"))
+                                    })
+                                });
+                            }
 
 
                                     if let Err(err) = request {
@@ -367,7 +374,7 @@ impl StorageService for LoreStorageService {
                                     );
 
                                     if let Err(err) = tx.send(response).await {
-                                        error!(
+                                        debug!(
                                             "Error sending put response for {}: {err}",
                                             request.address()
                                         );
@@ -439,7 +446,7 @@ impl StorageService for LoreStorageService {
                         let results = resp.results.iter().map(|res| *res as i32).collect();
                         Response::new(lore_proto::QueryResponse { results })
                     })
-                    .map_err(map_message_handle_error)
+                    .map_err(simple_map_message_handle_error)
             })
             .await
     }
@@ -492,36 +499,42 @@ impl StorageService for LoreStorageService {
                                 let start = Instant::now();
                                 let metric_context = create_operation_context_attribute("copy");
 
-                                let request = req.and_then(|r| {
-                                    let source_repository_id = r.source_repository_id.clone();
-                                    let target_context_bytes = r.target_context.clone();
-                                    r.source_address
-                                        .ok_or_else(|| {
-                                            Status::invalid_argument(
-                                                "CopyRequest.source_address is required",
-                                            )
-                                        })
-                                        .map(|addr| {
-                                            let source_address: lore_storage::Address = addr.into();
-                                            // Empty target_context preserves legacy semantics:
-                                            // destination context = source context. Lore-storage/0.4
-                                            // callers send a non-empty value to relocate the dedup
-                                            // tag without payload transfer.
-                                            let target_context = if target_context_bytes.is_empty()
-                                            {
-                                                source_address.context
-                                            } else {
-                                                lore_storage::Context::from(
-                                                    &target_context_bytes[..],
+                                let request;
+                                if let Err(streaming_error) = req {
+                                    request = Err(interpret_streaming_error(streaming_error));
+                                } else {
+                                    request = req.and_then(|r| {
+                                        let source_repository_id = r.source_repository_id.clone();
+                                        let target_context_bytes = r.target_context.clone();
+                                        r.source_address
+                                            .ok_or_else(|| {
+                                                Status::invalid_argument(
+                                                    "CopyRequest.source_address is required",
                                                 )
-                                            };
-                                            Copy {
-                                                source_repository: source_repository_id.into(),
-                                                source_address,
-                                                target_context,
-                                            }
-                                        })
-                                });
+                                            })
+                                            .map(|addr| {
+                                                let source_address: lore_storage::Address =
+                                                    addr.into();
+                                                // Empty target_context preserves legacy semantics:
+                                                // destination context = source context. Lore-storage/0.4
+                                                // callers send a non-empty value to relocate the dedup
+                                                // tag without payload transfer.
+                                                let target_context =
+                                                    if target_context_bytes.is_empty() {
+                                                        source_address.context
+                                                    } else {
+                                                        lore_storage::Context::from(
+                                                            &target_context_bytes[..],
+                                                        )
+                                                    };
+                                                Copy {
+                                                    source_repository: source_repository_id.into(),
+                                                    source_address,
+                                                    target_context,
+                                                }
+                                            })
+                                    });
+                                }
 
                                 let response = match request {
                                     Ok(msg) => {
@@ -592,7 +605,7 @@ impl StorageService for LoreStorageService {
                                 );
 
                                 if let Err(err) = tx.send(response).await {
-                                    error!("Error sending copy response: {err}");
+                                    debug!("Error sending copy response: {err}");
                                 }
                             }
                             .instrument(fragment_span)
@@ -649,7 +662,7 @@ impl StorageService for LoreStorageService {
                                 healed: resp.healed as i32,
                             })
                         })
-                        .map_err(map_message_handle_error)
+                        .map_err(simple_map_message_handle_error)
                 }
                 .in_current_span(),
             )
@@ -695,7 +708,7 @@ impl StorageService for LoreStorageService {
                         MessageHandleError::MutableDataNotFound(_) => {
                             Status::not_found("Mutable key not found")
                         }
-                        other => map_message_handle_error(other),
+                        other => simple_map_message_handle_error(other),
                     })
             })
             .await
@@ -734,7 +747,7 @@ impl StorageService for LoreStorageService {
                 msg.handle_mutable(context, mutable_store)
                     .await
                     .map(|_| Response::new(lore_proto::MutableStoreResponse {}))
-                    .map_err(map_message_handle_error)
+                    .map_err(simple_map_message_handle_error)
             })
             .await
     }
@@ -785,7 +798,7 @@ impl StorageService for LoreStorageService {
                             ),
                         })
                     })
-                    .map_err(map_message_handle_error)
+                    .map_err(simple_map_message_handle_error)
             })
             .await
     }

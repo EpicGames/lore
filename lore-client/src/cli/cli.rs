@@ -113,9 +113,9 @@ pub struct LoreCli {
     #[clap(global = true, long, action)]
     search_nearest: bool,
 
-    /// Set to run automatic garbage collection on local store in background
-    #[clap(global = true, long, action)]
-    gc: bool,
+    /// Prevent automatic incremental garbage collection for this command; it otherwise runs in the background on writes. `lore repository gc` always runs a full pass regardless
+    #[clap(global = true, long = "no-gc", action)]
+    no_gc: bool,
 
     /// Force sync data to storage media during flush
     #[clap(global = true, long, action)]
@@ -355,7 +355,7 @@ pub fn lore_globals_from_args(cli: &LoreCli) -> LoreGlobalArgs {
         offline: cli.offline.into(),
         remote: cli.remote.into(),
         local: cli.local.into(),
-        gc: cli.gc.into(),
+        no_gc: cli.no_gc.into(),
         sync_data: cli.sync_data.into(),
         cache: cli.cache.into(),
 

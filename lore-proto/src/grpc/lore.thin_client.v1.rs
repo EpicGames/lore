@@ -29,6 +29,14 @@ pub struct DiffChange {
     /// meaningful when the request set `autoresolve = true`).
     #[prost(bool, tag = "7")]
     pub automerged: bool,
+    /// Index into the per-stream partition table built from `DiffPartition`
+    /// payloads. 0 = the request's repository (the parent partition, never
+    /// announced). Non-zero values MUST be preceded on the same stream by
+    /// a `DiffPartition` whose `index` matches; the consumer's content
+    /// fetch for this change MUST target the corresponding partition,
+    /// not the request's repository id.
+    #[prost(uint32, tag = "8")]
+    pub link_repository_index: u32,
 }
 impl ::prost::Name for DiffChange {
     const NAME: &'static str = "DiffChange";
@@ -61,6 +69,34 @@ impl ::prost::Name for DiffConflict {
     }
     fn type_url() -> ::prost::alloc::string::String {
         "/lore.thin_client.v1.DiffConflict".into()
+    }
+}
+/// Per-stream partition table entry. Announces a linked partition and
+/// the stable index that `DiffChange.link_repository_index` will use to
+/// reference it for the remainder of this stream. Server emits each entry
+/// at most once, in discovery order starting at index 1, strictly before
+/// the first `DiffChange` (or `DiffConflict` half) that references it.
+/// Index 0 is reserved for the parent partition and never announced.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DiffPartition {
+    /// Stable per-stream index. Server assigns 1, 2, 3, … in discovery
+    /// order. Never zero.
+    #[prost(uint32, tag = "1")]
+    pub index: u32,
+    /// The partition bytes corresponding to `index` (a Lore `Partition`,
+    /// i.e. the repository scope the content of every `DiffChange` with
+    /// `link_repository_index == index` resolves under).
+    #[prost(bytes = "bytes", tag = "2")]
+    pub link_partition: ::prost::bytes::Bytes,
+}
+impl ::prost::Name for DiffPartition {
+    const NAME: &'static str = "DiffPartition";
+    const PACKAGE: &'static str = "lore.thin_client.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.thin_client.v1.DiffPartition".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.thin_client.v1.DiffPartition".into()
     }
 }
 /// A single entry in a revision tree listing.
@@ -582,11 +618,14 @@ impl ::prost::Name for RevisionDiffHeader {
     }
 }
 /// Server-streamed response for RevisionDiff. First message carries
-/// `payload.header`; subsequent messages stream `DiffChange` always and
-/// `DiffConflict` only in 3-way mode.
+/// `payload.header`; subsequent messages stream `DiffChange` always,
+/// `DiffConflict` only in 3-way mode, and `DiffPartition` lazily as the
+/// server discovers linked repositories during the walk. Each
+/// `DiffPartition` is emitted strictly before the first `DiffChange` or
+/// `DiffConflict` half that references its index.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RevisionDiffResponse {
-    #[prost(oneof = "revision_diff_response::Payload", tags = "1, 2, 3")]
+    #[prost(oneof = "revision_diff_response::Payload", tags = "1, 2, 3, 4")]
     pub payload: ::core::option::Option<revision_diff_response::Payload>,
 }
 /// Nested message and enum types in `RevisionDiffResponse`.
@@ -602,6 +641,9 @@ pub mod revision_diff_response {
         /// A 3-way merge conflict pair (3-way mode only).
         #[prost(message, tag = "3")]
         Conflict(super::DiffConflict),
+        /// A linked-repository announcement.
+        #[prost(message, tag = "4")]
+        Partition(super::DiffPartition),
     }
 }
 impl ::prost::Name for RevisionDiffResponse {

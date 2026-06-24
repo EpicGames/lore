@@ -45,8 +45,8 @@ handler_timeout_seconds = 300
 [server.grpc]
 request_handler_timeout_seconds = 300
 
-# Disable replication (single-node dev setup, no peers)
-[server.replication]
+# Disable gRPC internal endpoint (single-node dev setup, no peers)
+[server.grpc_internal]
 enabled = false
 
 # HTTP presigned URL HMAC key (dev-only, not a real secret)

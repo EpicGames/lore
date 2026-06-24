@@ -181,7 +181,7 @@ The binary and Docker paths are mutually exclusive, and each is complete on its 
     **Windows**
 
     ```powershell
-    "$env:USERPROFILE\bin\loreserver.exe" --config C:\loreserver\config
+    & "$env:USERPROFILE\bin\loreserver.exe" --config C:\loreserver\config
     ```
 
     <!-- tabs:end -->

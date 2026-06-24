@@ -252,10 +252,18 @@ pub struct LocalImmutableStore {
     eviction: Semaphore,
     compaction: Semaphore,
     stop_gc: AtomicBool,
+    /// Bytes reclaimed by the current compaction pass, accumulated across its
+    /// stepped `compact` calls and reset at the start of each pass. Reported in
+    /// the compaction-end progress callback.
+    compaction_reclaimed: AtomicU64,
     deserialize_all: Semaphore,
     deserialized_all: AtomicBool,
     settings: ImmutableStoreSettings,
     instruments: StoreInstruments,
+    /// Per-store running totals collected as data is loaded from disk; drive the
+    /// load-triggered automatic GC. Shared (by `Arc` clone) with this store's
+    /// packstores. See [`crate::maintenance::GcCounters`].
+    gc_counters: Arc<crate::maintenance::GcCounters>,
 
     #[cfg(feature = "failure_generator")]
     failure_generator: LocalImmutableStoreFailureGenerator,
@@ -738,6 +746,7 @@ impl ImmutableStoreBucket {
         path: &Path,
         group_index: usize,
         bucket_index: usize,
+        gc_counters: Option<&Arc<crate::maintenance::GcCounters>>,
     ) -> Result<(), LocalImmutableStoreError> {
         if self.deserialized {
             return Ok(());
@@ -761,6 +770,10 @@ impl ImmutableStoreBucket {
         self.entry = entry;
         self.upgrade_packfile = upgrade_packfile;
         self.deserialized = true;
+
+        if let Some(gc) = gc_counters {
+            gc.add_loaded_fragments(self.entry.len());
+        }
 
         if mark_dirty {
             dirty.store(true, atomic::Ordering::Relaxed);
@@ -878,6 +891,13 @@ impl ImmutableStoreGroup {
 }
 
 impl LocalImmutableStore {
+    /// Set the automatic-GC caps (from create options) on this store's load-driven GC
+    /// counters. Caps of 0 leave the corresponding trigger disabled — which is how
+    /// read-only / `--no-gc` opens (whose options carry no caps) stay inert.
+    pub fn set_gc_caps(&self, max_size: usize, max_capacity: usize, sync_data: bool) {
+        self.gc_counters.set_caps(max_size, max_capacity, sync_data);
+    }
+
     pub async fn new(
         path: Option<PathBuf>,
         settings: ImmutableStoreSettings,
@@ -950,9 +970,11 @@ impl LocalImmutableStore {
             eviction: Semaphore::new(1),
             compaction: Semaphore::new(1),
             stop_gc: AtomicBool::new(false),
+            compaction_reclaimed: AtomicU64::new(0),
             deserialize_all: Semaphore::new(1),
             deserialized_all: AtomicBool::new(false),
             instruments: StoreInstruments::default(),
+            gc_counters: Arc::new(crate::maintenance::GcCounters::new()),
             #[cfg(feature = "failure_generator")]
             failure_generator,
         };
@@ -1058,12 +1080,20 @@ impl LocalImmutableStore {
                 serialize_version: std::sync::atomic::AtomicU32::new(serialize_version),
                 fan_out_threshold: store.settings.fan_out_threshold,
                 committed_level: std::sync::atomic::AtomicUsize::new(committed_levels[group_index]),
-                packstore: crate::PackStore::new(packpath, MIN_PACKFILE_COUNT),
+                packstore: crate::PackStore::new(
+                    packpath,
+                    MIN_PACKFILE_COUNT,
+                    Some(store.gc_counters.clone()),
+                ),
                 flush: Mutex::new(JoinSet::new()),
             }));
         }
 
         let store = Arc::new(store);
+        // The `Arc` only exists now (not when the groups were built above), so back-fill
+        // the weak self-ref the load hooks need to fire a pass.
+        let dyn_store: Arc<dyn crate::immutable_store::ImmutableStore> = store.clone();
+        store.gc_counters.set_store(&dyn_store);
         if let Some(path) = immutable_path.as_deref() {
             let mut old_packpath = path.clone();
             old_packpath.push("pack");
@@ -1092,7 +1122,7 @@ impl LocalImmutableStore {
         self.deserialize_all_buckets().await?;
         let start = std::time::Instant::now();
         // Don't care about minimum number of packfiles, just pass 1
-        let old_packstore = Arc::new(crate::PackStore::new(Some(path.to_path_buf()), 1));
+        let old_packstore = Arc::new(crate::PackStore::new(Some(path.to_path_buf()), 1, None));
         if old_packstore.total_size().await.unwrap_or_default() == 0 {
             drop(old_packstore);
             lore_base::lore_debug!("Ignore upgrade of packstore, old packstore is empty");
@@ -1237,6 +1267,7 @@ impl LocalImmutableStore {
                     if !bucket.read().await.deserialized {
                         let path = path.clone();
                         let group = group.clone();
+                        let gc_counters = self.gc_counters.clone();
                         lore_base::lore_spawn!(tasks, async move {
                             let mut bucket = bucket.write().await;
                             bucket
@@ -1245,6 +1276,7 @@ impl LocalImmutableStore {
                                     path.as_path(),
                                     group_index,
                                     bucket_index,
+                                    Some(&gc_counters),
                                 )
                                 .await
                         });
@@ -1381,6 +1413,7 @@ impl LocalImmutableStore {
                 self.path.clone().unwrap().as_ref(),
                 group_index,
                 bucket_index,
+                Some(&self.gc_counters),
             ))
             .await?;
         }
@@ -1676,6 +1709,7 @@ impl LocalImmutableStore {
                 let bucket_ref_for_write = bucket_ref.clone();
                 let group_for_check = group;
                 let dirty = &group.dirty[idx];
+                let gc_counters = self.gc_counters.clone();
                 Box::pin(async move {
                     let mut bucket = bucket_ref_for_write.write_owned().await;
                     if group_for_check.bucket_count.load(atomic::Ordering::Relaxed) != n
@@ -1684,7 +1718,7 @@ impl LocalImmutableStore {
                         return Ok::<_, LocalImmutableStoreError>(());
                     }
                     bucket
-                        .deserialize(dirty, path.as_ref(), group_index, idx)
+                        .deserialize(dirty, path.as_ref(), group_index, idx, Some(&gc_counters))
                         .await?;
                     Ok(())
                 })
@@ -1959,8 +1993,13 @@ impl LocalImmutableStore {
         (total_evicted_count, total_evicted_size)
     }
 
-    pub async fn evict_oldest(&self, max_capacity: usize) -> usize {
+    pub async fn evict_oldest(
+        &self,
+        max_capacity: usize,
+        sink: Option<&crate::gc_event::GcEventSinkRef>,
+    ) -> usize {
         let mut evict_count = 0;
+        let mut began = false;
 
         if self.stop_gc.load(atomic::Ordering::Relaxed) {
             return 0;
@@ -2009,15 +2048,32 @@ impl LocalImmutableStore {
                 continue;
             }
 
+            if !began {
+                if let Some(sink) = sink {
+                    sink.eviction_begin(max_capacity as u64);
+                }
+                began = true;
+            }
+
             group_count += 1;
             bucket_count += buckets.len();
 
             for bucket_index in &buckets {
                 let bucket = group.bucket(*bucket_index).clone();
-                evict_count +=
+                let bucket_evicted =
                     Self::evict_oldest_bucket(bucket, &group.dirty[*bucket_index], target_capacity)
                         .await;
+                evict_count += bucket_evicted;
+                if bucket_evicted > 0
+                    && let Some(sink) = sink
+                {
+                    sink.eviction_progress(bucket_evicted as u64);
+                }
             }
+        }
+
+        if began && let Some(sink) = sink {
+            sink.eviction_end(evict_count as u64);
         }
 
         if evict_count > 0 {
@@ -2093,6 +2149,7 @@ impl LocalImmutableStore {
         max_size: usize,
         at: Option<usize>,
         sync_data: bool,
+        sink: Option<crate::gc_event::GcEventSinkRef>,
     ) -> Result<Option<usize>, StoreError> {
         let target_percentage = self.settings.target_size_percentage;
         let target_size = (max_size * target_percentage) / 100;
@@ -2118,6 +2175,11 @@ impl LocalImmutableStore {
             lore_base::lore_debug!(
                 "Packstore compactor running, current size {total_size} is above threshold {max_size} - targeting {target_size} bytes ({target_percentage}% of max size)"
             );
+            self.compaction_reclaimed
+                .store(0, atomic::Ordering::Relaxed);
+            if let Some(sink) = &sink {
+                sink.compaction_begin(max_size as u64);
+            }
         }
 
         let _ = self.deserialize_all_buckets().await;
@@ -2162,6 +2224,7 @@ impl LocalImmutableStore {
             let store = self.clone();
             let path = self.path.clone();
             let protect_local_fragment = self.settings.protect_local_fragment;
+            let group_sink = sink.clone();
             lore_base::lore_spawn!(
                 tasks,
                 store.compact_group_packfiles(
@@ -2171,6 +2234,7 @@ impl LocalImmutableStore {
                     protect_local_fragment,
                     sync_data,
                     self.instruments.compaction.clone(),
+                    group_sink,
                 )
             );
         }
@@ -2208,10 +2272,14 @@ impl LocalImmutableStore {
                 .record(total_size as u64, &[]);
             Ok(Some(group_index))
         } else {
+            if let Some(sink) = &sink {
+                sink.compaction_end(self.compaction_reclaimed.load(atomic::Ordering::Relaxed));
+            }
             Ok(None)
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn compact_group_packfiles(
         self: Arc<Self>,
         group_index: usize,
@@ -2220,6 +2288,7 @@ impl LocalImmutableStore {
         protect_local_fragment: bool,
         sync_data: bool,
         instruments: CompactionInstruments,
+        sink: Option<crate::gc_event::GcEventSinkRef>,
     ) -> Result<(), StoreError> {
         let (evicted_count, evicted_size) = self
             .clone()
@@ -2250,6 +2319,7 @@ impl LocalImmutableStore {
             .record(evicted_size as u64, &labels);
 
         let mut packfile = 1;
+        let mut group_reclaimed: u64 = 0;
         loop {
             let group = &self.group[group_index];
             if let Ok(current_size) = group.packstore.total_size().await
@@ -2325,7 +2395,16 @@ impl LocalImmutableStore {
                 .group_final_total_size
                 .record(compacted_size as u64, &labels);
 
+            group_reclaimed += (original_size as u64).saturating_sub(compacted_size as u64);
             packfile += 1;
+        }
+
+        if group_reclaimed > 0 {
+            if let Some(sink) = &sink {
+                sink.compaction_progress(group_reclaimed);
+            }
+            self.compaction_reclaimed
+                .fetch_add(group_reclaimed, atomic::Ordering::Relaxed);
         }
 
         Ok(())
@@ -2930,6 +3009,7 @@ impl LocalImmutableStore {
                     self.path.clone().unwrap().as_ref(),
                     group_index,
                     bucket_index,
+                    Some(&self.gc_counters),
                 )
                 .await;
         }
@@ -3249,6 +3329,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                             self.path.clone().unwrap().as_ref(),
                             group_index,
                             bucket_index,
+                            Some(&self.gc_counters),
                         ))
                         .await
                         .forward::<StoreError>("Failed to deserialize store data.")?;
@@ -3376,11 +3457,12 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         self: Arc<Self>,
         max_capacity: usize,
         _sync_data: bool,
+        sink: Option<crate::gc_event::GcEventSinkRef>,
     ) -> Result<usize, StoreError> {
         timed!(
             self.instruments.operation_latency,
             &self.instruments.get_labels_for_operation_context("evict"),
-            Ok(self.evict_oldest(max_capacity).await)
+            Ok(self.evict_oldest(max_capacity, sink.as_ref()).await)
         )
         .into()
     }
@@ -3390,13 +3472,14 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         max_size: usize,
         at: Option<usize>,
         sync_data: bool,
+        sink: Option<crate::gc_event::GcEventSinkRef>,
     ) -> Result<Option<usize>, StoreError> {
         timed!(
             self.instruments.operation_latency,
             &self.instruments.get_labels_for_operation_context("compact"),
             {
                 self.clone()
-                    .compact_packfiles(max_size, at, sync_data)
+                    .compact_packfiles(max_size, at, sync_data, sink)
                     .await
             }
         )
@@ -3693,6 +3776,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                     self.path.clone().unwrap().as_ref(),
                     group_index,
                     bucket_index,
+                    Some(&self.gc_counters),
                 )
                 .await
                 .forward_with::<StoreError, _>(|| {
@@ -3792,7 +3876,13 @@ impl LocalImmutableStore {
                     }
                     if !bucket.deserialized {
                         bucket
-                            .deserialize(&group.dirty[idx], path.as_ref(), group_index, idx)
+                            .deserialize(
+                                &group.dirty[idx],
+                                path.as_ref(),
+                                group_index,
+                                idx,
+                                Some(&self.gc_counters),
+                            )
                             .await
                             .forward::<StoreError>("Failed to deserialize store data.")?;
                     }
@@ -4119,6 +4209,7 @@ pub use crate::maintenance::compactor;
 pub use crate::maintenance::evictor;
 pub use crate::maintenance::gc;
 
+#[derive(Clone, Copy)]
 pub struct ImmutableStoreCreateOptions {
     pub max_capacity: Option<usize>,
     pub eviction_delay: Option<Duration>,
@@ -4180,6 +4271,7 @@ async fn maybe_fan_out_immutable_group(
                 path,
                 group_index,
                 bucket_index,
+                None,
             ))
             .await?;
         }
@@ -4226,7 +4318,13 @@ async fn maybe_fan_out_immutable_group(
     Ok(())
 }
 
-/// Create a local immutable store with optional evictor/compactor background tasks.
+/// Create a local immutable store.
+///
+/// Background eviction/compaction tasks are NOT spawned here — the store itself
+/// is unaware of any GC event sink. Spawn them separately with
+/// [`crate::maintenance::spawn_gc`], passing the GC config and an optional
+/// [`crate::gc_event::GcEventSink`] to receive progress. `options` is accepted
+/// for call-site compatibility and is consumed by `spawn_gc`, not here.
 pub async fn create(
     path: Option<impl AsRef<Path>>,
     options: ImmutableStoreCreateOptions,
@@ -4238,27 +4336,15 @@ pub async fn create(
         .await
         .forward::<StoreError>("Failed to create data store for repository.")?;
 
+    // Set before the bucket load below so a `deserialize_all` over-cap store can trigger.
+    store.set_gc_caps(
+        options.max_size.unwrap_or(0),
+        options.max_capacity.unwrap_or(0),
+        false,
+    );
+
     if deserialize_buckets {
         let _ = store.deserialize_all_buckets().await;
-    }
-
-    if let Some(max_capacity) = options.max_capacity
-        && max_capacity > 0
-    {
-        let store = store.clone();
-        let store = Arc::downgrade(&store);
-        drop(lore_base::lore_spawn!(async move {
-            evictor(store, max_capacity, options.eviction_delay, false).await;
-        }));
-    }
-    if let Some(max_size) = options.max_size
-        && max_size > 0
-    {
-        let store = store.clone();
-        let store = Arc::downgrade(&store);
-        drop(lore_base::lore_spawn!(async move {
-            compactor(store, max_size, options.compaction_delay, false).await;
-        }));
     }
 
     Ok(store)

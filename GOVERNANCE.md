@@ -10,15 +10,21 @@ Anyone who has had a pull request merged. Contributors participate in discussion
 
 ### Maintainer
 
-A trusted contributor with merge authority. Maintainers take responsibility for the quality and consistency of what lands in the codebase and can approve and merge pull requests. The current Maintainers are listed in [MAINTAINERS.md](MAINTAINERS.md).
+A trusted contributor with merge authority. Maintainers take responsibility for the quality and consistency of what lands in the codebase and can approve and merge pull requests. A maintainer's remit may span the whole project or focus on a specific area — such as documentation, the desktop client, CI, or the client SDKs. The current Maintainers, and any area focus, are listed in [MAINTAINERS.md](MAINTAINERS.md).
 
 **Path to Maintainer:** Consistent contributions over at least 3 months — bug fixes, features, or documentation — and working knowledge of the relevant parts of the codebase. Nominated by a Core Maintainer; existing Maintainers have 7 days to object.
 
 ### Core Maintainer
 
-Stewards of the project responsible for direction, security, and releases. Core Maintainers make final calls when consensus fails. The current Core Maintainers are listed in [MAINTAINERS.md](MAINTAINERS.md).
+Stewards of the project responsible for technical direction, security, and releases. Core Maintainers make final calls on technical matters when consensus fails. The current Core Maintainers are listed in [MAINTAINERS.md](MAINTAINERS.md).
 
 **Path to Core Maintainer:** Active Maintainer with contributions spanning multiple areas of the project. Requires unanimous approval from existing Core Maintainers.
+
+### Steering Group
+
+The Steering Group sets the project's strategic and product direction: roadmap priorities, scope, and ecosystem and community matters. Membership is not limited to people who contribute code directly and may include Maintainers alongside product and engineering leaders. The current members are listed in [MAINTAINERS.md](MAINTAINERS.md).
+
+**Path to the Steering Group:** Consistent collaboration over at least 6 months — community engagement, user feedback, feature requests, etc. — and a deep understanding of Lore's users and Lore itself. Nominated by a current Steering Group member; existing members have 7 days to object.
 
 ---
 
@@ -38,11 +44,11 @@ Significant changes to the wire protocol, on-disk format, or public APIs require
 
 ## Decision-making
 
-For most decisions, consensus in the GitHub Issue or PR discussion is sufficient. When consensus fails, Core Maintainers decide. Decisions are made in public — in issues, PRs, or LEP discussions.
+For most decisions, consensus in the GitHub Issue or PR discussion is sufficient. When consensus fails, Core Maintainers decide technical matters: what gets merged, releases, architecture, and LEPs. The Steering Group decides strategic matters: roadmap, scope, and community direction. Changes to the project's fundamental scope are the exception — they follow the major-decision process below. All decisions are made in public — in issues, PRs, or LEP discussions.
 
 Major decisions — license changes, changes to this document, or changes to the project's fundamental scope — are announced publicly with at least 2 weeks for community input before any change is made.
 
-## Maintainer lifecycle
+## Role lifecycle
 
 ### Emeritus status
 
@@ -51,6 +57,10 @@ Maintainers inactive for 12 or more consecutive months may be moved to Emeritus 
 ### Removal
 
 A Maintainer may be removed for a sustained Code of Conduct violation. Removal requires Core Maintainer consensus and is a last resort — the enforcement ladder in [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) applies first.
+
+### Core Maintainers and the Steering Group
+
+A Core Maintainer or Steering Group member may step down at any time by notifying the others in that body. Prolonged inactivity — the same 12-month guideline as above — or removal for cause is decided by the consensus of the remaining members of that body, with the Code of Conduct enforcement ladder applying first in any conduct case.
 
 ## Epic Games' role
 

@@ -197,7 +197,7 @@ Open a NEW terminal and try:
     lore repository create lore://127.0.0.1:$GRPC_PORT/my-project
 
 Then continue the quickstart to add, commit, and push:
-    https://github.com/EpicGames/lore/blob/main/docs/tutorials/quickstart.md
+    https://epicgames.github.io/lore/tutorials/quickstart/
 
 (Ctrl-C to stop the server)
 EOF

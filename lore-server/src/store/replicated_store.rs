@@ -503,6 +503,7 @@ where
         self: Arc<Self>,
         _max_capacity: usize,
         _sync_data: bool,
+        _sink: Option<lore_storage::gc_event::GcEventSinkRef>,
     ) -> Result<usize, StoreError> {
         Ok(0)
     }
@@ -512,6 +513,7 @@ where
         _max_size: usize,
         _at: Option<usize>,
         _sync_data: bool,
+        _sink: Option<lore_storage::gc_event::GcEventSinkRef>,
     ) -> Result<Option<usize>, StoreError> {
         Ok(None)
     }
@@ -662,6 +664,12 @@ mod tests {
         }
     }
 
+    fn make_mock_client() -> MockClient {
+        let mut client = MockClient::new();
+        client.expect_connection_stats().return_once(|| None);
+        client
+    }
+
     struct ChannelFactory {
         rx: tokio::sync::Mutex<Receiver<Result<MockClient, ProtocolError>>>,
     }
@@ -670,7 +678,10 @@ mod tests {
     impl ClientFactory for ChannelFactory {
         type Output = MockClient;
 
-        async fn make_client(&self) -> Result<MockClient, ProtocolError> {
+        async fn make_client(
+            &self,
+            _initial_cwnd: Option<u64>,
+        ) -> Result<MockClient, ProtocolError> {
             self.rx.lock().await.recv().await.expect("recv should work")
         }
     }
@@ -692,7 +703,7 @@ mod tests {
         let factory = ChannelFactory { rx: rx.into() };
 
         // allow 1 creation for initialization
-        tx.send(Ok(MockClient::new())).await.unwrap();
+        tx.send(Ok(make_mock_client())).await.unwrap();
         ReplicatedStore::new(
             Arc::new(factory),
             make_client_container_config(),
@@ -719,8 +730,8 @@ mod tests {
                 .scope(execution, async move {
                     let (tx, rx) = mpsc::channel(2);
                     // once during creation, allow one other for the test reconnect
-                    tx.send(Ok(MockClient::new())).await.expect("send 1");
-                    tx.send(Ok(MockClient::new())).await.expect("send 2");
+                    tx.send(Ok(make_mock_client())).await.expect("send 1");
+                    tx.send(Ok(make_mock_client())).await.expect("send 2");
                     let factory = ChannelFactory { rx: rx.into() };
 
                     let store = ReplicatedStore::new(
@@ -760,7 +771,7 @@ mod tests {
                     let factory = ChannelFactory { rx: rx.into() };
 
                     // allow 1 creation for initialization
-                    tx.send(Ok(MockClient::new())).await.unwrap();
+                    tx.send(Ok(make_mock_client())).await.unwrap();
                     let store = ReplicatedStore::new(
                         Arc::new(factory),
                         make_client_container_config(),
@@ -787,7 +798,7 @@ mod tests {
                     let _ = store.client_container.client().read().await;
 
                     // unblock the regen future
-                    tx.send(Ok(MockClient::new())).await.unwrap();
+                    tx.send(Ok(make_mock_client())).await.unwrap();
                     let did_regen = regen.await.expect("regen should work");
                     assert!(did_regen);
                     assert!(store.client_container.is_healthy());
@@ -805,7 +816,7 @@ mod tests {
                     let factory = ChannelFactory { rx: rx.into() };
 
                     // allow 1 creation for initialization
-                    tx.send(Ok(MockClient::new())).await.unwrap();
+                    tx.send(Ok(make_mock_client())).await.unwrap();
                     let store = ReplicatedStore::new(
                         Arc::new(factory),
                         make_client_container_config(),
@@ -836,7 +847,7 @@ mod tests {
                     // client should be still marked as unhealthy as regen is not finished
                     assert!(!store.client_container.is_healthy());
 
-                    tx.send(Ok(MockClient::new()))
+                    tx.send(Ok(make_mock_client()))
                         .await
                         .expect("send success error");
 
@@ -859,7 +870,7 @@ mod tests {
 
                     // 1 for initialization + plenty for periodic refreshes
                     for _ in 0..num_clients_to_mock {
-                        tx.send(Ok(MockClient::new())).await.unwrap();
+                        tx.send(Ok(make_mock_client())).await.unwrap();
                     }
 
                     let store = ReplicatedStore::new(
@@ -904,7 +915,7 @@ mod tests {
                     let factory = ChannelFactory { rx: rx.into() };
 
                     // allow 1 creation for initialization
-                    tx.send(Ok(MockClient::new())).await.unwrap();
+                    tx.send(Ok(make_mock_client())).await.unwrap();
                     let store = ReplicatedStore::new(
                         Arc::new(factory),
                         make_client_container_config(),
@@ -931,7 +942,7 @@ mod tests {
                     assert!(!store.client_container.is_healthy());
 
                     // unblock and observe new client regenerated
-                    tx.send(Ok(MockClient::new())).await.unwrap();
+                    tx.send(Ok(make_mock_client())).await.unwrap();
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     assert!(store.client_container.is_healthy());
                     assert_eq!(store.client_container.epoch(), start_epoch + 1);
@@ -1000,7 +1011,7 @@ mod tests {
             let (tx, rx) = mpsc::channel(1);
             let factory = ChannelFactory { rx: rx.into() };
 
-            let mut client = MockClient::new();
+            let mut client = make_mock_client();
             client
                 .expect_put()
                 .with(eq(Put {
@@ -1059,7 +1070,7 @@ mod tests {
                     let (tx, rx) = mpsc::channel(1);
                     let factory = ChannelFactory { rx: rx.into() };
 
-                    let mut client = MockClient::new();
+                    let mut client = make_mock_client();
                     client.expect_put().returning(|_| {
                         Err(ReplicationStoreClientError::ServiceError(
                             ReplicationServiceErrorCode::SlowDown,
@@ -1138,7 +1149,7 @@ mod tests {
                     let (tx, rx) = mpsc::channel(1);
                     let factory = ChannelFactory { rx: rx.into() };
 
-                    let mut client = MockClient::new();
+                    let mut client = make_mock_client();
                     for addresses in addresses.chunks(MAX_ADDRESSES) {
                         let address_matches = address_matches.clone();
                         client
@@ -1209,7 +1220,7 @@ mod tests {
                     let (tx, rx) = mpsc::channel(1);
                     let factory = ChannelFactory { rx: rx.into() };
 
-                    let mut client = MockClient::new();
+                    let mut client = make_mock_client();
                     // 1 of the batched calls is ok, the other isn't
                     client.expect_exists_batch().returning(|_| {
                         Err(ReplicationStoreClientError::ServiceError(
@@ -1270,7 +1281,7 @@ mod tests {
                     let (tx, rx) = mpsc::channel(1);
                     let factory = ChannelFactory { rx: rx.into() };
 
-                    let mut client = MockClient::new();
+                    let mut client = make_mock_client();
                     client
                         .expect_exists_batch()
                         .with(eq(ExistsBatch {
@@ -1323,7 +1334,7 @@ mod tests {
                     let (tx, rx) = mpsc::channel(1);
                     let factory = ChannelFactory { rx: rx.into() };
 
-                    let mut client = MockClient::new();
+                    let mut client = make_mock_client();
                     client.expect_exists_batch().returning(|_| {
                         Err(ReplicationStoreClientError::ServiceError(
                             ReplicationServiceErrorCode::SlowDown,
@@ -1379,7 +1390,7 @@ mod tests {
                     let (tx, rx) = mpsc::channel(1);
                     let factory = ChannelFactory { rx: rx.into() };
 
-                    let mut client = MockClient::new();
+                    let mut client = make_mock_client();
                     {
                         let num_fragments = expected_num_fragments as u64;
                         let num_payloads = expected_num_payloads as u64;
@@ -1444,7 +1455,7 @@ mod tests {
                     let (tx, rx) = mpsc::channel(1);
                     let factory = ChannelFactory { rx: rx.into() };
 
-                    let mut client = MockClient::new();
+                    let mut client = make_mock_client();
                     client.expect_obliterate().returning(|_| {
                         Err(ReplicationStoreClientError::ServiceError(
                             ReplicationServiceErrorCode::SlowDown,
@@ -1501,7 +1512,7 @@ mod tests {
                     let (tx, rx) = mpsc::channel(1);
                     let factory = ChannelFactory { rx: rx.into() };
 
-                    let mut client = MockClient::new();
+                    let mut client = make_mock_client();
                     {
                         let payload = payload.clone();
                         client
@@ -1555,7 +1566,7 @@ mod tests {
                     let (tx, rx) = mpsc::channel(1);
                     let factory = ChannelFactory { rx: rx.into() };
 
-                    let mut client = MockClient::new();
+                    let mut client = make_mock_client();
                     client.expect_get().returning(|_| {
                         Err(ReplicationStoreClientError::ServiceError(
                             ReplicationServiceErrorCode::SlowDown,
@@ -1606,7 +1617,7 @@ mod tests {
                     let (tx, rx) = mpsc::channel(1);
                     let factory = ChannelFactory { rx: rx.into() };
 
-                    let mut client = MockClient::new();
+                    let mut client = make_mock_client();
                     client
                         .expect_query()
                         .with(eq(Query(ExistsBatch {
@@ -1661,7 +1672,7 @@ mod tests {
                     let (tx, rx) = mpsc::channel(1);
                     let factory = ChannelFactory { rx: rx.into() };
 
-                    let mut client = MockClient::new();
+                    let mut client = make_mock_client();
                     client.expect_query().returning(|_| {
                         Err(ReplicationStoreClientError::ServiceError(
                             ReplicationServiceErrorCode::SlowDown,

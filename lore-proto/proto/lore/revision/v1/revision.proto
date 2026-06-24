@@ -217,3 +217,10 @@ message RevisionListResponse {
   // older revisions exist.
   optional bytes signature_backward = 3;
 }
+
+// A service to receive requests forwarded on from another Lore Sever,
+// to perform an RPC on behalf of a client
+service ForwardedRevisionService {
+
+  rpc BranchCreate     (BranchCreateRequest)      returns (BranchCreateResponse);
+}

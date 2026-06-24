@@ -65,6 +65,24 @@ pub struct LoreFragmentWriteEventData {
     pub deduplicated: u8,
 }
 
+/// Build a `WriteTracker`. When `stats` is set the tracker emits a
+/// `FragmentWrite` event per fragment; otherwise it carries no observer so the
+/// common commit path avoids the per-fragment overhead.
+pub fn commit_write_tracker(stats: bool) -> Arc<lore_storage::write_tracker::WriteTracker> {
+    if !stats {
+        return Arc::new(lore_storage::write_tracker::WriteTracker::new());
+    }
+    Arc::new(lore_storage::write_tracker::WriteTracker::with_observer(
+        Arc::new(|fragment: &Fragment, deduplicated: bool| {
+            crate::event::LoreEvent::FragmentWrite(LoreFragmentWriteEventData {
+                fragment: *fragment,
+                deduplicated: deduplicated as u8,
+            })
+            .send();
+        }),
+    ))
+}
+
 /// Construct [`WriteOptions`] from a repository context.
 pub fn write_options_from_repository(repository: Arc<RepositoryContext>) -> WriteOptions {
     let flags = WriteOptions::default();

@@ -251,15 +251,17 @@ async fn dirty_path(
 
         stats.modify_count.fetch_add(1, Ordering::Relaxed);
     } else if exists_on_disk {
-        // File on disk + not in revision -> Add
-        lore_trace!("Dirty add: {}", relative_path.as_str());
-        dirty_add(
-            repository.clone(),
-            state_staged.clone(),
-            relative_path,
-            stats.clone(),
-        )
-        .await?;
+        // Skip when already tracked so a repeated dirty doesn't duplicate the node.
+        if staged_link.is_none() {
+            lore_trace!("Dirty add: {}", relative_path.as_str());
+            dirty_add(
+                repository.clone(),
+                state_staged.clone(),
+                relative_path,
+                stats.clone(),
+            )
+            .await?;
+        }
     } else if in_current_revision {
         // Not on disk + in revision -> Delete
         lore_trace!("Dirty delete: {}", relative_path.as_str());
@@ -471,23 +473,23 @@ async fn dirty_add(
         ROOT_NODE
     };
 
-    // Create a new node with File + DirtyAdd flags and correct name hash
     let node = Node {
-        flags: (NodeFlags::File | NodeFlags::DirtyAdd).bits(),
+        flags: NodeFlags::File.bits(),
         name_hash: crate::hash::hash_string(file_name),
         ..Default::default()
     };
 
-    let _node_id = state
+    let node_id = state
         .node_add(repository.clone(), parent_node_id, node, file_name)
         .await
         .forward::<DirtyError>("Failed to add dirty node")?;
 
-    // Propagate dirty to parent directories
+    // Mark with propagation so reused committed ancestors are marked up to root,
+    // not left clean under a dirty child where a non-scan status walk prunes them.
     state
-        .node_mark_dirty(repository.clone(), parent_node_id, NodeFlags::Dirty, false)
+        .node_mark_dirty(repository.clone(), node_id, NodeFlags::DirtyAdd, true)
         .await
-        .forward::<DirtyError>("Failed to propagate dirty to parent")?;
+        .forward::<DirtyError>("Failed to mark dirty add and propagate to parents")?;
 
     stats.add_count.fetch_add(1, Ordering::Relaxed);
 
@@ -515,19 +517,18 @@ async fn dirty_add_directory(
     };
 
     let node = Node {
-        flags: NodeFlags::DirtyAdd.bits(),
         name_hash: crate::hash::hash_string(dir_name),
         ..Default::default()
     };
-    state
+    let new_id = state
         .node_add(repository.clone(), parent_node_id, node, dir_name)
         .await
         .forward::<DirtyError>("Failed to add dirty directory node")?;
 
     state
-        .node_mark_dirty(repository.clone(), parent_node_id, NodeFlags::Dirty, false)
+        .node_mark_dirty(repository.clone(), new_id, NodeFlags::DirtyAdd, true)
         .await
-        .forward::<DirtyError>("Failed to propagate dirty to parent")?;
+        .forward::<DirtyError>("Failed to mark dirty add directory and propagate to parents")?;
 
     stats.add_count.fetch_add(1, Ordering::Relaxed);
     Ok(())
@@ -552,10 +553,9 @@ async fn ensure_dirty_parent_dirs(
         {
             current_node = child_id;
         } else {
-            // Directory doesn't exist — create it with Dirty flag
-            // (directories are nodes without File or Link flags)
+            // A directory node carries no File or Link flag. Mark it with
+            // propagation so reused committed ancestors are marked up to root.
             let dir_node = Node {
-                flags: NodeFlags::Dirty.bits(),
                 name_hash,
                 ..Default::default()
             };
@@ -563,6 +563,10 @@ async fn ensure_dirty_parent_dirs(
                 .node_add(repository.clone(), current_node, dir_node, segment)
                 .await
                 .forward::<DirtyError>("Failed to create parent directory for dirty add")?;
+            state
+                .node_mark_dirty(repository.clone(), new_id, NodeFlags::Dirty, true)
+                .await
+                .forward::<DirtyError>("Failed to mark created parent directory dirty")?;
             current_node = new_id;
         }
     }

@@ -137,4 +137,10 @@ pub enum LoreCommand {
     StoragePutFile(crate::storage::put_file::LoreStoragePutFileArgs),
     StorageGetFile(crate::storage::get_file::LoreStorageGetFileArgs),
     StorageUpload(crate::storage::upload::LoreStorageUploadArgs),
+    StorageMutableLoad(crate::storage::mutable_load::LoreStorageMutableLoadArgs),
+    StorageMutableStore(crate::storage::mutable_store::LoreStorageMutableStoreArgs),
+    StorageMutableCompareAndSwap(
+        crate::storage::mutable_compare_and_swap::LoreStorageMutableCompareAndSwapArgs,
+    ),
+    StorageMutableList(crate::storage::mutable_list::LoreStorageMutableListArgs),
 }

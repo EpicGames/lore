@@ -96,10 +96,10 @@ def pytest_addoption(parser):
         help="Which remote TCP port to point Lore at. If unset, an OS-allocated free port is used.",
     )
     parser.addoption(
-        "--lore-remote-replication-port",
+        "--lore-remote-internal-port",
         action="store",
         default=None,
-        help="Which remote TCP port to point Lore Server replication clients at. If unset, an OS-allocated free port is used.",
+        help="Which remote ports to point Lore Server internal gRPC (TCP) and QUIC (UDP) endpoints at. If unset, an OS-allocated free port is used.",
     )
     parser.addoption(
         "--disable-local-server",
@@ -130,7 +130,12 @@ def new_lore_repo(
     """
 
     def _new_lore_repo(
-        name=None, remote_path=None, repo_id=None, create_repo=True, remote_url=None, environment_vars: dict[str, str] | None = None
+        name=None,
+        remote_path=None,
+        repo_id=None,
+        create_repo=True,
+        remote_url=None,
+        environment_vars: dict[str, str] | None = None,
     ):
         if name is None:
             name = ""
@@ -153,11 +158,36 @@ def new_lore_repo(
 
 @pytest.fixture(scope="function")
 def global_dir_name(tmp_path_factory):
-    path = str(tmp_path_factory.getbasetemp() / Lore.generate_random_name("lore_global"))
+    path = str(
+        tmp_path_factory.getbasetemp() / Lore.generate_random_name("lore_global")
+    )
     logger.info(f"Setting global directory for test to {path}")
     os.makedirs(path)
 
     yield path
+
+
+def _wait_for_service_ready(lore_executable_path, service_process, attempts=30):
+    """Block until the background service answers a probe."""
+    probe_env = os.environ.copy()
+    probe_env["LORE_USE_SERVICE"] = "1"
+    for _ in range(attempts):
+        if service_process.poll() is not None:
+            pytest.fail(
+                "Lore service process exited during startup with code "
+                f"{service_process.returncode}"
+            )
+        probe = subprocess.run(
+            [lore_executable_path, "repository", "list"],
+            capture_output=True,
+            text=True,
+            env=probe_env,
+        )
+        out = probe.stdout + probe.stderr
+        if "connecting to local socket" not in out and "10022" not in out:
+            return
+        sleep(1)
+    pytest.fail("Timed out waiting for Lore background service to accept connections")
 
 
 @pytest.fixture(scope="function")
@@ -165,6 +195,8 @@ def background_lore_service(lore_executable_path):
     command_args = [lore_executable_path, "service", "run"]
     logger.info("Executing Lore service command: %s", command_args)
     service_process = subprocess.Popen(command_args)
+
+    _wait_for_service_ready(lore_executable_path, service_process)
 
     yield service_process
 
@@ -247,7 +279,7 @@ def lore_remote_url(request, lore_main_server_ports):
 
 @pytest.fixture(scope="session")
 def lore_main_server_ports(request, tmp_path_factory):
-    """Resolve the main loreserver's {quic, grpc, http, replication} ports.
+    """Resolve the main loreserver's {quic, grpc, http, internal} ports.
 
     For each port: if its CLI option was explicitly passed, use that value;
     otherwise ask the OS for a free ephemeral port. Under pytest-xdist, gw0
@@ -258,7 +290,7 @@ def lore_main_server_ports(request, tmp_path_factory):
         "quic": request.config.getoption("--lore-remote-quic-port"),
         "grpc": request.config.getoption("--lore-remote-grpc-port"),
         "http": request.config.getoption("--lore-remote-http-port"),
-        "replication": request.config.getoption("--lore-remote-replication-port"),
+        "internal": request.config.getoption("--lore-remote-internal-port"),
     }
 
     def resolve_locally():
@@ -287,9 +319,9 @@ def lore_main_server_ports(request, tmp_path_factory):
                 if cli_values["http"] is not None
                 else allocate_free_port()
             ),
-            "replication": (
-                int(cli_values["replication"])
-                if cli_values["replication"] is not None
+            "internal": (
+                int(cli_values["internal"])
+                if cli_values["internal"] is not None
                 else allocate_free_port()
             ),
         }
@@ -370,7 +402,9 @@ def auto_lore_local_server(
     if worker_id is None:
         # Not xdist — original behavior (fixture owns full lifecycle)
         (server_root, server_env) = lore_local_server_config
-        yield from lore_local_server(server_root, server_env, lore_server_executable_path)
+        yield from lore_local_server(
+            server_root, server_env, lore_server_executable_path
+        )
         return
 
     shared_tmp = _get_shared_tmp_dir(tmp_path_factory)

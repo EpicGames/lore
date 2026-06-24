@@ -19,7 +19,7 @@ use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::log_server_error;
-use crate::grpc::map_message_handle_error;
+use crate::grpc::simple_map_message_handle_error;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::query::handle_query;
 use crate::util::setup_execution;
@@ -71,7 +71,7 @@ pub async fn handler(
                         let results = resp.results.iter().map(|res| *res as i32).collect();
                         Response::new(storage_v1::QueryResponse { results })
                     })
-                    .map_err(map_message_handle_error)
+                    .map_err(simple_map_message_handle_error)
                     .inspect_err(log_server_error)
             }
             .in_current_span(),

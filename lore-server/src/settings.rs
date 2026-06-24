@@ -321,7 +321,7 @@ pub struct ServerSettings {
     pub auth: Option<AuthSettings>,
     pub grpc: Option<GrpcSettings>,
     pub grpc_public_services: Option<GrpcPublicServicesSettings>,
-    pub replication: Option<GrpcSettings>,
+    pub grpc_internal: Option<GrpcSettings>,
     pub http: Option<HttpSettings>,
     // the public facing QUIC server settings
     pub quic: Option<QuicSettings>,

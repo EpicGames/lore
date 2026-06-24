@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
+import json
 import logging
 import os
 import re
@@ -944,11 +945,12 @@ def test_link_add_remove(new_lore_repo):
         "Link path should not appear in link list after unstaging a staged-add link"
     )
 
-    # Clean up link files left on disk after unstage (unstage discards the node
-    # but does not remove cloned files from the filesystem)
+    # Unstaging a staged-add link must remove the cloned files from the
+    # filesystem.
     link_abs_path = os.path.join(main_repo.path, link_path)
-    if os.path.exists(link_abs_path):
-        shutil.rmtree(link_abs_path)
+    assert not os.path.exists(link_abs_path), (
+        "Unstage of a staged-add link must remove the cloned link directory"
+    )
 
     # Original test: add link without committing
     main_repo.link_add(link_path, source_repo.get_id(), "/")
@@ -1141,22 +1143,41 @@ def test_link_add_remove(new_lore_repo):
     # --- Committed link: remove then unstage to restore ---
     main_repo.link_remove(link_path)
 
-    # Verify link is gone
+    # Verify link is gone — registry and on-disk content
     link_list_after_remove_for_unstage = main_repo.link_list()
     assert source_repo.get_id() not in link_list_after_remove_for_unstage, (
         "Source repo should not appear in link list after removal for unstage test"
+    )
+    assert not main_repo.file_exists(expected_file1), (
+        "Linked file 1 should not exist after link_remove"
+    )
+    assert not main_repo.file_exists(expected_file2), (
+        "Linked file 2 should not exist after link_remove"
     )
 
     # Unstage the removal to restore the link
     main_repo.unstage(link_path)
 
-    # Verify link is fully restored — registry entry and file access
+    # Verify link is fully restored — registry entry, file access, and on-disk
+    # content.
     link_list_after_unstage = main_repo.link_list()
     assert source_repo.get_id() in link_list_after_unstage, (
         "Source repo should appear in link list after unstaging removal"
     )
     assert link_path in link_list_after_unstage, (
         "Link path should appear in link list after unstaging removal"
+    )
+    assert main_repo.file_exists(expected_file1), (
+        "Linked file 1 should be re-materialized after unstaging removal"
+    )
+    assert main_repo.file_exists(expected_file2), (
+        "Linked file 2 should be re-materialized after unstaging removal"
+    )
+    assert main_repo.compare_file(main_repo, expected_file1), (
+        "Re-materialized file 1 content should match"
+    )
+    assert main_repo.compare_file(main_repo, expected_file2), (
+        "Re-materialized file 2 content should match"
     )
 
 
@@ -2092,6 +2113,377 @@ def test_link_reset(new_lore_repo):
         assert "second link file original" in f.read(), (
             "Second link file should be restored after multi-link root reset"
         )
+
+
+# ---------------------------------------------------------------------------
+# Helpers for the link-reset tests below.
+# ---------------------------------------------------------------------------
+
+
+def _assert_crr_clean(
+    repo: Lore,
+    expected_files_present: list[str],
+    expected_files_absent: list[str],
+    expected_link_registry: dict[str, bool],
+):
+    """Clean status, realized disk, registry-correct.
+
+    `expected_link_registry` maps a needle (repo id or link path) to whether
+    it should appear in `link_list()` output.
+    """
+    staged = parse_status_json(repo.status(json=True))
+    assert staged == [], f"Expected clean staged status, got {staged}"
+    unstaged = [
+        e
+        for e in parse_status_json(repo.status(json=True, unstaged=True))
+        if not e.get("flagStaged", False)
+    ]
+    assert unstaged == [], f"Expected clean unstaged status, got {unstaged}"
+    for path in expected_files_present:
+        assert repo.file_exists(path), f"Expected file present: {path}"
+    for path in expected_files_absent:
+        assert not repo.file_exists(path), f"Expected file absent: {path}"
+    link_list_output = repo.link_list()
+    for needle, present in expected_link_registry.items():
+        if present:
+            assert needle in link_list_output, (
+                f"Expected {needle!r} in link_list, got: {link_list_output}"
+            )
+        else:
+            assert needle not in link_list_output, (
+                f"Expected {needle!r} not in link_list, got: {link_list_output}"
+            )
+
+
+def _commit_initial_main(new_lore_repo, file_name: str) -> Lore:
+    """Create a main repo with one committed file and push."""
+    repo: Lore = new_lore_repo()
+    with repo.open_file(file_name, "w+") as f:
+        f.writelines(["main repo initial content\n"])
+    repo.stage(scan=True)
+    repo.commit("initial main")
+    repo.push()
+    return repo
+
+
+def _make_link_source(
+    new_lore_repo, file_paths: list[str]
+) -> tuple[Lore, list[str]]:
+    """Create a link source repo with the given files committed and pushed."""
+    repo: Lore = new_lore_repo()
+    for path in file_paths:
+        directory = os.path.dirname(path)
+        if directory:
+            repo.make_dirs(directory)
+        with repo.open_file(path, "w+") as f:
+            f.writelines([f"link source content for {path}\n"])
+    repo.stage(scan=True)
+    repo.commit("initial source")
+    repo.push()
+    return repo, file_paths
+
+
+# ---------------------------------------------------------------------------
+# Reset for added/removed/updated links.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.smoke
+def test_link_reset_staged_add(new_lore_repo):
+    """`lore file reset` undoes a staged-add link: registry, on-disk content,
+    and parent state are restored to pre-add."""
+    main_repo = _commit_initial_main(new_lore_repo, "main.txt")
+    source_repo, source_files = _make_link_source(
+        new_lore_repo, ["a.txt", "nested/b.txt"]
+    )
+
+    link_path = "linked"
+    expected = [f"{link_path}/{p}" for p in source_files]
+
+    main_repo.link_add(link_path, source_repo.get_id(), "/")
+    for p in expected:
+        assert main_repo.file_exists(p), f"Pre-reset: expected {p} on disk"
+    assert source_repo.get_id() in main_repo.link_list()
+
+    main_repo.reset(link_path)
+
+    _assert_crr_clean(
+        main_repo,
+        expected_files_present=["main.txt"],
+        expected_files_absent=expected,
+        expected_link_registry={source_repo.get_id(): False, link_path: False},
+    )
+
+
+def test_link_reset_staged_add_reports_reset(new_lore_repo):
+    """Resetting a staged-add link counts the node it reset in the summary."""
+    main_repo = _commit_initial_main(new_lore_repo, "main.txt")
+    source_repo, _ = _make_link_source(new_lore_repo, ["a.txt"])
+
+    link_path = "linked"
+    main_repo.link_add(link_path, source_repo.get_id(), "/")
+
+    output = main_repo.reset(link_path, json=True)
+
+    events = [json.loads(line) for line in output.splitlines() if line.strip()]
+    reset_end = next(e for e in events if e.get("tagName") == "fileResetEnd")
+    count = reset_end["data"]["count"]
+    total = (
+        count["directoryResetCount"]
+        + count["directoryDeleteCount"]
+        + count["fileResetCount"]
+        + count["fileDeleteCount"]
+    )
+    assert total >= 1, f"Reset of a staged link must count the reset, got: {count}"
+
+
+def test_link_reset_staged_add_into_existing_directory(new_lore_repo):
+    """If the link path was a committed directory before `link add`, reset
+    restores the empty directory rather than removing it."""
+    main_repo = _commit_initial_main(new_lore_repo, "main.txt")
+    source_repo, _ = _make_link_source(new_lore_repo, ["a.txt"])
+
+    # Commit an empty directory at the link path so it predates the link add.
+    link_path = "linked"
+    main_repo.make_dirs(link_path)
+    main_repo.stage(scan=True)
+    main_repo.commit("add empty linked directory")
+    main_repo.push()
+
+    main_repo.link_add(link_path, source_repo.get_id(), "/")
+    assert main_repo.file_exists(f"{link_path}/a.txt")
+
+    main_repo.reset(link_path)
+
+    _assert_crr_clean(
+        main_repo,
+        expected_files_present=["main.txt"],
+        expected_files_absent=[f"{link_path}/a.txt"],
+        expected_link_registry={source_repo.get_id(): False},
+    )
+    assert main_repo.path_exists(link_path), (
+        "Pre-existing committed directory must survive reset"
+    )
+
+
+def test_link_reset_staged_add_creates_parent_directories(new_lore_repo):
+    """If `link add` had to auto-stage parent directories, reset removes
+    both the link and the auto-staged parents."""
+    main_repo = _commit_initial_main(new_lore_repo, "main.txt")
+    source_repo, _ = _make_link_source(new_lore_repo, ["a.txt"])
+
+    link_path = "deep/parent/chain/linked"
+    main_repo.link_add(link_path, source_repo.get_id(), "/")
+
+    staged_paths = {
+        e["path"] for e in parse_status_json(main_repo.status(json=True))
+    }
+    assert any(p.startswith("deep") for p in staged_paths), (
+        f"Auto-staged parents should be visible in pre-reset status, got: {staged_paths}"
+    )
+
+    main_repo.reset(link_path)
+
+    _assert_crr_clean(
+        main_repo,
+        expected_files_present=["main.txt"],
+        expected_files_absent=[f"{link_path}/a.txt"],
+        expected_link_registry={source_repo.get_id(): False},
+    )
+    assert not main_repo.path_exists("deep"), (
+        "Parent chain that didn't exist before the link must be gone"
+    )
+
+
+@pytest.mark.smoke
+def test_link_reset_staged_remove(new_lore_repo):
+    """`lore file reset` of a staged-remove link restores the registry, the
+    link node, and re-materializes content on disk."""
+    main_repo = _commit_initial_main(new_lore_repo, "main.txt")
+    source_repo, source_files = _make_link_source(
+        new_lore_repo, ["a.txt", "nested/b.txt"]
+    )
+
+    link_path = "linked"
+    expected = [f"{link_path}/{p}" for p in source_files]
+
+    main_repo.link_add(link_path, source_repo.get_id(), "/")
+    main_repo.commit("add link")
+    main_repo.push()
+
+    main_repo.link_remove(link_path)
+    for p in expected:
+        assert not main_repo.file_exists(p), (
+            f"Pre-reset: expected {p} absent after link_remove"
+        )
+
+    main_repo.reset(link_path)
+
+    _assert_crr_clean(
+        main_repo,
+        expected_files_present=["main.txt", *expected],
+        expected_files_absent=[],
+        expected_link_registry={source_repo.get_id(): True, link_path: True},
+    )
+    for p in expected:
+        source_relative = p.removeprefix(f"{link_path}/")
+        assert main_repo.compare_file(
+            source_repo, p, other_file_path=source_relative
+        ), f"Restored content of {p} must match source repo content"
+
+
+@pytest.mark.smoke
+def test_link_reset_staged_update(new_lore_repo):
+    """`lore file reset` of a staged pin change restores the previous pin in
+    the registry and re-realizes content from the previous pin."""
+    main_repo = _commit_initial_main(new_lore_repo, "main.txt")
+
+    source_repo: Lore = new_lore_repo()
+    with source_repo.open_file("v1.txt", "w+") as f:
+        f.writelines(["v1\n"])
+    source_repo.stage(scan=True)
+    source_repo.commit("v1")
+    source_repo.push()
+
+    source_repo.branch_create("feature")
+    with source_repo.open_file("v2.txt", "w+") as f:
+        f.writelines(["v2\n"])
+    source_repo.stage(scan=True)
+    source_repo.commit("v2")
+    source_repo.push()
+
+    link_path = "linked"
+    main_repo.link_add(link_path, source_repo.get_id(), "/", pin="main@LATEST")
+    main_repo.commit("add link")
+    main_repo.push()
+
+    pre_link_list = main_repo.link_list()
+    assert main_repo.file_exists(f"{link_path}/v1.txt")
+    assert not main_repo.file_exists(f"{link_path}/v2.txt")
+
+    main_repo.link_update(link_path, pin="feature@LATEST")
+    assert main_repo.file_exists(f"{link_path}/v2.txt"), (
+        "Pre-reset: link_update should have realized v2.txt"
+    )
+
+    main_repo.reset(link_path)
+
+    _assert_crr_clean(
+        main_repo,
+        expected_files_present=["main.txt", f"{link_path}/v1.txt"],
+        expected_files_absent=[f"{link_path}/v2.txt"],
+        expected_link_registry={source_repo.get_id(): True, link_path: True},
+    )
+    assert main_repo.link_list() == pre_link_list, (
+        "Registry must match pre-update exactly (branch + signature)"
+    )
+
+
+def test_link_reset_root_handles_staged_link_changes(new_lore_repo):
+    """Root reset (`reset(".")`) traverses into the link node and reverts
+    a staged add/remove/update there."""
+    # --- staged-add ---
+    main_repo = _commit_initial_main(new_lore_repo, "main.txt")
+    source_repo, _ = _make_link_source(new_lore_repo, ["a.txt"])
+    link_path = "linked"
+    main_repo.link_add(link_path, source_repo.get_id(), "/")
+    main_repo.reset(".")
+    _assert_crr_clean(
+        main_repo,
+        expected_files_present=["main.txt"],
+        expected_files_absent=[f"{link_path}/a.txt"],
+        expected_link_registry={source_repo.get_id(): False},
+    )
+
+    # --- staged-remove ---
+    main_repo.link_add(link_path, source_repo.get_id(), "/")
+    main_repo.commit("add link")
+    main_repo.push()
+    main_repo.link_remove(link_path)
+    main_repo.reset(".")
+    _assert_crr_clean(
+        main_repo,
+        expected_files_present=["main.txt", f"{link_path}/a.txt"],
+        expected_files_absent=[],
+        expected_link_registry={source_repo.get_id(): True, link_path: True},
+    )
+
+    # --- staged-update ---
+    source_repo.branch_create("feature")
+    with source_repo.open_file("a.txt", "w+") as f:
+        f.writelines(["feature a\n"])
+    source_repo.stage(scan=True)
+    source_repo.commit("feature a")
+    source_repo.push()
+
+    pre_link_list = main_repo.link_list()
+    main_repo.link_update(link_path, pin="feature@LATEST")
+    main_repo.reset(".")
+    _assert_crr_clean(
+        main_repo,
+        expected_files_present=["main.txt", f"{link_path}/a.txt"],
+        expected_files_absent=[],
+        expected_link_registry={source_repo.get_id(): True, link_path: True},
+    )
+    assert main_repo.link_list() == pre_link_list, (
+        "Registry must match pre-update after root reset"
+    )
+
+
+def test_link_reset_does_not_affect_unrelated_links(new_lore_repo):
+    """Reset of one staged link change must not touch unrelated committed
+    links."""
+    main_repo = _commit_initial_main(new_lore_repo, "main.txt")
+    source_repo_a, _ = _make_link_source(new_lore_repo, ["a.txt"])
+    source_repo_b, _ = _make_link_source(new_lore_repo, ["b.txt"])
+
+    link_a = "linkA"
+    link_b = "linkB"
+
+    main_repo.link_add(link_a, source_repo_a.get_id(), "/")
+    main_repo.link_add(link_b, source_repo_b.get_id(), "/")
+    main_repo.commit("add both links")
+    main_repo.push()
+
+    # Stage a remove on linkA only; reset only that. linkB untouched.
+    main_repo.link_remove(link_a)
+    main_repo.reset(link_a)
+
+    _assert_crr_clean(
+        main_repo,
+        expected_files_present=[
+            "main.txt",
+            f"{link_a}/a.txt",
+            f"{link_b}/b.txt",
+        ],
+        expected_files_absent=[],
+        expected_link_registry={
+            source_repo_a.get_id(): True,
+            link_a: True,
+            source_repo_b.get_id(): True,
+            link_b: True,
+        },
+    )
+
+
+def test_link_reset_idempotent(new_lore_repo):
+    """Running reset twice on the same staged-add link change is a no-op
+    on the second call."""
+    main_repo = _commit_initial_main(new_lore_repo, "main.txt")
+    source_repo, _ = _make_link_source(new_lore_repo, ["a.txt"])
+
+    link_path = "linked"
+    main_repo.link_add(link_path, source_repo.get_id(), "/")
+    main_repo.reset(link_path)
+    # Second reset is a no-op (path no longer exists).
+    main_repo.reset(link_path)
+
+    _assert_crr_clean(
+        main_repo,
+        expected_files_present=["main.txt"],
+        expected_files_absent=[f"{link_path}/a.txt"],
+        expected_link_registry={source_repo.get_id(): False},
+    )
 
 
 def test_link_merge_specific(new_lore_repo):
@@ -6177,4 +6569,431 @@ def test_link_scoped_commit_subdirectory_source_path_translation(new_lore_repo):
     )
     assert sync_repo.file_exists("FolderReceivingLink/SharedFile.txt"), (
         "Original linked file must still be present under the link"
+    )
+
+
+def _make_link_target_repo(new_lore_repo, file_name: str, content: str):
+    """Build a small repo to be used as a link target, with one file at root.
+
+    Returns (repo, pinned_revision_of_main).
+    """
+    target_repo: Lore = new_lore_repo()
+    with target_repo.open_file(file_name, "w+") as f:
+        f.writelines([content])
+    target_repo.stage(scan=True)
+    target_repo.commit("Initial linked content")
+    target_repo.push()
+    return target_repo, target_repo.branch_info().local_latest
+
+
+def _make_parent_repo_with_baseline(new_lore_repo):
+    """Build a parent repo with one baseline commit. Returns (repo, baseline_revision)."""
+    parent_repo: Lore = new_lore_repo()
+    with parent_repo.open_file("README.txt", "w+") as f:
+        f.writelines(["baseline\n"])
+    parent_repo.stage(scan=True)
+    parent_repo.commit("Baseline commit")
+    parent_repo.push()
+    return parent_repo, parent_repo.branch_info().local_latest
+
+
+@pytest.mark.smoke
+def test_link_add_diff_reports_link_only(new_lore_repo):
+    """Adding a link is a parent-tree change, not a per-file addition of
+    the link's mounted contents.
+
+    This test documents the user-visible contract for `lore link add`. It
+    pairs two independent assertions that reach two different code paths:
+
+      - Positive proof (parent-tree path): `lore status` reports the link
+        path as a staged addition. This signal comes from
+        `state::diff_collect` (state-vs-staged), the change stream used by
+        status.
+
+      - Negative proof (filesystem-walker path): `lore file diff` against
+        the pre-link revision emits no unified-diff hunk for any file
+        inside the link. This is the surface where the regression appeared.
+
+    The negative-proof half is a contract assertion; on its own it would
+    also pass if `file diff` were broken in some unrelated way. The
+    walker's liveness is pinned by the symmetric content tests
+    (`test_link_diff_file_added_in_linked_repo` and siblings), which prove
+    `file diff` does emit hunks when the linked repository's content
+    actually changes.
+    """
+    link_repo, pinned_revision = _make_link_target_repo(
+        new_lore_repo, "shared.txt", "main content\n"
+    )
+    parent_repo, baseline_revision = _make_parent_repo_with_baseline(new_lore_repo)
+
+    link_path = "libs/shared"
+    linked_file = f"{link_path}/shared.txt"
+
+    parent_repo.link_add(
+        link_path, link_repo.get_id(), "/", pin=pinned_revision
+    )
+
+    # Positive proof: before committing, `lore status` must report the link
+    # path itself as a staged addition, and must not list files inside the
+    # link as separate staged adds.
+    staged_paths = [
+        entry.get("path", "")
+        for entry in parse_status_json(parent_repo.status(json=True))
+    ]
+    assert link_path in staged_paths, (
+        f"`lore status` must report the link path {link_path!r} as staged "
+        f"after `lore link add`. Staged paths: {staged_paths}"
+    )
+    assert linked_file not in staged_paths, (
+        f"`lore status` must not list files inside the link as separate "
+        f"staged adds. Staged paths: {staged_paths}"
+    )
+
+    parent_repo.commit("Add link libs/shared")
+    parent_repo.push()
+
+    output = parent_repo.file_diff(source=baseline_revision, no_pager=True)
+
+    # Negative proof: the file under the link must not appear in any unified-
+    # diff header. We assert on the diff headers specifically so the test
+    # fails for the exact format produced by the bug
+    # (`--- /dev/null\n+++ libs/shared/...`).
+    assert f"+++ {linked_file}" not in output, (
+        "lore file diff must not emit a '+++ <link>/<file>' header for a "
+        f"file inside a newly-added link.\nOutput:\n{output}"
+    )
+    assert f"--- {linked_file}" not in output, (
+        "lore file diff must not emit a '--- <link>/<file>' header for a "
+        f"file inside a newly-added link.\nOutput:\n{output}"
+    )
+    # The parent's baseline file was not touched -> no diff for it either.
+    assert "+++ README.txt" not in output and "--- README.txt" not in output, (
+        f"Parent's baseline file must not appear in the diff.\nOutput:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_update_diff_reports_link_only(new_lore_repo):
+    """Updating a link's pin is a parent-tree change. When the new pin
+    leaves the mounted subtree byte-identical, no file under the link path
+    is touched in the parent.
+
+    Setup: the link target has a subdirectory `mounted/` containing the
+    file the parent's link exposes, plus an unrelated `outside/` file.
+    Between pin P1 and pin P2 only `outside/` is modified; the subtree
+    `mounted/` is byte-identical. The parent pins the link to `mounted/`,
+    so the new pin is a metadata change (different signature) but the
+    mounted tree is unchanged.
+
+    This test pairs two independent assertions reaching different code paths:
+
+      - Positive proof (parent-tree path): `lore status` reports the link
+        path as a staged change after `lore link update`. This signal
+        comes from `state::diff_collect` (state-vs-staged).
+
+      - Negative proof (filesystem-walker path): `lore file diff` across
+        the pin bump emits no unified-diff hunk for any file under the
+        link path.
+
+    The negative-proof half is a contract assertion. The walker's
+    liveness is pinned by the symmetric content tests, which prove
+    `file diff` does emit hunks when the linked repository's content
+    actually changes between pins.
+    """
+    # Link target with a stable mounted/ subtree and an evolving outside/
+    # file. The parent will mount only mounted/.
+    link_repo: Lore = new_lore_repo()
+    link_repo.make_dirs("mounted")
+    with link_repo.open_file("mounted/stable.txt", "w+") as f:
+        f.writelines(["stable mounted content\n"])
+    link_repo.make_dirs("outside")
+    with link_repo.open_file("outside/v1.txt", "w+") as f:
+        f.writelines(["outside v1\n"])
+    link_repo.stage(scan=True)
+    link_repo.commit("v1 with mounted/ + outside/")
+    link_repo.push()
+    pin_v1 = link_repo.branch_info().local_latest
+
+    # Modify only outside/, leaving the mounted/ subtree untouched, so
+    # v1 and v2 resolve to the same mounted/ tree.
+    with link_repo.open_file("outside/v2.txt", "w+") as f:
+        f.writelines(["outside v2\n"])
+    link_repo.stage(scan=True)
+    link_repo.commit("v2 changes only outside/")
+    link_repo.push()
+    pin_v2 = link_repo.branch_info().local_latest
+
+    # Parent: baseline -> add link pinned to v1 mounting only mounted/ ->
+    # re-pin to v2 (mounted/ subtree unchanged).
+    parent_repo, _ = _make_parent_repo_with_baseline(new_lore_repo)
+    link_path = "libs/shared"
+    linked_file = f"{link_path}/stable.txt"
+
+    parent_repo.link_add(link_path, link_repo.get_id(), "/mounted", pin=pin_v1)
+    parent_repo.commit("Add link at v1, mounting mounted/")
+    parent_repo.push()
+    pre_update_revision = parent_repo.branch_info().local_latest
+
+    parent_repo.link_update(link_path, pin=pin_v2)
+
+    # Positive proof: before committing, `lore status` must report the link
+    # path as a staged change (the link node's pin moved), and must not list
+    # files under the link path as separate staged entries.
+    staged_paths = [
+        entry.get("path", "")
+        for entry in parse_status_json(parent_repo.status(json=True))
+    ]
+    assert link_path in staged_paths, (
+        f"`lore status` must report the link path {link_path!r} as staged "
+        f"after a `lore link update` pin move. Staged paths: {staged_paths}"
+    )
+    assert linked_file not in staged_paths, (
+        f"`lore status` must not list files inside the link as separate "
+        f"staged entries after a pin move. Staged paths: {staged_paths}"
+    )
+
+    parent_repo.commit("Bump link pin to v2 (no mounted/ change)")
+    parent_repo.push()
+
+    output = parent_repo.file_diff(source=pre_update_revision, no_pager=True)
+
+    # No file content changed under the link path, so the diff must not
+    # emit any unified-diff hunks for files under the link.
+    assert f"+++ {linked_file}" not in output, (
+        "lore file diff must not emit file edits when the link pin moved "
+        f"but no mounted file changed.\nOutput:\n{output}"
+    )
+    assert f"--- {linked_file}" not in output, (
+        "lore file diff must not emit file edits when the link pin moved "
+        f"but no mounted file changed.\nOutput:\n{output}"
+    )
+    assert "stable mounted content" not in output, (
+        "lore file diff must not surface stable mounted content as a "
+        f"change when only the link pin signature moved.\nOutput:\n{output}"
+    )
+    # The unrelated outside/ file lives outside the link's source_path and
+    # must never appear in the parent's diff.
+    assert "outside" not in output, (
+        "Files outside the link's mounted source_path must not appear in "
+        f"the parent's file diff.\nOutput:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_remove_diff_reports_link_only(new_lore_repo):
+    """Removing a link is a parent-tree change, not per-file deletions of
+    the files that were visible through it.
+
+    This test pairs two independent assertions reaching different code paths:
+
+      - Positive proof (parent-tree path): `lore status` reports the link
+        path as a staged removal after `lore link remove`. This signal
+        comes from `state::diff_collect` (state-vs-staged).
+
+      - Negative proof (filesystem-walker path): `lore file diff` against
+        the pre-remove revision emits no unified-diff hunk for any file
+        that was previously visible through the link.
+
+    The negative-proof half is a contract assertion. The walker's
+    liveness is pinned by the symmetric content tests, which prove
+    `file diff` does emit hunks when the linked repository's content
+    actually changes.
+    """
+    link_repo, pinned_revision = _make_link_target_repo(
+        new_lore_repo, "shared.txt", "main content\n"
+    )
+    parent_repo, _ = _make_parent_repo_with_baseline(new_lore_repo)
+
+    link_path = "libs/shared"
+    linked_file = f"{link_path}/shared.txt"
+
+    parent_repo.link_add(
+        link_path, link_repo.get_id(), "/", pin=pinned_revision
+    )
+    parent_repo.commit("Add link")
+    parent_repo.push()
+    pre_remove_revision = parent_repo.branch_info().local_latest
+
+    parent_repo.link_remove(link_path)
+
+    # Positive proof: before committing, `lore status` must report the link
+    # path as a staged removal, and must not list files that were visible
+    # through the link as separate staged deletions.
+    staged_paths = [
+        entry.get("path", "")
+        for entry in parse_status_json(parent_repo.status(json=True))
+    ]
+    assert link_path in staged_paths, (
+        f"`lore status` must report the link path {link_path!r} as staged "
+        f"after `lore link remove`. Staged paths: {staged_paths}"
+    )
+    assert linked_file not in staged_paths, (
+        f"`lore status` must not list files inside the link as separate "
+        f"staged deletions. Staged paths: {staged_paths}"
+    )
+
+    parent_repo.commit("Remove link")
+    parent_repo.push()
+
+    output = parent_repo.file_diff(source=pre_remove_revision, no_pager=True)
+
+    # The diff must not show files inside the (now-removed) link as
+    # individual file deletions in the parent.
+    assert f"--- {linked_file}" not in output, (
+        "lore file diff must not emit a '--- <link>/<file>' header for a "
+        f"file inside a removed link.\nOutput:\n{output}"
+    )
+    assert "-main content" not in output, (
+        "lore file diff must not surface deleted-link content as a parent "
+        f"file deletion.\nOutput:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_diff_file_added_in_linked_repo(new_lore_repo):
+    """When a link is updated and the new pin adds a new file inside the
+    linked repository, `lore file diff` against the pin-bump must show the
+    added file as an addition under the link path.
+    """
+    # Link target with two revisions: P1 has only "existing.txt"; P2 also
+    # contains "new.txt".
+    link_repo: Lore = new_lore_repo()
+    with link_repo.open_file("existing.txt", "w+") as f:
+        f.writelines(["already here\n"])
+    link_repo.stage(scan=True)
+    link_repo.commit("existing only")
+    link_repo.push()
+    pin_v1 = link_repo.branch_info().local_latest
+
+    with link_repo.open_file("new.txt", "w+") as f:
+        f.writelines(["brand new content\n"])
+    link_repo.stage(scan=True)
+    link_repo.commit("add new file")
+    link_repo.push()
+    pin_v2 = link_repo.branch_info().local_latest
+
+    parent_repo, _ = _make_parent_repo_with_baseline(new_lore_repo)
+    link_path = "libs/shared"
+    added_file = f"{link_path}/new.txt"
+
+    parent_repo.link_add(link_path, link_repo.get_id(), "/", pin=pin_v1)
+    parent_repo.commit("Add link@v1")
+    parent_repo.push()
+    pre_update_revision = parent_repo.branch_info().local_latest
+
+    parent_repo.link_update(link_path, pin=pin_v2)
+    parent_repo.commit("Bump link to v2")
+    parent_repo.push()
+
+    output = parent_repo.file_diff(source=pre_update_revision, no_pager=True)
+
+    expected_header = f"--- /dev/null\n+++ {added_file}"
+    assert expected_header in output, (
+        "lore file diff must report the newly-added file inside the link "
+        f"as added.\nExpected to contain:\n{expected_header}\n"
+        f"Output:\n{output}"
+    )
+    assert "+brand new content" in output, (
+        "lore file diff must include the added file's content as additions."
+        f"\nOutput:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_diff_file_modified_in_linked_repo(new_lore_repo):
+    """When a link is updated and the new pin modifies an existing file
+    inside the linked repository, `lore file diff` must show that file as
+    modified under the link path with the correct hunk content.
+    """
+    link_repo: Lore = new_lore_repo()
+    with link_repo.open_file("shared.txt", "w+") as f:
+        f.writelines(["before\n"])
+    link_repo.stage(scan=True)
+    link_repo.commit("v1")
+    link_repo.push()
+    pin_v1 = link_repo.branch_info().local_latest
+
+    with link_repo.open_file("shared.txt", "w+") as f:
+        f.writelines(["after\n"])
+    link_repo.stage(scan=True)
+    link_repo.commit("v2")
+    link_repo.push()
+    pin_v2 = link_repo.branch_info().local_latest
+
+    parent_repo, _ = _make_parent_repo_with_baseline(new_lore_repo)
+    link_path = "libs/shared"
+    modified_file = f"{link_path}/shared.txt"
+
+    parent_repo.link_add(link_path, link_repo.get_id(), "/", pin=pin_v1)
+    parent_repo.commit("Add link@v1")
+    parent_repo.push()
+    pre_update_revision = parent_repo.branch_info().local_latest
+
+    parent_repo.link_update(link_path, pin=pin_v2)
+    parent_repo.commit("Bump link to v2")
+    parent_repo.push()
+
+    output = parent_repo.file_diff(source=pre_update_revision, no_pager=True)
+
+    assert f"+++ {modified_file}" in output, (
+        "lore file diff must report the modified linked file under its "
+        f"link path.\nOutput:\n{output}"
+    )
+    assert f"--- {modified_file}" in output, (
+        "lore file diff must report the modified linked file's source "
+        f"side under its link path.\nOutput:\n{output}"
+    )
+    assert "-before" in output and "+after" in output, (
+        f"lore file diff must include the modified content hunk.\nOutput:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_diff_file_removed_in_linked_repo(new_lore_repo):
+    """When a link is updated and the new pin removes a file inside the
+    linked repository, `lore file diff` must show that file as removed
+    under the link path.
+    """
+    link_repo: Lore = new_lore_repo()
+    with link_repo.open_file("keep.txt", "w+") as f:
+        f.writelines(["keep me\n"])
+    with link_repo.open_file("doomed.txt", "w+") as f:
+        f.writelines(["delete me\n"])
+    link_repo.stage(scan=True)
+    link_repo.commit("v1 with both files")
+    link_repo.push()
+    pin_v1 = link_repo.branch_info().local_latest
+
+    link_repo.remove_file("doomed.txt")
+    link_repo.stage(scan=True)
+    link_repo.commit("v2 removes doomed.txt")
+    link_repo.push()
+    pin_v2 = link_repo.branch_info().local_latest
+
+    parent_repo, _ = _make_parent_repo_with_baseline(new_lore_repo)
+    link_path = "libs/shared"
+    removed_file = f"{link_path}/doomed.txt"
+
+    parent_repo.link_add(link_path, link_repo.get_id(), "/", pin=pin_v1)
+    parent_repo.commit("Add link@v1")
+    parent_repo.push()
+    pre_update_revision = parent_repo.branch_info().local_latest
+
+    parent_repo.link_update(link_path, pin=pin_v2)
+    parent_repo.commit("Bump link to v2")
+    parent_repo.push()
+
+    output = parent_repo.file_diff(source=pre_update_revision, no_pager=True)
+
+    assert f"--- {removed_file}" in output, (
+        "lore file diff must report the removed linked file under its "
+        f"link path.\nOutput:\n{output}"
+    )
+    assert "+++ /dev/null" in output, (
+        "lore file diff must report a deletion target of /dev/null for the "
+        f"removed linked file.\nOutput:\n{output}"
+    )
+    assert "-delete me" in output, (
+        f"lore file diff must include the removed file's content as a deletion."
+        f"\nOutput:\n{output}"
     )

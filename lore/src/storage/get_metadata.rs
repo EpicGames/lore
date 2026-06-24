@@ -124,17 +124,21 @@ async fn get_metadata_local(
             // straight into `codes`; only items that miss locally spawn into the JoinSet.
             let mut remote_tasks: JoinSet<LoreErrorCode> = JoinSet::new();
             let mut codes: Vec<LoreErrorCode> = Vec::with_capacity(total);
+            let mut reuse = crate::storage::store::SessionReuse::default();
 
             for item in items {
                 if effective.no_local {
-                    if let Some(session) = store.remote_session_for(item.partition) {
+                    if let Some(session) = reuse.session_for(&store, item.partition, true) {
                         lore_spawn!(
                             remote_tasks,
                             async move { resolve_remote(session, item).await }
                         );
                     } else {
-                        emit_complete(&item, Fragment::default(), LoreErrorCode::AddressNotFound);
-                        codes.push(LoreErrorCode::AddressNotFound);
+                        codes.push(emit_complete(
+                            &item,
+                            Fragment::default(),
+                            LoreErrorCode::AddressNotFound,
+                        ));
                     }
                     continue;
                 }
@@ -143,23 +147,23 @@ async fn get_metadata_local(
                     LocalOutcome::Done { code } => codes.push(code),
                     LocalOutcome::NeedRemote => {
                         if effective.no_remote {
-                            emit_complete(
+                            codes.push(emit_complete(
                                 &item,
                                 Fragment::default(),
                                 LoreErrorCode::AddressNotFound,
-                            );
-                            codes.push(LoreErrorCode::AddressNotFound);
-                        } else if let Some(session) = store.remote_session_for(item.partition) {
+                            ));
+                        } else if let Some(session) =
+                            reuse.session_for(&store, item.partition, true)
+                        {
                             lore_spawn!(remote_tasks, async move {
                                 resolve_remote(session, item).await
                             });
                         } else {
-                            emit_complete(
+                            codes.push(emit_complete(
                                 &item,
                                 Fragment::default(),
                                 LoreErrorCode::AddressNotFound,
-                            );
-                            codes.push(LoreErrorCode::AddressNotFound);
+                            ));
                         }
                     }
                 }
@@ -188,17 +192,13 @@ async fn resolve_local(
     item: &LoreStorageGetMetadataItem,
 ) -> LocalOutcome {
     if item.partition == Partition::default() {
-        emit_complete(item, Fragment::default(), LoreErrorCode::InvalidArguments);
-        return LocalOutcome::Done {
-            code: LoreErrorCode::InvalidArguments,
-        };
+        let code = emit_complete(item, Fragment::default(), LoreErrorCode::InvalidArguments);
+        return LocalOutcome::Done { code };
     }
 
     if item.address.hash == Hash::default() {
-        emit_complete(item, Fragment::default(), LoreErrorCode::None);
-        return LocalOutcome::Done {
-            code: LoreErrorCode::None,
-        };
+        let code = emit_complete(item, Fragment::default(), LoreErrorCode::None);
+        return LocalOutcome::Done { code };
     }
 
     match store
@@ -208,18 +208,19 @@ async fn resolve_local(
         .await
     {
         Ok(result) if result.match_made == StoreMatch::MatchFull => {
-            emit_complete(item, result.fragment, LoreErrorCode::None);
-            LocalOutcome::Done {
-                code: LoreErrorCode::None,
-            }
+            let code = emit_complete(item, result.fragment, LoreErrorCode::None);
+            LocalOutcome::Done { code }
         }
         Ok(_) => LocalOutcome::NeedRemote,
         Err(err) if err.is_address_not_found() => LocalOutcome::NeedRemote,
         Err(err) => {
             // Non-not-found local errors (slow-down, internal) shouldn't be masked by a
             // remote attempt — the operator wants to see them.
-            let code = crate::storage::store_error_to_code(&err);
-            emit_complete(item, Fragment::default(), code);
+            let code = emit_complete(
+                item,
+                Fragment::default(),
+                crate::storage::store_error_to_code(&err),
+            );
             LocalOutcome::Done { code }
         }
     }
@@ -233,20 +234,25 @@ async fn resolve_remote(
     item: LoreStorageGetMetadataItem,
 ) -> LoreErrorCode {
     match session.get_metadata(&item.address).await {
-        Ok(fragment) => {
-            emit_complete(&item, fragment, LoreErrorCode::None);
-            LoreErrorCode::None
-        }
+        Ok(fragment) => emit_complete(&item, fragment, LoreErrorCode::None),
         Err(err) => {
             let storage_err = lore_storage::error::protocol_error_to_storage(err, item.address);
-            let code = crate::storage::storage_error_to_code(&storage_err);
-            emit_complete(&item, Fragment::default(), code);
-            code
+            emit_complete(
+                &item,
+                Fragment::default(),
+                crate::storage::storage_error_to_code(&storage_err),
+            )
         }
     }
 }
 
-fn emit_complete(item: &LoreStorageGetMetadataItem, fragment: Fragment, error_code: LoreErrorCode) {
+/// Emit the item's terminal event and return the `error_code` that was sent, so callers can
+/// `return emit_complete(..)` directly.
+fn emit_complete(
+    item: &LoreStorageGetMetadataItem,
+    fragment: Fragment,
+    error_code: LoreErrorCode,
+) -> LoreErrorCode {
     let address = if error_code == LoreErrorCode::None {
         item.address
     } else {
@@ -259,4 +265,5 @@ fn emit_complete(item: &LoreStorageGetMetadataItem, fragment: Fragment, error_co
         error_code,
     })
     .send();
+    error_code
 }

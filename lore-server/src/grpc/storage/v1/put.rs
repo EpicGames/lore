@@ -29,13 +29,14 @@ use tonic::Status;
 use tonic::Streaming;
 use tracing::Instrument;
 use tracing::debug;
-use tracing::info;
 use tracing::info_span;
 
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
+use crate::grpc::interpret_streaming_error;
 use crate::grpc::log_server_error;
+use crate::grpc::map_message_handle_error_to_status;
 use crate::grpc::rpc_code_to_str;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::put::UnvalidatedPut;
@@ -104,23 +105,29 @@ pub async fn handler(
                             let start = Instant::now();
                             let metric_context = create_operation_context_attribute("put");
 
-                            let put = req.and_then(|r| {
-                                r.address
-                                    .zip(r.fragment)
-                                    .map(|(address, fragment)| UnvalidatedPut {
-                                        address: address.into(),
-                                        fragment: fragment.into(),
-                                        payload: r.payload,
-                                    })
-                                    .ok_or(Status::invalid_argument(
-                                        "Missing required field, both address and fragment must be present",
-                                    ))
-                                    .and_then(|unvalidated| {
-                                        unvalidated.validate().map_err(|_e| {
-                                            Status::invalid_argument("Payload failed validation")
+                            let put;
+                            if let Err(stream_error) = req {
+                                put = Err(interpret_streaming_error(stream_error));
+                            }
+                            else {
+                                put = req.and_then(|r| {
+                                    r.address
+                                        .zip(r.fragment)
+                                        .map(|(address, fragment)| UnvalidatedPut {
+                                            address: address.into(),
+                                            fragment: fragment.into(),
+                                            payload: r.payload,
                                         })
-                                    })
-                            });
+                                        .ok_or(Status::invalid_argument(
+                                            "Missing required field, both address and fragment must be present",
+                                        ))
+                                        .and_then(|unvalidated| {
+                                            unvalidated.validate().map_err(|_e| {
+                                                Status::invalid_argument("Payload failed validation")
+                                            })
+                                        })
+                                });
+                            }
 
                             let put_address = put.as_ref().ok().map(|p| *p.address());
 
@@ -142,9 +149,13 @@ pub async fn handler(
                                         Ok(_) => Err(Status::internal(
                                             "Put handler returned the wrong response type",
                                         )),
-                                        Err(err) => Err(Status::internal(format!(
-                                            "Error storing fragment {address}: {err}",
-                                        ))),
+                                        Err(err) => Err(
+                                            map_message_handle_error_to_status(
+                                                &err,
+                                                Some(format!("Error storing fragment {address}: {err}")),
+                                                None
+                                            )
+                                        ),
                                     }
                                 }
                                 Err(status) => Err(status),
@@ -167,7 +178,7 @@ pub async fn handler(
                             );
 
                             if let Err(err) = tx.send(response).await {
-                                info!(address = ?put_address, "Error sending put response: {err}");
+                                debug!(address = ?put_address, "Error sending put response: {err}");
                             }
                             drop(permit);
                         }

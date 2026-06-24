@@ -568,10 +568,12 @@ async fn collect_fragments_and_push(
     })
     .send();
 
+    let dry_run = execution_context().globals().dry_run();
+
     // If the revision is already pushed and the branch still exists, early out.
     // If the branch was deleted, restore it via branch_create before returning.
     if already_pushed {
-        if remote_deleted {
+        if remote_deleted && !dry_run {
             lore_debug!("Branch deleted on server with same latest, restoring via branch_create");
             revision_protocol
                 .branch_create(
@@ -614,7 +616,7 @@ async fn collect_fragments_and_push(
     }
 
     // If the branch was deleted on the server, restore it via branch_create
-    if remote_deleted {
+    if remote_deleted && !dry_run {
         lore_debug!("Branch deleted on server, restoring via branch_create before push");
         revision_protocol
             .branch_create(
@@ -641,30 +643,36 @@ async fn collect_fragments_and_push(
         })
         .send();
 
-        remote_latest = revision_protocol
-            .branch_create(
-                branch,
-                branch_metadata.name.as_str(),
-                branch_metadata.category.as_str(),
-                branch_metadata.creator.as_str(),
-                &branch_metadata.stack,
-            )
-            .await
-            .forward::<PushError>("creating branch on remote")?;
+        if !dry_run {
+            remote_latest = revision_protocol
+                .branch_create(
+                    branch,
+                    branch_metadata.name.as_str(),
+                    branch_metadata.category.as_str(),
+                    branch_metadata.creator.as_str(),
+                    &branch_metadata.stack,
+                )
+                .await
+                .forward::<PushError>("creating branch on remote")?;
+
+            if remote_latest != branch_point {
+                return Err(PushError::internal(format!(
+                    "Failed to create branch {}, remote latest now at {}",
+                    branch_metadata.name.clone(),
+                    remote_latest
+                )));
+            }
+
+            branch::store_last_sync(repository.clone(), branch, branch_point).await;
+        } else {
+            // Report the revision the branch creation would yield.
+            remote_latest = branch_point;
+        }
+
         event::LoreEvent::BranchPushBranchCreateEnd(LoreBranchPushBranchCreateEndEventData {
             remote_revision: remote_latest,
         })
         .send();
-
-        if remote_latest != branch_point {
-            return Err(PushError::internal(format!(
-                "Failed to create branch {}, remote latest now at {}",
-                branch_metadata.name.clone(),
-                remote_latest
-            )));
-        }
-
-        branch::store_last_sync(repository.clone(), branch, branch_point).await;
     }
 
     let mut current_latest = Hash::default();
@@ -795,13 +803,15 @@ async fn collect_fragments_and_push(
             }
         }));
 
-        push_fragments(
-            repository.clone(),
-            storage_protocol.clone(),
-            fragments,
-            stats.clone(),
-        )
-        .await?;
+        if !dry_run {
+            push_fragments(
+                repository.clone(),
+                storage_protocol.clone(),
+                fragments,
+                stats.clone(),
+            )
+            .await?;
+        }
 
         drop(ticker);
 
@@ -837,7 +847,8 @@ async fn collect_fragments_and_push(
         let current_remote = remote_latest;
         let current_number;
         let mut response_message = None;
-        if remote_latest != current_revision {
+
+        if !dry_run && remote_latest != current_revision {
             let push_result = revision_protocol
                 .branch_push(branch, current_revision, force, options.fast_forward_merge)
                 .await;
@@ -960,7 +971,9 @@ async fn collect_fragments_and_push(
         })
         .send();
 
-        branch::store_last_sync(repository.clone(), branch, current_latest).await;
+        if !dry_run {
+            branch::store_last_sync(repository.clone(), branch, current_latest).await;
+        }
     }
 
     lore_debug!(
@@ -971,6 +984,7 @@ async fn collect_fragments_and_push(
         && !repository.is_layer()
         && !repository.is_link()
         && !fast_forward_merged
+        && !dry_run
     {
         branch::store_latest(
             repository.clone(),

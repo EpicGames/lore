@@ -69,6 +69,13 @@ message DiffChange {
   // True when the server auto-resolved this change in 3-way mode (only
   // meaningful when the request set `autoresolve = true`).
   bool automerged = 7;
+  // Index into the per-stream partition table built from `DiffPartition`
+  // payloads. 0 = the request's repository (the parent partition, never
+  // announced). Non-zero values MUST be preceded on the same stream by
+  // a `DiffPartition` whose `index` matches; the consumer's content
+  // fetch for this change MUST target the corresponding partition,
+  // not the request's repository id.
+  uint32 link_repository_index = 8;
 }
 
 // Pair of per-path changes describing a 3-way merge conflict at a single
@@ -80,6 +87,22 @@ message DiffConflict {
   DiffChange change_from = 1;
   // The change the other side made relative to the common ancestor.
   DiffChange change_to = 2;
+}
+
+// Per-stream partition table entry. Announces a linked partition and
+// the stable index that `DiffChange.link_repository_index` will use to
+// reference it for the remainder of this stream. Server emits each entry
+// at most once, in discovery order starting at index 1, strictly before
+// the first `DiffChange` (or `DiffConflict` half) that references it.
+// Index 0 is reserved for the parent partition and never announced.
+message DiffPartition {
+  // Stable per-stream index. Server assigns 1, 2, 3, … in discovery
+  // order. Never zero.
+  uint32 index = 1;
+  // The partition bytes corresponding to `index` (a Lore `Partition`,
+  // i.e. the repository scope the content of every `DiffChange` with
+  // `link_repository_index == index` resolves under).
+  bytes link_partition = 2;
 }
 
 // A single entry in a revision tree listing.

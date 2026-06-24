@@ -95,22 +95,24 @@ impl EventError for ReleaseError {
     }
 }
 
-/// Data for an event reporting a path whose lock was released.
+/// Data for an event that marks the start of a lock release report.
+#[repr(C)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreLockFileReleaseBeginEventData {
+    /// Number of release entries that follow.
+    pub count: u64,
+    /// Whether no matching lock was found to release.
+    pub not_found: u8,
+}
+
+/// Data for an event reporting a path whose lock is being released.
 #[repr(C)]
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileReleaseEventData {
-    /// Path whose lock was released.
+    /// The path whose lock is being released.
     pub path: LoreString,
-}
-
-/// Data for an event reporting that no matching lock was found to release.
-#[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LoreLockFileReleaseNotFoundEventData {
-    /// Placeholder field; carries no meaningful value.
-    _unused: u32,
 }
 
 pub async fn release(
@@ -228,6 +230,30 @@ pub async fn release(
         return Ok(());
     }
 
+    // We cannot know which locks are going to be released without contacting the server, so every path is reported as a would-be release.
+    if execution_context().globals().dry_run() {
+        let mut paths = resources
+            .iter()
+            .map(|resource| resource.description.clone())
+            .collect::<Vec<_>>();
+        paths.sort();
+
+        event::LoreEvent::LockFileReleaseBegin(LoreLockFileReleaseBeginEventData {
+            count: paths.len() as u64,
+            not_found: 0,
+        })
+        .send();
+
+        for path in paths {
+            event::LoreEvent::LockFileRelease(LoreLockFileReleaseEventData {
+                path: LoreString::from(&path),
+            })
+            .send();
+        }
+
+        return Ok(());
+    }
+
     lore_debug!("Unlocking {} path(s)", resources.len());
 
     let resources_count = resources.len();
@@ -288,14 +314,22 @@ pub async fn release(
     }
 
     if unlocks.is_empty() {
-        event::LoreEvent::LockFileReleaseNotFound(LoreLockFileReleaseNotFoundEventData::default())
-            .send();
+        event::LoreEvent::LockFileReleaseBegin(LoreLockFileReleaseBeginEventData {
+            count: 0,
+            not_found: 1,
+        })
+        .send();
     } else {
         unlocks
             .sort_by(|resource_a, resource_b| resource_a.description.cmp(&resource_b.description));
 
         // Generate structured output for locks successfully released
         lore_debug!("Unlocked {} path(s)", unlocks.len());
+        event::LoreEvent::LockFileReleaseBegin(LoreLockFileReleaseBeginEventData {
+            count: unlocks.len() as u64,
+            not_found: 0,
+        })
+        .send();
         for unlock in unlocks.iter() {
             event::LoreEvent::LockFileRelease(LoreLockFileReleaseEventData {
                 path: LoreString::from(&unlock.description),

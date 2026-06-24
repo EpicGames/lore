@@ -404,6 +404,11 @@ impl RelativePath {
         overlaps_impl(self.as_str(), other.as_ref())
     }
 
+    /// Returns `true` if `self` equals `child` or is a path-ancestor of it.
+    pub fn covers(&self, child: &impl AsRef<str>) -> bool {
+        covers_impl(self.as_str(), child.as_ref())
+    }
+
     /// Reduces a set of paths to the minimal covering set by removing exact
     /// duplicates and replacing any descendant path with its ancestor — so each
     /// returned path is a superset of the input paths it covers.

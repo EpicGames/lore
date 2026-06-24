@@ -67,19 +67,34 @@ class _XdistControllerCleanup:
 
 
 def allocate_free_port(host: str = "127.0.0.1") -> int:
-    """Ask the OS for a free ephemeral port by briefly binding to :0.
+    """Ask the OS for a loopback port free for both TCP and UDP.
 
-    Only loopback is supported — the allocation and the subsequent server
-    bind must target the same address space; binding to 0.0.0.0 or a LAN IP
-    would allocate against a different port namespace than the loopback
-    clients use.
+    gRPC (TCP) and QUIC (UDP) share one port number, so a TCP-only probe is
+    not enough: on Windows a TCP-free port can be reserved for UDP, failing
+    the QUIC bind with WSAEACCES. We pick a TCP port and confirm the same
+    number is UDP-bindable, retrying otherwise.
     """
     assert host == "127.0.0.1", (
         f"allocate_free_port only supports 127.0.0.1, got {host!r}"
     )
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((host, 0))
-        return s.getsockname()[1]
+    last_err: OSError | None = None
+    for _ in range(20):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as tcp:
+            tcp.bind((host, 0))
+            port = tcp.getsockname()[1]
+            udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                udp.bind((host, port))
+            except OSError as e:
+                last_err = e
+                continue
+            finally:
+                udp.close()
+            return port
+    raise ServerException(
+        f"Could not find a port free for both TCP and UDP on {host} "
+        f"after 20 attempts; last UDP bind error: {last_err}"
+    )
 
 
 def generate_server_config(request, tmp_path_factory, ports: dict):
@@ -127,10 +142,10 @@ def generate_server_config(request, tmp_path_factory, ports: dict):
             "RUST_LOG": rust_log,
             "RUST_BACKTRACE": "1",
             "LORE__SERVER__QUIC__PORT": str(ports["quic"]),
-            # QUIC internal runs by default on the same port as Replication (using UDP instead of TCP)
-            "LORE__SERVER__QUIC_INTERNAL__PORT": str(ports["replication"]),
+            # QUIC internal runs on the same port as gRPC internal (UDP vs TCP)
+            "LORE__SERVER__QUIC_INTERNAL__PORT": str(ports["internal"]),
             "LORE__SERVER__GRPC__PORT": str(ports["grpc"]),
-            "LORE__SERVER__REPLICATION__PORT": str(ports["replication"]),
+            "LORE__SERVER__GRPC_INTERNAL__PORT": str(ports["internal"]),
             "LORE__SERVER__HTTP__PORT": str(ports["http"]),
             "LORE_ENV": "gha",
         }
@@ -154,7 +169,7 @@ def launch_lore_server(server_root, server_env, executable_path):
         "LORE__SERVER__GRPC__PORT",
         "LORE__SERVER__QUIC__PORT",
         "LORE__SERVER__QUIC_INTERNAL__PORT",
-        "LORE__SERVER__REPLICATION__PORT",
+        "LORE__SERVER__GRPC_INTERNAL__PORT",
     ):
         _check_port_free(
             "127.0.0.1", server_env[port_key], label=f"{server_name} ({port_key})"
@@ -181,9 +196,11 @@ def launch_lore_server(server_root, server_env, executable_path):
 
     # Wait for the server to be ready via health check instead of a blind sleep
     quic_port = server_env["LORE__SERVER__QUIC__PORT"]
+    grpc_port = server_env["LORE__SERVER__GRPC__PORT"]
     try:
         _wait_for_health_check("127.0.0.1", http_port)
         _wait_for_quic_port("127.0.0.1", quic_port)
+        _wait_for_grpc_port("127.0.0.1", grpc_port)
     except ServerException:
         if server_proc.returncode is not None:
             print(
@@ -384,6 +401,38 @@ def _wait_for_quic_port(host, port, retries=10, delay=0.5):
 
     raise ServerException(
         f"QUIC port {port} did not become ready after {retries} attempts."
+    )
+
+
+def _wait_for_grpc_port(host, port, retries=20, delay=0.5):
+    """Poll until the gRPC (TCP) port accepts connections.
+
+    gRPC shares the QUIC port number but listens over TCP, so it is a separate
+    listener that can bind slightly later than the HTTP health check and the
+    QUIC (UDP) port both pass. A gRPC operation issued in that window — e.g.
+    `repository create`, used to set up the topology fixtures — would otherwise
+    hit a transport error. A successful TCP connect confirms the listener is
+    accepting; this races most under parallel workers.
+    """
+    for attempt in range(retries):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(1)
+        try:
+            sock.connect((host, int(port)))
+            logger.info(
+                "gRPC port %s ready on attempt %d",
+                port,
+                attempt + 1,
+            )
+            return
+        except (ConnectionRefusedError, OSError):
+            # Listener not bound yet
+            sleep(delay)
+        finally:
+            sock.close()
+
+    raise ServerException(
+        f"gRPC port {port} did not become ready after {retries} attempts."
     )
 
 

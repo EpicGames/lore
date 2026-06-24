@@ -74,7 +74,7 @@ Next, configure your local server to use the certs for the replication gRPC serv
 `local.toml`
 
 ```toml
-[server.replication.certificate]
+[server.grpc_internal.certificate]
 cert_file = "./certs/server.crt"
 pkey_file = "./certs/server.key"
 cert_chain = "./certs/ca.crt"

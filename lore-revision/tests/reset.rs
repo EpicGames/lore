@@ -169,6 +169,7 @@ mod tests {
                     link: None,
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
+                    stats: false,
                 };
                 let _signature =
                     Box::pin(commit::commit(repository.clone(), &write_token, options))
@@ -257,6 +258,7 @@ mod tests {
                 // Reset all changes to the repository without purging
                 reset::reset(
                     repository.clone(),
+                    &write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     LoreString::default(),
                     ResetOptions::default(),
@@ -289,6 +291,7 @@ mod tests {
                 // Reset all changes to the repository this time purging untracked files
                 reset::reset(
                     repository.clone(),
+                    &write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     LoreString::default(),
                     ResetOptions {
@@ -341,6 +344,7 @@ mod tests {
                         force_context,
                         reset::reset(
                             repository.clone(),
+                            &write_token,
                             LoreArray::from_vec(vec![LoreString::from(&path)]),
                             LoreString::default(),
                             ResetOptions {
@@ -449,6 +453,7 @@ mod tests {
                     link: None,
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
+                    stats: false,
                 };
                 let _signature =
                     Box::pin(commit::commit(repository.clone(), &write_token, options))
@@ -504,6 +509,7 @@ mod tests {
                 // Reset the modified file without purging
                 reset::reset(
                     repository.clone(),
+                    &write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     LoreString::default(),
                     ResetOptions::default(),
@@ -612,6 +618,7 @@ mod tests {
                     link: None,
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
+                    stats: false,
                 };
                 let _signature =
                     Box::pin(commit::commit(repository.clone(), &write_token, options))
@@ -641,6 +648,7 @@ mod tests {
                 // Reset the modified file without purging, expect it to fail
                 reset::reset(
                     repository.clone(),
+                    &write_token,
                     LoreArray::from_vec(vec![LoreString::from(&path)]),
                     LoreString::default(),
                     ResetOptions::default(),

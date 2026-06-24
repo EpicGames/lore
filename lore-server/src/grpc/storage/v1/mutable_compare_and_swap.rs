@@ -14,7 +14,7 @@ use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::log_server_error;
-use crate::grpc::map_message_handle_error;
+use crate::grpc::simple_map_message_handle_error;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::mutable_cas::handle_mutable_cas;
 use crate::util::setup_execution;
@@ -59,7 +59,7 @@ pub async fn handler(
                     current_value: bytes::Bytes::copy_from_slice(resp.current_value.as_ref()),
                 })
             })
-            .map_err(map_message_handle_error)
+            .map_err(simple_map_message_handle_error)
             .inspect_err(log_server_error)
         })
         .await

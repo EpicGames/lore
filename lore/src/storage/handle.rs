@@ -66,6 +66,14 @@ pub fn immutable_for_test(handle: LoreStore) -> Option<Arc<dyn lore_storage::Imm
     lookup(handle).map(|store| store.immutable.clone())
 }
 
+/// Test-only helper: return the underlying `Arc<dyn MutableStore>` for a registered handle.
+/// Integration tests use this to assert mutable-store state directly. `#[doc(hidden)]` keeps it
+/// out of the public surface.
+#[doc(hidden)]
+pub fn mutable_for_test(handle: LoreStore) -> Option<Arc<dyn lore_storage::MutableStore>> {
+    lookup(handle).map(|store| store.mutable.clone())
+}
+
 /// Drain every entry in the registry, returning each `(handle_id, Arc<StoreInternal>)` pair
 /// the registry held. After this call the registry is empty. Used by the library-level
 /// shutdown path to walk + close every outstanding handle in one pass without racing against

@@ -49,6 +49,7 @@ use crate::util::path::RelativePathBuf;
 pub mod add;
 pub mod list;
 pub mod remove;
+pub(crate) mod reset;
 pub mod update;
 
 #[error_set]
@@ -543,6 +544,79 @@ pub async fn restore_link_paths_from_state(
         .forward::<LinkError>("Failed finalizing filesystem operation")?;
 
     Ok(())
+}
+
+/// Returns the absolute path of every staged link node (add, delete, or
+/// update) across both states' link registries.
+pub async fn list_staged_node_paths(
+    state_current: &Arc<State>,
+    state_staged: &Arc<State>,
+    repository: Arc<RepositoryContext>,
+) -> Result<Vec<String>, LinkError> {
+    let staged_links = state_staged
+        .link_list(repository.clone())
+        .await
+        .forward::<LinkError>("Failed to list staged links")?;
+    let current_links = state_current
+        .link_list(repository.clone())
+        .await
+        .forward::<LinkError>("Failed to list current links")?;
+
+    let mut seen: std::collections::HashSet<NodeID> = std::collections::HashSet::new();
+    let mut paths = Vec::new();
+
+    for link_reference in staged_links.iter().chain(current_links.iter()) {
+        if !seen.insert(link_reference.local_node) {
+            continue;
+        }
+        let Ok(node) = state_staged
+            .node(repository.clone(), link_reference.local_node)
+            .await
+        else {
+            continue;
+        };
+        if !node.is_staged() {
+            continue;
+        }
+        let Ok(path) = state_staged
+            .node_path(repository.clone(), link_reference.local_node)
+            .await
+        else {
+            continue;
+        };
+        let absolute = repository.require_path()?.join(&path);
+        paths.push(absolute.to_string_lossy().into_owned());
+    }
+    Ok(paths)
+}
+
+/// Returns true if `staged_node` is a staged link pin change (an update to an
+/// existing link, not an add or remove) with no staged changes on the linked
+/// side.
+pub async fn is_staged_pin_change(
+    staged_node: &Node,
+    current_node: &Node,
+    parent_repository: Arc<RepositoryContext>,
+) -> Result<bool, LinkError> {
+    if !(staged_node.is_link()
+        && staged_node.is_staged()
+        && !staged_node.is_staged_add()
+        && !staged_node.is_staged_delete()
+        && staged_node.address.hash != current_node.address.hash)
+    {
+        return Ok(false);
+    }
+
+    let link = staged_node.linked_node();
+    let linked_repository = Arc::new(parent_repository.to_link_context(link.repository).await);
+    let linked_state = State::deserialize(linked_repository.clone(), link.revision)
+        .await
+        .forward::<LinkError>("Failed deserializing linked state")?;
+    let has_staged_children = linked_state
+        .node_has_staged_children(linked_repository, link.node)
+        .await
+        .forward::<LinkError>("Failed checking linked node children")?;
+    Ok(!has_staged_children)
 }
 
 /// Realizes on-disk content changes when a link pin changes.

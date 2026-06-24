@@ -138,7 +138,7 @@ Compare to: content-defined chunking.
 
 ### Fork
 
-A separate partition with its own access control that shares a source repository's initial content but evolves independently, distinct from a branch. It's a planned future capability, filled in lazily through copy-on-read.
+A separate partition with its own access control that shares a source repository's initial content but evolves independently, distinct from a branch. It's a [planned future capability](roadmap.md), filled in lazily through copy-on-read.
 
 Compare to: branch, partition.
 

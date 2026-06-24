@@ -1644,3 +1644,225 @@ def test_file_diff3_binary_emits_marker(new_lore_repo):
             f"Binary diff3 must not emit conflict marker {marker!r}.\nOutput:\n"
             + output
         )
+
+
+@pytest.mark.smoke
+def test_diff_staged_move_shown_as_move(new_lore_repo):
+    """Diff of a staged move should show a single move, not a delete + add.
+
+    A file that has been renamed via ``stage move`` carries a move action. The
+    diff output must reflect that move (connecting the original path to the new
+    path) rather than decomposing it into an unrelated deletion of the old path
+    and addition of the new path.
+    """
+    repo: Lore = new_lore_repo()
+
+    original = "movetest.txt"
+    renamed = "renamedmove.txt"
+
+    # Commit the file so it exists in the current revision.
+    repo.write_commit_push(
+        "Add file that will be moved",
+        {original: ["test content\n"]},
+        offline=True,
+    )
+
+    # Rename it on disk, then record the move in staging.
+    repo.move(original, renamed)
+    repo.stage_move(original, renamed, offline=True)
+
+    output = repo.diff(offline=True)
+
+    # The move must not be rendered as a deletion of the original path...
+    assert f"--- {original}" not in output or "+++ /dev/null" not in output, (
+        "Diff rendered the staged move as a deletion of the original path "
+        "instead of a move.\nOutput:\n" + output
+    )
+    # ...nor as a brand-new addition of the renamed path.
+    assert "--- /dev/null" not in output or f"+++ {renamed}" not in output, (
+        "Diff rendered the staged move as an addition of the renamed path "
+        "instead of a move.\nOutput:\n" + output
+    )
+
+    # The move should appear as a single entry that connects both paths, naming
+    # the original path as the move source and the renamed path as the move
+    # destination.
+    assert f"move from {original}" in output, (
+        "Diff did not name the original path as the move source.\nOutput:\n"
+        + output
+    )
+    assert f"move to {renamed}" in output, (
+        "Diff did not name the renamed path as the move destination.\nOutput:\n"
+        + output
+    )
+
+
+@pytest.mark.smoke
+def test_diff_staged_move_with_edit_shows_move_and_content(new_lore_repo):
+    """A staged move whose content also changed shows the move and the hunks.
+
+    On top of the ``move from``/``move to`` header connecting the two paths, the
+    diff must also render the unified-diff hunks for the content change against
+    the original file, rather than splitting the rename into a delete + add.
+    """
+    repo: Lore = new_lore_repo()
+
+    original = "movetest.txt"
+    renamed = "renamedmove.txt"
+
+    # Commit the file so it exists in the current revision.
+    repo.write_commit_push(
+        "Add file that will be moved and edited",
+        {original: ["line one\n", "line two\n"]},
+        offline=True,
+    )
+
+    # Rename it on disk and record the move, then edit the renamed file.
+    repo.move(original, renamed)
+    repo.stage_move(original, renamed, offline=True)
+    with repo.open_file(renamed, "w") as renamed_file:
+        renamed_file.writelines(["line one\n", "line two changed\n"])
+
+    output = repo.diff(offline=True)
+
+    # The rename must not be split into a delete of the original path or an
+    # addition of the renamed path.
+    assert "+++ /dev/null" not in output, (
+        "Diff rendered the moved-and-edited file as a deletion.\nOutput:\n" + output
+    )
+    assert "--- /dev/null" not in output, (
+        "Diff rendered the moved-and-edited file as an addition.\nOutput:\n" + output
+    )
+
+    # The move is reported connecting both paths...
+    assert f"move from {original}" in output, (
+        "Diff did not name the original path as the move source.\nOutput:\n" + output
+    )
+    assert f"move to {renamed}" in output, (
+        "Diff did not name the renamed path as the move destination.\nOutput:\n"
+        + output
+    )
+
+    # ...and the content change is rendered as unified-diff hunks against the
+    # original content.
+    assert "-line two\n" in output, (
+        "Diff did not show the original line as removed.\nOutput:\n" + output
+    )
+    assert "+line two changed\n" in output, (
+        "Diff did not show the edited line as added.\nOutput:\n" + output
+    )
+
+
+@pytest.mark.smoke
+def test_diff_revision_to_revision_move_shown_as_move(new_lore_repo):
+    """A committed rename between two revisions shows as a move, not delete + add.
+
+    Diffing a source revision against a target revision that renamed (and edited)
+    a file must connect the two paths via the move header and render the content
+    change as hunks, rather than as an unrelated deletion plus addition.
+    """
+    repo: Lore = new_lore_repo()
+
+    original = "movetest.txt"
+    renamed = "renamedmove.txt"
+
+    # Base revision with the original file.
+    repo.write_commit_push(
+        "Add file that will be moved",
+        {original: ["line one\n", "line two\n"]},
+        offline=True,
+    )
+    source_rev = repo.revision_info(offline=True).signature
+
+    # Rename and edit on a feature branch, producing the target revision.
+    repo.branch_create("feature", offline=True)
+    repo.move(original, renamed)
+    repo.stage_move(original, renamed, offline=True)
+    with repo.open_file(renamed, "w") as renamed_file:
+        renamed_file.writelines(["line one\n", "line two changed\n"])
+    repo.stage(renamed, offline=True)
+    repo.commit("Rename and edit on feature", offline=True)
+    target_rev = repo.revision_info(offline=True).signature
+
+    output = repo.file_diff(source=source_rev, target=target_rev, offline=True)
+
+    # Not split into a deletion of the original or an addition of the renamed path.
+    assert "+++ /dev/null" not in output, (
+        "Revision diff rendered the move as a deletion.\nOutput:\n" + output
+    )
+    assert "--- /dev/null" not in output, (
+        "Revision diff rendered the move as an addition.\nOutput:\n" + output
+    )
+
+    # Shown as a move connecting both paths, with the content change as hunks.
+    assert f"move from {original}" in output, (
+        "Revision diff did not name the original path as the move source.\nOutput:\n"
+        + output
+    )
+    assert f"move to {renamed}" in output, (
+        "Revision diff did not name the renamed path as the move destination.\n"
+        "Output:\n" + output
+    )
+    assert "-line two\n" in output, (
+        "Revision diff did not show the original line as removed.\nOutput:\n" + output
+    )
+    assert "+line two changed\n" in output, (
+        "Revision diff did not show the edited line as added.\nOutput:\n" + output
+    )
+
+
+@pytest.mark.smoke
+def test_diff3_move_shown_as_move(new_lore_repo):
+    """diff3 of a branch that renamed a file shows the move, not delete + add.
+
+    With the rename done only on the source branch, diff3 surfaces that branch's
+    contribution as a move connecting the two paths, with the accompanying
+    content change rendered as hunks against the merge base.
+    """
+    repo: Lore = new_lore_repo()
+
+    original = "movetest.txt"
+    renamed = "renamedmove.txt"
+
+    # Base commit on main becomes the merge base.
+    repo.write_commit_push(
+        "Initial commit",
+        {original: ["line one\n", "line two\n"]},
+        offline=True,
+    )
+
+    # Feature branch renames and edits the file.
+    repo.branch_create("feature", offline=True)
+    repo.move(original, renamed)
+    repo.stage_move(original, renamed, offline=True)
+    with repo.open_file(renamed, "w") as renamed_file:
+        renamed_file.writelines(["line one\n", "line two changed\n"])
+    repo.stage(renamed, offline=True)
+    repo.commit("Rename and edit on feature", offline=True)
+    feature_rev = repo.revision_info(offline=True).signature
+
+    # Main is unchanged, so the rename is the source branch's sole contribution.
+    repo.branch_switch("main", offline=True)
+    main_rev = repo.revision_info(offline=True).signature
+
+    output = repo.file_diff(
+        source=main_rev, target=feature_rev, diff3=True, offline=True
+    )
+
+    assert "+++ /dev/null" not in output, (
+        "diff3 rendered the move as a deletion.\nOutput:\n" + output
+    )
+    assert "--- /dev/null" not in output, (
+        "diff3 rendered the move as an addition.\nOutput:\n" + output
+    )
+    assert f"move from {original}" in output, (
+        "diff3 did not name the original path as the move source.\nOutput:\n" + output
+    )
+    assert f"move to {renamed}" in output, (
+        "diff3 did not name the renamed path as the move destination.\nOutput:\n"
+        + output
+    )
+    assert "+line two changed\n" in output, (
+        "diff3 did not show the source branch's edit as an added line.\nOutput:\n"
+        + output
+    )

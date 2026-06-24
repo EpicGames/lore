@@ -133,13 +133,14 @@ async fn get_file_local(
             }
             let effective = store.effective_flags(per_call)?;
             let total = items.len();
+            let mut reuse = crate::storage::store::SessionReuse::default();
             let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
             for item in items {
+                let session = reuse.session_for(&store, item.partition, !effective.no_remote);
                 let store = store.clone();
-                lore_spawn!(
-                    tasks,
-                    async move { get_file_item(store, item, effective).await }
-                );
+                lore_spawn!(tasks, async move {
+                    get_file_item(store, item, effective, session).await
+                });
             }
             let codes = crate::storage::drain_codes(tasks).await;
             crate::storage::build_call_error(&codes, total, "get_file")
@@ -152,8 +153,9 @@ async fn get_file_item(
     store: Arc<StoreInternal>,
     item: LoreStorageGetFileItem,
     effective: crate::storage::store::EffectiveFlags,
+    session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
-    let error_code = resolve_get_file_item(store, &item, effective).await;
+    let error_code = resolve_get_file_item(store, &item, effective, session).await;
     let address = if error_code == LoreErrorCode::None {
         item.address
     } else {
@@ -172,6 +174,7 @@ async fn resolve_get_file_item(
     store: Arc<StoreInternal>,
     item: &LoreStorageGetFileItem,
     effective: crate::storage::store::EffectiveFlags,
+    remote_session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
     if item.partition == Partition::default() {
         return LoreErrorCode::InvalidArguments;
@@ -189,11 +192,6 @@ async fn resolve_get_file_item(
         };
     }
 
-    let remote_session = if effective.no_remote {
-        None
-    } else {
-        store.remote_session_for(item.partition)
-    };
     let mut read_options = effective.read_options(remote_session.is_some());
     if item.local_cache != 0 {
         read_options = read_options.with_cache();

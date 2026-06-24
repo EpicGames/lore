@@ -48,7 +48,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define LORE_INTERFACE_VERSION "0.8.3-nightly"
+#define LORE_INTERFACE_VERSION "0.8.4-nightly"
 
 // Severity level of a log message.
 typedef enum lore_log_level_t {
@@ -129,6 +129,24 @@ typedef enum lore_metadata_type_t {
   // A string value.
   LORE_METADATA_TYPE_STRING = 2,
 } lore_metadata_type_t;
+
+// Kind of value a stored key refers to.
+typedef enum lore_key_type_t {
+  // Key has no specific type.
+  LORE_KEY_TYPE_UNTYPED = 0,
+  // Key refers to branch metadata.
+  LORE_KEY_TYPE_BRANCH_METADATA = 1,
+  // Key refers to a branch identifier.
+  LORE_KEY_TYPE_BRANCH_ID = 2,
+  // Key refers to a pointer to a branch's latest revision.
+  LORE_KEY_TYPE_BRANCH_LATEST_POINTER = 3,
+  // Key refers to repository metadata.
+  LORE_KEY_TYPE_REPOSITORY_METADATA = 4,
+  // Key refers to a repository identifier.
+  LORE_KEY_TYPE_REPOSITORY_ID = 5,
+  // Key refers to a repository instance.
+  LORE_KEY_TYPE_INSTANCE = 6,
+} lore_key_type_t;
 
 // Data for a generic progress event.
 typedef struct lore_progress_event_data_t {
@@ -1459,17 +1477,19 @@ typedef struct lore_link_entry_event_data_t {
   uint32_t flags;
 } lore_link_entry_event_data_t;
 
-// Data for an event reporting a path whose lock was acquired.
+// Data for an event that marks the start of a lock acquire report.
+typedef struct lore_lock_file_acquire_begin_event_data_t {
+  // Number of acquire entries that follow.
+  uint64_t count;
+  // Whether the entries that follow were already owned.
+  uint8_t ignored;
+} lore_lock_file_acquire_begin_event_data_t;
+
+// Data for an event reporting a path whose lock is being acquired.
 typedef struct lore_lock_file_acquire_event_data_t {
-  // Path whose lock was acquired.
+  // The path whose lock is being acquired.
   struct lore_string_t path;
 } lore_lock_file_acquire_event_data_t;
-
-// Data for an event reporting a path that was skipped because its lock was already held.
-typedef struct lore_lock_file_acquire_ignore_event_data_t {
-  // Path that was skipped.
-  struct lore_string_t path;
-} lore_lock_file_acquire_ignore_event_data_t;
 
 // Data for an event that marks the start of a lock status report.
 typedef struct lore_lock_file_status_begin_event_data_t {
@@ -1505,17 +1525,19 @@ typedef struct lore_lock_file_query_event_data_t {
   uint64_t locked_at;
 } lore_lock_file_query_event_data_t;
 
-// Data for an event reporting a path whose lock was released.
+// Data for an event that marks the start of a lock release report.
+typedef struct lore_lock_file_release_begin_event_data_t {
+  // Number of release entries that follow.
+  uint64_t count;
+  // Whether no matching lock was found to release.
+  uint8_t not_found;
+} lore_lock_file_release_begin_event_data_t;
+
+// Data for an event reporting a path whose lock is being released.
 typedef struct lore_lock_file_release_event_data_t {
-  // Path whose lock was released.
+  // The path whose lock is being released.
   struct lore_string_t path;
 } lore_lock_file_release_event_data_t;
-
-// Data for an event reporting that no matching lock was found to release.
-typedef struct lore_lock_file_release_not_found_event_data_t {
-  // Placeholder field; carries no meaningful value.
-  uint32_t _unused;
-} lore_lock_file_release_not_found_event_data_t;
 
 // Data for an event reporting that a file's metadata was cleared.
 typedef struct lore_metadata_clear_file_event_data_t {
@@ -2620,6 +2642,93 @@ typedef struct lore_revision_tree_close_complete_event_data_t {
   enum lore_error_code_t error_code;
 } lore_revision_tree_close_complete_event_data_t;
 
+// Terminal per-item event for `mutable_load`. On success `error_code == None` and `value` is
+// the loaded value hash (`Hash::default()` when the key holds a null/removed value); on miss
+// `error_code == ADDRESS_NOT_FOUND` and `value` is zero.
+typedef struct lore_storage_mutable_load_item_complete_event_data_t {
+  // Correlation id of the item.
+  uint64_t id;
+  // The value stored for the key.
+  struct lore_hash_t value;
+  // The outcome for the item.
+  enum lore_error_code_t error_code;
+} lore_storage_mutable_load_item_complete_event_data_t;
+
+// Terminal per-item event for `mutable_store`. `error_code == None` on a successful store.
+typedef struct lore_storage_mutable_store_item_complete_event_data_t {
+  // Correlation id of the item.
+  uint64_t id;
+  // The outcome for the item.
+  enum lore_error_code_t error_code;
+} lore_storage_mutable_store_item_complete_event_data_t;
+
+// Terminal per-item event for `mutable_compare_and_swap`. `previous` is the value the key held
+// before the swap (equal to the caller's `expected` when the swap took effect, otherwise the
+// actual current value). `error_code == None` on success.
+typedef struct lore_storage_mutable_compare_and_swap_item_complete_event_data_t {
+  // Correlation id of the item.
+  uint64_t id;
+  // The value the key held before the swap.
+  struct lore_hash_t previous;
+  // The outcome for the item.
+  enum lore_error_code_t error_code;
+} lore_storage_mutable_compare_and_swap_item_complete_event_data_t;
+
+// One `(key, value)` pair emitted by `mutable_list`, before the item's terminal event.
+typedef struct lore_storage_mutable_list_entry_event_data_t {
+  // Correlation id of the listing item.
+  uint64_t id;
+  // The key of this entry.
+  struct lore_hash_t key;
+  // The value stored for the key.
+  struct lore_hash_t value;
+} lore_storage_mutable_list_entry_event_data_t;
+
+// Terminal per-item event for `mutable_list`, emitted after every `MUTABLE_LIST_ENTRY` for the
+// item. `error_code == None` once the listing completes.
+typedef struct lore_storage_mutable_list_item_complete_event_data_t {
+  // Correlation id of the listing item.
+  uint64_t id;
+  // The outcome for the item.
+  enum lore_error_code_t error_code;
+} lore_storage_mutable_list_item_complete_event_data_t;
+
+// Data for the start of a store eviction pass.
+typedef struct lore_eviction_begin_event_data_t {
+  // Fragment capacity the pass is reducing the store toward.
+  uint64_t target_fragments;
+} lore_eviction_begin_event_data_t;
+
+// Data for one bucket evicted during a store eviction pass.
+typedef struct lore_eviction_progress_event_data_t {
+  // Fragments evicted from this bucket.
+  uint64_t evicted;
+} lore_eviction_progress_event_data_t;
+
+// Data for the end of a store eviction pass.
+typedef struct lore_eviction_end_event_data_t {
+  // Total fragments evicted across the pass.
+  uint64_t total_evicted;
+} lore_eviction_end_event_data_t;
+
+// Data for the start of a store compaction pass.
+typedef struct lore_compaction_begin_event_data_t {
+  // Store size in bytes the pass is reducing the store toward.
+  uint64_t target_bytes;
+} lore_compaction_begin_event_data_t;
+
+// Data for one group compacted during a store compaction pass.
+typedef struct lore_compaction_progress_event_data_t {
+  // Bytes reclaimed from this group.
+  uint64_t compacted_bytes;
+} lore_compaction_progress_event_data_t;
+
+// Data for the end of a store compaction pass.
+typedef struct lore_compaction_end_event_data_t {
+  // Total bytes reclaimed across the pass.
+  uint64_t total_compacted_bytes;
+} lore_compaction_end_event_data_t;
+
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
 enum lore_event_id_t {
@@ -2863,10 +2972,10 @@ enum lore_event_id_t {
   LORE_EVENT_LINK_CHANGE,
   // One entry in a link listing.
   LORE_EVENT_LINK_ENTRY,
-  // A file lock was acquired.
+  // The start of a file lock acquire report.
+  LORE_EVENT_LOCK_FILE_ACQUIRE_BEGIN,
+  // A file concerning the lock acquire report.
   LORE_EVENT_LOCK_FILE_ACQUIRE,
-  // A file lock acquisition was ignored.
-  LORE_EVENT_LOCK_FILE_ACQUIRE_IGNORE,
   // The start of a file lock status report.
   LORE_EVENT_LOCK_FILE_STATUS_BEGIN,
   // One file lock status entry.
@@ -2875,10 +2984,10 @@ enum lore_event_id_t {
   LORE_EVENT_LOCK_FILE_QUERY_BEGIN,
   // One file lock query result.
   LORE_EVENT_LOCK_FILE_QUERY,
-  // A file lock was released.
+  // The start of a file lock release report.
+  LORE_EVENT_LOCK_FILE_RELEASE_BEGIN,
+  // A file concerning the lock release report.
   LORE_EVENT_LOCK_FILE_RELEASE,
-  // A file lock to release was not found.
-  LORE_EVENT_LOCK_FILE_RELEASE_NOT_FOUND,
   // Metadata was cleared on a file.
   LORE_EVENT_METADATA_CLEAR_FILE,
   // Metadata was cleared on a revision.
@@ -3049,6 +3158,28 @@ enum lore_event_id_t {
   LORE_EVENT_REVISION_TREE_COMMIT_COMPLETE,
   // A close call completed.
   LORE_EVENT_REVISION_TREE_CLOSE_COMPLETE,
+  // A mutable-load item completed.
+  LORE_EVENT_STORAGE_MUTABLE_LOAD_ITEM_COMPLETE,
+  // A mutable-store item completed.
+  LORE_EVENT_STORAGE_MUTABLE_STORE_ITEM_COMPLETE,
+  // A mutable-compare-and-swap item completed.
+  LORE_EVENT_STORAGE_MUTABLE_COMPARE_AND_SWAP_ITEM_COMPLETE,
+  // One key-value entry in a mutable listing.
+  LORE_EVENT_STORAGE_MUTABLE_LIST_ENTRY,
+  // A mutable-list item completed.
+  LORE_EVENT_STORAGE_MUTABLE_LIST_ITEM_COMPLETE,
+  // A store eviction pass began.
+  LORE_EVENT_EVICTION_BEGIN,
+  // One bucket was evicted during a store eviction pass.
+  LORE_EVENT_EVICTION_PROGRESS,
+  // A store eviction pass ended.
+  LORE_EVENT_EVICTION_END,
+  // A store compaction pass began.
+  LORE_EVENT_COMPACTION_BEGIN,
+  // One group was compacted during a store compaction pass.
+  LORE_EVENT_COMPACTION_PROGRESS,
+  // A store compaction pass ended.
+  LORE_EVENT_COMPACTION_END,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -3175,14 +3306,14 @@ typedef struct lore_event_t {
     struct lore_layer_staged_entry_event_data_t layer_staged_entry;
     struct lore_link_change_event_data_t link_change;
     struct lore_link_entry_event_data_t link_entry;
+    struct lore_lock_file_acquire_begin_event_data_t lock_file_acquire_begin;
     struct lore_lock_file_acquire_event_data_t lock_file_acquire;
-    struct lore_lock_file_acquire_ignore_event_data_t lock_file_acquire_ignore;
     struct lore_lock_file_status_begin_event_data_t lock_file_status_begin;
     struct lore_lock_file_status_event_data_t lock_file_status;
     struct lore_lock_file_query_begin_event_data_t lock_file_query_begin;
     struct lore_lock_file_query_event_data_t lock_file_query;
+    struct lore_lock_file_release_begin_event_data_t lock_file_release_begin;
     struct lore_lock_file_release_event_data_t lock_file_release;
-    struct lore_lock_file_release_not_found_event_data_t lock_file_release_not_found;
     struct lore_metadata_clear_file_event_data_t metadata_clear_file;
     struct lore_metadata_clear_revision_event_data_t metadata_clear_revision;
     struct lore_path_ignore_event_data_t path_ignore;
@@ -3268,6 +3399,17 @@ typedef struct lore_event_t {
     struct lore_revision_tree_metadata_get_complete_event_data_t revision_tree_metadata_get_complete;
     struct lore_revision_tree_commit_complete_event_data_t revision_tree_commit_complete;
     struct lore_revision_tree_close_complete_event_data_t revision_tree_close_complete;
+    struct lore_storage_mutable_load_item_complete_event_data_t storage_mutable_load_item_complete;
+    struct lore_storage_mutable_store_item_complete_event_data_t storage_mutable_store_item_complete;
+    struct lore_storage_mutable_compare_and_swap_item_complete_event_data_t storage_mutable_compare_and_swap_item_complete;
+    struct lore_storage_mutable_list_entry_event_data_t storage_mutable_list_entry;
+    struct lore_storage_mutable_list_item_complete_event_data_t storage_mutable_list_item_complete;
+    struct lore_eviction_begin_event_data_t eviction_begin;
+    struct lore_eviction_progress_event_data_t eviction_progress;
+    struct lore_eviction_end_event_data_t eviction_end;
+    struct lore_compaction_begin_event_data_t compaction_begin;
+    struct lore_compaction_progress_event_data_t compaction_progress;
+    struct lore_compaction_end_event_data_t compaction_end;
   };
 } lore_event_t;
 
@@ -3297,8 +3439,8 @@ typedef struct lore_global_args_t {
   uint32_t search_limit;
   // Allow matching to the nearest matching revision when a perfect match is not available
   uint8_t search_nearest;
-  // Run store compaction and eviction in the background
-  uint8_t gc;
+  // Prevent the automatic incremental/step GC for this operation; it otherwise runs in the background on write operations. `repository gc` always runs a full pass regardless
+  uint8_t no_gc;
   // Use in-memory stores instead of file-backed stores. No store data is
   // read from or written to the .urc/immutable/ and .urc/mutable/ directories.
   uint8_t in_memory;
@@ -4089,6 +4231,8 @@ typedef struct lore_revision_commit_args_t {
   struct lore_string_array_t layer_paths;
   // Array of messages corresponding to each layer path (parallel array with `layer_paths`)
   struct lore_string_array_t layer_messages;
+  // Emit per-fragment write stats during the commit
+  bool stats;
 } lore_revision_commit_args_t;
 
 // Arguments for amending the most recent revision's commit message.
@@ -4276,11 +4420,12 @@ typedef struct lore_storage_open_args_t {
   struct lore_storage_remote_config_t remote_config;
   // Activate `remote_config`; otherwise the handle has no remote
   uint8_t has_remote_config;
-  // Soft cap on total immutable-store bytes (compactor target); honored only when `globals.gc`
-  // is set. `0` selects the default; shared disk backends inherit the first opener's value
+  // Soft cap on total immutable-store bytes (compactor target). A non-zero cache target enables
+  // incremental background GC for the handle; `0` then selects the default. Shared disk backends
+  // inherit the first opener's value
   uint64_t cache_target_bytes;
-  // Soft cap on immutable-store fragment count (evictor target); honored only when `globals.gc`
-  // is set. `0` selects the default
+  // Soft cap on immutable-store fragment count (evictor target). A non-zero cache target enables
+  // incremental background GC for the handle; `0` then selects the default
   uint64_t cache_target_fragments;
 } lore_storage_open_args_t;
 
@@ -4424,6 +4569,126 @@ typedef struct lore_storage_obliterate_args_t {
   // Addresses to delete; each runs independently and emits its own `OBLITERATE_ITEM_COMPLETE`
   struct lore_storage_obliterate_item_array_t items;
 } lore_storage_obliterate_args_t;
+
+// One `mutable_load` item — the `(partition, key, key_type)` to read.
+typedef struct lore_storage_mutable_load_item_t {
+  // Caller-chosen id echoed back in `MUTABLE_LOAD_ITEM_COMPLETE`
+  uint64_t id;
+  // Partition (repository) to read from; the zero/default partition rejects with `INVALID_ARGUMENTS`
+  struct lore_partition_t partition;
+  // Key to read
+  struct lore_hash_t key;
+  // Kind of value the key refers to
+  enum lore_key_type_t key_type;
+} lore_storage_mutable_load_item_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_storage_mutable_load_item_array_t {
+  // Pointer to the first element.
+  const struct lore_storage_mutable_load_item_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_storage_mutable_load_item_array_t;
+
+// Arguments for `lore_storage_mutable_load`.
+typedef struct lore_storage_mutable_load_args_t {
+  // Open storage handle
+  struct lore_store_t handle;
+  // Keys to read; each runs independently and emits its own `MUTABLE_LOAD_ITEM_COMPLETE`
+  struct lore_storage_mutable_load_item_array_t items;
+} lore_storage_mutable_load_args_t;
+
+// One `mutable_store` item — the `(partition, key, value, key_type)` to write.
+typedef struct lore_storage_mutable_store_item_t {
+  // Caller-chosen id echoed back in `MUTABLE_STORE_ITEM_COMPLETE`
+  uint64_t id;
+  // Partition (repository) to write to; the zero/default partition rejects with `INVALID_ARGUMENTS`
+  struct lore_partition_t partition;
+  // Key to write
+  struct lore_hash_t key;
+  // Value to store; the null value (`Hash::default()`) removes the key
+  struct lore_hash_t value;
+  // Kind of value the key refers to
+  enum lore_key_type_t key_type;
+} lore_storage_mutable_store_item_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_storage_mutable_store_item_array_t {
+  // Pointer to the first element.
+  const struct lore_storage_mutable_store_item_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_storage_mutable_store_item_array_t;
+
+// Arguments for `lore_storage_mutable_store`.
+typedef struct lore_storage_mutable_store_args_t {
+  // Open storage handle
+  struct lore_store_t handle;
+  // Key-value pairs to write; each runs independently and emits its own `MUTABLE_STORE_ITEM_COMPLETE`
+  struct lore_storage_mutable_store_item_array_t items;
+} lore_storage_mutable_store_args_t;
+
+// One `mutable_compare_and_swap` item — the `(partition, key, expected, value, key_type)` swap.
+typedef struct lore_storage_mutable_compare_and_swap_item_t {
+  // Caller-chosen id echoed back in `MUTABLE_COMPARE_AND_SWAP_ITEM_COMPLETE`
+  uint64_t id;
+  // Partition (repository) to act on; the zero/default partition rejects with `INVALID_ARGUMENTS`
+  struct lore_partition_t partition;
+  // Key to swap
+  struct lore_hash_t key;
+  // Value the key must currently hold for the swap to take effect (null matches an absent key)
+  struct lore_hash_t expected;
+  // Value to store when the swap takes effect; the null value removes the key
+  struct lore_hash_t value;
+  // Kind of value the key refers to
+  enum lore_key_type_t key_type;
+} lore_storage_mutable_compare_and_swap_item_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_storage_mutable_compare_and_swap_item_array_t {
+  // Pointer to the first element.
+  const struct lore_storage_mutable_compare_and_swap_item_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_storage_mutable_compare_and_swap_item_array_t;
+
+// Arguments for `lore_storage_mutable_compare_and_swap`.
+typedef struct lore_storage_mutable_compare_and_swap_args_t {
+  // Open storage handle
+  struct lore_store_t handle;
+  // Swaps to perform; each runs independently and emits its own `MUTABLE_COMPARE_AND_SWAP_ITEM_COMPLETE`
+  struct lore_storage_mutable_compare_and_swap_item_array_t items;
+} lore_storage_mutable_compare_and_swap_args_t;
+
+// One `mutable_list` item — the `(partition, key_type)` to list.
+typedef struct lore_storage_mutable_list_item_t {
+  // Caller-chosen id echoed back on every entry and the terminal event
+  uint64_t id;
+  // Partition (repository) to list; the zero/default partition lists every accessible partition
+  struct lore_partition_t partition;
+  // Kind of value to list
+  enum lore_key_type_t key_type;
+} lore_storage_mutable_list_item_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_storage_mutable_list_item_array_t {
+  // Pointer to the first element.
+  const struct lore_storage_mutable_list_item_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_storage_mutable_list_item_array_t;
+
+// Arguments for `lore_storage_mutable_list`.
+typedef struct lore_storage_mutable_list_args_t {
+  // Open storage handle
+  struct lore_store_t handle;
+  // Listings to perform; each runs independently and emits its own entries and terminal event
+  struct lore_storage_mutable_list_item_array_t items;
+} lore_storage_mutable_list_args_t;
 
 // One copy item — relocate content from `(source_partition, source_address)` to
 // `(target_partition, source_address.hash, target_context)`, preserving the content hash.
@@ -9852,6 +10117,92 @@ int32_t lore_storage_obliterate(const struct lore_global_args_t *globals,
 void lore_storage_obliterate_async(const struct lore_global_args_t *globals,
                                    const struct lore_storage_obliterate_args_t *args,
                                    struct lore_event_callback_config_t callback);
+
+// Read one or more mutable key values.
+//
+// Each item acts on the local mutable store by default, or the remote mutable store when
+// `globals.remote` is set (or the handle was opened remote-bound), over the shared storage
+// session.
+//
+// # Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_STORAGE_MUTABLE_LOAD_ITEM_COMPLETE` | `lore_storage_mutable_load_item_complete_event_data_t` | Per-item terminal event carrying the value; `error_code == ADDRESS_NOT_FOUND` on a miss |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status: 0` iff every item succeeded |
+int32_t lore_storage_mutable_load(const struct lore_global_args_t *globals,
+                                  const struct lore_storage_mutable_load_args_t *args,
+                                  struct lore_event_callback_config_t callback);
+
+// Read one or more mutable key values (async variant).
+void lore_storage_mutable_load_async(const struct lore_global_args_t *globals,
+                                     const struct lore_storage_mutable_load_args_t *args,
+                                     struct lore_event_callback_config_t callback);
+
+// Write one or more mutable key-value pairs. Storing the null value removes the key.
+//
+// Each item acts on the local mutable store by default, or the remote mutable store when
+// `globals.remote` is set (or the handle was opened remote-bound), over the shared storage
+// session.
+//
+// # Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_STORAGE_MUTABLE_STORE_ITEM_COMPLETE` | `lore_storage_mutable_store_item_complete_event_data_t` | Per-item terminal event |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status: 0` iff every item succeeded |
+int32_t lore_storage_mutable_store(const struct lore_global_args_t *globals,
+                                   const struct lore_storage_mutable_store_args_t *args,
+                                   struct lore_event_callback_config_t callback);
+
+// Write one or more mutable key-value pairs (async variant).
+void lore_storage_mutable_store_async(const struct lore_global_args_t *globals,
+                                      const struct lore_storage_mutable_store_args_t *args,
+                                      struct lore_event_callback_config_t callback);
+
+// Conditionally swap one or more mutable key values. Each item updates the key to `value` when
+// its current value matches `expected`, and reports the value the key held before the swap.
+//
+// Each item acts on the local mutable store by default, or the remote mutable store when
+// `globals.remote` is set (or the handle was opened remote-bound), over the shared storage
+// session.
+//
+// # Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_STORAGE_MUTABLE_COMPARE_AND_SWAP_ITEM_COMPLETE` | `lore_storage_mutable_compare_and_swap_item_complete_event_data_t` | Per-item terminal event carrying `previous`; the swap took effect when `previous == expected` |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status: 0` iff every item succeeded |
+int32_t lore_storage_mutable_compare_and_swap(const struct lore_global_args_t *globals,
+                                              const struct lore_storage_mutable_compare_and_swap_args_t *args,
+                                              struct lore_event_callback_config_t callback);
+
+// Conditionally swap one or more mutable key values (async variant).
+void lore_storage_mutable_compare_and_swap_async(const struct lore_global_args_t *globals,
+                                                 const struct lore_storage_mutable_compare_and_swap_args_t *args,
+                                                 struct lore_event_callback_config_t callback);
+
+// List the mutable key-value pairs of a given type for one or more partitions.
+//
+// Acts on the local mutable store only; a remote-targeted call (`globals.remote`, or a
+// remote-bound handle) is rejected with `INVALID_ARGUMENTS`. A zero/default partition lists
+// every partition the caller can access.
+//
+// # Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_STORAGE_MUTABLE_LIST_ENTRY` | `lore_storage_mutable_list_entry_event_data_t` | One `(key, value)` pair, emitted before the item's terminal event |
+// | `LORE_EVENT_STORAGE_MUTABLE_LIST_ITEM_COMPLETE` | `lore_storage_mutable_list_item_complete_event_data_t` | Per-item terminal event |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status: 0` iff every item succeeded |
+int32_t lore_storage_mutable_list(const struct lore_global_args_t *globals,
+                                  const struct lore_storage_mutable_list_args_t *args,
+                                  struct lore_event_callback_config_t callback);
+
+// List mutable key-value pairs (async variant).
+void lore_storage_mutable_list_async(const struct lore_global_args_t *globals,
+                                     const struct lore_storage_mutable_list_args_t *args,
+                                     struct lore_event_callback_config_t callback);
 
 // Copy content from one partition to another within the same store.
 //

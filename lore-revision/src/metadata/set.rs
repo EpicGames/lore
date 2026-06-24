@@ -69,6 +69,18 @@ pub async fn set_revision(
     values: &[&[u8]],
     formats: &[MetadataType],
 ) -> Result<(), SetError> {
+    if keys.len() != values.len() || keys.len() != formats.len() {
+        return Err(InvalidArguments {
+            reason: format!(
+                "metadata requires matching keys, values, and formats (got {} keys, {} values, {} formats)",
+                keys.len(),
+                values.len(),
+                formats.len()
+            ),
+        }
+        .into());
+    }
+
     let (current_revision, _current_branch) = crate::instance::load_current_anchor(&repository)
         .await
         .internal("Failed to deserialize current revision anchor")?;
@@ -324,6 +336,30 @@ pub async fn set_file(
     formats: &[MetadataType],
     entries: &[u32],
 ) -> Result<(), SetError> {
+    if paths.len() != entries.len() {
+        return Err(InvalidArguments {
+            reason: format!(
+                "metadata requires one entry count per path (got {} paths, {} entry counts)",
+                paths.len(),
+                entries.len()
+            ),
+        }
+        .into());
+    }
+
+    let total: usize = entries.iter().map(|count| *count as usize).sum();
+    if total != keys.len() || total != values.len() || total != formats.len() {
+        return Err(InvalidArguments {
+            reason: format!(
+                "metadata requires matching keys, values, and formats (entry counts sum to {total}, got {} keys, {} values, {} formats)",
+                keys.len(),
+                values.len(),
+                formats.len()
+            ),
+        }
+        .into());
+    }
+
     let (current_revision, _current_branch) = crate::instance::load_current_anchor(&repository)
         .await
         .internal("Failed to deserialize current revision anchor")?;
