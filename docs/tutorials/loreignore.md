@@ -33,7 +33,7 @@ In this tutorial, you will set up a `.loreignore` file tailored for Unreal Engin
    .idea/
    *.sln
    *.suo
-   
+
    # UEFN specific (if applicable)
    .urc/
    ```

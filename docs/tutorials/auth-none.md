@@ -9,7 +9,7 @@ In your server's `local.toml`, ensure the following is set:
 ```toml
 [server.quic]
 # Allow any client to connect without a certificate
-verify_client_certs = false 
+verify_client_certs = false
 
 [server.quic.certificate]
 # The server's own certificate (required for TLS/QUIC)
