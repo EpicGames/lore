@@ -18,6 +18,11 @@ output "primary_dns" {
   value       = "primary.${aws_service_discovery_private_dns_namespace.this.name}"
 }
 
+output "edge_dns" {
+  description = "Cloud Map DNS for edge (used by clients)"
+  value       = "edge.${aws_service_discovery_private_dns_namespace.this.name}"
+}
+
 output "s3_bucket" {
   description = "S3 bucket for fragment storage"
   value       = aws_s3_bucket.fragments.id
@@ -31,5 +36,4 @@ output "log_group" {
 output "ca_certificate_pem" {
   description = "CA certificate — clients need this to trust the server's TLS cert"
   value       = local.ca_pem
-  sensitive   = true
 }

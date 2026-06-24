@@ -6,6 +6,7 @@
 
 mock_provider "aws" {}
 mock_provider "tls" {}
+mock_provider "random" {}
 
 override_data {
   target = data.aws_availability_zones.available
@@ -14,13 +15,21 @@ override_data {
   }
 }
 
+override_data {
+  target = data.aws_ssm_parameter.ecs_ami
+  values = {
+    value = "ami-0123456789abcdef0"
+  }
+}
+
 variables {
   container_image = "123456789012.dkr.ecr.us-west-2.amazonaws.com/loreserver:latest"
   allowed_cidrs   = ["10.0.0.0/8"]
   region          = "us-west-2"
+  name            = "lore"
 }
 
-run "primary_service_configured" {
+run "cluster_and_services_configured" {
   command = plan
 
   assert {
@@ -84,5 +93,19 @@ run "service_discovery_configured" {
   assert {
     condition     = aws_service_discovery_service.lore.name == "primary"
     error_message = "Cloud Map service name should be 'primary'"
+  }
+}
+
+run "ec2_infrastructure_configured" {
+  command = plan
+
+  assert {
+    condition     = aws_launch_template.ecs.instance_type == "c8gd.8xlarge"
+    error_message = "Launch template should use c8gd.8xlarge"
+  }
+
+  assert {
+    condition     = aws_autoscaling_group.ecs.min_size == 2
+    error_message = "ASG min size should be 2 (primary + edge)"
   }
 }

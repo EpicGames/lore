@@ -38,8 +38,8 @@ resource "tls_cert_request" "server" {
     organization = "Lore Example"
   }
 
-  # Cloud Map DNS name used by edge pods to reach primary
-  dns_names = ["primary.${local.name}.internal", "localhost"]
+  # Cloud Map DNS names used by clients and inter-node communication
+  dns_names = ["primary.${local.name}.internal", "edge.${local.name}.internal", "localhost"]
 }
 
 resource "tls_locally_signed_cert" "server" {

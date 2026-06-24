@@ -1,9 +1,23 @@
 # =============================================================================
-# ECS Cluster + Primary + Edge Services
+# ECS on EC2 — c8gd.8xlarge with NVMe instance store for fragment caching
+#
+# This is the recommended deployment for Lore. The NVMe instance store provides
+# sub-millisecond fragment reads for clones, while S3 provides durability.
+# c8gd.8xlarge: 32 vCPU, 64 GB RAM, 1x 1.9 TB NVMe, 25 Gbps network.
 # =============================================================================
+
+data "aws_ssm_parameter" "ecs_ami" {
+  name = "/aws/service/ecs/optimized-ami/amazon-linux-2023/arm64/recommended/image_id"
+}
 
 resource "aws_ecs_cluster" "this" {
   name = "${local.name}-cluster"
+
+  setting {
+    name  = "containerInsights"
+    value = "enabled"
+  }
+
   tags = local.tags
 }
 
@@ -14,29 +28,138 @@ resource "aws_cloudwatch_log_group" "lore" {
 }
 
 # =============================================================================
-# Primary — Durable storage (S3 + DynamoDB), serves replication to edge
+# Launch Template + ASG — ECS-managed instances with NVMe setup
+# =============================================================================
+
+resource "aws_launch_template" "ecs" {
+  name_prefix   = "${local.name}-ecs-"
+  image_id      = data.aws_ssm_parameter.ecs_ami.value
+  instance_type = var.instance_type
+
+  iam_instance_profile {
+    arn = aws_iam_instance_profile.ecs_instance.arn
+  }
+
+  vpc_security_group_ids = [aws_security_group.lore.id]
+
+  user_data = base64encode(templatefile("${path.module}/user_data.sh.tpl", {
+    cluster_name = aws_ecs_cluster.this.name
+    mount_path   = "/srv/urc"
+  }))
+
+  metadata_options {
+    http_endpoint               = "enabled"
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
+  }
+
+  tag_specifications {
+    resource_type = "instance"
+    tags          = merge(local.tags, { Name = "${local.name}-ecs" })
+  }
+
+  tags = local.tags
+}
+
+resource "aws_autoscaling_group" "ecs" {
+  name_prefix         = "${local.name}-ecs-"
+  min_size            = 2
+  max_size            = 2
+  desired_capacity    = 2
+  vpc_zone_identifier = aws_subnet.private[*].id
+
+  launch_template {
+    id      = aws_launch_template.ecs.id
+    version = "$Latest"
+  }
+
+  protect_from_scale_in = true
+
+  # Allows terraform destroy to delete the ASG without waiting for capacity
+  # provider reconciliation (~6 min). Remove for production if you want
+  # graceful drain before ASG deletion.
+  force_delete = true
+
+  tag {
+    key                 = "AmazonECSManaged"
+    value               = "true"
+    propagate_at_launch = true
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "${local.name}-ecs"
+    propagate_at_launch = true
+  }
+
+  lifecycle {
+    ignore_changes = [desired_capacity]
+  }
+}
+
+# =============================================================================
+# Capacity Provider — links ASG to ECS cluster
+# =============================================================================
+
+resource "aws_ecs_capacity_provider" "ec2" {
+  name = "${local.name}-ec2"
+
+  auto_scaling_group_provider {
+    auto_scaling_group_arn         = aws_autoscaling_group.ecs.arn
+    managed_termination_protection = "ENABLED"
+
+    managed_scaling {
+      status                    = "ENABLED"
+      target_capacity           = 100
+      minimum_scaling_step_size = 1
+      maximum_scaling_step_size = 1
+    }
+  }
+
+  tags = local.tags
+}
+
+resource "aws_ecs_cluster_capacity_providers" "this" {
+  cluster_name       = aws_ecs_cluster.this.name
+  capacity_providers = [aws_ecs_capacity_provider.ec2.name]
+
+  default_capacity_provider_strategy {
+    capacity_provider = aws_ecs_capacity_provider.ec2.name
+    weight            = 100
+  }
+}
+
+# =============================================================================
+# Primary — Composite store (NVMe cache + durable S3), serves replication
 # =============================================================================
 
 resource "aws_ecs_task_definition" "lore" {
   family                   = local.name
-  requires_compatibilities = ["FARGATE"]
+  requires_compatibilities = ["EC2"]
   network_mode             = "awsvpc"
-  cpu                      = "1024"
-  memory                   = "2048"
   execution_role_arn       = aws_iam_role.execution.arn
   task_role_arn            = aws_iam_role.task.arn
+
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = "ARM64"
+  }
+
+  volume {
+    name      = "instance-store-cache"
+    host_path = "/srv/urc"
+  }
 
   volume {
     name = "certs"
   }
 
   container_definitions = jsonencode([
-    # Init container: write TLS certs from secrets to shared volume
     {
       name      = "init-certs"
       image     = "public.ecr.aws/amazonlinux/amazonlinux:minimal"
       essential = false
-      command   = ["sh", "-c", "echo \"$CERT\" > /certs/fullchain.crt && echo \"$KEY\" > /certs/server.key && echo \"$CA\" > /certs/ca.pem"]
+      command   = ["sh", "-c", "echo \"$CERT\" > /certs/fullchain.crt && echo \"$KEY\" > /certs/server.key && chmod 600 /certs/server.key && echo \"$CA\" > /certs/ca.pem"]
 
       secrets = [
         { name = "CERT", valueFrom = "${aws_secretsmanager_secret.tls.arn}:fullchain::" },
@@ -45,6 +168,7 @@ resource "aws_ecs_task_definition" "lore" {
       ]
 
       mountPoints = [{ sourceVolume = "certs", containerPath = "/certs", readOnly = false }]
+      memoryReservation = 64
 
       logConfiguration = {
         logDriver = "awslogs"
@@ -55,13 +179,13 @@ resource "aws_ecs_task_definition" "lore" {
         }
       }
     },
-    # Loreserver primary
     {
       name      = "loreserver"
       image     = var.container_image
       essential = true
 
       dependsOn = [{ containerName = "init-certs", condition = "SUCCESS" }]
+      memoryReservation = 8192
 
       portMappings = [
         { containerPort = local.port_quic_grpc, protocol = "tcp" },
@@ -70,27 +194,41 @@ resource "aws_ecs_task_definition" "lore" {
         { containerPort = local.port_replication, protocol = "udp" },
       ]
 
-      mountPoints = [{ sourceVolume = "certs", containerPath = "/certs", readOnly = true }]
+      mountPoints = [
+        { sourceVolume = "instance-store-cache", containerPath = "/srv/urc", readOnly = false },
+        { sourceVolume = "certs", containerPath = "/certs", readOnly = true },
+      ]
+
+      secrets = [
+        { name = "LORE__SERVER__HTTP__PRESIGNED_URL_HMAC_KEY", valueFrom = aws_secretsmanager_secret.hmac.arn },
+      ]
 
       environment = [
         { name = "LORE_ENV", value = "docker" },
         { name = "LORE_CONFIG_PATH", value = "/etc/lore/config" },
 
-        # TLS for all endpoints
+        # TLS
         { name = "LORE__SERVER__QUIC__CERTIFICATE__CERT_FILE", value = "/certs/fullchain.crt" },
         { name = "LORE__SERVER__QUIC__CERTIFICATE__PKEY_FILE", value = "/certs/server.key" },
         { name = "LORE__SERVER__GRPC__CERTIFICATE__CERT_FILE", value = "/certs/fullchain.crt" },
         { name = "LORE__SERVER__GRPC__CERTIFICATE__PKEY_FILE", value = "/certs/server.key" },
         { name = "LORE__SERVER__GRPC__VERIFY_CLIENT_CERTS", value = "false" },
 
-        # Enable internal QUIC for edge pod replication
+        # Internal QUIC for edge replication
         { name = "LORE__SERVER__QUIC_INTERNAL__ENABLED", value = "true" },
         { name = "LORE__SERVER__QUIC_INTERNAL__CERTIFICATE__CERT_FILE", value = "/certs/fullchain.crt" },
         { name = "LORE__SERVER__QUIC_INTERNAL__CERTIFICATE__PKEY_FILE", value = "/certs/server.key" },
         { name = "LORE__SERVER__QUIC_INTERNAL__VERIFY_CLIENT_CERTS", value = "false" },
 
-        # Storage: S3 + DynamoDB via the aws plugin
-        { name = "LORE__IMMUTABLE_STORE__MODE", value = "aws" },
+        # Storage: composite (NVMe cache + S3 durable)
+        { name = "LORE__IMMUTABLE_STORE__MODE", value = "composite" },
+        { name = "LORE__IMMUTABLE_STORE__COMPOSITE__LOCAL__MODE", value = "local" },
+        { name = "LORE__IMMUTABLE_STORE__COMPOSITE__LOCAL__LOCAL__PATH", value = "/srv/urc" },
+        # 80% of c8gd.8xlarge NVMe (1.9 TB). Reserves 20% for xfs metadata/journal.
+        # The fragment cache is the only consumer of the instance store.
+        { name = "LORE__IMMUTABLE_STORE__COMPOSITE__LOCAL__LOCAL__MAX_SIZE", value = "1520000000000" },
+        { name = "LORE__IMMUTABLE_STORE__COMPOSITE__LOCAL__LOCAL__FLUSH_DELAY_SECONDS", value = "10" },
+        { name = "LORE__IMMUTABLE_STORE__COMPOSITE__DURABLE__MODE", value = "aws" },
         { name = "LORE__MUTABLE_STORE__MODE", value = "aws" },
         { name = "LORE__LOCK_STORE__MODE", value = "aws" },
 
@@ -121,23 +259,35 @@ resource "aws_ecs_service" "lore" {
   cluster         = aws_ecs_cluster.this.id
   task_definition = aws_ecs_task_definition.lore.arn
   desired_count   = 1
-  launch_type     = "FARGATE"
+
+  health_check_grace_period_seconds = 120
+
+  capacity_provider_strategy {
+    capacity_provider = aws_ecs_capacity_provider.ec2.name
+    weight            = 100
+  }
 
   network_configuration {
-    subnets          = aws_subnet.private[*].id
-    security_groups  = [aws_security_group.lore.id]
-    assign_public_ip = false
+    subnets         = aws_subnet.private[*].id
+    security_groups = [aws_security_group.lore.id]
   }
 
   service_registries {
     registry_arn = aws_service_discovery_service.lore.arn
   }
 
+  placement_constraints {
+    type = "distinctInstance"
+  }
+
   tags = local.tags
 }
 
 # =============================================================================
-# Cloud Map — Service discovery for edge → primary
+# Cloud Map — Service discovery for edge → primary and client → edge
+#
+# NOTE: terraform destroy may fail if ECS tasks are still registered. If this
+# happens, scale services to 0 and wait 30s before re-running destroy.
 # =============================================================================
 
 resource "aws_service_discovery_private_dns_namespace" "this" {
@@ -158,43 +308,68 @@ resource "aws_service_discovery_service" "lore" {
     routing_policy = "MULTIVALUE"
   }
 
-  health_check_custom_config {
-    failure_threshold = 1
+  health_check_custom_config {}
+
+  tags = local.tags
+}
+
+resource "aws_service_discovery_service" "edge" {
+  name = "edge"
+
+  dns_config {
+    namespace_id = aws_service_discovery_private_dns_namespace.this.id
+    dns_records {
+      ttl  = 10
+      type = "A"
+    }
+    routing_policy = "MULTIVALUE"
   }
+
+  health_check_custom_config {}
 
   tags = local.tags
 }
 
 # =============================================================================
-# Edge Pod — Caching node with replicated + remote stores
+# Edge — Composite store (NVMe cache + replicated durable via QUIC to primary)
 # =============================================================================
 
 resource "aws_ecs_task_definition" "edge" {
   family                   = "${local.name}-edge"
-  requires_compatibilities = ["FARGATE"]
+  requires_compatibilities = ["EC2"]
   network_mode             = "awsvpc"
-  cpu                      = "1024"
-  memory                   = "2048"
   execution_role_arn       = aws_iam_role.execution.arn
-  task_role_arn            = aws_iam_role.task.arn
+  task_role_arn            = aws_iam_role.edge_task.arn
+
+  runtime_platform {
+    operating_system_family = "LINUX"
+    cpu_architecture        = "ARM64"
+  }
+
+  volume {
+    name      = "instance-store-cache"
+    host_path = "/srv/urc"
+  }
 
   volume {
     name = "certs"
   }
 
   container_definitions = jsonencode([
-    # Init container: write CA cert so edge trusts primary
     {
       name      = "init-certs"
       image     = "public.ecr.aws/amazonlinux/amazonlinux:minimal"
       essential = false
-      command   = ["sh", "-c", "echo \"$CA\" > /certs/ca.pem"]
+      command   = ["sh", "-c", "echo \"$CERT\" > /certs/fullchain.crt && echo \"$KEY\" > /certs/server.key && chmod 600 /certs/server.key && cat /etc/pki/tls/certs/ca-bundle.crt > /certs/ca.pem && echo \"$CA\" >> /certs/ca.pem"]
 
       secrets = [
+        { name = "CERT", valueFrom = "${aws_secretsmanager_secret.tls.arn}:fullchain::" },
+        { name = "KEY", valueFrom = "${aws_secretsmanager_secret.tls.arn}:key::" },
         { name = "CA", valueFrom = "${aws_secretsmanager_secret.tls.arn}:ca::" },
       ]
 
       mountPoints = [{ sourceVolume = "certs", containerPath = "/certs", readOnly = false }]
+      memoryReservation = 64
 
       logConfiguration = {
         logDriver = "awslogs"
@@ -205,13 +380,13 @@ resource "aws_ecs_task_definition" "edge" {
         }
       }
     },
-    # Loreserver edge
     {
       name      = "loreserver"
       image     = var.container_image
       essential = true
 
       dependsOn = [{ containerName = "init-certs", condition = "SUCCESS" }]
+      memoryReservation = 8192
 
       portMappings = [
         { containerPort = local.port_quic_grpc, protocol = "tcp" },
@@ -219,21 +394,43 @@ resource "aws_ecs_task_definition" "edge" {
         { containerPort = local.port_http, protocol = "tcp" },
       ]
 
-      mountPoints = [{ sourceVolume = "certs", containerPath = "/certs", readOnly = true }]
+      mountPoints = [
+        { sourceVolume = "instance-store-cache", containerPath = "/srv/urc", readOnly = false },
+        { sourceVolume = "certs", containerPath = "/certs", readOnly = true },
+      ]
+
+      secrets = [
+        { name = "LORE__SERVER__HTTP__PRESIGNED_URL_HMAC_KEY", valueFrom = aws_secretsmanager_secret.hmac.arn },
+      ]
 
       environment = [
         { name = "LORE_ENV", value = "docker" },
         { name = "LORE_CONFIG_PATH", value = "/etc/lore/config" },
-        # Trust the primary's CA for QUIC replication connection
         { name = "SSL_CERT_FILE", value = "/certs/ca.pem" },
 
-        # Edge stores: replicated immutable (QUIC to primary:41340) + remote mutable (gRPC to primary:41337)
-        { name = "LORE__IMMUTABLE_STORE__MODE", value = "replicated" },
-        { name = "LORE__IMMUTABLE_STORE__REPLICATED__REMOTE_URL", value = "lore://primary.${local.name}.internal:${local.port_replication}" },
-        { name = "LORE__IMMUTABLE_STORE__REPLICATED__PERIODIC_CLIENT_REFRESH_SECS", value = "300" },
-        { name = "LORE__IMMUTABLE_STORE__REPLICATED__REGENERATE_RETRY__INITIAL_BACKOFF_MS", value = "100" },
-        { name = "LORE__IMMUTABLE_STORE__REPLICATED__REGENERATE_RETRY__MAX_BACKOFF_MS", value = "5000" },
-        { name = "LORE__IMMUTABLE_STORE__REPLICATED__REGENERATE_RETRY__MAX_ATTEMPTS", value = "10" },
+        # TLS for client-facing endpoints
+        { name = "LORE__SERVER__QUIC__CERTIFICATE__CERT_FILE", value = "/certs/fullchain.crt" },
+        { name = "LORE__SERVER__QUIC__CERTIFICATE__PKEY_FILE", value = "/certs/server.key" },
+        { name = "LORE__SERVER__GRPC__CERTIFICATE__CERT_FILE", value = "/certs/fullchain.crt" },
+        { name = "LORE__SERVER__GRPC__CERTIFICATE__PKEY_FILE", value = "/certs/server.key" },
+        { name = "LORE__SERVER__GRPC__VERIFY_CLIENT_CERTS", value = "false" },
+
+        # Storage: composite (NVMe cache + replicated durable via QUIC to primary)
+        { name = "LORE__IMMUTABLE_STORE__MODE", value = "composite" },
+        { name = "LORE__IMMUTABLE_STORE__COMPOSITE__LOCAL__MODE", value = "local" },
+        { name = "LORE__IMMUTABLE_STORE__COMPOSITE__LOCAL__LOCAL__PATH", value = "/srv/urc" },
+        # 80% of c8gd.8xlarge NVMe (1.9 TB). Reserves 20% for xfs metadata/journal.
+        # The fragment cache is the only consumer of the instance store.
+        { name = "LORE__IMMUTABLE_STORE__COMPOSITE__LOCAL__LOCAL__MAX_SIZE", value = "1520000000000" },
+        { name = "LORE__IMMUTABLE_STORE__COMPOSITE__LOCAL__LOCAL__FLUSH_DELAY_SECONDS", value = "10" },
+        { name = "LORE__IMMUTABLE_STORE__COMPOSITE__DURABLE__MODE", value = "replicated" },
+        { name = "LORE__IMMUTABLE_STORE__COMPOSITE__DURABLE__REPLICATED__REMOTE_URL", value = "lore://primary.${local.name}.internal:${local.port_replication}" },
+        { name = "LORE__IMMUTABLE_STORE__COMPOSITE__DURABLE__REPLICATED__PERIODIC_CLIENT_REFRESH_SECS", value = "180" },
+        { name = "LORE__IMMUTABLE_STORE__COMPOSITE__DURABLE__REPLICATED__REGENERATE_RETRY__INITIAL_BACKOFF_MS", value = "100" },
+        { name = "LORE__IMMUTABLE_STORE__COMPOSITE__DURABLE__REPLICATED__REGENERATE_RETRY__MAX_BACKOFF_MS", value = "1000" },
+        { name = "LORE__IMMUTABLE_STORE__COMPOSITE__DURABLE__REPLICATED__REGENERATE_RETRY__MAX_ATTEMPTS", value = "10" },
+
+        # Branch resolution proxied to primary
         { name = "LORE__MUTABLE_STORE__MODE", value = "remote" },
         { name = "LORE__MUTABLE_STORE__REMOTE__REMOTE_URL", value = "lores://primary.${local.name}.internal:${local.port_quic_grpc}" },
         { name = "LORE__LOCK_STORE__MODE", value = "local" },
@@ -258,12 +455,25 @@ resource "aws_ecs_service" "edge" {
   cluster         = aws_ecs_cluster.this.id
   task_definition = aws_ecs_task_definition.edge.arn
   desired_count   = 1
-  launch_type     = "FARGATE"
+
+  health_check_grace_period_seconds = 300
+
+  capacity_provider_strategy {
+    capacity_provider = aws_ecs_capacity_provider.ec2.name
+    weight            = 100
+  }
 
   network_configuration {
-    subnets          = aws_subnet.private[*].id
-    security_groups  = [aws_security_group.lore.id]
-    assign_public_ip = false
+    subnets         = aws_subnet.private[*].id
+    security_groups = [aws_security_group.lore.id]
+  }
+
+  service_registries {
+    registry_arn = aws_service_discovery_service.edge.arn
+  }
+
+  placement_constraints {
+    type = "distinctInstance"
   }
 
   depends_on = [aws_ecs_service.lore]
