@@ -167,7 +167,7 @@ resource "aws_ecs_task_definition" "lore" {
         { name = "CA", valueFrom = "${aws_secretsmanager_secret.tls.arn}:ca::" },
       ]
 
-      mountPoints = [{ sourceVolume = "certs", containerPath = "/certs", readOnly = false }]
+      mountPoints       = [{ sourceVolume = "certs", containerPath = "/certs", readOnly = false }]
       memoryReservation = 64
 
       logConfiguration = {
@@ -184,7 +184,7 @@ resource "aws_ecs_task_definition" "lore" {
       image     = var.container_image
       essential = true
 
-      dependsOn = [{ containerName = "init-certs", condition = "SUCCESS" }]
+      dependsOn         = [{ containerName = "init-certs", condition = "SUCCESS" }]
       memoryReservation = 8192
 
       portMappings = [
@@ -368,7 +368,7 @@ resource "aws_ecs_task_definition" "edge" {
         { name = "CA", valueFrom = "${aws_secretsmanager_secret.tls.arn}:ca::" },
       ]
 
-      mountPoints = [{ sourceVolume = "certs", containerPath = "/certs", readOnly = false }]
+      mountPoints       = [{ sourceVolume = "certs", containerPath = "/certs", readOnly = false }]
       memoryReservation = 64
 
       logConfiguration = {
@@ -385,7 +385,7 @@ resource "aws_ecs_task_definition" "edge" {
       image     = var.container_image
       essential = true
 
-      dependsOn = [{ containerName = "init-certs", condition = "SUCCESS" }]
+      dependsOn         = [{ containerName = "init-certs", condition = "SUCCESS" }]
       memoryReservation = 8192
 
       portMappings = [

@@ -1,0 +1,36 @@
+name: Validate AWS Example
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - examples/aws/**
+      - .github/workflows/terraform-aws-example.yml
+  pull_request:
+    paths:
+      - examples/aws/**
+      - .github/workflows/terraform-aws-example.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/aws
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_wrapper: false
+          terraform_version: "1.15.3"
+      - run: terraform init -backend=false
+      - run: terraform fmt -check
+      - run: terraform validate
+      - run: terraform test

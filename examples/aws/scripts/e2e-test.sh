@@ -80,7 +80,7 @@ while true; do
     --query 'Status' \
     --output text \
     --region "$REGION" 2>/dev/null || echo "Pending")
-  
+
   case "$STATUS" in
     InProgress|Pending) echo "  ... still running" ;;
     Success)
