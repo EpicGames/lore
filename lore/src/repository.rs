@@ -673,7 +673,12 @@ async fn flush_local(
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
 #[handler(gc_local)]
-pub struct LoreRepositoryGcArgs {}
+pub struct LoreRepositoryGcArgs {
+    /// Grace period (in seconds) to spare newly created fragments from premature pruning
+    pub grace_period_sec: u64,
+    /// Minimum size threshold (in bytes) to trigger pruning
+    pub prune_threshold: u64,
+}
 
 /// Runs garbage collection on the local repository store to reclaim space from unreferenced data.
 ///
