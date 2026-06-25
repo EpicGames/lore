@@ -43,6 +43,8 @@ pub enum JWKServiceError {
     DecodingError(#[from] jsonwebtoken::errors::Error),
     #[error("Key for kid not found")]
     NotFound,
+    #[error("JWK with kid '{kid}' is missing the 'alg' field and cannot be inferred")]
+    MissingAlgorithm { kid: String },
 }
 
 #[async_trait]
@@ -143,7 +145,20 @@ impl JwkServiceImpl {
             let algorithm = jwk
                 .common
                 .key_algorithm
-                .ok_or(JWKServiceError::InternalError)?;
+                .or({
+                    // RFC 7517: alg is OPTIONAL. Infer from key type when absent.
+                    match (&jwk.algorithm, jwk.common.public_key_use.as_ref()) {
+                        (jsonwebtoken::jwk::AlgorithmParameters::RSA(_), Some(jsonwebtoken::jwk::PublicKeyUse::Signature)) => {
+                            Some(jsonwebtoken::jwk::KeyAlgorithm::RS256)
+                        }
+                        _ => None,
+                    }
+                })
+                .ok_or_else(|| {
+                    let kid_str = jwk.common.key_id.clone().unwrap_or_default();
+                    warn!(kid = %kid_str, "JWK missing 'alg' field and cannot be inferred from key type");
+                    JWKServiceError::MissingAlgorithm { kid: kid_str }
+                })?;
             let algorithm = jsonwebtoken::Algorithm::from_str(&algorithm.to_string())
                 .map_err(JWKServiceError::DecodingError)?;
 
