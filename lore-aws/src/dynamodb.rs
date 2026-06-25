@@ -70,13 +70,6 @@ const QUERY_ROWS: [f64; 10] = [
 pub const METRICS_ACCUMULATION_OPERATION_LATENCY_METRIC_NAME: &str =
     "accumulation_operation_duration";
 
-/// Temporary environment variable to allow enabling/disabling query pagination.
-/// TODO(jcohen): Remove this when we're confident in the pagination support.
-static ENABLE_QUERY_PAGINATION: LazyLock<bool> =
-    LazyLock::new(|| match std::env::var("LORE_ENABLE_QUERY_PAGINATION") {
-        Ok(v) => v.eq_ignore_ascii_case("true"),
-        Err(_) => true, // Default to enabled if the env var isn't present
-    });
 
 pub trait DynamoDbQuery {
     fn index_name(&self) -> Option<String> {
@@ -652,11 +645,7 @@ impl DynamoDbImpl {
                     //    rows.
                     // 3. *Unless* the query is also a count query (in which case we need to fetch
                     //    until there's no more data to collect to ensure we get the correct count).
-                    // TODO(jcohen): We should probably disallow the combination of `Select::Count`
-                    //  and a limit to avoid the degenerate case of fetching a full count one row at
-                    //  a time.
-                    if *ENABLE_QUERY_PAGINATION
-                        && let Some(last_evaluated_key) = r.last_evaluated_key
+                    if let Some(last_evaluated_key) = r.last_evaluated_key
                         && !last_evaluated_key.is_empty()
                         && (query.limit().is_none()
                             || matches!(query.select(), Some(Select::Count))
