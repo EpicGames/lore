@@ -89,7 +89,7 @@ fn protoc_available() -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
-/// Compile the legacy urc.rpc.{Storage,Revision,Repository,Environment}Service protos that now live in this crate. `urc.model` messages stay in `lore-proto`; `extern_path` redirects generated references there so the types are not re-declared.
+/// Compile the legacy urc.rpc.{Storage,Revision,Repository,Environment}Service protos that now live in this crate. `urc.model` messages stay in `lore-proto`; `extern_path` redirects generated references there so the types are not redeclared.
 fn compile_legacy_protos() -> Result<(), Box<dyn Error>> {
     // Declare the codegen inputs unconditionally so Cargo re-runs this script
     // when PROTOC changes or a watched .proto is edited — even on a build where

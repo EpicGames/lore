@@ -57,11 +57,15 @@ repos:
         exclude: ".envrc$"
 
   - repo: https://github.com/codespell-project/codespell
-    rev: v2.2.4
+    # Configuration lives in pyproject.toml [tool.codespell].
+    rev: v2.4.2
     hooks:
       - id: codespell
-        args: [ "-L", "ue,crate,numer,ser,ratatui,ect,noes,keep-alives", "-S", "Cargo.*,vendor/*" ]
-        exclude: ^docs/developing/doc-standards/tools/vale/styles/
+        additional_dependencies:
+          - tomli; python_version<'3.11'
+        # Mirror central `skip` patterns — pre-commit passes file paths
+        # explicitly, which bypasses codespell's own skip handling.
+        exclude: '^(docs/developing/doc-standards/tools/vale/styles/|vendor/|Cargo\.)'
 
   - repo: https://github.com/rhysd/actionlint
     rev: v1.7.1

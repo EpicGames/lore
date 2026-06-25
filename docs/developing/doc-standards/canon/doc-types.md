@@ -397,7 +397,7 @@ Optional sections (use when the content warrants):
 
 `docs/developing/decisions/NNNNN-<slug>.md`, where `NNNNN` is zero-padded and `<slug>` is the lowercased, hyphenated form of the decision title (drop articles).
 
-Numbering is monotonic across the project. A new ADR claims the next available number; never re-use a number even for superseded ADRs. The H1 itself doesn't include the number — readers find it via the filename and the directory listing.
+Numbering is monotonic across the project. A new ADR claims the next available number; never reuse a number even for superseded ADRs. The H1 itself doesn't include the number — readers find it via the filename and the directory listing.
 
 ### Voice and length
 
