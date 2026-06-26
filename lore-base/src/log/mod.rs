@@ -79,19 +79,12 @@ pub fn dispatch_log(level: LoreLogLevel, location: &str, message: &str) {
 
 #[macro_export]
 macro_rules! lore_trace {
-    ($fmt:expr $(, $arg:expr)* $(,)?) => {{
-        #[cfg(not(feature = "trace_log"))]
-        if false {
-            let _ = core::format_args!($fmt $(, $arg)*);
-        }
-        #[cfg(feature = "trace_log")]
-        if true {
-            $crate::lore_log_event!(
-                $crate::log::LoreLogLevel::Trace,
-                $fmt $(, $arg)*
-            )
-        }
-    }};
+    ($fmt:expr $(, $arg:expr)* $(,)?) => {
+        $crate::lore_log_event!(
+            $crate::log::LoreLogLevel::Trace,
+            $fmt $(, $arg)*
+        )
+    };
 }
 
 #[macro_export]
