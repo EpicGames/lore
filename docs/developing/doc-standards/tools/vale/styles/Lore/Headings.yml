@@ -10,6 +10,7 @@ exceptions:
   - ADR
   - anyhow
   - Azure
+  - CA
   - CLI
   - Code
   - Code-Standard
@@ -17,6 +18,7 @@ exceptions:
   - Diátaxis
   - Docker
   - Emmet
+  - Engine
   - EventError
   - Git
   - How-To
@@ -28,6 +30,7 @@ exceptions:
   - macOS
   - Marketplace
   - Mermaid
+  - mTLS
   - MkDocs
   - MongoDB
   - pytest
@@ -35,6 +38,8 @@ exceptions:
   - Studio
   - thiserror
   - TypeScript
+  - UEFN
+  - Unreal
   - URLs
   - Visual
   - VS

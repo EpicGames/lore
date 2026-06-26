@@ -78,7 +78,7 @@ With the foundations in place, the focus shifts to scale and collaboration: grap
 
 **Surface a visual version-control workflow inside the Unreal Editor, the interface you already work in.** A Lore plugin brings everyday Lore operations directly into the tool artists and developers use to build with Unreal Engine, so versioning your work is a native part of the editor rather than a separate command-line step — and artists who never touch a terminal can manage it themselves. It builds on the Lore plugin that already ships with UEFN, and rather than living as a separate Lore project, it will be included in the native Unreal Engine codebase and delivered as part of the engine itself.
 
-### Web client and code review tools
+### Web client
 
 **Timeline:** 2027 · **Status:** Committed
 
