@@ -212,7 +212,6 @@ resource "aws_ecs_task_definition" "lore" {
         { name = "LORE__SERVER__QUIC__CERTIFICATE__PKEY_FILE", value = "/certs/server.key" },
         { name = "LORE__SERVER__GRPC__CERTIFICATE__CERT_FILE", value = "/certs/fullchain.crt" },
         { name = "LORE__SERVER__GRPC__CERTIFICATE__PKEY_FILE", value = "/certs/server.key" },
-        { name = "LORE__SERVER__GRPC__VERIFY_CLIENT_CERTS", value = "false" },
 
         # Internal QUIC for edge replication
         { name = "LORE__SERVER__QUIC_INTERNAL__ENABLED", value = "true" },
@@ -413,7 +412,6 @@ resource "aws_ecs_task_definition" "edge" {
         { name = "LORE__SERVER__QUIC__CERTIFICATE__PKEY_FILE", value = "/certs/server.key" },
         { name = "LORE__SERVER__GRPC__CERTIFICATE__CERT_FILE", value = "/certs/fullchain.crt" },
         { name = "LORE__SERVER__GRPC__CERTIFICATE__PKEY_FILE", value = "/certs/server.key" },
-        { name = "LORE__SERVER__GRPC__VERIFY_CLIENT_CERTS", value = "false" },
 
         # Storage: composite (NVMe cache + replicated durable via QUIC to primary)
         { name = "LORE__IMMUTABLE_STORE__MODE", value = "composite" },
@@ -424,7 +422,7 @@ resource "aws_ecs_task_definition" "edge" {
         { name = "LORE__IMMUTABLE_STORE__COMPOSITE__LOCAL__LOCAL__MAX_SIZE", value = "1520000000000" },
         { name = "LORE__IMMUTABLE_STORE__COMPOSITE__LOCAL__LOCAL__FLUSH_DELAY_SECONDS", value = "10" },
         { name = "LORE__IMMUTABLE_STORE__COMPOSITE__DURABLE__MODE", value = "replicated" },
-        { name = "LORE__IMMUTABLE_STORE__COMPOSITE__DURABLE__REPLICATED__REMOTE_URL", value = "lore://primary.${local.name}.internal:${local.port_replication}" },
+        { name = "LORE__IMMUTABLE_STORE__COMPOSITE__DURABLE__REPLICATED__REMOTE_URL", value = "quics://primary.${local.name}.internal:${local.port_replication}" },
         { name = "LORE__IMMUTABLE_STORE__COMPOSITE__DURABLE__REPLICATED__PERIODIC_CLIENT_REFRESH_SECS", value = "180" },
         { name = "LORE__IMMUTABLE_STORE__COMPOSITE__DURABLE__REPLICATED__REGENERATE_RETRY__INITIAL_BACKOFF_MS", value = "100" },
         { name = "LORE__IMMUTABLE_STORE__COMPOSITE__DURABLE__REPLICATED__REGENERATE_RETRY__MAX_BACKOFF_MS", value = "1000" },
@@ -443,6 +441,18 @@ resource "aws_ecs_task_definition" "edge" {
           "awslogs-region"        = var.region
           "awslogs-stream-prefix" = "edge"
         }
+      }
+
+      # Self-healing: if ReplicatedStore::new() blocks on cold deploy (primary
+      # not yet accepting QUIC), the server never binds ports. After startPeriod
+      # + retries, ECS replaces the task — by then the primary is warm.
+      # Note: CMD-SHELL runs via /bin/sh; must invoke bash explicitly for /dev/tcp.
+      healthCheck = {
+        command     = ["CMD-SHELL", "/usr/bin/bash -c 'echo > /dev/tcp/localhost/${local.port_http}' 2>/dev/null"]
+        startPeriod = 120
+        interval    = 10
+        timeout     = 5
+        retries     = 6
       }
     },
   ])

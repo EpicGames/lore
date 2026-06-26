@@ -13,7 +13,7 @@ This example uses **c8gd.8xlarge** Graviton instances (32 vCPU, 64 GB RAM, 1.9 T
 From the Lore repo root:
 
 ```sh
-docker buildx build --platform linux/arm64 -f lore-server/Dockerfile -t loreserver .
+docker buildx build --platform linux/arm64 -f lore-server/Dockerfile -t loreserver:v0.8.3 --load .
 ```
 
 > If building on an x86 host, [register QEMU](https://docs.docker.com/build/building/multi-platform/#qemu) first:
@@ -24,8 +24,8 @@ Push to ECR (replace `<ACCOUNT_ID>` and `<REGION>`):
 ```sh
 aws ecr get-login-password --region <REGION> | docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com
 aws ecr create-repository --repository-name loreserver --region <REGION>
-docker tag loreserver:latest <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/loreserver:latest
-docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/loreserver:latest
+docker tag loreserver:v0.8.3 <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/loreserver:v0.8.3
+docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/loreserver:v0.8.3
 ```
 
 ### 2. Deploy
@@ -39,7 +39,7 @@ Edit `terraform.tfvars`:
 
 ```hcl
 region          = "us-west-2"
-container_image = "<ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/loreserver:latest"
+container_image = "<ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/loreserver:v0.8.3"
 allowed_cidrs   = ["10.0.0.0/8"]  # Your VPC or VPN CIDR
 ```
 
@@ -94,27 +94,57 @@ lore clone lores://edge.lore.internal:41337/my-game ./my-game
 
 **Startup:** Health check grace periods allow the primary (120s) and edge (300s) to initialize without being marked unhealthy. The edge's retry configuration handles Cloud Map DNS propagation delays automatically. On first deploy, edge nodes may restart 1-2 times while DNS propagates — this is expected and self-resolving.
 
+**Edge limitations:** The edge uses `remote` mutable store mode (proxies to primary). Administrative commands like `lore repository create` and `lore repository list` must go to the primary directly. All client-facing operations (clone, push, branch, merge, sync) work through the edge.
+
 ### Data flow
 
 ```
 Client ──lores://──→ Edge (NVMe cache hit → instant response)
                          │ cache miss
-                         ├──QUIC:41340──→ Primary (NVMe cache → S3 fallback)
-                         └──gRPC:41337──→ Primary (branch resolution)
+                         ├──quics://41340───→ Primary (NVMe cache → S3 fallback)
+                         └──lores://41337──→ Primary (branch resolution)
 ```
 
 > **Instance sizing:** Use node sizes without network bandwidth caps (32+ vCPU) for production. This example uses c8gd.8xlarge (NVMe + Graviton).
 
 ## Verify
 
+Check services are running:
+
 ```sh
 aws ecs describe-services --cluster lore-cluster --services lore lore-edge \
   --query 'services[].{name:serviceName,running:runningCount}' --region us-west-2
 ```
 
+Check server logs:
+
 ```sh
 aws logs tail /ecs/lore --since 5m --region us-west-2
 ```
+
+## Testing
+
+This example ships with a test plan and an automated e2e script in `tests/`:
+
+| File | Purpose |
+|------|---------|
+| `tests/plan.tftest.hcl` | Terraform plan-level validation (offline, free) |
+| `tests/e2e-test.sh` | Automated end-to-end validation (requires live infrastructure) |
+| `tests/TEST_PLAN.md` | Manual runbook — step-by-step deployment + validation |
+
+The e2e test mirrors the [official Lore quickstart](https://epicgames.github.io/lore/tutorials/quickstart/) against this infrastructure, exercising all client operations through both the primary and edge:
+
+```sh
+./tests/e2e-test.sh us-west-2
+```
+
+What it validates:
+- Health checks (HTTP 200 from primary and edge)
+- Full data path via primary (create → stage → commit → push → clone)
+- Full client workflow via edge (clone → branch → merge → push → sync)
+- Data integrity (MD5 checksums match across all paths)
+
+See `tests/TEST_PLAN.md` for the manual equivalent with AWS resource validation.
 
 ## Customize
 
@@ -153,5 +183,9 @@ For dev/test where you want one-command teardown, add `force_destroy = true` to 
 ## Prerequisites
 
 - [Terraform](https://developer.hashicorp.com/terraform/install) >= 1.7
-- AWS credentials with VPC, ECS, EC2, S3, DynamoDB, IAM, Secrets Manager, Cloud Map, Auto Scaling permissions
+- AWS credentials with VPC, ECS, EC2, S3, DynamoDB, IAM, Secrets Manager, Cloud Map, Auto Scaling, SSM permissions
 - Docker (to build the ARM64 container image)
+
+## Design
+
+This example implements the architecture described in the [Lore System Design](https://epicgames.github.io/lore/explanation/system-design/) — S3 as the immutable store, DynamoDB as the mutable store, edge nodes as a hot cache tier with `quics://` replication to a centralized primary.

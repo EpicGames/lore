@@ -97,7 +97,7 @@ resource "aws_vpc_security_group_ingress_rule" "client_quic" {
   to_port           = local.port_quic_grpc
   ip_protocol       = "udp"
   cidr_ipv4         = each.value
-  description       = "Client QUIC"
+  description       = "Lore client (QUIC)"
 }
 
 resource "aws_vpc_security_group_ingress_rule" "client_grpc" {
@@ -107,7 +107,7 @@ resource "aws_vpc_security_group_ingress_rule" "client_grpc" {
   to_port           = local.port_quic_grpc
   ip_protocol       = "tcp"
   cidr_ipv4         = each.value
-  description       = "Client gRPC"
+  description       = "Lore client (gRPC)"
 }
 
 # HTTP health checks + presigned URLs
@@ -118,7 +118,7 @@ resource "aws_vpc_security_group_ingress_rule" "client_http" {
   to_port           = local.port_http
   ip_protocol       = "tcp"
   cidr_ipv4         = each.value
-  description       = "Client HTTP"
+  description       = "Lore client (HTTP)"
 }
 
 # Internal: QUIC replication (edge → primary on 41340 UDP)
@@ -128,7 +128,7 @@ resource "aws_vpc_security_group_ingress_rule" "replication_quic" {
   to_port                      = 41340
   ip_protocol                  = "udp"
   referenced_security_group_id = aws_security_group.lore.id
-  description                  = "QUIC replication between Lore nodes"
+  description                  = "Lore replication (QUIC)"
 }
 
 # Internal: gRPC (edge → primary on 41337 TCP for remote mutable store)
@@ -138,7 +138,7 @@ resource "aws_vpc_security_group_ingress_rule" "internal_grpc" {
   to_port                      = 41337
   ip_protocol                  = "tcp"
   referenced_security_group_id = aws_security_group.lore.id
-  description                  = "gRPC between Lore nodes"
+  description                  = "Lore branch resolution (gRPC)"
 }
 
 # Internal: QUIC (edge → primary on 41337 UDP for replicated immutable store)
@@ -148,7 +148,7 @@ resource "aws_vpc_security_group_ingress_rule" "internal_quic" {
   to_port                      = 41337
   ip_protocol                  = "udp"
   referenced_security_group_id = aws_security_group.lore.id
-  description                  = "QUIC between Lore nodes"
+  description                  = "Lore data transfer (QUIC)"
 }
 
 resource "aws_vpc_security_group_egress_rule" "all" {
