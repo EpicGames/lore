@@ -2,6 +2,8 @@
 
 Welcome to the Lore documentation. The pages below cover everything from your first install through the internal design, organized into a consistent structure that helps you find what you need.
 
+Test Test Test
+
 ## Get started
 
 - [Quickstart](tutorials/quickstart.md) — create your first Lore repository.
