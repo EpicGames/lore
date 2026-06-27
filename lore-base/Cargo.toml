@@ -33,9 +33,6 @@ rand = { workspace = true }
 serde = { workspace = true }
 uuid = { workspace = true, features = ["zerocopy"] }
 
-# fs
-windows-sys = { workspace = true, features = ["Win32_Storage_ProjectedFileSystem", "Win32_Storage_FileSystem", "Win32_System_Diagnostics", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_Security"] }
-
 # log
 chrono = { workspace = true }
 
@@ -43,6 +40,10 @@ chrono = { workspace = true }
 pin-project = { workspace = true }
 rayon = { workspace = true }
 tokio = { workspace = true }
+
+# fs
+[target.'cfg(target_family = "windows")'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Storage_ProjectedFileSystem", "Win32_Storage_FileSystem", "Win32_System_Diagnostics", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_Security"] }
 
 [dev-dependencies]
 serde_json = { workspace = true, features = ["std"] }
