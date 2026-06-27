@@ -26,7 +26,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .includes(Some(native_dir.join("thirdparty")));
 
     if platform == "linux" && arch == "aarch64" {
-        cc_builder.flag("-mcpu=neoverse-512tvb");
+        if env::var("LORE_CPU_NEOVERSE_512TVB").is_ok() {
+            let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+            if cpuinfo.contains("sve2") {
+                cc_builder.flag("-mcpu=neoverse-512tvb");
+            } else {
+                println!(
+                    "cargo:warning=LORE_CPU_NEOVERSE_512TVB is set but SVE2 not detected in /proc/cpuinfo; skipping -mcpu=neoverse-512tvb and building for generic aarch64 to avoid illegal hardware instruction. Disable the `neoverse-512tvb` feature to suppress this warning"
+                );
+            }
+        } else {
+            println!(
+                "cargo:warning=Building rpmalloc without -mcpu=neoverse-512tvb; binary may be slower on Graviton3+. Set LORE_CPU_NEOVERSE_512TVB=1 to opt in"
+            );
+        }
     }
 
     if cc_builder.get_compiler().is_like_msvc() {
