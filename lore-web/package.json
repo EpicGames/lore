@@ -1,0 +1,19 @@
+{
+  "name": "lore-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted browser UI for the Lore version control system",
+  "type": "module",
+  "engines": {
+    "node": ">=18 <25"
+  },
+  "scripts": {
+    "start": "node server/start.mjs",
+    "serve": "node server/index.mjs",
+    "smoke": "node server/smoke.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@lore-vcs/sdk": "0.8.4"
+  }
+}

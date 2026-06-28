@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>lore-web</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <header class="brand">
+          <span class="logo">lore</span><span class="logo-web">web</span>
+          <span id="conn" class="conn" title="live connection">●</span>
+        </header>
+        <div class="add-repo">
+          <input id="add-path" type="text" placeholder="Path to a Lore working copy…" />
+          <button id="add-btn">Add</button>
+        </div>
+        <ul id="repo-list" class="repo-list"></ul>
+        <footer class="side-foot">
+          <button id="clone-btn" class="ghost">Clone a repository…</button>
+        </footer>
+      </aside>
+
+      <main id="main">
+        <div id="empty" class="empty">
+          <p>Select or add a repository to begin.</p>
+        </div>
+
+        <section id="repo-view" hidden>
+          <header class="repo-head">
+            <div>
+              <h1 id="repo-title">—</h1>
+              <div class="repo-sub">
+                <span id="repo-branch" class="pill"></span>
+                <span id="repo-path" class="muted"></span>
+              </div>
+            </div>
+            <div class="repo-actions">
+              <button id="sync-btn">Sync</button>
+              <button id="push-btn" class="primary">Push</button>
+              <button id="refresh-btn" class="ghost" title="Refresh">⟳</button>
+            </div>
+          </header>
+
+          <nav class="tabs">
+            <button class="tab active" data-tab="changes">Changes</button>
+            <button class="tab" data-tab="history">History</button>
+            <button class="tab" data-tab="branches">Branches</button>
+          </nav>
+
+          <div class="tab-panels">
+            <!-- Changes -->
+            <div class="panel active" data-panel="changes">
+              <div class="changes-layout">
+                <div class="file-cols">
+                  <div class="file-col">
+                    <h3>Staged</h3>
+                    <ul id="staged-files" class="files"></ul>
+                  </div>
+                  <div class="file-col">
+                    <h3>Unstaged</h3>
+                    <ul id="unstaged-files" class="files"></ul>
+                  </div>
+                </div>
+                <div class="commit-box">
+                  <textarea id="commit-msg" placeholder="Commit message…"></textarea>
+                  <button id="commit-btn" class="primary">Commit staged</button>
+                </div>
+                <div id="diff-view" class="diff-view"></div>
+              </div>
+            </div>
+
+            <!-- History -->
+            <div class="panel" data-panel="history">
+              <ul id="history-list" class="history"></ul>
+            </div>
+
+            <!-- Branches -->
+            <div class="panel" data-panel="branches">
+              <ul id="branch-list" class="branches"></ul>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <!-- Operation progress overlay (sync / push / clone) -->
+    <div id="op-overlay" class="overlay" hidden>
+      <div class="op-modal">
+        <h3 id="op-title">Working…</h3>
+        <pre id="op-log" class="op-log"></pre>
+        <div class="op-foot">
+          <span id="op-status"></span>
+          <button id="op-close" hidden>Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Clone dialog -->
+    <dialog id="clone-dialog">
+      <form method="dialog" class="clone-form">
+        <h3>Clone a repository</h3>
+        <label>Remote URL<input id="clone-url" type="text" placeholder="lore://host:41337/org/repo" /></label>
+        <label>Destination folder<input id="clone-dest" type="text" placeholder="D:\path\to\clone" /></label>
+        <menu>
+          <button value="cancel">Cancel</button>
+          <button id="clone-go" value="default" class="primary">Clone</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast" hidden></div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
