@@ -115,10 +115,20 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); }
 
 /* History */
 .history { list-style: none; margin: 0; padding: 0; }
-.history li { padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 8px; background: var(--panel); }
+.history li { border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 8px; background: var(--panel); overflow: hidden; }
+.history li.open { outline: 1px solid var(--accent); }
+.history .h-row { padding: 12px 14px; cursor: pointer; }
+.history .h-row:hover { background: var(--panel-2); }
 .history .h-msg { font-weight: 600; margin-bottom: 4px; white-space: pre-wrap; }
 .history .h-meta { color: var(--muted); font-size: 12px; display: flex; gap: 12px; }
 .history .h-rev { font-family: ui-monospace, monospace; }
+.rev-detail { border-top: 1px solid var(--border); padding: 10px 14px; background: var(--bg); }
+.rev-files { list-style: none; margin: 0 0 8px; padding: 0; }
+.rev-files li { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px; cursor: pointer; }
+.rev-files li:hover { background: var(--panel-2); }
+.rev-files li.sel { background: var(--panel-2); outline: 1px solid var(--accent); }
+.rev-files .f-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rev-diff { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 12.5px; white-space: pre; overflow-x: auto; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; margin: 0; max-height: 45vh; }
 
 /* Branches */
 .branches { list-style: none; margin: 0; padding: 0; }

@@ -65,6 +65,26 @@ export function branches(events) {
   return events.filter((e) => e.tag === "BRANCH_LIST_ENTRY").map((e) => e.data);
 }
 
+/**
+ * The files changed in a single revision, from `revisionInfo({ delta: true })`.
+ * @param {LoreEvt[]} events
+ */
+export function revisionFiles(events) {
+  return events
+    .filter((e) => e.tag === "REVISION_INFO_DELTA")
+    // The delta walks the whole tree; keep only entries that actually changed
+    // (content modified, or added/deleted/moved — action other than KEEP=0).
+    // Unchanged directory/context entries (action KEEP, not modified) are noise.
+    .filter((e) => e.data?.flagModify || (e.data?.action ?? 0) !== 0)
+    .map((e) => ({
+      path: e.data?.path,
+      action: e.data?.action,
+      size: e.data?.size,
+      flagModify: e.data?.flagModify,
+      flagMerged: e.data?.flagMerged,
+    }));
+}
+
 /** @param {LoreEvt[]} events */
 export function diff(events) {
   return events

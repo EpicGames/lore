@@ -247,21 +247,88 @@ async function commit() {
 async function loadHistory(pathEnc) {
   try {
     const { revisions } = await apiGet(`/api/history?path=${pathEnc}&length=50`);
+    state.revisions = revisions;
+    // Skip the rebuild when nothing changed, so a background refresh (poll, focus,
+    // file-watch) does not collapse a revision the user has expanded.
+    const sig = revisions.map((r) => r.revision).join(",");
+    if (sig === state.historySig) return;
+    state.historySig = sig;
     const ul = $("#history-list");
     ul.innerHTML = "";
     for (const r of revisions) {
       const li = document.createElement("li");
       const when = r.timestamp ? new Date(r.timestamp).toLocaleString() : "";
       li.innerHTML = `
-        <div class="h-msg">${(r.message || "(no message)").split("\n")[0]}</div>
-        <div class="h-meta">
-          <span class="h-rev">#${r.revisionNumber} · ${(r.revision || "").slice(0, 12)}</span>
-          <span>${when}</span>
-        </div>`;
+        <div class="h-row">
+          <div class="h-msg">${(r.message || "(no message)").split("\n")[0]}</div>
+          <div class="h-meta">
+            <span class="h-rev">#${r.revisionNumber} · ${(r.revision || "").slice(0, 12)}</span>
+            <span>${when}</span>
+          </div>
+        </div>
+        <div class="rev-detail" hidden></div>`;
+      li.querySelector(".h-row").onclick = () => toggleRevision(r, li);
+      if (r.revision === state.openRevision) toggleRevision(r, li);
       ul.appendChild(li);
     }
   } catch (err) {
     toast(err.message, true);
+  }
+}
+
+/** Expand a revision to show the files it changed; collapse if already open. */
+async function toggleRevision(r, li) {
+  const detail = li.querySelector(".rev-detail");
+  if (!detail.hidden) {
+    detail.hidden = true;
+    li.classList.remove("open");
+    state.openRevision = null;
+    return;
+  }
+  detail.hidden = false;
+  li.classList.add("open");
+  state.openRevision = r.revision;
+  detail.innerHTML = `<div class="muted">Loading changes…</div>`;
+  const parent = (r.parent && r.parent[0]) || "";
+  try {
+    const { files } = await apiGet(
+      `/api/revision?path=${encodeURIComponent(state.active)}&revision=${r.revision}`,
+    );
+    if (!files.length) {
+      detail.innerHTML = `<div class="muted">No file changes in this revision.</div>`;
+      return;
+    }
+    detail.innerHTML = `<ul class="rev-files"></ul><pre class="rev-diff" hidden></pre>`;
+    const list = detail.querySelector(".rev-files");
+    for (const f of files) {
+      const [label, cls] = fileBadge(f);
+      const item = document.createElement("li");
+      item.innerHTML = `<span class="f-act ${cls}">${label}</span><span class="f-path" title="${f.path}">${f.path}</span>`;
+      item.onclick = () => showRevisionFileDiff(r, parent, f.path, detail);
+      list.appendChild(item);
+    }
+  } catch (err) {
+    detail.innerHTML = `<div class="muted">${err.message}</div>`;
+  }
+}
+
+/** Show one file's diff between a revision and its parent, inside the detail. */
+async function showRevisionFileDiff(r, parent, file, detail) {
+  const pre = detail.querySelector(".rev-diff");
+  detail.querySelectorAll(".rev-files li").forEach((el) =>
+    el.classList.toggle("sel", el.querySelector(".f-path")?.title === file),
+  );
+  pre.hidden = false;
+  pre.textContent = "Loading diff…";
+  try {
+    const url =
+      `/api/diff?path=${encodeURIComponent(state.active)}` +
+      `&file=${encodeURIComponent(file)}&source=${parent}&target=${r.revision}`;
+    const { diff } = await apiGet(url);
+    const patch = diff.map((d) => d.patch || "").join("\n");
+    pre.innerHTML = colorizeDiff(patch || "(no textual diff — binary file or no change)");
+  } catch (err) {
+    pre.textContent = err.message;
   }
 }
 

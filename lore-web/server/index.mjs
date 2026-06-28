@@ -196,8 +196,20 @@ const server = createServer(async (req, res) => {
       // The native lib resolves relative path args against process.cwd(); anchor
       // them to the repo by passing an absolute path instead.
       const abs = file && repoPath ? join(repoPath, file) : file;
-      const events = await collect("fileDiff", globalArgs, abs ? { paths: [abs] } : {});
+      const args = abs ? { paths: [abs] } : {};
+      // Optional revision range: diff a file between two revisions instead of the
+      // working tree (used to show what a historical revision changed).
+      const source = q.get("source");
+      const target = q.get("target");
+      if (source) args.sourceRevision = source;
+      if (target) args.targetRevision = target;
+      const events = await collect("fileDiff", globalArgs, args);
       return sendJson(res, 200, { diff: xform.diff(events) });
+    }
+    if (p === "/api/revision" && req.method === "GET") {
+      const revision = q.get("revision");
+      const events = await collect("revisionInfo", globalArgs, { revision, delta: true });
+      return sendJson(res, 200, { files: xform.revisionFiles(events) });
     }
 
     // --- write actions (quick; respond with refreshed nothing, broadcast refresh) ---
