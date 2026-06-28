@@ -72,7 +72,7 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); }
 .repo-list .r-missing { color: var(--red); font-size: 11px; }
 .repo-list .r-remove { margin-left: 6px; color: var(--muted); border: none; background: none; padding: 2px 6px; }
 .repo-list .r-remove:hover { color: var(--red); }
-.side-foot { padding: 12px; border-top: 1px solid var(--border); }
+.side-foot { padding: 12px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
 .side-foot button { width: 100%; }
 
 /* Main */
@@ -153,6 +153,22 @@ dialog::backdrop { background: rgba(0,0,0,0.6); }
 .clone-form h3 { margin: 0; }
 .clone-form label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
 .clone-form menu { display: flex; gap: 8px; justify-content: flex-end; margin: 0; padding: 0; }
+.field-row { display: flex; gap: 6px; }
+.field-row input { flex: 1; min-width: 0; }
+
+/* Folder picker dialog */
+.picker { padding: 18px; display: flex; flex-direction: column; gap: 12px; width: min(520px, 92vw); }
+.picker h3 { margin: 0; }
+.picker-bar { display: flex; align-items: center; gap: 8px; }
+.picker-cur { font-size: 13px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.picker-list { list-style: none; margin: 0; padding: 4px; height: 320px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel-2); }
+.picker-list li { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: var(--radius); cursor: pointer; }
+.picker-list li:hover { background: var(--panel); }
+.picker-list li.muted { cursor: default; color: var(--muted); }
+.picker-list .p-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.picker-list .p-tag { margin-left: auto; font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--accent); border: 1px solid var(--accent); border-radius: 4px; padding: 0 5px; }
+.picker-new { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+.picker menu { display: flex; gap: 8px; justify-content: flex-end; margin: 0; padding: 0; }
 
 /* Toast */
 .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 16px; z-index: 60; }

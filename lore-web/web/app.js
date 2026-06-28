@@ -13,8 +13,6 @@ const state = {
   selectedFile: null,
 };
 
-// ---- API helpers ---------------------------------------------------------
-
 async function apiGet(path) {
   const res = await fetch(path);
   const body = await res.json();
@@ -64,8 +62,6 @@ function toast(msg, isErr) {
   setTimeout(() => (t.hidden = true), isErr ? 5000 : 2500);
 }
 
-// ---- Repo list -----------------------------------------------------------
-
 async function loadRepos() {
   try {
     const { repos } = await apiGet("/api/repos");
@@ -96,18 +92,63 @@ function renderRepos() {
   }
 }
 
+/** Pick a folder, then track it — initializing a new repo if it isn't one yet. */
 async function addRepo() {
-  const input = $("#add-path");
-  const path = input.value.trim();
+  const path = await pickFolder({ title: "Add a repository" });
   if (!path) return;
+  let url;
   try {
-    await apiPost("/api/repos", { path, label: path.split(/[\\/]/).pop() });
-    input.value = "";
+    // Brand-new folders are initialized; let the user review/edit the URL first.
+    const info = await apiGet(`/api/init-url?path=${encodeURIComponent(path)}`);
+    if (!info.isRepo) {
+      url = await confirmInit(path, info.url);
+      if (url === null) return; // cancelled
+    }
+  } catch (err) {
+    return toast(err.message, true);
+  }
+  try {
+    const { initialized } = await apiPost("/api/repos", { path, url });
     await loadRepos();
     selectRepo(path);
+    toast(initialized ? "Repository initialized" : "Repository added");
   } catch (err) {
     toast(err.message, true);
   }
+}
+
+/**
+ * Show the generated repository URL for a soon-to-be-initialized folder in an
+ * editable box. Resolves to the (possibly edited) URL, or null if cancelled.
+ */
+let initResolve = null;
+function confirmInit(path, suggestedUrl) {
+  $("#init-folder").textContent = `${path} is not a Lore repository yet — it will be created with:`;
+  $("#init-url").value = suggestedUrl || "";
+  $("#init-dialog").showModal();
+  return new Promise((resolve) => {
+    initResolve = resolve;
+  });
+}
+
+function initFinish(url) {
+  $("#init-dialog").close();
+  const resolve = initResolve;
+  initResolve = null;
+  resolve?.(url);
+}
+
+function wireInit() {
+  $("#init-cancel").onclick = () => initFinish(null);
+  $("#init-go").onclick = () => {
+    const v = $("#init-url").value.trim();
+    if (!v) return toast("Repository URL required", true);
+    initFinish(v);
+  };
+  $("#init-dialog").addEventListener("cancel", (e) => {
+    e.preventDefault();
+    initFinish(null);
+  });
 }
 
 async function removeRepo(path) {
@@ -123,8 +164,6 @@ async function removeRepo(path) {
     toast(err.message, true);
   }
 }
-
-// ---- Active repo views ---------------------------------------------------
 
 function showEmpty() {
   $("#empty").hidden = false;
@@ -353,8 +392,6 @@ async function loadBranches(pathEnc) {
   }
 }
 
-// ---- Remote operations (streamed) ---------------------------------------
-
 async function runOp(title, path, payload) {
   const overlay = $("#op-overlay");
   const logEl = $("#op-log");
@@ -387,8 +424,6 @@ async function runOp(title, path, payload) {
   await refreshActive();
 }
 
-// ---- Live connection (SSE) ----------------------------------------------
-
 function connectSSE() {
   const es = new EventSource("/events");
   es.onopen = () => $("#conn").classList.add("live");
@@ -408,11 +443,72 @@ function connectSSE() {
   };
 }
 
-// ---- Wiring --------------------------------------------------------------
+// The browser can't hand the server a real filesystem path, so the folder picker
+// drives a server-backed directory browser (/api/browse) instead of typed paths.
+const picker ={ cur: "", parent: null, sep: "\\", resolve: null };
+
+async function pickerNavigate(path) {
+  const data = await apiGet(`/api/browse?path=${encodeURIComponent(path ?? "")}`);
+  picker.cur = data.path;
+  picker.parent = data.parent;
+  picker.sep = data.sep || picker.sep;
+  $("#picker-cur").textContent = data.path || "This PC";
+  $("#picker-up").disabled = data.parent === null;
+  const ul = $("#picker-list");
+  ul.innerHTML = "";
+  if (data.entries.length === 0) {
+    ul.innerHTML = `<li class="muted">— no sub-folders —</li>`;
+  }
+  for (const e of data.entries) {
+    const li = document.createElement("li");
+    li.innerHTML = `<span class="p-name" title="${e.path}">${e.name}</span>${
+      e.isRepo ? `<span class="p-tag">lore</span>` : ""
+    }`;
+    li.onclick = () => pickerNavigate(e.path);
+    ul.appendChild(li);
+  }
+}
+
+/**
+ * Open the folder picker and resolve to a chosen absolute path (or null on
+ * cancel). With { allowNew: true } the user may type a new sub-folder name to
+ * create under the browsed directory (used for a clone destination).
+ */
+function pickFolder({ title, allowNew } = {}) {
+  $("#picker-title").textContent = title || "Select a folder";
+  $("#picker-new").hidden = !allowNew;
+  $("#picker-newname").value = "";
+  pickerNavigate("").catch((err) => toast(err.message, true));
+  $("#picker-dialog").showModal();
+  return new Promise((resolve) => {
+    picker.resolve = resolve;
+  });
+}
+
+function pickerFinish(path) {
+  $("#picker-dialog").close();
+  const resolve = picker.resolve;
+  picker.resolve = null;
+  resolve?.(path);
+}
+
+function wirePicker() {
+  $("#picker-up").onclick = () => picker.parent !== null && pickerNavigate(picker.parent);
+  $("#picker-cancel").onclick = () => pickerFinish(null);
+  $("#picker-choose").onclick = () => {
+    if (!picker.cur) return toast("Open a folder first", true);
+    const name = $("#picker-newname")?.value.trim();
+    const path = !$("#picker-new").hidden && name ? picker.cur + picker.sep + name : picker.cur;
+    pickerFinish(path);
+  };
+  $("#picker-dialog").addEventListener("cancel", (e) => {
+    e.preventDefault();
+    pickerFinish(null);
+  });
+}
 
 function wire() {
   $("#add-btn").onclick = addRepo;
-  $("#add-path").addEventListener("keydown", (e) => e.key === "Enter" && addRepo());
   $("#refresh-btn").onclick = refreshActive;
   $("#commit-btn").onclick = commit;
 
@@ -421,6 +517,10 @@ function wire() {
   $("#op-close").onclick = () => ($("#op-overlay").hidden = true);
 
   $("#clone-btn").onclick = () => $("#clone-dialog").showModal();
+  $("#clone-dest-browse").onclick = async () => {
+    const dest = await pickFolder({ title: "Clone destination", allowNew: true });
+    if (dest) $("#clone-dest").value = dest;
+  };
   $("#clone-go").onclick = (e) => {
     const url = $("#clone-url").value.trim();
     const dest = $("#clone-dest").value.trim();
@@ -433,6 +533,9 @@ function wire() {
       await loadRepos();
     }, 0);
   };
+
+  wirePicker();
+  wireInit();
 
   $$(".tab").forEach((tab) => {
     tab.onclick = () => {
@@ -450,8 +553,6 @@ function wire() {
   // Slow poll catches revisions pushed by the other machine (no local fs event).
   setInterval(() => state.active && loadHistory(encodeURIComponent(state.active)), 10000);
 }
-
-// ---- Boot ----------------------------------------------------------------
 
 wire();
 connectSSE();

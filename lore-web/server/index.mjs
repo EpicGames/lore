@@ -4,10 +4,11 @@
 // and must never be reachable off-host.
 
 import { createServer } from "node:http";
-import { readFile, stat } from "node:fs/promises";
-import { existsSync } from "node:fs";
-import { join, extname, normalize as normalizePath, dirname } from "node:path";
+import { readFile, stat, readdir } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
+import { join, extname, normalize as normalizePath, dirname, parse as parsePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { homedir } from "node:os";
 
 import { log } from "./log.mjs";
 import { collect, stream, configureSdk, shutdownSdk } from "./sdk.mjs";
@@ -20,11 +21,54 @@ import { isLoggedIn } from "./cli.mjs";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = join(HERE, "..", "web");
 const HOST = process.env.LORE_WEB_HOST ?? "127.0.0.1";
-const PORT = Number(process.env.LORE_WEB_PORT ?? 7420);
+const PORT = Number(process.env.LORE_WEB_PORT ?? process.env.PORT ?? 7420);
 
 /** A path is a Lore working copy if it holds a .lore (or legacy .urc) dir. */
 function isRepo(path) {
   return existsSync(join(path, ".lore")) || existsSync(join(path, ".urc"));
+}
+
+/**
+ * The remote server base to assign when initializing a brand-new repository, so
+ * the user never types one. We reuse the remote of an already-tracked repo
+ * (almost always the same self-hosted server), falling back to an env override
+ * and finally the default local Lore server. The repo name is appended later;
+ * repositoryCreate mints the per-repo UUID that distinguishes repos on a server.
+ * @returns {string} a remote base URL with no trailing repo-name path component
+ */
+function defaultRemoteBase() {
+  for (const r of store.listRepos()) {
+    for (const name of ["config.toml", "config"]) {
+      const cfg = join(r.path, ".lore", name);
+      if (!existsSync(cfg)) continue;
+      try {
+        const m = readFileSync(cfg, "utf8").match(/^\s*remote_url\s*=\s*"([^"]+)"/m);
+        if (m && m[1]) return m[1];
+      } catch {
+        // unreadable config — keep looking
+      }
+    }
+  }
+  return process.env.LORE_WEB_DEFAULT_REMOTE ?? "lore://127.0.0.1:41337";
+}
+
+/**
+ * The repository URL suggested when initializing a folder named `label`, of the
+ * form <server-base>/<label>. This is what the Add flow shows for review.
+ * @param {string} label the repo name (usually the folder's last path segment)
+ * @returns {string} a full repository URL
+ */
+function suggestInitUrl(label) {
+  return `${defaultRemoteBase().replace(/\/+$/, "")}/${label}`;
+}
+
+/**
+ * Forward-slash form of a path — the native lib drops Windows backslashes.
+ * @param {string} p a filesystem path, possibly using backslash separators
+ * @returns {string} the same path with every backslash replaced by a slash
+ */
+function toUnixPath(p) {
+  return p.replace(/\\/g, "/");
 }
 
 function sendJson(res, status, body) {
@@ -105,16 +149,96 @@ async function listRepos(res) {
   sendJson(res, 200, { repos: enriched });
 }
 
-/** POST /api/repos — start tracking a working copy. */
+/**
+ * POST /api/repos — start tracking a folder, smartly. If the folder is already a
+ * Lore working copy it is just tracked; otherwise a new repository is initialized
+ * there first (with an auto-generated remote URL) so the user can point at any
+ * folder without caring whether it has been set up yet.
+ */
 async function addRepo(req, res) {
-  const { path, label } = await readBody(req);
+  let { path, url } = await readBody(req);
   if (!path || typeof path !== "string") return sendJson(res, 400, { error: "path required" });
+  // The native lib mangles backslash paths; forward slashes are the store's
+  // convention and what every other verb here is given.
+  path = toUnixPath(path);
   if (!existsSync(path)) return sendJson(res, 400, { error: "path does not exist" });
-  if (!isRepo(path)) return sendJson(res, 400, { error: "not a Lore repository (no .lore directory)" });
+  const label = path.split(/[\\/]/).filter(Boolean).pop() || path;
+  let initialized = false;
+  if (!isRepo(path)) {
+    // Use the caller's reviewed URL when given, else the generated suggestion.
+    // A bare host is rejected as invalid, so the name is part of the suggestion.
+    const repositoryUrl = (typeof url === "string" && url.trim()) || suggestInitUrl(label);
+    log.info("initializing repository", { path, repositoryUrl });
+    await collect("repositoryCreate", { repositoryPath: path }, { repositoryUrl, id: "" });
+    initialized = true;
+  }
   const entry = store.addRepo(path, label);
   watchRepo(path, () => broadcastRefresh(path, "fs"));
   broadcastRefresh("*", "repos");
-  sendJson(res, 200, { repo: entry });
+  sendJson(res, 200, { repo: entry, initialized });
+}
+
+/**
+ * Drive roots present on this machine, used as the picker's top "This PC" level.
+ * @returns {string[]} drive-root paths (Windows: C:\ … Z:\; POSIX: just "/")
+ */
+function listDrives() {
+  if (process.platform !== "win32") return ["/"];
+  const drives = [];
+  for (let c = 67; c <= 90; c++) {
+    const d = `${String.fromCharCode(c)}:\\`;
+    if (existsSync(d)) drives.push(d);
+  }
+  return drives;
+}
+
+/**
+ * GET /api/browse?path= — list the sub-folders of a directory so the UI can offer
+ * a native-feeling folder picker (the browser can't hand us a real fs path). An
+ * empty path returns the drive roots ("This PC"). Each entry is flagged when it
+ * is itself a Lore repo. Only directories are returned — this is a folder picker.
+ * @param {import("node:http").ServerResponse} res
+ * @param {string|null} rawPath directory to list; empty/null lists the roots
+ */
+async function browse(res, rawPath) {
+  let path = (rawPath || "").trim();
+  // Empty path → the roots level (drives on Windows, "/" on POSIX).
+  if (!path) {
+    const entries = listDrives().map((d) => ({ name: d, path: d, isRepo: isRepo(d) }));
+    return sendJson(res, 200, { path: "", parent: null, sep, entries });
+  }
+  const norm = normalizePath(path);
+  let info;
+  try {
+    info = await stat(norm);
+  } catch {
+    return sendJson(res, 400, { error: "path does not exist" });
+  }
+  if (!info.isDirectory()) return sendJson(res, 400, { error: "not a directory" });
+  // Parent: the drives/roots level when we're at a drive root, else dirname.
+  const atRoot = parsePath(norm).root === norm || norm === "/";
+  const parent = atRoot ? "" : dirname(norm);
+  let entries = [];
+  try {
+    const dirents = await readdir(norm, { withFileTypes: true });
+    entries = dirents
+      .filter((d) => {
+        try {
+          return d.isDirectory();
+        } catch {
+          return false;
+        }
+      })
+      .filter((d) => !d.name.startsWith("."))
+      .map((d) => {
+        const full = join(norm, d.name);
+        return { name: d.name, path: full, isRepo: isRepo(full) };
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+  } catch (err) {
+    return sendJson(res, 400, { error: err instanceof Error ? err.message : "cannot read directory" });
+  }
+  sendJson(res, 200, { path: norm, parent, sep, isRepo: isRepo(norm), entries });
 }
 
 /**
@@ -167,11 +291,22 @@ const server = createServer(async (req, res) => {
     const repoPath = q.get("path");
     const globalArgs = repoPath ? { repositoryPath: repoPath } : {};
 
-    // --- API ---
     if (p === "/events" && req.method === "GET") return addClient(res);
 
     if (p === "/api/auth" && req.method === "GET") {
       return sendJson(res, 200, { loggedIn: await isLoggedIn() });
+    }
+
+    if (p === "/api/browse" && req.method === "GET") return await browse(res, q.get("path"));
+
+    // Pre-flight for the Add flow: report whether a folder is already a repo and,
+    // if not, the URL it would be initialized with (editable before confirming).
+    if (p === "/api/init-url" && req.method === "GET") {
+      const target = toUnixPath(q.get("path") || "");
+      if (!target || !existsSync(target)) return sendJson(res, 400, { error: "path does not exist" });
+      const already = isRepo(target);
+      const label = target.split(/[\\/]/).filter(Boolean).pop() || target;
+      return sendJson(res, 200, { isRepo: already, url: already ? null : suggestInitUrl(label) });
     }
 
     if (p === "/api/repos" && req.method === "GET") return await listRepos(res);
@@ -212,7 +347,8 @@ const server = createServer(async (req, res) => {
       return sendJson(res, 200, { files: xform.revisionFiles(events) });
     }
 
-    // --- write actions (quick; respond with refreshed nothing, broadcast refresh) ---
+    // Quick mutating actions answer immediately and broadcast a refresh so every
+    // client refetches; the response body itself carries no refreshed state.
     if (p === "/api/stage" && req.method === "POST") {
       const { path: rp, files } = await readBody(req);
       await collect("fileStage", { repositoryPath: rp }, { paths: absFiles(rp, files), scan: true });
@@ -239,7 +375,7 @@ const server = createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true });
     }
 
-    // --- remote operations (streamed progress as NDJSON) ---
+    // Remote operations stream their progress back as NDJSON.
     if (p === "/api/sync" && req.method === "POST") {
       const { path: rp, revision, reset } = await readBody(req);
       return await streamOp(res, "revisionSync", { repositoryPath: rp }, { revision, reset: !!reset }, rp);
@@ -251,10 +387,10 @@ const server = createServer(async (req, res) => {
     if (p === "/api/clone" && req.method === "POST") {
       const { url, dest } = await readBody(req);
       if (!url || !dest) return sendJson(res, 400, { error: "url and dest required" });
-      return await streamOp(res, "repositoryClone", { repositoryPath: dest }, { repositoryUrl: url }, null);
+      return await streamOp(res, "repositoryClone", { repositoryPath: toUnixPath(dest) }, { repositoryUrl: url }, null);
     }
 
-    // --- static SPA ---
+    // Anything else is a static asset request, falling back to the SPA shell.
     if (req.method === "GET") return await serveStatic(req, res, p);
     sendJson(res, 404, { error: "not found" });
   } catch (err) {
