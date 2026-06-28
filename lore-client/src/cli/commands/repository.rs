@@ -817,8 +817,8 @@ pub fn handle_repository_info(globals: LoreGlobalArgs, args: &RepositoryInfoArgs
                     anstyle::Reset,
                     data.creator
                 );
-                if let Some(created) = DateTime::from_timestamp_millis(data.created as i64)
-                    .map(|time| time.to_rfc2822())
+                if let Some(created) =
+                    DateTime::from_timestamp(data.created as i64, 0).map(|time| time.to_rfc2822())
                 {
                     println!(
                         "{}Created:{} {created}",

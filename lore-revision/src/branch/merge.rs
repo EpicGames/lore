@@ -32,6 +32,7 @@ use crate::interface::LoreEvent;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
 use crate::link;
+use crate::lore::Address;
 use crate::lore::BranchId;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
@@ -3621,7 +3622,7 @@ async fn merge_into_link(
         .forward::<MergeError>("serializing state")?;
 
     // Collect and push fragments
-    let fragments = state::collect_new_fragments(
+    let mut fragments = state::collect_new_fragments(
         repository.clone(),
         state_branch.clone(),
         state_new.clone(),
@@ -3629,6 +3630,9 @@ async fn merge_into_link(
     )
     .await
     .forward::<MergeError>("collecting new fragments")?;
+    if !state_new.parent_other().is_zero() {
+        fragments.push(Address::zero_context_hash(state_new.parent_other()));
+    }
 
     let mut revision = signature;
     let mut revision_number = state_new.revision_number();
@@ -3964,7 +3968,7 @@ pub async fn merge_into(
         state_branch.revision(),
         state_new.revision()
     );
-    let fragments = state::collect_new_fragments(
+    let mut fragments = state::collect_new_fragments(
         repository.clone(),
         state_branch.clone(),
         state_new.clone(),
@@ -3972,6 +3976,9 @@ pub async fn merge_into(
     )
     .await
     .forward::<MergeError>("collecting new fragments")?;
+    if !state_new.parent_other().is_zero() {
+        fragments.push(Address::zero_context_hash(state_new.parent_other()));
+    }
 
     let mut revision = signature;
     let mut revision_number = state_new.revision_number();
