@@ -34,7 +34,6 @@ use crate::lore_info;
 use crate::node::Node;
 use crate::node::NodeLink;
 use crate::node::ROOT_NODE;
-use crate::repository::DOT_URC;
 use crate::repository::RepositoryContext;
 use crate::repository::clone::VirtualLayer;
 use crate::state::State;
@@ -92,12 +91,12 @@ impl std::fmt::Display for Win32Error {
     }
 }
 
-impl From<windows_sys::core::GUID> for Context {
-    fn from(value: windows_sys::core::GUID) -> Self {
-        // Safety: GUID and Context are the same binary size and just raw data
-        unsafe { std::mem::transmute_copy::<windows_sys::core::GUID, Context>(&value) }
-    }
-}
+// GUID -> Context conversion is inlined in `context_from_guid` below.
+// (Can't `impl From<GUID> for Context` here: orphan rule — both types are foreign
+//  to this crate now that Context lives in lore_storage.)
+
+/// ProjFS callbacks report failure to the OS as an HRESULT-shaped i32 (0 == S_OK).
+const E_INVALIDARG: i32 = -2147024809; // 0x80070057
 
 struct InstanceContext {
     execution: std::sync::Arc<ExecutionContext>,
@@ -193,7 +192,14 @@ pub fn serve(
         None
     };
 
-    if let Err(err) = std::env::set_current_dir(repository.require_path()?) {
+    let repo_path = match repository.require_path() {
+        Ok(repo_path) => repo_path,
+        Err(err) => {
+            lore_error!("Repository has no working path: {err}");
+            return;
+        }
+    };
+    if let Err(err) = std::env::set_current_dir(repo_path) {
         lore_error!("Failed to set repository path as current working dir: {err}");
         return;
     }
@@ -406,8 +412,9 @@ fn instance_context(cbdata: &*const ProjectedFileSystem::PRJ_CALLBACK_DATA) -> &
 }
 
 fn context_from_guid(guid: *const windows_sys::core::GUID) -> Context {
-    // Safety: Only valid pointers from ProjFS are passed to this function
-    unsafe { (*guid).into() }
+    // Safety: Only valid pointers from ProjFS are passed to this function.
+    // GUID and Context share the same 16-byte raw-data layout.
+    unsafe { std::mem::transmute_copy::<windows_sys::core::GUID, Context>(&*guid) }
 }
 
 unsafe extern "system" fn start_directory_enumeration(
@@ -549,7 +556,11 @@ async unsafe fn get_directory_enumeration_async(
 
         // TODO(vri): UCS-19230 - Links: Handle link nodes in ProjFS directory enumeration and find
         let relative_path = RelativePath::new_from_user_path(
-            instance_context.layers[0].module.path.as_path(),
+            instance_context.layers[0]
+                .module
+                .path
+                .as_deref()
+                .expect("virtual layer module path"),
             file_path.as_str(),
         )
         .unwrap_or_default();
@@ -597,7 +608,11 @@ async unsafe fn get_directory_enumeration_async(
                 let (directory_path, search) = enum_instance.search.split_at(sep);
 
                 let relative_path = RelativePath::new_from_user_path(
-                    instance_context.layers[0].module.path.as_path(),
+                    instance_context.layers[0]
+                        .module
+                        .path
+                        .as_deref()
+                        .expect("virtual layer module path"),
                     directory_path,
                 )
                 .unwrap_or_default();
@@ -837,9 +852,11 @@ async unsafe fn get_placeholder_info_async(
         let repository = layer.module.clone();
         let state = layer.state.clone();
 
-        let relative_path =
-            RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
-                .unwrap_or_default();
+        let relative_path = RelativePath::new_from_user_path(
+            repository.require_path().map_err(|_| E_INVALIDARG)?,
+            path.as_str(),
+        )
+        .unwrap_or_default();
 
         let Ok(node_link) = state
             .find_node_link(repository.clone(), relative_path.as_str())
@@ -930,7 +947,11 @@ unsafe extern "system" fn query_file_name(
         unsafe { slice::from_raw_parts((*cbdata).FilePathName, wcslen((*cbdata).FilePathName)) };
     let path = String::from_utf16_lossy(path);
     let relative_path = RelativePath::new_from_user_path(
-        instance_context.layers[0].module.path.as_path(),
+        instance_context.layers[0]
+            .module
+            .path
+            .as_deref()
+            .expect("virtual layer module path"),
         path.as_str(),
     )
     .unwrap_or_default();
@@ -976,7 +997,11 @@ unsafe extern "system" fn get_file_data(
         unsafe { slice::from_raw_parts((*cbdata).FilePathName, wcslen((*cbdata).FilePathName)) };
     let path = String::from_utf16_lossy(path);
     let relative_path = RelativePath::new_from_user_path(
-        instance_context.layers[0].module.path.as_path(),
+        instance_context.layers[0]
+            .module
+            .path
+            .as_deref()
+            .expect("virtual layer module path"),
         path.as_str(),
     )
     .unwrap_or_default();
@@ -1065,7 +1090,7 @@ async fn get_file_data_async(
                 },
                 // Safety: Ok as buffer is verified non-null and range is clamped above
                 unsafe { slice::from_raw_parts_mut(write_buffer.cast::<u8>(), to_read) },
-                immutable::ReadOptions::default()
+                lore_storage::options::ReadOptions::default()
                     .with_decompress()
                     .with_remote()
                     .with_verify(),
