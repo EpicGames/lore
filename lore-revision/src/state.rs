@@ -4684,6 +4684,30 @@ async fn apply_pending_discards(
         }
 
         let initial_ancestor = discard_node.parent;
+
+        // For a directory, discard the whole subtree below it first so its node
+        // slots are reclaimed; the node itself is unlinked from its parent and
+        // discarded by node_discard_patch below. Each child's sibling pointer is
+        // captured before discarding it, since discard_node repurposes that
+        // pointer for the block's free list.
+        if discard_node.is_directory() {
+            let mut child_ref = discard_node.child();
+            while let Some(child_id) = child_ref {
+                let child_node = state.node(repository.clone(), child_id).await?;
+                let next_sibling = child_node.sibling();
+                node_discard_recurse(
+                    state.clone(),
+                    repository.clone(),
+                    child_id,
+                    true, /* recurse */
+                    true, /* discard */
+                    |_, _| {},
+                )
+                .await?;
+                child_ref = next_sibling;
+            }
+        }
+
         node_discard_patch(
             state.clone(),
             repository.clone(),
@@ -5606,6 +5630,23 @@ async fn emit_filesystem_subtree_deletes(
     Ok(false)
 }
 
+/// Returns whether the on-disk directory at `relative_path` (resolved under
+/// `repository_root`) is itself a Lore working copy — it contains its own
+/// `.lore/` (or legacy `.urc/`) control directory.
+///
+/// Such a nested repository is an implicit boundary for the parent's
+/// working-tree scan: its contents belong to the nested repository, not the
+/// parent, so the parent neither descends into nor indexes it. This mirrors the
+/// way git treats a nested `.git` directory as a submodule boundary rather than
+/// pulling its files into the outer repository.
+fn is_nested_repository_root(
+    repository_root: &std::path::Path,
+    relative_path: &RelativePath,
+) -> bool {
+    let absolute_path = relative_path.to_absolute_path(repository_root);
+    absolute_path.join(DOT_LORE).is_dir() || absolute_path.join(DOT_URC).is_dir()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn diff_filesystem_directory_walk(
     ctx: &DiffFilesystemContext,
@@ -5629,6 +5670,21 @@ async fn diff_filesystem_directory_walk(
             .filesystem_path
             .push_into_buf(item.name.as_str())
             .freeze();
+
+        // A child directory that is itself a Lore working copy (it contains its
+        // own `.lore`/`.urc` control directory) is an implicit boundary: do not
+        // descend into or index it, mirroring how git ignores nested `.git`
+        // directories. Skipping it keeps the nested repository's contents out of
+        // the parent's tree. A node previously indexed for it (from before this
+        // boundary check existed) is left unmatched and so falls through to the
+        // delete pass below, where an empty never-committed entry is discarded —
+        // clearing a pre-existing stale "zombie" entry on the next scan.
+        if item.metadata.is_dir()
+            && is_nested_repository_root(ctx.from.repository.require_path()?, &item_path)
+        {
+            lore_trace!("Skipping nested repository root {item_path}");
+            continue;
+        }
 
         if ctx.from.repository.filter.emit_excludes(
             &item_path,
@@ -5936,6 +5992,32 @@ async fn diff_filesystem_directory_walk(
         else {
             continue;
         };
+
+        // A directory node that exists in state_from but neither in state_current
+        // (never committed) nor on disk is a reverted, uncommitted add — for
+        // example a nested repository root that was indexed before the boundary
+        // check above existed and has since been removed, together with whatever
+        // of its contents had been pulled into the parent tree. Reporting it as a
+        // `Delete` is meaningless because there is no committed base to delete
+        // from, and no mutation verb can clear it (the "zombie" entry). Discard
+        // the whole subtree so state_staged matches the filesystem instead, the
+        // same way a reverted single-file add is discarded below.
+        if ctx.scan_dirty && from_node.node.is_directory() {
+            let in_current = current_node_list
+                .children
+                .as_slice()
+                .binary_search_by(|child| child.name.cmp(&from_named_node.name))
+                .is_ok();
+            if !in_current {
+                lore_trace!(
+                    "Queueing reverted uncommitted directory node {} (no entry at {}, not in current)",
+                    from_named_node.node,
+                    from_node.path
+                );
+                pending_discards.push(from_named_node.node);
+                continue;
+            }
+        }
 
         // Emit deletes only for the materialized portion of the subtree,
         // suppressing directories the filter merely descended through but never
