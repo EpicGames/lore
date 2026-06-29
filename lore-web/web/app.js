@@ -82,8 +82,9 @@ function renderRepos() {
       <span class="r-name" title="${r.path}">${r.label}</span>
       ${r.exists ? `<span class="r-branch">${r.branch || ""}</span>` : `<span class="r-missing">missing</span>`}
       <button class="r-remove" title="Remove">✕</button>`;
-    li.querySelector(".r-name").onclick = () => selectRepo(r.path);
-    li.querySelector(".r-branch, .r-missing")?.addEventListener?.("click", () => selectRepo(r.path));
+    // Select on a click anywhere in the row, not just the label, so the whole
+    // row is one big hit target. The remove button stops propagation below.
+    li.onclick = () => selectRepo(r.path);
     li.querySelector(".r-remove").onclick = (e) => {
       e.stopPropagation();
       removeRepo(r.path);
