@@ -4,3 +4,7 @@ node_modules/
 # Local runtime state.
 *.log
 .data/
+
+# Lore files
+.lore/
+.loreignore

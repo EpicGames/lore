@@ -26,7 +26,7 @@ is read live from the Lore SDK on each request; nothing is cached server-side.
 
 | Method | Path | Query | Description |
 | --- | --- | --- | --- |
-| GET | `/api/status` | `path` | Current branch plus staged/unstaged changed files. |
+| GET | `/api/status` | `path` | Current branch plus staged/unstaged changed files. Also returns `hasLoreignore`/`hasGitignore` flags, and marks each changed entry that is itself a nested Lore working copy with `nested: true`. |
 | GET | `/api/history` | `path`, `length` | Revision history (default 50), with message and timestamp. |
 | GET | `/api/branches` | `path` | Branch list. |
 | GET | `/api/diff` | `path`, `file` | Unified diff for one file. |
@@ -40,6 +40,9 @@ is read live from the Lore SDK on each request; nothing is cached server-side.
 | POST | `/api/unstage` | `{ path, files }` | Unstage the given files. |
 | POST | `/api/reset` | `{ path, files }` | Discard working changes to the given files. |
 | POST | `/api/commit` | `{ path, message }` | Commit the staged revision. |
+| POST | `/api/ignore` | `{ path, pattern }` | Append a gitignore-style `pattern` (file, `folder/`, or `*.ext`) to `.loreignore`, creating it if absent. Returns `{ ok, added }`. |
+| POST | `/api/init-loreignore` | `{ path }` | Set up `.loreignore` (seeded from `.gitignore` when present) and keep each tool's metadata out of the other's history. Returns `{ ok, created, gitignoreUpdated }`. |
+| POST | `/api/repair` | `{ path }` | Rebuild the working copy's `.lore` in place to purge unremovable stale index entries, preserving the repository id and remote. Refused (409) when there is committed history. Returns `{ ok, id }`. |
 
 ### Remote operations (streamed)
 

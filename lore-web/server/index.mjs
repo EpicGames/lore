@@ -5,7 +5,7 @@
 
 import { createServer } from "node:http";
 import { readFile, stat, readdir } from "node:fs/promises";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, renameSync } from "node:fs";
 import { join, extname, normalize as normalizePath, dirname, parse as parsePath, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
@@ -17,6 +17,7 @@ import * as xform from "./transforms.mjs";
 import { addClient, broadcastRefresh } from "./events.mjs";
 import { watchRepo, unwatchRepo } from "./watcher.mjs";
 import { isLoggedIn } from "./cli.mjs";
+import { setupLoreignore, appendIgnorePattern, hasLoreignore, hasGitignore } from "./loreignore.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = join(HERE, "..", "web");
@@ -50,6 +51,27 @@ function defaultRemoteBase() {
     }
   }
   return process.env.LORE_WEB_DEFAULT_REMOTE ?? "lore://127.0.0.1:41337";
+}
+
+/** The remote_url recorded in a repo's .lore config, or null if none/unreadable. */
+function readRepoRemote(repoPath) {
+  for (const name of ["config.toml", "config"]) {
+    const cfg = join(repoPath, ".lore", name);
+    if (!existsSync(cfg)) continue;
+    try {
+      const m = readFileSync(cfg, "utf8").match(/^\s*remote_url\s*=\s*"([^"]+)"/m);
+      if (m && m[1]) return m[1];
+    } catch {
+      // unreadable — fall through
+    }
+  }
+  return null;
+}
+
+/** The scheme://authority prefix of a URL, with any path/repo component dropped. */
+function remoteBase(url) {
+  const m = url.match(/^([a-z][a-z0-9+.-]*:\/\/[^/]+)/i);
+  return m ? m[1] : url.replace(/\/+$/, "");
 }
 
 /**
@@ -170,12 +192,64 @@ async function addRepo(req, res) {
     const repositoryUrl = (typeof url === "string" && url.trim()) || suggestInitUrl(label);
     log.info("initializing repository", { path, repositoryUrl });
     await collect("repositoryCreate", { repositoryPath: path }, { repositoryUrl, id: "" });
+    // Seed .loreignore (from .gitignore when present) and keep each tool's
+    // metadata out of the other's history.
+    setupLoreignore(path);
     initialized = true;
   }
   const entry = store.addRepo(path, label);
   watchRepo(path, () => broadcastRefresh(path, "fs"));
   broadcastRefresh("*", "repos");
   sendJson(res, 200, { repo: entry, initialized });
+}
+
+/**
+ * POST /api/repair — rebuild a working copy's .lore in place. Lore can leave
+ * "zombie" status entries (e.g. a nested repo that was indexed then deleted) that
+ * no reset/stage/commit/obliterate can remove; the only cure is recreating .lore.
+ * We do that while preserving the repository id and remote, so the repo keeps its
+ * identity. Refused when there is committed history (which a rebuild would drop) —
+ * such a repo should be re-cloned from its remote instead.
+ */
+async function repairRepo(path, res) {
+  if (!existsSync(path)) return sendJson(res, 400, { error: "path does not exist" });
+  if (!isRepo(path)) return sendJson(res, 400, { error: "not a Lore repository" });
+  // Guard: never destroy committed history.
+  const hist = xform.history(await collect("revisionHistory", { repositoryPath: path }, { length: 1 }));
+  if (hist.length > 0) {
+    return sendJson(res, 409, {
+      error: "repository has committed revisions; repair would lose them — re-clone from the remote instead",
+    });
+  }
+  const dot = join(path, ".lore");
+  let id = "";
+  try {
+    id = readFileSync(join(dot, "id")).toString("hex");
+  } catch {
+    // no id file — let create mint a fresh one
+  }
+  const remote = readRepoRemote(path);
+  const label = path.split(/[\\/]/).filter(Boolean).pop() || path;
+  const repositoryUrl = `${remote ? remoteBase(remote) : defaultRemoteBase().replace(/\/+$/, "")}/${label}`;
+  log.info("repairing repository", { path, repositoryUrl, id });
+  // Recreate offline so we never re-register on (or conflict with) the remote —
+  // the repo already exists there; we are only rebuilding the local .lore. Move
+  // the old .lore aside first and restore it if the rebuild fails, so a failure
+  // never leaves the working copy without a repository.
+  const backup = `${dot}.repair-bak`;
+  rmSync(backup, { recursive: true, force: true });
+  renameSync(dot, backup);
+  try {
+    await collect("repositoryCreate", { repositoryPath: path, offline: true }, { repositoryUrl, id });
+  } catch (err) {
+    rmSync(dot, { recursive: true, force: true });
+    renameSync(backup, dot);
+    throw err;
+  }
+  rmSync(backup, { recursive: true, force: true });
+  setupLoreignore(path);
+  broadcastRefresh(path, "repair");
+  sendJson(res, 200, { ok: true, id });
 }
 
 /**
@@ -320,7 +394,20 @@ const server = createServer(async (req, res) => {
     }
     if (p === "/api/status" && req.method === "GET") {
       const events = await collect("repositoryStatus", globalArgs, { staged: true, scan: true });
-      return sendJson(res, 200, xform.status(events));
+      const out = xform.status(events);
+      // The UI offers an "Initialize .loreignore" action when one is absent.
+      out.hasLoreignore = repoPath ? hasLoreignore(repoPath) : false;
+      out.hasGitignore = repoPath ? hasGitignore(repoPath) : false;
+      // Flag entries that are themselves Lore working copies (a directory holding
+      // its own .lore). The UI prompts to ignore these *while they still exist* —
+      // the only way to avoid the unremovable "zombie" entry Lore leaves behind if
+      // an indexed nested repo is later deleted.
+      if (repoPath) {
+        for (const f of out.files) {
+          if (f.type === 0 && isRepo(join(repoPath, f.path))) f.nested = true;
+        }
+      }
+      return sendJson(res, 200, out);
     }
     if (p === "/api/branches" && req.method === "GET") {
       const events = await collect("branchList", globalArgs, {});
@@ -366,6 +453,31 @@ const server = createServer(async (req, res) => {
       await collect("fileReset", { repositoryPath: rp }, { paths: absFiles(rp, files) });
       broadcastRefresh(rp, "reset");
       return sendJson(res, 200, { ok: true });
+    }
+    // Add a file/folder/extension pattern to .loreignore (created if absent).
+    if (p === "/api/ignore" && req.method === "POST") {
+      const { path: rp, pattern } = await readBody(req);
+      if (!rp || !pattern) return sendJson(res, 400, { error: "path and pattern required" });
+      const added = appendIgnorePattern(toUnixPath(rp), pattern);
+      broadcastRefresh(rp, "ignore");
+      return sendJson(res, 200, { ok: true, added });
+    }
+    // Seed/repair .loreignore for an already-initialized repo (the same setup the
+    // Add flow runs on init).
+    if (p === "/api/init-loreignore" && req.method === "POST") {
+      const { path: rp } = await readBody(req);
+      if (!rp) return sendJson(res, 400, { error: "path required" });
+      const result = setupLoreignore(toUnixPath(rp));
+      broadcastRefresh(rp, "ignore");
+      return sendJson(res, 200, { ok: true, ...result });
+    }
+    // Rebuild a repo's .lore in place to purge unremovable zombie index entries
+    // (Lore has no command to drop them). Guarded: refuses if there is committed
+    // history to lose. Preserves the repository id and remote so identity is kept.
+    if (p === "/api/repair" && req.method === "POST") {
+      const { path: rp } = await readBody(req);
+      if (!rp) return sendJson(res, 400, { error: "path required" });
+      return await repairRepo(toUnixPath(rp), res);
     }
     if (p === "/api/commit" && req.method === "POST") {
       const { path: rp, message } = await readBody(req);

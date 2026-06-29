@@ -94,6 +94,10 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); }
 .panel.active { display: block; }
 
 /* Changes */
+.changes-bar { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-bottom: 12px; }
+.changes-bar:empty { display: none; }
+.changes-bar .bar-note { margin-right: auto; font-size: 12px; color: var(--muted); }
+.changes-bar .bar-note.warn { color: var(--yellow); }
 .file-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 .file-col h3 { margin: 0 0 8px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
 .files { list-style: none; margin: 0; padding: 0; }
@@ -104,6 +108,8 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); }
 .files .badge-A { color: var(--green); }
 .files .badge-M { color: var(--yellow); }
 .files .badge-D { color: var(--red); }
+.files .badge-nested { color: var(--accent); }
+.files .badge-stale { color: var(--yellow); }
 .commit-box { margin-top: 18px; display: flex; flex-direction: column; gap: 8px; }
 .commit-box textarea { min-height: 64px; resize: vertical; }
 .commit-box button { align-self: flex-start; }
@@ -169,6 +175,16 @@ dialog::backdrop { background: rgba(0,0,0,0.6); }
 .picker-list .p-tag { margin-left: auto; font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--accent); border: 1px solid var(--accent); border-radius: 4px; padding: 0 5px; }
 .picker-new { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
 .picker menu { display: flex; gap: 8px; justify-content: flex-end; margin: 0; padding: 0; }
+
+/* Ignore chooser */
+.ignore-options { list-style: none; margin: 0; padding: 4px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel-2); }
+.ignore-options li { display: flex; align-items: baseline; gap: 10px; padding: 9px 10px; border-radius: var(--radius); cursor: pointer; }
+.ignore-options li:hover { background: var(--panel); }
+.ignore-options code { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; color: var(--accent); }
+
+/* Per-file ignore button */
+.files .f-ignore { color: var(--muted); border: none; background: none; padding: 2px 6px; }
+.files .f-ignore:hover { color: var(--accent); }
 
 /* Toast */
 .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 16px; z-index: 60; }

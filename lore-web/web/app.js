@@ -190,6 +190,13 @@ async function refreshActive() {
 }
 
 function fileBadge(f) {
+  // A directory that is itself a Lore working copy: a live nested repo. Offer to
+  // ignore it (see the changes bar) rather than track a repo-inside-a-repo.
+  if (f.nested) return ["nested", "badge-nested"];
+  // A directory (LoreNodeType.DIRECTORY = 0) reported with action DELETE that is
+  // no longer on disk is a *stale* nested-repo entry — a Lore zombie that no
+  // discard can clear (only "Repair repository" can). Not a real deletion.
+  if (f.type === 0 && f.action === 2) return ["stale", "badge-stale"];
   if (f.action === 1) return ["A", "badge-A"];
   if (f.action === 2) return ["D", "badge-D"];
   if (f.action === 3) return ["R", "badge-M"];
@@ -205,6 +212,7 @@ async function loadStatus(pathEnc) {
     renderFiles($("#staged-files"), staged, "unstage");
     renderFiles($("#unstaged-files"), unstaged, "stage");
     $("#commit-btn").disabled = staged.length === 0;
+    updateChangesBar(data);
   } catch (err) {
     toast(err.message, true);
   }
@@ -223,9 +231,11 @@ function renderFiles(ul, files, action) {
       <span class="f-act ${cls}">${label}</span>
       <span class="f-path" title="${f.path}">${f.path}</span>
       <button class="f-do">${action === "stage" ? "Stage" : "Unstage"}</button>
+      <button class="f-ignore" title="Add to .loreignore">⊘</button>
       ${action === "stage" ? `<button class="f-reset" title="Discard changes">↺</button>` : ""}`;
     li.querySelector(".f-path").onclick = () => showDiff(f.path);
     li.querySelector(".f-do").onclick = () => fileAction(action, f.path);
+    li.querySelector(".f-ignore").onclick = () => openIgnoreMenu(f);
     li.querySelector(".f-reset")?.addEventListener("click", () => fileAction("reset", f.path));
     ul.appendChild(li);
   }
@@ -236,6 +246,143 @@ async function fileAction(action, file) {
     await apiPost(`/api/${action}`, { path: state.active, files: [file] });
     // SSE refresh will follow, but refetch now for immediate feedback.
     await loadStatus(encodeURIComponent(state.active));
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+/**
+ * The ignore patterns offered for a file: the file itself, its parent folder,
+ * and its extension. Patterns are gitignore-style with forward slashes (Lore's
+ * ignore syntax), regardless of the path separator the status used.
+ */
+function ignoreOptionsFor(f) {
+  const path = (f.path || "").replace(/\\/g, "/");
+  const sep = path.lastIndexOf("/");
+  const name = path.slice(sep + 1);
+  const parent = sep >= 0 ? path.slice(0, sep + 1) : "";
+  const opts = [];
+  if (f.type === 0) {
+    // A directory entry (e.g. a stale nested-repo marker): ignore the folder
+    // itself with a trailing slash. This is the way to clear nested-repo
+    // phantoms — Lore's status filter excludes ignored paths.
+    opts.push({ pattern: `${path}/`, label: "This folder" });
+  } else {
+    opts.push({ pattern: path, label: "This file" });
+    const dot = name.lastIndexOf(".");
+    if (dot > 0) opts.push({ pattern: `*${name.slice(dot)}`, label: "All files with this extension" });
+  }
+  if (parent) opts.push({ pattern: parent, label: "Its parent folder" });
+  return opts;
+}
+
+function openIgnoreMenu(f) {
+  const ul = $("#ignore-options");
+  ul.innerHTML = "";
+  for (const o of ignoreOptionsFor(f)) {
+    const li = document.createElement("li");
+    li.innerHTML = `<code>${o.pattern}</code><span class="muted">${o.label}</span>`;
+    li.onclick = () => {
+      $("#ignore-dialog").close();
+      ignorePattern(o.pattern);
+    };
+    ul.appendChild(li);
+  }
+  $("#ignore-dialog").showModal();
+}
+
+async function ignorePattern(pattern) {
+  try {
+    const { added } = await apiPost("/api/ignore", { path: state.active, pattern });
+    toast(added ? `Ignoring ${pattern}` : `${pattern} was already ignored`);
+    await loadStatus(encodeURIComponent(state.active));
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+async function initLoreignore() {
+  try {
+    const { created, gitignoreUpdated } = await apiPost("/api/init-loreignore", { path: state.active });
+    toast(created ? "Created .loreignore" : "Updated .loreignore");
+    if (gitignoreUpdated) toast("Updated .gitignore");
+    await loadStatus(encodeURIComponent(state.active));
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+function barButton(label, onclick, cls) {
+  const b = document.createElement("button");
+  b.className = cls || "ghost";
+  b.textContent = label;
+  b.onclick = onclick;
+  return b;
+}
+
+/**
+ * Populate the toolbar above the file lists with context actions: set up
+ * .loreignore, ignore live nested repos (so they never rot into zombies), and
+ * repair stale nested-repo entries that no discard can clear.
+ */
+function updateChangesBar(data) {
+  const bar = $(".changes-bar");
+  bar.innerHTML = "";
+  const files = data.files || [];
+  const nested = files.filter((f) => f.nested);
+  const stale = files.filter((f) => f.type === 0 && f.action === 2 && !f.nested);
+
+  if (data.hasLoreignore === false) {
+    bar.appendChild(barButton("Initialize .loreignore", initLoreignore));
+  }
+  if (nested.length) {
+    const n = nested.length;
+    const note = document.createElement("span");
+    note.className = "bar-note";
+    note.textContent = `${n} nested ${n === 1 ? "repository" : "repositories"} — ignore so Lore doesn't track a repo-in-a-repo`;
+    bar.appendChild(note);
+    bar.appendChild(barButton(`Ignore nested`, () => ignoreNested(nested)));
+  }
+  if (stale.length) {
+    const n = stale.length;
+    const note = document.createElement("span");
+    note.className = "bar-note warn";
+    note.textContent = `${n} stale nested ${n === 1 ? "entry" : "entries"} can't be discarded`;
+    bar.appendChild(note);
+    bar.appendChild(barButton("Repair repository…", repairRepository));
+  }
+  bar.hidden = bar.childElementCount === 0;
+}
+
+/** Add each live nested repo to .loreignore (as a folder pattern). */
+async function ignoreNested(list) {
+  try {
+    for (const f of list) {
+      const path = (f.path || "").replace(/\\/g, "/");
+      await apiPost("/api/ignore", { path: state.active, pattern: `${path}/` });
+    }
+    toast(`Ignored ${list.length} nested ${list.length === 1 ? "repo" : "repos"}`);
+    await loadStatus(encodeURIComponent(state.active));
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+/**
+ * Rebuild the repo's .lore to purge stale "zombie" entries Lore can't otherwise
+ * remove. Files are untouched; the server refuses if there is committed history.
+ */
+async function repairRepository() {
+  const ok = confirm(
+    "Rebuild this repository's index to clear stale entries?\n\n" +
+      "Your files are not touched, and the repository keeps its identity and remote. " +
+      "You can only do this before anything has been committed.",
+  );
+  if (!ok) return;
+  try {
+    await apiPost("/api/repair", { path: state.active });
+    toast("Repository repaired");
+    await refreshActive();
   } catch (err) {
     toast(err.message, true);
   }
@@ -511,6 +658,7 @@ function wire() {
   $("#add-btn").onclick = addRepo;
   $("#refresh-btn").onclick = refreshActive;
   $("#commit-btn").onclick = commit;
+  $("#ignore-cancel").onclick = () => $("#ignore-dialog").close();
 
   $("#sync-btn").onclick = () => runOp("Syncing…", "/api/sync", { path: state.active });
   $("#push-btn").onclick = () => runOp("Pushing…", "/api/push", { path: state.active });

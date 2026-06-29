@@ -51,6 +51,7 @@
             <!-- Changes -->
             <div class="panel active" data-panel="changes">
               <div class="changes-layout">
+                <div class="changes-bar" hidden></div>
                 <div class="file-cols">
                   <div class="file-col">
                     <h3>Staged</h3>
@@ -124,6 +125,17 @@
           <button type="button" id="init-go" class="primary">Initialize</button>
         </menu>
       </form>
+    </dialog>
+
+    <!-- Ignore chooser (ignore this file / its folder / its extension) -->
+    <dialog id="ignore-dialog">
+      <div class="picker">
+        <h3>Add to .loreignore</h3>
+        <ul id="ignore-options" class="ignore-options"></ul>
+        <menu>
+          <button type="button" id="ignore-cancel">Cancel</button>
+        </menu>
+      </div>
     </dialog>
 
     <!-- Folder picker dialog -->
