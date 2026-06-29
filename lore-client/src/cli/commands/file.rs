@@ -317,11 +317,15 @@ pub struct FileStageArgs {
     /// `lore dirty <paths>`, or run `lore status --scan` to reconcile
     /// dirty flags across a tree. Single-file stage paths are always
     /// checked against the filesystem regardless of this flag.
+    ///
+    /// With `--scan` and no path, `lore` reconciles and stages the entire
+    /// working tree from the repository root, matching the bulk reconciliation
+    /// `lore dirty` recommends.
     #[clap(long, action)]
     scan: bool,
 
     #[clap(flatten)]
-    paths: FilePathsTargetsArgs,
+    paths: FileOptionalPathsTargetsArgs,
 
     #[clap(flatten)]
     stage: FileStageCommandArgs,
@@ -1146,7 +1150,22 @@ pub fn handle_file_stage(globals: LoreGlobalArgs, args: &FileStageArgs) -> u8 {
 
     // Standard stage
     if args.stage.subcommand.is_none() {
-        let paths = convert_paths_and_targets(&args.paths.paths, &args.paths.targets);
+        let mut paths = convert_paths_and_targets(&args.paths.paths, &args.paths.targets);
+
+        // `lore stage --scan` with no path reconciles and stages the whole
+        // working tree, defaulting to the repository root. Without `--scan` a
+        // path is still required, since directory staging without a scan only
+        // picks up already-dirty entries and an empty path set has nothing to do.
+        if paths.is_empty() {
+            if args.scan {
+                paths = LoreArray::from_vec(vec![LoreString::from(".")]);
+            } else {
+                println!(
+                    "error: a path is required; pass one or more paths, or use --scan to stage the whole tree"
+                );
+                return 1;
+            }
+        }
 
         let stage_args = LoreFileStageArgs {
             paths,
