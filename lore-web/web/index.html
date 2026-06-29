@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>lore-web</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside id="sidebar">
+        <header class="brand">
+          <span class="logo">lore</span><span class="logo-web">web</span>
+          <span id="conn" class="conn" title="live connection">●</span>
+        </header>
+        <ul id="repo-list" class="repo-list"></ul>
+        <footer class="side-foot">
+          <button id="add-btn" class="primary">Add a repository…</button>
+          <button id="server-btn" class="ghost">Server repositories…</button>
+          <button id="clone-btn" class="ghost">Clone from URL…</button>
+        </footer>
+      </aside>
+
+      <main id="main">
+        <div id="empty" class="empty">
+          <p>Select or add a repository to begin.</p>
+        </div>
+
+        <section id="repo-view" hidden>
+          <header class="repo-head">
+            <div>
+              <h1 id="repo-title">—</h1>
+              <div class="repo-sub">
+                <button id="repo-org" class="pill org-pill" title="Organization — click to change" hidden></button>
+                <span id="repo-branch" class="pill"></span>
+                <span id="repo-path" class="muted"></span>
+              </div>
+            </div>
+            <div class="repo-actions">
+              <button id="sync-btn">Sync</button>
+              <button id="push-btn" class="primary">Push</button>
+              <button id="refresh-btn" class="ghost" title="Refresh">⟳</button>
+            </div>
+          </header>
+
+          <nav class="tabs">
+            <button class="tab active" data-tab="changes">Changes</button>
+            <button class="tab" data-tab="history">History</button>
+            <button class="tab" data-tab="branches">Branches</button>
+          </nav>
+
+          <div class="tab-panels">
+            <!-- Changes -->
+            <div class="panel active" data-panel="changes">
+              <div class="changes-layout">
+                <div class="changes-bar" hidden></div>
+                <div class="file-cols">
+                  <div class="file-col">
+                    <h3>Staged</h3>
+                    <ul id="staged-files" class="files"></ul>
+                  </div>
+                  <div class="file-col">
+                    <h3>Unstaged</h3>
+                    <ul id="unstaged-files" class="files"></ul>
+                  </div>
+                </div>
+                <div class="commit-box">
+                  <textarea id="commit-msg" placeholder="Commit message…"></textarea>
+                  <button id="commit-btn" class="primary">Commit staged</button>
+                </div>
+                <div id="diff-view" class="diff-view"></div>
+              </div>
+            </div>
+
+            <!-- History -->
+            <div class="panel" data-panel="history">
+              <ul id="history-list" class="history"></ul>
+            </div>
+
+            <!-- Branches -->
+            <div class="panel" data-panel="branches">
+              <ul id="branch-list" class="branches"></ul>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <!-- Operation progress overlay (sync / push / clone) -->
+    <div id="op-overlay" class="overlay" hidden>
+      <div class="op-modal">
+        <h3 id="op-title">Working…</h3>
+        <pre id="op-log" class="op-log"></pre>
+        <div class="op-foot">
+          <span id="op-status"></span>
+          <button id="op-close" hidden>Close</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Server repositories: browse what the server hosts, then clone or delete -->
+    <dialog id="server-dialog">
+      <form method="dialog" class="clone-form">
+        <h3>Server repositories</h3>
+        <label>Server URL
+          <div class="field-row">
+            <input id="server-url" type="text" placeholder="lore://host:41337" />
+            <button type="button" id="server-refresh" class="ghost">List</button>
+          </div>
+        </label>
+        <ul id="server-repos" class="picker-list" hidden></ul>
+        <menu>
+          <button value="cancel">Close</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <!-- Clone dialog (clone directly from a known remote URL) -->
+    <dialog id="clone-dialog">
+      <form method="dialog" class="clone-form">
+        <h3>Clone from URL</h3>
+        <label>Remote URL<input id="clone-url" type="text" placeholder="lore://host:41337/org/repo" /></label>
+        <label>Destination folder
+          <div class="field-row">
+            <input id="clone-dest" type="text" placeholder="D:\path\to\clone" />
+            <button type="button" id="clone-dest-browse" class="ghost">Browse…</button>
+          </div>
+        </label>
+        <menu>
+          <button value="cancel">Cancel</button>
+          <button id="clone-go" value="default" class="primary">Clone</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <!-- Initialize-repository confirmation (new repo: review the generated URL) -->
+    <dialog id="init-dialog">
+      <form method="dialog" class="clone-form">
+        <h3>Initialize repository</h3>
+        <p class="muted" id="init-folder"></p>
+        <label>Repository URL<input id="init-url" type="text" /></label>
+        <menu>
+          <button type="button" id="init-cancel">Cancel</button>
+          <button type="button" id="init-go" class="primary">Initialize</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <!-- Organization editor — recreates the repo identity under a new org -->
+    <dialog id="org-dialog">
+      <form method="dialog" class="clone-form">
+        <h3>Change organization</h3>
+        <p class="muted" id="org-repo"></p>
+        <label>Organization<input id="org-name" type="text" placeholder="organization" /></label>
+        <p class="warn">
+          A repository's organization is part of its read-only identity, set when the
+          repository is created. Changing it rebuilds the local repository, which
+          <strong>discards all local committed revisions</strong>. Only proceed if this
+          repository is fully pushed to its remote — its id and remote are preserved.
+        </p>
+        <menu>
+          <button value="cancel">Cancel</button>
+          <button id="org-go" value="default" class="danger">Change and rebuild</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <!-- Ignore chooser (ignore this file / its folder / its extension) -->
+    <dialog id="ignore-dialog">
+      <div class="picker">
+        <h3>Add to .loreignore</h3>
+        <ul id="ignore-options" class="ignore-options"></ul>
+        <menu>
+          <button type="button" id="ignore-cancel">Cancel</button>
+        </menu>
+      </div>
+    </dialog>
+
+    <!-- Folder picker dialog -->
+    <dialog id="picker-dialog">
+      <div class="picker">
+        <h3 id="picker-title">Select a folder</h3>
+        <div class="picker-bar">
+          <button type="button" id="picker-up" title="Up one level">↑</button>
+          <span id="picker-cur" class="picker-cur"></span>
+        </div>
+        <ul id="picker-list" class="picker-list"></ul>
+        <label id="picker-new" class="picker-new" hidden>
+          New folder (optional)
+          <input id="picker-newname" type="text" placeholder="leave empty to use the folder above" />
+        </label>
+        <menu>
+          <button type="button" id="picker-cancel">Cancel</button>
+          <button type="button" id="picker-choose" class="primary">Select this folder</button>
+        </menu>
+      </div>
+    </dialog>
+
+    <div id="toast" class="toast" hidden></div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>

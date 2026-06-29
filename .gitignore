@@ -164,3 +164,6 @@ ctrf/
 
 # lychee link checker cache
 .lycheecache
+
+# lore folders
+.lore

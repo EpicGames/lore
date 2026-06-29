@@ -1,0 +1,10 @@
+# Installed by `npm install` from the registry — not committed.
+node_modules/
+
+# Local runtime state.
+*.log
+.data/
+
+# Lore files
+.lore/
+.loreignore
