@@ -1,0 +1,2449 @@
+﻿2026-06-29T03:01:42.3398080Z Current runner version: '2.335.1'
+2026-06-29T03:01:42.3432148Z ##[group]Runner Image Provisioner
+2026-06-29T03:01:42.3433442Z Hosted Compute Agent
+2026-06-29T03:01:42.3434418Z Version: 20260611.554
+2026-06-29T03:01:42.3435593Z Commit: 5e0782fdc9014723d3be820dd114dd31555c2bd1
+2026-06-29T03:01:42.3436779Z Build Date: 2026-06-11T21:40:46Z
+2026-06-29T03:01:42.3438021Z Worker ID: {981ce492-6ec2-4efc-bd2b-cbff3888c5a1}
+2026-06-29T03:01:42.3439186Z Azure Region: eastus
+2026-06-29T03:01:42.3440101Z ##[endgroup]
+2026-06-29T03:01:42.3442825Z ##[group]Operating System
+2026-06-29T03:01:42.3443833Z Ubuntu
+2026-06-29T03:01:42.3444795Z 24.04.4
+2026-06-29T03:01:42.3445657Z LTS
+2026-06-29T03:01:42.3446437Z ##[endgroup]
+2026-06-29T03:01:42.3447478Z ##[group]Runner Image
+2026-06-29T03:01:42.3448515Z Image: ubuntu-24.04
+2026-06-29T03:01:42.3449906Z Version: 20260622.220.1
+2026-06-29T03:01:42.3452312Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20260622.220/images/ubuntu/Ubuntu2404-Readme.md
+2026-06-29T03:01:42.3455131Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20260622.220
+2026-06-29T03:01:42.3456889Z ##[endgroup]
+2026-06-29T03:01:42.3458941Z ##[group]GITHUB_TOKEN Permissions
+2026-06-29T03:01:42.3462012Z Contents: write
+2026-06-29T03:01:42.3463149Z Metadata: read
+2026-06-29T03:01:42.3464104Z Packages: write
+2026-06-29T03:01:42.3465119Z ##[endgroup]
+2026-06-29T03:01:42.3468089Z Secret source: Actions
+2026-06-29T03:01:42.3469591Z Prepare workflow directory
+2026-06-29T03:01:42.3938528Z Prepare all required actions
+2026-06-29T03:01:42.3996554Z Getting action download info
+2026-06-29T03:01:42.6169211Z Download action repository 'actions/checkout@v4' (SHA:34e114876b0b11c390a56381ad16ebd13914f8d5)
+2026-06-29T03:01:42.7033484Z Download action repository 'docker/setup-buildx-action@v3' (SHA:8d2750c68a42422c14e847fe6c8ac0403b4cbd6f)
+2026-06-29T03:01:42.9369759Z Download action repository 'docker/login-action@v3' (SHA:c94ce9fb468520275223c153574b00df6fe4bcc9)
+2026-06-29T03:01:43.1580628Z Download action repository 'docker/metadata-action@v5' (SHA:c299e40c65443455700f0fdfc63efafe5b349051)
+2026-06-29T03:01:43.4195140Z Download action repository 'docker/build-push-action@v5' (SHA:ca052bb54ab0790a636c9b5f226502c73d547a25)
+2026-06-29T03:01:43.6205825Z Download action repository 'softprops/action-gh-release@v1' (SHA:de2c0eb89ae2a093876385947365aca7b0e5f844)
+2026-06-29T03:01:43.8340834Z Complete job name: build-and-release
+2026-06-29T03:01:43.9162070Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+2026-06-29T03:01:43.9170969Z ##[group]Run actions/checkout@v4
+2026-06-29T03:01:43.9172173Z with:
+2026-06-29T03:01:43.9172817Z   repository: veyvin/lore
+2026-06-29T03:01:43.9177511Z   token: ***
+2026-06-29T03:01:43.9178109Z   ssh-strict: true
+2026-06-29T03:01:43.9178683Z   ssh-user: git
+2026-06-29T03:01:43.9179216Z   persist-credentials: true
+2026-06-29T03:01:43.9179866Z   clean: true
+2026-06-29T03:01:43.9180449Z   sparse-checkout-cone-mode: true
+2026-06-29T03:01:43.9181312Z   fetch-depth: 1
+2026-06-29T03:01:43.9181882Z   fetch-tags: false
+2026-06-29T03:01:43.9182430Z   show-progress: true
+2026-06-29T03:01:43.9183037Z   lfs: false
+2026-06-29T03:01:43.9183679Z   submodules: false
+2026-06-29T03:01:43.9184284Z   set-safe-directory: true
+2026-06-29T03:01:43.9185210Z ##[endgroup]
+2026-06-29T03:01:44.0186995Z Syncing repository: veyvin/lore
+2026-06-29T03:01:44.0188768Z ##[group]Getting Git version info
+2026-06-29T03:01:44.0189454Z Working directory is '/home/runner/work/lore/lore'
+2026-06-29T03:01:44.0190490Z [command]/usr/bin/git version
+2026-06-29T03:01:44.0272247Z git version 2.54.0
+2026-06-29T03:01:44.0325098Z ##[endgroup]
+2026-06-29T03:01:44.0339386Z Temporarily overriding HOME='/home/runner/work/_temp/cf3aeda0-ae28-4e05-b6f8-6d39f3c332fa' before making global git config changes
+2026-06-29T03:01:44.0341428Z Adding repository directory to the temporary git global config as a safe directory
+2026-06-29T03:01:44.0345154Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/lore/lore
+2026-06-29T03:01:44.0399530Z Deleting the contents of '/home/runner/work/lore/lore'
+2026-06-29T03:01:44.0404165Z ##[group]Initializing the repository
+2026-06-29T03:01:44.0408404Z [command]/usr/bin/git init /home/runner/work/lore/lore
+2026-06-29T03:01:44.0530465Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-06-29T03:01:44.0532425Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-06-29T03:01:44.0534478Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-06-29T03:01:44.0535687Z hint: call:
+2026-06-29T03:01:44.0536148Z hint:
+2026-06-29T03:01:44.0536724Z hint: 	git config --global init.defaultBranch <name>
+2026-06-29T03:01:44.0537424Z hint:
+2026-06-29T03:01:44.0538104Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-06-29T03:01:44.0539175Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-06-29T03:01:44.0539974Z hint:
+2026-06-29T03:01:44.0540410Z hint: 	git branch -m <name>
+2026-06-29T03:01:44.0540914Z hint:
+2026-06-29T03:01:44.0541877Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-06-29T03:01:44.0562403Z Initialized empty Git repository in /home/runner/work/lore/lore/.git/
+2026-06-29T03:01:44.0573178Z [command]/usr/bin/git remote add origin https://github.com/veyvin/lore
+2026-06-29T03:01:44.0616731Z ##[endgroup]
+2026-06-29T03:01:44.0617682Z ##[group]Disabling automatic garbage collection
+2026-06-29T03:01:44.0621808Z [command]/usr/bin/git config --local gc.auto 0
+2026-06-29T03:01:44.0650713Z ##[endgroup]
+2026-06-29T03:01:44.0652354Z ##[group]Setting up auth
+2026-06-29T03:01:44.0658216Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-06-29T03:01:44.0693740Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-06-29T03:01:44.1064460Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-06-29T03:01:44.1095752Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-06-29T03:01:44.1312617Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-06-29T03:01:44.1345416Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-06-29T03:01:44.1563760Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-06-29T03:01:44.1597212Z ##[endgroup]
+2026-06-29T03:01:44.1598048Z ##[group]Fetching the repository
+2026-06-29T03:01:44.1606493Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa:refs/tags/v1.0.0
+2026-06-29T03:01:44.6132455Z From https://github.com/veyvin/lore
+2026-06-29T03:01:44.6135070Z  * [new ref]         76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa -> v1.0.0
+2026-06-29T03:01:44.6176525Z ##[endgroup]
+2026-06-29T03:01:44.6179061Z ##[group]Determining the checkout info
+2026-06-29T03:01:44.6182267Z ##[endgroup]
+2026-06-29T03:01:44.6184401Z [command]/usr/bin/git sparse-checkout disable
+2026-06-29T03:01:44.6229368Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-06-29T03:01:44.6258629Z ##[group]Checking out the ref
+2026-06-29T03:01:44.6260922Z [command]/usr/bin/git checkout --progress --force refs/tags/v1.0.0
+2026-06-29T03:01:44.7264894Z Note: switching to 'refs/tags/v1.0.0'.
+2026-06-29T03:01:44.7266968Z 
+2026-06-29T03:01:44.7268740Z You are in 'detached HEAD' state. You can look around, make experimental
+2026-06-29T03:01:44.7271770Z changes and commit them, and you can discard any commits you make in this
+2026-06-29T03:01:44.7274300Z state without impacting any branches by switching back to a branch.
+2026-06-29T03:01:44.7275853Z 
+2026-06-29T03:01:44.7276874Z If you want to create a new branch to retain commits you create, you may
+2026-06-29T03:01:44.7279195Z do so (now or later) by using -c with the switch command. Example:
+2026-06-29T03:01:44.7280522Z 
+2026-06-29T03:01:44.7281317Z   git switch -c <new-branch-name>
+2026-06-29T03:01:44.7282230Z 
+2026-06-29T03:01:44.7282761Z Or undo this operation with:
+2026-06-29T03:01:44.7283571Z 
+2026-06-29T03:01:44.7284059Z   git switch -
+2026-06-29T03:01:44.7284694Z 
+2026-06-29T03:01:44.7285729Z Turn off this advice by setting config variable advice.detachedHead to false
+2026-06-29T03:01:44.7287247Z 
+2026-06-29T03:01:44.7288089Z HEAD is now at 76afb43 feat: 编译并发布 Docker 镜像
+2026-06-29T03:01:44.7297607Z ##[endgroup]
+2026-06-29T03:01:44.7340359Z [command]/usr/bin/git log -1 --format=%H
+2026-06-29T03:01:44.7363446Z 76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa
+2026-06-29T03:01:44.7712871Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+2026-06-29T03:01:44.7718622Z ##[group]Run docker/setup-buildx-action@v3
+2026-06-29T03:01:44.7719821Z with:
+2026-06-29T03:01:44.7720661Z   driver: docker-container
+2026-06-29T03:01:44.7721838Z   use: true
+2026-06-29T03:01:44.7722681Z   keep-state: false
+2026-06-29T03:01:44.7723590Z   cache-binary: true
+2026-06-29T03:01:44.7724515Z   cleanup: true
+2026-06-29T03:01:44.7725392Z   install: false
+2026-06-29T03:01:44.7726273Z ##[endgroup]
+2026-06-29T03:01:45.0244028Z (node:2302) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-06-29T03:01:45.0249178Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-06-29T03:01:45.0299430Z ##[group]Docker info
+2026-06-29T03:01:45.0322766Z [command]/usr/bin/docker version
+2026-06-29T03:01:45.1639230Z Client: Docker Engine - Community
+2026-06-29T03:01:45.1641614Z  Version:           28.0.4
+2026-06-29T03:01:45.1643245Z  API version:       1.48
+2026-06-29T03:01:45.1644831Z  Go version:        go1.23.7
+2026-06-29T03:01:45.1646452Z  Git commit:        b8034c0
+2026-06-29T03:01:45.1648432Z  Built:             Tue Mar 25 15:07:16 2025
+2026-06-29T03:01:45.1650316Z  OS/Arch:           linux/amd64
+2026-06-29T03:01:45.1652175Z  Context:           default
+2026-06-29T03:01:45.1653178Z 
+2026-06-29T03:01:45.1653853Z Server: Docker Engine - Community
+2026-06-29T03:01:45.1655537Z  Engine:
+2026-06-29T03:01:45.1656753Z   Version:          28.0.4
+2026-06-29T03:01:45.1658482Z   API version:      1.48 (minimum version 1.24)
+2026-06-29T03:01:45.1660473Z   Go version:       go1.23.7
+2026-06-29T03:01:45.1676083Z   Git commit:       6430e49
+2026-06-29T03:01:45.1677892Z   Built:            Tue Mar 25 15:07:16 2025
+2026-06-29T03:01:45.1679869Z   OS/Arch:          linux/amd64
+2026-06-29T03:01:45.1681940Z   Experimental:     false
+2026-06-29T03:01:45.1683499Z  containerd:
+2026-06-29T03:01:45.1684823Z   Version:          v2.2.5
+2026-06-29T03:01:45.1686876Z   GitCommit:        e53c7c1516c3b2bff98eb76f1f4117477e6f4e66
+2026-06-29T03:01:45.1689116Z  runc:
+2026-06-29T03:01:45.1690385Z   Version:          1.3.6
+2026-06-29T03:01:45.1692360Z   GitCommit:        v1.3.6-0-g491b69ba
+2026-06-29T03:01:45.1694146Z  docker-init:
+2026-06-29T03:01:45.1695508Z   Version:          0.19.0
+2026-06-29T03:01:45.1697058Z   GitCommit:        de40ad0
+2026-06-29T03:01:45.1717767Z [command]/usr/bin/docker info
+2026-06-29T03:01:47.3511438Z Client: Docker Engine - Community
+2026-06-29T03:01:47.3512595Z  Version:    28.0.4
+2026-06-29T03:01:47.3524870Z  Context:    default
+2026-06-29T03:01:47.3525438Z  Debug Mode: false
+2026-06-29T03:01:47.3525834Z  Plugins:
+2026-06-29T03:01:47.3526235Z   buildx: Docker Buildx (Docker Inc.)
+2026-06-29T03:01:47.3526700Z     Version:  v0.35.0
+2026-06-29T03:01:47.3527252Z     Path:     /usr/libexec/docker/cli-plugins/docker-buildx
+2026-06-29T03:01:47.3527918Z   compose: Docker Compose (Docker Inc.)
+2026-06-29T03:01:47.3528403Z     Version:  v2.38.2
+2026-06-29T03:01:47.3528945Z     Path:     /usr/libexec/docker/cli-plugins/docker-compose
+2026-06-29T03:01:47.3529404Z 
+2026-06-29T03:01:47.3529548Z Server:
+2026-06-29T03:01:47.3529873Z  Containers: 0
+2026-06-29T03:01:47.3530261Z   Running: 0
+2026-06-29T03:01:47.3530657Z   Paused: 0
+2026-06-29T03:01:47.3531547Z   Stopped: 0
+2026-06-29T03:01:47.3531941Z  Images: 6
+2026-06-29T03:01:47.3532301Z  Server Version: 28.0.4
+2026-06-29T03:01:47.3532726Z  Storage Driver: overlay2
+2026-06-29T03:01:47.3533170Z   Backing Filesystem: extfs
+2026-06-29T03:01:47.3533622Z   Supports d_type: true
+2026-06-29T03:01:47.3534031Z   Using metacopy: false
+2026-06-29T03:01:47.3534448Z   Native Overlay Diff: false
+2026-06-29T03:01:47.3534892Z   userxattr: false
+2026-06-29T03:01:47.3535607Z  Logging Driver: json-file
+2026-06-29T03:01:47.3536074Z  Cgroup Driver: systemd
+2026-06-29T03:01:47.3536485Z  Cgroup Version: 2
+2026-06-29T03:01:47.3536868Z  Plugins:
+2026-06-29T03:01:47.3537318Z   Volume: local
+2026-06-29T03:01:47.3538060Z   Network: bridge host ipvlan macvlan null overlay
+2026-06-29T03:01:47.3539290Z   Log: awslogs fluentd gcplogs gelf journald json-file local splunk syslog
+2026-06-29T03:01:47.3540089Z  Swarm: inactive
+2026-06-29T03:01:47.3540505Z  Runtimes: io.containerd.runc.v2 runc
+2026-06-29T03:01:47.3540989Z  Default Runtime: runc
+2026-06-29T03:01:47.3541650Z  Init Binary: docker-init
+2026-06-29T03:01:47.3542210Z  containerd version: e53c7c1516c3b2bff98eb76f1f4117477e6f4e66
+2026-06-29T03:01:47.3542867Z  runc version: v1.3.6-0-g491b69ba
+2026-06-29T03:01:47.3543310Z  init version: de40ad0
+2026-06-29T03:01:47.3543695Z  Security Options:
+2026-06-29T03:01:47.3544048Z   apparmor
+2026-06-29T03:01:47.3544278Z   seccomp
+2026-06-29T03:01:47.3544475Z    Profile: builtin
+2026-06-29T03:01:47.3544692Z   cgroupns
+2026-06-29T03:01:47.3544891Z  Kernel Version: 6.17.0-1018-azure
+2026-06-29T03:01:47.3545167Z  Operating System: Ubuntu 24.04.4 LTS
+2026-06-29T03:01:47.3545432Z  OSType: linux
+2026-06-29T03:01:47.3545661Z  Architecture: x86_64
+2026-06-29T03:01:47.3545873Z  CPUs: 4
+2026-06-29T03:01:47.3546062Z  Total Memory: 15.61GiB
+2026-06-29T03:01:47.3546283Z  Name: runnervmmklqx
+2026-06-29T03:01:47.3546520Z  ID: f2d2c484-93e9-43a1-aea9-ebee539c4962
+2026-06-29T03:01:47.3546817Z  Docker Root Dir: /var/lib/docker
+2026-06-29T03:01:47.3547064Z  Debug Mode: false
+2026-06-29T03:01:47.3547275Z  Username: githubactions
+2026-06-29T03:01:47.3547505Z  Experimental: false
+2026-06-29T03:01:47.3547725Z  Insecure Registries:
+2026-06-29T03:01:47.3551553Z   ::1/128
+2026-06-29T03:01:47.3551936Z   127.0.0.0/8
+2026-06-29T03:01:47.3552408Z  Live Restore Enabled: false
+2026-06-29T03:01:47.3552737Z 
+2026-06-29T03:01:47.3553554Z ##[endgroup]
+2026-06-29T03:01:47.4605473Z ##[group]Buildx version
+2026-06-29T03:01:47.4631860Z [command]/usr/bin/docker buildx version
+2026-06-29T03:01:47.5188758Z github.com/docker/buildx v0.35.0 a319e5b15052cf6557ceb666eb8ff6e32380b782
+2026-06-29T03:01:47.5218023Z ##[endgroup]
+2026-06-29T03:01:47.5365034Z ##[group]Inspecting default docker context
+2026-06-29T03:01:47.5504686Z [
+2026-06-29T03:01:47.5505192Z   {
+2026-06-29T03:01:47.5505497Z     "Name": "default",
+2026-06-29T03:01:47.5505830Z     "Metadata": {},
+2026-06-29T03:01:47.5506062Z     "Endpoints": {
+2026-06-29T03:01:47.5506279Z       "docker": {
+2026-06-29T03:01:47.5506517Z         "Host": "unix:///var/run/docker.sock",
+2026-06-29T03:01:47.5506836Z         "SkipTLSVerify": false
+2026-06-29T03:01:47.5507081Z       }
+2026-06-29T03:01:47.5507272Z     },
+2026-06-29T03:01:47.5507462Z     "TLSMaterial": {},
+2026-06-29T03:01:47.5507678Z     "Storage": {
+2026-06-29T03:01:47.5508227Z       "MetadataPath": "<IN MEMORY>",
+2026-06-29T03:01:47.5508504Z       "TLSPath": "<IN MEMORY>"
+2026-06-29T03:01:47.5508738Z     }
+2026-06-29T03:01:47.5508933Z   }
+2026-06-29T03:01:47.5509122Z ]
+2026-06-29T03:01:47.5509790Z ##[endgroup]
+2026-06-29T03:01:47.5510233Z ##[group]Creating a new builder instance
+2026-06-29T03:01:47.7064728Z [command]/usr/bin/docker buildx create --name builder-0ed13988-a6a1-4791-a355-bf440965ecd1 --driver docker-container --buildkitd-flags --allow-insecure-entitlement security.insecure --allow-insecure-entitlement network.host --use
+2026-06-29T03:01:47.7889429Z builder-0ed13988-a6a1-4791-a355-bf440965ecd1
+2026-06-29T03:01:47.7920386Z ##[endgroup]
+2026-06-29T03:01:47.7921356Z ##[group]Booting builder
+2026-06-29T03:01:47.7957832Z [command]/usr/bin/docker buildx inspect --bootstrap --builder builder-0ed13988-a6a1-4791-a355-bf440965ecd1
+2026-06-29T03:01:47.8522557Z #1 [internal] booting buildkit
+2026-06-29T03:01:48.0029133Z #1 pulling image moby/buildkit:buildx-stable-1
+2026-06-29T03:01:49.9782559Z #1 pulling image moby/buildkit:buildx-stable-1 2.1s done
+2026-06-29T03:01:50.1293606Z #1 creating container buildx_buildkit_builder-0ed13988-a6a1-4791-a355-bf440965ecd10
+2026-06-29T03:01:50.2421173Z #1 creating container buildx_buildkit_builder-0ed13988-a6a1-4791-a355-bf440965ecd10 0.3s done
+2026-06-29T03:01:50.2462639Z #1 DONE 2.4s
+2026-06-29T03:01:50.2891761Z Name:          builder-0ed13988-a6a1-4791-a355-bf440965ecd1
+2026-06-29T03:01:50.2892504Z Driver:        docker-container
+2026-06-29T03:01:50.2893057Z Last Activity: 2026-06-29 03:01:47 +0000 UTC
+2026-06-29T03:01:50.2893474Z 
+2026-06-29T03:01:50.2893630Z Nodes:
+2026-06-29T03:01:50.2895552Z Name:                  builder-0ed13988-a6a1-4791-a355-bf440965ecd10
+2026-06-29T03:01:50.2896231Z Endpoint:              unix:///var/run/docker.sock
+2026-06-29T03:01:50.2896752Z Status:                running
+2026-06-29T03:01:50.2897699Z BuildKit daemon flags: --allow-insecure-entitlement security.insecure --allow-insecure-entitlement network.host
+2026-06-29T03:01:50.2898726Z BuildKit version:      v0.30.0
+2026-06-29T03:01:50.2899322Z Platforms:             linux/amd64, linux/amd64/v2, linux/amd64/v3, linux/386
+2026-06-29T03:01:50.2899954Z Labels:
+2026-06-29T03:01:50.2900394Z  org.mobyproject.buildkit.worker.executor:         oci
+2026-06-29T03:01:50.2901382Z  org.mobyproject.buildkit.worker.hostname:         4aafe69b208e
+2026-06-29T03:01:50.2902159Z  org.mobyproject.buildkit.worker.network:          host
+2026-06-29T03:01:50.2903087Z  org.mobyproject.buildkit.worker.oci.process-mode: sandbox
+2026-06-29T03:01:50.2903880Z  org.mobyproject.buildkit.worker.selinux.enabled:  false
+2026-06-29T03:01:50.2908693Z  org.mobyproject.buildkit.worker.snapshotter:      overlayfs
+2026-06-29T03:01:50.2909416Z GC Policy rule#0:
+2026-06-29T03:01:50.2909840Z  All:            false
+2026-06-29T03:01:50.2910516Z  Filters:        type==source.local,type==exec.cachemount,type==source.git.checkout
+2026-06-29T03:01:50.2911680Z  Keep Duration:  48h0m0s
+2026-06-29T03:01:50.2912512Z  Max Used Space: 488.3MiB
+2026-06-29T03:01:50.2913121Z GC Policy rule#1:
+2026-06-29T03:01:50.2913704Z  All:            false
+2026-06-29T03:01:50.2914462Z  Keep Duration:  1440h0m0s
+2026-06-29T03:01:50.2914963Z  Reserved Space: 9.313GiB
+2026-06-29T03:01:50.2915425Z  Max Used Space: 93.13GiB
+2026-06-29T03:01:50.2915952Z  Min Free Space: 27.01GiB
+2026-06-29T03:01:50.2916407Z GC Policy rule#2:
+2026-06-29T03:01:50.2916799Z  All:            false
+2026-06-29T03:01:50.2917229Z  Reserved Space: 9.313GiB
+2026-06-29T03:01:50.2917742Z  Max Used Space: 93.13GiB
+2026-06-29T03:01:50.2918189Z  Min Free Space: 27.01GiB
+2026-06-29T03:01:50.2918630Z GC Policy rule#3:
+2026-06-29T03:01:50.2919029Z  All:            true
+2026-06-29T03:01:50.2919372Z  Reserved Space: 9.313GiB
+2026-06-29T03:01:50.2919766Z  Max Used Space: 93.13GiB
+2026-06-29T03:01:50.2920162Z  Min Free Space: 27.01GiB
+2026-06-29T03:01:50.2947241Z ##[endgroup]
+2026-06-29T03:01:50.3847368Z ##[group]Inspect builder
+2026-06-29T03:01:50.3848823Z {
+2026-06-29T03:01:50.3850321Z   "nodes": [
+2026-06-29T03:01:50.3851600Z     {
+2026-06-29T03:01:50.3853136Z       "name": "builder-0ed13988-a6a1-4791-a355-bf440965ecd10",
+2026-06-29T03:01:50.3854199Z       "endpoint": "unix:///var/run/docker.sock",
+2026-06-29T03:01:50.3855155Z       "status": "running",
+2026-06-29T03:01:50.3856422Z       "buildkitd-flags": "--allow-insecure-entitlement security.insecure --allow-insecure-entitlement network.host",
+2026-06-29T03:01:50.3857686Z       "buildkit": "v0.30.0",
+2026-06-29T03:01:50.3858444Z       "platforms": "linux/amd64,linux/amd64/v2,linux/amd64/v3,linux/386",
+2026-06-29T03:01:50.3859226Z       "features": {
+2026-06-29T03:01:50.3859994Z         "Automatically load images to the Docker Engine image store": true,
+2026-06-29T03:01:50.3860914Z         "Cache export": true,
+2026-06-29T03:01:50.3861802Z         "Direct push": true,
+2026-06-29T03:01:50.3862488Z         "Docker exporter": true,
+2026-06-29T03:01:50.3863164Z         "Multi-platform build": true,
+2026-06-29T03:01:50.3863774Z         "OCI exporter": true
+2026-06-29T03:01:50.3864348Z       },
+2026-06-29T03:01:50.3864913Z       "labels": {
+2026-06-29T03:01:50.3865938Z         "org.mobyproject.buildkit.worker.executor": "oci",
+2026-06-29T03:01:50.3866856Z         "org.mobyproject.buildkit.worker.hostname": "4aafe69b208e",
+2026-06-29T03:01:50.3867797Z         "org.mobyproject.buildkit.worker.network": "host",
+2026-06-29T03:01:50.3868878Z         "org.mobyproject.buildkit.worker.oci.process-mode": "sandbox",
+2026-06-29T03:01:50.3869993Z         "org.mobyproject.buildkit.worker.selinux.enabled": "false",
+2026-06-29T03:01:50.3871609Z         "org.mobyproject.buildkit.worker.snapshotter": "overlayfs"
+2026-06-29T03:01:50.3872577Z       },
+2026-06-29T03:01:50.3873148Z       "gcPolicy": [
+2026-06-29T03:01:50.3873763Z         {
+2026-06-29T03:01:50.3874256Z           "all": false,
+2026-06-29T03:01:50.3874838Z           "filter": [
+2026-06-29T03:01:50.3875482Z             "type==source.local",
+2026-06-29T03:01:50.3876090Z             "type==exec.cachemount",
+2026-06-29T03:01:50.3876993Z             "type==source.git.checkout"
+2026-06-29T03:01:50.3877710Z           ],
+2026-06-29T03:01:50.3878290Z           "keepDuration": "48h0m0s",
+2026-06-29T03:01:50.3879008Z           "maxUsedSpace": "488.3MiB"
+2026-06-29T03:01:50.3879693Z         },
+2026-06-29T03:01:50.3880254Z         {
+2026-06-29T03:01:50.3880827Z           "all": false,
+2026-06-29T03:01:50.3881809Z           "keepDuration": "1440h0m0s",
+2026-06-29T03:01:50.3882572Z           "reservedSpace": "9.313GiB",
+2026-06-29T03:01:50.3883312Z           "maxUsedSpace": "93.13GiB",
+2026-06-29T03:01:50.3884087Z           "minFreeSpace": "27.01GiB"
+2026-06-29T03:01:50.3884779Z         },
+2026-06-29T03:01:50.3885311Z         {
+2026-06-29T03:01:50.3885881Z           "all": false,
+2026-06-29T03:01:50.3886625Z           "reservedSpace": "9.313GiB",
+2026-06-29T03:01:50.3887507Z           "maxUsedSpace": "93.13GiB",
+2026-06-29T03:01:50.3888293Z           "minFreeSpace": "27.01GiB"
+2026-06-29T03:01:50.3888955Z         },
+2026-06-29T03:01:50.3889529Z         {
+2026-06-29T03:01:50.3890094Z           "all": true,
+2026-06-29T03:01:50.3890738Z           "reservedSpace": "9.313GiB",
+2026-06-29T03:01:50.3891717Z           "maxUsedSpace": "93.13GiB",
+2026-06-29T03:01:50.3892479Z           "minFreeSpace": "27.01GiB"
+2026-06-29T03:01:50.3893166Z         }
+2026-06-29T03:01:50.3893698Z       ]
+2026-06-29T03:01:50.3894258Z     }
+2026-06-29T03:01:50.3894814Z   ],
+2026-06-29T03:01:50.3895482Z   "name": "builder-0ed13988-a6a1-4791-a355-bf440965ecd1",
+2026-06-29T03:01:50.3896328Z   "driver": "docker-container",
+2026-06-29T03:01:50.3897052Z   "lastActivity": "2026-06-29T03:01:47.000Z"
+2026-06-29T03:01:50.3897808Z }
+2026-06-29T03:01:50.3898828Z ##[endgroup]
+2026-06-29T03:01:50.3899764Z ##[group]BuildKit version
+2026-06-29T03:01:50.3900540Z builder-0ed13988-a6a1-4791-a355-bf440965ecd10: v0.30.0
+2026-06-29T03:01:50.3901876Z ##[endgroup]
+2026-06-29T03:01:50.4053551Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+2026-06-29T03:01:50.4055161Z ##[group]Run docker/login-action@v3
+2026-06-29T03:01:50.4055515Z with:
+2026-06-29T03:01:50.4055858Z   registry: ghcr.io
+2026-06-29T03:01:50.4056157Z   username: veyvin
+2026-06-29T03:01:50.4059694Z   password: ***
+2026-06-29T03:01:50.4060021Z   logout: true
+2026-06-29T03:01:50.4060315Z ##[endgroup]
+2026-06-29T03:01:50.7449089Z Logging into ghcr.io...
+2026-06-29T03:01:50.7475082Z (node:2781) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-06-29T03:01:50.7476676Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-06-29T03:01:50.8943770Z Login Succeeded!
+2026-06-29T03:01:50.9160312Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+2026-06-29T03:01:50.9161867Z ##[group]Run docker/metadata-action@v5
+2026-06-29T03:01:50.9162135Z with:
+2026-06-29T03:01:50.9162334Z   images: ghcr.io/veyvin/lore
+2026-06-29T03:01:50.9162936Z   tags: type=ref,event=branch
+type=ref,event=tag
+type=semver,pattern={{version}}
+type=semver,pattern={{major}}.{{minor}}
+type=semver,pattern={{major}}
+
+2026-06-29T03:01:50.9163559Z   context: workflow
+2026-06-29T03:01:50.9166764Z   github-token: ***
+2026-06-29T03:01:50.9166977Z ##[endgroup]
+2026-06-29T03:01:51.3033944Z (node:2802) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-06-29T03:01:51.3034877Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-06-29T03:01:51.6134297Z ##[group]Context info
+2026-06-29T03:01:51.6134725Z eventName: push
+2026-06-29T03:01:51.6135112Z sha: 76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa
+2026-06-29T03:01:51.6135608Z ref: refs/tags/v1.0.0
+2026-06-29T03:01:51.6136026Z workflow: Build and Release Docker Image
+2026-06-29T03:01:51.6136533Z action: meta
+2026-06-29T03:01:51.6136886Z actor: veyvin
+2026-06-29T03:01:51.6137262Z runNumber: 1
+2026-06-29T03:01:51.6137623Z runId: 28345839178
+2026-06-29T03:01:51.6138193Z commitDate: Mon Jun 29 2026 02:56:57 GMT+0000 (Coordinated Universal Time)
+2026-06-29T03:01:51.6139226Z ##[endgroup]
+2026-06-29T03:01:51.6145941Z ##[group]Processing images input
+2026-06-29T03:01:51.6146454Z name=ghcr.io/veyvin/lore,enable=true
+2026-06-29T03:01:51.6147191Z ##[endgroup]
+2026-06-29T03:01:51.6166078Z ##[group]Processing tags input
+2026-06-29T03:01:51.6192532Z type=semver,pattern={{version}},value=,match=,enable=true,priority=900
+2026-06-29T03:01:51.6199831Z type=semver,pattern={{major}}.{{minor}},value=,match=,enable=true,priority=900
+2026-06-29T03:01:51.6231861Z type=semver,pattern={{major}},value=,match=,enable=true,priority=900
+2026-06-29T03:01:51.6232624Z type=ref,event=branch,enable=true,priority=600
+2026-06-29T03:01:51.6233380Z type=ref,event=tag,enable=true,priority=600
+2026-06-29T03:01:51.6235481Z ##[endgroup]
+2026-06-29T03:01:51.6236482Z ##[group]Processing flavor input
+2026-06-29T03:01:51.6237172Z latest=auto
+2026-06-29T03:01:51.6237703Z prefix=
+2026-06-29T03:01:51.6238242Z prefixLatest=false
+2026-06-29T03:01:51.6238841Z suffix=
+2026-06-29T03:01:51.6240182Z suffixLatest=false
+2026-06-29T03:01:51.6241334Z ##[endgroup]
+2026-06-29T03:01:51.6272048Z ##[group]Docker image version
+2026-06-29T03:01:51.6272472Z 1.0.0
+2026-06-29T03:01:51.6273572Z ##[endgroup]
+2026-06-29T03:01:51.6274399Z ##[group]Docker tags
+2026-06-29T03:01:51.6274934Z ghcr.io/veyvin/lore:1.0.0
+2026-06-29T03:01:51.6275493Z ghcr.io/veyvin/lore:1.0
+2026-06-29T03:01:51.6276057Z ghcr.io/veyvin/lore:1
+2026-06-29T03:01:51.6276589Z ghcr.io/veyvin/lore:v1.0.0
+2026-06-29T03:01:51.6277431Z ghcr.io/veyvin/lore:latest
+2026-06-29T03:01:51.6278225Z ##[endgroup]
+2026-06-29T03:01:51.6355766Z ##[group]Docker labels
+2026-06-29T03:01:51.6356531Z org.opencontainers.image.created=2026-06-29T03:01:51.616Z
+2026-06-29T03:01:51.6357759Z org.opencontainers.image.description=Lore is a next-generation, open source version control system
+2026-06-29T03:01:51.6358928Z org.opencontainers.image.licenses=MIT
+2026-06-29T03:01:51.6359907Z org.opencontainers.image.revision=76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa
+2026-06-29T03:01:51.6361515Z org.opencontainers.image.source=https://github.com/veyvin/lore
+2026-06-29T03:01:51.6362497Z org.opencontainers.image.title=lore
+2026-06-29T03:01:51.6363157Z org.opencontainers.image.url=https://github.com/veyvin/lore
+2026-06-29T03:01:51.6363913Z org.opencontainers.image.version=1.0.0
+2026-06-29T03:01:51.6364720Z ##[endgroup]
+2026-06-29T03:01:51.6365365Z ##[group]Annotations
+2026-06-29T03:01:51.6366277Z manifest:org.opencontainers.image.created=2026-06-29T03:01:51.616Z
+2026-06-29T03:01:51.6367608Z manifest:org.opencontainers.image.description=Lore is a next-generation, open source version control system
+2026-06-29T03:01:51.6368685Z manifest:org.opencontainers.image.licenses=MIT
+2026-06-29T03:01:51.6369529Z manifest:org.opencontainers.image.revision=76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa
+2026-06-29T03:01:51.6370629Z manifest:org.opencontainers.image.source=https://github.com/veyvin/lore
+2026-06-29T03:01:51.6371764Z manifest:org.opencontainers.image.title=lore
+2026-06-29T03:01:51.6372559Z manifest:org.opencontainers.image.url=https://github.com/veyvin/lore
+2026-06-29T03:01:51.6373391Z manifest:org.opencontainers.image.version=1.0.0
+2026-06-29T03:01:51.6374264Z ##[endgroup]
+2026-06-29T03:01:51.6375121Z ##[group]JSON output
+2026-06-29T03:01:51.6375659Z {
+2026-06-29T03:01:51.6376084Z   "tags": [
+2026-06-29T03:01:51.6376523Z     "ghcr.io/veyvin/lore:1.0.0",
+2026-06-29T03:01:51.6377141Z     "ghcr.io/veyvin/lore:1.0",
+2026-06-29T03:01:51.6377756Z     "ghcr.io/veyvin/lore:1",
+2026-06-29T03:01:51.6378397Z     "ghcr.io/veyvin/lore:v1.0.0",
+2026-06-29T03:01:51.6379023Z     "ghcr.io/veyvin/lore:latest"
+2026-06-29T03:01:51.6379620Z   ],
+2026-06-29T03:01:51.6380058Z   "tag-names": [
+2026-06-29T03:01:51.6380561Z     "1.0.0",
+2026-06-29T03:01:51.6385321Z     "1.0",
+2026-06-29T03:01:51.6385689Z     "1",
+2026-06-29T03:01:51.6385947Z     "v1.0.0",
+2026-06-29T03:01:51.6386228Z     "latest"
+2026-06-29T03:01:51.6386500Z   ],
+2026-06-29T03:01:51.6386765Z   "labels": {
+2026-06-29T03:01:51.6387218Z     "org.opencontainers.image.created": "2026-06-29T03:01:51.616Z",
+2026-06-29T03:01:51.6388184Z     "org.opencontainers.image.description": "Lore is a next-generation, open source version control system",
+2026-06-29T03:01:51.6389176Z     "org.opencontainers.image.licenses": "MIT",
+2026-06-29T03:01:51.6389979Z     "org.opencontainers.image.revision": "76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa",
+2026-06-29T03:01:51.6391245Z     "org.opencontainers.image.source": "https://github.com/veyvin/lore",
+2026-06-29T03:01:51.6392042Z     "org.opencontainers.image.title": "lore",
+2026-06-29T03:01:51.6392795Z     "org.opencontainers.image.url": "https://github.com/veyvin/lore",
+2026-06-29T03:01:51.6393419Z     "org.opencontainers.image.version": "1.0.0"
+2026-06-29T03:01:51.6393971Z   },
+2026-06-29T03:01:51.6394261Z   "annotations": [
+2026-06-29T03:01:51.6394861Z     "manifest:org.opencontainers.image.created=2026-06-29T03:01:51.616Z",
+2026-06-29T03:01:51.6395958Z     "manifest:org.opencontainers.image.description=Lore is a next-generation, open source version control system",
+2026-06-29T03:01:51.6397056Z     "manifest:org.opencontainers.image.licenses=MIT",
+2026-06-29T03:01:51.6398856Z     "manifest:org.opencontainers.image.revision=76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa",
+2026-06-29T03:01:51.6399975Z     "manifest:org.opencontainers.image.source=https://github.com/veyvin/lore",
+2026-06-29T03:01:51.6400843Z     "manifest:org.opencontainers.image.title=lore",
+2026-06-29T03:01:51.6401883Z     "manifest:org.opencontainers.image.url=https://github.com/veyvin/lore",
+2026-06-29T03:01:51.6403067Z     "manifest:org.opencontainers.image.version=1.0.0"
+2026-06-29T03:01:51.6403620Z   ]
+2026-06-29T03:01:51.6403959Z }
+2026-06-29T03:01:51.6404589Z ##[endgroup]
+2026-06-29T03:01:51.6405234Z ##[group]Bake file definition (tags)
+2026-06-29T03:01:51.6405695Z {
+2026-06-29T03:01:51.6406008Z   "target": {
+2026-06-29T03:01:51.6406345Z     "docker-metadata-action": {
+2026-06-29T03:01:51.6406731Z       "tags": [
+2026-06-29T03:01:51.6407059Z         "ghcr.io/veyvin/lore:1.0.0",
+2026-06-29T03:01:51.6407546Z         "ghcr.io/veyvin/lore:1.0",
+2026-06-29T03:01:51.6407985Z         "ghcr.io/veyvin/lore:1",
+2026-06-29T03:01:51.6408410Z         "ghcr.io/veyvin/lore:v1.0.0",
+2026-06-29T03:01:51.6408899Z         "ghcr.io/veyvin/lore:latest"
+2026-06-29T03:01:51.6409347Z       ],
+2026-06-29T03:01:51.6409669Z       "args": {
+2026-06-29T03:01:51.6410324Z         "DOCKER_META_IMAGES": "ghcr.io/veyvin/lore",
+2026-06-29T03:01:51.6410931Z         "DOCKER_META_VERSION": "1.0.0"
+2026-06-29T03:01:51.6411923Z       }
+2026-06-29T03:01:51.6412267Z     }
+2026-06-29T03:01:51.6412583Z   }
+2026-06-29T03:01:51.6412872Z }
+2026-06-29T03:01:51.6413488Z ##[endgroup]
+2026-06-29T03:01:51.6414135Z ##[group]Bake file definition (labels)
+2026-06-29T03:01:51.6414637Z {
+2026-06-29T03:01:51.6414952Z   "target": {
+2026-06-29T03:01:51.6415349Z     "docker-metadata-action": {
+2026-06-29T03:01:51.6415830Z       "labels": {
+2026-06-29T03:01:51.6416373Z         "org.opencontainers.image.created": "2026-06-29T03:01:51.616Z",
+2026-06-29T03:01:51.6417592Z         "org.opencontainers.image.description": "Lore is a next-generation, open source version control system",
+2026-06-29T03:01:51.6418672Z         "org.opencontainers.image.licenses": "MIT",
+2026-06-29T03:01:51.6419581Z         "org.opencontainers.image.revision": "76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa",
+2026-06-29T03:01:51.6420906Z         "org.opencontainers.image.source": "https://github.com/veyvin/lore",
+2026-06-29T03:01:51.6421977Z         "org.opencontainers.image.title": "lore",
+2026-06-29T03:01:51.6422794Z         "org.opencontainers.image.url": "https://github.com/veyvin/lore",
+2026-06-29T03:01:51.6423613Z         "org.opencontainers.image.version": "1.0.0"
+2026-06-29T03:01:51.6424148Z       }
+2026-06-29T03:01:51.6424565Z     }
+2026-06-29T03:01:51.6424874Z   }
+2026-06-29T03:01:51.6425187Z }
+2026-06-29T03:01:51.6425779Z ##[endgroup]
+2026-06-29T03:01:51.6426407Z ##[group]Bake file definition (annotations)
+2026-06-29T03:01:51.6426920Z {
+2026-06-29T03:01:51.6427205Z   "target": {
+2026-06-29T03:01:51.6427581Z     "docker-metadata-action": {
+2026-06-29T03:01:51.6428054Z       "annotations": [
+2026-06-29T03:01:51.6428651Z         "manifest:org.opencontainers.image.created=2026-06-29T03:01:51.616Z",
+2026-06-29T03:01:51.6429892Z         "manifest:org.opencontainers.image.description=Lore is a next-generation, open source version control system",
+2026-06-29T03:01:51.6431210Z         "manifest:org.opencontainers.image.licenses=MIT",
+2026-06-29T03:01:51.6432202Z         "manifest:org.opencontainers.image.revision=76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa",
+2026-06-29T03:01:51.6433356Z         "manifest:org.opencontainers.image.source=https://github.com/veyvin/lore",
+2026-06-29T03:01:51.6434233Z         "manifest:org.opencontainers.image.title=lore",
+2026-06-29T03:01:51.6435062Z         "manifest:org.opencontainers.image.url=https://github.com/veyvin/lore",
+2026-06-29T03:01:51.6435935Z         "manifest:org.opencontainers.image.version=1.0.0"
+2026-06-29T03:01:51.6436493Z       ]
+2026-06-29T03:01:51.6436813Z     }
+2026-06-29T03:01:51.6437128Z   }
+2026-06-29T03:01:51.6437439Z }
+2026-06-29T03:01:51.6438009Z ##[endgroup]
+2026-06-29T03:01:51.6613171Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+2026-06-29T03:01:51.6614646Z ##[group]Run docker/build-push-action@v5
+2026-06-29T03:01:51.6614915Z with:
+2026-06-29T03:01:51.6615103Z   context: .
+2026-06-29T03:01:51.6615315Z   file: ./lore-server/Dockerfile
+2026-06-29T03:01:51.6615558Z   push: true
+2026-06-29T03:01:51.6616047Z   tags: ghcr.io/veyvin/lore:1.0.0
+ghcr.io/veyvin/lore:1.0
+ghcr.io/veyvin/lore:1
+ghcr.io/veyvin/lore:v1.0.0
+ghcr.io/veyvin/lore:latest
+2026-06-29T03:01:51.6618240Z   labels: org.opencontainers.image.created=2026-06-29T03:01:51.616Z
+org.opencontainers.image.description=Lore is a next-generation, open source version control system
+org.opencontainers.image.licenses=MIT
+org.opencontainers.image.revision=76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa
+org.opencontainers.image.source=https://github.com/veyvin/lore
+org.opencontainers.image.title=lore
+org.opencontainers.image.url=https://github.com/veyvin/lore
+org.opencontainers.image.version=1.0.0
+2026-06-29T03:01:51.6620077Z   cache-from: type=gha
+2026-06-29T03:01:51.6620302Z   cache-to: type=gha,mode=max
+2026-06-29T03:01:51.6620544Z   load: false
+2026-06-29T03:01:51.6620732Z   no-cache: false
+2026-06-29T03:01:51.6620929Z   pull: false
+2026-06-29T03:01:51.6624421Z   github-token: ***
+2026-06-29T03:01:51.6624638Z env:
+2026-06-29T03:01:51.6624840Z   DOCKER_METADATA_OUTPUT_VERSION: 1.0.0
+2026-06-29T03:01:51.6625486Z   DOCKER_METADATA_OUTPUT_TAGS: ghcr.io/veyvin/lore:1.0.0
+ghcr.io/veyvin/lore:1.0
+ghcr.io/veyvin/lore:1
+ghcr.io/veyvin/lore:v1.0.0
+ghcr.io/veyvin/lore:latest
+2026-06-29T03:01:51.6626180Z   DOCKER_METADATA_OUTPUT_TAG_NAMES: 1.0.0
+1.0
+1
+v1.0.0
+latest
+2026-06-29T03:01:51.6628173Z   DOCKER_METADATA_OUTPUT_LABELS: org.opencontainers.image.created=2026-06-29T03:01:51.616Z
+org.opencontainers.image.description=Lore is a next-generation, open source version control system
+org.opencontainers.image.licenses=MIT
+org.opencontainers.image.revision=76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa
+org.opencontainers.image.source=https://github.com/veyvin/lore
+org.opencontainers.image.title=lore
+org.opencontainers.image.url=https://github.com/veyvin/lore
+org.opencontainers.image.version=1.0.0
+2026-06-29T03:01:51.6632234Z   DOCKER_METADATA_OUTPUT_ANNOTATIONS: manifest:org.opencontainers.image.created=2026-06-29T03:01:51.616Z
+manifest:org.opencontainers.image.description=Lore is a next-generation, open source version control system
+manifest:org.opencontainers.image.licenses=MIT
+manifest:org.opencontainers.image.revision=76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa
+manifest:org.opencontainers.image.source=https://github.com/veyvin/lore
+manifest:org.opencontainers.image.title=lore
+manifest:org.opencontainers.image.url=https://github.com/veyvin/lore
+manifest:org.opencontainers.image.version=1.0.0
+2026-06-29T03:01:51.6638859Z   DOCKER_METADATA_OUTPUT_JSON: {"tags":["ghcr.io/veyvin/lore:1.0.0","ghcr.io/veyvin/lore:1.0","ghcr.io/veyvin/lore:1","ghcr.io/veyvin/lore:v1.0.0","ghcr.io/veyvin/lore:latest"],"tag-names":["1.0.0","1.0","1","v1.0.0","latest"],"labels":{"org.opencontainers.image.created":"2026-06-29T03:01:51.616Z","org.opencontainers.image.description":"Lore is a next-generation, open source version control system","org.opencontainers.image.licenses":"MIT","org.opencontainers.image.revision":"76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa","org.opencontainers.image.source":"https://github.com/veyvin/lore","org.opencontainers.image.title":"lore","org.opencontainers.image.url":"https://github.com/veyvin/lore","org.opencontainers.image.version":"1.0.0"},"annotations":["manifest:org.opencontainers.image.created=2026-06-29T03:01:51.616Z","manifest:org.opencontainers.image.description=Lore is a next-generation, open source version control system","manifest:org.opencontainers.image.licenses=MIT","manifest:org.opencontainers.image.revision=76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa","manifest:org.opencontainers.image.source=https://github.com/veyvin/lore","manifest:org.opencontainers.image.title=lore","manifest:org.opencontainers.image.url=https://github.com/veyvin/lore","manifest:org.opencontainers.image.version=1.0.0"]}
+2026-06-29T03:01:51.6644408Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_TAGS: /home/runner/work/_temp/docker-actions-toolkit-LTnfLM/docker-metadata-action-bake-tags.json
+2026-06-29T03:01:51.6645388Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_LABELS: /home/runner/work/_temp/docker-actions-toolkit-LTnfLM/docker-metadata-action-bake-labels.json
+2026-06-29T03:01:51.6646370Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_ANNOTATIONS: /home/runner/work/_temp/docker-actions-toolkit-LTnfLM/docker-metadata-action-bake-annotations.json
+2026-06-29T03:01:51.6647328Z   DOCKER_METADATA_OUTPUT_BAKE_FILE: /home/runner/work/_temp/docker-actions-toolkit-LTnfLM/docker-metadata-action-bake.json
+2026-06-29T03:01:51.6647886Z ##[endgroup]
+2026-06-29T03:01:51.9124337Z (node:2814) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-06-29T03:01:51.9125885Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-06-29T03:01:51.9142308Z ##[group]GitHub Actions runtime token ACs
+2026-06-29T03:01:51.9149781Z refs/heads/refs/tags/v1.0.0: read/write
+2026-06-29T03:01:51.9150416Z refs/heads/main: read
+2026-06-29T03:01:51.9151395Z ##[endgroup]
+2026-06-29T03:01:51.9152129Z ##[group]Docker info
+2026-06-29T03:01:51.9187983Z [command]/usr/bin/docker version
+2026-06-29T03:01:51.9406572Z Client: Docker Engine - Community
+2026-06-29T03:01:51.9409221Z  Version:           28.0.4
+2026-06-29T03:01:51.9409820Z  API version:       1.48
+2026-06-29T03:01:51.9410383Z  Go version:        go1.23.7
+2026-06-29T03:01:51.9410936Z  Git commit:        b8034c0
+2026-06-29T03:01:51.9411760Z  Built:             Tue Mar 25 15:07:16 2025
+2026-06-29T03:01:51.9412342Z  OS/Arch:           linux/amd64
+2026-06-29T03:01:51.9412900Z  Context:           default
+2026-06-29T03:01:51.9413273Z 
+2026-06-29T03:01:51.9416162Z Server: Docker Engine - Community
+2026-06-29T03:01:51.9416792Z  Engine:
+2026-06-29T03:01:51.9417278Z   Version:          28.0.4
+2026-06-29T03:01:51.9417927Z   API version:      1.48 (minimum version 1.24)
+2026-06-29T03:01:51.9418644Z   Go version:       go1.23.7
+2026-06-29T03:01:51.9419191Z   Git commit:       6430e49
+2026-06-29T03:01:51.9419750Z   Built:            Tue Mar 25 15:07:16 2025
+2026-06-29T03:01:51.9420384Z   OS/Arch:          linux/amd64
+2026-06-29T03:01:51.9421729Z   Experimental:     false
+2026-06-29T03:01:51.9422630Z  containerd:
+2026-06-29T03:01:51.9424869Z   Version:          v2.2.5
+2026-06-29T03:01:51.9425702Z   GitCommit:        e53c7c1516c3b2bff98eb76f1f4117477e6f4e66
+2026-06-29T03:01:51.9426532Z  runc:
+2026-06-29T03:01:51.9427115Z   Version:          1.3.6
+2026-06-29T03:01:51.9427791Z   GitCommit:        v1.3.6-0-g491b69ba
+2026-06-29T03:01:51.9428467Z  docker-init:
+2026-06-29T03:01:51.9429039Z   Version:          0.19.0
+2026-06-29T03:01:51.9429655Z   GitCommit:        de40ad0
+2026-06-29T03:01:51.9455263Z [command]/usr/bin/docker info
+2026-06-29T03:01:52.0177441Z Client: Docker Engine - Community
+2026-06-29T03:01:52.0178246Z  Version:    28.0.4
+2026-06-29T03:01:52.0178896Z  Context:    default
+2026-06-29T03:01:52.0179312Z  Debug Mode: false
+2026-06-29T03:01:52.0179651Z  Plugins:
+2026-06-29T03:01:52.0179968Z   buildx: Docker Buildx (Docker Inc.)
+2026-06-29T03:01:52.0180243Z     Version:  v0.35.0
+2026-06-29T03:01:52.0180540Z     Path:     /usr/libexec/docker/cli-plugins/docker-buildx
+2026-06-29T03:01:52.0180897Z   compose: Docker Compose (Docker Inc.)
+2026-06-29T03:01:52.0181516Z     Version:  v2.38.2
+2026-06-29T03:01:52.0181814Z     Path:     /usr/libexec/docker/cli-plugins/docker-compose
+2026-06-29T03:01:52.0182056Z 
+2026-06-29T03:01:52.0182138Z Server:
+2026-06-29T03:01:52.0182318Z  Containers: 1
+2026-06-29T03:01:52.0182511Z   Running: 1
+2026-06-29T03:01:52.0182691Z   Paused: 0
+2026-06-29T03:01:52.0183214Z   Stopped: 0
+2026-06-29T03:01:52.0183409Z  Images: 7
+2026-06-29T03:01:52.0183598Z  Server Version: 28.0.4
+2026-06-29T03:01:52.0183824Z  Storage Driver: overlay2
+2026-06-29T03:01:52.0184060Z   Backing Filesystem: extfs
+2026-06-29T03:01:52.0184295Z   Supports d_type: true
+2026-06-29T03:01:52.0184538Z   Using metacopy: false
+2026-06-29T03:01:52.0184899Z   Native Overlay Diff: false
+2026-06-29T03:01:52.0185175Z   userxattr: false
+2026-06-29T03:01:52.0185389Z  Logging Driver: json-file
+2026-06-29T03:01:52.0185629Z  Cgroup Driver: systemd
+2026-06-29T03:01:52.0185841Z  Cgroup Version: 2
+2026-06-29T03:01:52.0186034Z  Plugins:
+2026-06-29T03:01:52.0186215Z   Volume: local
+2026-06-29T03:01:52.0186448Z   Network: bridge host ipvlan macvlan null overlay
+2026-06-29T03:01:52.0186856Z   Log: awslogs fluentd gcplogs gelf journald json-file local splunk syslog
+2026-06-29T03:01:52.0187222Z  Swarm: inactive
+2026-06-29T03:01:52.0187437Z  Runtimes: io.containerd.runc.v2 runc
+2026-06-29T03:01:52.0187707Z  Default Runtime: runc
+2026-06-29T03:01:52.0187925Z  Init Binary: docker-init
+2026-06-29T03:01:52.0188218Z  containerd version: e53c7c1516c3b2bff98eb76f1f4117477e6f4e66
+2026-06-29T03:01:52.0188572Z  runc version: v1.3.6-0-g491b69ba
+2026-06-29T03:01:52.0188983Z  init version: de40ad0
+2026-06-29T03:01:52.0189207Z  Security Options:
+2026-06-29T03:01:52.0189405Z   apparmor
+2026-06-29T03:01:52.0189582Z   seccomp
+2026-06-29T03:01:52.0189762Z    Profile: builtin
+2026-06-29T03:01:52.0190063Z   cgroupns
+2026-06-29T03:01:52.0190316Z  Kernel Version: 6.17.0-1018-azure
+2026-06-29T03:01:52.0190576Z  Operating System: Ubuntu 24.04.4 LTS
+2026-06-29T03:01:52.0190826Z  OSType: linux
+2026-06-29T03:01:52.0191274Z  Architecture: x86_64
+2026-06-29T03:01:52.0191511Z  CPUs: 4
+2026-06-29T03:01:52.0191696Z  Total Memory: 15.61GiB
+2026-06-29T03:01:52.0191916Z  Name: runnervmmklqx
+2026-06-29T03:01:52.0192145Z  ID: f2d2c484-93e9-43a1-aea9-ebee539c4962
+2026-06-29T03:01:52.0192427Z  Docker Root Dir: /var/lib/docker
+2026-06-29T03:01:52.0192675Z  Debug Mode: false
+2026-06-29T03:01:52.0192880Z  Username: githubactions
+2026-06-29T03:01:52.0193102Z  Experimental: false
+2026-06-29T03:01:52.0193305Z  Insecure Registries:
+2026-06-29T03:01:52.0193700Z   ::1/128
+2026-06-29T03:01:52.0193988Z   127.0.0.0/8
+2026-06-29T03:01:52.0194321Z  Live Restore Enabled: false
+2026-06-29T03:01:52.0194603Z 
+2026-06-29T03:01:52.0195072Z ##[endgroup]
+2026-06-29T03:01:52.0195644Z ##[group]Proxy configuration
+2026-06-29T03:01:52.0196694Z No proxy configuration found
+2026-06-29T03:01:52.0197298Z ##[endgroup]
+2026-06-29T03:01:52.0772632Z ##[group]Buildx version
+2026-06-29T03:01:52.0802589Z [command]/usr/bin/docker buildx version
+2026-06-29T03:01:52.1319658Z github.com/docker/buildx v0.35.0 a319e5b15052cf6557ceb666eb8ff6e32380b782
+2026-06-29T03:01:52.1348424Z ##[endgroup]
+2026-06-29T03:01:52.1349018Z ##[group]Builder info
+2026-06-29T03:01:52.2189543Z {
+2026-06-29T03:01:52.2193358Z   "nodes": [
+2026-06-29T03:01:52.2202449Z     {
+2026-06-29T03:01:52.2202959Z       "name": "builder-0ed13988-a6a1-4791-a355-bf440965ecd10",
+2026-06-29T03:01:52.2203597Z       "endpoint": "unix:///var/run/docker.sock",
+2026-06-29T03:01:52.2204096Z       "status": "running",
+2026-06-29T03:01:52.2204994Z       "buildkitd-flags": "--allow-insecure-entitlement security.insecure --allow-insecure-entitlement network.host",
+2026-06-29T03:01:52.2205962Z       "buildkit": "v0.30.0",
+2026-06-29T03:01:52.2206437Z       "platforms": "linux/amd64,linux/amd64/v2,linux/amd64/v3,linux/386",
+2026-06-29T03:01:52.2206807Z       "features": {
+2026-06-29T03:01:52.2207138Z         "Automatically load images to the Docker Engine image store": true,
+2026-06-29T03:01:52.2207532Z         "Cache export": true,
+2026-06-29T03:01:52.2207781Z         "Direct push": true,
+2026-06-29T03:01:52.2208018Z         "Docker exporter": true,
+2026-06-29T03:01:52.2208281Z         "Multi-platform build": true,
+2026-06-29T03:01:52.2208544Z         "OCI exporter": true
+2026-06-29T03:01:52.2208765Z       },
+2026-06-29T03:01:52.2209574Z       "labels": {
+2026-06-29T03:01:52.2209912Z         "org.mobyproject.buildkit.worker.executor": "oci",
+2026-06-29T03:01:52.2210341Z         "org.mobyproject.buildkit.worker.hostname": "4aafe69b208e",
+2026-06-29T03:01:52.2210752Z         "org.mobyproject.buildkit.worker.network": "host",
+2026-06-29T03:01:52.2220346Z         "org.mobyproject.buildkit.worker.oci.process-mode": "sandbox",
+2026-06-29T03:01:52.2221736Z         "org.mobyproject.buildkit.worker.selinux.enabled": "false",
+2026-06-29T03:01:52.2222218Z         "org.mobyproject.buildkit.worker.snapshotter": "overlayfs"
+2026-06-29T03:01:52.2222574Z       },
+2026-06-29T03:01:52.2222764Z       "gcPolicy": [
+2026-06-29T03:01:52.2222959Z         {
+2026-06-29T03:01:52.2223150Z           "all": false,
+2026-06-29T03:01:52.2223363Z           "filter": [
+2026-06-29T03:01:52.2223587Z             "type==source.local",
+2026-06-29T03:01:52.2223853Z             "type==exec.cachemount",
+2026-06-29T03:01:52.2224122Z             "type==source.git.checkout"
+2026-06-29T03:01:52.2224392Z           ],
+2026-06-29T03:01:52.2224591Z           "keepDuration": "48h0m0s"
+2026-06-29T03:01:52.2224822Z         },
+2026-06-29T03:01:52.2224994Z         {
+2026-06-29T03:01:52.2225170Z           "all": false,
+2026-06-29T03:01:52.2225409Z           "keepDuration": "1440h0m0s"
+2026-06-29T03:01:52.2225655Z         },
+2026-06-29T03:01:52.2225833Z         {
+2026-06-29T03:01:52.2226008Z           "all": false
+2026-06-29T03:01:52.2226228Z         },
+2026-06-29T03:01:52.2226394Z         {
+2026-06-29T03:01:52.2226565Z           "all": true
+2026-06-29T03:01:52.2226758Z         }
+2026-06-29T03:01:52.2226923Z       ]
+2026-06-29T03:01:52.2227095Z     }
+2026-06-29T03:01:52.2227264Z   ],
+2026-06-29T03:01:52.2227509Z   "name": "builder-0ed13988-a6a1-4791-a355-bf440965ecd1",
+2026-06-29T03:01:52.2227837Z   "driver": "docker-container",
+2026-06-29T03:01:52.2228097Z   "lastActivity": "2026-06-29T03:01:47.000Z"
+2026-06-29T03:01:52.2228355Z }
+2026-06-29T03:01:52.2228863Z ##[endgroup]
+2026-06-29T03:01:52.3748940Z [command]/usr/bin/docker buildx build --cache-from type=gha --cache-to type=gha,mode=max --file ./lore-server/Dockerfile --iidfile /home/runner/work/_temp/docker-actions-toolkit-Y8o4jV/build-iidfile-fb515acd51.txt --label org.opencontainers.image.created=2026-06-29T03:01:51.616Z --label org.opencontainers.image.description=Lore is a next-generation, open source version control system --label org.opencontainers.image.licenses=MIT --label org.opencontainers.image.revision=76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa --label org.opencontainers.image.source=https://github.com/veyvin/lore --label org.opencontainers.image.title=lore --label org.opencontainers.image.url=https://github.com/veyvin/lore --label org.opencontainers.image.version=1.0.0 --attest type=provenance,mode=max,builder-id=https://github.com/veyvin/lore/actions/runs/28345839178 --tag ghcr.io/veyvin/lore:1.0.0 --tag ghcr.io/veyvin/lore:1.0 --tag ghcr.io/veyvin/lore:1 --tag ghcr.io/veyvin/lore:v1.0.0 --tag ghcr.io/veyvin/lore:latest --metadata-file /home/runner/work/_temp/docker-actions-toolkit-Y8o4jV/build-metadata-e0f4ce21d9.json --push .
+2026-06-29T03:01:52.7180881Z #0 building with "builder-0ed13988-a6a1-4791-a355-bf440965ecd1" instance using docker-container driver
+2026-06-29T03:01:52.7185505Z 
+2026-06-29T03:01:52.7185764Z #1 [internal] load build definition from Dockerfile
+2026-06-29T03:01:52.7186212Z #1 transferring dockerfile: 1.40kB 0.0s done
+2026-06-29T03:01:52.7186551Z #1 DONE 0.0s
+2026-06-29T03:01:52.7186689Z 
+2026-06-29T03:01:52.7186869Z #2 [auth] library/rust:pull token for registry-1.docker.io
+2026-06-29T03:01:52.7187258Z #2 DONE 0.0s
+2026-06-29T03:01:52.7187386Z 
+2026-06-29T03:01:52.7187567Z #3 [auth] library/debian:pull token for registry-1.docker.io
+2026-06-29T03:01:52.7187948Z #3 DONE 0.0s
+2026-06-29T03:01:52.7188072Z 
+2026-06-29T03:01:52.7188292Z #4 [internal] load metadata for docker.io/library/debian:trixie-slim
+2026-06-29T03:01:52.8268566Z #4 DONE 0.3s
+2026-06-29T03:01:52.8268862Z 
+2026-06-29T03:01:52.8269576Z #5 [internal] load metadata for docker.io/library/rust:slim-trixie
+2026-06-29T03:01:52.9315535Z #5 DONE 0.3s
+2026-06-29T03:01:52.9315948Z 
+2026-06-29T03:01:52.9317315Z #6 [internal] load .dockerignore
+2026-06-29T03:01:52.9317901Z #6 transferring context: 59B done
+2026-06-29T03:01:52.9318745Z #6 DONE 0.0s
+2026-06-29T03:01:52.9319107Z 
+2026-06-29T03:01:52.9319452Z #7 [internal] load build context
+2026-06-29T03:01:52.9320846Z #7 DONE 0.0s
+2026-06-29T03:01:52.9321443Z 
+2026-06-29T03:01:52.9322171Z #8 [builder 1/5] FROM docker.io/library/rust:slim-trixie@sha256:6abf73f05806f36362d0ff2722f2250c6153398831edd0455e0e0baa1f78ecc7
+2026-06-29T03:01:52.9324205Z #8 resolve docker.io/library/rust:slim-trixie@sha256:6abf73f05806f36362d0ff2722f2250c6153398831edd0455e0e0baa1f78ecc7 done
+2026-06-29T03:01:52.9325428Z #8 DONE 0.0s
+2026-06-29T03:01:52.9325626Z 
+2026-06-29T03:01:52.9326595Z #9 [stage-1 1/6] FROM docker.io/library/debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
+2026-06-29T03:01:52.9328265Z #9 resolve docker.io/library/debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2 done
+2026-06-29T03:01:52.9329314Z #9 DONE 0.0s
+2026-06-29T03:01:52.9329524Z 
+2026-06-29T03:01:52.9329786Z #10 importing cache manifest from gha:1882559626343471659
+2026-06-29T03:01:52.9330330Z #10 DONE 0.0s
+2026-06-29T03:01:53.0519920Z 
+2026-06-29T03:01:53.0524282Z #9 [stage-1 1/6] FROM docker.io/library/debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
+2026-06-29T03:01:53.2519259Z #9 sha256:e95a6c7ea7d49b37920899b023ecd0e32796c976c1748491f76cae53ba86d13a 29.79MB / 29.79MB 0.2s done
+2026-06-29T03:01:53.2520659Z #9 extracting sha256:e95a6c7ea7d49b37920899b023ecd0e32796c976c1748491f76cae53ba86d13a
+2026-06-29T03:01:53.5583563Z #9 ...
+2026-06-29T03:01:53.5585429Z 
+2026-06-29T03:01:53.5585864Z #7 [internal] load build context
+2026-06-29T03:01:53.5586553Z #7 transferring context: 20.50MB 0.5s done
+2026-06-29T03:01:53.5587185Z #7 DONE 0.5s
+2026-06-29T03:01:53.7085241Z 
+2026-06-29T03:01:53.7086722Z #8 [builder 1/5] FROM docker.io/library/rust:slim-trixie@sha256:6abf73f05806f36362d0ff2722f2250c6153398831edd0455e0e0baa1f78ecc7
+2026-06-29T03:01:53.7088532Z #8 sha256:c7505bdadba87cbd8ec5e818e33e479ad20c36e423bf26bad22d733eae37a455 146.80MB / 290.63MB 0.8s
+2026-06-29T03:01:53.8582141Z #8 sha256:c7505bdadba87cbd8ec5e818e33e479ad20c36e423bf26bad22d733eae37a455 183.50MB / 290.63MB 0.9s
+2026-06-29T03:01:54.0084328Z #8 sha256:c7505bdadba87cbd8ec5e818e33e479ad20c36e423bf26bad22d733eae37a455 220.20MB / 290.63MB 1.1s
+2026-06-29T03:01:54.1290585Z #8 ...
+2026-06-29T03:01:54.1291130Z 
+2026-06-29T03:01:54.1292135Z #9 [stage-1 1/6] FROM docker.io/library/debian:trixie-slim@sha256:28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2
+2026-06-29T03:01:54.1293597Z #9 extracting sha256:e95a6c7ea7d49b37920899b023ecd0e32796c976c1748491f76cae53ba86d13a 1.0s done
+2026-06-29T03:01:54.1294442Z #9 DONE 1.2s
+2026-06-29T03:01:54.2424949Z 
+2026-06-29T03:01:54.2426202Z #11 [stage-1 2/6] RUN apt-get update && apt-get install -y     ca-certificates     && rm -rf /var/lib/apt/lists/*
+2026-06-29T03:01:54.2427609Z #11 0.092 Get:1 http://deb.debian.org/debian trixie InRelease [140 kB]
+2026-06-29T03:01:54.2429197Z #11 0.113 Get:2 http://deb.debian.org/debian trixie-updates InRelease [47.3 kB]
+2026-06-29T03:01:54.3650294Z #11 0.122 Get:3 http://deb.debian.org/debian-security trixie-security InRelease [43.4 kB]
+2026-06-29T03:01:54.3653810Z #11 0.136 Get:4 http://deb.debian.org/debian trixie/main amd64 Packages [9671 kB]
+2026-06-29T03:01:54.3655764Z #11 0.236 Get:5 http://deb.debian.org/debian trixie-updates/main amd64 Packages [5412 B]
+2026-06-29T03:01:54.6084605Z #11 0.237 Get:6 http://deb.debian.org/debian-security trixie-security/main amd64 Packages [223 kB]
+2026-06-29T03:01:55.0407649Z #11 0.912 Fetched 10.1 MB in 1s (12.1 MB/s)
+2026-06-29T03:01:55.6883088Z #11 0.912 Reading package lists...
+2026-06-29T03:01:56.4294113Z #11 1.585 Reading package lists...
+2026-06-29T03:01:56.6117725Z #11 2.309 Building dependency tree...
+2026-06-29T03:01:56.7626745Z #11 2.482 Reading state information...
+2026-06-29T03:01:56.7677006Z #11 2.638 The following additional packages will be installed:
+2026-06-29T03:01:56.9744261Z #11 2.638   openssl
+2026-06-29T03:01:56.9744919Z #11 2.659 The following NEW packages will be installed:
+2026-06-29T03:01:56.9745674Z #11 2.660   ca-certificates openssl
+2026-06-29T03:01:56.9746679Z #11 2.686 0 upgraded, 2 newly installed, 0 to remove and 0 not upgraded.
+2026-06-29T03:01:56.9747279Z #11 2.686 Need to get 1664 kB of archives.
+2026-06-29T03:01:56.9748305Z #11 2.686 After this operation, 2966 kB of additional disk space will be used.
+2026-06-29T03:01:56.9750839Z #11 2.686 Get:1 http://deb.debian.org/debian-security trixie-security/main amd64 openssl amd64 3.5.6-1~deb13u2 [1503 kB]
+2026-06-29T03:01:56.9752774Z #11 2.703 Get:2 http://deb.debian.org/debian trixie/main amd64 ca-certificates all 20250419 [162 kB]
+2026-06-29T03:01:56.9753979Z #11 2.845 debconf: unable to initialize frontend: Dialog
+2026-06-29T03:01:56.9754999Z #11 2.845 debconf: (TERM is not set, so the dialog frontend is not usable.)
+2026-06-29T03:01:56.9756089Z #11 2.845 debconf: falling back to frontend: Readline
+2026-06-29T03:01:56.9757012Z #11 2.845 debconf: unable to initialize frontend: Readline
+2026-06-29T03:01:56.9771001Z #11 2.845 debconf: (Can't locate Term/ReadLine.pm in @INC (you may need to install the Term::ReadLine module) (@INC entries checked: /etc/perl /usr/local/lib/x86_64-linux-gnu/perl/5.40.1 /usr/local/share/perl/5.40.1 /usr/lib/x86_64-linux-gnu/perl5/5.40 /usr/share/perl5 /usr/lib/x86_64-linux-gnu/perl-base /usr/lib/x86_64-linux-gnu/perl/5.40 /usr/share/perl/5.40 /usr/local/lib/site_perl) at /usr/share/perl5/Debconf/FrontEnd/Readline.pm line 8, <STDIN> line 2.)
+2026-06-29T03:01:56.9774041Z #11 2.845 debconf: falling back to frontend: Teletype
+2026-06-29T03:01:57.1296282Z #11 2.850 debconf: unable to initialize frontend: Teletype
+2026-06-29T03:01:57.1297544Z #11 2.850 debconf: (This frontend requires a controlling tty.)
+2026-06-29T03:01:57.1298922Z #11 2.850 debconf: falling back to frontend: Noninteractive
+2026-06-29T03:01:57.6350876Z #11 3.506 Preconfiguring packages ...
+2026-06-29T03:01:57.7903843Z #11 3.563 Fetched 1664 kB in 0s (47.8 MB/s)
+2026-06-29T03:01:57.7904524Z #11 3.580 Selecting previously unselected package openssl.
+2026-06-29T03:01:57.7905120Z #11 3.581 (Reading database ... 
+2026-06-29T03:01:57.7905591Z (Reading database ... 5%
+2026-06-29T03:01:57.7905983Z (Reading database ... 10%
+2026-06-29T03:01:57.7906379Z (Reading database ... 15%
+2026-06-29T03:01:57.7906741Z (Reading database ... 20%
+2026-06-29T03:01:57.7907198Z (Reading database ... 25%
+2026-06-29T03:01:57.7907567Z (Reading database ... 30%
+2026-06-29T03:01:57.7907799Z (Reading database ... 35%
+2026-06-29T03:01:57.7908022Z (Reading database ... 40%
+2026-06-29T03:01:57.7908252Z (Reading database ... 45%
+2026-06-29T03:01:57.7908615Z (Reading database ... 50%
+2026-06-29T03:01:57.7908903Z (Reading database ... 55%
+2026-06-29T03:01:57.7909140Z (Reading database ... 60%
+2026-06-29T03:01:57.7909359Z (Reading database ... 65%
+2026-06-29T03:01:57.7909579Z (Reading database ... 70%
+2026-06-29T03:01:57.7909795Z (Reading database ... 75%
+2026-06-29T03:01:57.7910010Z (Reading database ... 80%
+2026-06-29T03:01:57.7910421Z (Reading database ... 85%
+2026-06-29T03:01:57.7910645Z (Reading database ... 90%
+2026-06-29T03:01:57.7910867Z (Reading database ... 95%
+2026-06-29T03:01:57.7911452Z (Reading database ... 100%
+2026-06-29T03:01:57.7912114Z (Reading database ... 4936 files and directories currently installed.)
+2026-06-29T03:01:57.7912985Z #11 3.588 Preparing to unpack .../openssl_3.5.6-1~deb13u2_amd64.deb ...
+2026-06-29T03:01:57.7913879Z #11 3.590 Unpacking openssl (3.5.6-1~deb13u2) ...
+2026-06-29T03:01:57.7915822Z #11 3.660 Selecting previously unselected package ca-certificates.
+2026-06-29T03:01:57.9458293Z #11 3.663 Preparing to unpack .../ca-certificates_20250419_all.deb ...
+2026-06-29T03:01:57.9459235Z #11 3.664 Unpacking ca-certificates (20250419) ...
+2026-06-29T03:01:57.9460345Z #11 3.715 Setting up openssl (3.5.6-1~deb13u2) ...
+2026-06-29T03:01:57.9461667Z #11 3.720 Setting up ca-certificates (20250419) ...
+2026-06-29T03:01:57.9462127Z #11 3.816 debconf: unable to initialize frontend: Dialog
+2026-06-29T03:01:57.9462575Z #11 3.816 debconf: (TERM is not set, so the dialog frontend is not usable.)
+2026-06-29T03:01:57.9463443Z #11 3.816 debconf: falling back to frontend: Readline
+2026-06-29T03:01:58.1041863Z #11 3.816 debconf: unable to initialize frontend: Readline
+2026-06-29T03:01:58.1046272Z #11 3.816 debconf: (Can't locate Term/ReadLine.pm in @INC (you may need to install the Term::ReadLine module) (@INC entries checked: /etc/perl /usr/local/lib/x86_64-linux-gnu/perl/5.40.1 /usr/local/share/perl/5.40.1 /usr/lib/x86_64-linux-gnu/perl5/5.40 /usr/share/perl5 /usr/lib/x86_64-linux-gnu/perl-base /usr/lib/x86_64-linux-gnu/perl/5.40 /usr/share/perl/5.40 /usr/local/lib/site_perl) at /usr/share/perl5/Debconf/FrontEnd/Readline.pm line 8.)
+2026-06-29T03:01:58.1049265Z #11 3.816 debconf: falling back to frontend: Teletype
+2026-06-29T03:01:58.1050081Z #11 3.824 debconf: unable to initialize frontend: Teletype
+2026-06-29T03:01:58.1050783Z #11 3.824 debconf: (This frontend requires a controlling tty.)
+2026-06-29T03:01:58.1051677Z #11 3.824 debconf: falling back to frontend: Noninteractive
+2026-06-29T03:01:58.6878103Z #11 4.408 Updating certificates in /etc/ssl/certs...
+2026-06-29T03:01:59.2893514Z #11 ...
+2026-06-29T03:01:59.2895638Z 
+2026-06-29T03:01:59.2896731Z #8 [builder 1/5] FROM docker.io/library/rust:slim-trixie@sha256:6abf73f05806f36362d0ff2722f2250c6153398831edd0455e0e0baa1f78ecc7
+2026-06-29T03:01:59.2898181Z #8 sha256:c7505bdadba87cbd8ec5e818e33e479ad20c36e423bf26bad22d733eae37a455 290.63MB / 290.63MB 1.8s done
+2026-06-29T03:01:59.2899558Z #8 extracting sha256:c7505bdadba87cbd8ec5e818e33e479ad20c36e423bf26bad22d733eae37a455 4.5s done
+2026-06-29T03:01:59.2900457Z #8 DONE 6.4s
+2026-06-29T03:01:59.3925831Z 
+2026-06-29T03:01:59.3928404Z #11 [stage-1 2/6] RUN apt-get update && apt-get install -y     ca-certificates     && rm -rf /var/lib/apt/lists/*
+2026-06-29T03:01:59.3932469Z #11 5.245 150 added, 0 removed; done.
+2026-06-29T03:01:59.3933266Z #11 5.264 Processing triggers for ca-certificates (20250419) ...
+2026-06-29T03:01:59.6255692Z #11 5.270 Updating certificates in /etc/ssl/certs...
+2026-06-29T03:01:59.9602691Z #11 5.830 0 added, 0 removed; done.
+2026-06-29T03:02:00.1134743Z #11 5.831 Running hooks in /etc/ca-certificates/update.d...
+2026-06-29T03:02:00.1135577Z #11 5.833 done.
+2026-06-29T03:02:02.1073551Z #11 DONE 8.0s
+2026-06-29T03:02:02.1073832Z 
+2026-06-29T03:02:02.1074585Z #12 [builder 2/5] RUN apt-get update && apt-get install -y     build-essential     protobuf-compiler     && rm -rf /var/lib/apt/lists/*
+2026-06-29T03:02:02.1075863Z #12 0.084 Get:1 http://deb.debian.org/debian trixie InRelease [140 kB]
+2026-06-29T03:02:02.1076520Z #12 0.096 Get:2 http://deb.debian.org/debian trixie-updates InRelease [47.3 kB]
+2026-06-29T03:02:02.1077227Z #12 0.096 Get:3 http://deb.debian.org/debian-security trixie-security InRelease [43.4 kB]
+2026-06-29T03:02:02.1077853Z #12 0.116 Get:4 http://deb.debian.org/debian trixie/main amd64 Packages [9671 kB]
+2026-06-29T03:02:02.1078571Z #12 0.185 Get:5 http://deb.debian.org/debian trixie-updates/main amd64 Packages [5412 B]
+2026-06-29T03:02:02.1079177Z #12 0.186 Get:6 http://deb.debian.org/debian-security trixie-security/main amd64 Packages [223 kB]
+2026-06-29T03:02:02.1079811Z #12 0.959 Fetched 10.1 MB in 1s (11.5 MB/s)
+2026-06-29T03:02:02.1080101Z #12 0.959 Reading package lists...
+2026-06-29T03:02:02.1080362Z #12 1.756 Reading package lists...
+2026-06-29T03:02:02.1080667Z #12 2.218 Building dependency tree...
+2026-06-29T03:02:02.1081192Z #12 2.319 Reading state information...
+2026-06-29T03:02:02.1081533Z #12 2.443 The following additional packages will be installed:
+2026-06-29T03:02:02.1082135Z #12 2.443   bzip2 dpkg-dev fakeroot g++ g++-14 g++-14-x86-64-linux-gnu
+2026-06-29T03:02:02.1082894Z #12 2.443   g++-x86-64-linux-gnu libalgorithm-diff-perl libalgorithm-diff-xs-perl
+2026-06-29T03:02:02.1083661Z #12 2.443   libalgorithm-merge-perl libdpkg-perl libfakeroot libfile-fcntllock-perl
+2026-06-29T03:02:02.1084222Z #12 2.443   libgdbm-compat4t64 libgdbm6t64 liblocale-gettext-perl libperl5.40
+2026-06-29T03:02:02.1084916Z #12 2.443   libprotobuf-dev libprotobuf-lite32t64 libprotobuf32t64 libprotoc32t64
+2026-06-29T03:02:02.1085799Z #12 2.444   libstdc++-14-dev make netbase patch perl perl-modules-5.40 sq xz-utils
+2026-06-29T03:02:02.1086200Z #12 2.444   zlib1g-dev
+2026-06-29T03:02:02.1086427Z #12 2.445 Suggested packages:
+2026-06-29T03:02:02.1086914Z #12 2.445   bzip2-doc debian-keyring debian-tag2upload-keyring g++-multilib
+2026-06-29T03:02:02.1087433Z #12 2.445   g++-14-multilib gcc-14-doc sensible-utils git bzr gdbm-l10n libstdc++-14-doc
+2026-06-29T03:02:02.1088044Z #12 2.445   make-doc ed diffutils-doc perl-doc libterm-readline-gnu-perl
+2026-06-29T03:02:02.1088596Z #12 2.445   | libterm-readline-perl-perl libtap-harness-archive-perl protobuf-mode-el
+2026-06-29T03:02:02.2570625Z #12 2.967 The following NEW packages will be installed:
+2026-06-29T03:02:02.2573087Z #12 2.967   build-essential bzip2 dpkg-dev fakeroot g++ g++-14 g++-14-x86-64-linux-gnu
+2026-06-29T03:02:02.3748374Z #12 2.968   g++-x86-64-linux-gnu libalgorithm-diff-perl libalgorithm-diff-xs-perl
+2026-06-29T03:02:02.3750384Z #12 2.968   libalgorithm-merge-perl libdpkg-perl libfakeroot libfile-fcntllock-perl
+2026-06-29T03:02:02.3751804Z #12 2.968   libgdbm-compat4t64 libgdbm6t64 liblocale-gettext-perl libperl5.40
+2026-06-29T03:02:02.3753036Z #12 2.968   libprotobuf-dev libprotobuf-lite32t64 libprotobuf32t64 libprotoc32t64
+2026-06-29T03:02:02.3754289Z #12 2.968   libstdc++-14-dev make netbase patch perl perl-modules-5.40 protobuf-compiler
+2026-06-29T03:02:02.3755551Z #12 2.968   sq xz-utils zlib1g-dev
+2026-06-29T03:02:02.3762006Z #12 3.000 0 upgraded, 32 newly installed, 0 to remove and 0 not upgraded.
+2026-06-29T03:02:02.3762889Z #12 3.000 Need to get 36.0 MB of archives.
+2026-06-29T03:02:02.3763473Z #12 3.000 After this operation, 165 MB of additional disk space will be used.
+2026-06-29T03:02:02.3764384Z #12 3.000 Get:1 http://deb.debian.org/debian trixie/main amd64 liblocale-gettext-perl amd64 1.07-7+b1 [15.3 kB]
+2026-06-29T03:02:02.3765027Z #12 3.008 Get:2 http://deb.debian.org/debian trixie/main amd64 netbase all 6.5 [12.4 kB]
+2026-06-29T03:02:02.3765804Z #12 3.009 Get:3 http://deb.debian.org/debian trixie/main amd64 bzip2 amd64 1.0.8-6 [40.5 kB]
+2026-06-29T03:02:02.3766544Z #12 3.023 Get:4 http://deb.debian.org/debian trixie/main amd64 perl-modules-5.40 all 5.40.1-6 [3019 kB]
+2026-06-29T03:02:02.3767224Z #12 3.086 Get:5 http://deb.debian.org/debian trixie/main amd64 libgdbm6t64 amd64 1.24-2 [75.2 kB]
+2026-06-29T03:02:02.4968744Z #12 3.087 Get:6 http://deb.debian.org/debian trixie/main amd64 libgdbm-compat4t64 amd64 1.24-2 [50.3 kB]
+2026-06-29T03:02:02.4971965Z #12 3.087 Get:7 http://deb.debian.org/debian trixie/main amd64 libperl5.40 amd64 5.40.1-6 [4341 kB]
+2026-06-29T03:02:02.4974387Z #12 3.118 Get:8 http://deb.debian.org/debian trixie/main amd64 perl amd64 5.40.1-6 [267 kB]
+2026-06-29T03:02:02.4982522Z #12 3.119 Get:9 http://deb.debian.org/debian trixie/main amd64 xz-utils amd64 5.8.1-1 [660 kB]
+2026-06-29T03:02:02.4984000Z #12 3.137 Get:10 http://deb.debian.org/debian trixie/main amd64 libstdc++-14-dev amd64 14.2.0-19 [2376 kB]
+2026-06-29T03:02:02.4985658Z #12 3.152 Get:11 http://deb.debian.org/debian trixie/main amd64 g++-14-x86-64-linux-gnu amd64 14.2.0-19 [12.1 MB]
+2026-06-29T03:02:02.4987090Z #12 3.207 Get:12 http://deb.debian.org/debian trixie/main amd64 g++-14 amd64 14.2.0-19 [22.5 kB]
+2026-06-29T03:02:02.6013923Z #12 3.208 Get:13 http://deb.debian.org/debian trixie/main amd64 g++-x86-64-linux-gnu amd64 4:14.2.0-1 [1200 B]
+2026-06-29T03:02:02.6015840Z #12 3.208 Get:14 http://deb.debian.org/debian trixie/main amd64 g++ amd64 4:14.2.0-1 [1344 B]
+2026-06-29T03:02:02.6016611Z #12 3.208 Get:15 http://deb.debian.org/debian trixie/main amd64 make amd64 4.4.1-2 [463 kB]
+2026-06-29T03:02:02.6017623Z #12 3.211 Get:16 http://deb.debian.org/debian trixie/main amd64 libdpkg-perl all 1.22.22 [651 kB]
+2026-06-29T03:02:02.6018404Z #12 3.213 Get:17 http://deb.debian.org/debian trixie/main amd64 patch amd64 2.8-2 [134 kB]
+2026-06-29T03:02:02.6019155Z #12 3.214 Get:18 http://deb.debian.org/debian trixie/main amd64 dpkg-dev all 1.22.22 [1337 kB]
+2026-06-29T03:02:02.6020073Z #12 3.219 Get:19 http://deb.debian.org/debian trixie/main amd64 build-essential amd64 12.12 [4624 B]
+2026-06-29T03:02:02.6020989Z #12 3.219 Get:20 http://deb.debian.org/debian trixie/main amd64 libfakeroot amd64 1.37.1.1-1 [29.6 kB]
+2026-06-29T03:02:02.6022115Z #12 3.219 Get:21 http://deb.debian.org/debian trixie/main amd64 fakeroot amd64 1.37.1.1-1 [76.0 kB]
+2026-06-29T03:02:02.6023165Z #12 3.223 Get:22 http://deb.debian.org/debian trixie/main amd64 libalgorithm-diff-perl all 1.201-1 [43.3 kB]
+2026-06-29T03:02:02.6024101Z #12 3.225 Get:23 http://deb.debian.org/debian trixie/main amd64 libalgorithm-diff-xs-perl amd64 0.04-9 [11.1 kB]
+2026-06-29T03:02:02.6024901Z #12 3.225 Get:24 http://deb.debian.org/debian trixie/main amd64 libalgorithm-merge-perl all 0.08-5 [11.8 kB]
+2026-06-29T03:02:02.6025588Z #12 3.226 Get:25 http://deb.debian.org/debian trixie/main amd64 libfile-fcntllock-perl amd64 0.22-4+b4 [34.6 kB]
+2026-06-29T03:02:02.6026320Z #12 3.235 Get:26 http://deb.debian.org/debian trixie/main amd64 zlib1g-dev amd64 1:1.3.dfsg+really1.3.1-1+b1 [920 kB]
+2026-06-29T03:02:02.6027007Z #12 3.258 Get:27 http://deb.debian.org/debian trixie/main amd64 libprotobuf32t64 amd64 3.21.12-11 [983 kB]
+2026-06-29T03:02:02.6027662Z #12 3.277 Get:28 http://deb.debian.org/debian trixie/main amd64 libprotobuf-lite32t64 amd64 3.21.12-11 [274 kB]
+2026-06-29T03:02:02.6028313Z #12 3.289 Get:29 http://deb.debian.org/debian trixie/main amd64 libprotobuf-dev amd64 3.21.12-11 [1328 kB]
+2026-06-29T03:02:02.6028934Z #12 3.302 Get:30 http://deb.debian.org/debian trixie/main amd64 libprotoc32t64 amd64 3.21.12-11 [922 kB]
+2026-06-29T03:02:02.6029577Z #12 3.312 Get:31 http://deb.debian.org/debian trixie/main amd64 protobuf-compiler amd64 3.21.12-11 [84.7 kB]
+2026-06-29T03:02:02.7441526Z #12 3.327 Get:32 http://deb.debian.org/debian trixie/main amd64 sq amd64 1.3.1-2+b2 [5653 kB]
+2026-06-29T03:02:02.7442531Z #12 3.455 debconf: unable to initialize frontend: Dialog
+2026-06-29T03:02:02.7443334Z #12 3.455 debconf: (TERM is not set, so the dialog frontend is not usable.)
+2026-06-29T03:02:02.7444129Z #12 3.455 debconf: falling back to frontend: Readline
+2026-06-29T03:02:02.8995397Z #12 3.455 debconf: unable to initialize frontend: Readline
+2026-06-29T03:02:02.8998629Z #12 3.455 debconf: (Can't locate Term/ReadLine.pm in @INC (you may need to install the Term::ReadLine module) (@INC entries checked: /etc/perl /usr/local/lib/x86_64-linux-gnu/perl/5.40.1 /usr/local/share/perl/5.40.1 /usr/lib/x86_64-linux-gnu/perl5/5.40 /usr/share/perl5 /usr/lib/x86_64-linux-gnu/perl-base /usr/lib/x86_64-linux-gnu/perl/5.40 /usr/share/perl/5.40 /usr/local/lib/site_perl) at /usr/share/perl5/Debconf/FrontEnd/Readline.pm line 8, <STDIN> line 32.)
+2026-06-29T03:02:02.9001950Z #12 3.455 debconf: falling back to frontend: Teletype
+2026-06-29T03:02:02.9002593Z #12 3.460 debconf: unable to initialize frontend: Teletype
+2026-06-29T03:02:02.9003275Z #12 3.460 debconf: (This frontend requires a controlling tty.)
+2026-06-29T03:02:02.9003969Z #12 3.460 debconf: falling back to frontend: Noninteractive
+2026-06-29T03:02:03.6735545Z #12 4.384 Fetched 36.0 MB in 0s (96.8 MB/s)
+2026-06-29T03:02:03.8976776Z #12 4.396 Selecting previously unselected package liblocale-gettext-perl.
+2026-06-29T03:02:03.8977356Z #12 4.396 (Reading database ... 
+2026-06-29T03:02:03.8977689Z (Reading database ... 5%
+2026-06-29T03:02:03.8978019Z (Reading database ... 10%
+2026-06-29T03:02:03.8978387Z (Reading database ... 15%
+2026-06-29T03:02:03.8978679Z (Reading database ... 20%
+2026-06-29T03:02:03.8978967Z (Reading database ... 25%
+2026-06-29T03:02:03.8979254Z (Reading database ... 30%
+2026-06-29T03:02:03.8979540Z (Reading database ... 35%
+2026-06-29T03:02:03.8980115Z (Reading database ... 40%
+2026-06-29T03:02:03.8980408Z (Reading database ... 45%
+2026-06-29T03:02:03.8980695Z (Reading database ... 50%
+2026-06-29T03:02:03.8981261Z (Reading database ... 55%
+2026-06-29T03:02:03.8981760Z (Reading database ... 60%
+2026-06-29T03:02:03.8982218Z (Reading database ... 65%
+2026-06-29T03:02:03.8982674Z (Reading database ... 70%
+2026-06-29T03:02:03.8983218Z (Reading database ... 75%
+2026-06-29T03:02:03.8983522Z (Reading database ... 80%
+2026-06-29T03:02:03.8983817Z (Reading database ... 85%
+2026-06-29T03:02:03.8984103Z (Reading database ... 90%
+2026-06-29T03:02:03.8984388Z (Reading database ... 95%
+2026-06-29T03:02:03.8984672Z (Reading database ... 100%
+2026-06-29T03:02:03.8985099Z (Reading database ... 9595 files and directories currently installed.)
+2026-06-29T03:02:03.8985758Z #12 4.404 Preparing to unpack .../00-liblocale-gettext-perl_1.07-7+b1_amd64.deb ...
+2026-06-29T03:02:03.8986357Z #12 4.405 Unpacking liblocale-gettext-perl (1.07-7+b1) ...
+2026-06-29T03:02:03.8986845Z #12 4.423 Selecting previously unselected package netbase.
+2026-06-29T03:02:03.8987341Z #12 4.424 Preparing to unpack .../01-netbase_6.5_all.deb ...
+2026-06-29T03:02:03.8987762Z #12 4.425 Unpacking netbase (6.5) ...
+2026-06-29T03:02:03.8988161Z #12 4.438 Selecting previously unselected package bzip2.
+2026-06-29T03:02:03.8988644Z #12 4.439 Preparing to unpack .../02-bzip2_1.0.8-6_amd64.deb ...
+2026-06-29T03:02:03.8989049Z #12 4.440 Unpacking bzip2 (1.0.8-6) ...
+2026-06-29T03:02:03.8989425Z #12 4.456 Selecting previously unselected package perl-modules-5.40.
+2026-06-29T03:02:03.8989886Z #12 4.457 Preparing to unpack .../03-perl-modules-5.40_5.40.1-6_all.deb ...
+2026-06-29T03:02:03.8990289Z #12 4.459 Unpacking perl-modules-5.40 (5.40.1-6) ...
+2026-06-29T03:02:03.9870849Z #12 4.698 Selecting previously unselected package libgdbm6t64:amd64.
+2026-06-29T03:02:04.1753905Z #12 4.700 Preparing to unpack .../04-libgdbm6t64_1.24-2_amd64.deb ...
+2026-06-29T03:02:04.1754799Z #12 4.702 Unpacking libgdbm6t64:amd64 (1.24-2) ...
+2026-06-29T03:02:04.1755694Z #12 4.717 Selecting previously unselected package libgdbm-compat4t64:amd64.
+2026-06-29T03:02:04.1756718Z #12 4.718 Preparing to unpack .../05-libgdbm-compat4t64_1.24-2_amd64.deb ...
+2026-06-29T03:02:04.1757500Z #12 4.719 Unpacking libgdbm-compat4t64:amd64 (1.24-2) ...
+2026-06-29T03:02:04.1758048Z #12 4.733 Selecting previously unselected package libperl5.40:amd64.
+2026-06-29T03:02:04.1758652Z #12 4.734 Preparing to unpack .../06-libperl5.40_5.40.1-6_amd64.deb ...
+2026-06-29T03:02:04.1759167Z #12 4.736 Unpacking libperl5.40:amd64 (5.40.1-6) ...
+2026-06-29T03:02:04.2317986Z #12 4.943 Selecting previously unselected package perl.
+2026-06-29T03:02:04.4428970Z #12 4.944 Preparing to unpack .../07-perl_5.40.1-6_amd64.deb ...
+2026-06-29T03:02:04.4429438Z #12 4.946 Unpacking perl (5.40.1-6) ...
+2026-06-29T03:02:04.4429849Z #12 4.968 Selecting previously unselected package xz-utils.
+2026-06-29T03:02:04.4430341Z #12 4.970 Preparing to unpack .../08-xz-utils_5.8.1-1_amd64.deb ...
+2026-06-29T03:02:04.4430803Z #12 4.971 Unpacking xz-utils (5.8.1-1) ...
+2026-06-29T03:02:04.4431390Z #12 5.000 Selecting previously unselected package libstdc++-14-dev:amd64.
+2026-06-29T03:02:04.4431962Z #12 5.002 Preparing to unpack .../09-libstdc++-14-dev_14.2.0-19_amd64.deb ...
+2026-06-29T03:02:04.4432470Z #12 5.003 Unpacking libstdc++-14-dev:amd64 (14.2.0-19) ...
+2026-06-29T03:02:04.4682517Z #12 5.179 Selecting previously unselected package g++-14-x86-64-linux-gnu.
+2026-06-29T03:02:04.6220858Z #12 5.181 Preparing to unpack .../10-g++-14-x86-64-linux-gnu_14.2.0-19_amd64.deb ...
+2026-06-29T03:02:04.6221979Z #12 5.182 Unpacking g++-14-x86-64-linux-gnu (14.2.0-19) ...
+2026-06-29T03:02:04.8338227Z #12 5.545 Selecting previously unselected package g++-14.
+2026-06-29T03:02:04.9498482Z #12 5.547 Preparing to unpack .../11-g++-14_14.2.0-19_amd64.deb ...
+2026-06-29T03:02:04.9499382Z #12 5.548 Unpacking g++-14 (14.2.0-19) ...
+2026-06-29T03:02:04.9500527Z #12 5.560 Selecting previously unselected package g++-x86-64-linux-gnu.
+2026-06-29T03:02:04.9503685Z #12 5.561 Preparing to unpack .../12-g++-x86-64-linux-gnu_4%3a14.2.0-1_amd64.deb ...
+2026-06-29T03:02:04.9504461Z #12 5.562 Unpacking g++-x86-64-linux-gnu (4:14.2.0-1) ...
+2026-06-29T03:02:04.9505216Z #12 5.575 Selecting previously unselected package g++.
+2026-06-29T03:02:04.9505889Z #12 5.577 Preparing to unpack .../13-g++_4%3a14.2.0-1_amd64.deb ...
+2026-06-29T03:02:04.9506763Z #12 5.578 Unpacking g++ (4:14.2.0-1) ...
+2026-06-29T03:02:04.9507302Z #12 5.589 Selecting previously unselected package make.
+2026-06-29T03:02:04.9507953Z #12 5.591 Preparing to unpack .../14-make_4.4.1-2_amd64.deb ...
+2026-06-29T03:02:04.9508530Z #12 5.591 Unpacking make (4.4.1-2) ...
+2026-06-29T03:02:04.9509066Z #12 5.620 Selecting previously unselected package libdpkg-perl.
+2026-06-29T03:02:04.9509809Z #12 5.621 Preparing to unpack .../15-libdpkg-perl_1.22.22_all.deb ...
+2026-06-29T03:02:04.9510249Z #12 5.622 Unpacking libdpkg-perl (1.22.22) ...
+2026-06-29T03:02:04.9510604Z #12 5.661 Selecting previously unselected package patch.
+2026-06-29T03:02:05.0538637Z #12 5.663 Preparing to unpack .../16-patch_2.8-2_amd64.deb ...
+2026-06-29T03:02:05.0540020Z #12 5.664 Unpacking patch (2.8-2) ...
+2026-06-29T03:02:05.0540831Z #12 5.680 Selecting previously unselected package dpkg-dev.
+2026-06-29T03:02:05.0542471Z #12 5.682 Preparing to unpack .../17-dpkg-dev_1.22.22_all.deb ...
+2026-06-29T03:02:05.0543156Z #12 5.683 Unpacking dpkg-dev (1.22.22) ...
+2026-06-29T03:02:05.0543912Z #12 5.731 Selecting previously unselected package build-essential.
+2026-06-29T03:02:05.0544641Z #12 5.733 Preparing to unpack .../18-build-essential_12.12_amd64.deb ...
+2026-06-29T03:02:05.0545065Z #12 5.734 Unpacking build-essential (12.12) ...
+2026-06-29T03:02:05.0545465Z #12 5.748 Selecting previously unselected package libfakeroot:amd64.
+2026-06-29T03:02:05.0545936Z #12 5.749 Preparing to unpack .../19-libfakeroot_1.37.1.1-1_amd64.deb ...
+2026-06-29T03:02:05.0546354Z #12 5.751 Unpacking libfakeroot:amd64 (1.37.1.1-1) ...
+2026-06-29T03:02:05.0546742Z #12 5.765 Selecting previously unselected package fakeroot.
+2026-06-29T03:02:05.1627405Z #12 5.766 Preparing to unpack .../20-fakeroot_1.37.1.1-1_amd64.deb ...
+2026-06-29T03:02:05.1628248Z #12 5.768 Unpacking fakeroot (1.37.1.1-1) ...
+2026-06-29T03:02:05.1629083Z #12 5.783 Selecting previously unselected package libalgorithm-diff-perl.
+2026-06-29T03:02:05.1629859Z #12 5.785 Preparing to unpack .../21-libalgorithm-diff-perl_1.201-1_all.deb ...
+2026-06-29T03:02:05.1630410Z #12 5.786 Unpacking libalgorithm-diff-perl (1.201-1) ...
+2026-06-29T03:02:05.1630986Z #12 5.799 Selecting previously unselected package libalgorithm-diff-xs-perl.
+2026-06-29T03:02:05.1632836Z #12 5.800 Preparing to unpack .../22-libalgorithm-diff-xs-perl_0.04-9_amd64.deb ...
+2026-06-29T03:02:05.1633372Z #12 5.801 Unpacking libalgorithm-diff-xs-perl (0.04-9) ...
+2026-06-29T03:02:05.1633845Z #12 5.814 Selecting previously unselected package libalgorithm-merge-perl.
+2026-06-29T03:02:05.1634408Z #12 5.815 Preparing to unpack .../23-libalgorithm-merge-perl_0.08-5_all.deb ...
+2026-06-29T03:02:05.1634859Z #12 5.816 Unpacking libalgorithm-merge-perl (0.08-5) ...
+2026-06-29T03:02:05.1635286Z #12 5.828 Selecting previously unselected package libfile-fcntllock-perl.
+2026-06-29T03:02:05.1635790Z #12 5.830 Preparing to unpack .../24-libfile-fcntllock-perl_0.22-4+b4_amd64.deb ...
+2026-06-29T03:02:05.1636247Z #12 5.831 Unpacking libfile-fcntllock-perl (0.22-4+b4) ...
+2026-06-29T03:02:05.1636653Z #12 5.845 Selecting previously unselected package zlib1g-dev:amd64.
+2026-06-29T03:02:05.1637379Z #12 5.846 Preparing to unpack .../25-zlib1g-dev_1%3a1.3.dfsg+really1.3.1-1+b1_amd64.deb ...
+2026-06-29T03:02:05.1639669Z #12 5.847 Unpacking zlib1g-dev:amd64 (1:1.3.dfsg+really1.3.1-1+b1) ...
+2026-06-29T03:02:05.1640782Z #12 5.873 Selecting previously unselected package libprotobuf32t64:amd64.
+2026-06-29T03:02:05.3244749Z #12 5.875 Preparing to unpack .../26-libprotobuf32t64_3.21.12-11_amd64.deb ...
+2026-06-29T03:02:05.3245924Z #12 5.876 Unpacking libprotobuf32t64:amd64 (3.21.12-11) ...
+2026-06-29T03:02:05.3246730Z #12 5.930 Selecting previously unselected package libprotobuf-lite32t64:amd64.
+2026-06-29T03:02:05.3247655Z #12 5.932 Preparing to unpack .../27-libprotobuf-lite32t64_3.21.12-11_amd64.deb ...
+2026-06-29T03:02:05.3248166Z #12 5.933 Unpacking libprotobuf-lite32t64:amd64 (3.21.12-11) ...
+2026-06-29T03:02:05.3248810Z #12 5.956 Selecting previously unselected package libprotobuf-dev:amd64.
+2026-06-29T03:02:05.3249364Z #12 5.957 Preparing to unpack .../28-libprotobuf-dev_3.21.12-11_amd64.deb ...
+2026-06-29T03:02:05.3249821Z #12 5.959 Unpacking libprotobuf-dev:amd64 (3.21.12-11) ...
+2026-06-29T03:02:05.3250259Z #12 6.035 Selecting previously unselected package libprotoc32t64:amd64.
+2026-06-29T03:02:05.5470952Z #12 6.037 Preparing to unpack .../29-libprotoc32t64_3.21.12-11_amd64.deb ...
+2026-06-29T03:02:05.5472001Z #12 6.038 Unpacking libprotoc32t64:amd64 (3.21.12-11) ...
+2026-06-29T03:02:05.5472740Z #12 6.086 Selecting previously unselected package protobuf-compiler.
+2026-06-29T03:02:05.5473659Z #12 6.088 Preparing to unpack .../30-protobuf-compiler_3.21.12-11_amd64.deb ...
+2026-06-29T03:02:05.5474427Z #12 6.089 Unpacking protobuf-compiler (3.21.12-11) ...
+2026-06-29T03:02:05.5475029Z #12 6.104 Selecting previously unselected package sq.
+2026-06-29T03:02:05.5475687Z #12 6.106 Preparing to unpack .../31-sq_1.3.1-2+b2_amd64.deb ...
+2026-06-29T03:02:05.5476289Z #12 6.107 Unpacking sq (1.3.1-2+b2) ...
+2026-06-29T03:02:05.6294150Z #12 6.340 Setting up libprotobuf-lite32t64:amd64 (3.21.12-11) ...
+2026-06-29T03:02:05.7316045Z #12 6.343 Setting up libprotobuf32t64:amd64 (3.21.12-11) ...
+2026-06-29T03:02:05.7316651Z #12 6.346 Setting up libgdbm6t64:amd64 (1.24-2) ...
+2026-06-29T03:02:05.7317351Z #12 6.348 Setting up libgdbm-compat4t64:amd64 (1.24-2) ...
+2026-06-29T03:02:05.7317836Z #12 6.351 Setting up sq (1.3.1-2+b2) ...
+2026-06-29T03:02:05.7320459Z #12 6.353 Setting up bzip2 (1.0.8-6) ...
+2026-06-29T03:02:05.7321430Z #12 6.355 Setting up libfakeroot:amd64 (1.37.1.1-1) ...
+2026-06-29T03:02:05.7322401Z #12 6.359 Setting up fakeroot (1.37.1.1-1) ...
+2026-06-29T03:02:05.7323202Z #12 6.363 update-alternatives: using /usr/bin/fakeroot-sysv to provide /usr/bin/fakeroot (fakeroot) in auto mode
+2026-06-29T03:02:05.7324523Z #12 6.363 update-alternatives: warning: skip creation of /usr/share/man/man1/fakeroot.1.gz because associated file /usr/share/man/man1/fakeroot-sysv.1.gz (of link group fakeroot) doesn't exist
+2026-06-29T03:02:05.7326260Z #12 6.363 update-alternatives: warning: skip creation of /usr/share/man/man1/faked.1.gz because associated file /usr/share/man/man1/faked-sysv.1.gz (of link group fakeroot) doesn't exist
+2026-06-29T03:02:05.7327798Z #12 6.363 update-alternatives: warning: skip creation of /usr/share/man/es/man1/fakeroot.1.gz because associated file /usr/share/man/es/man1/fakeroot-sysv.1.gz (of link group fakeroot) doesn't exist
+2026-06-29T03:02:05.7329425Z #12 6.363 update-alternatives: warning: skip creation of /usr/share/man/es/man1/faked.1.gz because associated file /usr/share/man/es/man1/faked-sysv.1.gz (of link group fakeroot) doesn't exist
+2026-06-29T03:02:05.7331644Z #12 6.363 update-alternatives: warning: skip creation of /usr/share/man/fr/man1/fakeroot.1.gz because associated file /usr/share/man/fr/man1/fakeroot-sysv.1.gz (of link group fakeroot) doesn't exist
+2026-06-29T03:02:05.7333247Z #12 6.363 update-alternatives: warning: skip creation of /usr/share/man/fr/man1/faked.1.gz because associated file /usr/share/man/fr/man1/faked-sysv.1.gz (of link group fakeroot) doesn't exist
+2026-06-29T03:02:05.7335070Z #12 6.363 update-alternatives: warning: skip creation of /usr/share/man/sv/man1/fakeroot.1.gz because associated file /usr/share/man/sv/man1/fakeroot-sysv.1.gz (of link group fakeroot) doesn't exist
+2026-06-29T03:02:05.7337420Z #12 6.363 update-alternatives: warning: skip creation of /usr/share/man/sv/man1/faked.1.gz because associated file /usr/share/man/sv/man1/faked-sysv.1.gz (of link group fakeroot) doesn't exist
+2026-06-29T03:02:05.7339082Z #12 6.367 Setting up make (4.4.1-2) ...
+2026-06-29T03:02:05.7339584Z #12 6.369 Setting up xz-utils (5.8.1-1) ...
+2026-06-29T03:02:05.7340401Z #12 6.373 update-alternatives: using /usr/bin/xz to provide /usr/bin/lzma (lzma) in auto mode
+2026-06-29T03:02:05.7342390Z #12 6.373 update-alternatives: warning: skip creation of /usr/share/man/man1/lzma.1.gz because associated file /usr/share/man/man1/xz.1.gz (of link group lzma) doesn't exist
+2026-06-29T03:02:05.7344752Z #12 6.373 update-alternatives: warning: skip creation of /usr/share/man/man1/unlzma.1.gz because associated file /usr/share/man/man1/unxz.1.gz (of link group lzma) doesn't exist
+2026-06-29T03:02:05.7346781Z #12 6.373 update-alternatives: warning: skip creation of /usr/share/man/man1/lzcat.1.gz because associated file /usr/share/man/man1/xzcat.1.gz (of link group lzma) doesn't exist
+2026-06-29T03:02:05.7348558Z #12 6.374 update-alternatives: warning: skip creation of /usr/share/man/man1/lzmore.1.gz because associated file /usr/share/man/man1/xzmore.1.gz (of link group lzma) doesn't exist
+2026-06-29T03:02:05.7350879Z #12 6.374 update-alternatives: warning: skip creation of /usr/share/man/man1/lzless.1.gz because associated file /usr/share/man/man1/xzless.1.gz (of link group lzma) doesn't exist
+2026-06-29T03:02:05.7352574Z #12 6.374 update-alternatives: warning: skip creation of /usr/share/man/man1/lzdiff.1.gz because associated file /usr/share/man/man1/xzdiff.1.gz (of link group lzma) doesn't exist
+2026-06-29T03:02:05.7353739Z #12 6.374 update-alternatives: warning: skip creation of /usr/share/man/man1/lzcmp.1.gz because associated file /usr/share/man/man1/xzcmp.1.gz (of link group lzma) doesn't exist
+2026-06-29T03:02:05.7354871Z #12 6.374 update-alternatives: warning: skip creation of /usr/share/man/man1/lzgrep.1.gz because associated file /usr/share/man/man1/xzgrep.1.gz (of link group lzma) doesn't exist
+2026-06-29T03:02:05.7356061Z #12 6.375 update-alternatives: warning: skip creation of /usr/share/man/man1/lzegrep.1.gz because associated file /usr/share/man/man1/xzegrep.1.gz (of link group lzma) doesn't exist
+2026-06-29T03:02:05.7357236Z #12 6.375 update-alternatives: warning: skip creation of /usr/share/man/man1/lzfgrep.1.gz because associated file /usr/share/man/man1/xzfgrep.1.gz (of link group lzma) doesn't exist
+2026-06-29T03:02:05.7357964Z #12 6.377 Setting up patch (2.8-2) ...
+2026-06-29T03:02:05.7358328Z #12 6.380 Setting up zlib1g-dev:amd64 (1:1.3.dfsg+really1.3.1-1+b1) ...
+2026-06-29T03:02:05.7358732Z #12 6.382 Setting up perl-modules-5.40 (5.40.1-6) ...
+2026-06-29T03:02:05.7359051Z #12 6.385 Setting up netbase (6.5) ...
+2026-06-29T03:02:05.7359366Z #12 6.392 Setting up libprotoc32t64:amd64 (3.21.12-11) ...
+2026-06-29T03:02:05.7359908Z #12 6.394 Setting up libstdc++-14-dev:amd64 (14.2.0-19) ...
+2026-06-29T03:02:05.7360273Z #12 6.397 Setting up liblocale-gettext-perl (1.07-7+b1) ...
+2026-06-29T03:02:05.7360695Z #12 6.399 Setting up protobuf-compiler (3.21.12-11) ...
+2026-06-29T03:02:05.7361247Z #12 6.402 Setting up libprotobuf-dev:amd64 (3.21.12-11) ...
+2026-06-29T03:02:05.7361594Z #12 6.404 Setting up libperl5.40:amd64 (5.40.1-6) ...
+2026-06-29T03:02:05.7362071Z #12 6.407 Setting up perl (5.40.1-6) ...
+2026-06-29T03:02:05.7362402Z #12 6.412 Setting up libdpkg-perl (1.22.22) ...
+2026-06-29T03:02:05.7362735Z #12 6.415 Setting up g++-14-x86-64-linux-gnu (14.2.0-19) ...
+2026-06-29T03:02:05.7363178Z #12 6.418 Setting up g++-x86-64-linux-gnu (4:14.2.0-1) ...
+2026-06-29T03:02:05.7363584Z #12 6.420 Setting up g++-14 (14.2.0-19) ...
+2026-06-29T03:02:05.7363922Z #12 6.424 Setting up libfile-fcntllock-perl (0.22-4+b4) ...
+2026-06-29T03:02:05.7364357Z #12 6.426 Setting up libalgorithm-diff-perl (1.201-1) ...
+2026-06-29T03:02:05.7364775Z #12 6.429 Setting up dpkg-dev (1.22.22) ...
+2026-06-29T03:02:05.7365046Z #12 6.433 Setting up g++ (4:14.2.0-1) ...
+2026-06-29T03:02:05.7365520Z #12 6.436 update-alternatives: using /usr/bin/g++ to provide /usr/bin/c++ (c++) in auto mode
+2026-06-29T03:02:05.7366081Z #12 6.438 Setting up build-essential (12.12) ...
+2026-06-29T03:02:05.7366599Z #12 6.440 Setting up libalgorithm-diff-xs-perl (0.04-9) ...
+2026-06-29T03:02:05.7367325Z #12 6.443 Setting up libalgorithm-merge-perl (0.08-5) ...
+2026-06-29T03:02:05.8855707Z #12 6.446 Processing triggers for libc-bin (2.41-12+deb13u3) ...
+2026-06-29T03:02:05.8891374Z #12 DONE 6.6s
+2026-06-29T03:02:06.0740781Z 
+2026-06-29T03:02:06.0741482Z #13 [builder 3/5] WORKDIR /build
+2026-06-29T03:02:06.0742279Z #13 DONE 0.0s
+2026-06-29T03:02:06.0742471Z 
+2026-06-29T03:02:06.0742611Z #14 [builder 4/5] COPY . .
+2026-06-29T03:02:06.0985686Z #14 DONE 0.2s
+2026-06-29T03:02:06.2211208Z 
+2026-06-29T03:02:06.2214656Z #15 [builder 5/5] RUN --mount=type=cache,target=/usr/local/cargo/registry     --mount=type=cache,target=/usr/local/cargo/git     --mount=type=cache,target=/build/target     cargo build --release --bin loreserver &&     cp /build/target/release/loreserver /build/loreserver-bin
+2026-06-29T03:02:06.2216811Z #15 0.121     Updating crates.io index
+2026-06-29T03:02:07.1875931Z #15 1.088  Downloading crates ...
+2026-06-29T03:02:07.4006190Z #15 1.301   Downloaded adler2 v2.0.1
+2026-06-29T03:02:07.5032352Z #15 1.304   Downloaded allocator-api2 v0.2.21
+2026-06-29T03:02:07.5033593Z #15 1.309   Downloaded anstream v0.6.21
+2026-06-29T03:02:07.5035535Z #15 1.312   Downloaded addr2line v0.25.1
+2026-06-29T03:02:07.5036708Z #15 1.315   Downloaded aws-smithy-types v1.4.8
+2026-06-29T03:02:07.5037588Z #15 1.321   Downloaded ctutils v0.4.2
+2026-06-29T03:02:07.5038177Z #15 1.325   Downloaded axum v0.8.9
+2026-06-29T03:02:07.5038685Z #15 1.335   Downloaded futures-core v0.3.32
+2026-06-29T03:02:07.5039233Z #15 1.338   Downloaded hyper-rustls v0.27.9
+2026-06-29T03:02:07.5039783Z #15 1.342   Downloaded generic-array v0.14.7
+2026-06-29T03:02:07.5040310Z #15 1.345   Downloaded futures-sink v0.3.32
+2026-06-29T03:02:07.5040817Z #15 1.347   Downloaded futures-task v0.3.32
+2026-06-29T03:02:07.5041622Z #15 1.350   Downloaded futures v0.3.32
+2026-06-29T03:02:07.5042215Z #15 1.357   Downloaded futures-macro v0.3.32
+2026-06-29T03:02:07.5042763Z #15 1.360   Downloaded darling v0.23.0
+2026-06-29T03:02:07.5043251Z #15 1.367   Downloaded multimap v0.10.1
+2026-06-29T03:02:07.5043730Z #15 1.370   Downloaded cfg-if v1.0.4
+2026-06-29T03:02:07.5044210Z #15 1.373   Downloaded idna_adapter v1.2.2
+2026-06-29T03:02:07.5044721Z #15 1.376   Downloaded darling_macro v0.23.0
+2026-06-29T03:02:07.5045233Z #15 1.378   Downloaded axum-core v0.5.6
+2026-06-29T03:02:07.5045727Z #15 1.383   Downloaded hybrid-array v0.4.12
+2026-06-29T03:02:07.5046223Z #15 1.387   Downloaded ident_case v1.0.1
+2026-06-29T03:02:07.5046718Z #15 1.389   Downloaded crypto-common v0.2.2
+2026-06-29T03:02:07.5047218Z #15 1.392   Downloaded colorchoice v1.0.5
+2026-06-29T03:02:07.5047748Z #15 1.394   Downloaded fastrand v2.4.1
+2026-06-29T03:02:07.5048245Z #15 1.398   Downloaded nonzero_ext v0.3.0
+2026-06-29T03:02:07.5048755Z #15 1.404   Downloaded option-ext v0.2.0
+2026-06-29T03:02:07.6033751Z #15 1.406   Downloaded deranged v0.5.8
+2026-06-29T03:02:07.6035482Z #15 1.410   Downloaded openssl-probe v0.2.1
+2026-06-29T03:02:07.6036939Z #15 1.413   Downloaded iana-time-zone v0.1.65
+2026-06-29T03:02:07.6038217Z #15 1.419   Downloaded nu-ansi-term v0.50.3
+2026-06-29T03:02:07.6039255Z #15 1.424   Downloaded pathdiff v0.2.3
+2026-06-29T03:02:07.6040501Z #15 1.427   Downloaded oid-registry v0.8.1
+2026-06-29T03:02:07.6042237Z #15 1.430   Downloaded powerfmt v0.2.0
+2026-06-29T03:02:07.6043051Z #15 1.433   Downloaded derive_builder_macro v0.20.2
+2026-06-29T03:02:07.6044126Z #15 1.436   Downloaded pin-project-internal v1.1.13
+2026-06-29T03:02:07.6044909Z #15 1.443   Downloaded rand_core v0.9.5
+2026-06-29T03:02:07.6045603Z #15 1.449   Downloaded rustc_version v0.4.1
+2026-06-29T03:02:07.6046854Z #15 1.458   Downloaded serde_urlencoded v0.7.1
+2026-06-29T03:02:07.6047598Z #15 1.466   Downloaded thread_local v1.1.9
+2026-06-29T03:02:07.6049574Z #15 1.471   Downloaded time-core v0.1.8
+2026-06-29T03:02:07.6050247Z #15 1.473   Downloaded serde v1.0.228
+2026-06-29T03:02:07.6050919Z #15 1.479   Downloaded utf8-zero v0.8.1
+2026-06-29T03:02:07.6052374Z #15 1.482   Downloaded tonic-prost v0.14.6
+2026-06-29T03:02:07.6053907Z #15 1.485   Downloaded tracing-serde v0.2.0
+2026-06-29T03:02:07.6054664Z #15 1.487   Downloaded tonic-build v0.14.6
+2026-06-29T03:02:07.6056083Z #15 1.489   Downloaded thiserror-impl v1.0.69
+2026-06-29T03:02:07.6057117Z #15 1.491   Downloaded urlencoding v2.1.3
+2026-06-29T03:02:07.6058242Z #15 1.494   Downloaded version_check v0.9.5
+2026-06-29T03:02:07.6059921Z #15 1.498   Downloaded yoke-derive v0.8.2
+2026-06-29T03:02:07.6060785Z #15 1.501   Downloaded xxhash-rust v0.8.15
+2026-06-29T03:02:07.6061734Z #15 1.504   Downloaded zerofrom-derive v0.1.7
+2026-06-29T03:02:07.7181436Z #15 1.509   Downloaded tracing-core v0.1.36
+2026-06-29T03:02:07.7183145Z #15 1.515   Downloaded uuid v1.23.1
+2026-06-29T03:02:07.7184154Z #15 1.521   Downloaded zerofrom v0.1.8
+2026-06-29T03:02:07.7184784Z #15 1.524   Downloaded zerocopy-derive v0.8.48
+2026-06-29T03:02:07.7185401Z #15 1.536   Downloaded zerotrie v0.2.4
+2026-06-29T03:02:07.7185907Z #15 1.542   Downloaded object v0.37.3
+2026-06-29T03:02:07.7186426Z #15 1.556   Downloaded winnow v1.0.3
+2026-06-29T03:02:07.7186776Z #15 1.568   Downloaded xmlparser v0.13.6
+2026-06-29T03:02:07.7187166Z #15 1.573   Downloaded tracing-subscriber v0.3.23
+2026-06-29T03:02:07.7187555Z #15 1.584   Downloaded zeroize v1.8.2
+2026-06-29T03:02:07.7187898Z #15 1.587   Downloaded web-time v1.1.0
+2026-06-29T03:02:07.7188251Z #15 1.590   Downloaded zmij v1.0.21
+2026-06-29T03:02:07.7188592Z #15 1.594   Downloaded zerocopy v0.8.48
+2026-06-29T03:02:07.7188964Z #15 1.619   Downloaded regex-automata v0.4.14
+2026-06-29T03:02:07.8799100Z #15 1.636   Downloaded webpki-roots v1.0.7
+2026-06-29T03:02:07.8800519Z #15 1.640   Downloaded encoding_rs v0.8.35
+2026-06-29T03:02:07.8802078Z #15 1.662   Downloaded tower-http v0.6.11
+2026-06-29T03:02:07.8803002Z #15 1.673   Downloaded typenum v1.20.0
+2026-06-29T03:02:07.8803586Z #15 1.678   Downloaded glam v0.33.0
+2026-06-29T03:02:07.8804088Z #15 1.709   Downloaded utf8parse v0.2.2
+2026-06-29T03:02:07.8804643Z #15 1.711   Downloaded windows-sys v0.61.2
+2026-06-29T03:02:07.8805163Z #15 1.780   Downloaded spin v0.10.0
+2026-06-29T03:02:08.0025721Z #15 1.784   Downloaded tonic-prost-build v0.14.6
+2026-06-29T03:02:08.0026570Z #15 1.786   Downloaded slog v2.8.2
+2026-06-29T03:02:08.0027613Z #15 1.791   Downloaded tower-service v0.3.3
+2026-06-29T03:02:08.0028806Z #15 1.792   Downloaded vergen-lib v9.1.0
+2026-06-29T03:02:08.0029404Z #15 1.795   Downloaded vsimd v0.8.0
+2026-06-29T03:02:08.0029945Z #15 1.797   Downloaded tracing-appender v0.2.5
+2026-06-29T03:02:08.0030496Z #15 1.800   Downloaded tinystr v0.8.3
+2026-06-29T03:02:08.0030979Z #15 1.803   Downloaded slab v0.4.12
+2026-06-29T03:02:08.0033192Z #15 1.805   Downloaded zerovec v0.11.6
+2026-06-29T03:02:08.0033711Z #15 1.812   Downloaded windows-link v0.2.1
+2026-06-29T03:02:08.0034266Z #15 1.814   Downloaded zerovec-derive v0.11.3
+2026-06-29T03:02:08.0034708Z #15 1.816   Downloaded vergen v9.1.0
+2026-06-29T03:02:08.0035021Z #15 1.818   Downloaded rustls v0.23.40
+2026-06-29T03:02:08.0035390Z #15 1.831   Downloaded aws-sdk-dynamodb v1.112.0
+2026-06-29T03:02:08.0035762Z #15 1.903   Downloaded tokio v1.52.3
+2026-06-29T03:02:08.1209435Z #15 1.954   Downloaded petgraph v0.8.3
+2026-06-29T03:02:08.1210070Z #15 1.977   Downloaded libc v0.2.186
+2026-06-29T03:02:08.1210702Z #15 2.022   Downloaded tracing-ecs v0.4.1
+2026-06-29T03:02:08.2576242Z #15 2.024   Downloaded winnow v0.7.15
+2026-06-29T03:02:08.2579043Z #15 2.035   Downloaded tracing v0.1.44
+2026-06-29T03:02:08.2579782Z #15 2.052   Downloaded rustix v1.1.4
+2026-06-29T03:02:08.2580315Z #15 2.084   Downloaded unicode-width v0.2.2
+2026-06-29T03:02:08.2580824Z #15 2.090   Downloaded crc-fast v1.10.0
+2026-06-29T03:02:08.2582008Z #15 2.110   Downloaded rustls-pki-types v1.14.1
+2026-06-29T03:02:08.2582880Z #15 2.113   Downloaded ring v0.17.14
+2026-06-29T03:02:08.2583431Z #15 2.158   Downloaded tracing-opentelemetry v0.32.1
+2026-06-29T03:02:08.3597156Z #15 2.163   Downloaded syn v2.0.117
+2026-06-29T03:02:08.3597933Z #15 2.175   Downloaded gimli v0.32.3
+2026-06-29T03:02:08.3598448Z #15 2.183   Downloaded writeable v0.6.3
+2026-06-29T03:02:08.3599577Z #15 2.186   Downloaded time v0.3.47
+2026-06-29T03:02:08.3600250Z #15 2.200   Downloaded rayon v1.12.0
+2026-06-29T03:02:08.3600714Z #15 2.212   Downloaded yoke v0.8.2
+2026-06-29T03:02:08.3601462Z #15 2.215   Downloaded zstd-sys v2.0.16+zstd.1.5.7
+2026-06-29T03:02:08.3602233Z #15 2.233   Downloaded yasna v0.6.0
+2026-06-29T03:02:08.3602718Z #15 2.236   Downloaded x509-parser v0.18.1
+2026-06-29T03:02:08.3603226Z #15 2.243   Downloaded winresource v0.1.31
+2026-06-29T03:02:08.3603738Z #15 2.245   Downloaded unicode-ident v1.0.24
+2026-06-29T03:02:08.3604239Z #15 2.249   Downloaded tower v0.5.3
+2026-06-29T03:02:08.3604711Z #15 2.260   Downloaded regex-syntax v0.8.10
+2026-06-29T03:02:08.5489030Z #15 2.268   Downloaded quinn v0.11.9
+2026-06-29T03:02:08.5489770Z #15 2.272   Downloaded lz4-sys v1.11.1+lz4-1.10.0
+2026-06-29T03:02:08.5490320Z #15 2.292   Downloaded libm v0.2.16
+2026-06-29T03:02:08.5490856Z #15 2.306   Downloaded icu_properties_data v2.2.0
+2026-06-29T03:02:08.5491842Z #15 2.318   Downloaded hashbrown v0.16.1
+2026-06-29T03:02:08.5492355Z #15 2.324   Downloaded ureq v3.3.0
+2026-06-29T03:02:08.5492828Z #15 2.330   Downloaded tinyvec v1.11.0
+2026-06-29T03:02:08.5493216Z #15 2.333   Downloaded prost-types v0.14.3
+2026-06-29T03:02:08.5493595Z #15 2.335   Downloaded aws-sdk-s3 v1.133.0
+2026-06-29T03:02:08.5493934Z #15 2.449   Downloaded once_cell v1.21.4
+2026-06-29T03:02:08.6717197Z #15 2.453   Downloaded itertools v0.14.0
+2026-06-29T03:02:08.6718272Z #15 2.461   Downloaded hyper v1.9.0
+2026-06-29T03:02:08.6719434Z #15 2.469   Downloaded hashbrown v0.15.5
+2026-06-29T03:02:08.6720249Z #15 2.474   Downloaded governor v0.10.4
+2026-06-29T03:02:08.6721834Z #15 2.479   Downloaded futures-util v0.3.32
+2026-06-29T03:02:08.6722853Z #15 2.494   Downloaded tracing-attributes v0.1.31
+2026-06-29T03:02:08.6723640Z #15 2.497   Downloaded hashbrown v0.17.1
+2026-06-29T03:02:08.6724350Z #15 2.503   Downloaded want v0.3.1
+2026-06-29T03:02:08.6725060Z #15 2.504   Downloaded try-lock v0.2.5
+2026-06-29T03:02:08.6725784Z #15 2.506   Downloaded linux-raw-sys v0.12.1
+2026-06-29T03:02:08.6726513Z #15 2.572   Downloaded tokio-util v0.7.18
+2026-06-29T03:02:08.7724497Z #15 2.581   Downloaded sha2 v0.11.0
+2026-06-29T03:02:08.7725346Z #15 2.586   Downloaded rustls-webpki v0.103.13
+2026-06-29T03:02:08.7726424Z #15 2.589   Downloaded http v0.2.12
+2026-06-29T03:02:08.7728164Z #15 2.593   Downloaded url v2.5.8
+2026-06-29T03:02:08.7728880Z #15 2.596   Downloaded untrusted v0.9.0
+2026-06-29T03:02:08.7729640Z #15 2.598   Downloaded sysinfo v0.37.2
+2026-06-29T03:02:08.7730339Z #15 2.611   Downloaded socket2 v0.6.3
+2026-06-29T03:02:08.7731339Z #15 2.613   Downloaded serde_with v3.20.0
+2026-06-29T03:02:08.7732097Z #15 2.627   Downloaded nom v7.1.3
+2026-06-29T03:02:08.7732763Z #15 2.633   Downloaded is-wsl v0.4.0
+2026-06-29T03:02:08.7733450Z #15 2.634   Downloaded indexmap v2.14.0
+2026-06-29T03:02:08.7734196Z #15 2.639   Downloaded ureq-proto v0.6.0
+2026-06-29T03:02:08.7734935Z #15 2.644   Downloaded unicase v2.9.0
+2026-06-29T03:02:08.7735658Z #15 2.646   Downloaded tower-layer v0.3.3
+2026-06-29T03:02:08.7736360Z #15 2.647   Downloaded tonic v0.14.6
+2026-06-29T03:02:08.7737067Z #15 2.654   Downloaded toml v1.1.2+spec-1.1.0
+2026-06-29T03:02:08.7737803Z #15 2.658   Downloaded thiserror v1.0.69
+2026-06-29T03:02:08.7738529Z #15 2.665   Downloaded serde_json v1.0.149
+2026-06-29T03:02:08.7739261Z #15 2.673   Downloaded num-bigint v0.4.6
+2026-06-29T03:02:08.9188116Z #15 2.679   Downloaded h2 v0.4.14
+2026-06-29T03:02:08.9189541Z #15 2.687   Downloaded flate2 v1.1.9
+2026-06-29T03:02:08.9190365Z #15 2.692   Downloaded utf8_iter v1.0.4
+2026-06-29T03:02:08.9191429Z #15 2.694   Downloaded tracing-log v0.2.0
+2026-06-29T03:02:08.9192109Z #15 2.696   Downloaded toml_datetime v1.1.1+spec-1.1.0
+2026-06-29T03:02:08.9192833Z #15 2.697   Downloaded opentelemetry_sdk v0.31.0
+2026-06-29T03:02:08.9193456Z #15 2.707   Downloaded chrono v0.4.44
+2026-06-29T03:02:08.9194317Z #15 2.714   Downloaded cbindgen v0.29.2
+2026-06-29T03:02:08.9194935Z #15 2.819   Downloaded toml_writer v1.1.1+spec-1.1.0
+2026-06-29T03:02:09.0201161Z #15 2.821   Downloaded toml_datetime v0.7.5+spec-1.1.0
+2026-06-29T03:02:09.0202429Z #15 2.823   Downloaded toml v0.9.12+spec-1.1.0
+2026-06-29T03:02:09.0203484Z #15 2.827   Downloaded tokio-metrics v0.4.9
+2026-06-29T03:02:09.0233844Z #15 2.831   Downloaded tinyvec_macros v0.1.1
+2026-06-29T03:02:09.0234478Z #15 2.832   Downloaded reqwest v0.12.28
+2026-06-29T03:02:09.0235062Z #15 2.838   Downloaded serde_dynamo v4.3.0
+2026-06-29T03:02:09.0235556Z #15 2.843   Downloaded regex v1.12.3
+2026-06-29T03:02:09.0236139Z #15 2.848   Downloaded toml_parser v1.1.2+spec-1.1.0
+2026-06-29T03:02:09.0236743Z #15 2.851   Downloaded tokio-rustls v0.26.4
+2026-06-29T03:02:09.0237254Z #15 2.854   Downloaded tokio-macros v2.7.0
+2026-06-29T03:02:09.0237741Z #15 2.855   Downloaded subtle v2.6.1
+2026-06-29T03:02:09.0238215Z #15 2.857   Downloaded sharded-slab v0.1.7
+2026-06-29T03:02:09.0238760Z #15 2.860   Downloaded serde_with_macros v3.20.0
+2026-06-29T03:02:09.0239440Z #15 2.863   Downloaded portable-atomic v1.13.1
+2026-06-29T03:02:09.0240000Z #15 2.871   Downloaded minimal-lexical v0.2.1
+2026-06-29T03:02:09.0240520Z #15 2.876   Downloaded blake3 v1.8.5
+2026-06-29T03:02:09.0241248Z #15 2.885   Downloaded aws-sdk-sts v1.104.0
+2026-06-29T03:02:09.0241802Z #15 2.899   Downloaded tokio-stream v0.1.18
+2026-06-29T03:02:09.0242310Z #15 2.904   Downloaded time-macros v0.2.27
+2026-06-29T03:02:09.0242815Z #15 2.907   Downloaded spinning_top v0.3.0
+2026-06-29T03:02:09.0243323Z #15 2.909   Downloaded serde_derive v1.0.228
+2026-06-29T03:02:09.0243857Z #15 2.912   Downloaded pulldown-cmark v0.13.4
+2026-06-29T03:02:09.0244373Z #15 2.918   Downloaded icu_provider v2.2.0
+2026-06-29T03:02:09.0244866Z #15 2.921   Downloaded clap_builder v4.6.0
+2026-06-29T03:02:09.1224594Z #15 2.929   Downloaded thiserror-impl v2.0.18
+2026-06-29T03:02:09.1225888Z #15 2.931   Downloaded thiserror v2.0.18
+2026-06-29T03:02:09.1226861Z #15 2.939   Downloaded tempfile v3.27.0
+2026-06-29T03:02:09.1227412Z #15 2.941   Downloaded synstructure v0.13.2
+2026-06-29T03:02:09.1227960Z #15 2.943   Downloaded smart-default v0.7.1
+2026-06-29T03:02:09.1228413Z #15 2.945   Downloaded smallvec v1.15.1
+2026-06-29T03:02:09.1228764Z #15 2.947   Downloaded slog-scope v4.4.1
+2026-06-29T03:02:09.1229110Z #15 2.949   Downloaded idna v1.1.0
+2026-06-29T03:02:09.1229429Z #15 2.953   Downloaded hashbrown v0.14.5
+2026-06-29T03:02:09.1229752Z #15 2.958   Downloaded raw-cpuid v11.6.0
+2026-06-29T03:02:09.1230107Z #15 2.962   Downloaded opentelemetry-otlp v0.31.1
+2026-06-29T03:02:09.1230477Z #15 2.965   Downloaded hyper-util v0.1.20
+2026-06-29T03:02:09.1230804Z #15 2.972   Downloaded getrandom v0.3.4
+2026-06-29T03:02:09.1231365Z #15 2.976   Downloaded aws-config v1.8.17
+2026-06-29T03:02:09.1231694Z #15 2.984   Downloaded symlink v0.1.0
+2026-06-29T03:02:09.1232003Z #15 2.985   Downloaded strsim v0.11.1
+2026-06-29T03:02:09.1232343Z #15 2.987   Downloaded stable_deref_trait v1.2.1
+2026-06-29T03:02:09.1232697Z #15 2.988   Downloaded siphasher v1.0.3
+2026-06-29T03:02:09.1233022Z #15 2.990   Downloaded simd-adler32 v0.3.9
+2026-06-29T03:02:09.1233350Z #15 2.992   Downloaded shlex v1.3.0
+2026-06-29T03:02:09.1233669Z #15 2.994   Downloaded serde_spanned v1.1.1
+2026-06-29T03:02:09.1234012Z #15 2.996   Downloaded serde_core v1.0.228
+2026-06-29T03:02:09.1234352Z #15 2.999   Downloaded ryu v1.0.23
+2026-06-29T03:02:09.1234658Z #15 3.003   Downloaded regex-lite v0.1.9
+2026-06-29T03:02:09.1234983Z #15 3.006   Downloaded rayon-core v1.13.0
+2026-06-29T03:02:09.1235310Z #15 3.010   Downloaded rand_distr v0.5.1
+2026-06-29T03:02:09.1235629Z #15 3.014   Downloaded rand v0.9.4
+2026-06-29T03:02:09.1235945Z #15 3.019   Downloaded prettyplease v0.2.37
+2026-06-29T03:02:09.1236289Z #15 3.023   Downloaded miniz_oxide v0.8.9
+2026-06-29T03:02:09.2224608Z #15 3.026   Downloaded memchr v2.8.0
+2026-06-29T03:02:09.2225187Z #15 3.032   Downloaded jsonwebtoken v9.3.1
+2026-06-29T03:02:09.2226742Z #15 3.037   Downloaded icu_properties v2.2.0
+2026-06-29T03:02:09.2227341Z #15 3.040   Downloaded icu_normalizer_data v2.2.0
+2026-06-29T03:02:09.2227878Z #15 3.042   Downloaded hmac v0.13.0
+2026-06-29T03:02:09.2228368Z #15 3.045   Downloaded erased-serde v0.3.31
+2026-06-29T03:02:09.2229619Z #15 3.048   Downloaded der-parser v10.0.0
+2026-06-29T03:02:09.2230899Z #15 3.052   Downloaded aws-smithy-runtime v1.11.3
+2026-06-29T03:02:09.2232259Z #15 3.059   Downloaded aws-sigv4 v1.4.4
+2026-06-29T03:02:09.2232769Z #15 3.116   Downloaded aws-runtime v1.7.4
+2026-06-29T03:02:09.2233280Z #15 3.120   Downloaded sync_wrapper v1.0.2
+2026-06-29T03:02:09.2233782Z #15 3.122   Downloaded simple_asn1 v0.6.4
+2026-06-29T03:02:09.2234323Z #15 3.123   Downloaded signal-hook-registry v1.4.8
+2026-06-29T03:02:09.3239870Z #15 3.125   Downloaded sha1 v0.11.0
+2026-06-29T03:02:09.3240558Z #15 3.127   Downloaded serde_path_to_error v0.1.20
+2026-06-29T03:02:09.3241394Z #15 3.129   Downloaded serde_bytes v0.11.19
+2026-06-29T03:02:09.3242036Z #15 3.131   Downloaded rusticata-macros v4.1.0
+2026-06-29T03:02:09.3242603Z #15 3.133   Downloaded rs-consul v0.13.0
+2026-06-29T03:02:09.3243124Z #15 3.137   Downloaded rcgen v0.14.8
+2026-06-29T03:02:09.3243636Z #15 3.140   Downloaded ppv-lite86 v0.2.21
+2026-06-29T03:02:09.3244302Z #15 3.141   Downloaded opentelemetry-semantic-conventions v0.31.0
+2026-06-29T03:02:09.3245037Z #15 3.145   Downloaded opentelemetry-proto v0.31.0
+2026-06-29T03:02:09.3245631Z #15 3.148   Downloaded opentelemetry v0.31.0
+2026-06-29T03:02:09.3246168Z #15 3.153   Downloaded num-traits v0.2.19
+2026-06-29T03:02:09.3246665Z #15 3.156   Downloaded mio v1.2.0
+2026-06-29T03:02:09.3247092Z #15 3.163   Downloaded mime v0.3.17
+2026-06-29T03:02:09.3247410Z #15 3.164   Downloaded litemap v0.8.2
+2026-06-29T03:02:09.3247727Z #15 3.167   Downloaded keyring v3.6.3
+2026-06-29T03:02:09.3248055Z #15 3.170   Downloaded icu_collections v2.2.0
+2026-06-29T03:02:09.3248423Z #15 3.177   Downloaded hyper-timeout v0.5.2
+2026-06-29T03:02:09.3248777Z #15 3.179   Downloaded httparse v1.10.1
+2026-06-29T03:02:09.3249391Z #15 3.183   Downloaded http-body-util v0.1.3
+2026-06-29T03:02:09.3249976Z #15 3.185   Downloaded http-body v1.0.1
+2026-06-29T03:02:09.3250509Z #15 3.186   Downloaded hex v0.4.3
+2026-06-29T03:02:09.3251284Z #15 3.188   Downloaded getrandom v0.4.2
+2026-06-29T03:02:09.3251724Z #15 3.192   Downloaded futures-executor v0.3.32
+2026-06-29T03:02:09.3252098Z #15 3.194   Downloaded fixedbitset v0.5.7
+2026-06-29T03:02:09.3252653Z #15 3.196   Downloaded enum_dispatch v0.3.13
+2026-06-29T03:02:09.3253265Z #15 3.200   Downloaded either v1.16.0
+2026-06-29T03:02:09.3253879Z #15 3.202   Downloaded digest v0.11.3
+2026-06-29T03:02:09.3254425Z #15 3.205   Downloaded derive_builder_core v0.20.2
+2026-06-29T03:02:09.3255018Z #15 3.207   Downloaded derive_builder v0.20.2
+2026-06-29T03:02:09.3255650Z #15 3.213   Downloaded crossbeam-channel v0.5.15
+2026-06-29T03:02:09.3256202Z #15 3.217   Downloaded base64 v0.21.7
+2026-06-29T03:02:09.3256473Z #15 3.222   Downloaded semver v1.0.28
+2026-06-29T03:02:09.3256743Z #15 3.224   Downloaded scopeguard v1.2.0
+2026-06-29T03:02:09.4238870Z #15 3.226   Downloaded rustversion v1.0.22
+2026-06-29T03:02:09.4239838Z #15 3.230   Downloaded rustls-native-certs v0.8.3
+2026-06-29T03:02:09.4240959Z #15 3.233   Downloaded rustc-demangle v0.1.27
+2026-06-29T03:02:09.4241786Z #15 3.235   Downloaded proc-macro2 v1.0.106
+2026-06-29T03:02:09.4242187Z #15 3.239   Downloaded pkg-config v0.3.33
+2026-06-29T03:02:09.4242627Z #15 3.241   Downloaded pin-project v1.1.13
+2026-06-29T03:02:09.4243141Z #15 3.256   Downloaded percent-encoding v2.3.2
+2026-06-29T03:02:09.4243504Z #15 3.257   Downloaded open v5.3.5
+2026-06-29T03:02:09.4243945Z #15 3.259   Downloaded num_threads v0.1.7
+2026-06-29T03:02:09.4244355Z #15 3.260   Downloaded num-integer v0.1.46
+2026-06-29T03:02:09.4244695Z #15 3.262   Downloaded num-conv v0.2.2
+2026-06-29T03:02:09.4245114Z #15 3.263   Downloaded linux-keyutils v0.2.5
+2026-06-29T03:02:09.4245556Z #15 3.266   Downloaded itoa v1.0.18
+2026-06-29T03:02:09.4246119Z #15 3.268   Downloaded icu_normalizer v2.2.0
+2026-06-29T03:02:09.4246675Z #15 3.272   Downloaded icu_locale_core v2.2.0
+2026-06-29T03:02:09.4247024Z #15 3.280   Downloaded fastcdc v3.2.1
+2026-06-29T03:02:09.4247343Z #15 3.283   Downloaded equivalent v1.0.2
+2026-06-29T03:02:09.4247819Z #15 3.284   Downloaded diffy v0.4.2
+2026-06-29T03:02:09.4248315Z #15 3.287   Downloaded config v0.15.23
+2026-06-29T03:02:09.4248638Z #15 3.292   Downloaded bon-macros v3.9.1
+2026-06-29T03:02:09.4249148Z #15 3.300   Downloaded bon v3.9.1
+2026-06-29T03:02:09.4249491Z #15 3.311   Downloaded bitcode v0.6.9
+2026-06-29T03:02:09.4249799Z #15 3.316   Downloaded base64 v0.22.1
+2026-06-29T03:02:09.4250263Z #15 3.320   Downloaded aws-smithy-schema v0.1.0
+2026-06-29T03:02:09.4250690Z #15 3.323   Downloaded rustc-hash v2.1.2
+2026-06-29T03:02:09.4251166Z #15 3.325   Downloaded quinn-udp v0.5.14
+2026-06-29T03:02:09.5265433Z #15 3.327   Downloaded quanta v0.12.6
+2026-06-29T03:02:09.5267361Z #15 3.330   Downloaded pulldown-cmark-to-cmark v22.0.0
+2026-06-29T03:02:09.5268090Z #15 3.332   Downloaded prost-build v0.14.3
+2026-06-29T03:02:09.5268671Z #15 3.336   Downloaded prost v0.14.3
+2026-06-29T03:02:09.5269238Z #15 3.338   Downloaded potential_utf v0.1.5
+2026-06-29T03:02:09.5269856Z #15 3.339   Downloaded parking_lot_core v0.9.12
+2026-06-29T03:02:09.5270471Z #15 3.342   Downloaded parking_lot v0.12.5
+2026-06-29T03:02:09.5271273Z #15 3.345   Downloaded outref v0.5.2
+2026-06-29T03:02:09.5271717Z #15 3.346   Downloaded memmap2 v0.9.10
+2026-06-29T03:02:09.5272065Z #15 3.348   Downloaded is-docker v0.2.0
+2026-06-29T03:02:09.5272416Z #15 3.350   Downloaded infer v0.19.0
+2026-06-29T03:02:09.5272743Z #15 3.353   Downloaded glob v0.3.3
+2026-06-29T03:02:09.5273066Z #15 3.355   Downloaded fnv v1.0.7
+2026-06-29T03:02:09.5273432Z #15 3.356   Downloaded find-msvc-tools v0.1.9
+2026-06-29T03:02:09.5273870Z #15 3.358   Downloaded document-features v0.2.12
+2026-06-29T03:02:09.5274263Z #15 3.359   Downloaded displaydoc v0.2.5
+2026-06-29T03:02:09.5274626Z #15 3.363   Downloaded digest v0.10.7
+2026-06-29T03:02:09.5274895Z #15 3.365   Downloaded darling v0.20.11
+2026-06-29T03:02:09.5275173Z #15 3.371   Downloaded clap_complete v4.6.5
+2026-06-29T03:02:09.5275444Z #15 3.374   Downloaded cfb v0.7.3
+2026-06-29T03:02:09.5275690Z #15 3.379   Downloaded bytemuck v1.25.0
+2026-06-29T03:02:09.5275972Z #15 3.383   Downloaded aws-smithy-json v0.62.6
+2026-06-29T03:02:09.5276266Z #15 3.386   Downloaded arc-swap v1.9.1
+2026-06-29T03:02:09.5276530Z #15 3.390   Downloaded rand_chacha v0.9.0
+2026-06-29T03:02:09.5276804Z #15 3.392   Downloaded quote v1.0.45
+2026-06-29T03:02:09.5277076Z #15 3.395   Downloaded prost-derive v0.14.3
+2026-06-29T03:02:09.5277394Z #15 3.397   Downloaded pin-project-lite v0.2.17
+2026-06-29T03:02:09.5277709Z #15 3.403   Downloaded pem v3.0.6
+2026-06-29T03:02:09.5277970Z #15 3.405   Downloaded matchit v0.8.4
+2026-06-29T03:02:09.5278233Z #15 3.408   Downloaded http-body v0.4.6
+2026-06-29T03:02:09.5278499Z #15 3.410   Downloaded heck v0.5.0
+2026-06-29T03:02:09.5278786Z #15 3.411   Downloaded opentelemetry-http v0.31.0
+2026-06-29T03:02:09.5279151Z #15 3.413   Downloaded opentelemetry-appender-tracing v0.31.1
+2026-06-29T03:02:09.5279485Z #15 3.414   Downloaded log v0.4.29
+2026-06-29T03:02:09.5279734Z #15 3.417   Downloaded litrs v1.0.0
+2026-06-29T03:02:09.5279987Z #15 3.421   Downloaded dirs-sys v0.5.0
+2026-06-29T03:02:09.5280262Z #15 3.422   Downloaded anstyle-parse v1.0.0
+2026-06-29T03:02:09.5280560Z #15 3.424   Downloaded crossbeam-epoch v0.9.18
+2026-06-29T03:02:09.5280867Z #15 3.427   Downloaded bitflags v2.11.1
+2026-06-29T03:02:09.6266200Z #15 3.432   Downloaded base64-simd v0.8.0
+2026-06-29T03:02:09.6267256Z #15 3.434   Downloaded pin-utils v0.1.0
+2026-06-29T03:02:09.6268255Z #15 3.436   Downloaded jobserver v0.1.34
+2026-06-29T03:02:09.6268807Z #15 3.438   Downloaded ipnet v2.12.0
+2026-06-29T03:02:09.6269397Z #15 3.440   Downloaded fastbloom v0.14.1
+2026-06-29T03:02:09.6271117Z #15 3.442   Downloaded lru v0.16.4
+2026-06-29T03:02:09.6271931Z #15 3.443   Downloaded lazy_static v1.5.0
+2026-06-29T03:02:09.6274512Z #15 3.445   Downloaded foldhash v0.1.5
+2026-06-29T03:02:09.6275130Z #15 3.447   Downloaded errno v0.3.14
+2026-06-29T03:02:09.6275738Z #15 3.449   Downloaded clap_derive v4.6.1
+2026-06-29T03:02:09.6276092Z #15 3.451   Downloaded block-buffer v0.12.0
+2026-06-29T03:02:09.6276501Z #15 3.453   Downloaded anstyle-parse v0.2.7
+2026-06-29T03:02:09.6277118Z #15 3.455   Downloaded md-5 v0.11.0
+2026-06-29T03:02:09.6277386Z #15 3.457   Downloaded matchers v0.2.0
+2026-06-29T03:02:09.6277661Z #15 3.458   Downloaded lock_api v0.4.14
+2026-06-29T03:02:09.6277940Z #15 3.460   Downloaded glob-match v0.2.1
+2026-06-29T03:02:09.6278233Z #15 3.461   Downloaded crossbeam-utils v0.8.21
+2026-06-29T03:02:09.6278529Z #15 3.464   Downloaded const-oid v0.10.2
+2026-06-29T03:02:09.6278791Z #15 3.467   Downloaded clap v4.6.1
+2026-06-29T03:02:09.6279043Z #15 3.479   Downloaded bytes v1.11.1
+2026-06-29T03:02:09.6279308Z #15 3.483   Downloaded bit-vec v0.9.1
+2026-06-29T03:02:09.6279754Z #15 3.485   Downloaded async-trait v0.1.89
+2026-06-29T03:02:09.6280555Z #15 3.491   Downloaded is_terminal_polyfill v1.70.2
+2026-06-29T03:02:09.6282288Z #15 3.492   Downloaded constant_time_eq v0.4.2
+2026-06-29T03:02:09.6283335Z #15 3.494   Downloaded byteorder v1.5.0
+2026-06-29T03:02:09.6283924Z #15 3.496   Downloaded aws-smithy-eventstream v0.60.20
+2026-06-29T03:02:09.6284746Z #15 3.499   Downloaded autocfg v1.5.0
+2026-06-29T03:02:09.6285212Z #15 3.501   Downloaded httpdate v1.0.3
+2026-06-29T03:02:09.6285819Z #15 3.503   Downloaded arrayvec v0.7.6
+2026-06-29T03:02:09.6286091Z #15 3.505   Downloaded http v1.4.0
+2026-06-29T03:02:09.6286349Z #15 3.510   Downloaded getrandom v0.2.17
+2026-06-29T03:02:09.6286628Z #15 3.513   Downloaded directories v6.0.0
+2026-06-29T03:02:09.6286921Z #15 3.515   Downloaded crossbeam-deque v0.8.6
+2026-06-29T03:02:09.6287212Z #15 3.517   Downloaded cookie v0.18.1
+2026-06-29T03:02:09.6287463Z #15 3.520   Downloaded anyhow v1.0.102
+2026-06-29T03:02:09.6287718Z #15 3.525   Downloaded lru-slab v0.1.2
+2026-06-29T03:02:09.6287994Z #15 3.526   Downloaded crypto-common v0.1.7
+2026-06-29T03:02:09.6288310Z #15 3.527   Downloaded async-stream-impl v0.3.6
+2026-06-29T03:02:09.7303019Z #15 3.528   Downloaded asn1-rs-impl v0.2.0
+2026-06-29T03:02:09.7304583Z #15 3.529   Downloaded anstyle-query v1.1.5
+2026-06-29T03:02:09.7305147Z #15 3.531   Downloaded cc v1.2.62
+2026-06-29T03:02:09.7305757Z #15 3.534   Downloaded cargo-platform v0.3.3
+2026-06-29T03:02:09.7306346Z #15 3.536   Downloaded cmov v0.5.3
+2026-06-29T03:02:09.7306886Z #15 3.538   Downloaded aws-smithy-http-client v1.1.12
+2026-06-29T03:02:09.7307488Z #15 3.542   Downloaded aws-smithy-async v1.2.14
+2026-06-29T03:02:09.7308080Z #15 3.545   Downloaded cpufeatures v0.3.0
+2026-06-29T03:02:09.7308582Z #15 3.547   Downloaded clap-markdown v0.1.5
+2026-06-29T03:02:09.7309049Z #15 3.550   Downloaded asn1-rs-derive v0.6.0
+2026-06-29T03:02:09.7309352Z #15 3.551   Downloaded bs58 v0.5.1
+2026-06-29T03:02:09.7309688Z #15 3.554   Downloaded aws-smithy-runtime-api-macros v1.0.0
+2026-06-29T03:02:09.7310103Z #15 3.555   Downloaded aws-smithy-observability v0.2.6
+2026-06-29T03:02:09.7310448Z #15 3.556   Downloaded darling_macro v0.20.11
+2026-06-29T03:02:09.7310757Z #15 3.557   Downloaded bytes-utils v0.1.4
+2026-06-29T03:02:09.7311268Z #15 3.559   Downloaded bitcode_derive v0.6.9
+2026-06-29T03:02:09.7311598Z #15 3.560   Downloaded aws-smithy-query v0.60.15
+2026-06-29T03:02:09.7311919Z #15 3.562   Downloaded anstream v1.0.0
+2026-06-29T03:02:09.7312234Z #15 3.564   Downloaded aws-smithy-checksums v0.64.8
+2026-06-29T03:02:09.7312553Z #15 3.566   Downloaded arrayref v0.3.9
+2026-06-29T03:02:09.7312833Z #15 3.567   Downloaded cfg_aliases v0.2.1
+2026-06-29T03:02:09.7313137Z #15 3.568   Downloaded aws-smithy-xml v0.60.15
+2026-06-29T03:02:09.7313457Z #15 3.570   Downloaded aws-smithy-http v0.63.6
+2026-06-29T03:02:09.7313772Z #15 3.573   Downloaded async-stream v0.3.6
+2026-06-29T03:02:09.7314081Z #15 3.575   Downloaded crossbeam-queue v0.3.12
+2026-06-29T03:02:09.7314634Z #15 3.577   Downloaded crc32fast v1.5.0
+2026-06-29T03:02:09.7314931Z #15 3.579   Downloaded cookie_store v0.22.1
+2026-06-29T03:02:09.7315224Z #15 3.582   Downloaded asn1-rs v0.7.2
+2026-06-29T03:02:09.7315504Z #15 3.590   Downloaded clap_lex v1.1.0
+2026-06-29T03:02:09.7315795Z #15 3.591   Downloaded cargo_metadata v0.23.1
+2026-06-29T03:02:09.7316098Z #15 3.593   Downloaded aws-types v1.3.16
+2026-06-29T03:02:09.7316520Z #15 3.595   Downloaded atomic-waker v1.1.2
+2026-06-29T03:02:09.7316814Z #15 3.597   Downloaded futures-io v0.3.32
+2026-06-29T03:02:09.7317131Z #15 3.598   Downloaded aws-credential-types v1.2.14
+2026-06-29T03:02:09.7317466Z #15 3.600   Downloaded futures-timer v3.0.4
+2026-06-29T03:02:09.7317775Z #15 3.602   Downloaded futures-channel v0.3.32
+2026-06-29T03:02:09.7318078Z #15 3.605   Downloaded foldhash v0.2.0
+2026-06-29T03:02:09.7318353Z #15 3.606   Downloaded dashmap v6.2.1
+2026-06-29T03:02:09.7318626Z #15 3.609   Downloaded camino v1.2.2
+2026-06-29T03:02:09.7318885Z #15 3.611   Downloaded backtrace v0.3.76
+2026-06-29T03:02:09.7319174Z #15 3.617   Downloaded data-encoding v2.11.0
+2026-06-29T03:02:09.7319495Z #15 3.619   Downloaded aws-smithy-runtime-api v1.12.1
+2026-06-29T03:02:09.7319818Z #15 3.623   Downloaded form_urlencoded v1.2.2
+2026-06-29T03:02:09.7320103Z #15 3.625   Downloaded darling_core v0.23.0
+2026-06-29T03:02:09.7320385Z #15 3.631   Downloaded darling_core v0.20.11
+2026-06-29T03:02:09.8936233Z #15 3.637   Downloaded aho-corasick v1.1.4
+2026-06-29T03:02:09.8936980Z #15 3.643   Downloaded crossbeam v0.8.4
+2026-06-29T03:02:09.8937552Z #15 3.644   Downloaded anstyle v1.0.14
+2026-06-29T03:02:09.8970149Z #15 3.798    Compiling proc-macro2 v1.0.106
+2026-06-29T03:02:09.8970791Z #15 3.798    Compiling quote v1.0.45
+2026-06-29T03:02:10.0848687Z #15 3.798    Compiling unicode-ident v1.0.24
+2026-06-29T03:02:10.0849746Z #15 3.798    Compiling libc v0.2.186
+2026-06-29T03:02:10.0850562Z #15 3.868    Compiling serde_core v1.0.228
+2026-06-29T03:02:10.0851605Z #15 3.985    Compiling cfg-if v1.0.4
+2026-06-29T03:02:10.2721867Z #15 4.022    Compiling serde v1.0.228
+2026-06-29T03:02:10.3338628Z #15 4.234    Compiling memchr v2.8.0
+2026-06-29T03:02:11.1583409Z #15 5.058    Compiling syn v2.0.117
+2026-06-29T03:02:11.4836769Z #15 5.233    Compiling pin-project-lite v0.2.17
+2026-06-29T03:02:11.6372149Z #15 5.386    Compiling itoa v1.0.18
+2026-06-29T03:02:11.8903961Z #15 5.791    Compiling smallvec v1.15.1
+2026-06-29T03:02:12.3286666Z #15 6.229    Compiling once_cell v1.21.4
+2026-06-29T03:02:12.4850078Z #15 6.235    Compiling futures-core v0.3.32
+2026-06-29T03:02:12.6345525Z #15 6.429    Compiling log v0.4.29
+2026-06-29T03:02:12.6347820Z #15 6.436    Compiling scopeguard v1.2.0
+2026-06-29T03:02:12.6348640Z #15 6.535    Compiling parking_lot_core v0.9.12
+2026-06-29T03:02:12.7946584Z #15 6.695    Compiling lock_api v0.4.14
+2026-06-29T03:02:13.3093630Z #15 6.997    Compiling futures-sink v0.3.32
+2026-06-29T03:02:13.3095664Z #15 7.058    Compiling tracing-core v0.1.36
+2026-06-29T03:02:13.3950387Z #15 7.295    Compiling parking_lot v0.12.5
+2026-06-29T03:02:13.9902572Z #15 7.777    Compiling errno v0.3.14
+2026-06-29T03:02:13.9903504Z #15 7.891    Compiling socket2 v0.6.3
+2026-06-29T03:02:14.3444090Z #15 8.243    Compiling slab v0.4.12
+2026-06-29T03:02:14.7154777Z #15 8.393    Compiling signal-hook-registry v1.4.8
+2026-06-29T03:02:14.7157165Z #15 8.464    Compiling mio v1.2.0
+2026-06-29T03:02:15.1169109Z #15 8.865    Compiling futures-channel v0.3.32
+2026-06-29T03:02:15.1873030Z #15 9.088    Compiling futures-task v0.3.32
+2026-06-29T03:02:15.3192418Z #15 9.096    Compiling futures-io v0.3.32
+2026-06-29T03:02:15.4404072Z #15 9.219    Compiling num-conv v0.2.2
+2026-06-29T03:02:15.4404916Z #15 9.249    Compiling time-core v0.1.8
+2026-06-29T03:02:15.5592286Z #15 9.341    Compiling jobserver v0.1.34
+2026-06-29T03:02:15.5595259Z #15 9.371    Compiling find-msvc-tools v0.1.9
+2026-06-29T03:02:15.6672074Z #15 9.459    Compiling shlex v1.3.0
+2026-06-29T03:02:15.7708416Z #15 9.568    Compiling libm v0.2.16
+2026-06-29T03:02:15.7709569Z #15 9.596    Compiling fnv v1.0.7
+2026-06-29T03:02:15.7710827Z #15 9.663    Compiling cc v1.2.62
+2026-06-29T03:02:15.9214141Z #15 9.671    Compiling zeroize v1.8.2
+2026-06-29T03:02:16.0720310Z #15 9.822    Compiling autocfg v1.5.0
+2026-06-29T03:02:16.4251874Z #15 10.17    Compiling num-traits v0.2.19
+2026-06-29T03:02:16.7686269Z #15 10.42    Compiling powerfmt v0.2.0
+2026-06-29T03:02:16.7689485Z #15 10.52    Compiling serde_derive v1.0.228
+2026-06-29T03:02:16.9699174Z #15 10.72    Compiling tokio-macros v2.7.0
+2026-06-29T03:02:17.5215379Z #15 11.28    Compiling tracing-attributes v0.1.31
+2026-06-29T03:02:17.6732311Z #15 11.42    Compiling futures-macro v0.3.32
+2026-06-29T03:02:18.3537530Z #15 12.10    Compiling futures-util v0.3.32
+2026-06-29T03:02:18.6841512Z #15 12.43    Compiling tracing v0.1.44
+2026-06-29T03:02:19.0998428Z #15 12.85    Compiling deranged v0.5.8
+2026-06-29T03:02:19.7793794Z #15 13.53    Compiling time-macros v0.2.27
+2026-06-29T03:02:20.4382767Z #15 14.19    Compiling percent-encoding v2.3.2
+2026-06-29T03:02:20.6241506Z #15 14.37    Compiling bytes v1.11.1
+2026-06-29T03:02:20.7897195Z #15 14.56    Compiling thiserror v2.0.18
+2026-06-29T03:02:20.7898357Z #15 14.69    Compiling time v0.3.47
+2026-06-29T03:02:21.0379037Z #15 14.79    Compiling ryu v1.0.23
+2026-06-29T03:02:21.3923854Z #15 15.14    Compiling tokio v1.52.3
+2026-06-29T03:02:21.5634813Z #15 15.31    Compiling http v1.4.0
+2026-06-29T03:02:21.8008688Z #15 15.55    Compiling thiserror-impl v2.0.18
+2026-06-29T03:02:22.9195911Z #15 16.71    Compiling http-body v1.0.1
+2026-06-29T03:02:23.0709316Z #15 16.82    Compiling http-body-util v0.1.3
+2026-06-29T03:02:23.3161586Z #15 17.06    Compiling zmij v1.0.21
+2026-06-29T03:02:23.4837814Z #15 17.23    Compiling synstructure v0.13.2
+2026-06-29T03:02:24.0794691Z #15 17.79    Compiling num-integer v0.1.46
+2026-06-29T03:02:24.0795396Z #15 17.83    Compiling either v1.16.0
+2026-06-29T03:02:24.2443066Z #15 17.99    Compiling zerocopy v0.8.48
+2026-06-29T03:02:24.5020248Z #15 18.25    Compiling anyhow v1.0.102
+2026-06-29T03:02:24.6994164Z #15 18.45    Compiling ring v0.17.14
+2026-06-29T03:02:24.7124708Z #15 18.61    Compiling zerocopy-derive v0.8.48
+2026-06-29T03:02:26.9589518Z #15 20.71    Compiling tokio-util v0.7.18
+2026-06-29T03:02:29.6614357Z #15 23.42    Compiling getrandom v0.4.2
+2026-06-29T03:02:29.8133250Z #15 23.56    Compiling rustversion v1.0.22
+2026-06-29T03:02:30.0253869Z #15 23.77    Compiling strsim v0.11.1
+2026-06-29T03:02:30.1371894Z #15 24.04    Compiling ident_case v1.0.1
+2026-06-29T03:02:30.3454283Z #15 24.09    Compiling equivalent v1.0.2
+2026-06-29T03:02:30.7424148Z #15 24.49    Compiling zerofrom-derive v0.1.7
+2026-06-29T03:02:30.9515165Z #15 24.70    Compiling displaydoc v0.2.5
+2026-06-29T03:02:31.4965936Z #15 25.24    Compiling getrandom v0.2.17
+2026-06-29T03:02:31.7173183Z #15 25.42    Compiling untrusted v0.9.0
+2026-06-29T03:02:31.7173979Z #15 25.50    Compiling yoke-derive v0.8.2
+2026-06-29T03:02:31.9634092Z #15 25.62    Compiling zerofrom v0.1.8
+2026-06-29T03:02:31.9636249Z #15 25.71    Compiling form_urlencoded v1.2.2
+2026-06-29T03:02:32.0247491Z #15 25.93    Compiling rustls-pki-types v1.14.1
+2026-06-29T03:02:32.5154948Z #15 26.42    Compiling base64 v0.22.1
+2026-06-29T03:02:33.0395720Z #15 26.94    Compiling stable_deref_trait v1.2.1
+2026-06-29T03:02:33.2369487Z #15 26.99    Compiling yoke v0.8.2
+2026-06-29T03:02:33.2386886Z #15 27.14    Compiling semver v1.0.28
+2026-06-29T03:02:33.6675884Z #15 27.41    Compiling hashbrown v0.17.1
+2026-06-29T03:02:33.6676935Z #15 27.42    Compiling httparse v1.10.1
+2026-06-29T03:02:33.9432992Z #15 27.69    Compiling zerovec-derive v0.11.3
+2026-06-29T03:02:34.3627677Z #15 28.11    Compiling indexmap v2.14.0
+2026-06-29T03:02:34.9965557Z #15 28.78    Compiling serde_json v1.0.149
+2026-06-29T03:02:35.1480920Z #15 28.90    Compiling zerovec v0.11.6
+2026-06-29T03:02:35.6579578Z #15 29.56    Compiling rustc_version v0.4.1
+2026-06-29T03:02:35.8428266Z #15 29.74    Compiling rustls v0.23.40
+2026-06-29T03:02:35.9698106Z #15 29.82    Compiling tower-service v0.3.3
+2026-06-29T03:02:36.1204684Z #15 29.87    Compiling http v0.2.12
+2026-06-29T03:02:36.9992225Z #15 30.90    Compiling subtle v2.6.1
+2026-06-29T03:02:37.2444074Z #15 31.00    Compiling crossbeam-utils v0.8.21
+2026-06-29T03:02:37.2444828Z #15 31.14    Compiling vsimd v0.8.0
+2026-06-29T03:02:37.6898090Z #15 31.59    Compiling try-lock v0.2.5
+2026-06-29T03:02:37.9046098Z #15 31.65    Compiling getrandom v0.3.4
+2026-06-29T03:02:37.9715038Z #15 31.87    Compiling atomic-waker v1.1.2
+2026-06-29T03:02:38.1109563Z #15 31.95    Compiling outref v0.5.2
+2026-06-29T03:02:38.1110514Z #15 32.01    Compiling base64-simd v0.8.0
+2026-06-29T03:02:38.4147108Z #15 32.16    Compiling h2 v0.4.14
+2026-06-29T03:02:38.9139453Z #15 32.67    Compiling want v0.3.1
+2026-06-29T03:02:39.0663109Z #15 32.81    Compiling itertools v0.14.0
+2026-06-29T03:02:39.4136027Z #15 33.16    Compiling rustls-webpki v0.103.13
+2026-06-29T03:02:42.8606809Z #15 36.61    Compiling http-body v0.4.6
+2026-06-29T03:02:43.0750347Z #15 36.82    Compiling bytes-utils v0.1.4
+2026-06-29T03:02:43.3707526Z #15 37.05    Compiling pin-utils v0.1.0
+2026-06-29T03:02:43.3708326Z #15 37.09    Compiling typenum v1.20.0
+2026-06-29T03:02:43.3708967Z #15 37.12    Compiling httpdate v1.0.3
+2026-06-29T03:02:43.8342763Z #15 37.58    Compiling darling_core v0.20.11
+2026-06-29T03:02:44.2938963Z #15 38.04    Compiling hyper v1.9.0
+2026-06-29T03:02:46.4778620Z #15 40.23    Compiling aws-smithy-types v1.4.8
+2026-06-29T03:02:48.9718023Z #15 42.72    Compiling prost-derive v0.14.3
+2026-06-29T03:02:50.6862035Z #15 44.40    Compiling tinystr v0.8.3
+2026-06-29T03:02:50.6864209Z #15 44.47    Compiling aho-corasick v1.1.4
+2026-06-29T03:02:50.8523143Z #15 44.59    Compiling regex-syntax v0.8.10
+2026-06-29T03:02:50.8526008Z #15 44.60    Compiling litemap v0.8.2
+2026-06-29T03:02:51.0130708Z #15 44.76    Compiling ipnet v2.12.0
+2026-06-29T03:02:52.5621415Z #15 46.31    Compiling writeable v0.6.3
+2026-06-29T03:02:52.8238867Z #15 46.53    Compiling cpufeatures v0.3.0
+2026-06-29T03:02:52.8239599Z #15 46.54    Compiling icu_locale_core v2.2.0
+2026-06-29T03:02:52.8240254Z #15 46.57    Compiling regex-automata v0.4.14
+2026-06-29T03:02:53.3023595Z #15 47.05    Compiling hyper-util v0.1.20
+2026-06-29T03:02:55.9824437Z #15 49.73    Compiling rand_core v0.9.5
+2026-06-29T03:02:56.0447737Z #15 49.95    Compiling darling_macro v0.20.11
+2026-06-29T03:02:56.3933431Z #15 50.17    Compiling potential_utf v0.1.5
+2026-06-29T03:02:56.3934557Z #15 50.17    Compiling zerotrie v0.2.4
+2026-06-29T03:02:56.5439989Z #15 50.29    Compiling ppv-lite86 v0.2.21
+2026-06-29T03:02:56.8550085Z #15 50.61    Compiling sync_wrapper v1.0.2
+2026-06-29T03:02:56.8552603Z #15 50.65    Compiling icu_normalizer_data v2.2.0
+2026-06-29T03:02:56.8553438Z #15 50.68    Compiling utf8_iter v1.0.4
+2026-06-29T03:02:56.9757034Z #15 50.76    Compiling icu_properties_data v2.2.0
+2026-06-29T03:02:56.9757958Z #15 50.80    Compiling tower-layer v0.3.3
+2026-06-29T03:02:56.9758506Z #15 50.83    Compiling prettyplease v0.2.37
+2026-06-29T03:02:57.2202865Z #15 50.88    Compiling icu_collections v2.2.0
+2026-06-29T03:02:57.2203753Z #15 50.97    Compiling rand_chacha v0.9.0
+2026-06-29T03:02:57.4062992Z #15 51.15    Compiling icu_provider v2.2.0
+2026-06-29T03:02:57.8736590Z #15 51.64    Compiling darling v0.20.11
+2026-06-29T03:02:57.8737518Z #15 51.70    Compiling regex v1.12.3
+2026-06-29T03:02:58.1002000Z #15 51.77    Compiling aws-smithy-async v1.2.14
+2026-06-29T03:02:58.1002791Z #15 51.85    Compiling aws-smithy-runtime-api-macros v1.0.0
+2026-06-29T03:02:58.3539763Z #15 52.01    Compiling bitflags v2.11.1
+2026-06-29T03:02:58.3540399Z #15 52.07    Compiling openssl-probe v0.2.1
+2026-06-29T03:02:58.3540933Z #15 52.10    Compiling crc32fast v1.5.0
+2026-06-29T03:02:58.5098212Z #15 52.29    Compiling rustls-native-certs v0.8.3
+2026-06-29T03:02:58.5099137Z #15 52.33    Compiling aws-smithy-runtime-api v1.12.1
+2026-06-29T03:02:58.6610871Z #15 52.41    Compiling derive_builder_core v0.20.2
+2026-06-29T03:02:59.5640967Z #15 53.34    Compiling rand v0.9.4
+2026-06-29T03:02:59.5643307Z #15 53.46    Compiling uuid v1.23.1
+2026-06-29T03:03:00.4017667Z #15 54.15    Compiling tower v0.5.3
+2026-06-29T03:03:01.4255438Z #15 55.18    Compiling tokio-rustls v0.26.4
+2026-06-29T03:03:01.7472651Z #15 55.65    Compiling hex v0.4.3
+2026-06-29T03:03:02.1645781Z #15 55.91    Compiling camino v1.2.2
+2026-06-29T03:03:02.2402150Z #15 56.14    Compiling icu_properties v2.2.0
+2026-06-29T03:03:02.4588064Z #15 56.21    Compiling icu_normalizer v2.2.0
+2026-06-29T03:03:04.0216591Z #15 57.77    Compiling derive_builder_macro v0.20.2
+2026-06-29T03:03:04.1822267Z #15 57.98    Compiling hybrid-array v0.4.12
+2026-06-29T03:03:04.2836772Z #15 58.08    Compiling vergen-lib v9.1.0
+2026-06-29T03:03:04.2839598Z #15 58.18    Compiling pulldown-cmark v0.13.4
+2026-06-29T03:03:04.4670048Z #15 58.22    Compiling rustix v1.1.4
+2026-06-29T03:03:04.6774321Z #15 58.43    Compiling mime v0.3.17
+2026-06-29T03:03:04.7318721Z #15 58.63    Compiling derive_builder v0.20.2
+2026-06-29T03:03:04.9517129Z #15 58.70    Compiling idna_adapter v1.2.2
+2026-06-29T03:03:05.5426595Z #15 59.44    Compiling serde_urlencoded v0.7.1
+2026-06-29T03:03:05.8949736Z #15 59.69    Compiling vergen v9.1.0
+2026-06-29T03:03:05.8950674Z #15 59.71    Compiling cargo-platform v0.3.3
+2026-06-29T03:03:05.8951694Z #15 59.80    Compiling pin-project-internal v1.1.13
+2026-06-29T03:03:06.0081632Z #15 59.86    Compiling num_threads v0.1.7
+2026-06-29T03:03:06.2061928Z #15 59.91    Compiling foldhash v0.1.5
+2026-06-29T03:03:06.2062495Z #15 59.95    Compiling heck v0.5.0
+2026-06-29T03:03:06.3861466Z #15 60.14    Compiling linux-raw-sys v0.12.1
+2026-06-29T03:03:06.7286639Z #15 60.49    Compiling unicase v2.9.0
+2026-06-29T03:03:06.8819378Z #15 60.63    Compiling cmov v0.5.3
+2026-06-29T03:03:07.0906620Z #15 60.80    Compiling pin-project v1.1.13
+2026-06-29T03:03:07.0907257Z #15 60.84    Compiling ctutils v0.4.2
+2026-06-29T03:03:07.1569812Z #15 61.06    Compiling prost v0.14.3
+2026-06-29T03:03:07.5935527Z #15 61.34    Compiling hashbrown v0.15.5
+2026-06-29T03:03:08.1538503Z #15 61.90    Compiling cargo_metadata v0.23.1
+2026-06-29T03:03:08.4344211Z #15 62.18    Compiling idna v1.1.0
+2026-06-29T03:03:09.0187142Z #15 62.92    Compiling crypto-common v0.2.2
+2026-06-29T03:03:09.4273686Z #15 63.20    Compiling block-buffer v0.12.0
+2026-06-29T03:03:09.5790345Z #15 63.33    Compiling sysinfo v0.37.2
+2026-06-29T03:03:09.7628933Z #15 63.51    Compiling darling_core v0.23.0
+2026-06-29T03:03:11.0566190Z #15 64.81    Compiling tokio-stream v0.1.18
+2026-06-29T03:03:11.5948233Z #15 65.34    Compiling fastrand v2.4.1
+2026-06-29T03:03:11.8855305Z #15 65.67    Compiling adler2 v2.0.1
+2026-06-29T03:03:12.0377205Z #15 65.79    Compiling simd-adler32 v0.3.9
+2026-06-29T03:03:12.5735541Z #15 66.32    Compiling const-oid v0.10.2
+2026-06-29T03:03:12.8492480Z #15 66.60    Compiling fixedbitset v0.5.7
+2026-06-29T03:03:13.0958119Z #15 66.84    Compiling petgraph v0.8.3
+2026-06-29T03:03:13.3029583Z #15 67.05    Compiling digest v0.11.3
+2026-06-29T03:03:13.4625264Z #15 67.21    Compiling darling_macro v0.23.0
+2026-06-29T03:03:14.6699019Z #15 68.42    Compiling miniz_oxide v0.8.9
+2026-06-29T03:03:16.5203747Z #15 70.27    Compiling tempfile v3.27.0
+2026-06-29T03:03:17.5533919Z #15 71.30    Compiling url v2.5.8
+2026-06-29T03:03:20.0814919Z #15 73.83    Compiling pulldown-cmark-to-cmark v22.0.0
+2026-06-29T03:03:20.3607178Z #15 74.11    Compiling prost-types v0.14.3
+2026-06-29T03:03:20.6414965Z #15 74.39    Compiling axum-core v0.5.6
+2026-06-29T03:03:21.1127756Z #15 74.86    Compiling crossbeam-epoch v0.9.18
+2026-06-29T03:03:21.5958056Z #15 75.34    Compiling async-trait v0.1.89
+2026-06-29T03:03:21.5960009Z #15 75.35    Compiling serde_path_to_error v0.1.20
+2026-06-29T03:03:22.2254777Z #15 75.97    Compiling matchit v0.8.4
+2026-06-29T03:03:22.4396823Z #15 76.21    Compiling multimap v0.10.1
+2026-06-29T03:03:22.4397451Z #15 76.34    Compiling prost-build v0.14.3
+2026-06-29T03:03:23.0596334Z #15 76.79    Compiling axum v0.8.9
+2026-06-29T03:03:23.0597257Z #15 76.81    Compiling crossbeam-deque v0.8.6
+2026-06-29T03:03:23.3003923Z #15 77.00    Compiling darling v0.23.0
+2026-06-29T03:03:23.3004819Z #15 77.05    Compiling tonic-build v0.14.6
+2026-06-29T03:03:23.9588352Z #15 77.71    Compiling hyper-timeout v0.5.2
+2026-06-29T03:03:24.1407630Z #15 77.86    Compiling opentelemetry v0.31.0
+2026-06-29T03:03:24.1408954Z #15 77.89    Compiling cfg_aliases v0.2.1
+2026-06-29T03:03:24.1410235Z #15 77.94    Compiling rayon-core v1.13.0
+2026-06-29T03:03:24.2941370Z #15 78.04    Compiling object v0.37.3
+2026-06-29T03:03:24.4929568Z #15 78.24    Compiling tonic-prost-build v0.14.6
+2026-06-29T03:03:24.9465319Z #15 78.69    Compiling aws-smithy-eventstream v0.60.20
+2026-06-29T03:03:26.8315867Z #15 80.58    Compiling tonic v0.14.6
+2026-06-29T03:03:27.9009781Z #15 81.80    Compiling num-bigint v0.4.6
+2026-06-29T03:03:29.8878512Z #15 83.64    Compiling futures-executor v0.3.32
+2026-06-29T03:03:30.3600011Z #15 84.11    Compiling blake3 v1.8.5
+2026-06-29T03:03:30.5783827Z #15 84.33    Compiling lore-error-set-macro v0.1.0 (/build/lore-error-set-macro)
+2026-06-29T03:03:31.5576528Z #15 85.31    Compiling gimli v0.32.3
+2026-06-29T03:03:32.8777319Z #15 86.57    Compiling option-ext v0.2.0
+2026-06-29T03:03:32.8778179Z #15 86.63    Compiling winnow v1.0.3
+2026-06-29T03:03:34.3924656Z #15 88.14    Compiling iana-time-zone v0.1.65
+2026-06-29T03:03:34.6496979Z #15 88.40    Compiling chrono v0.4.44
+2026-06-29T03:03:34.9616071Z #15 88.71    Compiling toml_parser v1.1.2+spec-1.1.0
+2026-06-29T03:03:35.1144502Z #15 88.86    Compiling addr2line v0.25.1
+2026-06-29T03:03:35.5584660Z #15 89.31    Compiling dirs-sys v0.5.0
+2026-06-29T03:03:36.1882942Z #15 89.94    Compiling lore-error-set v0.1.0 (/build/lore-error-set)
+2026-06-29T03:03:36.6304045Z #15 90.53    Compiling aws-smithy-http v0.63.6
+2026-06-29T03:03:39.0149422Z #15 92.75    Compiling lore-base v0.8.5-nightly (/build/lore-base)
+2026-06-29T03:03:39.0150195Z #15 92.76    Compiling aws-smithy-schema v0.1.0
+2026-06-29T03:03:39.4567339Z #15 93.23    Compiling serde_spanned v1.1.1
+2026-06-29T03:03:39.4568425Z #15 93.32    Compiling windows-link v0.2.1
+2026-06-29T03:03:39.6526085Z #15 93.36    Compiling arrayref v0.3.9
+2026-06-29T03:03:39.6527071Z #15 93.40    Compiling constant_time_eq v0.4.2
+2026-06-29T03:03:39.8397429Z #15 93.59    Compiling arrayvec v0.7.6
+2026-06-29T03:03:40.0901859Z #15 93.78    Compiling lazy_static v1.5.0
+2026-06-29T03:03:40.0903882Z #15 93.84    Compiling rustc-demangle v0.1.27
+2026-06-29T03:03:41.1125892Z #15 94.86    Compiling nu-ansi-term v0.50.3
+2026-06-29T03:03:41.7046517Z #15 95.45    Compiling windows-sys v0.61.2
+2026-06-29T03:03:42.3363281Z #15 96.08    Compiling backtrace v0.3.76
+2026-06-29T03:03:43.3290497Z #15 97.13    Compiling rayon v1.12.0
+2026-06-29T03:03:43.4822592Z #15 97.23 warning: lore-base@0.8.5-nightly: Failed to execute Lore to get revision information, unknown version generated: No such file or directory (os error 2)
+2026-06-29T03:03:43.4825291Z #15 97.23    Compiling directories v6.0.0
+2026-06-29T03:03:43.8541701Z #15 97.60    Compiling tonic-prost v0.14.6
+2026-06-29T03:03:44.0053692Z #15 97.79    Compiling quinn-udp v0.5.14
+2026-06-29T03:03:44.1295781Z #15 97.91    Compiling sha2 v0.11.0
+2026-06-29T03:03:44.2815949Z #15 98.03    Compiling aws-credential-types v1.2.14
+2026-06-29T03:03:45.2938817Z #15 99.06    Compiling aws-types v1.3.16
+2026-06-29T03:03:45.4465959Z #15 99.19    Compiling pem v3.0.6
+2026-06-29T03:03:46.1067380Z #15 99.78    Compiling webpki-roots v1.0.7
+2026-06-29T03:03:46.1068366Z #15 99.86    Compiling siphasher v1.0.3
+2026-06-29T03:03:46.3081645Z #15 100.0    Compiling version_check v0.9.5
+2026-06-29T03:03:46.3082565Z #15 100.1    Compiling pkg-config v0.3.33
+2026-06-29T03:03:46.5952185Z #15 100.3    Compiling tinyvec_macros v0.1.1
+2026-06-29T03:03:46.5952797Z #15 100.3    Compiling tinyvec v1.11.0
+2026-06-29T03:03:46.7916155Z #15 100.5    Compiling zstd-sys v2.0.16+zstd.1.5.7
+2026-06-29T03:03:46.7917176Z #15 100.6    Compiling generic-array v0.14.7
+2026-06-29T03:03:46.9308062Z #15 100.7    Compiling fastbloom v0.14.1
+2026-06-29T03:03:47.0823658Z #15 100.8    Compiling opentelemetry_sdk v0.31.0
+2026-06-29T03:03:47.3564596Z #15 101.1    Compiling simple_asn1 v0.6.4
+2026-06-29T03:03:49.3423048Z #15 103.1    Compiling lore-proto v0.1.60 (/build/lore-proto)
+2026-06-29T03:03:49.8140027Z #15 103.6    Compiling quinn v0.11.9
+2026-06-29T03:03:49.9432863Z #15 103.7    Compiling serde_with_macros v3.20.0
+2026-06-29T03:03:49.9434054Z #15 103.8    Compiling hmac v0.13.0
+2026-06-29T03:03:50.2278855Z #15 104.0    Compiling aws-smithy-observability v0.2.6
+2026-06-29T03:03:50.5531521Z #15 104.3    Compiling linux-keyutils v0.2.5
+2026-06-29T03:03:50.9179004Z #15 104.7    Compiling lz4-sys v1.11.1+lz4-1.10.0
+2026-06-29T03:03:51.1029735Z #15 104.9    Compiling toml_datetime v0.7.5+spec-1.1.0
+2026-06-29T03:03:51.3565598Z #15 105.0    Compiling rustc-hash v2.1.2
+2026-06-29T03:03:51.3567679Z #15 105.1    Compiling hashbrown v0.14.5
+2026-06-29T03:03:51.5303902Z #15 105.3    Compiling winnow v0.7.15
+2026-06-29T03:03:52.0595520Z #15 105.8    Compiling allocator-api2 v0.2.21
+2026-06-29T03:03:52.4582160Z #15 106.2    Compiling toml_writer v1.1.1+spec-1.1.0
+2026-06-29T03:03:52.8984068Z #15 106.7    Compiling lru-slab v0.1.2
+2026-06-29T03:03:53.0501478Z #15 106.8    Compiling foldhash v0.2.0
+2026-06-29T03:03:53.3074759Z #15 107.1    Compiling hashbrown v0.16.1
+2026-06-29T03:03:53.6360807Z #15 107.4    Compiling toml v0.9.12+spec-1.1.0
+2026-06-29T03:03:54.0816359Z #15 107.8    Compiling quinn-proto v0.11.13 (/build/vendor/quinn-proto)
+2026-06-29T03:03:54.3434521Z #15 108.1    Compiling aws-smithy-runtime v1.11.3
+2026-06-29T03:03:59.7144052Z #15 113.5    Compiling dashmap v6.2.1
+2026-06-29T03:04:07.1182479Z #15 120.9    Compiling serde_with v3.20.0
+2026-06-29T03:04:07.9249532Z #15 121.7    Compiling keyring v3.6.3
+2026-06-29T03:04:08.5427367Z #15 122.3    Compiling aws-sigv4 v1.4.4
+2026-06-29T03:04:09.6369151Z #15 123.5    Compiling jsonwebtoken v9.3.1
+2026-06-29T03:04:14.7423019Z #15 128.5    Compiling hyper-rustls v0.27.9
+2026-06-29T03:04:15.7007689Z #15 129.4    Compiling crossbeam-channel v0.5.15
+2026-06-29T03:04:16.4029606Z #15 130.2    Compiling yasna v0.6.0
+2026-06-29T03:04:17.4386529Z #15 131.2    Compiling async-stream-impl v0.3.6
+2026-06-29T03:04:17.8222379Z #15 131.6    Compiling portable-atomic v1.13.1
+2026-06-29T03:04:18.1067714Z #15 131.8    Compiling async-stream v0.3.6
+2026-06-29T03:04:18.1068340Z #15 131.9    Compiling rcgen v0.14.8
+2026-06-29T03:04:18.7718279Z #15 132.5    Compiling aws-runtime v1.7.4
+2026-06-29T03:04:26.3936538Z #15 140.1    Compiling lore-credential v0.8.5-nightly (/build/lore-credential)
+2026-06-29T03:04:26.7072362Z #15 140.5    Compiling aws-smithy-json v0.62.6
+2026-06-29T03:04:26.9303385Z #15 140.7    Compiling futures v0.3.32
+2026-06-29T03:04:28.4685341Z #15 142.2    Compiling raw-cpuid v11.6.0
+2026-06-29T03:04:30.9658035Z #15 144.9    Compiling crossbeam-queue v0.3.12
+2026-06-29T03:04:31.2081693Z #15 145.0    Compiling is-docker v0.2.0
+2026-06-29T03:04:31.2852334Z #15 145.2    Compiling lore-storage v0.8.5-nightly (/build/lore-storage)
+2026-06-29T03:04:31.4709767Z #15 145.4    Compiling regex-lite v0.1.9
+2026-06-29T03:04:32.1006054Z #15 145.8    Compiling pathdiff v0.2.3
+2026-06-29T03:04:32.1007545Z #15 145.9    Compiling opentelemetry-semantic-conventions v0.31.0
+2026-06-29T03:04:32.2536442Z #15 146.0    Compiling byteorder v1.5.0
+2026-06-29T03:04:32.4856984Z #15 146.2    Compiling minimal-lexical v0.2.1
+2026-06-29T03:04:32.8142794Z #15 146.6    Compiling nom v7.1.3
+2026-06-29T03:04:33.2244615Z #15 147.0    Compiling cfb v0.7.3
+2026-06-29T03:04:34.9509428Z #15 148.7    Compiling lore-telemetry v0.8.5-nightly (/build/lore-telemetry)
+2026-06-29T03:04:35.4715173Z #15 148.7    Compiling is-wsl v0.4.0
+2026-06-29T03:04:35.4715942Z #15 149.2    Compiling crossbeam v0.8.4
+2026-06-29T03:04:35.4716957Z #15 149.2    Compiling quanta v0.12.6
+2026-06-29T03:04:35.4717766Z #15 149.2    Compiling lore-transport v0.8.5-nightly (/build/lore-transport)
+2026-06-29T03:04:35.8487449Z #15 149.7    Compiling crypto-common v0.1.7
+2026-06-29T03:04:36.9916651Z #15 150.8    Compiling sharded-slab v0.1.7
+2026-06-29T03:04:36.9917905Z #15 150.8    Compiling matchers v0.2.0
+2026-06-29T03:04:37.1045368Z #15 150.9    Compiling slog v2.8.2
+2026-06-29T03:04:37.2275865Z #15 151.0    Compiling tracing-serde v0.2.0
+2026-06-29T03:04:37.3786148Z #15 151.1    Compiling tracing-log v0.2.0
+2026-06-29T03:04:37.6237915Z #15 151.4    Compiling spinning_top v0.3.0
+2026-06-29T03:04:37.6239095Z #15 151.5    Compiling memmap2 v0.9.10
+2026-06-29T03:04:37.7763925Z #15 151.5    Compiling thread_local v1.1.9
+2026-06-29T03:04:38.0738629Z #15 151.7    Compiling xmlparser v0.13.6
+2026-06-29T03:04:38.0739256Z #15 151.8    Compiling urlencoding v2.1.3
+2026-06-29T03:04:38.3557276Z #15 152.1    Compiling web-time v1.1.0
+2026-06-29T03:04:38.3558146Z #15 152.1    Compiling fastcdc v3.2.1
+2026-06-29T03:04:38.7322645Z #15 152.4    Compiling nonzero_ext v0.3.0
+2026-06-29T03:04:38.7323571Z #15 152.5    Compiling futures-timer v3.0.4
+2026-06-29T03:04:39.2850993Z #15 153.0    Compiling xxhash-rust v0.8.15
+2026-06-29T03:04:39.5115319Z #15 153.3    Compiling governor v0.10.4
+2026-06-29T03:04:39.9318646Z #15 153.6    Compiling aws-smithy-xml v0.60.15
+2026-06-29T03:04:39.9319531Z #15 153.7    Compiling tracing-subscriber v0.3.23
+2026-06-29T03:04:40.4291866Z #15 154.3    Compiling digest v0.10.7
+2026-06-29T03:04:40.6733861Z #15 154.4    Compiling open v5.3.5
+2026-06-29T03:04:40.8698715Z #15 154.6    Compiling rusticata-macros v4.1.0
+2026-06-29T03:04:41.0968153Z #15 154.8    Compiling infer v0.19.0
+2026-06-29T03:04:42.7715763Z #15 156.5    Compiling diffy v0.4.2
+2026-06-29T03:04:46.2625632Z #15 160.0    Compiling asn1-rs-derive v0.6.0
+2026-06-29T03:04:46.8998854Z #15 160.6    Compiling erased-serde v0.3.31
+2026-06-29T03:04:47.6234368Z #15 161.4    Compiling lore-macro v0.8.5-nightly (/build/lore-macro)
+2026-06-29T03:04:48.1287837Z #15 161.9    Compiling asn1-rs-impl v0.2.0
+2026-06-29T03:04:48.3693326Z #15 162.1    Compiling glob-match v0.2.1
+2026-06-29T03:04:48.6065889Z #15 162.4    Compiling spin v0.10.0
+2026-06-29T03:04:48.6066770Z #15 162.4    Compiling utf8parse v0.2.2
+2026-06-29T03:04:48.7730190Z #15 162.5    Compiling anstyle-parse v1.0.0
+2026-06-29T03:04:48.7731272Z #15 162.6    Compiling crc-fast v1.10.0
+2026-06-29T03:04:48.9248704Z #15 162.7    Compiling asn1-rs v0.7.2
+2026-06-29T03:04:53.2210416Z #15 167.0    Compiling aws-smithy-query v0.60.15
+2026-06-29T03:04:53.4210069Z #15 167.2    Compiling bon-macros v3.9.1
+2026-06-29T03:04:55.1889083Z #15 168.9    Compiling tower-http v0.6.11
+2026-06-29T03:04:56.4859678Z #15 170.2    Compiling flate2 v1.1.9
+2026-06-29T03:04:57.0981869Z #15 170.8    Compiling sha1 v0.11.0
+2026-06-29T03:04:57.5663158Z #15 171.3    Compiling md-5 v0.11.0
+2026-06-29T03:04:57.8102210Z #15 171.5    Compiling ureq-proto v0.6.0
+2026-06-29T03:04:57.8102833Z #15 171.6    Compiling arc-swap v1.9.1
+2026-06-29T03:04:58.0702448Z #15 171.8    Compiling encoding_rs v0.8.35
+2026-06-29T03:05:00.0647979Z #15 174.0    Compiling thiserror v1.0.69
+2026-06-29T03:05:00.4292647Z #15 174.1    Compiling anstyle-query v1.1.5
+2026-06-29T03:05:00.4294835Z #15 174.2    Compiling anstyle v1.0.14
+2026-06-29T03:05:00.6618812Z #15 174.4    Compiling utf8-zero v0.8.1
+2026-06-29T03:05:00.6621523Z #15 174.6    Compiling oid-registry v0.8.1
+2026-06-29T03:05:01.0360213Z #15 174.8    Compiling is_terminal_polyfill v1.70.2
+2026-06-29T03:05:01.0360895Z #15 174.9    Compiling colorchoice v1.0.5
+2026-06-29T03:05:01.1867926Z #15 174.9    Compiling anstream v1.0.0
+2026-06-29T03:05:01.7388624Z #15 175.5    Compiling ureq v3.3.0
+2026-06-29T03:05:04.2920795Z #15 178.0    Compiling reqwest v0.12.28
+2026-06-29T03:05:12.1279343Z #15 185.9    Compiling slog-scope v4.4.1
+2026-06-29T03:05:12.6085080Z #15 186.3    Compiling bon v3.9.1
+2026-06-29T03:05:12.6085919Z #15 186.4    Compiling aws-smithy-checksums v0.64.8
+2026-06-29T03:05:15.7673672Z #15 189.5    Compiling aws-sdk-sts v1.104.0
+2026-06-29T03:05:27.7467279Z #15 201.5    Compiling lore-revision v0.8.5-nightly (/build/lore-revision)
+2026-06-29T03:05:39.8851585Z #15 213.6    Compiling aws-sdk-dynamodb v1.112.0
+2026-06-29T03:05:46.7747881Z #15 220.5    Compiling lru v0.16.4
+2026-06-29T03:05:46.9416750Z #15 220.7    Compiling smart-default v0.7.1
+2026-06-29T03:05:47.2641796Z #15 221.0    Compiling thiserror-impl v1.0.69
+2026-06-29T03:05:48.3602918Z #15 222.1    Compiling toml_datetime v1.1.1+spec-1.1.0
+2026-06-29T03:05:48.7877150Z #15 222.5    Compiling clap_lex v1.1.0
+2026-06-29T03:05:50.2993859Z #15 224.0    Compiling base64 v0.21.7
+2026-06-29T03:05:50.8536664Z #15 224.6    Compiling unicode-width v0.2.2
+2026-06-29T03:05:51.0838326Z #15 224.8    Compiling clap_builder v4.6.0
+2026-06-29T03:05:51.9864118Z #15 225.7    Compiling toml v1.1.2+spec-1.1.0
+2026-06-29T03:05:56.1305900Z #15 230.0    Compiling serde_dynamo v4.3.0
+2026-06-29T03:05:58.3709993Z #15 232.1    Compiling rs-consul v0.13.0
+2026-06-29T03:06:02.5176461Z #15 236.3    Compiling aws-sdk-s3 v1.133.0
+2026-06-29T03:06:07.5868781Z #15 241.3    Compiling aws-config v1.8.17
+2026-06-29T03:06:28.3210477Z #15 262.1    Compiling opentelemetry-http v0.31.0
+2026-06-29T03:06:31.0346867Z #15 264.8    Compiling der-parser v10.0.0
+2026-06-29T03:06:32.5456936Z #15 266.4    Compiling aws-smithy-http-client v1.1.12
+2026-06-29T03:06:52.8850417Z #15 286.6    Compiling opentelemetry-proto v0.31.0
+2026-06-29T03:06:58.6104357Z #15 292.4    Compiling lore-server v0.8.5-nightly (/build/lore-server)
+2026-06-29T03:06:59.6857408Z #15 293.4    Compiling clap_derive v4.6.1
+2026-06-29T03:07:01.4636909Z #15 295.2    Compiling serde_bytes v0.11.19
+2026-06-29T03:07:01.7196867Z #15 295.4    Compiling symlink v0.1.0
+2026-06-29T03:07:01.7199572Z #15 295.5    Compiling data-encoding v2.11.0
+2026-06-29T03:07:05.4057226Z #15 299.2    Compiling x509-parser v0.18.1
+2026-06-29T03:07:12.6749225Z #15 306.4    Compiling tracing-appender v0.2.5
+2026-06-29T03:07:14.0076889Z #15 307.8    Compiling lore-aws v0.8.5-nightly (/build/lore-aws)
+2026-06-29T03:07:16.2585195Z #15 310.0    Compiling clap v4.6.1
+2026-06-29T03:07:16.6685054Z #15 310.4 warning: lore-server@0.8.5-nightly: Failed to execute Lore to get revision information, unknown version generated: No such file or directory (os error 2)
+2026-06-29T03:07:16.6687112Z #15 310.4    Compiling opentelemetry-otlp v0.31.1
+2026-06-29T03:07:22.5445164Z #15 316.3    Compiling lore-notification v0.8.5-nightly (/build/lore-notification)
+2026-06-29T03:07:42.0651858Z #15 335.8    Compiling lore-hashicorp v0.8.5-nightly (/build/lore-hashicorp)
+2026-06-29T03:07:59.3830651Z #15 353.1    Compiling tracing-ecs v0.4.1
+2026-06-29T03:08:00.6539881Z #15 354.4    Compiling config v0.15.23
+2026-06-29T03:08:00.6540539Z #15 354.4    Compiling tracing-opentelemetry v0.32.1
+2026-06-29T03:08:03.0770236Z #15 356.7    Compiling opentelemetry-appender-tracing v0.31.1
+2026-06-29T03:08:03.0771509Z #15 356.8    Compiling tokio-metrics v0.4.9
+2026-06-29T03:08:03.4609289Z #15 357.2    Compiling enum_dispatch v0.3.13
+2026-06-29T03:10:30.4398514Z #15 504.3     Finished `release` profile [optimized + debuginfo] target(s) in 8m 24s
+2026-06-29T03:10:32.5911107Z #15 DONE 506.5s
+2026-06-29T03:10:32.8300337Z 
+2026-06-29T03:10:32.8301602Z #16 [stage-1 3/6] COPY --from=builder /build/loreserver-bin /usr/local/bin/loreserver
+2026-06-29T03:10:33.3387946Z #16 DONE 0.5s
+2026-06-29T03:10:33.4544667Z 
+2026-06-29T03:10:33.4547282Z #17 [stage-1 4/6] COPY --from=builder /build/lore-server/config/default.toml /etc/lore/config/default.toml
+2026-06-29T03:10:33.4548655Z #17 DONE 0.0s
+2026-06-29T03:10:33.4549165Z 
+2026-06-29T03:10:33.4549333Z #18 [stage-1 5/6] RUN cat <<'EOF' > /etc/lore/config/docker.toml
+2026-06-29T03:10:33.4549666Z #18 DONE 0.1s
+2026-06-29T03:10:33.4549803Z 
+2026-06-29T03:10:33.4550397Z #19 [stage-1 6/6] RUN mkdir -p /data
+2026-06-29T03:10:33.4550697Z #19 DONE 0.0s
+2026-06-29T03:10:33.6073043Z 
+2026-06-29T03:10:33.6073534Z #20 exporting to image
+2026-06-29T03:10:33.6073968Z #20 exporting layers
+2026-06-29T03:10:40.5432627Z #20 exporting layers 7.1s done
+2026-06-29T03:10:40.7825675Z #20 ...
+2026-06-29T03:10:40.7826022Z 
+2026-06-29T03:10:40.7826488Z #21 [auth] veyvin/lore:pull,push token for ghcr.io
+2026-06-29T03:10:40.7827009Z #21 DONE 0.0s
+2026-06-29T03:10:40.7827505Z 
+2026-06-29T03:10:40.7827661Z #20 exporting to image
+2026-06-29T03:10:40.7828509Z #20 exporting manifest sha256:fc1326d57d1fd75ff2dad68aa7b4d5627b9c79d576e4f62c46c2eb5cfe678e35 done
+2026-06-29T03:10:40.7829815Z #20 exporting config sha256:882651cf0fe669496e097d2499e98b835ec5efbc8cf6b598ecd2442e0741c07e done
+2026-06-29T03:10:40.7842699Z #20 exporting attestation manifest sha256:aac768252ecbc0a7ad463a398a34361af7b199e8129db49d3a09fce2343f1894 done
+2026-06-29T03:10:40.7844403Z #20 exporting manifest list sha256:393ee1aba5c93e4b56a1420593edcef46ab2ac1f6765222e21327acc17f32455 done
+2026-06-29T03:10:40.7845272Z #20 pushing layers
+2026-06-29T03:10:40.7845593Z #20 ...
+2026-06-29T03:10:40.7845756Z 
+2026-06-29T03:10:40.7845924Z #22 exporting to GitHub Actions Cache
+2026-06-29T03:10:40.7846381Z #22 preparing build cache for export
+2026-06-29T03:10:46.0254161Z #22 ...
+2026-06-29T03:10:46.0254414Z 
+2026-06-29T03:10:46.0254542Z #20 exporting to image
+2026-06-29T03:10:46.0254886Z #20 pushing layers 0.1s done
+2026-06-29T03:10:46.0255769Z #20 pushing manifest for ghcr.io/veyvin/lore:1.0.0@sha256:393ee1aba5c93e4b56a1420593edcef46ab2ac1f6765222e21327acc17f32455 0.9s done
+2026-06-29T03:10:46.0257104Z #20 pushing manifest for ghcr.io/veyvin/lore:1.0@sha256:393ee1aba5c93e4b56a1420593edcef46ab2ac1f6765222e21327acc17f32455 0.4s done
+2026-06-29T03:10:46.0258415Z #20 pushing manifest for ghcr.io/veyvin/lore:1@sha256:393ee1aba5c93e4b56a1420593edcef46ab2ac1f6765222e21327acc17f32455 0.4s done
+2026-06-29T03:10:46.0259718Z #20 pushing manifest for ghcr.io/veyvin/lore:v1.0.0@sha256:393ee1aba5c93e4b56a1420593edcef46ab2ac1f6765222e21327acc17f32455 0.4s done
+2026-06-29T03:10:46.0260997Z #20 pushing manifest for ghcr.io/veyvin/lore:latest@sha256:393ee1aba5c93e4b56a1420593edcef46ab2ac1f6765222e21327acc17f32455
+2026-06-29T03:10:46.2112043Z #20 pushing manifest for ghcr.io/veyvin/lore:latest@sha256:393ee1aba5c93e4b56a1420593edcef46ab2ac1f6765222e21327acc17f32455 0.3s done
+2026-06-29T03:10:46.2115168Z #20 DONE 12.8s
+2026-06-29T03:10:46.2115420Z 
+2026-06-29T03:10:46.2115580Z #22 exporting to GitHub Actions Cache
+2026-06-29T03:10:47.9275124Z #22 preparing build cache for export 7.4s done
+2026-06-29T03:10:47.9276012Z #22 sending cache export
+2026-06-29T03:10:48.1008395Z #22 writing layer sha256:01d4f34bf422a9cbcdb482dad542fcc5a261a0b6c55f849dd753852632480cc5 0.1s done
+2026-06-29T03:10:48.2673485Z #22 writing layer sha256:0fc5368ed7341c977ddfaacf002a805f4ec5f2236e502de8740b408fbe190c89
+2026-06-29T03:10:50.9819951Z #22 writing layer sha256:0fc5368ed7341c977ddfaacf002a805f4ec5f2236e502de8740b408fbe190c89 2.9s done
+2026-06-29T03:10:51.1500417Z #22 writing layer sha256:44110ad9b027a589fd439e743b67ed3e16f43b50db829567601c93de6e41e72d
+2026-06-29T03:10:52.7886490Z #22 writing layer sha256:44110ad9b027a589fd439e743b67ed3e16f43b50db829567601c93de6e41e72d 1.8s done
+2026-06-29T03:10:52.9032598Z #22 writing layer sha256:9734246a27997acb46c4865a1e556f999e68e9c58b2d788f77de07dc8ef40ceb 0.1s done
+2026-06-29T03:10:52.9033708Z #22 writing layer sha256:b26d87faea2e7175e4f969ed25157fef54b7221e9652dc4a3bbf76c8a3ea5486
+2026-06-29T03:10:53.0077921Z #22 writing layer sha256:b26d87faea2e7175e4f969ed25157fef54b7221e9652dc4a3bbf76c8a3ea5486 0.1s done
+2026-06-29T03:10:53.1758159Z #22 writing layer sha256:c5c79d363af7ecb8d1e95aa2f505f77f5d7122da30555afa8fe91864635b87ba
+2026-06-29T03:10:56.3337899Z #22 writing layer sha256:c5c79d363af7ecb8d1e95aa2f505f77f5d7122da30555afa8fe91864635b87ba 3.3s done
+2026-06-29T03:10:56.5008294Z #22 writing layer sha256:c7505bdadba87cbd8ec5e818e33e479ad20c36e423bf26bad22d733eae37a455
+2026-06-29T03:11:06.6187019Z #22 writing layer sha256:c7505bdadba87cbd8ec5e818e33e479ad20c36e423bf26bad22d733eae37a455 10.3s done
+2026-06-29T03:11:06.7850671Z #22 writing layer sha256:cd640406422fc66a3f1f09c5abf299cf3005553c6654ff9fe8572de186e19b11
+2026-06-29T03:11:07.1229121Z #22 writing layer sha256:cd640406422fc66a3f1f09c5abf299cf3005553c6654ff9fe8572de186e19b11 0.5s done
+2026-06-29T03:11:07.2323993Z #22 writing layer sha256:d5a2f179c6675771e968dc3c601a1045fa25d7a3162b8ef396252d094964157a 0.1s done
+2026-06-29T03:11:07.2326127Z #22 writing layer sha256:e95a6c7ea7d49b37920899b023ecd0e32796c976c1748491f76cae53ba86d13a
+2026-06-29T03:11:08.4440524Z #22 writing layer sha256:e95a6c7ea7d49b37920899b023ecd0e32796c976c1748491f76cae53ba86d13a 1.2s done
+2026-06-29T03:11:08.6120457Z #22 writing layer sha256:f45c8f8ec32dd5551c0fa26a12ec484475a03894de7b4921db240a4072943332
+2026-06-29T03:11:08.6949687Z #22 writing layer sha256:f45c8f8ec32dd5551c0fa26a12ec484475a03894de7b4921db240a4072943332 0.2s done
+2026-06-29T03:11:08.8156711Z #22 sending cache export 20.9s done
+2026-06-29T03:11:08.8158443Z #22 DONE 28.2s
+2026-06-29T03:11:08.8158896Z 
+2026-06-29T03:11:08.8159236Z #23 resolving provenance for metadata file
+2026-06-29T03:11:08.8266770Z #23 DONE 0.0s
+2026-06-29T03:11:08.8341629Z ##[group]ImageID
+2026-06-29T03:11:08.8341996Z sha256:393ee1aba5c93e4b56a1420593edcef46ab2ac1f6765222e21327acc17f32455
+2026-06-29T03:11:08.8343267Z ##[endgroup]
+2026-06-29T03:11:08.8343942Z ##[group]Digest
+2026-06-29T03:11:08.8344626Z sha256:393ee1aba5c93e4b56a1420593edcef46ab2ac1f6765222e21327acc17f32455
+2026-06-29T03:11:08.8345632Z ##[endgroup]
+2026-06-29T03:11:08.8346296Z ##[group]Metadata
+2026-06-29T03:11:08.8346785Z {
+2026-06-29T03:11:08.8347029Z   "buildx.build.provenance": {
+2026-06-29T03:11:08.8347338Z     "builder": {
+2026-06-29T03:11:08.8347671Z       "id": "https://github.com/veyvin/lore/actions/runs/28345839178"
+2026-06-29T03:11:08.8348054Z     },
+2026-06-29T03:11:08.8348318Z     "buildType": "https://mobyproject.org/buildkit@v1",
+2026-06-29T03:11:08.8348671Z     "materials": [
+2026-06-29T03:11:08.8348875Z       {
+2026-06-29T03:11:08.8349166Z         "uri": "pkg:docker/debian@trixie-slim?platform=linux%2Famd64",
+2026-06-29T03:11:08.8349850Z         "digest": {
+2026-06-29T03:11:08.8350797Z           "sha256": "28de0877c2189802884ccd20f15ee41c203573bd87bb6b883f5f46362d24c5c2"
+2026-06-29T03:11:08.8351965Z         }
+2026-06-29T03:11:08.8352416Z       },
+2026-06-29T03:11:08.8352714Z       {
+2026-06-29T03:11:08.8353193Z         "uri": "pkg:docker/rust@slim-trixie?platform=linux%2Famd64",
+2026-06-29T03:11:08.8353699Z         "digest": {
+2026-06-29T03:11:08.8354053Z           "sha256": "6abf73f05806f36362d0ff2722f2250c6153398831edd0455e0e0baa1f78ecc7"
+2026-06-29T03:11:08.8354799Z         }
+2026-06-29T03:11:08.8355101Z       }
+2026-06-29T03:11:08.8355387Z     ],
+2026-06-29T03:11:08.8355686Z     "invocation": {
+2026-06-29T03:11:08.8356033Z       "configSource": {
+2026-06-29T03:11:08.8356413Z         "entryPoint": "Dockerfile"
+2026-06-29T03:11:08.8356818Z       },
+2026-06-29T03:11:08.8357168Z       "parameters": {
+2026-06-29T03:11:08.8357576Z         "frontend": "dockerfile.v0",
+2026-06-29T03:11:08.8358030Z         "args": {
+2026-06-29T03:11:08.8358625Z           "label:org.opencontainers.image.created": "2026-06-29T03:01:51.616Z",
+2026-06-29T03:11:08.8359469Z           "label:org.opencontainers.image.description": "Lore is a next-generation, open source version control system",
+2026-06-29T03:11:08.8360116Z           "label:org.opencontainers.image.licenses": "MIT",
+2026-06-29T03:11:08.8360672Z           "label:org.opencontainers.image.revision": "76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa",
+2026-06-29T03:11:08.8361679Z           "label:org.opencontainers.image.source": "https://github.com/veyvin/lore",
+2026-06-29T03:11:08.8362330Z           "label:org.opencontainers.image.title": "lore",
+2026-06-29T03:11:08.8362797Z           "label:org.opencontainers.image.url": "https://github.com/veyvin/lore",
+2026-06-29T03:11:08.8363281Z           "label:org.opencontainers.image.version": "1.0.0"
+2026-06-29T03:11:08.8363598Z         },
+2026-06-29T03:11:08.8363778Z         "locals": [
+2026-06-29T03:11:08.8363988Z           {
+2026-06-29T03:11:08.8364195Z             "name": "context"
+2026-06-29T03:11:08.8364432Z           },
+2026-06-29T03:11:08.8364633Z           {
+2026-06-29T03:11:08.8364819Z             "name": "dockerfile"
+2026-06-29T03:11:08.8365068Z           }
+2026-06-29T03:11:08.8365240Z         ],
+2026-06-29T03:11:08.8365649Z         "root": {
+2026-06-29T03:11:08.8365856Z           "configSource": {
+2026-06-29T03:11:08.8366090Z             "path": "Dockerfile"
+2026-06-29T03:11:08.8366384Z           },
+2026-06-29T03:11:08.8366569Z           "request": {
+2026-06-29T03:11:08.8366771Z             "args": {
+2026-06-29T03:11:08.8367092Z               "label:org.opencontainers.image.created": "2026-06-29T03:01:51.616Z",
+2026-06-29T03:11:08.8367914Z               "label:org.opencontainers.image.description": "Lore is a next-generation, open source version control system",
+2026-06-29T03:11:08.8368500Z               "label:org.opencontainers.image.licenses": "MIT",
+2026-06-29T03:11:08.8369001Z               "label:org.opencontainers.image.revision": "76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa",
+2026-06-29T03:11:08.8369694Z               "label:org.opencontainers.image.source": "https://github.com/veyvin/lore",
+2026-06-29T03:11:08.8370297Z               "label:org.opencontainers.image.title": "lore",
+2026-06-29T03:11:08.8370818Z               "label:org.opencontainers.image.url": "https://github.com/veyvin/lore",
+2026-06-29T03:11:08.8372169Z               "label:org.opencontainers.image.version": "1.0.0",
+2026-06-29T03:11:08.8372537Z               "vcs:localdir:context": ".",
+2026-06-29T03:11:08.8372862Z               "vcs:localdir:dockerfile": "lore-server",
+2026-06-29T03:11:08.8373279Z               "vcs:revision": "76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa",
+2026-06-29T03:11:08.8373708Z               "vcs:source": "https://github.com/veyvin/lore"
+2026-06-29T03:11:08.8374023Z             }
+2026-06-29T03:11:08.8374204Z           }
+2026-06-29T03:11:08.8374398Z         },
+2026-06-29T03:11:08.8374611Z         "compatibilityVersion": 20
+2026-06-29T03:11:08.8374872Z       },
+2026-06-29T03:11:08.8375070Z       "environment": {
+2026-06-29T03:11:08.8375313Z         "dockerfileVersion": "1.24.0",
+2026-06-29T03:11:08.8375672Z         "github_actor": "veyvin",
+2026-06-29T03:11:08.8375963Z         "github_actor_id": "6776758",
+2026-06-29T03:11:08.8376244Z         "github_event_name": "push",
+2026-06-29T03:11:08.8376517Z         "github_event_payload": {
+2026-06-29T03:11:08.8376827Z           "after": "76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa",
+2026-06-29T03:11:08.8377187Z           "base_ref": "refs/heads/trae/agent-U5FkLK",
+2026-06-29T03:11:08.8377566Z           "before": "0000000000000000000000000000000000000000",
+2026-06-29T03:11:08.8377908Z           "commits": [],
+2026-06-29T03:11:08.8378240Z           "compare": "https://github.com/veyvin/lore/compare/v1.0.0",
+2026-06-29T03:11:08.8378616Z           "created": true,
+2026-06-29T03:11:08.8378839Z           "deleted": false,
+2026-06-29T03:11:08.8379080Z           "forced": false,
+2026-06-29T03:11:08.8379315Z           "head_commit": {
+2026-06-29T03:11:08.8379550Z             "author": {
+2026-06-29T03:11:08.8379822Z               "email": "veyvin@users.noreply.github.com",
+2026-06-29T03:11:08.8380146Z               "name": "veyvin",
+2026-06-29T03:11:08.8380417Z               "username": "veyvin"
+2026-06-29T03:11:08.8380667Z             },
+2026-06-29T03:11:08.8380858Z             "committer": {
+2026-06-29T03:11:08.8381400Z               "email": "veyvin@users.noreply.github.com",
+2026-06-29T03:11:08.8381721Z               "name": "veyvin",
+2026-06-29T03:11:08.8381967Z               "username": "veyvin"
+2026-06-29T03:11:08.8382212Z             },
+2026-06-29T03:11:08.8382426Z             "distinct": true,
+2026-06-29T03:11:08.8382725Z             "id": "76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa",
+2026-06-29T03:11:08.8383641Z             "message": "feat: 编译并发布 Docker 镜像\n\nCo-authored-by: traeagent <traeagent@users.noreply.github.com>",
+2026-06-29T03:11:08.8384186Z             "timestamp": "2026-06-29T02:56:57Z",
+2026-06-29T03:11:08.8384539Z             "tree_id": "8b32597152fda6e08d4fad1a5d1a7ece53db37c3",
+2026-06-29T03:11:08.8385069Z             "url": "https://github.com/veyvin/lore/commit/76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa"
+2026-06-29T03:11:08.8385527Z           },
+2026-06-29T03:11:08.8385732Z           "pusher": {
+2026-06-29T03:11:08.8386187Z             "email": "243169656@qq.com",
+2026-06-29T03:11:08.8386469Z             "name": "veyvin"
+2026-06-29T03:11:08.8386698Z           },
+2026-06-29T03:11:08.8386906Z           "ref": "refs/tags/v1.0.0",
+2026-06-29T03:11:08.8387178Z           "repository": {
+2026-06-29T03:11:08.8387422Z             "allow_forking": true,
+2026-06-29T03:11:08.8387973Z             "archive_url": "https://api.github.com/repos/veyvin/lore/{archive_format}{/ref}",
+2026-06-29T03:11:08.8388427Z             "archived": false,
+2026-06-29T03:11:08.8388812Z             "assignees_url": "https://api.github.com/repos/veyvin/lore/assignees{/user}",
+2026-06-29T03:11:08.8389365Z             "blobs_url": "https://api.github.com/repos/veyvin/lore/git/blobs{/sha}",
+2026-06-29T03:11:08.8389919Z             "branches_url": "https://api.github.com/repos/veyvin/lore/branches{/branch}",
+2026-06-29T03:11:08.8390408Z             "clone_url": "https://github.com/veyvin/lore.git",
+2026-06-29T03:11:08.8390958Z             "collaborators_url": "https://api.github.com/repos/veyvin/lore/collaborators{/collaborator}",
+2026-06-29T03:11:08.8391932Z             "comments_url": "https://api.github.com/repos/veyvin/lore/comments{/number}",
+2026-06-29T03:11:08.8392477Z             "commits_url": "https://api.github.com/repos/veyvin/lore/commits{/sha}",
+2026-06-29T03:11:08.8393050Z             "compare_url": "https://api.github.com/repos/veyvin/lore/compare/{base}...{head}",
+2026-06-29T03:11:08.8393623Z             "contents_url": "https://api.github.com/repos/veyvin/lore/contents/{+path}",
+2026-06-29T03:11:08.8394198Z             "contributors_url": "https://api.github.com/repos/veyvin/lore/contributors",
+2026-06-29T03:11:08.8394621Z             "created_at": 1782701588,
+2026-06-29T03:11:08.8394894Z             "default_branch": "main",
+2026-06-29T03:11:08.8395303Z             "deployments_url": "https://api.github.com/repos/veyvin/lore/deployments",
+2026-06-29T03:11:08.8395940Z             "description": "Lore is a next-generation, open source version control system",
+2026-06-29T03:11:08.8396431Z             "disabled": false,
+2026-06-29T03:11:08.8396810Z             "downloads_url": "https://api.github.com/repos/veyvin/lore/downloads",
+2026-06-29T03:11:08.8397282Z             "events_url": "https://api.github.com/repos/veyvin/lore/events",
+2026-06-29T03:11:08.8397665Z             "fork": true,
+2026-06-29T03:11:08.8397883Z             "forks": 0,
+2026-06-29T03:11:08.8398115Z             "forks_count": 0,
+2026-06-29T03:11:08.8398430Z             "forks_url": "https://api.github.com/repos/veyvin/lore/forks",
+2026-06-29T03:11:08.8398782Z             "full_name": "veyvin/lore",
+2026-06-29T03:11:08.8399218Z             "git_commits_url": "https://api.github.com/repos/veyvin/lore/git/commits{/sha}",
+2026-06-29T03:11:08.8399821Z             "git_refs_url": "https://api.github.com/repos/veyvin/lore/git/refs{/sha}",
+2026-06-29T03:11:08.8400840Z             "git_tags_url": "https://api.github.com/repos/veyvin/lore/git/tags{/sha}",
+2026-06-29T03:11:08.8401805Z             "git_url": "git://github.com/veyvin/lore.git",
+2026-06-29T03:11:08.8402165Z             "has_discussions": false,
+2026-06-29T03:11:08.8402457Z             "has_downloads": true,
+2026-06-29T03:11:08.8402701Z             "has_issues": false,
+2026-06-29T03:11:08.8402942Z             "has_pages": false,
+2026-06-29T03:11:08.8403180Z             "has_projects": true,
+2026-06-29T03:11:08.8403438Z             "has_pull_requests": true,
+2026-06-29T03:11:08.8403697Z             "has_wiki": false,
+2026-06-29T03:11:08.8403946Z             "homepage": "https://lore.org",
+2026-06-29T03:11:08.8404301Z             "hooks_url": "https://api.github.com/repos/veyvin/lore/hooks",
+2026-06-29T03:11:08.8404691Z             "html_url": "https://github.com/veyvin/lore",
+2026-06-29T03:11:08.8404983Z             "id": 1283544162,
+2026-06-29T03:11:08.8405209Z             "is_template": false,
+2026-06-29T03:11:08.8405783Z             "issue_comment_url": "https://api.github.com/repos/veyvin/lore/issues/comments{/number}",
+2026-06-29T03:11:08.8406390Z             "issue_events_url": "https://api.github.com/repos/veyvin/lore/issues/events{/number}",
+2026-06-29T03:11:08.8406933Z             "issues_url": "https://api.github.com/repos/veyvin/lore/issues{/number}",
+2026-06-29T03:11:08.8407415Z             "keys_url": "https://api.github.com/repos/veyvin/lore/keys{/key_id}",
+2026-06-29T03:11:08.8407995Z             "labels_url": "https://api.github.com/repos/veyvin/lore/labels{/name}",
+2026-06-29T03:11:08.8408370Z             "language": null,
+2026-06-29T03:11:08.8408726Z             "languages_url": "https://api.github.com/repos/veyvin/lore/languages",
+2026-06-29T03:11:08.8409103Z             "license": {
+2026-06-29T03:11:08.8409314Z               "key": "mit",
+2026-06-29T03:11:08.8409536Z               "name": "MIT License",
+2026-06-29T03:11:08.8409798Z               "node_id": "MDc6TGljZW5zZTEz",
+2026-06-29T03:11:08.8410065Z               "spdx_id": "MIT",
+2026-06-29T03:11:08.8410341Z               "url": "https://api.github.com/licenses/mit"
+2026-06-29T03:11:08.8410629Z             },
+2026-06-29T03:11:08.8410827Z             "master_branch": "main",
+2026-06-29T03:11:08.8411500Z             "merges_url": "https://api.github.com/repos/veyvin/lore/merges",
+2026-06-29T03:11:08.8412061Z             "milestones_url": "https://api.github.com/repos/veyvin/lore/milestones{/number}",
+2026-06-29T03:11:08.8412481Z             "mirror_url": null,
+2026-06-29T03:11:08.8412706Z             "name": "lore",
+2026-06-29T03:11:08.8412930Z             "node_id": "R_kgDOTIFUYg",
+2026-06-29T03:11:08.8413422Z             "notifications_url": "https://api.github.com/repos/veyvin/lore/notifications{?since,all,participating}",
+2026-06-29T03:11:08.8413921Z             "open_issues": 0,
+2026-06-29T03:11:08.8414157Z             "open_issues_count": 0,
+2026-06-29T03:11:08.8414397Z             "owner": {
+2026-06-29T03:11:08.8414721Z               "avatar_url": "https://avatars.githubusercontent.com/u/6776758?v=4",
+2026-06-29T03:11:08.8415105Z               "email": "243169656@qq.com",
+2026-06-29T03:11:08.8415467Z               "events_url": "https://api.github.com/users/veyvin/events{/privacy}",
+2026-06-29T03:11:08.8415930Z               "followers_url": "https://api.github.com/users/veyvin/followers",
+2026-06-29T03:11:08.8416429Z               "following_url": "https://api.github.com/users/veyvin/following{/other_user}",
+2026-06-29T03:11:08.8416930Z               "gists_url": "https://api.github.com/users/veyvin/gists{/gist_id}",
+2026-06-29T03:11:08.8417294Z               "gravatar_id": "",
+2026-06-29T03:11:08.8417564Z               "html_url": "https://github.com/veyvin",
+2026-06-29T03:11:08.8417847Z               "id": 6776758,
+2026-06-29T03:11:08.8418068Z               "login": "veyvin",
+2026-06-29T03:11:08.8418298Z               "name": "veyvin",
+2026-06-29T03:11:08.8418547Z               "node_id": "MDQ6VXNlcjY3NzY3NTg=",
+2026-06-29T03:11:08.8418923Z               "organizations_url": "https://api.github.com/users/veyvin/orgs",
+2026-06-29T03:11:08.8419705Z               "received_events_url": "https://api.github.com/users/veyvin/received_events",
+2026-06-29T03:11:08.8420194Z               "repos_url": "https://api.github.com/users/veyvin/repos",
+2026-06-29T03:11:08.8420528Z               "site_admin": false,
+2026-06-29T03:11:08.8420898Z               "starred_url": "https://api.github.com/users/veyvin/starred{/owner}{/repo}",
+2026-06-29T03:11:08.8422012Z               "subscriptions_url": "https://api.github.com/users/veyvin/subscriptions",
+2026-06-29T03:11:08.8422519Z               "type": "User",
+2026-06-29T03:11:08.8422994Z               "url": "https://api.github.com/users/veyvin",
+2026-06-29T03:11:08.8423542Z               "user_view_type": "public"
+2026-06-29T03:11:08.8423977Z             },
+2026-06-29T03:11:08.8424302Z             "private": false,
+2026-06-29T03:11:08.8424745Z             "pull_request_creation_policy": "all",
+2026-06-29T03:11:08.8425444Z             "pulls_url": "https://api.github.com/repos/veyvin/lore/pulls{/number}",
+2026-06-29T03:11:08.8426332Z             "pushed_at": 1782702096,
+2026-06-29T03:11:08.8426986Z             "releases_url": "https://api.github.com/repos/veyvin/lore/releases{/id}",
+2026-06-29T03:11:08.8427662Z             "size": 4617,
+2026-06-29T03:11:08.8428101Z             "ssh_url": "git@github.com:veyvin/lore.git",
+2026-06-29T03:11:08.8428611Z             "stargazers": 0,
+2026-06-29T03:11:08.8429169Z             "stargazers_count": 0,
+2026-06-29T03:11:08.8429805Z             "stargazers_url": "https://api.github.com/repos/veyvin/lore/stargazers",
+2026-06-29T03:11:08.8430706Z             "statuses_url": "https://api.github.com/repos/veyvin/lore/statuses/{sha}",
+2026-06-29T03:11:08.8431938Z             "subscribers_url": "https://api.github.com/repos/veyvin/lore/subscribers",
+2026-06-29T03:11:08.8432873Z             "subscription_url": "https://api.github.com/repos/veyvin/lore/subscription",
+2026-06-29T03:11:08.8433655Z             "svn_url": "https://github.com/veyvin/lore",
+2026-06-29T03:11:08.8434317Z             "tags_url": "https://api.github.com/repos/veyvin/lore/tags",
+2026-06-29T03:11:08.8435067Z             "teams_url": "https://api.github.com/repos/veyvin/lore/teams",
+2026-06-29T03:11:08.8435681Z             "topics": [],
+2026-06-29T03:11:08.8436261Z             "trees_url": "https://api.github.com/repos/veyvin/lore/git/trees{/sha}",
+2026-06-29T03:11:08.8436969Z             "updated_at": "2026-06-29T02:53:08Z",
+2026-06-29T03:11:08.8437573Z             "url": "https://api.github.com/repos/veyvin/lore",
+2026-06-29T03:11:08.8438151Z             "visibility": "public",
+2026-06-29T03:11:08.8438593Z             "watchers": 0,
+2026-06-29T03:11:08.8438986Z             "watchers_count": 0,
+2026-06-29T03:11:08.8439432Z             "web_commit_signoff_required": false
+2026-06-29T03:11:08.8439885Z           },
+2026-06-29T03:11:08.8440180Z           "sender": {
+2026-06-29T03:11:08.8440714Z             "avatar_url": "https://avatars.githubusercontent.com/u/6776758?v=4",
+2026-06-29T03:11:08.8441744Z             "events_url": "https://api.github.com/users/veyvin/events{/privacy}",
+2026-06-29T03:11:08.8442550Z             "followers_url": "https://api.github.com/users/veyvin/followers",
+2026-06-29T03:11:08.8443393Z             "following_url": "https://api.github.com/users/veyvin/following{/other_user}",
+2026-06-29T03:11:08.8444258Z             "gists_url": "https://api.github.com/users/veyvin/gists{/gist_id}",
+2026-06-29T03:11:08.8444891Z             "gravatar_id": "",
+2026-06-29T03:11:08.8445338Z             "html_url": "https://github.com/veyvin",
+2026-06-29T03:11:08.8445826Z             "id": 6776758,
+2026-06-29T03:11:08.8446163Z             "login": "veyvin",
+2026-06-29T03:11:08.8446621Z             "node_id": "MDQ6VXNlcjY3NzY3NTg=",
+2026-06-29T03:11:08.8447278Z             "organizations_url": "https://api.github.com/users/veyvin/orgs",
+2026-06-29T03:11:08.8448157Z             "received_events_url": "https://api.github.com/users/veyvin/received_events",
+2026-06-29T03:11:08.8448996Z             "repos_url": "https://api.github.com/users/veyvin/repos",
+2026-06-29T03:11:08.8449579Z             "site_admin": false,
+2026-06-29T03:11:08.8450211Z             "starred_url": "https://api.github.com/users/veyvin/starred{/owner}{/repo}",
+2026-06-29T03:11:08.8451317Z             "subscriptions_url": "https://api.github.com/users/veyvin/subscriptions",
+2026-06-29T03:11:08.8452021Z             "type": "User",
+2026-06-29T03:11:08.8452470Z             "url": "https://api.github.com/users/veyvin",
+2026-06-29T03:11:08.8452995Z             "user_view_type": "public"
+2026-06-29T03:11:08.8453400Z           }
+2026-06-29T03:11:08.8453673Z         },
+2026-06-29T03:11:08.8453980Z         "github_job": "build-and-release",
+2026-06-29T03:11:08.8454415Z         "github_ref": "refs/tags/v1.0.0",
+2026-06-29T03:11:08.8454862Z         "github_ref_name": "v1.0.0",
+2026-06-29T03:11:08.8455314Z         "github_ref_protected": "false",
+2026-06-29T03:11:08.8455809Z         "github_ref_type": "tag",
+2026-06-29T03:11:08.8456230Z         "github_repository": "veyvin/lore",
+2026-06-29T03:11:08.8456914Z         "github_repository_id": "1283544162",
+2026-06-29T03:11:08.8457522Z         "github_repository_owner": "veyvin",
+2026-06-29T03:11:08.8458024Z         "github_repository_owner_id": "6776758",
+2026-06-29T03:11:08.8458522Z         "github_run_attempt": "1",
+2026-06-29T03:11:08.8458948Z         "github_run_id": "28345839178",
+2026-06-29T03:11:08.8459613Z         "github_run_number": "1",
+2026-06-29T03:11:08.8460033Z         "github_runner_arch": "X64",
+2026-06-29T03:11:08.8460534Z         "github_runner_environment": "github-hosted",
+2026-06-29T03:11:08.8460892Z         "github_runner_image_os": "ubuntu24",
+2026-06-29T03:11:08.8461468Z         "github_runner_image_version": "20260622.220.1",
+2026-06-29T03:11:08.8461806Z         "github_runner_name": "GitHub Actions 1000002638",
+2026-06-29T03:11:08.8462115Z         "github_runner_os": "Linux",
+2026-06-29T03:11:08.8462491Z         "github_runner_tracking_id": "github_157de249-131c-41a0-8fe1-9d936d7825e3",
+2026-06-29T03:11:08.8468409Z         "github_server_url": "https://github.com",
+2026-06-29T03:11:08.8468754Z         "github_triggering_actor": "veyvin",
+2026-06-29T03:11:08.8469088Z         "github_workflow": "Build and Release Docker Image",
+2026-06-29T03:11:08.8469584Z         "github_workflow_ref": "veyvin/lore/.github/workflows/docker-release.yml@refs/tags/v1.0.0",
+2026-06-29T03:11:08.8470131Z         "github_workflow_sha": "76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa",
+2026-06-29T03:11:08.8470495Z         "platform": "linux/amd64"
+2026-06-29T03:11:08.8470733Z       }
+2026-06-29T03:11:08.8470897Z     }
+2026-06-29T03:11:08.8471347Z   },
+2026-06-29T03:11:08.8471904Z   "buildx.build.ref": "builder-0ed13988-a6a1-4791-a355-bf440965ecd1/builder-0ed13988-a6a1-4791-a355-bf440965ecd10/0a4hcmjnb9std73ycupkzkfst",
+2026-06-29T03:11:08.8472692Z   "containerimage.descriptor": {
+2026-06-29T03:11:08.8473026Z     "mediaType": "application/vnd.oci.image.index.v1+json",
+2026-06-29T03:11:08.8473511Z     "digest": "sha256:393ee1aba5c93e4b56a1420593edcef46ab2ac1f6765222e21327acc17f32455",
+2026-06-29T03:11:08.8473931Z     "size": 856
+2026-06-29T03:11:08.8474116Z   },
+2026-06-29T03:11:08.8474507Z   "containerimage.digest": "sha256:393ee1aba5c93e4b56a1420593edcef46ab2ac1f6765222e21327acc17f32455",
+2026-06-29T03:11:08.8475308Z   "image.name": "ghcr.io/veyvin/lore:1.0.0,ghcr.io/veyvin/lore:1.0,ghcr.io/veyvin/lore:1,ghcr.io/veyvin/lore:v1.0.0,ghcr.io/veyvin/lore:latest"
+2026-06-29T03:11:08.8475867Z }
+2026-06-29T03:11:08.8476209Z ##[endgroup]
+2026-06-29T03:11:08.8547155Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+2026-06-29T03:11:08.8548596Z ##[group]Run softprops/action-gh-release@v1
+2026-06-29T03:11:08.8548867Z with:
+2026-06-29T03:11:08.8549064Z   generate_release_notes: true
+2026-06-29T03:11:08.8549298Z   files: LICENSE
+
+2026-06-29T03:11:08.8552793Z   token: ***
+2026-06-29T03:11:08.8552984Z env:
+2026-06-29T03:11:08.8553177Z   DOCKER_METADATA_OUTPUT_VERSION: 1.0.0
+2026-06-29T03:11:08.8553811Z   DOCKER_METADATA_OUTPUT_TAGS: ghcr.io/veyvin/lore:1.0.0
+ghcr.io/veyvin/lore:1.0
+ghcr.io/veyvin/lore:1
+ghcr.io/veyvin/lore:v1.0.0
+ghcr.io/veyvin/lore:latest
+2026-06-29T03:11:08.8554503Z   DOCKER_METADATA_OUTPUT_TAG_NAMES: 1.0.0
+1.0
+1
+v1.0.0
+latest
+2026-06-29T03:11:08.8556499Z   DOCKER_METADATA_OUTPUT_LABELS: org.opencontainers.image.created=2026-06-29T03:01:51.616Z
+org.opencontainers.image.description=Lore is a next-generation, open source version control system
+org.opencontainers.image.licenses=MIT
+org.opencontainers.image.revision=76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa
+org.opencontainers.image.source=https://github.com/veyvin/lore
+org.opencontainers.image.title=lore
+org.opencontainers.image.url=https://github.com/veyvin/lore
+org.opencontainers.image.version=1.0.0
+2026-06-29T03:11:08.8560298Z   DOCKER_METADATA_OUTPUT_ANNOTATIONS: manifest:org.opencontainers.image.created=2026-06-29T03:01:51.616Z
+manifest:org.opencontainers.image.description=Lore is a next-generation, open source version control system
+manifest:org.opencontainers.image.licenses=MIT
+manifest:org.opencontainers.image.revision=76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa
+manifest:org.opencontainers.image.source=https://github.com/veyvin/lore
+manifest:org.opencontainers.image.title=lore
+manifest:org.opencontainers.image.url=https://github.com/veyvin/lore
+manifest:org.opencontainers.image.version=1.0.0
+2026-06-29T03:11:08.8567167Z   DOCKER_METADATA_OUTPUT_JSON: {"tags":["ghcr.io/veyvin/lore:1.0.0","ghcr.io/veyvin/lore:1.0","ghcr.io/veyvin/lore:1","ghcr.io/veyvin/lore:v1.0.0","ghcr.io/veyvin/lore:latest"],"tag-names":["1.0.0","1.0","1","v1.0.0","latest"],"labels":{"org.opencontainers.image.created":"2026-06-29T03:01:51.616Z","org.opencontainers.image.description":"Lore is a next-generation, open source version control system","org.opencontainers.image.licenses":"MIT","org.opencontainers.image.revision":"76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa","org.opencontainers.image.source":"https://github.com/veyvin/lore","org.opencontainers.image.title":"lore","org.opencontainers.image.url":"https://github.com/veyvin/lore","org.opencontainers.image.version":"1.0.0"},"annotations":["manifest:org.opencontainers.image.created=2026-06-29T03:01:51.616Z","manifest:org.opencontainers.image.description=Lore is a next-generation, open source version control system","manifest:org.opencontainers.image.licenses=MIT","manifest:org.opencontainers.image.revision=76afb433c0adc59ee6ad2f52f1b9beda7e6c48fa","manifest:org.opencontainers.image.source=https://github.com/veyvin/lore","manifest:org.opencontainers.image.title=lore","manifest:org.opencontainers.image.url=https://github.com/veyvin/lore","manifest:org.opencontainers.image.version=1.0.0"]}
+2026-06-29T03:11:08.8572459Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_TAGS: /home/runner/work/_temp/docker-actions-toolkit-LTnfLM/docker-metadata-action-bake-tags.json
+2026-06-29T03:11:08.8573401Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_LABELS: /home/runner/work/_temp/docker-actions-toolkit-LTnfLM/docker-metadata-action-bake-labels.json
+2026-06-29T03:11:08.8574374Z   DOCKER_METADATA_OUTPUT_BAKE_FILE_ANNOTATIONS: /home/runner/work/_temp/docker-actions-toolkit-LTnfLM/docker-metadata-action-bake-annotations.json
+2026-06-29T03:11:08.8575476Z   DOCKER_METADATA_OUTPUT_BAKE_FILE: /home/runner/work/_temp/docker-actions-toolkit-LTnfLM/docker-metadata-action-bake.json
+2026-06-29T03:11:08.8578972Z   GITHUB_TOKEN: ***
+2026-06-29T03:11:08.8579183Z ##[endgroup]
+2026-06-29T03:11:08.9348146Z (node:19851) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-06-29T03:11:08.9349680Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-06-29T03:11:08.9472578Z (node:19851) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+2026-06-29T03:11:09.1202527Z 👩‍🏭 Creating new GitHub release for tag v1.0.0...
+2026-06-29T03:11:09.6271344Z ⬆️ Uploading LICENSE...
+2026-06-29T03:11:10.0830915Z 🎉 Release ready at https://github.com/veyvin/lore/releases/tag/v1.0.0
+2026-06-29T03:11:10.0994461Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+2026-06-29T03:11:10.0995731Z Post job cleanup.
+2026-06-29T03:11:10.3308744Z ##[group]Removing temp folder /home/runner/work/_temp/docker-actions-toolkit-Y8o4jV
+2026-06-29T03:11:10.3315306Z (node:19863) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-06-29T03:11:10.3316694Z ##[endgroup]
+2026-06-29T03:11:10.3317384Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-06-29T03:11:10.3318322Z ##[group]Post cache
+2026-06-29T03:11:10.3318881Z State not set
+2026-06-29T03:11:10.3319754Z ##[endgroup]
+2026-06-29T03:11:10.3454340Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+2026-06-29T03:11:10.3455769Z Post job cleanup.
+2026-06-29T03:11:10.6537449Z ##[group]Logout from ghcr.io
+2026-06-29T03:11:10.6559936Z (node:19871) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-06-29T03:11:10.6560934Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-06-29T03:11:10.6580708Z [command]/usr/bin/docker logout ghcr.io
+2026-06-29T03:11:10.6710075Z Removing login credentials for ghcr.io
+2026-06-29T03:11:10.6737559Z ##[endgroup]
+2026-06-29T03:11:10.6738141Z ##[group]Post cache
+2026-06-29T03:11:10.6739767Z State not set
+2026-06-29T03:11:10.6740465Z ##[endgroup]
+2026-06-29T03:11:10.6903076Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+2026-06-29T03:11:10.6904350Z Post job cleanup.
+2026-06-29T03:11:10.9431536Z ##[group]Removing builder
+2026-06-29T03:11:10.9442461Z (node:19891) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-06-29T03:11:10.9444942Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-06-29T03:11:11.0414600Z [command]/usr/bin/docker buildx rm builder-0ed13988-a6a1-4791-a355-bf440965ecd1
+2026-06-29T03:11:13.0513456Z builder-0ed13988-a6a1-4791-a355-bf440965ecd1 removed
+2026-06-29T03:11:13.0537928Z ##[endgroup]
+2026-06-29T03:11:13.0538374Z ##[group]Cleaning up certificates
+2026-06-29T03:11:13.0540632Z ##[endgroup]
+2026-06-29T03:11:13.0541585Z ##[group]Post cache
+2026-06-29T03:11:13.0543996Z State not set
+2026-06-29T03:11:13.0544895Z ##[endgroup]
+2026-06-29T03:11:13.0739520Z Node 20 is being deprecated. This workflow is running with Node 24 by default. If you need to temporarily use Node 20, you can set the ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION=true environment variable. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+2026-06-29T03:11:13.0740775Z Post job cleanup.
+2026-06-29T03:11:13.1560443Z [command]/usr/bin/git version
+2026-06-29T03:11:13.1597007Z git version 2.54.0
+2026-06-29T03:11:13.1635304Z Temporarily overriding HOME='/home/runner/work/_temp/2a4c8617-6fd9-4b35-8c02-68f46840fd11' before making global git config changes
+2026-06-29T03:11:13.1636876Z Adding repository directory to the temporary git global config as a safe directory
+2026-06-29T03:11:13.1640200Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/lore/lore
+2026-06-29T03:11:13.1678838Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-06-29T03:11:13.1736361Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-06-29T03:11:13.1957980Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-06-29T03:11:13.1984269Z http.https://github.com/.extraheader
+2026-06-29T03:11:13.1996173Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+2026-06-29T03:11:13.2027866Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-06-29T03:11:13.2248061Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-06-29T03:11:13.2278313Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-06-29T03:11:13.2634998Z Cleaning up orphan processes
+2026-06-29T03:11:13.2962721Z ##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/checkout@v4, docker/build-push-action@v5, docker/login-action@v3, docker/metadata-action@v5, docker/setup-buildx-action@v3, softprops/action-gh-release@v1. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
