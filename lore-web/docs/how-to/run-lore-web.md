@@ -43,6 +43,22 @@ collaborator who syncs with your server but runs no server of their own.
 4. Work normally. Use **Push** to send commits to the host and **Sync** to pull
    the host's latest revision. Progress streams live in the dialog.
 
+## Change a repository's organization
+
+A repository's organization is the `org/` prefix of its name (the `acme` in
+`acme/widgets`), shown as a pill beside the branch and as a badge in the sidebar.
+
+1. Select the repository, then click the organization pill (it reads
+   **Set organization…** when the name has no prefix yet).
+2. Enter the new organization and confirm.
+
+> [!CAUTION]
+> The organization is part of a repository's read-only identity, fixed when the
+> repository is created. Changing it rebuilds the local repository — preserving its
+> id and remote but discarding local committed revisions. Push everything to the
+> remote first, and only change the organization when you accept that local
+> history loss.
+
 ## Result
 
 Both machines drive the same repository: the host serves it, the collaborator
