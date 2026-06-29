@@ -24,6 +24,43 @@ test("history groups metadata under each revision entry", () => {
   assert.equal(revs[1].timestamp, undefined);
 });
 
+test("metadata collects key/value pairs, unwrapping Lore metadata values", () => {
+  const events = [
+    ev("METADATA", { key: "name", value: { tag: 6, data: "acme/widgets", tagName: "string" } }),
+    ev("METADATA", { key: "description", value: "plain" }),
+    ev("COMPLETE", { status: 0 }),
+  ];
+  const meta = xform.metadata(events);
+  assert.equal(meta.name, "acme/widgets");
+  assert.equal(meta.description, "plain");
+});
+
+test("splitOrg separates the org prefix from the repository name", () => {
+  assert.deepEqual(xform.splitOrg("acme/widgets"), {
+    organization: "acme",
+    repoName: "widgets",
+    name: "acme/widgets",
+  });
+});
+
+test("splitOrg treats a name with no slash as having no organization", () => {
+  assert.deepEqual(xform.splitOrg("lore-web"), {
+    organization: "",
+    repoName: "lore-web",
+    name: "lore-web",
+  });
+});
+
+test("splitOrg keeps only the first slash as the org separator", () => {
+  const out = xform.splitOrg("org/team/repo");
+  assert.equal(out.organization, "org");
+  assert.equal(out.repoName, "team/repo");
+});
+
+test("splitOrg tolerates a missing name", () => {
+  assert.deepEqual(xform.splitOrg(undefined), { organization: "", repoName: "", name: "" });
+});
+
 test("status splits branch summary from changed files", () => {
   const events = [
     ev("REPOSITORY_STATUS_REVISION", { branchName: "main", revision: "r1" }),

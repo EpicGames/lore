@@ -158,17 +158,80 @@ async function listRepos(res) {
     repos.map(async (r) => {
       const exists = isRepo(r.path);
       let info = {};
+      let organization = "";
       if (exists) {
         try {
           info = xform.repoSummary(await collect("repositoryStatus", { repositoryPath: r.path }, { staged: false }));
         } catch (err) {
           log.debug("repo enrich failed", { path: r.path });
         }
+        try {
+          organization = (await readOrg(r.path)).organization;
+        } catch (err) {
+          log.debug("repo org read failed", { path: r.path });
+        }
       }
-      return { ...r, exists, ...info };
+      return { ...r, exists, organization, ...info };
     }),
   );
   sendJson(res, 200, { repos: enriched });
+}
+
+/**
+ * Read a repository's organization, parsed from its `name` metadata. Lore stores
+ * the name as an `org/repo` value; the prefix before the first slash is the
+ * organization. Reads local metadata only (the working copy), matching what the
+ * desktop client surfaces.
+ * @param {string} repoPath path to a Lore working copy
+ * @returns {Promise<{ organization: string, repoName: string, name: string }>}
+ */
+async function readOrg(repoPath) {
+  const events = await collect("repositoryMetadataGet", { repositoryPath: repoPath, local: true }, { key: "name" });
+  return xform.splitOrg(xform.metadata(events).name);
+}
+
+/**
+ * GET /api/org — the organization and repository name for a tracked repo.
+ * @param {import("node:http").ServerResponse} res
+ * @param {string|null} repoPath the `path` query parameter
+ */
+async function getOrg(res, repoPath) {
+  if (!repoPath) return sendJson(res, 400, { error: "path required" });
+  return sendJson(res, 200, await readOrg(repoPath));
+}
+
+/**
+ * POST /api/org — change a repository's organization. A repo's org is the `org/`
+ * prefix of its `name` metadata, which Lore makes read-only after creation: it is
+ * set from the path of the create URL and cannot be edited via metadata. The only
+ * way to change it in place is to recreate the working copy's `.lore` under a new
+ * URL (preserving the repository id), which discards local committed history. The
+ * caller must therefore confirm the destructive nature first; this endpoint
+ * performs the recreate unconditionally.
+ *
+ * The body is `{ path, organization }`. An organization cannot be empty or contain
+ * a slash, since the slash separates it from the repository name.
+ * @param {import("node:http").IncomingMessage} req
+ * @param {import("node:http").ServerResponse} res
+ */
+async function setOrg(req, res) {
+  const body = await readBody(req);
+  const path = typeof body.path === "string" ? toUnixPath(body.path) : "";
+  if (!path) return sendJson(res, 400, { error: "path required" });
+  if (!existsSync(path)) return sendJson(res, 400, { error: "path does not exist" });
+  if (!isRepo(path)) return sendJson(res, 400, { error: "not a Lore repository" });
+  const organization = typeof body.organization === "string" ? body.organization.trim() : "";
+  if (!organization) return sendJson(res, 400, { error: "organization required" });
+  if (organization.includes("/")) return sendJson(res, 400, { error: "organization cannot contain '/'" });
+  const current = await readOrg(path);
+  const repoName = current.repoName || path.split(/[\\/]/).filter(Boolean).pop() || path;
+  const remote = readRepoRemote(path);
+  const base = remote ? remoteBase(remote) : defaultRemoteBase().replace(/\/+$/, "");
+  const repositoryUrl = `${base}/${organization}/${repoName}`;
+  log.info("changing organization", { path, from: current.organization, to: organization });
+  const id = await recreateLore(path, repositoryUrl);
+  broadcastRefresh("*", "repos");
+  return sendJson(res, 200, { ...xform.splitOrg(`${organization}/${repoName}`), id });
 }
 
 /**
@@ -221,6 +284,28 @@ async function repairRepo(path, res) {
       error: "repository has committed revisions; repair would lose them — re-clone from the remote instead",
     });
   }
+  const remote = readRepoRemote(path);
+  const label = path.split(/[\\/]/).filter(Boolean).pop() || path;
+  const repositoryUrl = `${remote ? remoteBase(remote) : defaultRemoteBase().replace(/\/+$/, "")}/${label}`;
+  const id = await recreateLore(path, repositoryUrl);
+  broadcastRefresh(path, "repair");
+  sendJson(res, 200, { ok: true, id });
+}
+
+/**
+ * Rebuild a working copy's `.lore` in place, re-registering it under
+ * `repositoryUrl` while preserving its existing repository id. The old `.lore` is
+ * moved aside and restored if the rebuild throws, so a failure never leaves the
+ * folder without a repository. The rebuild runs offline so it never re-registers
+ * on (or conflicts with) the remote — the repo already exists there.
+ *
+ * This discards any local committed history (a fresh `.lore` has none), so callers
+ * must guard against or warn about that before invoking it.
+ * @param {string} path a Lore working copy
+ * @param {string} repositoryUrl the URL whose path component becomes the repo name
+ * @returns {Promise<string>} the preserved repository id (hex), or "" if none existed
+ */
+async function recreateLore(path, repositoryUrl) {
   const dot = join(path, ".lore");
   let id = "";
   try {
@@ -228,14 +313,7 @@ async function repairRepo(path, res) {
   } catch {
     // no id file — let create mint a fresh one
   }
-  const remote = readRepoRemote(path);
-  const label = path.split(/[\\/]/).filter(Boolean).pop() || path;
-  const repositoryUrl = `${remote ? remoteBase(remote) : defaultRemoteBase().replace(/\/+$/, "")}/${label}`;
-  log.info("repairing repository", { path, repositoryUrl, id });
-  // Recreate offline so we never re-register on (or conflict with) the remote —
-  // the repo already exists there; we are only rebuilding the local .lore. Move
-  // the old .lore aside first and restore it if the rebuild fails, so a failure
-  // never leaves the working copy without a repository.
+  log.info("recreating repository .lore", { path, repositoryUrl, id });
   const backup = `${dot}.repair-bak`;
   rmSync(backup, { recursive: true, force: true });
   renameSync(dot, backup);
@@ -248,8 +326,7 @@ async function repairRepo(path, res) {
   }
   rmSync(backup, { recursive: true, force: true });
   setupLoreignore(path);
-  broadcastRefresh(path, "repair");
-  sendJson(res, 200, { ok: true, id });
+  return id;
 }
 
 /**
@@ -448,6 +525,9 @@ const server = createServer(async (req, res) => {
     if (p === "/api/repos" && req.method === "GET") return await listRepos(res);
     if (p === "/api/repos" && req.method === "POST") return await addRepo(req, res);
     if (p === "/api/repos" && req.method === "DELETE") return await deleteRepo(req, res);
+
+    if (p === "/api/org" && req.method === "GET") return await getOrg(res, repoPath);
+    if (p === "/api/org" && req.method === "POST") return await setOrg(req, res);
 
     if (p === "/api/history" && req.method === "GET") {
       const length = Number(q.get("length") ?? 50);

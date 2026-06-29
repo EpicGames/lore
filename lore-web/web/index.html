@@ -31,6 +31,7 @@
             <div>
               <h1 id="repo-title">—</h1>
               <div class="repo-sub">
+                <button id="repo-org" class="pill org-pill" title="Organization — click to change" hidden></button>
                 <span id="repo-branch" class="pill"></span>
                 <span id="repo-path" class="muted"></span>
               </div>
@@ -141,6 +142,25 @@
         <menu>
           <button type="button" id="init-cancel">Cancel</button>
           <button type="button" id="init-go" class="primary">Initialize</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <!-- Organization editor — recreates the repo identity under a new org -->
+    <dialog id="org-dialog">
+      <form method="dialog" class="clone-form">
+        <h3>Change organization</h3>
+        <p class="muted" id="org-repo"></p>
+        <label>Organization<input id="org-name" type="text" placeholder="organization" /></label>
+        <p class="warn">
+          A repository's organization is part of its read-only identity, set when the
+          repository is created. Changing it rebuilds the local repository, which
+          <strong>discards all local committed revisions</strong>. Only proceed if this
+          repository is fully pushed to its remote — its id and remote are preserved.
+        </p>
+        <menu>
+          <button value="cancel">Cancel</button>
+          <button id="org-go" value="default" class="danger">Change and rebuild</button>
         </menu>
       </form>
     </dialog>

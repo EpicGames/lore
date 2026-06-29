@@ -80,6 +80,7 @@ function renderRepos() {
     li.className = r.path === state.active ? "active" : "";
     li.innerHTML = `
       <span class="r-name" title="${r.path}">${r.label}</span>
+      ${r.organization ? `<span class="r-org">${r.organization}</span>` : ""}
       ${r.exists ? `<span class="r-branch">${r.branch || ""}</span>` : `<span class="r-missing">missing</span>`}
       <button class="r-remove" title="Remove">✕</button>`;
     // Select on a click anywhere in the row, not only the label, so the whole
@@ -180,7 +181,29 @@ async function selectRepo(path) {
   $("#repo-title").textContent = repo?.label || path;
   $("#repo-path").textContent = path;
   renderRepos();
+  loadOrg(path);
   await refreshActive();
+}
+
+/**
+ * Fetch the active repo's organization and show it as a clickable pill. The org
+ * is the prefix of the repo's `name` metadata; a repo with no org prefix hides
+ * the pill. Best-effort — a read failure leaves the pill hidden rather than
+ * surfacing an error.
+ * @param {string} path the repository path
+ */
+async function loadOrg(path) {
+  const pill = $("#repo-org");
+  pill.hidden = true;
+  try {
+    const { organization, repoName } = await apiGet(`/api/org?path=${encodeURIComponent(path)}`);
+    state.org = { organization, repoName };
+    pill.textContent = organization || "Set organization…";
+    pill.classList.toggle("org-empty", !organization);
+    pill.hidden = false;
+  } catch (err) {
+    state.org = null;
+  }
 }
 
 /** Refetch every view for the active repo. The single source of freshness. */
@@ -761,6 +784,34 @@ function wire() {
     setTimeout(async () => {
       await runOp("Cloning…", "/api/clone", { url, dest });
       await loadRepos();
+    }, 0);
+  };
+
+  $("#repo-org").onclick = () => {
+    if (!state.active) return;
+    $("#org-repo").textContent = state.org?.repoName
+      ? `Repository: ${state.org.repoName}`
+      : "";
+    $("#org-name").value = state.org?.organization || "";
+    $("#org-dialog").showModal();
+    $("#org-name").focus();
+  };
+  $("#org-go").onclick = (e) => {
+    const organization = $("#org-name").value.trim();
+    if (!organization || organization.includes("/")) {
+      e.preventDefault();
+      return toast("Organization is required and cannot contain '/'", true);
+    }
+    const path = state.active;
+    setTimeout(async () => {
+      try {
+        await apiPost("/api/org", { path, organization });
+        toast("Organization changed — repository rebuilt");
+        if (state.active === path) loadOrg(path);
+        await loadRepos();
+      } catch (err) {
+        toast(err.message, true);
+      }
     }, 0);
   };
 

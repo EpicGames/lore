@@ -37,6 +37,9 @@ button {
 button:hover { border-color: var(--accent); }
 button.primary { background: var(--accent); color: #0b0d12; border-color: var(--accent); font-weight: 600; }
 button.primary:hover { background: var(--accent-press); }
+button.danger { background: var(--red); color: #0b0d12; border-color: var(--red); font-weight: 600; }
+button.danger:hover { background: var(--red); filter: brightness(1.1); }
+.warn { color: var(--red); font-size: 12px; line-height: 1.4; margin: 4px 0 0; }
 button.ghost { background: transparent; }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
 input, textarea {
@@ -68,6 +71,7 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); }
 .repo-list li:hover { background: var(--panel-2); }
 .repo-list li.active { background: var(--panel-2); outline: 1px solid var(--accent); }
 .repo-list .r-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.repo-list .r-org { color: var(--accent); font-size: 11px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 10px; padding: 0 6px; }
 .repo-list .r-branch { color: var(--muted); font-size: 12px; margin-left: auto; }
 .repo-list .r-missing { color: var(--red); font-size: 11px; }
 .repo-list .r-remove { margin-left: 6px; color: var(--muted); border: none; background: none; padding: 2px 6px; }
@@ -83,6 +87,9 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); }
 .repo-head h1 { margin: 0 0 6px; font-size: 18px; }
 .repo-sub { display: flex; align-items: center; gap: 10px; }
 .pill { background: var(--panel-2); border: 1px solid var(--border); border-radius: 20px; padding: 2px 10px; font-size: 12px; color: var(--accent); }
+.org-pill { cursor: pointer; font: inherit; font-size: 12px; }
+.org-pill:hover { border-color: var(--accent); }
+.org-pill.org-empty { color: var(--muted); font-style: italic; }
 .muted { color: var(--muted); font-size: 12px; }
 .repo-actions { display: flex; gap: 8px; }
 

@@ -99,6 +99,31 @@ export function remoteRepos(events) {
     .map((e) => ({ id: e.data?.id, name: e.data?.name }));
 }
 
+/** Collect repository metadata key/values from `repositoryMetadataGet`. @param {LoreEvt[]} events */
+export function metadata(events) {
+  /** @type {Record<string, any>} */
+  const out = {};
+  for (const e of events) {
+    if (e.tag === "METADATA" && e.data?.key != null) out[e.data.key] = metaValue(e.data.value);
+  }
+  return out;
+}
+
+/**
+ * Split a repository `name` metadata value into its organization prefix and bare
+ * repository name. Lore encodes the org as an `org/repo` prefix on the name (it
+ * comes from the path of the create/clone URL); everything before the first slash
+ * is the organization, the remainder is the repository name.
+ * @param {string|undefined} name
+ * @returns {{ organization: string, repoName: string, name: string }}
+ */
+export function splitOrg(name) {
+  const full = typeof name === "string" ? name : "";
+  const slash = full.indexOf("/");
+  if (slash === -1) return { organization: "", repoName: full, name: full };
+  return { organization: full.slice(0, slash), repoName: full.slice(slash + 1), name: full };
+}
+
 /** Branch/revision summary used to enrich the repo list. @param {LoreEvt[]} events */
 export function repoSummary(events) {
   for (const e of events) {

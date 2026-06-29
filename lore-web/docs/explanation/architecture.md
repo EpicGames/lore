@@ -60,9 +60,18 @@ the entry when that check failed on a missing folder.
 
 ## What's intentionally out of scope
 
-Organization rename is a hosted-account operation with no verb in the Lore SDK or
-the open-source server, so lore-web cannot implement it; it surfaces org names as
-read-only.
+A repository's organization is the `org/` prefix of its `name` metadata, set from
+the path of the create or clone URL. lore-web reads it through the SDK's
+`repositoryMetadataGet` verb and surfaces it per repository. Lore makes `name`
+read-only after creation, so changing the organization is not a metadata edit: it
+rebuilds the working copy's `.lore` under a new URL (preserving the repository id
+and remote), the same mechanism repository repair uses. That rebuild discards
+local committed revisions, so the UI confirms the loss before proceeding and the
+repository should be fully pushed to its remote first.
+
+Renaming an organization across a hosted account — which would retag every repo it
+owns — has no verb in the Lore SDK or the open-source server and stays out of
+scope.
 
 ## Related
 
