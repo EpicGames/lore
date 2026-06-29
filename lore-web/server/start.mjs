@@ -37,7 +37,7 @@ function openBrowser() {
 }
 
 if (await isUp()) {
-  // An instance is already running — just open the browser to it.
+  // An instance is already running — open the browser to it.
   console.log(`lore-web is already running. Opening ${url}`);
   openBrowser();
 } else {

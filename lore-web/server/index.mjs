@@ -16,7 +16,7 @@ import * as store from "./store.mjs";
 import * as xform from "./transforms.mjs";
 import { addClient, broadcastRefresh } from "./events.mjs";
 import { watchRepo, unwatchRepo } from "./watcher.mjs";
-import { isLoggedIn } from "./cli.mjs";
+import { isLoggedIn, runCli } from "./cli.mjs";
 import { setupLoreignore, appendIgnorePattern, hasLoreignore, hasGitignore } from "./loreignore.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -173,7 +173,7 @@ async function listRepos(res) {
 
 /**
  * POST /api/repos — start tracking a folder, smartly. If the folder is already a
- * Lore working copy it is just tracked; otherwise a new repository is initialized
+ * Lore working copy it is tracked as-is; otherwise a new repository is initialized
  * there first (with an auto-generated remote URL) so the user can point at any
  * folder without caring whether it has been set up yet.
  */
@@ -205,7 +205,7 @@ async function addRepo(req, res) {
 
 /**
  * POST /api/repair — rebuild a working copy's .lore in place. Lore can leave
- * "zombie" status entries (e.g. a nested repo that was indexed then deleted) that
+ * "zombie" status entries (for example, a nested repo that was indexed then deleted) that
  * no reset/stage/commit/obliterate can remove; the only cure is recreating .lore.
  * We do that while preserving the repository id and remote, so the repo keeps its
  * identity. Refused when there is committed history (which a rebuild would drop) —
@@ -253,8 +253,67 @@ async function repairRepo(path, res) {
 }
 
 /**
+ * GET /api/remote-repos?url= — ask a Lore server which repositories it hosts, so
+ * the user can pick one to clone instead of typing its full URL. The server base
+ * comes from the query, falling back to the same default the Add flow suggests
+ * (the remote of an already-tracked repo, an env override, or the local server).
+ * Each entry is returned with a ready-to-clone URL of the form <base>/<name>.
+ * @param {import("node:http").ServerResponse} res
+ * @param {string|null} rawUrl the server URL to query; empty/null uses the default
+ */
+async function listRemoteRepos(res, rawUrl) {
+  const base = remoteBase((rawUrl || "").trim() || defaultRemoteBase());
+  const events = await collect("repositoryList", {}, { url: base });
+  const local = localRepoIds();
+  // Address each repo by its id (server-listed names do not resolve for repos
+  // created without an owner — see deleteRemoteRepo) but offer the name-based
+  // URL for cloning, which the user expects to look like the real remote.
+  const repos = xform.remoteRepos(events).map((r) => ({
+    ...r,
+    url: `${base}/${r.name}`,
+    idUrl: `${base}/${r.id}`,
+    tracked: local.has(r.id),
+  }));
+  sendJson(res, 200, { base, repos });
+}
+
+/** Repository ids of every tracked local working copy (from each .lore/id). */
+function localRepoIds() {
+  const ids = new Set();
+  for (const r of store.listRepos()) {
+    try {
+      const id = readFileSync(join(r.path, ".lore", "id")).toString("hex");
+      if (id) ids.add(id);
+    } catch {
+      // no id file / not a working copy — nothing to match
+    }
+  }
+  return ids;
+}
+
+/**
+ * DELETE /api/remote-repos — remove a repository from its server by id. Two Lore
+ * quirks force the shape of this: (1) repos created without an owner do not
+ * resolve by their listed name, only by id; (2) `lore repository delete` prints
+ * a spurious "Not found" and exits 0 even when it succeeded. So we delete by id
+ * and ignore the CLI's status entirely, confirming the outcome by re-listing —
+ * the delete worked iff the id is gone.
+ */
+async function deleteRemoteRepo(req, res) {
+  const { id, base: rawBase } = await readBody(req);
+  if (!id) return sendJson(res, 400, { error: "id required" });
+  const base = remoteBase((rawBase || "").trim() || defaultRemoteBase());
+  log.info("deleting remote repository", { base, id });
+  await runCli(["repository", "delete", `${base}/${id}`]);
+  const events = await collect("repositoryList", {}, { url: base });
+  const stillThere = xform.remoteRepos(events).some((r) => r.id === id);
+  if (stillThere) return sendJson(res, 500, { error: "server did not delete the repository" });
+  sendJson(res, 200, { ok: true });
+}
+
+/**
  * Drive roots present on this machine, used as the picker's top "This PC" level.
- * @returns {string[]} drive-root paths (Windows: C:\ … Z:\; POSIX: just "/")
+ * @returns {string[]} drive-root paths (Windows: C:\ … Z:\; POSIX: "/")
  */
 function listDrives() {
   if (process.platform !== "win32") return ["/"];
@@ -382,6 +441,9 @@ const server = createServer(async (req, res) => {
       const label = target.split(/[\\/]/).filter(Boolean).pop() || target;
       return sendJson(res, 200, { isRepo: already, url: already ? null : suggestInitUrl(label) });
     }
+
+    if (p === "/api/remote-repos" && req.method === "GET") return await listRemoteRepos(res, q.get("url"));
+    if (p === "/api/remote-repos" && req.method === "DELETE") return await deleteRemoteRepo(req, res);
 
     if (p === "/api/repos" && req.method === "GET") return await listRepos(res);
     if (p === "/api/repos" && req.method === "POST") return await addRepo(req, res);

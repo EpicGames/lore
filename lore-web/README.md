@@ -29,7 +29,7 @@ folder was deleted. lore-web fixes these by owning the refresh path: see
    to install anything missing) and installs the SDK.
 2. Double-click **`start.bat`** — launches the app and opens
    `http://127.0.0.1:7420`. (It also runs setup automatically on first use, so you
-   can skip step 1 and just run `start.bat`.)
+   can skip step 1 and run `start.bat` directly.)
 
 ### Any platform (terminal)
 
@@ -42,7 +42,7 @@ npm start         # launch the server and open http://127.0.0.1:7420
 Then click **Add**, paste the path to a Lore working copy, and you're in.
 
 > **Sharing with a collaborator:** the `lore-web` folder is self-contained — send
-> just that folder (no need to clone this repository). They run `setup.bat` (or
+> only that folder (no need to clone this repository). They run `setup.bat` (or
 > `npm install`) once, then `lore login lore://<your-host>:41337`. See the
 > [how-to guide](docs/how-to/run-lore-web.md).
 

@@ -82,7 +82,7 @@ function renderRepos() {
       <span class="r-name" title="${r.path}">${r.label}</span>
       ${r.exists ? `<span class="r-branch">${r.branch || ""}</span>` : `<span class="r-missing">missing</span>`}
       <button class="r-remove" title="Remove">✕</button>`;
-    // Select on a click anywhere in the row, not just the label, so the whole
+    // Select on a click anywhere in the row, not only the label, so the whole
     // row is one big hit target. The remove button stops propagation below.
     li.onclick = () => selectRepo(r.path);
     li.querySelector(".r-remove").onclick = (e) => {
@@ -264,7 +264,7 @@ function ignoreOptionsFor(f) {
   const parent = sep >= 0 ? path.slice(0, sep + 1) : "";
   const opts = [];
   if (f.type === 0) {
-    // A directory entry (e.g. a stale nested-repo marker): ignore the folder
+    // A directory entry (for example, a stale nested-repo marker): ignore the folder
     // itself with a trailing slash. This is the way to clear nested-repo
     // phantoms — Lore's status filter excludes ignored paths.
     opts.push({ pattern: `${path}/`, label: "This folder" });
@@ -655,6 +655,64 @@ function wirePicker() {
   });
 }
 
+/** Fetch the server's hosted repositories into the Server repositories dialog
+ * (server URL from the field, or the default when blank). */
+async function loadServerRepos() {
+  const server = $("#server-url").value.trim();
+  const data = await apiGet(`/api/remote-repos${server ? `?url=${encodeURIComponent(server)}` : ""}`);
+  $("#server-url").value = data.base;
+  renderServerRepos(data.repos);
+}
+
+/**
+ * Render the repositories the server hosts. Each row offers Clone (hands the
+ * remote URL to the clone dialog to pick a destination) and ✕ Delete (removes
+ * it from the server by id — see the server's deleteRemoteRepo). Repos already
+ * cloned on this machine are tagged so the real ones stand out from stale ones.
+ */
+function renderServerRepos(repos) {
+  const ul = $("#server-repos");
+  ul.innerHTML = "";
+  ul.hidden = false;
+  if (repos.length === 0) {
+    ul.innerHTML = `<li class="muted">— no repositories on this server —</li>`;
+    return;
+  }
+  for (const r of repos) {
+    const li = document.createElement("li");
+    const tag = r.tracked ? `<span class="p-tag">cloned</span>` : "";
+    li.innerHTML =
+      `<span class="p-name" title="${r.url}">${r.name}</span>${tag}` +
+      `<button type="button" class="p-clone">Clone</button>` +
+      `<button type="button" class="p-del" title="Delete from server">✕</button>`;
+    li.querySelector(".p-clone").onclick = () => cloneServerRepo(r);
+    li.querySelector(".p-del").onclick = () => deleteServerRepo(r);
+    ul.appendChild(li);
+  }
+}
+
+/** Start cloning a server repo: prefill and open the clone-from-URL dialog so
+ * the user only has to choose a destination folder. */
+function cloneServerRepo(r) {
+  $("#server-dialog").close();
+  $("#clone-url").value = r.url;
+  $("#clone-dest").value = "";
+  $("#clone-dialog").showModal();
+}
+
+/** Delete a server-side repository after confirmation, then refresh the list. */
+async function deleteServerRepo(r) {
+  const warn = r.tracked ? "\n\nThis is one of your local working copies — its files on disk are left untouched, but it will no longer exist on the server." : "";
+  if (!confirm(`Delete "${r.name}" from the server? This cannot be undone.${warn}`)) return;
+  try {
+    await apiPost("/api/remote-repos", { _method: "DELETE", id: r.id, base: $("#server-url").value.trim() });
+    toast(`Deleted ${r.name}`);
+    await loadServerRepos();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
 function wire() {
   $("#add-btn").onclick = addRepo;
   $("#refresh-btn").onclick = refreshActive;
@@ -664,6 +722,29 @@ function wire() {
   $("#sync-btn").onclick = () => runOp("Syncing…", "/api/sync", { path: state.active });
   $("#push-btn").onclick = () => runOp("Pushing…", "/api/push", { path: state.active });
   $("#op-close").onclick = () => ($("#op-overlay").hidden = true);
+
+  // Server repositories: open the dialog and list immediately (it falls back to
+  // the default server when the field is blank, so the catalog shows at once).
+  $("#server-btn").onclick = async () => {
+    $("#server-repos").hidden = true;
+    $("#server-dialog").showModal();
+    try {
+      await loadServerRepos();
+    } catch (err) {
+      toast(err.message, true);
+    }
+  };
+  $("#server-refresh").onclick = async () => {
+    const btn = $("#server-refresh");
+    btn.disabled = true;
+    try {
+      await loadServerRepos();
+    } catch (err) {
+      toast(err.message, true);
+    } finally {
+      btn.disabled = false;
+    }
+  };
 
   $("#clone-btn").onclick = () => $("#clone-dialog").showModal();
   $("#clone-dest-browse").onclick = async () => {

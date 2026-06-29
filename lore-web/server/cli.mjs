@@ -11,7 +11,7 @@ const LORE_BIN = process.env.LORE_CLI ?? "lore";
 
 /**
  * Run a `lore` subcommand to completion, capturing its output.
- * @param {string[]} args CLI arguments, e.g. ["auth", "list"]
+ * @param {string[]} args CLI arguments, such as ["auth", "list"]
  * @param {{ repoPath?: string }} [opts]
  * @returns {Promise<{ code: number, stdout: string, stderr: string }>}
  */
@@ -32,7 +32,7 @@ export function runCli(args, opts = {}) {
 }
 
 /**
- * Report whether the CLI has any stored identity (i.e. the user has logged in).
+ * Report whether the CLI has any stored identity — whether the user has logged in.
  * @returns {Promise<boolean>}
  */
 export async function isLoggedIn() {

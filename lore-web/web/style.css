@@ -17,7 +17,7 @@
 
 * { box-sizing: border-box; }
 /* The `hidden` attribute must win over component `display` rules below
-   (e.g. .overlay { display: grid }), otherwise hidden panels stay visible. */
+   (for example, .overlay { display: grid }), otherwise hidden panels stay visible. */
 [hidden] { display: none !important; }
 html, body { margin: 0; height: 100%; }
 body {
@@ -173,6 +173,17 @@ dialog::backdrop { background: rgba(0,0,0,0.6); }
 .picker-list li.muted { cursor: default; color: var(--muted); }
 .picker-list .p-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .picker-list .p-tag { margin-left: auto; font-size: 10px; text-transform: uppercase; letter-spacing: .04em; color: var(--accent); border: 1px solid var(--accent); border-radius: 4px; padding: 0 5px; }
+/* The Server repositories list is short and inline, not a full picker. Rows are
+   not selectable — each carries its own Clone and Delete actions instead. */
+#server-repos { height: auto; max-height: 280px; }
+#server-repos li { cursor: default; }
+#server-repos .p-name { margin-right: auto; }
+#server-repos .p-tag { margin-left: 0; }
+#server-repos .p-clone { margin-left: 8px; border: 1px solid var(--border); background: var(--panel-2); color: var(--fg, inherit); cursor: pointer; font-size: 11px; padding: 2px 8px; border-radius: 4px; opacity: 0; }
+#server-repos .p-del { margin-left: 6px; border: none; background: transparent; color: var(--muted); cursor: pointer; font-size: 13px; line-height: 1; padding: 2px 6px; border-radius: 4px; opacity: 0; }
+#server-repos li:hover .p-clone, #server-repos li:hover .p-del { opacity: 1; }
+#server-repos .p-clone:hover { border-color: var(--accent); color: var(--accent); }
+#server-repos .p-del:hover { background: var(--danger, #c0392b); color: #fff; }
 .picker-new { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
 .picker menu { display: flex; gap: 8px; justify-content: flex-end; margin: 0; padding: 0; }
 

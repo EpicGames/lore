@@ -45,3 +45,16 @@ test("branches keeps only BRANCH_LIST_ENTRY events", () => {
   ];
   assert.deepEqual(xform.branches(events), [{ name: "main" }]);
 });
+
+test("remoteRepos keeps only REPOSITORY_LIST_ENTRY events", () => {
+  const events = [
+    ev("REPOSITORY_LIST_BEGIN", {}),
+    ev("REPOSITORY_LIST_ENTRY", { id: "abc", name: "ui-demo" }),
+    ev("REPOSITORY_LIST_ENTRY", { id: "def", name: "scratch" }),
+    ev("REPOSITORY_LIST_END", {}),
+  ];
+  assert.deepEqual(xform.remoteRepos(events), [
+    { id: "abc", name: "ui-demo" },
+    { id: "def", name: "scratch" },
+  ]);
+});

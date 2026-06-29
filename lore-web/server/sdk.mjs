@@ -76,7 +76,7 @@ function messageFromErrors(errors, fallback) {
 /**
  * Run a Lore verb to completion and return all of its events. Throws a
  * LoreVerbError if the operation fails.
- * @param {string} verb e.g. "revisionHistory"
+ * @param {string} verb such as "revisionHistory"
  * @param {Record<string, unknown>} globalArgs at minimum `{ repositoryPath }`
  * @param {Record<string, unknown>} [args] verb-specific arguments
  * @returns {Promise<LoreEvt[]>}
@@ -102,7 +102,7 @@ export async function collect(verb, globalArgs, args = {}) {
     }
   } catch (err) {
     // asyncIter throws LoreError on a non-zero return; the COMPLETE detail
-    // captured above is the canonical source, so just mark failure.
+    // captured above is the canonical source, so mark failure and move on.
     if (!(err instanceof LoreError)) throw err;
     status = status || -1;
   }

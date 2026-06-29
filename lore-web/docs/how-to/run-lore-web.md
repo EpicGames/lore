@@ -29,14 +29,17 @@ collaborator who syncs with your server but runs no server of their own.
 
 1. Send the `lore-web` folder to the collaborator (it is self-contained — they do
    not need to clone the repository). They run `setup.bat` (or `npm install`) once.
-2. Authenticate the CLI against the host's server once, in a terminal:
+2. If the host's server requires authentication, sign in once against it in a
+   terminal (servers with no auth configured can skip this):
    ```sh
    lore login lore://<host>:41337
    ```
    This stores an identity the SDK reuses for `clone`, `sync`, and `push`.
 3. Start lore-web (`npm start`) and clone the host's repository: click
-   **Clone a repository…**, enter the remote URL
-   (`lore://<host>:41337/<org>/<repo>`) and a destination folder.
+   **Server repositories…** to browse the host's repositories, then **Clone** the
+   one you want and pick a destination folder. (Already-cloned repos are tagged, and
+   each row's ✕ deletes that repository from the server.) To clone a known URL
+   directly instead, use **Clone from URL…**.
 4. Work normally. Use **Push** to send commits to the host and **Sync** to pull
    the host's latest revision. Progress streams live in the dialog.
 

@@ -16,7 +16,8 @@
         <ul id="repo-list" class="repo-list"></ul>
         <footer class="side-foot">
           <button id="add-btn" class="primary">Add a repository…</button>
-          <button id="clone-btn" class="ghost">Clone a repository…</button>
+          <button id="server-btn" class="ghost">Server repositories…</button>
+          <button id="clone-btn" class="ghost">Clone from URL…</button>
         </footer>
       </aside>
 
@@ -96,10 +97,27 @@
       </div>
     </div>
 
-    <!-- Clone dialog -->
+    <!-- Server repositories: browse what the server hosts, then clone or delete -->
+    <dialog id="server-dialog">
+      <form method="dialog" class="clone-form">
+        <h3>Server repositories</h3>
+        <label>Server URL
+          <div class="field-row">
+            <input id="server-url" type="text" placeholder="lore://host:41337" />
+            <button type="button" id="server-refresh" class="ghost">List</button>
+          </div>
+        </label>
+        <ul id="server-repos" class="picker-list" hidden></ul>
+        <menu>
+          <button value="cancel">Close</button>
+        </menu>
+      </form>
+    </dialog>
+
+    <!-- Clone dialog (clone directly from a known remote URL) -->
     <dialog id="clone-dialog">
       <form method="dialog" class="clone-form">
-        <h3>Clone a repository</h3>
+        <h3>Clone from URL</h3>
         <label>Remote URL<input id="clone-url" type="text" placeholder="lore://host:41337/org/repo" /></label>
         <label>Destination folder
           <div class="field-row">

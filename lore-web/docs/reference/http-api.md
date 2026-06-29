@@ -31,6 +31,8 @@ is read live from the Lore SDK on each request; nothing is cached server-side.
 | GET | `/api/branches` | `path` | Branch list. |
 | GET | `/api/diff` | `path`, `file` | Unified diff for one file. |
 | GET | `/api/auth` | — | `{ loggedIn }` — whether the CLI has a stored identity. |
+| GET | `/api/remote-repos` | `url?` | Repositories a Lore server hosts, for picking one to clone or delete. `url` is the server base; omitted, it defaults to the same remote the Add flow suggests. Returns `{ base, repos }` where each repo is `{ id, name, url, idUrl, tracked }` — `url` is the name-based clone URL, `idUrl` the id-based one, and `tracked` is true when the repo is one of this machine's working copies (matched by `.lore/id`). |
+| DELETE | `/api/remote-repos` | `{ id, base? }` | Delete a repository from its server by `id` (names of repos created without an owner do not resolve). `base` defaults to the suggested remote. Returns `{ ok: true }`, confirmed by re-listing — the underlying CLI reports a spurious error and exit 0 even on success, so its status is ignored. |
 
 ### Writes
 

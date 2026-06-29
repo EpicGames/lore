@@ -92,6 +92,13 @@ export function diff(events) {
     .map((e) => e.data);
 }
 
+/** Repositories a server hosts, from `repositoryList`. @param {LoreEvt[]} events */
+export function remoteRepos(events) {
+  return events
+    .filter((e) => e.tag === "REPOSITORY_LIST_ENTRY")
+    .map((e) => ({ id: e.data?.id, name: e.data?.name }));
+}
+
 /** Branch/revision summary used to enrich the repo list. @param {LoreEvt[]} events */
 export function repoSummary(events) {
   for (const e of events) {
