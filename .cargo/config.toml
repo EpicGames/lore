@@ -97,12 +97,14 @@ rustflags = [
 #  The rust flags for this would be ["-C", "linker-flavor=lld-link"]
 
 [target.aarch64-unknown-linux-gnu]
-# Target Graviton3+
+# Keep the default aarch64 Linux build portable. Release jobs that produce a
+# Neoverse 512-bit vector/SVE artifact can opt in by setting a full
+# CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS replacement that includes
+# target-cpu=neoverse-512tvb, plus LORE_AARCH64_NEOVERSE_512TVB=1 for C sources.
 rustflags = [
     "--cfg", "tokio_unstable",
     "-C", "force-unwind-tables=yes",
     "-C", "force-frame-pointers=yes",
-    "-C", "target-cpu=neoverse-512tvb",
     # Leave debug symbols in the binary for now, we want these in place for the server binary, but still split them via
     # package-cli.sh for CLI binaries.
     "-C", "split-debuginfo=off",
