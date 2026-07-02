@@ -6,15 +6,13 @@ telemetry integration, or replication is configured.
 ## Prerequisites
 
 - Docker with BuildKit support
-- On Apple Silicon (M-series Macs), builds must target `linux/amd64` due to Graviton-specific
-  compiler flags in `.cargo/config.toml` for `aarch64-unknown-linux-gnu`
 
 ## Building
 
 From the repository root:
 
 ```sh
-docker build --platform linux/amd64 -f lore-server/Dockerfile -t loreserver .
+docker build -f lore-server/Dockerfile -t loreserver .
 ```
 
 The build compiles the `loreserver` binary and generates self-signed TLS certificates for QUIC

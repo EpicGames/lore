@@ -5,6 +5,8 @@ use std::path::Path;
 
 include!("../build-helper.rs");
 
+const AARCH64_NEOVERSE_512TVB_ENV: &str = "LORE_AARCH64_NEOVERSE_512TVB";
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Populate environment with build details
     vergen::Emitter::default()
@@ -25,7 +27,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .opt_level(3)
         .includes(Some(native_dir.join("thirdparty")));
 
-    if platform == "linux" && arch == "aarch64" {
+    println!("cargo:rerun-if-env-changed={}", AARCH64_NEOVERSE_512TVB_ENV);
+
+    if platform == "linux" && arch == "aarch64" && env_flag_enabled(AARCH64_NEOVERSE_512TVB_ENV) {
         cc_builder.flag("-mcpu=neoverse-512tvb");
     }
 
@@ -47,4 +51,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     cc_builder.clone().file(rpmalloc_source).compile("rpmalloc");
 
     Ok(())
+}
+
+fn env_flag_enabled(name: &str) -> bool {
+    env::var(name)
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
