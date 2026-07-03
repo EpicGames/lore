@@ -11,6 +11,8 @@ const state = {
   active: null, // repo path
   tab: "changes",
   selectedFile: null,
+  defaultRemote: "",
+  discoveredServers: [],
 };
 
 async function apiGet(path) {
@@ -736,6 +738,72 @@ async function deleteServerRepo(r) {
   }
 }
 
+/** Load and display the current remote server configuration. */
+async function loadConfig() {
+  try {
+    const data = await apiGet("/api/config");
+    state.defaultRemote = data.defaultRemote || "";
+    state.discoveredServers = data.discoveredServers || [];
+    $("#settings-remote").value = state.defaultRemote;
+    renderDiscoveredServers();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+/** Display the list of discovered servers in the settings dialog. */
+function renderDiscoveredServers() {
+  const container = $("#discovered-servers");
+  const list = $("#discovered-list");
+  if (state.discoveredServers.length === 0) {
+    container.hidden = true;
+    return;
+  }
+  container.hidden = false;
+  list.innerHTML = "";
+  for (const server of state.discoveredServers) {
+    const li = document.createElement("li");
+    li.textContent = server.url;
+    li.onclick = () => {
+      $("#settings-remote").value = server.url;
+    };
+    list.appendChild(li);
+  }
+}
+
+/** Trigger manual discovery of Lore servers and update the list. */
+async function discoverServers() {
+  const btn = $("#settings-discover");
+  btn.disabled = true;
+  try {
+    const data = await apiGet("/api/discover");
+    state.discoveredServers = data.discoveredServers || [];
+    if (state.discoveredServers.length === 0) {
+      toast("No Lore servers found on the local network");
+    } else {
+      toast(`Found ${state.discoveredServers.length} server${state.discoveredServers.length === 1 ? "" : "s"}`);
+    }
+    renderDiscoveredServers();
+  } catch (err) {
+    toast(err.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/** Save the remote server configuration and refresh repos. */
+async function saveConfig() {
+  const url = $("#settings-remote").value.trim();
+  try {
+    await apiPost("/api/config", { defaultRemote: url });
+    toast(url ? "Remote server configured" : "Remote server cleared");
+    state.defaultRemote = url;
+    await loadRepos();
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
 function wire() {
   $("#add-btn").onclick = addRepo;
   $("#refresh-btn").onclick = refreshActive;
@@ -814,6 +882,21 @@ function wire() {
       }
     }, 0);
   };
+
+  // Settings dialog
+  $("#settings-btn").onclick = async () => {
+    await loadConfig();
+    $("#settings-dialog").showModal();
+  };
+  $("#settings-discover").onclick = () => discoverServers();
+  $("#settings-go").onclick = () => {
+    saveConfig();
+    $("#settings-dialog").close();
+  };
+  $("#settings-dialog").addEventListener("cancel", (e) => {
+    e.preventDefault();
+    $("#settings-dialog").close();
+  });
 
   wirePicker();
   wireInit();

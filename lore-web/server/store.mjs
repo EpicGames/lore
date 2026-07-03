@@ -14,16 +14,21 @@ import { log } from "./log.mjs";
 const STORE_PATH =
   process.env.LORE_WEB_STORE ?? join(homedir(), ".lore-web", "store.json");
 
-/** @type {{ repos: RepoEntry[] }} */
-let state = { repos: [] };
+/** @type {{ repos: RepoEntry[], defaultRemote?: string }} */
+let state = { repos: [], defaultRemote: process.env.LORE_WEB_DEFAULT_REMOTE ?? "" };
 
+/**
+ * Load persisted state from `STORE_PATH` into module state, if the file exists.
+ * A missing file is normal (first run) and leaves the initial empty state in
+ * place. A corrupt file must not take the app down, so it is treated the same
+ * way, with a warning logged for visibility.
+ */
 function loadFromDisk() {
   if (!existsSync(STORE_PATH)) return;
   try {
     const parsed = JSON.parse(readFileSync(STORE_PATH, "utf8"));
     if (parsed && Array.isArray(parsed.repos)) state = parsed;
   } catch (err) {
-    // A corrupt store should not take the app down; start empty and warn.
     log.warn("store unreadable, starting empty", {
       path: STORE_PATH,
       error: err instanceof Error ? err.message : String(err),
@@ -31,6 +36,7 @@ function loadFromDisk() {
   }
 }
 
+/** Write the current module state to `STORE_PATH`, creating its directory if needed. */
 function persist() {
   mkdirSync(dirname(STORE_PATH), { recursive: true });
   writeFileSync(STORE_PATH, JSON.stringify(state, null, 2));
@@ -80,4 +86,26 @@ export function removeRepo(path) {
   const removed = state.repos.length < before;
   if (removed) persist();
   return removed;
+}
+
+/**
+ * Get the configured default remote server URL.
+ * @returns {string} the remote server URL or empty string if not set
+ */
+export function getDefaultRemote() {
+  return state.defaultRemote || "";
+}
+
+/**
+ * Set the default remote server URL for repositories. Validates the URL format.
+ * @param {string} url the remote server URL, for example "lore://127.0.0.1:41337"
+ * @throws {Error} if URL is malformed
+ */
+export function setDefaultRemote(url) {
+  const trimmed = (url || "").trim();
+  if (trimmed && !trimmed.match(/^[a-z][a-z0-9+.-]*:\/\/[^/]+/i)) {
+    throw new Error(`invalid remote URL format: "${trimmed}"`);
+  }
+  state.defaultRemote = trimmed;
+  persist();
 }

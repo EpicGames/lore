@@ -22,6 +22,14 @@ is read live from the Lore SDK on each request; nothing is cached server-side.
 | POST | `/api/repos` | `{ path, label }` | Start tracking a working copy. Rejects non-repos. |
 | DELETE | `/api/repos` | `{ path }` | Stop tracking. Always succeeds, even if the folder is gone. |
 
+### Configuration
+
+| Method | Path | Body / query | Description |
+| --- | --- | --- | --- |
+| GET | `/api/config` | — | Get the configured default remote server and list of auto-discovered servers. Returns `{ defaultRemote, discoveredServers }` where `discoveredServers` is an array of `{ url, label }`. |
+| POST | `/api/config` | `{ defaultRemote }` | Set the default remote server URL. Validates URL format. Returns `{ ok: true }`. |
+| GET | `/api/discover` | — | Manually trigger discovery of Lore servers on the local network and return the list. Returns `{ discoveredServers }`. |
+
 ### Reads
 
 | Method | Path | Query | Description |

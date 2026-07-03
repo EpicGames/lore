@@ -12,6 +12,7 @@
         <header class="brand">
           <span class="logo">lore</span><span class="logo-web">web</span>
           <span id="conn" class="conn" title="live connection">●</span>
+          <button id="settings-btn" class="icon-btn" title="Settings">⚙</button>
         </header>
         <ul id="repo-list" class="repo-list"></ul>
         <footer class="side-foot">
@@ -194,6 +195,31 @@
           <button type="button" id="picker-choose" class="primary">Select this folder</button>
         </menu>
       </div>
+    </dialog>
+
+    <!-- Settings dialog — configure remote server -->
+    <dialog id="settings-dialog">
+      <form method="dialog" class="clone-form">
+        <h3>Settings</h3>
+        <label>Remote server
+          <div class="settings-field">
+            <input id="settings-remote" type="text" placeholder="lore://host:41337" />
+            <button type="button" id="settings-discover" class="ghost" title="Search for local servers">⟲</button>
+          </div>
+        </label>
+        <div id="discovered-servers" class="discovered-servers" hidden>
+          <p class="muted">Discovered servers:</p>
+          <ul id="discovered-list" class="discovered-list"></ul>
+        </div>
+        <p class="muted">
+          Format: <code>lore://IP-or-hostname:port</code><br>
+          Leave empty to disable remote operations.
+        </p>
+        <menu>
+          <button value="cancel">Cancel</button>
+          <button id="settings-go" value="default" class="primary">Save</button>
+        </menu>
+      </form>
     </dialog>
 
     <div id="toast" class="toast" hidden></div>

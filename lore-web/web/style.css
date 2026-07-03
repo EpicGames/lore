@@ -61,6 +61,8 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); }
 .brand .logo-web { color: var(--accent); }
 .brand .conn { margin-left: auto; font-size: 12px; color: var(--red); }
 .brand .conn.live { color: var(--green); }
+.icon-btn { margin-left: 10px; padding: 2px 6px; font-size: 14px; line-height: 1; background: transparent; border: 1px solid var(--border); }
+.icon-btn:hover { border-color: var(--accent); color: var(--accent); }
 .add-repo { display: flex; gap: 6px; padding: 0 12px 12px; }
 .add-repo input { flex: 1; min-width: 0; }
 .repo-list { list-style: none; margin: 0; padding: 0 8px; overflow-y: auto; flex: 1; }
@@ -203,6 +205,14 @@ dialog::backdrop { background: rgba(0,0,0,0.6); }
 /* Per-file ignore button */
 .files .f-ignore { color: var(--muted); border: none; background: none; padding: 2px 6px; }
 .files .f-ignore:hover { color: var(--accent); }
+
+/* Settings dialog */
+.settings-field { display: flex; gap: 6px; }
+.settings-field input { flex: 1; min-width: 0; }
+.discovered-servers { margin-top: 8px; padding: 10px; background: var(--panel-2); border-radius: var(--radius); }
+.discovered-list { list-style: none; margin: 8px 0 0; padding: 0; }
+.discovered-list li { padding: 6px 8px; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 4px; cursor: pointer; font-family: ui-monospace, monospace; font-size: 12px; }
+.discovered-list li:hover { border-color: var(--accent); background: var(--panel); }
 
 /* Toast */
 .toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 16px; z-index: 60; }

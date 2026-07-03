@@ -18,6 +18,7 @@ import { addClient, broadcastRefresh } from "./events.mjs";
 import { watchRepo, unwatchRepo } from "./watcher.mjs";
 import { isLoggedIn, runCli } from "./cli.mjs";
 import { setupLoreignore, appendIgnorePattern, hasLoreignore, hasGitignore } from "./loreignore.mjs";
+import { discoverServers } from "./discovery.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const WEB_DIR = join(HERE, "..", "web");
@@ -31,13 +32,16 @@ function isRepo(path) {
 
 /**
  * The remote server base to assign when initializing a brand-new repository, so
- * the user never types one. We reuse the remote of an already-tracked repo
- * (almost always the same self-hosted server), falling back to an env override
- * and finally the default local Lore server. The repo name is appended later;
- * repositoryCreate mints the per-repo UUID that distinguishes repos on a server.
+ * the user never types one. Reads from configured default remote, falls back to
+ * an already-tracked repo's remote, or the default local Lore server. The repo
+ * name is appended later; repositoryCreate mints the per-repo UUID that
+ * distinguishes repos on a server.
  * @returns {string} a remote base URL with no trailing repo-name path component
  */
 function defaultRemoteBase() {
+  const configured = store.getDefaultRemote();
+  if (configured) return configured;
+
   for (const r of store.listRepos()) {
     for (const name of ["config.toml", "config"]) {
       const cfg = join(r.path, ".lore", name);
@@ -50,7 +54,7 @@ function defaultRemoteBase() {
       }
     }
   }
-  return process.env.LORE_WEB_DEFAULT_REMOTE ?? "lore://127.0.0.1:41337";
+  return "lore://127.0.0.1:41337";
 }
 
 /** The remote_url recorded in a repo's .lore config, or null if none/unreadable. */
@@ -163,12 +167,12 @@ async function listRepos(res) {
         try {
           info = xform.repoSummary(await collect("repositoryStatus", { repositoryPath: r.path }, { staged: false }));
         } catch (err) {
-          log.debug("repo enrich failed", { path: r.path });
+          log.debug("repo enrich failed", { path: r.path, message: err instanceof Error ? err.message : String(err) });
         }
         try {
           organization = (await readOrg(r.path)).organization;
         } catch (err) {
-          log.debug("repo org read failed", { path: r.path });
+          log.debug("repo org read failed", { path: r.path, message: err instanceof Error ? err.message : String(err) });
         }
       }
       return { ...r, exists, organization, ...info };
@@ -389,6 +393,55 @@ async function deleteRemoteRepo(req, res) {
 }
 
 /**
+ * GET /api/config — return the configured default remote server and discovered servers.
+ * @param {import("node:http").ServerResponse} res
+ */
+async function getConfig(res) {
+  let discovered = [];
+  try {
+    discovered = await discoverServers();
+  } catch (err) {
+    log.debug("server discovery failed", { message: err instanceof Error ? err.message : String(err) });
+  }
+  return sendJson(res, 200, {
+    defaultRemote: store.getDefaultRemote(),
+    discoveredServers: discovered,
+  });
+}
+
+/**
+ * POST /api/config — set the default remote server URL.
+ * @param {import("node:http").IncomingMessage} req
+ * @param {import("node:http").ServerResponse} res
+ */
+async function setConfig(req, res) {
+  const body = await readBody(req);
+  const defaultRemote = typeof body.defaultRemote === "string" ? body.defaultRemote.trim() : "";
+  try {
+    store.setDefaultRemote(defaultRemote);
+    log.info("remote server configured", { url: defaultRemote ? "[configured]" : "[cleared]" });
+    return sendJson(res, 200, { ok: true });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return sendJson(res, 400, { error: message });
+  }
+}
+
+/**
+ * GET /api/discover — manually trigger discovery of Lore servers on the local network.
+ * @param {import("node:http").ServerResponse} res
+ */
+async function manualDiscover(res) {
+  try {
+    const discovered = await discoverServers();
+    return sendJson(res, 200, { discoveredServers: discovered });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return sendJson(res, 500, { error: message });
+  }
+}
+
+/**
  * Drive roots present on this machine, used as the picker's top "This PC" level.
  * @returns {string[]} drive-root paths (Windows: C:\ … Z:\; POSIX: "/")
  */
@@ -528,6 +581,10 @@ const server = createServer(async (req, res) => {
 
     if (p === "/api/org" && req.method === "GET") return await getOrg(res, repoPath);
     if (p === "/api/org" && req.method === "POST") return await setOrg(req, res);
+
+    if (p === "/api/config" && req.method === "GET") return await getConfig(res);
+    if (p === "/api/config" && req.method === "POST") return await setConfig(req, res);
+    if (p === "/api/discover" && req.method === "GET") return await manualDiscover(res);
 
     if (p === "/api/history" && req.method === "GET") {
       const length = Number(q.get("length") ?? 50);
