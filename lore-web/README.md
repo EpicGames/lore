@@ -58,7 +58,16 @@ Then click **Add**, paste the path to a Lore working copy, and you're in.
 | `LORE_WEB_HOST` | `127.0.0.1` | bind address — keep it loopback |
 | `LORE_WEB_LOG_LEVEL` | `info` | `trace`…`error` |
 | `LORE_WEB_STORE` | `~/.lore-web/store.json` | tracked-repo list location |
+| `LORE_WEB_DEFAULT_REMOTE` | none | initial remote server URL, seen once on first run |
 | `LORE_CLI` | `lore` | path to the `lore` CLI (login/service fallback) |
+
+The remote server (the `lore://host:port` a new repository is created under, and
+where **Server repositories…**/**Clone from URL…** look) is set from the app
+itself: click the **⚙** button beside the `lore web` logo. This is how a
+collaborator points lore-web at their host's server — see
+[Set up a collaborator](docs/how-to/run-lore-web.md#set-up-a-collaborator-no-server).
+`LORE_WEB_DEFAULT_REMOTE` only seeds the value before it has ever been set
+through the app; once configured, the app's own setting takes over.
 
 > **Security:** lore-web exposes full read/write access to your repositories and
 > is bound to loopback only. Never expose it on a network. The *Lore server* is

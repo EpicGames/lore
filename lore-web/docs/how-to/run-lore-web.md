@@ -35,12 +35,17 @@ collaborator who syncs with your server but runs no server of their own.
    lore login lore://<host>:41337
    ```
    This stores an identity the SDK reuses for `clone`, `sync`, and `push`.
-3. Start lore-web (`npm start`) and clone the host's repository: click
-   **Server repositories…** to browse the host's repositories, then **Clone** the
-   one you want and pick a destination folder. (Already-cloned repos are tagged, and
-   each row's ✕ deletes that repository from the server.) To clone a known URL
-   directly instead, use **Clone from URL…**.
-4. Work normally. Use **Push** to send commits to the host and **Sync** to pull
+3. Start lore-web (`npm start`), click the **⚙** button beside the `lore web`
+   logo, and enter the host's server URL (`lore://<host>:41337`). Click **Search
+   again** first — lore-web checks common local addresses and lists any it finds,
+   so you may only need to select one. Without this step, lore-web defaults to a
+   local server address that will not reach the host's machine.
+4. Clone the host's repository: click **Server repositories…** to browse the
+   host's repositories, then **Clone** the one you want and pick a destination
+   folder. (Already-cloned repos are tagged, and each row's ✕ deletes that
+   repository from the server.) To clone a known URL directly instead, use
+   **Clone from URL…**.
+5. Work normally. Use **Push** to send commits to the host and **Sync** to pull
    the host's latest revision. Progress streams live in the dialog.
 
 ## Change a repository's organization
