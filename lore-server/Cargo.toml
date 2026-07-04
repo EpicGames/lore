@@ -27,6 +27,7 @@ opentelemetry = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
 parking_lot = { workspace = true }
 pin-project = { workspace = true }
+postgres = { workspace = true }
 prost-types = { workspace = true }
 quinn = { workspace = true }
 rand = { workspace = true }

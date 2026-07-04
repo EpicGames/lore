@@ -90,6 +90,7 @@ opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] }
 opentelemetry-semantic-conventions = { version = "0.31.0", features = ["semconv_experimental"] }
 parking_lot = { version = "0.12.4", features = ["arc_lock"] }
 pin-project = "1.1.10"
+postgres = { version = "0.19.14", features = ["with-uuid-1"] }
 proc-macro2 = "1"
 prost = "0.14.1"
 prost-types = "0.14.1"
