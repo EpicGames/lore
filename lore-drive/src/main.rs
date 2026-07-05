@@ -532,6 +532,7 @@ async fn main() -> anyhow::Result<()> {
         .layer(Extension(state));
 
     // ── Listen ───────────────────────────────────────────────────────────────
+    //let addr = SocketAddr::from(([127, 0, 0, 1], cli.port));
     let addr = SocketAddr::from(([0, 0, 0, 0], cli.port));
     info!("lore-drive listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;

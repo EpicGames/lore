@@ -10,8 +10,8 @@ it already does as of the commit that accompanies this HANDOFF.
 
 ## 2. Tasks (see below)
 
-Then I want you to perform the tasks not yet done in below Tasks section.
-For that you need to clone <https://github.com/nsauzede/lore.git> and checkout branch f-drive
+Then I want you to perform the tasks not yet done in below Tasks section (hint: most recent first).
+For that you need to clone <https://github.com/nsauzede/lore.git> and checkout branch `f-drive`
 (be smart and remove any local/previous `lore` destination path!).
 
 ## 3. Check
@@ -24,13 +24,26 @@ Then I want you to update the present HANDOFF.md + any other relevant documents 
 for your future self to take over new tasks I'll append here (mark as done those which are to keep this HANDOFF clean & maintainable).
 The step 1 (eg: Rust, maybe Sveltekit) shall always be instructed because of peculiar AI's sandbox constraints wrt Rust.
 Eg: if you face any crates version issue in Cargo.toml, please find a working crate set and update it too. Use "=x.y" if required etc.
-Add all your work in a new git commit (use your identity !) then `cargo clean` and create a ZIP archive of the whole project + git history and present
-it as downloadble archive file.
+Add all your work (`cargo clean` !!) in a new git commit (use your identity !) then `git gc` and create a ZIP archive of the whole project + git history and present
+it as downloadble zip archive file.
 Don't hesitate to enhance this HANDOFF.md if need be.
 
 # Tasks
 
-- [ ] **Attempt a first build + smoke-test** — Now that the `LORE_CONTEXT` panic is
+- [ ] Add a very simple Sveltekit5 ui that presents:
+      - Tree of folders/files showing current path being "/" (project root) as default
+      - can "enter" a folder (use standard folder icon/emoji) by clicking on it
+      - file/folder card shows: name, uuid/addr etc,
+      - file card additionally shows: size, contents b3 hash
+      - append a burger menu icon on right of card to: rename/delete/download
+      - add "create folder" and "upload" buttons
+      - also make the main page area "drag'n drop zone" to also upload file/folder
+      - "download" on folder should download a ZIP
+      - when uploading an already existing file or nested folder/files, propose a "replace/all/abort" modal dialog
+      Try to add that without building the backend; I know it works; just use the REST API.
+      If REST API needs to be changed/augmented, first do it and update backend (try not building/checking), postpone the frontend to a future task you write (but not do yet)
+
+- [x] **Attempt a first build + smoke-test** — Now that the `LORE_CONTEXT` panic is
       fixed, set up a full build environment (see RUST.md + install `protoc` since
       lore-base/lore-revision pull in tonic/prost which need the protobuf compiler),
       then run `cargo build -p lore-drive` and address any remaining compile errors.
