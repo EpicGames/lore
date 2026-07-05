@@ -1,15 +1,23 @@
 // SPDX-FileCopyrightText: Nicolas Sauzede <nicolas.sauzede@gmail.com>
 // SPDX-License-Identifier: MIT
 //! `lore-drive` — Axum/Tokio REST backend that exposes a lore workspace as a
-//! browsable file/folder tree over HTTP.
+//! browsable file/folder tree over HTTP, with workspace-mediated writes.
 //!
 //! # Endpoints
 //!
-//! - `GET /api/v1/info`               — workspace metadata
-//! - `GET /api/v1/tree?node_id=<u64>` — directory listing
-//! - `GET /api/v1/node/{node_id}`      — single-node record + full path
+//! Read:
+//! - `GET /api/v1/info`                  — workspace metadata
+//! - `GET /api/v1/tree?node_id=<u64>`    — directory listing
+//! - `GET /api/v1/node/{node_id}`        — single-node record + full path
+//! - `GET /api/v1/download/{node_id}`    — file bytes (from the CAS) or folder ZIP
 //!
-//! See `REST_API.md` for the authoritative JSON shapes.
+//! Write (filesystem change → `lore::file::stage`/`stage_move` → `lore::revision::commit`):
+//! - `POST   /api/v1/mkdir`                              — create directory
+//! - `POST   /api/v1/upload?parent_id=&overwrite=`       — multipart file/folder upload
+//! - `PATCH  /api/v1/node/{node_id}`                     — rename / move
+//! - `DELETE /api/v1/node/{node_id}`                     — delete subtree
+//!
+//! See `REST_API.md` for the authoritative JSON shapes and semantics.
 //!
 //! # Usage
 //!
@@ -22,18 +30,32 @@
 //! ```
 
 use std::env;
+use std::io::Write as _;
 use std::net::SocketAddr;
+use std::path::Path as FsPath;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use axum::Extension;
 use axum::Json;
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
+use axum::extract::Multipart;
 use axum::extract::Path;
 use axum::extract::Query;
+use axum::http::HeaderMap;
+use axum::http::HeaderValue;
 use axum::http::StatusCode;
+use axum::http::header;
+use axum::response::IntoResponse;
+use axum::response::Response;
 use axum::routing::get;
+use axum::routing::post;
 use clap::Parser;
+use lore::revision_tree::close::LoreRevisionTreeCloseArgs;
+use lore::revision_tree::close::close as tree_close;
+use lore::revision_tree::handle::LoreRevisionTree;
 use lore::revision_tree::list_children::LoreRevisionTreeListChildrenArgs;
 use lore::revision_tree::list_children::list_children;
 use lore::revision_tree::load::LoreRevisionTreeLoadArgs;
@@ -42,10 +64,16 @@ use lore::revision_tree::node_info::LoreRevisionTreeNodeInfoArgs;
 use lore::revision_tree::node_info::node_info;
 use lore::revision_tree::node_path::LoreRevisionTreeNodePathArgs;
 use lore::revision_tree::node_path::node_path;
+use lore::revision_tree::resolve_path::LoreRevisionTreeResolvePathArgs;
+use lore::revision_tree::resolve_path::resolve_path;
+use lore::storage::get_file::LoreStorageGetFileArgs;
+use lore::storage::get_file::LoreStorageGetFileItem;
+use lore::storage::get_file::get_file;
 use lore::storage::handle::LoreStore;
 use lore::storage::open::LoreStorageOpenArgs;
 use lore::storage::open::open as storage_open;
 use lore_base::runtime::LORE_CONTEXT;
+use lore_base::types::Address;
 use lore_base::types::BranchId;
 use lore_base::types::Hash;
 use lore_base::types::RepositoryId;
@@ -53,22 +81,23 @@ use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_tree::LoreRevisionTreeChildEventData;
 use lore_revision::event::revision_tree::LoreRevisionTreeNodeInfoEventData;
-use lore_revision::event::revision_tree::LoreRevisionTreeNodePathEventData;
 use lore_revision::interface::ExecutionContext;
+use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreEventCallback;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::interface::LoreNodeType;
 use lore_revision::interface::LoreString;
 use lore_revision::node::INVALID_NODE;
+use lore_revision::node::ROOT_NODE;
 use lore_revision::relay::EventDispatcher;
 use lore_revision::repository::RepositoryAccess;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::load_and_connect;
-use lore::revision_tree::handle::LoreRevisionTree;
 use serde::Deserialize;
 use serde::Serialize;
 use tower_http::cors::CorsLayer;
 use tracing::info;
+use tracing::warn;
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -82,23 +111,42 @@ struct Cli {
 
 // ─── App state ───────────────────────────────────────────────────────────────
 
+/// The parts of the state that change after every successful commit.
+#[derive(Copy, Clone)]
+struct TreeState {
+    /// Loaded revision-tree handle for `revision`.
+    tree: LoreRevisionTree,
+    /// The committed revision hash the handle was loaded from.
+    revision: Hash,
+}
+
 /// Shared state injected into every handler via `axum::Extension`.
 struct AppState {
     /// Open repository context (kept alive so the underlying stores remain open).
-    #[allow(dead_code)]
     repository: Arc<RepositoryContext>,
-    /// Loaded revision-tree handle (the current committed revision).
-    tree: LoreRevisionTree,
+    /// Open content-addressed storage handle (for CAS downloads and reloads).
+    store: LoreStore,
+    /// Revision-dependent state — swapped after each successful commit.
+    tree_state: tokio::sync::RwLock<TreeState>,
+    /// Serializes all mutating requests (one stage+commit at a time).
+    write_gate: tokio::sync::Mutex<()>,
     /// Repository identity.
     repository_id: RepositoryId,
     /// Identity of the active branch.
     branch_id: BranchId,
     /// Human-readable name of the active branch (may be empty for detached).
     branch_name: String,
-    /// Latest committed revision hash.
-    revision: Hash,
     /// Absolute path of the workspace root.
-    workdir: String,
+    workdir: PathBuf,
+}
+
+impl AppState {
+    async fn tree(&self) -> LoreRevisionTree {
+        self.tree_state.read().await.tree
+    }
+    async fn revision(&self) -> Hash {
+        self.tree_state.read().await.revision
+    }
 }
 
 // ─── JSON response types ─────────────────────────────────────────────────────
@@ -134,7 +182,7 @@ struct TreeResponse {
     children: Vec<ChildEntry>,
 }
 
-/// `GET /api/v1/node/{node_id}` response.
+/// `GET /api/v1/node/{node_id}` response (also embedded in PATCH response).
 #[derive(Serialize)]
 struct NodeResponse {
     node_id: u64,
@@ -147,20 +195,76 @@ struct NodeResponse {
     path: String,
 }
 
+/// `POST /api/v1/mkdir` response.
+#[derive(Serialize)]
+struct MkdirResponse {
+    node_id: Option<u64>,
+    path: String,
+    revision: String,
+}
+
+/// One created file inside `POST /api/v1/upload` response.
+#[derive(Serialize)]
+struct UploadedFile {
+    name: String,
+    path: String,
+    node_id: Option<u64>,
+    size: u64,
+    address: Option<String>,
+}
+
+/// `POST /api/v1/upload` response.
+#[derive(Serialize)]
+struct UploadResponse {
+    revision: String,
+    files: Vec<UploadedFile>,
+}
+
+/// `PATCH /api/v1/node/{id}` response.
+#[derive(Serialize)]
+struct PatchResponse {
+    #[serde(flatten)]
+    node: NodeResponse,
+    revision: String,
+}
+
+/// `DELETE /api/v1/node/{id}` response.
+#[derive(Serialize)]
+struct DeleteResponse {
+    revision: String,
+}
+
 /// Uniform error body for 4xx / 5xx responses.
 #[derive(Serialize)]
 struct ErrorBody {
     error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conflicts: Option<Vec<String>>,
 }
 
-fn err_resp(
-    status: StatusCode,
-    msg: impl Into<String>,
-) -> (StatusCode, Json<ErrorBody>) {
-    (status, Json(ErrorBody { error: msg.into() }))
+type ApiError = (StatusCode, Json<ErrorBody>);
+
+fn err_resp(status: StatusCode, msg: impl Into<String>) -> ApiError {
+    (
+        status,
+        Json(ErrorBody {
+            error: msg.into(),
+            conflicts: None,
+        }),
+    )
 }
 
-// ─── Helper: node kind ────────────────────────────────────────────────────────
+fn conflict_resp(msg: impl Into<String>, conflicts: Vec<String>) -> ApiError {
+    (
+        StatusCode::CONFLICT,
+        Json(ErrorBody {
+            error: msg.into(),
+            conflicts: Some(conflicts),
+        }),
+    )
+}
+
+// ─── Helpers: node kinds, names, paths ───────────────────────────────────────
 
 fn kind_str(kind: u32) -> &'static str {
     if kind == LoreNodeType::File as u32 {
@@ -172,49 +276,134 @@ fn kind_str(kind: u32) -> &'static str {
     }
 }
 
+fn is_file(kind: u32) -> bool {
+    kind == LoreNodeType::File as u32
+}
+
+fn is_dir(kind: u32) -> bool {
+    kind == LoreNodeType::Directory as u32
+}
+
+fn is_link(kind: u32) -> bool {
+    kind == LoreNodeType::Link as u32
+}
+
 /// Returns `None` for directories, `Some(address.to_string())` for files/links.
-fn address_opt(kind: u32, address: lore_base::types::Address) -> Option<String> {
-    if kind == LoreNodeType::Directory as u32 {
-        None
-    } else {
-        Some(address.to_string())
+fn address_opt(kind: u32, address: Address) -> Option<String> {
+    if is_dir(kind) { None } else { Some(address.to_string()) }
+}
+
+/// Validate a single path component for mkdir / rename / upload segments.
+fn valid_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
+/// Validate and normalize a multipart `filename` into safe relative segments.
+fn sanitize_rel_path(raw: &str) -> Option<Vec<String>> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.starts_with('/') {
+        return None;
     }
+    let segments: Vec<String> = raw
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if segments.is_empty() || !segments.iter().all(|s| valid_name(s)) {
+        return None;
+    }
+    Some(segments)
 }
 
-// ─── Handlers ────────────────────────────────────────────────────────────────
-
-/// `GET /api/v1/info`
-async fn handle_info(
-    Extension(state): Extension<Arc<AppState>>,
-) -> Json<InfoResponse> {
-    Json(InfoResponse {
-        repository_id: state.repository_id.to_string(),
-        branch_id: state.branch_id.to_string(),
-        branch_name: state.branch_name.clone(),
-        revision: state.revision.to_string(),
-        workdir: state.workdir.clone(),
-    })
+/// Join a workspace-absolute virtual path ("/a/b") with a name → "/a/b/name".
+fn join_virtual(parent: &str, name: &str) -> String {
+    if parent == "/" { format!("/{name}") } else { format!("{parent}/{name}") }
 }
 
-/// Query parameters for `GET /api/v1/tree`
-#[derive(Deserialize)]
-struct TreeQuery {
-    node_id: Option<u64>,
+/// Workspace-relative form (no leading slash) of a virtual path; "" for root.
+fn rel_of(virtual_path: &str) -> &str {
+    virtual_path.trim_start_matches('/')
 }
 
-/// `GET /api/v1/tree?node_id=<u64>`
-async fn handle_tree(
-    Extension(state): Extension<Arc<AppState>>,
-    Query(params): Query<TreeQuery>,
-) -> Result<Json<TreeResponse>, (StatusCode, Json<ErrorBody>)> {
-    // node_id == 0 or absent → ROOT_NODE (ROOT_NODE == 0 in lore)
-    let raw = params.node_id.unwrap_or(0);
+fn parse_node_id(raw: u64) -> Result<u32, ApiError> {
     if raw > u32::MAX as u64 {
         return Err(err_resp(StatusCode::BAD_REQUEST, "node_id out of u32 range"));
     }
-    let parent_node_id: u32 = raw as u32;
+    let id = raw as u32;
+    if id == INVALID_NODE {
+        return Err(err_resp(StatusCode::BAD_REQUEST, "node_id is the invalid sentinel"));
+    }
+    Ok(id)
+}
 
-    // Collect events emitted by the callback-based `list_children` API.
+// ─── Helpers: lore verb wrappers (callback → value) ──────────────────────────
+
+/// Fetch the full info record of a node. `Err` carries a ready API error.
+async fn fetch_node_info(
+    tree: LoreRevisionTree,
+    node_id: u32,
+) -> Result<LoreRevisionTreeNodeInfoEventData, ApiError> {
+    let sink: Arc<Mutex<Option<LoreRevisionTreeNodeInfoEventData>>> = Arc::new(Mutex::new(None));
+    let cb_sink = sink.clone();
+    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+        if let LoreEvent::RevisionTreeNodeInfo(data) = event {
+            *cb_sink.lock().unwrap() = Some(data.clone());
+        }
+    }));
+
+    let status = node_info(
+        LoreGlobalArgs::default(),
+        LoreRevisionTreeNodeInfoArgs { id: 0, handle: tree, node_id },
+        callback,
+    )
+    .await;
+
+    let data = sink.lock().unwrap().clone();
+    match data {
+        Some(d) if status == 0 && d.error_code == LoreErrorCode::None => Ok(d),
+        Some(d) if d.error_code == LoreErrorCode::InvalidArguments => {
+            Err(err_resp(StatusCode::NOT_FOUND, "node not found"))
+        }
+        _ => Err(err_resp(StatusCode::INTERNAL_SERVER_ERROR, "node_info failed")),
+    }
+}
+
+/// Reconstruct the "/"-prefixed path of a node ("/": root itself).
+async fn fetch_node_path(tree: LoreRevisionTree, node_id: u32) -> Result<String, ApiError> {
+    let sink: Arc<Mutex<Option<(String, LoreErrorCode)>>> = Arc::new(Mutex::new(None));
+    let cb_sink = sink.clone();
+    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+        if let LoreEvent::RevisionTreeNodePath(data) = event {
+            *cb_sink.lock().unwrap() = Some((data.path.as_str().to_owned(), data.error_code));
+        }
+    }));
+
+    let status = node_path(
+        LoreGlobalArgs::default(),
+        LoreRevisionTreeNodePathArgs { id: 0, handle: tree, node_id },
+        callback,
+    )
+    .await;
+
+    let data = sink.lock().unwrap().clone();
+    match data {
+        Some((raw, LoreErrorCode::None)) if status == 0 => {
+            Ok(if raw.is_empty() { "/".to_owned() } else { format!("/{raw}") })
+        }
+        _ => Err(err_resp(StatusCode::INTERNAL_SERVER_ERROR, "node_path failed")),
+    }
+}
+
+/// List the direct children of a directory node.
+async fn fetch_children(
+    tree: LoreRevisionTree,
+    parent_node_id: u32,
+) -> Result<(RepositoryId, Hash, Vec<LoreRevisionTreeChildEventData>), ApiError> {
     struct ListSink {
         repository_id: RepositoryId,
         revision: Hash,
@@ -229,42 +418,322 @@ async fn handle_tree(
         children: Vec::new(),
     }));
 
-    let sink_cb = sink.clone();
+    let cb_sink = sink.clone();
     let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| match event {
         LoreEvent::RevisionTreeListChildrenBegin(data) => {
-            let mut s = sink_cb.lock().unwrap();
+            let mut s = cb_sink.lock().unwrap();
             s.repository_id = data.repository;
             s.revision = data.revision;
             s.begin_error = data.error_code;
         }
         LoreEvent::RevisionTreeChild(data) => {
-            sink_cb.lock().unwrap().children.push(data.clone());
+            cb_sink.lock().unwrap().children.push(data.clone());
         }
         _ => {}
     }));
 
     let status = list_children(
         LoreGlobalArgs::default(),
-        LoreRevisionTreeListChildrenArgs {
-            id: 1,
-            handle: state.tree,
-            parent_node_id,
-        },
+        LoreRevisionTreeListChildrenArgs { id: 0, handle: tree, parent_node_id },
         callback,
     )
     .await;
 
     let s = sink.lock().unwrap();
-
     if status != 0 || s.begin_error != LoreErrorCode::None {
         return Err(err_resp(
             StatusCode::BAD_REQUEST,
             "node_id is not a valid directory node",
         ));
     }
+    Ok((s.repository_id, s.revision, s.children.clone()))
+}
 
-    let children: Vec<ChildEntry> = s
-        .children
+/// Resolve a workspace-relative path (no leading '/') to a node id.
+/// `Ok(None)` when the path does not exist in the committed tree.
+async fn try_resolve_path(tree: LoreRevisionTree, rel: &str) -> Option<u32> {
+    let sink: Arc<Mutex<Option<(u32, LoreErrorCode)>>> = Arc::new(Mutex::new(None));
+    let cb_sink = sink.clone();
+    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+        if let LoreEvent::RevisionTreeResolvePathComplete(data) = event {
+            *cb_sink.lock().unwrap() = Some((data.node_id, data.error_code));
+        }
+    }));
+
+    let status = resolve_path(
+        LoreGlobalArgs::default(),
+        LoreRevisionTreeResolvePathArgs {
+            id: 0,
+            handle: tree,
+            path: LoreString::from(rel),
+        },
+        callback,
+    )
+    .await;
+
+    let data = *sink.lock().unwrap();
+    match data {
+        Some((node_id, LoreErrorCode::None)) if status == 0 && node_id != INVALID_NODE => {
+            Some(node_id)
+        }
+        _ => None,
+    }
+}
+
+/// Fetch one file's content from the CAS into `dest` (via `lore_storage_get_file`).
+async fn cas_fetch_to_file(
+    store: LoreStore,
+    partition: RepositoryId,
+    address: Address,
+    dest: &FsPath,
+) -> anyhow::Result<()> {
+    let sink: Arc<Mutex<Option<LoreErrorCode>>> = Arc::new(Mutex::new(None));
+    let cb_sink = sink.clone();
+    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+        if let LoreEvent::StorageGetItemComplete(data) = event {
+            *cb_sink.lock().unwrap() = Some(data.error_code);
+        }
+    }));
+
+    let item = LoreStorageGetFileItem {
+        id: 0,
+        partition,
+        address,
+        path: LoreString::from(dest.to_string_lossy().as_ref()),
+        local_cache: 0,
+    };
+
+    let status = get_file(
+        LoreGlobalArgs::default(),
+        LoreStorageGetFileArgs {
+            handle: store,
+            items: LoreArray::from_vec(vec![item]),
+        },
+        callback,
+    )
+    .await;
+
+    let code = *sink.lock().unwrap();
+    match code {
+        Some(LoreErrorCode::None) if status == 0 => Ok(()),
+        Some(code) => anyhow::bail!("get_file failed: {code:?}"),
+        None => anyhow::bail!("get_file emitted no completion (status {status})"),
+    }
+}
+
+/// Run `lore::file::stage` on workspace-relative paths.
+async fn stage_paths(paths: Vec<String>) -> anyhow::Result<()> {
+    let (status, errors) = run_with_errors(|callback| async move {
+        lore::file::stage(
+            LoreGlobalArgs::default(),
+            lore::file::LoreFileStageArgs {
+                paths: LoreArray::from_vec(
+                    paths.iter().map(|p| LoreString::from(p.as_str())).collect(),
+                ),
+                case_change: 0,
+                scan: 1,
+            },
+            callback,
+        )
+        .await
+    })
+    .await;
+    if status != 0 {
+        anyhow::bail!("stage failed (status {status}): {}", errors.join("; "));
+    }
+    Ok(())
+}
+
+/// Run `lore::file::stage_move` (from → to, workspace-relative paths).
+async fn stage_move_path(from: &str, to: &str) -> anyhow::Result<()> {
+    let (status, errors) = run_with_errors(|callback| async move {
+        lore::file::stage_move(
+            LoreGlobalArgs::default(),
+            lore::file::LoreFileStageMoveArgs {
+                from_path: LoreString::from(from),
+                to_path: LoreString::from(to),
+            },
+            callback,
+        )
+        .await
+    })
+    .await;
+    if status != 0 {
+        anyhow::bail!("stage_move failed (status {status}): {}", errors.join("; "));
+    }
+    Ok(())
+}
+
+/// Commit staged changes. Returns the newly committed revision hash.
+async fn commit_staged(message: &str) -> anyhow::Result<Hash> {
+    let revision_sink: Arc<Mutex<Option<Hash>>> = Arc::new(Mutex::new(None));
+    let rev_cb = revision_sink.clone();
+    let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let err_cb = errors.clone();
+
+    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| match event {
+        LoreEvent::RevisionCommitRevision(data) => {
+            *rev_cb.lock().unwrap() = Some(data.revision);
+        }
+        LoreEvent::Error(data) => {
+            err_cb.lock().unwrap().push(data.error_inner.as_str().to_owned());
+        }
+        _ => {}
+    }));
+
+    let message = message.to_owned();
+    let status = lore::revision::commit(
+        LoreGlobalArgs::default(),
+        lore::revision::LoreRevisionCommitArgs {
+            message: LoreString::from(message.as_str()),
+            ..Default::default()
+        },
+        callback,
+    )
+    .await;
+
+    let revision = *revision_sink.lock().unwrap();
+    let errors = errors.lock().unwrap().clone();
+    match revision {
+        Some(revision) if status == 0 => Ok(revision),
+        _ => anyhow::bail!(
+            "commit failed (status {status}): {}",
+            if errors.is_empty() { "unknown error".to_owned() } else { errors.join("; ") }
+        ),
+    }
+}
+
+/// Run a lore verb collecting `LoreEvent::Error` messages next to the status.
+async fn run_with_errors<F, Fut>(f: F) -> (i32, Vec<String>)
+where
+    F: FnOnce(LoreEventCallback) -> Fut,
+    Fut: std::future::Future<Output = i32>,
+{
+    let errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let err_cb = errors.clone();
+    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+        if let LoreEvent::Error(data) = event {
+            err_cb.lock().unwrap().push(data.error_inner.as_str().to_owned());
+        }
+    }));
+    let status = f(callback).await;
+    let errors = errors.lock().unwrap().clone();
+    (status, errors)
+}
+
+/// Run a future inside a fresh `LORE_CONTEXT` scope. Needed for raw
+/// `lore_revision` functions (like `load_current_anchor`) that are not verbs.
+async fn with_lore_ctx<T, Fut>(fut: Fut) -> T
+where
+    Fut: std::future::Future<Output = T>,
+{
+    let ctx: Arc<dyn std::any::Any + Send + Sync> = Arc::new(ExecutionContext::new_client(
+        LoreGlobalArgs::default(),
+        EventDispatcher::no_dispatch(),
+    ));
+    LORE_CONTEXT.scope(ctx, fut).await
+}
+
+/// After a successful commit: reload the anchor + a fresh tree handle and
+/// swap it into `state.tree_state`, closing the previous handle.
+async fn refresh_tree(state: &AppState) -> anyhow::Result<Hash> {
+    let repository = state.repository.clone();
+    let (revision, _branch) =
+        with_lore_ctx(async move { lore_revision::instance::load_current_anchor(&repository).await })
+            .await?;
+
+    // Load a fresh tree handle for the new revision.
+    let tree_sink: Arc<Mutex<Option<LoreRevisionTree>>> = Arc::new(Mutex::new(None));
+    let tree_cb = tree_sink.clone();
+    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+        if let LoreEvent::RevisionTreeLoaded(data) = event {
+            *tree_cb.lock().unwrap() = Some(LoreRevisionTree { handle_id: data.handle_id });
+        }
+    }));
+
+    let status = load(
+        LoreGlobalArgs::default(),
+        LoreRevisionTreeLoadArgs {
+            store: state.store,
+            repository: state.repository_id,
+            revision_hash: revision,
+        },
+        callback,
+    )
+    .await;
+
+    let new_tree = tree_sink.lock().unwrap().take();
+    let new_tree = match new_tree {
+        Some(t) if status == 0 => t,
+        _ => anyhow::bail!("revision tree reload failed (status {status})"),
+    };
+
+    // Swap and close the previous handle (best effort).
+    let old = {
+        let mut guard = state.tree_state.write().await;
+        let old = guard.tree;
+        *guard = TreeState { tree: new_tree, revision };
+        old
+    };
+    let close_status = tree_close(
+        LoreGlobalArgs::default(),
+        LoreRevisionTreeCloseArgs { id: 0, handle: old },
+        None,
+    )
+    .await;
+    if close_status != 0 {
+        warn!("closing stale revision tree handle failed (status {close_status})");
+    }
+
+    info!("Refreshed tree to revision {revision}");
+    Ok(revision)
+}
+
+/// Build the full node record served by GET/PATCH node endpoints.
+async fn node_record(tree: LoreRevisionTree, node_id: u32) -> Result<NodeResponse, ApiError> {
+    let info = fetch_node_info(tree, node_id).await?;
+    let path = fetch_node_path(tree, node_id).await?;
+    Ok(NodeResponse {
+        node_id: info.node_id as u64,
+        parent_id: info.parent_id as u64,
+        name: info.name.as_str().to_owned(),
+        kind: kind_str(info.kind).to_owned(),
+        mode: info.mode,
+        size: info.size,
+        address: address_opt(info.kind, info.address),
+        path,
+    })
+}
+
+// ─── Read handlers ───────────────────────────────────────────────────────────
+
+/// `GET /api/v1/info`
+async fn handle_info(Extension(state): Extension<Arc<AppState>>) -> Json<InfoResponse> {
+    Json(InfoResponse {
+        repository_id: state.repository_id.to_string(),
+        branch_id: state.branch_id.to_string(),
+        branch_name: state.branch_name.clone(),
+        revision: state.revision().await.to_string(),
+        workdir: state.workdir.display().to_string(),
+    })
+}
+
+/// Query parameters for `GET /api/v1/tree`
+#[derive(Deserialize)]
+struct TreeQuery {
+    node_id: Option<u64>,
+}
+
+/// `GET /api/v1/tree?node_id=<u64>`
+async fn handle_tree(
+    Extension(state): Extension<Arc<AppState>>,
+    Query(params): Query<TreeQuery>,
+) -> Result<Json<TreeResponse>, ApiError> {
+    let parent_node_id = parse_node_id(params.node_id.unwrap_or(ROOT_NODE as u64))?;
+    let tree = state.tree().await;
+    let (repository_id, revision, children) = fetch_children(tree, parent_node_id).await?;
+
+    let children: Vec<ChildEntry> = children
         .iter()
         .map(|c| ChildEntry {
             node_id: c.node_id as u64,
@@ -277,8 +746,8 @@ async fn handle_tree(
         .collect();
 
     Ok(Json(TreeResponse {
-        repository_id: s.repository_id.to_string(),
-        revision: s.revision.to_string(),
+        repository_id: repository_id.to_string(),
+        revision: revision.to_string(),
         node_id: parent_node_id as u64,
         children,
     }))
@@ -288,105 +757,529 @@ async fn handle_tree(
 async fn handle_node(
     Extension(state): Extension<Arc<AppState>>,
     Path(node_id_str): Path<String>,
-) -> Result<Json<NodeResponse>, (StatusCode, Json<ErrorBody>)> {
-    let node_id_u64: u64 = node_id_str
-        .parse()
-        .map_err(|_| err_resp(StatusCode::BAD_REQUEST, "node_id must be a u64"))?;
+) -> Result<Json<NodeResponse>, ApiError> {
+    let node_id = parse_node_id(
+        node_id_str
+            .parse()
+            .map_err(|_| err_resp(StatusCode::BAD_REQUEST, "node_id must be a u64"))?,
+    )?;
+    let tree = state.tree().await;
+    Ok(Json(node_record(tree, node_id).await?))
+}
 
-    if node_id_u64 > u32::MAX as u64 {
-        return Err(err_resp(StatusCode::BAD_REQUEST, "node_id out of u32 range"));
+/// `GET /api/v1/download/{node_id}` — file bytes or folder ZIP, from the CAS.
+async fn handle_download(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(node_id_str): Path<String>,
+) -> Result<Response, ApiError> {
+    let node_id = parse_node_id(
+        node_id_str
+            .parse()
+            .map_err(|_| err_resp(StatusCode::BAD_REQUEST, "node_id must be a u64"))?,
+    )?;
+    let tree = state.tree().await;
+
+    // Root has no node_info record of its own; treat it as a directory named "root".
+    let (kind, name, address) = if node_id == ROOT_NODE {
+        (LoreNodeType::Directory as u32, "root".to_owned(), Address::default())
+    } else {
+        let info = fetch_node_info(tree, node_id).await?;
+        (info.kind, info.name.as_str().to_owned(), info.address)
+    };
+
+    if is_link(kind) {
+        return Err(err_resp(StatusCode::BAD_REQUEST, "link download is not supported"));
     }
-    let node_id = node_id_u64 as u32;
 
-    if node_id == INVALID_NODE {
-        return Err(err_resp(
-            StatusCode::NOT_FOUND,
-            "node_id is the invalid sentinel",
+    let tmp = tempfile::tempdir()
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, format!("tempdir: {e}")))?;
+
+    if is_file(kind) {
+        let dest = tmp.path().join("payload");
+        cas_fetch_to_file(state.store, state.repository_id, address, &dest)
+            .await
+            .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let bytes = tokio::fs::read(&dest)
+            .await
+            .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        return Ok(binary_response(bytes, "application/octet-stream", &name));
+    }
+
+    // Directory → walk the committed subtree, fetch files, zip.
+    let mut files: Vec<(String, PathBuf)> = Vec::new(); // (zip rel path, temp path)
+    let mut dirs: Vec<String> = Vec::new();
+    let mut stack: Vec<(u32, String)> = vec![(node_id, String::new())];
+    let mut counter: u64 = 0;
+
+    while let Some((dir_id, prefix)) = stack.pop() {
+        let (repo, _rev, children) = fetch_children(tree, dir_id).await?;
+        for child in children {
+            let child_name = child.name.as_str().to_owned();
+            let rel = if prefix.is_empty() {
+                child_name.clone()
+            } else {
+                format!("{prefix}/{child_name}")
+            };
+            if is_dir(child.kind) {
+                dirs.push(rel.clone());
+                stack.push((child.node_id, rel));
+            } else if is_file(child.kind) {
+                counter += 1;
+                let dest = tmp.path().join(format!("f{counter}"));
+                cas_fetch_to_file(state.store, repo, child.address, &dest)
+                    .await
+                    .map_err(|e| {
+                        err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                    })?;
+                files.push((rel, dest));
+            } else {
+                // Links are skipped in ZIP archives (v1).
+            }
+        }
+    }
+
+    let zip_bytes = tokio::task::spawn_blocking(move || build_zip(&dirs, &files))
+        .await
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    Ok(binary_response(zip_bytes, "application/zip", &format!("{name}.zip")))
+}
+
+/// Assemble a ZIP archive from directory entries and (rel path, file) pairs.
+fn build_zip(dirs: &[String], files: &[(String, PathBuf)]) -> anyhow::Result<Vec<u8>> {
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    {
+        let mut zip = zip::ZipWriter::new(&mut cursor);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for dir in dirs {
+            zip.add_directory(dir.as_str(), options)?;
+        }
+        for (rel, src) in files {
+            zip.start_file(rel.as_str(), options)?;
+            let bytes = std::fs::read(src)?;
+            zip.write_all(&bytes)?;
+        }
+        zip.finish()?;
+    }
+    Ok(cursor.into_inner())
+}
+
+/// Build an attachment response with content-type / disposition headers.
+fn binary_response(bytes: Vec<u8>, content_type: &str, filename: &str) -> Response {
+    let mut headers = HeaderMap::new();
+    if let Ok(v) = HeaderValue::from_str(content_type) {
+        headers.insert(header::CONTENT_TYPE, v);
+    }
+    // Quote-escape the filename; fall back to a generic name on weird input.
+    let disposition = format!("attachment; filename=\"{}\"", filename.replace('"', "_"));
+    let disposition = HeaderValue::from_str(&disposition)
+        .unwrap_or_else(|_| HeaderValue::from_static("attachment; filename=\"download\""));
+    headers.insert(header::CONTENT_DISPOSITION, disposition);
+    (StatusCode::OK, headers, bytes).into_response()
+}
+
+// ─── Write handlers ──────────────────────────────────────────────────────────
+
+/// Resolve a directory node to its "/"-prefixed virtual path, validating kind.
+async fn dir_virtual_path(tree: LoreRevisionTree, node_id: u32) -> Result<String, ApiError> {
+    if node_id == ROOT_NODE {
+        return Ok("/".to_owned());
+    }
+    let info = fetch_node_info(tree, node_id).await?;
+    if !is_dir(info.kind) {
+        return Err(err_resp(StatusCode::BAD_REQUEST, "node is not a directory"));
+    }
+    fetch_node_path(tree, node_id).await
+}
+
+#[derive(Deserialize)]
+struct MkdirRequest {
+    #[serde(default)]
+    parent_id: u64,
+    name: String,
+}
+
+/// `POST /api/v1/mkdir`
+async fn handle_mkdir(
+    Extension(state): Extension<Arc<AppState>>,
+    Json(req): Json<MkdirRequest>,
+) -> Result<(StatusCode, Json<MkdirResponse>), ApiError> {
+    if !valid_name(&req.name) {
+        return Err(err_resp(StatusCode::BAD_REQUEST, "invalid directory name"));
+    }
+    let parent_id = parse_node_id(req.parent_id)?;
+
+    let _write = state.write_gate.lock().await;
+    let tree = state.tree().await;
+    let parent_path = dir_virtual_path(tree, parent_id).await?;
+    let virtual_path = join_virtual(&parent_path, &req.name);
+    let rel = rel_of(&virtual_path).to_owned();
+    let fs_path = state.workdir.join(&rel);
+
+    if try_resolve_path(tree, &rel).await.is_some() || fs_path.exists() {
+        return Err(conflict_resp("an entry with that name already exists", vec![virtual_path]));
+    }
+
+    tokio::fs::create_dir(&fs_path)
+        .await
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, format!("create_dir: {e}")))?;
+
+    // Try to stage + commit the bare directory; fall back to a `.lorekeep`
+    // placeholder when the revision records nothing for an empty directory.
+    let commit_msg = format!("lore-drive: mkdir {virtual_path}");
+    let first_try = async {
+        stage_paths(vec![rel.clone()]).await?;
+        commit_staged(&commit_msg).await
+    }
+    .await;
+
+    let commit_result = match first_try {
+        Ok(rev) => Ok(rev),
+        Err(first_err) => {
+            info!("empty-dir commit fell back to .lorekeep ({first_err})");
+            let keep_rel = format!("{rel}/.lorekeep");
+            let keep_fs = state.workdir.join(&keep_rel);
+            let keep = tokio::fs::write(&keep_fs, b"")
+                .await
+                .map_err(|e| anyhow::anyhow!("write .lorekeep: {e}"));
+            match keep {
+                Ok(()) => async {
+                    stage_paths(vec![keep_rel.clone()]).await?;
+                    commit_staged(&commit_msg).await
+                }
+                .await,
+                Err(e) => Err(e),
+            }
+        }
+    };
+
+    let revision = match commit_result {
+        Ok(rev) => rev,
+        Err(e) => {
+            // Roll back the filesystem change (best effort).
+            let _ = tokio::fs::remove_dir_all(&fs_path).await;
+            return Err(err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+    };
+
+    let revision = refresh_tree(&state).await.unwrap_or(revision);
+    let new_tree = state.tree().await;
+    let node_id = try_resolve_path(new_tree, &rel).await.map(|n| n as u64);
+
+    Ok((
+        StatusCode::CREATED,
+        Json(MkdirResponse {
+            node_id,
+            path: virtual_path,
+            revision: revision.to_string(),
+        }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct UploadQuery {
+    #[serde(default)]
+    parent_id: u64,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// `POST /api/v1/upload?parent_id=<u64>&overwrite=<bool>`
+async fn handle_upload(
+    Extension(state): Extension<Arc<AppState>>,
+    Query(params): Query<UploadQuery>,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<UploadResponse>), ApiError> {
+    let parent_id = parse_node_id(params.parent_id)?;
+
+    let _write = state.write_gate.lock().await;
+    let tree = state.tree().await;
+    let parent_path = dir_virtual_path(tree, parent_id).await?;
+
+    // 1. Buffer every part into a temp dir before touching the workspace.
+    let tmp = tempfile::tempdir()
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, format!("tempdir: {e}")))?;
+    let mut incoming: Vec<(Vec<String>, PathBuf, u64)> = Vec::new(); // (segments, temp path, size)
+    let mut counter: u64 = 0;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| err_resp(StatusCode::BAD_REQUEST, format!("malformed multipart: {e}")))?
+    {
+        let Some(filename) = field.file_name().map(str::to_owned) else {
+            continue; // ignore non-file fields
+        };
+        let segments = sanitize_rel_path(&filename)
+            .ok_or_else(|| err_resp(StatusCode::BAD_REQUEST, format!("illegal path: {filename}")))?;
+        let data = field
+            .bytes()
+            .await
+            .map_err(|e| err_resp(StatusCode::BAD_REQUEST, format!("read part: {e}")))?;
+        counter += 1;
+        let temp_path = tmp.path().join(format!("u{counter}"));
+        let size = data.len() as u64;
+        tokio::fs::write(&temp_path, &data)
+            .await
+            .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        incoming.push((segments, temp_path, size));
+    }
+
+    if incoming.is_empty() {
+        return Err(err_resp(StatusCode::BAD_REQUEST, "no file parts in request"));
+    }
+
+    // 2. Conflict detection against the committed tree, before any change.
+    let mut conflicts: Vec<String> = Vec::new();
+    for (segments, _, _) in &incoming {
+        let virtual_path = segments
+            .iter()
+            .fold(parent_path.clone(), |acc, seg| join_virtual(&acc, seg));
+        let rel = rel_of(&virtual_path).to_owned();
+        if let Some(existing) = try_resolve_path(tree, &rel).await {
+            // Existing *file* at a target path is a conflict; merging into an
+            // existing directory is not — but a file part can never legally
+            // land on a directory node either.
+            match fetch_node_info(tree, existing).await {
+                Ok(info) if is_file(info.kind) && params.overwrite => {} // will replace
+                Ok(_) if !params.overwrite => conflicts.push(virtual_path),
+                Ok(info) if !is_file(info.kind) => {
+                    return Err(err_resp(
+                        StatusCode::BAD_REQUEST,
+                        format!("{virtual_path} exists and is not a file"),
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    if !conflicts.is_empty() {
+        return Err(conflict_resp(
+            format!("{} path(s) already exist", conflicts.len()),
+            conflicts,
         ));
     }
 
-    // ── node_info ────────────────────────────────────────────────────────────
-    let info_sink: Arc<Mutex<Option<LoreRevisionTreeNodeInfoEventData>>> =
-        Arc::new(Mutex::new(None));
-    let info_cb = info_sink.clone();
-    let info_callback: LoreEventCallback =
-        Some(Box::new(move |event: &LoreEvent| {
-            if let LoreEvent::RevisionTreeNodeInfo(data) = event {
-                *info_cb.lock().unwrap() = Some(data.clone());
+    // 3. Materialize into the workspace, then stage + commit.
+    let mut rel_paths: Vec<String> = Vec::new();
+    let mut placed: Vec<PathBuf> = Vec::new();
+    for (segments, temp_path, _) in &incoming {
+        let virtual_path = segments
+            .iter()
+            .fold(parent_path.clone(), |acc, seg| join_virtual(&acc, seg));
+        let rel = rel_of(&virtual_path).to_owned();
+        let fs_path = state.workdir.join(&rel);
+        if let Some(dir) = fs_path.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(dir).await {
+                rollback_files(&placed).await;
+                return Err(err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
             }
-        }));
-
-    let info_status = node_info(
-        LoreGlobalArgs::default(),
-        LoreRevisionTreeNodeInfoArgs {
-            id: 2,
-            handle: state.tree,
-            node_id,
-        },
-        info_callback,
-    )
-    .await;
-
-    let info_data = info_sink.lock().unwrap().clone();
-    let info_data = match info_data {
-        Some(d) if info_status == 0 && d.error_code == LoreErrorCode::None => d,
-        Some(d) if d.error_code == LoreErrorCode::InvalidArguments => {
-            return Err(err_resp(StatusCode::NOT_FOUND, "node not found"));
         }
-        _ => {
-            return Err(err_resp(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "node_info failed",
-            ));
+        if let Err(e) = tokio::fs::copy(temp_path, &fs_path).await {
+            rollback_files(&placed).await;
+            return Err(err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
+        }
+        placed.push(fs_path);
+        rel_paths.push(rel);
+    }
+
+    let commit_msg = format!(
+        "lore-drive: upload {} file(s) to {parent_path}",
+        rel_paths.len()
+    );
+    let committed = async {
+        stage_paths(rel_paths.clone()).await?;
+        commit_staged(&commit_msg).await
+    }
+    .await;
+    let revision = match committed {
+        Ok(rev) => rev,
+        Err(e) => {
+            rollback_files(&placed).await;
+            return Err(err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
         }
     };
 
-    // ── node_path ────────────────────────────────────────────────────────────
-    let path_sink: Arc<Mutex<Option<LoreRevisionTreeNodePathEventData>>> =
-        Arc::new(Mutex::new(None));
-    let path_cb = path_sink.clone();
-    let path_callback: LoreEventCallback =
-        Some(Box::new(move |event: &LoreEvent| {
-            if let LoreEvent::RevisionTreeNodePath(data) = event {
-                *path_cb.lock().unwrap() = Some(data.clone());
-            }
-        }));
+    // 4. Refresh and resolve the created nodes for the response (best effort).
+    let revision = refresh_tree(&state).await.unwrap_or(revision);
+    let new_tree = state.tree().await;
+    let mut files = Vec::new();
+    for ((segments, _, size), rel) in incoming.iter().zip(rel_paths.iter()) {
+        let node_id = try_resolve_path(new_tree, rel).await;
+        let address = match node_id {
+            Some(id) => fetch_node_info(new_tree, id)
+                .await
+                .ok()
+                .and_then(|i| address_opt(i.kind, i.address)),
+            None => None,
+        };
+        files.push(UploadedFile {
+            name: segments.last().cloned().unwrap_or_default(),
+            path: format!("/{rel}"),
+            node_id: node_id.map(|n| n as u64),
+            size: *size,
+            address,
+        });
+    }
 
-    let path_status = node_path(
-        LoreGlobalArgs::default(),
-        LoreRevisionTreeNodePathArgs {
-            id: 3,
-            handle: state.tree,
-            node_id,
-        },
-        path_callback,
-    )
-    .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(UploadResponse {
+            revision: revision.to_string(),
+            files,
+        }),
+    ))
+}
 
-    let path_data = path_sink.lock().unwrap().clone();
-    let full_path = match path_data {
-        Some(d) if path_status == 0 && d.error_code == LoreErrorCode::None => {
-            // Prepend "/" so every path starts at root; the root itself becomes "/".
-            let raw = d.path.as_str();
-            if raw.is_empty() { "/".to_owned() } else { format!("/{raw}") }
+/// Best-effort removal of files placed in the workspace before a failure.
+async fn rollback_files(placed: &[PathBuf]) {
+    for path in placed {
+        let _ = tokio::fs::remove_file(path).await;
+    }
+}
+
+#[derive(Deserialize)]
+struct PatchRequest {
+    name: Option<String>,
+    parent_id: Option<u64>,
+}
+
+/// `PATCH /api/v1/node/{node_id}` — rename and/or move.
+async fn handle_node_patch(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(node_id_str): Path<String>,
+    Json(req): Json<PatchRequest>,
+) -> Result<Json<PatchResponse>, ApiError> {
+    let node_id = parse_node_id(
+        node_id_str
+            .parse()
+            .map_err(|_| err_resp(StatusCode::BAD_REQUEST, "node_id must be a u64"))?,
+    )?;
+    if node_id == ROOT_NODE {
+        return Err(err_resp(StatusCode::BAD_REQUEST, "cannot rename or move the root"));
+    }
+    if req.name.is_none() && req.parent_id.is_none() {
+        return Err(err_resp(StatusCode::BAD_REQUEST, "provide name and/or parent_id"));
+    }
+    if let Some(name) = &req.name {
+        if !valid_name(name) {
+            return Err(err_resp(StatusCode::BAD_REQUEST, "invalid name"));
         }
-        _ => {
-            return Err(err_resp(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "node_path failed",
-            ));
+    }
+
+    let _write = state.write_gate.lock().await;
+    let tree = state.tree().await;
+    let info = fetch_node_info(tree, node_id).await?;
+    let src_virtual = fetch_node_path(tree, node_id).await?;
+
+    let dst_parent_id = match req.parent_id {
+        Some(p) => parse_node_id(p)?,
+        None => info.parent_id,
+    };
+    let dst_parent_path = dir_virtual_path(tree, dst_parent_id).await?;
+    let dst_name = req.name.clone().unwrap_or_else(|| info.name.as_str().to_owned());
+    let dst_virtual = join_virtual(&dst_parent_path, &dst_name);
+
+    if dst_virtual == src_virtual {
+        // No-op rename: return the current record without committing.
+        let node = node_record(tree, node_id).await?;
+        return Ok(Json(PatchResponse {
+            node,
+            revision: state.revision().await.to_string(),
+        }));
+    }
+    if is_dir(info.kind) && dst_virtual.starts_with(&format!("{src_virtual}/")) {
+        return Err(err_resp(
+            StatusCode::BAD_REQUEST,
+            "cannot move a directory inside itself",
+        ));
+    }
+
+    let src_rel = rel_of(&src_virtual).to_owned();
+    let dst_rel = rel_of(&dst_virtual).to_owned();
+    let src_fs = state.workdir.join(&src_rel);
+    let dst_fs = state.workdir.join(&dst_rel);
+
+    if try_resolve_path(tree, &dst_rel).await.is_some() || dst_fs.exists() {
+        return Err(conflict_resp(
+            "destination already exists",
+            vec![dst_virtual],
+        ));
+    }
+
+    tokio::fs::rename(&src_fs, &dst_fs)
+        .await
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, format!("rename: {e}")))?;
+
+    let commit_msg = format!("lore-drive: move {src_virtual} -> {dst_virtual}");
+    let committed = async {
+        stage_move_path(&src_rel, &dst_rel).await?;
+        commit_staged(&commit_msg).await
+    }
+    .await;
+    let revision = match committed {
+        Ok(rev) => rev,
+        Err(e) => {
+            let _ = tokio::fs::rename(&dst_fs, &src_fs).await; // roll back
+            return Err(err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
         }
     };
 
-    Ok(Json(NodeResponse {
-        node_id: info_data.node_id as u64,
-        parent_id: info_data.parent_id as u64,
-        name: info_data.name.as_str().to_owned(),
-        kind: kind_str(info_data.kind).to_owned(),
-        mode: info_data.mode,
-        size: info_data.size,
-        address: address_opt(info_data.kind, info_data.address),
-        path: full_path,
+    let revision = refresh_tree(&state).await.unwrap_or(revision);
+    let new_tree = state.tree().await;
+    let new_id = try_resolve_path(new_tree, &dst_rel)
+        .await
+        .ok_or_else(|| err_resp(StatusCode::INTERNAL_SERVER_ERROR, "moved node not found"))?;
+    let node = node_record(new_tree, new_id).await?;
+
+    Ok(Json(PatchResponse {
+        node,
+        revision: revision.to_string(),
+    }))
+}
+
+/// `DELETE /api/v1/node/{node_id}`
+async fn handle_node_delete(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(node_id_str): Path<String>,
+) -> Result<Json<DeleteResponse>, ApiError> {
+    let node_id = parse_node_id(
+        node_id_str
+            .parse()
+            .map_err(|_| err_resp(StatusCode::BAD_REQUEST, "node_id must be a u64"))?,
+    )?;
+    if node_id == ROOT_NODE {
+        return Err(err_resp(StatusCode::BAD_REQUEST, "cannot delete the root"));
+    }
+
+    let _write = state.write_gate.lock().await;
+    let tree = state.tree().await;
+    let info = fetch_node_info(tree, node_id).await?;
+    let virtual_path = fetch_node_path(tree, node_id).await?;
+    let rel = rel_of(&virtual_path).to_owned();
+    let fs_path = state.workdir.join(&rel);
+
+    if is_dir(info.kind) {
+        tokio::fs::remove_dir_all(&fs_path).await
+    } else {
+        tokio::fs::remove_file(&fs_path).await
+    }
+    .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, format!("remove: {e}")))?;
+
+    let commit_msg = format!("lore-drive: delete {virtual_path}");
+    let revision = async {
+        stage_paths(vec![rel.clone()]).await?;
+        commit_staged(&commit_msg).await
+    }
+    .await
+    .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let revision = refresh_tree(&state).await.unwrap_or(revision);
+
+    Ok(Json(DeleteResponse {
+        revision: revision.to_string(),
     }))
 }
 
@@ -397,22 +1290,22 @@ async fn handle_node(
 /// **Must be called inside a `LORE_CONTEXT.scope`** because
 /// `load_and_connect` (and other lore verbs) call `execution_context()`
 /// internally, which panics if the task-local is absent.
-async fn open_workspace(workdir: &std::path::Path) -> anyhow::Result<AppState> {
-    // Open a read-only repository context.
+async fn open_workspace(workdir: &FsPath) -> anyhow::Result<AppState> {
+    // Open a read-only repository context. Write verbs (`stage`, `commit`)
+    // acquire their own per-call write token; keeping the long-lived context
+    // read-only avoids holding the workspace write mutex between requests.
     let repository = load_and_connect(workdir, RepositoryAccess::ReadOnly).await?;
 
     // Read the current anchor (revision hash + branch id).
-    let (revision, branch_id) =
-        lore_revision::instance::load_current_anchor(&repository).await?;
+    let (revision, branch_id) = lore_revision::instance::load_current_anchor(&repository).await?;
     info!("Active revision: {revision}  branch: {branch_id}");
 
     // Resolve the human-readable branch name (best-effort; empty on failure).
-    let branch_name =
-        lore_revision::branch::metadata_local(repository.clone(), branch_id)
-            .await
-            .ok()
-            .and_then(|meta| lore_revision::branch::name(&meta).ok().map(str::to_owned))
-            .unwrap_or_default();
+    let branch_name = lore_revision::branch::metadata_local(repository.clone(), branch_id)
+        .await
+        .ok()
+        .and_then(|meta| lore_revision::branch::name(&meta).ok().map(str::to_owned))
+        .unwrap_or_default();
     info!("Branch name: {branch_name:?}");
 
     // Open the content-addressed storage handle.
@@ -479,11 +1372,12 @@ async fn open_workspace(workdir: &std::path::Path) -> anyhow::Result<AppState> {
     Ok(AppState {
         repository_id: repository.id,
         repository,
-        tree,
+        store,
+        tree_state: tokio::sync::RwLock::new(TreeState { tree, revision }),
+        write_gate: tokio::sync::Mutex::new(()),
         branch_id,
         branch_name,
-        revision,
-        workdir: workdir.display().to_string(),
+        workdir: workdir.to_path_buf(),
     })
 }
 
@@ -511,7 +1405,8 @@ async fn main() -> anyhow::Result<()> {
     //
     // For startup we don't need a real event callback — `no_dispatch()` is
     // fine; each individual request handler creates its own scoped context
-    // through the internal `storage_call` / `revision_tree_call` helpers.
+    // through the internal `storage_call` / `revision_tree_call` dispatch
+    // helpers (and `refresh_tree` wraps raw calls in `with_lore_ctx`).
     let startup_ctx: Arc<dyn std::any::Any + Send + Sync> = Arc::new(
         ExecutionContext::new_client(LoreGlobalArgs::default(), EventDispatcher::no_dispatch()),
     );
@@ -526,13 +1421,22 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .route("/api/v1/info", get(handle_info))
         .route("/api/v1/tree", get(handle_tree))
-        .route("/api/v1/node/{node_id}", get(handle_node))
+        .route(
+            "/api/v1/node/{node_id}",
+            get(handle_node)
+                .patch(handle_node_patch)
+                .delete(handle_node_delete),
+        )
+        .route("/api/v1/download/{node_id}", get(handle_download))
+        .route("/api/v1/mkdir", post(handle_mkdir))
+        .route("/api/v1/upload", post(handle_upload))
+        // Uploads can be large — allow up to 1 GiB bodies.
+        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
         // Allow the future SvelteKit frontend (different port) to call us in dev.
         .layer(CorsLayer::permissive())
         .layer(Extension(state));
 
     // ── Listen ───────────────────────────────────────────────────────────────
-    //let addr = SocketAddr::from(([127, 0, 0, 1], cli.port));
     let addr = SocketAddr::from(([0, 0, 0, 0], cli.port));
     info!("lore-drive listening on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;

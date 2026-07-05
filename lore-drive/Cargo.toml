@@ -9,8 +9,8 @@ name = "lore-drive"
 path = "src/main.rs"
 
 [dependencies]
-# HTTP server
-axum = { workspace = true }
+# HTTP server — multipart powers POST /api/v1/upload
+axum = { workspace = true, features = ["multipart"] }
 tokio = { workspace = true }
 tower-http = { workspace = true }
 # Serialization
@@ -27,3 +27,6 @@ anyhow = { workspace = true }
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Downloads: CAS fetch staging + folder ZIP assembly
+tempfile = { workspace = true }
+zip = { workspace = true }

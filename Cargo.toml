@@ -127,6 +127,7 @@ socket2 = "0.6.0"
 syn = "2.0.106"
 sysinfo = "0.37.0"
 temp-env = "0.3.6"
+tempfile = "3.27.0"
 thiserror = "2.0.16"
 tokio = { version = "1.47.1", features = [
     "fs",
@@ -165,6 +166,9 @@ zerocopy = { version = "0.8.26", features = [
     "alloc",
     "simd",
 ] }
+# lore-drive: ZIP assembly for folder downloads. Pinned exact for sandbox
+# reproducibility (see lore-drive/HANDOFF.md step 1 note on crate pinning).
+zip = { version = "=2.2.2", default-features = false, features = ["deflate"] }
 
 # Note: we currently control debug symbol splitting in .cargo/config.toml
 
