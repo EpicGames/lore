@@ -469,12 +469,8 @@ async function commit() {
   if (!msg) return toast("Enter a commit message", true);
   $("#commit-btn").disabled = true;
   try {
-    await apiPost("/api/commit", { path: state.active, message: msg });
+    await runOp("Committing…", "/api/commit", { path: state.active, message: msg });
     $("#commit-msg").value = "";
-    toast("Committed");
-    await refreshActive();
-  } catch (err) {
-    toast(err.message, true);
   } finally {
     $("#commit-btn").disabled = false;
   }
@@ -589,26 +585,80 @@ async function loadBranches(pathEnc) {
   }
 }
 
+/** Format a byte count as a short human-readable string, for example "42.1 MB".
+ * @param {number} n bytes to format
+ * @returns {string} human-readable byte count
+ */
+function fmtBytes(n) {
+  if (!n) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${v.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+const PROGRESS_BEGIN_TAGS = new Set(["REPOSITORY_CLONE_BEGIN", "REVISION_COMMIT_BEGIN"]);
+const PROGRESS_TAGS = new Set(["REPOSITORY_CLONE_PROGRESS", "REVISION_COMMIT_PROGRESS"]);
+const PROGRESS_END_TAGS = new Set(["REPOSITORY_CLONE_END", "REVISION_COMMIT_END"]);
+
+/** Render progress data (file and byte counts) onto the operation overlay bar.
+ * @param {HTMLElement} barFillEl progress bar fill element
+ * @param {HTMLElement} textEl progress text element
+ * @param {object} data progress payload with fileComplete, fileTotal, bytesTransferred, bytesTotal, discoveryComplete
+ */
+function renderOpProgress(barFillEl, textEl, data) {
+  const fileDone = data.fileComplete ?? data.fileCount ?? 0;
+  const fileTotal = data.fileTotal ?? data.fileCount ?? 0;
+  const bytesDone = data.bytesTransferred ?? 0;
+  const bytesTotal = data.bytesTotal ?? 0;
+  const pct = data.discoveryComplete && bytesTotal > 0 ? (bytesDone / bytesTotal) * 100 : fileTotal > 0 ? (fileDone / fileTotal) * 100 : 0;
+  barFillEl.style.width = `${Math.min(100, Math.max(0, pct))}%`;
+  textEl.textContent = data.discoveryComplete
+    ? `${fileDone.toLocaleString()} / ${fileTotal.toLocaleString()} files · ${fmtBytes(bytesDone)} / ${fmtBytes(bytesTotal)}`
+    : "Discovering…";
+}
+
 async function runOp(title, path, payload) {
   const overlay = $("#op-overlay");
   const logEl = $("#op-log");
   const statusEl = $("#op-status");
   const closeBtn = $("#op-close");
+  const progressEl = $("#op-progress");
+  const barFillEl = $("#op-bar-fill");
+  const progressTextEl = $("#op-progress-text");
   $("#op-title").textContent = title;
   logEl.textContent = "";
   statusEl.textContent = "";
   statusEl.className = "";
   closeBtn.hidden = true;
+  progressEl.hidden = true;
+  barFillEl.style.width = "0%";
+  progressTextEl.textContent = "";
   overlay.hidden = false;
 
   try {
     await apiStream(path, payload, (ev) => {
       if (ev.tag === "LOG") logEl.textContent += (ev.data?.message || "") + "\n";
       else if (ev.tag === "DONE") {
+        if (ev.data.ok) barFillEl.style.width = "100%";
         statusEl.textContent = ev.data.ok ? "Success" : `Failed: ${ev.data.message || "unknown error"}`;
         statusEl.className = ev.data.ok ? "ok" : "fail";
+      } else if (PROGRESS_BEGIN_TAGS.has(ev.tag)) {
+        progressEl.hidden = false;
+        barFillEl.style.width = "0%";
+        progressTextEl.textContent = "Starting…";
+      } else if (PROGRESS_TAGS.has(ev.tag)) {
+        progressEl.hidden = false;
+        renderOpProgress(barFillEl, progressTextEl, ev.data || {});
+      } else if (PROGRESS_END_TAGS.has(ev.tag)) {
+        progressEl.hidden = false;
+        barFillEl.style.width = "100%";
       } else if (ev.tag !== "END" && ev.tag !== "COMPLETE") {
-        // Surface progress-bearing events compactly.
+        // Surface other progress-bearing events compactly.
         logEl.textContent += `• ${ev.tag}\n`;
       }
       logEl.scrollTop = logEl.scrollHeight;

@@ -160,6 +160,10 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); }
 .op-modal { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; width: min(720px, 92vw); max-height: 80vh; display: flex; flex-direction: column; }
 .op-modal h3 { margin: 0; padding: 16px 18px; border-bottom: 1px solid var(--border); }
 .op-log { flex: 1; overflow: auto; margin: 0; padding: 14px 18px; font-family: ui-monospace, monospace; font-size: 12px; color: var(--muted); white-space: pre-wrap; max-height: 50vh; }
+.op-progress { padding: 0 18px 14px; display: flex; flex-direction: column; gap: 6px; }
+.op-bar { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+#op-bar-fill { height: 100%; width: 0%; background: var(--accent); transition: width .15s ease-out; }
+#op-progress-text { font-size: 12px; color: var(--muted); }
 .op-foot { display: flex; align-items: center; justify-content: space-between; padding: 12px 18px; border-top: 1px solid var(--border); }
 #op-status.ok { color: var(--green); }
 #op-status.fail { color: var(--red); }

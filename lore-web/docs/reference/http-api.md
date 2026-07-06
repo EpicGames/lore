@@ -50,19 +50,21 @@ is read live from the Lore SDK on each request; nothing is cached server-side.
 | POST | `/api/stage` | `{ path, files }` | Stage the given files. |
 | POST | `/api/unstage` | `{ path, files }` | Unstage the given files. |
 | POST | `/api/reset` | `{ path, files }` | Discard working changes to the given files. |
-| POST | `/api/commit` | `{ path, message }` | Commit the staged revision. |
 | POST | `/api/ignore` | `{ path, pattern }` | Append a gitignore-style `pattern` (file, `folder/`, or `*.ext`) to `.loreignore`, creating it if absent. Returns `{ ok, added }`. |
 | POST | `/api/init-loreignore` | `{ path }` | Set up `.loreignore` (seeded from `.gitignore` and `.p4ignore` when present) and keep each tool's metadata out of the other's history. Returns `{ ok, created, gitignoreUpdated, gitignoreBlocked, p4ignoreUpdated, p4ignoreBlocked }`. A `*Blocked` flag is `true` when that ignore file exists but is read-only (Perforce keeps `.p4ignore` read-only until `p4 edit`), so Lore's entries could not be added — seeding `.loreignore` still succeeds. |
 | POST | `/api/repair` | `{ path }` | Rebuild the working copy's `.lore` in place to purge unremovable stale index entries, preserving the repository id and remote. Refused (409) when there is committed history. Returns `{ ok, id }`. |
 | POST | `/api/org` | `{ path, organization }` | Change a repo's organization. A repo's org is the `org/` prefix of its `name`, which Lore makes read-only after creation, so this rebuilds the working copy's `.lore` under a new URL (preserving the repository id and remote), which discards local committed revisions. The caller must confirm that loss first. `organization` cannot be empty or contain a slash. Returns `{ organization, repoName, name, id }`. |
 
-### Remote operations (streamed)
+### Streamed operations
 
 These respond with `application/x-ndjson`: one normalized Lore event per line,
 ending with a `{ "tag": "DONE", "data": { "ok", "status", "message" } }` marker.
+Long-running verbs also emit `*_BEGIN`/`*_PROGRESS`/`*_END` events carrying
+file and byte counts, which the web UI renders as a progress bar.
 
 | Method | Path | Body | Description |
 | --- | --- | --- | --- |
+| POST | `/api/commit` | `{ path, message }` | Commit the staged revision. |
 | POST | `/api/sync` | `{ path, revision?, reset? }` | Sync the working copy to a revision. |
 | POST | `/api/push` | `{ path, branch?, fastForwardMerge? }` | Push commits to the remote. |
 | POST | `/api/clone` | `{ url, dest }` | Clone a remote repository into `dest`. |

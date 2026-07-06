@@ -682,9 +682,7 @@ const server = createServer(async (req, res) => {
     if (p === "/api/commit" && req.method === "POST") {
       const { path: rp, message } = await readBody(req);
       if (!message) return sendJson(res, 400, { error: "commit message required" });
-      await collect("revisionCommit", { repositoryPath: rp }, { message });
-      broadcastRefresh(rp, "commit");
-      return sendJson(res, 200, { ok: true });
+      return await streamOp(res, "revisionCommit", { repositoryPath: rp }, { message }, rp);
     }
 
     // Remote operations stream their progress back as NDJSON.
