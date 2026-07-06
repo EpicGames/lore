@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .opt_level(3)
         .includes(Some(native_dir.join("thirdparty")));
 
-    println!("cargo:rerun-if-env-changed={}", AARCH64_NEOVERSE_512TVB_ENV);
+    println!("cargo:rerun-if-env-changed={AARCH64_NEOVERSE_512TVB_ENV}");
 
     if platform == "linux" && arch == "aarch64" && env_flag_enabled(AARCH64_NEOVERSE_512TVB_ENV) {
         cc_builder.flag("-mcpu=neoverse-512tvb");
@@ -54,7 +54,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn env_flag_enabled(name: &str) -> bool {
-    env::var(name)
-        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    env::var(name).is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
 }
