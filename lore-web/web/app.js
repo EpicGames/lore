@@ -229,6 +229,7 @@ function fileBadge(f) {
   return ["M", "badge-M"];
 }
 
+/** Fetches repository status and renders the staged/unstaged file lists. */
 async function loadStatus(pathEnc) {
   try {
     const data = await apiGet(`/api/status?path=${pathEnc}`);
@@ -238,6 +239,8 @@ async function loadStatus(pathEnc) {
     renderFiles($("#staged-files"), staged, "unstage");
     renderFiles($("#unstaged-files"), unstaged, "stage");
     $("#commit-btn").disabled = staged.length === 0;
+    $("#stage-all-btn").disabled = unstaged.length === 0;
+    state.unstaged = unstaged;
     updateChangesBar(data);
   } catch (err) {
     toast(err.message, true);
@@ -271,6 +274,18 @@ async function fileAction(action, file) {
   try {
     await apiPost(`/api/${action}`, { path: state.active, files: [file] });
     // SSE refresh will follow, but refetch now for immediate feedback.
+    await loadStatus(encodeURIComponent(state.active));
+  } catch (err) {
+    toast(err.message, true);
+  }
+}
+
+/** Stages every currently unstaged file in the active repository. */
+async function stageAll() {
+  const files = (state.unstaged || []).map((f) => f.path);
+  if (files.length === 0) return;
+  try {
+    await apiPost("/api/stage", { path: state.active, files });
     await loadStatus(encodeURIComponent(state.active));
   } catch (err) {
     toast(err.message, true);
@@ -817,6 +832,7 @@ function wire() {
   $("#add-btn").onclick = addRepo;
   $("#refresh-btn").onclick = refreshActive;
   $("#commit-btn").onclick = commit;
+  $("#stage-all-btn").onclick = stageAll;
   $("#ignore-cancel").onclick = () => $("#ignore-dialog").close();
 
   $("#sync-btn").onclick = () => runOp("Syncing…", "/api/sync", { path: state.active });

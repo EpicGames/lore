@@ -108,7 +108,10 @@ input:focus, textarea:focus { outline: none; border-color: var(--accent); }
 .changes-bar .bar-note { margin-right: auto; font-size: 12px; color: var(--muted); }
 .changes-bar .bar-note.warn { color: var(--yellow); }
 .file-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
-.file-col h3 { margin: 0 0 8px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+.file-col h3 { margin: 0 0 8px; font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; display: flex; align-items: center; justify-content: space-between; }
+.file-col h3 .link-btn { font-size: 11px; text-transform: none; letter-spacing: normal; color: var(--accent); border: none; background: none; padding: 0; cursor: pointer; }
+.file-col h3 .link-btn:hover { text-decoration: underline; }
+.file-col h3 .link-btn:disabled { color: var(--muted); cursor: default; text-decoration: none; }
 .files { list-style: none; margin: 0; padding: 0; }
 .files li { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; }
 .files li:hover { background: var(--panel-2); }
