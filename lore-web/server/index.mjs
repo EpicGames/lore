@@ -17,7 +17,7 @@ import * as xform from "./transforms.mjs";
 import { addClient, broadcastRefresh } from "./events.mjs";
 import { watchRepo, unwatchRepo } from "./watcher.mjs";
 import { isLoggedIn, runCli } from "./cli.mjs";
-import { setupLoreignore, appendIgnorePattern, hasLoreignore, hasGitignore } from "./loreignore.mjs";
+import { setupLoreignore, appendIgnorePattern, hasLoreignore, hasGitignore, hasP4ignore } from "./loreignore.mjs";
 import { discoverServers } from "./discovery.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -597,6 +597,7 @@ const server = createServer(async (req, res) => {
       // The UI offers an "Initialize .loreignore" action when one is absent.
       out.hasLoreignore = repoPath ? hasLoreignore(repoPath) : false;
       out.hasGitignore = repoPath ? hasGitignore(repoPath) : false;
+      out.hasP4ignore = repoPath ? hasP4ignore(repoPath) : false;
       // Flag entries that are themselves Lore working copies (a directory holding
       // its own .lore). The UI prompts to ignore these *while they still exist* —
       // the only way to avoid the unremovable "zombie" entry Lore leaves behind if

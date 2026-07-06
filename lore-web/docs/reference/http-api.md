@@ -34,7 +34,7 @@ is read live from the Lore SDK on each request; nothing is cached server-side.
 
 | Method | Path | Query | Description |
 | --- | --- | --- | --- |
-| GET | `/api/status` | `path` | Current branch plus staged/unstaged changed files. Also returns `hasLoreignore`/`hasGitignore` flags, and marks each changed entry that is itself a nested Lore working copy with `nested: true`. |
+| GET | `/api/status` | `path` | Current branch plus staged/unstaged changed files. Also returns `hasLoreignore`, `hasGitignore`, and `hasP4ignore` flags, and marks each changed entry that is itself a nested Lore working copy with `nested: true`. |
 | GET | `/api/history` | `path`, `length` | Revision history (default 50), with message and timestamp. |
 | GET | `/api/branches` | `path` | Branch list. |
 | GET | `/api/diff` | `path`, `file` | Unified diff for one file. |
@@ -52,7 +52,7 @@ is read live from the Lore SDK on each request; nothing is cached server-side.
 | POST | `/api/reset` | `{ path, files }` | Discard working changes to the given files. |
 | POST | `/api/commit` | `{ path, message }` | Commit the staged revision. |
 | POST | `/api/ignore` | `{ path, pattern }` | Append a gitignore-style `pattern` (file, `folder/`, or `*.ext`) to `.loreignore`, creating it if absent. Returns `{ ok, added }`. |
-| POST | `/api/init-loreignore` | `{ path }` | Set up `.loreignore` (seeded from `.gitignore` when present) and keep each tool's metadata out of the other's history. Returns `{ ok, created, gitignoreUpdated }`. |
+| POST | `/api/init-loreignore` | `{ path }` | Set up `.loreignore` (seeded from `.gitignore` and `.p4ignore` when present) and keep each tool's metadata out of the other's history. Returns `{ ok, created, gitignoreUpdated, gitignoreBlocked, p4ignoreUpdated, p4ignoreBlocked }`. A `*Blocked` flag is `true` when that ignore file exists but is read-only (Perforce keeps `.p4ignore` read-only until `p4 edit`), so Lore's entries could not be added — seeding `.loreignore` still succeeds. |
 | POST | `/api/repair` | `{ path }` | Rebuild the working copy's `.lore` in place to purge unremovable stale index entries, preserving the repository id and remote. Refused (409) when there is committed history. Returns `{ ok, id }`. |
 | POST | `/api/org` | `{ path, organization }` | Change a repo's organization. A repo's org is the `org/` prefix of its `name`, which Lore makes read-only after creation, so this rebuilds the working copy's `.lore` under a new URL (preserving the repository id and remote), which discards local committed revisions. The caller must confirm that loss first. `organization` cannot be empty or contain a slash. Returns `{ organization, repoName, name, id }`. |
 

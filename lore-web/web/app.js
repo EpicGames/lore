@@ -329,9 +329,16 @@ async function ignorePattern(pattern) {
 
 async function initLoreignore() {
   try {
-    const { created, gitignoreUpdated } = await apiPost("/api/init-loreignore", { path: state.active });
+    const { created, gitignoreUpdated, p4ignoreUpdated, p4ignoreBlocked } = await apiPost(
+      "/api/init-loreignore",
+      { path: state.active },
+    );
     toast(created ? "Created .loreignore" : "Updated .loreignore");
     if (gitignoreUpdated) toast("Updated .gitignore");
+    if (p4ignoreUpdated) toast("Updated .p4ignore");
+    // Perforce keeps .p4ignore read-only until it is opened for edit, so Lore
+    // cannot add its entries there on its own.
+    if (p4ignoreBlocked) toast(".p4ignore is read-only — run p4 edit .p4ignore, then retry", true);
     await loadStatus(encodeURIComponent(state.active));
   } catch (err) {
     toast(err.message, true);
@@ -360,6 +367,8 @@ function updateChangesBar(data) {
 
   if (data.hasLoreignore === false) {
     bar.appendChild(barButton("Initialize .loreignore", initLoreignore));
+  } else if (data.hasGitignore || data.hasP4ignore) {
+    bar.appendChild(barButton("Re-sync ignore patterns", initLoreignore, "ghost"));
   }
   if (nested.length) {
     const n = nested.length;
