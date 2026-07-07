@@ -1948,6 +1948,53 @@ pub(crate) async fn stage_node_from_metadata(
         }
     }
 
+    // Refresh the visible metadata of an *already-staged* file when the
+    // filesystem disagrees (size or mode changed since it was staged).
+    // The block below intentionally skips nodes that are already staged, so
+    // without this a stage → edit → stage cycle that never commits (e.g.
+    // lore-drive's stage-only drive mode) keeps serving the stale size in
+    // listings even though the workdir (and the drive's CAS copy) hold the
+    // new content.
+    if node.is_staged()
+        && !node.is_staged_delete()
+        && !force
+        && !options.node_flags.contains(NodeFlags::StagedMerge)
+        && !node.is_staged_merge_unresolved()
+        && node.is_file()
+        && !metadata.is_dir()
+    {
+        let fs_size = util::fs::file_size(&metadata);
+        let fs_mode = util::fs::metadata_to_mode(&metadata, node.mode);
+        if fs_size != node.size || fs_mode != node.mode {
+            node.size = fs_size;
+            node.mode = fs_mode;
+            let dirtied = {
+                let mut block_writer = block.write();
+                *block_writer.node(node_index) = node;
+                block_writer.mark_dirty()
+            };
+            if dirtied {
+                state.block_modified(block.clone(), block_index);
+                state.mark_dirty();
+            }
+            if let Some(ref tracker) = link_tracker {
+                tracker.on_node_changed(repository.id);
+            }
+            lore_debug!(
+                "Refreshed staged metadata for node {} ({}): size {}, mode 0o{:o}",
+                node_link.node,
+                relative_path.join(name.as_str()),
+                fs_size,
+                fs_mode
+            );
+            if event_action.is_none() {
+                // Reported as a modification so the stage driver counts a
+                // change and re-serializes the staged revision.
+                event_action = Some(LoreFileAction::Keep);
+            }
+        }
+    }
+
     if !node.is_staged()
         || force
         || options.node_flags.contains(NodeFlags::StagedMerge)

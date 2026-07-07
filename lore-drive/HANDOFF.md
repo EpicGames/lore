@@ -6,7 +6,7 @@ Firstly, apply RUST.md to correctly setup the required Rust toolchain
 (the workspace uses edition 2024 which requires Rust ≥ 1.85), and install
 `protobuf-compiler` (tonic/prost need `protoc`).
 
-**Sandbox build survival guide** (learned the hard way this session):
+**Sandbox build survival guide** (learned the hard way across sessions):
 - Check free disk *first* (`df -h /`): a full debug build with default
   settings needs ~10 GB.  Free space by deleting `target/debug/incremental`
   and stale caches (`~/.cache/uv`, `~/.cache/puppeteer` were ~2 GB).
@@ -15,10 +15,24 @@ Firstly, apply RUST.md to correctly setup the required Rust toolchain
   (`lore`, `lore-revision`) otherwise exceed one tool-call time budget.
 - Tool calls are capped around ~4½ minutes and background processes die
   between calls: run `timeout 250 cargo build -p <crate>` repeatedly —
-  cargo resumes from cached artifacts, ~3 chunks for a cold workspace build.
+  cargo resumes from cached artifacts, ~3 chunks for a cold workspace build
+  (same for `-p lore-client`, which provides the `lore` CLI binary).
 - Long-running servers survive within a *message* via
   `(setsid <cmd> > log 2>&1 < /dev/null &)` but are killed between user
   messages — restart them per message and re-check `pgrep`.
+- **`pkill -f` trap**: the pattern matches the *current* `/bin/sh -c ...`
+  command line too (it contains the pattern text), killing your own shell —
+  the tool call then reports returncode −1 with no output and *no side
+  effects*.  Kill servers by port instead: `fuser -k 8080/tcp 5173/tcp`
+  (needs `apt-get install -y psmisc`), or `pkill -x <exact-binary-name>`.
+- **Browser E2E works**: Playwright (npm, dev-dependency) driving the
+  preinstalled system Chrome at `/opt/google/chrome/chrome` with
+  `{ executablePath, args: ['--no-sandbox','--disable-dev-shm-usage'] }`.
+  Do NOT `npx playwright install` (download hosts are blocked) — and don't
+  delete `~/.cache/puppeteer` if you plan to use puppeteer instead.
+  `/opt/pw-browsers` also has Playwright-layout chromium builds, but their
+  revision rarely matches the npm playwright version — `executablePath` to
+  system Chrome is the reliable route.
 
 For the frontend: Node/npm are preinstalled; `npm install` + `npm run build`
 inside `lore-drive/frontend/` just work (registry is whitelisted).
@@ -35,10 +49,18 @@ Quick health check of the current state, in a scratch workspace
 (`lore repository create --offline <name>` inside an empty dir):
 
 ```bash
-target/debug/lore-drive &          # drive mode
+target/debug/lore-drive &          # drive mode (add --ui lore-drive/frontend/build to also serve the SPA)
 curl -s localhost:8080/api/v1/info # → {"mode":"drive", ...}
 curl -F "file=@somefile" "localhost:8080/api/v1/upload?parent_id=0"  # → 201, non-zero b3 address
+# replace-upload must refresh BOTH content and metadata (the fixed stale-size bug):
+curl -F "file=@bigger_somefile;filename=somefile" "localhost:8080/api/v1/upload?parent_id=0&overwrite=true"
+curl -s localhost:8080/api/v1/tree  # → the file's size and address are the NEW ones
 ```
+
+Full browser E2E (29 checks): build the frontend, start lore-drive in a
+scratch workspace, then `node frontend/e2e.mjs` (against `npm run dev` on
+:5173) or `E2E_BASE=http://localhost:8080 node frontend/e2e.mjs` (against
+`lore-drive --ui frontend/build`).  See `frontend/README.md`.
 
 ## 4. Update project
 
@@ -52,22 +74,53 @@ Don't hesitate to enhance this HANDOFF.md if need be.
 
 # Tasks
 
-- [ ] **End-to-end test the frontend against the backend in a browser-like
-      environment** — the SvelteKit app was written, `npm run build` passes and
-      the dev-proxy wiring was verified with curl (`/api/v1/info` through
-      :5173), but no real browser exercised the UI.  Verify: navigation,
-      upload (buttons and drag'n'drop of a *folder*), the 409
-      replace-selected/all/abort modal (including the path-matching in
-      `conflictPathOf` after navigating into a subfolder — the backend
-      reports absolute virtual paths), rename/delete/download, `.lorekeep`
-      hidden.  Fix what a real browser disagrees with.  Optional polish:
-      serve the built SPA directly from lore-drive (axum static route) so no
-      second server is needed.
-      **MY REMARKS**:
-      - I noticed, uploading manually nested 2x the same folder1/file1, with the second file1 having a different
-        content/size, that the actual stored file is updated (on disk), as well as if we re-download it,
-        HOWEVER, the displayed file1 metadata (at least the size), is THE OLD ONE, as if the corresponding
-        metadata (mutable store ?) had NOT been updated; please test that usecase in above E2E.
+- [x] **End-to-end test the frontend against the backend in a browser-like
+      environment** — done this session with Playwright driving the system
+      Chrome (see survival guide).  `frontend/e2e.mjs` (29 checks, all green,
+      run against BOTH the dev-proxy topology on :5173 and the new
+      single-server topology on :8080): navigation + breadcrumbs, file upload
+      via picker, **folder upload via the `webkitdirectory` picker** (relative
+      paths preserved: `bundle/sub/two.txt` lands nested), drag'n'drop
+      (synthetic `DataTransfer` exercises the `getAsFile` fallback; real
+      `webkitGetAsEntry` folder-drop can't be synthesized headlessly — the
+      traversal's output shape is identical to the directory picker's, which
+      IS covered), the 409 modal: abort / replace-all / **replace-selected
+      with `conflictPathOf` matching verified inside a subfolder** (backend
+      reports `/docs/bundle/one.txt`; non-conflicting files in the same batch
+      still upload; deselecting every conflict disables "Replace selected" by
+      design — abort leaves everything untouched), rename (file_id preserved),
+      delete (confirm accepted and dismissed), file download (bytes verified),
+      folder download (ZIP magic verified), `.lorekeep` hidden (planted one
+      via the API into an empty folder; UI keeps showing "empty").
+      **MY REMARKS — the stale-size bug: reproduced, root-caused, fixed.**
+      - Repro (curl or UI): upload `folder1/file1` (4 B), replace-upload the
+        same path with 12 B → workdir, CAS and `/download` all served the new
+        bytes, but `/tree`/`/node` kept **size 4** and the staged revision
+        never changed, so `refresh_tree` had nothing to swap.
+      - Root cause (upstream, `lore-revision/src/stage.rs`,
+        `stage_node_from_metadata`): a node that is **already staged is
+        skipped wholesale** (`if !node.is_staged() || force …`).  In drive
+        mode nothing ever commits, every node stays `StagedAdd` forever, so
+        re-staging never refreshed the recorded size/mode.  The address only
+        *looked* fresh because lore-drive's CAS-put epilogue updates its
+        address cache independently of the tree.
+      - Fix (in `stage.rs`): for an already-staged, non-deleted **file** whose
+        filesystem size or mode disagrees with the staged record, rewrite the
+        node record, mark block+state dirty and report a modification — the
+        stage driver then re-serializes the staged revision, `FileStageRevision`
+        fires, and lore-drive swaps in a fresh tree.  Guarded to not run when
+        the normal staging block below will handle the node anyway (`force`,
+        merge flags), and to never resurrect a staged-delete tombstone.
+      - Regression-verified: identical re-upload is still a revision-
+        preserving no-op; same-size same-mode content change still updates
+        bytes + address while metadata legitimately stays (documented in
+        REST_API.md "Verified behavior & caveats"); mkdir / rename / delete /
+        `.lorekeep` / dedup unaffected.
+      **Polish done**: `lore-drive --ui <dir>` now serves the built SPA
+      (adapter-static, `index.html` fallback via `tower_http::services::
+      ServeDir`/`ServeFile`, `fs` feature added to the workspace `tower-http`)
+      on every non-`/api` route — one server, no dev proxy.  E2E suite passes
+      against it directly.
 
 - [x] **Build + smoke-test the write API (drive mode default + `--versioned`)**
       — done this session; every checklist item verified against a real

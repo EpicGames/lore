@@ -23,6 +23,35 @@ Point the app at a different backend with `VITE_API_BASE=http://host:port`.
 `index.html`). Any static file server can host it; the backend stays a pure
 REST API with permissive CORS.
 
+## Run (single server, no dev proxy)
+
+```bash
+npm run build
+cd /path/to/workspace && lore-drive --ui /path/to/lore/lore-drive/frontend/build
+# → http://localhost:8080 serves both the SPA and /api/v1/*
+```
+
+## End-to-end tests (real Chromium)
+
+`e2e.mjs` drives the full UI with Playwright: navigation, file/folder
+upload (including the `webkitdirectory` picker and drag'n'drop), the 409
+abort / replace-all / replace-selected modal (with absolute-virtual-path
+matching after navigating into a subfolder), rename, delete (confirm
+dialog), file download (bytes verified) and folder download (ZIP magic
+verified), `.lorekeep` hiding, and the replace-upload metadata-refresh
+scenario (size must update along with content and address).
+
+```bash
+npm install                    # pulls playwright (dev dependency)
+# start the backend in a scratch workspace, plus either `npm run dev`
+# (test via :5173) or `lore-drive --ui frontend/build` (test via :8080):
+node e2e.mjs                                   # defaults to :5173
+E2E_BASE=http://localhost:8080 node e2e.mjs    # single-server mode
+# E2E_CHROME=/path/to/chrome to override the browser binary
+```
+
+All 29 checks pass in both topologies (Chromium 141).
+
 ## What it does
 
 - Browsable tree, breadcrumb navigation, click a 📁 to enter it

@@ -130,6 +130,12 @@ struct Cli {
     /// mutations only update the single staged revision, no history)
     #[arg(long, default_value_t = false)]
     versioned: bool,
+    /// Serve the built SvelteKit SPA from this directory (e.g.
+    /// `lore-drive/frontend/build`) on every non-/api route, with an
+    /// index.html fallback for client-side routing. When omitted, only the
+    /// REST API is served.
+    #[arg(long)]
+    ui: Option<std::path::PathBuf>,
 }
 
 // ─── App state ───────────────────────────────────────────────────────────────
@@ -1779,7 +1785,28 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/api/v1/download/{node_id}", get(handle_download))
         .route("/api/v1/mkdir", post(handle_mkdir))
-        .route("/api/v1/upload", post(handle_upload))
+        .route("/api/v1/upload", post(handle_upload));
+
+    // Optionally serve the built SPA (adapter-static, fallback index.html)
+    // on every non-/api route — one server for the whole drive.
+    let app = if let Some(ui) = &cli.ui {
+        let index = ui.join("index.html");
+        if !index.is_file() {
+            anyhow::bail!(
+                "--ui {}: no index.html found (build the frontend first: `npm run build` in lore-drive/frontend)",
+                ui.display()
+            );
+        }
+        info!("Serving SPA from {}", ui.display());
+        app.fallback_service(
+            tower_http::services::ServeDir::new(ui)
+                .fallback(tower_http::services::ServeFile::new(index)),
+        )
+    } else {
+        app
+    };
+
+    let app = app
         // Uploads can be large — allow up to 1 GiB bodies.
         .layer(DefaultBodyLimit::max(1024 * 1024 * 1024))
         // Allow the future SvelteKit frontend (different port) to call us in dev.

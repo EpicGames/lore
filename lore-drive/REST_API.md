@@ -40,6 +40,12 @@ current one — no history browsing, no version selection.  Two serving modes:
 See *Single-version drive semantics* below for what this means precisely and
 for the feasibility analysis behind the design.
 
+**Serving the frontend**: `lore-drive --ui <dir>` additionally serves the
+built SvelteKit SPA (`lore-drive/frontend/build`, produced by `npm run
+build`) on every non-`/api` route with an `index.html` fallback — one server
+for API + UI, no dev proxy needed.  Without `--ui`, only the REST API is
+served (the vite dev server on :5173 proxies `/api` → :8080 for development).
+
 **Base URL**: `http://localhost:8080`  
 **Protocol**: HTTP/1.1, JSON bodies (`Content-Type: application/json`).  
 **Error shape** (all 4xx / 5xx responses):
@@ -270,16 +276,26 @@ Drive mode compensates at the lore-drive layer:
 Directory nodes have no materialized hash in drive mode (directory hashes are
 also computed at commit); their `address` is `null` as usual.
 
-### Verified behavior & caveats (from the smoke-test task)
+### Verified behavior & caveats (from the smoke-test + browser-E2E tasks)
 
-- **Same-size modifications are staging no-ops.**  Because staged records
-  hold only `file_id`/size/mode (no content hash), overwriting a file with
-  different bytes of the *same size* produces a bit-identical staged
-  revision: `stage` emits nothing and the `revision` change-tag stays put.
-  The upload epilogue still `put`s the new bytes into the CAS and refreshes
-  the address cache, so `/tree`, `/node` and `/download` stay 1-to-1 with the
-  workdir content — only the change-tag is blind to it.  Clients must not
-  infer "content unchanged" from an unchanged `revision` in drive mode.
+- **Metadata of an already-staged file is refreshed on re-stage.**  Upstream
+  `stage_node_from_metadata` used to skip nodes that were already staged, so
+  in drive mode (nothing ever commits — every node stays `StagedAdd`) a
+  replace-upload with a *different size* kept serving the **old size** in
+  `/tree`/`/node` forever, even though the workdir, the CAS copy and
+  `/download` all had the new content (observed by the owner as "stored file
+  updated but displayed size is the old one").  `stage.rs` now refreshes the
+  staged record's size/mode from the filesystem when they disagree, which
+  also bumps the staged revision so lore-drive swaps in a fresh tree.
+- **Same-size, same-mode modifications are still staging no-ops.**  Because
+  staged records hold only `file_id`/size/mode (no content hash), overwriting
+  a file with different bytes of the *same size* produces a bit-identical
+  staged revision: `stage` emits nothing and the `revision` change-tag stays
+  put.  The upload epilogue still `put`s the new bytes into the CAS and
+  refreshes the address cache, so `/tree`, `/node` and `/download` stay
+  1-to-1 with the workdir content — only the change-tag is blind to it.
+  Clients must not infer "content unchanged" from an unchanged `revision` in
+  drive mode.
 - **Staged deletions are tombstones.**  The underlying sibling chain keeps
   staged-deleted nodes; the `list_children` verb has been fixed to skip
   `is_staged_delete()` nodes (the child event carries no deletion flag, so
