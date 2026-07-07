@@ -23,38 +23,66 @@ Nothing to do for now.
 Then I want you to update the present HANDOFF.md + any other relevant documents to reflect the current state of the project,
 for your future self to take over new tasks I'll append here (mark as done those which are to keep this HANDOFF clean & maintainable).
 The step 1 (eg: Rust, maybe Sveltekit) shall always be instructed because of peculiar AI's sandbox constraints wrt Rust.
-Eg: if you face any crates version issue in Cargo.toml, please find a working crate set and update it too. Use "=x.y" if required etc.
+Eg: if you face any crates version issue in Cargo.toml, please find a working crate set and update it too.
 Add all your work (`cargo clean` !!) in a new git commit (use your identity !) then `git gc` and create a ZIP archive of the whole project + git history and present
 it as downloadble zip archive file.
 Don't hesitate to enhance this HANDOFF.md if need be.
 
 # Tasks
 
-- [ ] **Build + smoke-test the new write API** — the write endpoints below were
-      added *without building* (per instruction). Before (or alongside) the
-      frontend task, verify them:
+- [ ] **Build + smoke-test the write API (drive mode default + `--versioned`)** —
+      the write endpoints were added *without building* (per instruction), then
+      reworked for single-version drive semantics. Verify:
       1. Setup per RUST.md + `apt-get install -y protobuf-compiler` (tonic/prost need `protoc`).
-      2. `cargo build -p lore-drive` — new deps `zip` (pinned `=2.2.2`) and
+      2. `cargo build -p lore-drive` — deps `zip` (pinned `=2.2.2`) and
          `tempfile` were added to the root workspace + lore-drive manifests and
          axum gained the `multipart` feature; the first build will update
          `Cargo.lock` (crates.io is reachable from the sandbox). If `zip =2.2.2`
          misbehaves under edition-2024/workspace lints, pick another 2.x and pin it.
-      3. Point the binary at a real lore workspace **with a commit identity
-         configured** (commits fail with `MissingIdentity` otherwise) and verify:
-         - `curl http://localhost:8080/api/v1/download/<file id>` matches `lore` content (b3 hash!)
-         - `curl http://localhost:8080/api/v1/download/0 -o root.zip` yields a valid ZIP
-         - `curl -X POST -H 'content-type: application/json' -d '{"parent_id":0,"name":"newdir"}' http://localhost:8080/api/v1/mkdir`
-           (watch the empty-dir `.lorekeep` fallback path)
-         - `curl -F 'file=@x.txt' 'http://localhost:8080/api/v1/upload?parent_id=0'` then re-upload
-           without/with `overwrite=true` to see the `409 {conflicts}` / replace flow
-         - `curl -X PATCH -d '{"name":"y.txt"}' .../api/v1/node/<id>` and `curl -X DELETE .../api/v1/node/<id>`
-         - after each mutation `GET /api/v1/info` must show the new revision, and
-           a concurrent `lore` CLI must still work (long-lived context stays ReadOnly;
-           write verbs take their own per-call token)
-      4. Open questions to resolve while testing (documented in REST_API.md):
-         does `load_current_anchor` on the long-lived context observe the new
-         anchor after commit (else re-`load_and_connect` in `refresh_tree`)?
-         does staging a bare directory commit anything (else `.lorekeep` kicks in)?
+      3. **Drive mode (default, stage-only, no history)** — run `lore-drive` in a
+         real workspace and verify:
+         - `GET /api/v1/info` reports `"mode":"drive"`; `revision` is the staged
+           revision once anything is staged
+         - upload a file → `201`; its `address` must be a **non-zero** b3 hash
+           (drive mode pushes content via `put_file` and serves the CAS-returned
+           address — the staged node record itself keeps hash 0, see
+           `effective_address` in main.rs and the semantics section of REST_API.md)
+         - `GET /api/v1/tree` / `node` show the same non-zero address (lazy
+           materialization + `addr_cache`); `b3sum` of the file must match
+         - `GET /api/v1/download/<id>` returns the exact bytes (zero-hash records
+           must never hit the CAS — get_file would truncate-to-empty; the code
+           short-circuits to the workdir)
+         - re-upload identical bytes with `overwrite=true` → `201`, **unchanged**
+           `revision` change-tag, store size unchanged (dedup)
+         - upload same path 3× with different bytes → still exactly one node /
+           one `file_id`; old fragments may remain in the CAS (acceptable —
+           note actual behavior)
+         - mkdir / rename (PATCH) / delete, then confirm a plain `lore` CLI
+           `status`/`commit` in the same workspace sees the accumulated staged
+           changes and can commit them (drive + CLI coexistence)
+         - restart lore-drive → staged revision is re-served (persistence of the
+           staged anchor)
+      4. **Versioned mode** — run `lore-drive --versioned` in a workspace **with a
+         commit identity** (commits fail with `MissingIdentity` otherwise):
+         - one commit per effective mutation; `409 {conflicts}` upload flow;
+           re-upload of identical content → *nothing staged* mapped to success
+           no-op (verify the exact error wording matched by `is_nothing_staged`
+           in main.rs and tighten it)
+      5. Open questions to resolve while testing (flagged in REST_API.md):
+         does staging alone require an identity? does `served_revision` on the
+         long-lived ReadOnly context observe staged-anchor/anchor updates after
+         each mutation (else re-`load_and_connect` in `refresh_tree`)? does
+         `load` accept a staged revision hash (it should — same State format)?
+         is the empty-dir `.lorekeep` fallback triggered in both modes?
+      **MY ANSWERS**:
+      - Question 5:
+        - how to "upload" ?
+        - in "drive" mode, seems to work without identity (is `lore auth info` returning 255 `[Error] No auth endpoint available at lore/src/auth.rs:32:1` a valid test ?)
+        - browsing `api/v1/download/3` => `WARN lore_drive: CAS miss for /notes.txt (get_file failed: AddressNotFound); served from workdir`
+          => but despite warning, I get correct file (node 3) contents
+      - If my answers are not sufficient, update the document to progress.
+      - If needed/relevant, try to build/run/test yourself
+      - Or, if enough progress/context, go ahead and implememt the frontend
 
 - [ ] **Implement the SvelteKit 5 frontend** (postponed from the previous task —
       the REST API had to be augmented first, which is now done; see REST_API.md).
@@ -80,11 +108,48 @@ Don't hesitate to enhance this HANDOFF.md if need be.
         "replace" re-sends only the selected conflicting files with
         `overwrite=true` (plus the non-conflicting ones without it), "abort" cancels
       - after every successful mutation, refresh the current listing (responses
-        carry the new `revision`; stale `node_id`s must not be reused)
+        carry the current `revision` change-tag — treat it as an ETag: it may be
+        UNCHANGED on idempotent no-ops; stale `node_id`s must not be reused)
       - treat `.lorekeep` entries as hidden
       Keep it minimal & clean; no component library needed. Building the Rust
       backend is not required to *write* the frontend, but end-to-end testing
       needs the task above done.
+
+- [x] **Single-version drive semantics (owner request): stage-only drive mode
+      (default) + `--versioned`, and zero-hash fixes** — the owner asked for a
+      no-versioning "USB-stick" drive (one copy per path, no history), or
+      alternatively an eternal-amend scheme. Feasibility (verified in code):
+      - *eternal amend*: not a primitive — `lore revision amend`
+        (`lore-revision/src/revision/amend.rs`) only rewrites the tip's
+        message/metadata; it never folds staged content, and revision parent
+        pointers cannot be rewritten via any API → rejected.
+      - *stage-only*: viable **only** with lore-drive populating the CAS
+        itself, because content hashing + immutable-store writes are a
+        **commit**-time step (`lore-revision/src/commit.rs`:
+        `write_from_file_with_tracker` per file, blake3 rehash per dir;
+        staged nodes carry a ZERO content hash — `stage_node_from_metadata`
+        records only file_id/size/mode). The owner's on-disk rewrite of
+        main.rs (drive mode default + `--versioned` + `cas_put_file` on
+        upload) adopted exactly that; this session kept it and fixed the
+        three latent zero-hash bugs it inherited:
+        1. `/tree`+`/node` would display `0000…-<file_id>` for staged files →
+           new `effective_address` materializer: idempotent `cas_put_file` of
+           the workdir bytes at the node's file_id, cached in `addr_cache`
+           (cleared on every tree swap); zero-SIZE files keep the zero hash
+           (lore's empty-content convention); link-repo children pass through.
+        2. downloads of staged files returned 0 bytes — `get_file` with a
+           zero hash *truncates-to-empty and succeeds*, so the workdir
+           fallback never fired → `read_file_bytes` short-circuits zero-hash
+           reads to the workdir; single-file download materializes first.
+        3. upload epilogue's `stored == node.address` always warned (staged
+           side is zero) → compares file_id context only; CAS-returned
+           address feeds the response + cache.
+        Plus: `commit_staged` → `Result<Option<Hash>>` with `is_nothing_staged`
+        so identical re-uploads in `--versioned` are success no-ops too.
+      - REST_API.md rewritten accordingly: dual-mode overview, "Single-version
+        drive semantics" section (guarantees, drive-mode subtlety, feasibility
+        notes, client consequences as ETag semantics), download/upload/mkdir/
+        info docs updated, implementer note on the materialization cache.
 
 - [x] **Augment REST API + backend with write & download endpoints** — outcome of
       the "simple SvelteKit UI" task: the UI needs rename/delete/download/upload/

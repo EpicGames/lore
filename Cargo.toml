@@ -168,7 +168,7 @@ zerocopy = { version = "0.8.26", features = [
 ] }
 # lore-drive: ZIP assembly for folder downloads. Pinned exact for sandbox
 # reproducibility (see lore-drive/HANDOFF.md step 1 note on crate pinning).
-zip = { version = "=2.2.2", default-features = false, features = ["deflate"] }
+zip = { version = "2.2.2", default-features = false, features = ["deflate"] }
 
 # Note: we currently control debug symbol splitting in .cargo/config.toml
 

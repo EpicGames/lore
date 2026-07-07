@@ -16,13 +16,29 @@ file/folder tree.
 The API has two halves:
 
 - a **read API** (`info`, `tree`, `node`, `download`) that serves the
-  *committed* revision tree and file contents straight from the CAS, and
+  *current* tree and file contents straight from the CAS, and
 - a **write API** (`upload`, `mkdir`, `PATCH node`, `DELETE node`) whose
   mutations are **workspace-mediated**: every mutation is performed as a
   filesystem change inside the working directory, then staged
-  (`lore::file::stage` / `stage_move`) and committed
-  (`lore::revision::commit`) — exactly what the `lore` CLI would do.
-  One successful mutating request produces exactly one new revision.
+  (`lore::file::stage` / `stage_move`) — and, in versioned mode only, also
+  committed (`lore::revision::commit`) — the same flows the `lore` CLI uses.
+
+**lore-drive is a single-version drive by default** ("dumb cloud drive" /
+USB-stick semantics): the API exposes exactly one version of the tree — the
+current one — no history browsing, no version selection.  Two serving modes:
+
+- **Drive mode (default)** — mutations update the working directory and the
+  single **staged revision** (`lore::file::stage`/`stage_move`), **never
+  committing**.  Every mutation replaces the one staged snapshot in place.
+  Content is pushed into the CAS by lore-drive itself (`lore_storage_put_file`),
+  so files still have node ids, `file_id`s and real BLAKE3 content addresses,
+  and populate the mutable/immutable stores — deduplicated: uploading the same
+  path/content N times keeps exactly one stored copy.
+- **Versioned mode (`--versioned`)** — every *effective* mutating request
+  produces exactly one commit on the active branch.
+
+See *Single-version drive semantics* below for what this means precisely and
+for the feasibility analysis behind the design.
 
 **Base URL**: `http://localhost:8080`  
 **Protocol**: HTTP/1.1, JSON bodies (`Content-Type: application/json`).  
@@ -64,7 +80,8 @@ Returns metadata about the workspace open in this `lore-drive` instance.
   "branch_id":     "<32-char hex>",
   "branch_name":   "main",
   "revision":      "<64-char hex>",
-  "workdir":       "/absolute/path/to/workspace"
+  "workdir":       "/absolute/path/to/workspace",
+  "mode":          "drive"
 }
 ```
 
@@ -73,8 +90,9 @@ Returns metadata about the workspace open in this `lore-drive` instance.
 | `repository_id` | `Partition` — repository UUID as stored in the CAS |
 | `branch_id` | `Context` — branch UUID as stored in the CAS |
 | `branch_name` | Human-readable branch name |
-| `revision` | `Hash` — latest committed revision hash |
+| `revision` | `Hash` — current change-tag (served revision; see *Single-version drive semantics*) |
 | `workdir` | Absolute filesystem path of the workspace root |
+| `mode` | `"drive"` (stage-only, no history — default) or `"versioned"` (commit per mutation) |
 
 ---
 
@@ -190,29 +208,124 @@ Fetch the full metadata record for a single node.
 
 ---
 
+## Single-version drive semantics
+
+The project owner's requirement: behave like a dumb cloud drive / USB stick —
+files and folders are "in the system" (node ids, `file_id` UUIDs, BLAKE3
+content hashes, mutable/immutable stores populated) but there is only ever
+**one** version of the tree.  Uploading the same file/path three times must
+keep exactly one stored copy.
+
+### What the API guarantees (both modes)
+
+1. **One visible version.**  Every endpoint serves the *current* tree — the
+   staged revision in drive mode (falling back to the committed anchor when
+   nothing is staged yet), the branch tip in versioned mode.  There is no
+   endpoint to list, browse, or check out history.  The `revision` field in
+   responses is an **opaque change-tag** (think HTTP ETag): compare it to
+   know whether anything changed; do not interpret it as a navigable version.
+2. **One stored copy per content.**  The store is content-addressed: storing
+   the same bytes N times writes the fragments **once** (deduplicated).
+   Re-uploading an identical file is a no-op at the storage layer by
+   construction.
+3. **One identity per path.**  Overwriting an existing file reuses its node —
+   the `file_id` (the context half of the `Address`) is preserved, so a path
+   keeps a single stable identity across content updates.
+4. **Idempotent writes.**  A mutation that changes nothing (e.g. re-uploading
+   identical content with `overwrite=true`) is a **success no-op**: the
+   change-tag stays the same, no error is returned.  Drive mode detects this
+   as an unchanged staged-revision hash; versioned mode maps the *nothing
+   staged* commit outcome to success.
+
+### How drive mode works (and the one subtlety)
+
+Drive mode never commits.  Mutations are: filesystem change → `stage`/
+`stage_move` → serve the resulting **staged revision** (a real serialized
+revision state, loadable by the same revision-tree machinery as a commit).
+Each stage *replaces* the staged snapshot in place — no history accrues, not
+even invisible metadata.  An external `lore` CLI sees the accumulated staged
+changes and may commit them at any time; lore-drive keeps working either way.
+
+The subtlety: **staged file nodes carry a zero content hash.**  In lore,
+content hashing and immutable-store writes are performed by the *commit* step
+(`lore-revision/src/commit.rs`: `write_from_file_with_tracker` per file,
+blake3 rehash per directory; see also `stage_node_from_metadata` in
+`stage.rs`, which records `file_id`, size and mode but no content hash).
+Drive mode compensates at the lore-drive layer:
+
+- **On upload**, each file's bytes are pushed into the CAS at the staged
+  node's `file_id` context via `lore_storage_put_file` (content-addressed →
+  dedup for free).  The returned address is the authoritative one.
+- **On read** (`/tree`, `/node`, `/download`), a file node whose record still
+  has a zero hash gets its address **materialized**: the workdir bytes are
+  `put` into the CAS (idempotent) and the resulting address is served and
+  cached for the current change-tag.  This keeps the displayed b3 hash
+  1-to-1 with the CAS and also covers files staged by an external CLI.
+  Zero-*size* files legitimately keep the zero hash (lore's empty-content
+  convention).
+- **Downloads** never send a zero hash to the CAS (`get_file`'s contract for
+  a zero hash is *truncate-to-empty and succeed*); such reads are served from
+  the working directory instead.
+
+Directory nodes have no materialized hash in drive mode (directory hashes are
+also computed at commit); their `address` is `null` as usual.
+
+### Feasibility notes (alternatives considered)
+
+- **Eternal amend** (`git commit --amend --no-edit` equivalent): not
+  available as a primitive.  `lore revision amend`
+  (`lore_revision::revision::amend::amend_revision`) only rewrites the tip's
+  *metadata/message* and re-anchors the branch; it does not fold staged
+  content into the tip, and there is no API to rewrite a committed revision's
+  parent pointers.  Emulating it would mean hand-editing serialized `State`
+  records — fragile, rejected.
+- **Commit per mutation** (kept as `--versioned`): the standard flow; history
+  accrues (a ~320-byte revision record plus changed node blocks per
+  mutation) while file *content* stays deduplicated.  If a middle ground is
+  ever wanted (real commits, bounded history), a future task can add periodic
+  history squashing / `obliterate` of unreferenced revisions — the drive API
+  needs no change for it.
+
+### Consequences for clients
+
+- Treat `revision` as an ETag.  Refresh listings when it changes.
+- A `2xx` on a mutation does **not** imply a new `revision` (idempotent
+  no-op keeps the old one).
+- Node ids remain per-version internally; after any mutation response with a
+  *new* `revision`, re-fetch listings and do not reuse stale ids.
+- `GET /api/v1/info` reports the serving `mode` (`"drive"` or
+  `"versioned"`); clients need no behavioral switch — the contract above is
+  identical in both.
+
+---
+
 ## Write model
 
 All mutating endpoints share the following contract:
 
 1. **Workspace-mediated.**  The backend performs the change on the real
    working directory (`create_dir`, write bytes, `rename`, `remove_*`),
-   then stages the affected paths and commits.  The commit message is
-   generated (`"lore-drive: <verb> <path>"`).
-2. **Atomic per request.**  One successful request = one commit.  On any
-   error before the commit, the backend rolls back its filesystem changes
-   (best effort) and the committed tree is untouched.
+   then stages the affected paths — and, in versioned mode, commits.  The
+   generated commit message (`"lore-drive: <verb> <path>"`) is
+   drive-internal noise, never surfaced by the API.
+2. **Atomic per request.**  One successful request = one staged-snapshot
+   replacement (drive mode) or at most one commit (versioned mode; zero for
+   a no-op).  On any error before that point, the backend rolls back its
+   filesystem changes (best effort) and the current tree is untouched.
 3. **Serialized.**  A process-global writer mutex serializes mutations, so
-   two concurrent `POST /upload` requests never interleave stage/commit.
-4. **Fresh tree after commit.**  After a successful commit, the backend
-   reloads its revision-tree handle from the new branch anchor.  Every
-   success response carries the new `revision` so the client can refresh.
-5. **Identity required.**  Commits need a configured lore identity in the
-   workspace (same requirement as `lore revision commit`).  Missing identity
-   surfaces as `500` with the underlying error message.
-6. **Node ids are per revision.**  After any mutation, previously fetched
-   `node_id` values belong to the *old* revision handle. The backend reloads
-   its handle, so clients must re-fetch `/tree` listings after each mutation
-   and must not reuse stale node ids.
+   two concurrent `POST /upload` requests never interleave stage[/commit].
+4. **Fresh tree after effective mutations.**  After an effective stage (or
+   commit), the backend reloads its tree handle from the new served
+   revision.  Every success response carries the current `revision`
+   change-tag.
+5. **Identity for commits.**  Versioned mode needs a configured lore
+   identity in the workspace (same requirement as `lore revision commit`);
+   missing identity surfaces as `500` with the underlying error message.
+   Drive mode does not commit and has no such requirement — verify during
+   smoke testing whether staging alone also expects one.
+6. **No-op detection.**  A *nothing staged* outcome from stage+commit is
+   mapped to success with the unchanged `revision` (see single-version
+   semantics above).
 
 Uniform error shape stays `{ "error": "<message>" }`; the `409 Conflict`
 upload response adds a `conflicts` array (see below).
@@ -221,9 +334,13 @@ upload response adds a `conflicts` array (see below).
 
 ### `GET /api/v1/download/{node_id}`
 
-Download content.  Bytes are fetched from the CAS (`lore_storage_get_file`),
-**not** from the working directory, so what you download is exactly the
-content whose BLAKE3 hash is displayed in `/tree` / `/node` responses.
+Download content.  Bytes are fetched from the CAS (`lore_storage_get_file`)
+at the node's *effective* address (drive mode materializes zero-hash records
+first — see the semantics section), so what you download is exactly the
+content whose BLAKE3 hash is displayed in `/tree` / `/node` responses.  When
+a file's record still has a zero hash (e.g. staged by an external CLI and not
+yet materialized) or the CAS read fails, the bytes are served from the
+working directory as a fallback — a zero hash is never sent to the CAS.
 
 | Node kind | Response |
 |-----------|----------|
@@ -233,8 +350,9 @@ content whose BLAKE3 hash is displayed in `/tree` / `/node` responses.
 
 ZIP details: entry paths are relative to the downloaded directory, `deflate`
 compression, empty directories included as directory entries, `link` children
-skipped.  The archive is assembled from the *committed* tree (recursive
-`list_children` walk) with each file fetched from the CAS.
+skipped.  The archive is assembled from the *served* tree (recursive
+`list_children` walk) with each file fetched from the CAS (workdir fallback
+per file as above).
 
 #### Error responses
 
@@ -276,10 +394,11 @@ new (empty) directory as a node — see the empty-directory caveat below.
 #### Empty-directory caveat
 
 lore stages *files*; a freshly created empty directory may stage to nothing.
-The implementation first tries `create_dir` + stage + commit; if the commit
-reports nothing staged, it drops a `.lorekeep` placeholder file inside the new
-directory and stages/commits again.  Frontends should treat `.lorekeep` as a
-hidden implementation detail.
+The implementation first tries `create_dir` + stage (in drive mode an
+unchanged staged-revision hash means nothing was recorded; in versioned mode
+the commit reports *nothing staged*); it then drops a `.lorekeep` placeholder
+file inside the new directory and stages again.  Frontends should treat
+`.lorekeep` as a hidden implementation detail.
 
 #### Error responses
 
@@ -313,7 +432,7 @@ whole request with `400`.
 #### Conflict semantics ("replace / all / abort" support)
 
 Before touching the workspace, every target path is resolved against the
-committed tree:
+current (served) tree:
 
 - target exists as a **file** → conflict
 - target exists as a **directory** while uploading a file (or vice versa) → conflict
@@ -342,8 +461,16 @@ filtered part list ("replace" selected ones only).
 }
 ```
 
-`node_id`/`address` are resolved from the freshly committed tree (best effort;
+`node_id`/`address` are resolved from the current tree (best effort;
 `null` if resolution fails).
+
+**Idempotency**: re-uploading byte-identical content over the same paths with
+`overwrite=true` is a success no-op — `201` with the *unchanged* `revision`
+change-tag, and the content remains stored once (CAS dedup).
+
+In drive mode the response `address` for each file is the authoritative
+CAS address returned by the content `put` (the staged node record itself
+keeps a zero hash — see the semantics section).
 
 #### Error responses
 
@@ -447,10 +574,17 @@ Delete a file or a directory subtree.
    `lore_revision_tree_{add,delete,move,modify,commit}` verbs currently exist
    as argument structs only (no implementation in the `lore` crate), so the
    write path reuses the proven high-level workspace flow instead: filesystem
-   change → `lore::file::stage`/`stage_move` → `lore::revision::commit`.
-   These verbs open their own per-call write token against the workspace in
-   the current working directory, which also keeps lore-drive's long-lived
-   handles read-only.
+   change → `lore::file::stage`/`stage_move` [→ `lore::revision::commit` in
+   versioned mode].  These verbs open their own per-call write token against
+   the workspace in the current working directory, which also keeps
+   lore-drive's long-lived handles read-only.
 
 7. **Paths passed to stage verbs** are workspace-relative (no leading `/`),
    with the process CWD being the workspace root — identical to CLI usage.
+
+8. **Address materialization cache** (drive mode) is in-memory, keyed by node
+   id and valid only for the currently served change-tag (cleared on every
+   tree swap).  Cold-start listings of large staged trees will therefore
+   re-`put` (rehash) files once per process lifetime + change-tag; that is
+   accepted for v1 — `put_file` is idempotent and writes nothing when the
+   content already exists.
