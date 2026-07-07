@@ -74,6 +74,22 @@ Don't hesitate to enhance this HANDOFF.md if need be.
 
 # Tasks
 
+- [ ] Discovered a bug:
+      1. upload nested folder1/file1
+      2. delete folder1/
+      3. it "works" as in: browser shows empty root, and on-disk FS shows an empty lore reop (remains only .lore)
+      4. HOWEVER: trying to upload again nested folder1/file1, shows the popup "replace?"
+      Please fix/test that.
+
+- [ ] Let's talk about /metadata/
+      What if I'd like for the browser user, to set/list custom metadata per browser item (folder/file), possible ?
+      Eg: in the "..." menu of those, add a "Properties" submenu that lists those set user-properties, and let add
+      new ones. Let's start simple: such a property is key/value (string/string)
+      Can we elegantly stuff that with minimal effort, eg: inside the existing "mutable store", for cheap ?
+      Can we then add a global "search" toolbar, letting us search for folder/file names, and/or property key/value ?
+      Could this be elegant/minimalist/fast ? Can that be unit(cargo)/integration(hurl)/e2e(playwright) tested ?
+      If complex, this task could result in drafting spec for further task(s)
+
 - [x] **End-to-end test the frontend against the backend in a browser-like
       environment** — done this session with Playwright driving the system
       Chrome (see survival guide).  `frontend/e2e.mjs` (29 checks, all green,
