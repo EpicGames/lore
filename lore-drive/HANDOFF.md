@@ -63,6 +63,11 @@ Don't hesitate to enhance this HANDOFF.md if need be.
       hidden.  Fix what a real browser disagrees with.  Optional polish:
       serve the built SPA directly from lore-drive (axum static route) so no
       second server is needed.
+      **MY REMARKS**:
+      - I noticed, uploading manually nested 2x the same folder1/file1, with the second file1 having a different
+        content/size, that the actual stored file is updated (on disk), as well as if we re-download it,
+        HOWEVER, the displayed file1 metadata (at least the size), is THE OLD ONE, as if the corresponding
+        metadata (mutable store ?) had NOT been updated; please test that usecase in above E2E.
 
 - [x] **Build + smoke-test the write API (drive mode default + `--versioned`)**
       — done this session; every checklist item verified against a real
