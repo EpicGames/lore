@@ -49,7 +49,7 @@ is read live from the Lore SDK on each request; nothing is cached server-side.
 | --- | --- | --- | --- |
 | POST | `/api/stage` | `{ path, files }` | Stage the given files. |
 | POST | `/api/unstage` | `{ path, files }` | Unstage the given files. |
-| POST | `/api/reset` | `{ path, files }` | Discard working changes to the given files. |
+| POST | `/api/reset` | `{ path, files }` | Discard working changes to the given files, including removing newly added (untracked) files and folders. |
 | POST | `/api/ignore` | `{ path, pattern }` | Append a gitignore-style `pattern` (file, `folder/`, or `*.ext`) to `.loreignore`, creating it if absent. Returns `{ ok, added }`. |
 | POST | `/api/init-loreignore` | `{ path }` | Set up `.loreignore` (seeded from `.gitignore` and `.p4ignore` when present) and keep each tool's metadata out of the other's history. Returns `{ ok, created, gitignoreUpdated, gitignoreBlocked, p4ignoreUpdated, p4ignoreBlocked }`. A `*Blocked` flag is `true` when that ignore file exists but is read-only (Perforce keeps `.p4ignore` read-only until `p4 edit`), so Lore's entries could not be added — seeding `.loreignore` still succeeds. |
 | POST | `/api/repair` | `{ path }` | Rebuild the working copy's `.lore` in place to purge unremovable stale index entries, preserving the repository id and remote. Refused (409) when there is committed history. Returns `{ ok, id }`. |

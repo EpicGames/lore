@@ -650,7 +650,10 @@ const server = createServer(async (req, res) => {
     }
     if (p === "/api/reset" && req.method === "POST") {
       const { path: rp, files } = await readBody(req);
-      await collect("fileReset", { repositoryPath: rp }, { paths: absFiles(rp, files) });
+      // purge is required to discard newly added (untracked) files/folders — without
+      // it, fileReset only reverts already-tracked modified content and silently
+      // leaves added entries dirty.
+      await collect("fileReset", { repositoryPath: rp }, { paths: absFiles(rp, files), purge: true });
       broadcastRefresh(rp, "reset");
       return sendJson(res, 200, { ok: true });
     }
