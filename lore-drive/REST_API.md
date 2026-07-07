@@ -270,6 +270,33 @@ Drive mode compensates at the lore-drive layer:
 Directory nodes have no materialized hash in drive mode (directory hashes are
 also computed at commit); their `address` is `null` as usual.
 
+### Verified behavior & caveats (from the smoke-test task)
+
+- **Same-size modifications are staging no-ops.**  Because staged records
+  hold only `file_id`/size/mode (no content hash), overwriting a file with
+  different bytes of the *same size* produces a bit-identical staged
+  revision: `stage` emits nothing and the `revision` change-tag stays put.
+  The upload epilogue still `put`s the new bytes into the CAS and refreshes
+  the address cache, so `/tree`, `/node` and `/download` stay 1-to-1 with the
+  workdir content — only the change-tag is blind to it.  Clients must not
+  infer "content unchanged" from an unchanged `revision` in drive mode.
+- **Staged deletions are tombstones.**  The underlying sibling chain keeps
+  staged-deleted nodes; the `list_children` verb has been fixed to skip
+  `is_staged_delete()` nodes (the child event carries no deletion flag, so
+  streaming them would be indistinguishable from live entries).  Direct
+  `GET /node/{id}` of a tombstoned id may still resolve — don't navigate by
+  remembered ids.
+- **CLI coexistence is sequential, not concurrent.**  A running lore-drive
+  holds the workspace lock (`.lore/lock`); a concurrent `lore` CLI command in
+  the same workspace *blocks* until lore-drive exits.  Stop lore-drive, run
+  `lore status`/`commit` (it sees all accumulated staged changes), restart —
+  the staged anchor persists and is re-served.
+- **`CAS miss … served from workdir` warnings** on download mean the store
+  genuinely lacks the blob for a non-zero address (e.g. gc'd store, copied
+  workspace, artifacts from an older build).  The workdir fallback serving
+  the correct bytes is the designed safety net, not an error; the next
+  materialization pass re-`put`s the content.
+
 ### Feasibility notes (alternatives considered)
 
 - **Eternal amend** (`git commit --amend --no-edit` equivalent): not
@@ -319,13 +346,19 @@ All mutating endpoints share the following contract:
    revision.  Every success response carries the current `revision`
    change-tag.
 5. **Identity for commits.**  Versioned mode needs a configured lore
-   identity in the workspace (same requirement as `lore revision commit`);
+   identity in the workspace (same requirement as `lore revision commit`) —
+   e.g. a top-level `identity = "Name <mail>"` entry in `.lore/config.toml`;
    missing identity surfaces as `500` with the underlying error message.
-   Drive mode does not commit and has no such requirement — verify during
-   smoke testing whether staging alone also expects one.
+   Drive mode does not commit and has no such requirement — **verified**:
+   staging alone works with no identity configured.  (Note: `lore auth info`
+   probes the *auth endpoint*, not the commit identity — its failure in an
+   offline workspace is expected and unrelated.)
 6. **No-op detection.**  A *nothing staged* outcome from stage+commit is
    mapped to success with the unchanged `revision` (see single-version
-   semantics above).
+   semantics above).  **Verified wiring**: a `NothingStaged` commit outcome
+   emits *no* error event — the only observable signal is the `Complete`
+   status `21` (the variant's discriminant in the `CommitError` error-set);
+   a no-op *stage* simply emits no `FileStageRevision` event with status `0`.
 
 Uniform error shape stays `{ "error": "<message>" }`; the `409 Conflict`
 upload response adds a `conflicts` array (see below).
@@ -428,6 +461,21 @@ relative path segments (`sub/dir/file.txt`) — this is how folder upload and
 drag-and-drop of directories are transported.  Path segments must be plain
 components: no leading `/`, no `.`/`..`, no backslashes; violations reject the
 whole request with `400`.
+
+#### `curl` examples
+
+```bash
+# single file into the root
+curl -F "file=@notes.txt" "http://localhost:8080/api/v1/upload?parent_id=0"
+
+# replace an existing file
+curl -F "file=@notes.txt" "http://localhost:8080/api/v1/upload?parent_id=0&overwrite=true"
+
+# several files, one of them under a relative path (folder upload):
+curl -F "file=@a.txt" -F "file=@b.bin;filename=sub/dir/b.bin" \
+     "http://localhost:8080/api/v1/upload?parent_id=0"
+```
+
 
 #### Conflict semantics ("replace / all / abort" support)
 

@@ -271,6 +271,14 @@ async fn list_children_impl(
             loop {
                 match children.next().await {
                     Ok(Some((child_id, child_node, name))) => {
+                        // Staged deletions remain in the sibling chain as
+                        // tombstones; the child event carries no deletion
+                        // flag, so streaming them would make them
+                        // indistinguishable from live entries for every
+                        // consumer. Skip them.
+                        if child_node.is_staged_delete() {
+                            continue;
+                        }
                         emit_child(id, child_id, &name, list_node, &child_node);
                     }
                     Ok(None) => break,

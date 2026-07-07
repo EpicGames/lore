@@ -2,11 +2,26 @@
 
 ## 1. Setup
 
-Firstly, apply RUST.md to correctly setup the required Rust toolchain.
-(the workspace uses edition 2024 which requires Rust ≥ 1.85):
+Firstly, apply RUST.md to correctly setup the required Rust toolchain
+(the workspace uses edition 2024 which requires Rust ≥ 1.85), and install
+`protobuf-compiler` (tonic/prost need `protoc`).
 
-Verify the workspace root `Cargo.toml` references `lore-drive` in `members` —
-it already does as of the commit that accompanies this HANDOFF.
+**Sandbox build survival guide** (learned the hard way this session):
+- Check free disk *first* (`df -h /`): a full debug build with default
+  settings needs ~10 GB.  Free space by deleting `target/debug/incremental`
+  and stale caches (`~/.cache/uv`, `~/.cache/puppeteer` were ~2 GB).
+- Build with `CARGO_INCREMENTAL=0 CARGO_PROFILE_DEV_DEBUG=0` — debug info
+  roughly triples artifact size and compile time here, and single big crates
+  (`lore`, `lore-revision`) otherwise exceed one tool-call time budget.
+- Tool calls are capped around ~4½ minutes and background processes die
+  between calls: run `timeout 250 cargo build -p <crate>` repeatedly —
+  cargo resumes from cached artifacts, ~3 chunks for a cold workspace build.
+- Long-running servers survive within a *message* via
+  `(setsid <cmd> > log 2>&1 < /dev/null &)` but are killed between user
+  messages — restart them per message and re-check `pgrep`.
+
+For the frontend: Node/npm are preinstalled; `npm install` + `npm run build`
+inside `lore-drive/frontend/` just work (registry is whitelisted).
 
 ## 2. Tasks (see below)
 
@@ -16,7 +31,14 @@ For that you need to clone <https://github.com/nsauzede/lore.git> and checkout b
 
 ## 3. Check
 
-Nothing to do for now.
+Quick health check of the current state, in a scratch workspace
+(`lore repository create --offline <name>` inside an empty dir):
+
+```bash
+target/debug/lore-drive &          # drive mode
+curl -s localhost:8080/api/v1/info # → {"mode":"drive", ...}
+curl -F "file=@somefile" "localhost:8080/api/v1/upload?parent_id=0"  # → 201, non-zero b3 address
+```
 
 ## 4. Update project
 
@@ -30,90 +52,84 @@ Don't hesitate to enhance this HANDOFF.md if need be.
 
 # Tasks
 
-- [ ] **Build + smoke-test the write API (drive mode default + `--versioned`)** —
-      the write endpoints were added *without building* (per instruction), then
-      reworked for single-version drive semantics. Verify:
-      1. Setup per RUST.md + `apt-get install -y protobuf-compiler` (tonic/prost need `protoc`).
-      2. `cargo build -p lore-drive` — deps `zip` (pinned `=2.2.2`) and
-         `tempfile` were added to the root workspace + lore-drive manifests and
-         axum gained the `multipart` feature; the first build will update
-         `Cargo.lock` (crates.io is reachable from the sandbox). If `zip =2.2.2`
-         misbehaves under edition-2024/workspace lints, pick another 2.x and pin it.
-      3. **Drive mode (default, stage-only, no history)** — run `lore-drive` in a
-         real workspace and verify:
-         - `GET /api/v1/info` reports `"mode":"drive"`; `revision` is the staged
-           revision once anything is staged
-         - upload a file → `201`; its `address` must be a **non-zero** b3 hash
-           (drive mode pushes content via `put_file` and serves the CAS-returned
-           address — the staged node record itself keeps hash 0, see
-           `effective_address` in main.rs and the semantics section of REST_API.md)
-         - `GET /api/v1/tree` / `node` show the same non-zero address (lazy
-           materialization + `addr_cache`); `b3sum` of the file must match
-         - `GET /api/v1/download/<id>` returns the exact bytes (zero-hash records
-           must never hit the CAS — get_file would truncate-to-empty; the code
-           short-circuits to the workdir)
-         - re-upload identical bytes with `overwrite=true` → `201`, **unchanged**
-           `revision` change-tag, store size unchanged (dedup)
-         - upload same path 3× with different bytes → still exactly one node /
-           one `file_id`; old fragments may remain in the CAS (acceptable —
-           note actual behavior)
-         - mkdir / rename (PATCH) / delete, then confirm a plain `lore` CLI
-           `status`/`commit` in the same workspace sees the accumulated staged
-           changes and can commit them (drive + CLI coexistence)
-         - restart lore-drive → staged revision is re-served (persistence of the
-           staged anchor)
-      4. **Versioned mode** — run `lore-drive --versioned` in a workspace **with a
-         commit identity** (commits fail with `MissingIdentity` otherwise):
-         - one commit per effective mutation; `409 {conflicts}` upload flow;
-           re-upload of identical content → *nothing staged* mapped to success
-           no-op (verify the exact error wording matched by `is_nothing_staged`
-           in main.rs and tighten it)
-      5. Open questions to resolve while testing (flagged in REST_API.md):
-         does staging alone require an identity? does `served_revision` on the
-         long-lived ReadOnly context observe staged-anchor/anchor updates after
-         each mutation (else re-`load_and_connect` in `refresh_tree`)? does
-         `load` accept a staged revision hash (it should — same State format)?
-         is the empty-dir `.lorekeep` fallback triggered in both modes?
-      **MY ANSWERS**:
-      - Question 5:
-        - how to "upload" ?
-        - in "drive" mode, seems to work without identity (is `lore auth info` returning 255 `[Error] No auth endpoint available at lore/src/auth.rs:32:1` a valid test ?)
-        - browsing `api/v1/download/3` => `WARN lore_drive: CAS miss for /notes.txt (get_file failed: AddressNotFound); served from workdir`
-          => but despite warning, I get correct file (node 3) contents
-      - If my answers are not sufficient, update the document to progress.
-      - If needed/relevant, try to build/run/test yourself
-      - Or, if enough progress/context, go ahead and implememt the frontend
+- [ ] **End-to-end test the frontend against the backend in a browser-like
+      environment** — the SvelteKit app was written, `npm run build` passes and
+      the dev-proxy wiring was verified with curl (`/api/v1/info` through
+      :5173), but no real browser exercised the UI.  Verify: navigation,
+      upload (buttons and drag'n'drop of a *folder*), the 409
+      replace-selected/all/abort modal (including the path-matching in
+      `conflictPathOf` after navigating into a subfolder — the backend
+      reports absolute virtual paths), rename/delete/download, `.lorekeep`
+      hidden.  Fix what a real browser disagrees with.  Optional polish:
+      serve the built SPA directly from lore-drive (axum static route) so no
+      second server is needed.
 
-- [ ] **Implement the SvelteKit 5 frontend** (postponed from the previous task —
-      the REST API had to be augmented first, which is now done; see REST_API.md).
-      Create it under `lore-drive/frontend/` (Vite + SvelteKit 5, runes). Dev
-      server proxies/points at `http://localhost:8080`; CORS is already permissive.
-      Requirements (from the project owner):
-      - Tree of folders/files, current path "/" (project root) by default,
-        breadcrumb navigation; "enter" a folder (📁 icon) by clicking it
-        → `GET /api/v1/tree?node_id=`, `GET /api/v1/info`
-      - file/folder card shows: name, uuid/addr etc; file card additionally
-        shows size and contents b3 hash — display `address` (`<b3-hash>-<file-id>`)
-        and `node_id` exactly as returned, 1-to-1 with the CAS
-      - burger menu (⋮) on the right of each card: rename / delete / download
-        → `PATCH /api/v1/node/{id}`, `DELETE /api/v1/node/{id}`, `GET /api/v1/download/{id}`
-      - "create folder" and "upload" buttons → `POST /api/v1/mkdir`,
-        `POST /api/v1/upload?parent_id=` (multipart, part filename may carry
-        relative paths for folder upload)
-      - main page area is a drag'n'drop zone for files *and* folders (use
-        `webkitGetAsEntry`/`FileSystemEntry` traversal to build relative paths)
-      - "download" on a folder downloads a ZIP (the backend already serves it)
-      - on `409 {error, conflicts:[...]}` from upload, show a **replace / all /
-        abort** modal: "all" re-sends everything with `overwrite=true`,
-        "replace" re-sends only the selected conflicting files with
-        `overwrite=true` (plus the non-conflicting ones without it), "abort" cancels
-      - after every successful mutation, refresh the current listing (responses
-        carry the current `revision` change-tag — treat it as an ETag: it may be
-        UNCHANGED on idempotent no-ops; stale `node_id`s must not be reused)
-      - treat `.lorekeep` entries as hidden
-      Keep it minimal & clean; no component library needed. Building the Rust
-      backend is not required to *write* the frontend, but end-to-end testing
-      needs the task above done.
+- [x] **Build + smoke-test the write API (drive mode default + `--versioned`)**
+      — done this session; every checklist item verified against a real
+      workspace, four bugs found, all fixed:
+      1. *(fixed)* A staging **no-op returned 500** ("stage emitted no staged
+         revision").  Bites on byte-identical re-uploads *and* on any
+         **same-size, same-mode content change** (staged records carry no
+         content hash, so such an edit yields a bit-identical staged
+         revision).  `stage_paths` now returns `Option<Hash>` (`None` =
+         success no-op) and the upload epilogue still CAS-puts the new bytes
+         → address stays 1-to-1 with content even when the change-tag can't
+         move.  mkdir's empty-dir detection was adapted (`None` ⇒ `.lorekeep`
+         fallback).
+      2. *(fixed)* **Upload rollback destroyed data**: on failure it deleted
+         every placed file, including *pre-existing* files being overwritten
+         (observed live: it deleted the workspace's `notes.txt`).  Overwritten
+         files are now backed up to the request tempdir first and restored on
+         rollback.
+      3. *(fixed, in the `lore` crate)* **Staged deletions leaked into
+         listings**: `list_children` streamed tombstoned (staged-delete)
+         nodes and its child event carries no deletion flag, so a deleted
+         file remained visible in `/tree` forever (drive mode never commits
+         the deletion away).  `lore/src/revision_tree/list_children.rs` now
+         skips `is_staged_delete()` children.
+      4. *(fixed)* Versioned-mode no-op commit: the `NothingStaged` outcome
+         emits **no error event** — only `Complete` status **21** (its
+         discriminant in the `CommitError` error-set).  `commit_staged`
+         now matches the status code (`COMMIT_STATUS_NOTHING_STAGED`), with
+         the old message matcher kept as belt-and-braces.
+      Answers to the open questions (also folded into REST_API.md):
+      - staging alone requires **no identity** (drive mode runs identity-less;
+        `lore auth info` failing offline probes the auth *endpoint*, unrelated);
+      - `served_revision` observes staged-anchor/anchor updates fine through
+        `refresh_tree` after each mutation (tree swap verified);
+      - `load` accepts a staged revision hash (drive mode serves one across
+        restarts — persistence verified);
+      - the `.lorekeep` fallback triggers for empty dirs (mkdir path verified
+        in drive mode);
+      - the owner's `CAS miss … served from workdir` warning was **not
+        reproducible** with the fixed build (uploaded, CLI-staged and
+        committed files all download cleanly with matching b3 hashes); it
+        indicates a blob genuinely absent from the local store and the
+        workdir fallback is the designed safety net — documented in
+        REST_API.md.
+      Also verified: mkdir/rename/move/delete; 409 `{error, conflicts}`;
+      dedup (store size unchanged on identical re-upload); one node/file_id
+      across 3 re-uploads of the same path; drive↔CLI coexistence is
+      **sequential only** — a running lore-drive holds `.lore/lock`, so
+      concurrent `lore` CLI commands block until it exits; commit identity =
+      top-level `identity = "Name <mail>"` in `.lore/config.toml`.
+
+- [x] **Implement the SvelteKit 5 frontend** — done this session under
+      `lore-drive/frontend/` (SvelteKit 2 + Svelte 5 runes + Vite 6,
+      adapter-static SPA, no component library).  Single-page app
+      (`src/routes/+page.svelte`) + tiny API client (`src/lib/api.js`):
+      breadcrumb tree navigation, cards with exact `node_id` and verbatim
+      `address` (`<b3-hash>-<file-id>`), size for files, a deterministic
+      color "content fingerprint" derived from the b3 hash (visual 1-to-1
+      restatement of the CAS mapping), ⋮ menu (rename/download/delete —
+      folder download hits the ZIP endpoint), create-folder + upload-files +
+      upload-folder buttons, whole-page drag'n'drop with
+      `webkitGetAsEntry`/`FileSystemEntry` traversal for folders, 409
+      replace-selected/all/abort modal, refresh-after-mutation treating
+      `revision` as an ETag, `.lorekeep` hidden.  `npm run build` passes;
+      dev-server proxy (`/api` → :8080) verified with curl against the live
+      backend.  See `frontend/README.md`.  Browser-level e2e remains (task
+      above).
 
 - [x] **Single-version drive semantics (owner request): stage-only drive mode
       (default) + `--versioned`, and zero-hash fixes** — the owner asked for a

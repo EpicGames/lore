@@ -670,7 +670,14 @@ async fn effective_address_str(
 /// Run `lore::file::stage` on workspace-relative paths. Returns the resulting
 /// staged revision hash from the `FileStageRevision` event (unchanged hash ⇒
 /// nothing was staged).
-async fn stage_paths(paths: Vec<String>) -> anyhow::Result<Hash> {
+/// `Ok(None)` ⇒ staging changed nothing (success no-op).  This happens on
+/// identical re-uploads, and — drive-mode subtlety — on **any same-size,
+/// same-mode content change**: staged node records carry no content hash
+/// (only file_id/size/mode), so such an edit produces a bit-identical staged
+/// revision and `stage` emits no `FileStageRevision` event.  Callers must
+/// treat `None` as success and still run their CAS-put epilogue so the new
+/// bytes reach the store and the address cache is refreshed.
+async fn stage_paths(paths: Vec<String>) -> anyhow::Result<Option<Hash>> {
     let (status, staged, errors) = run_stage_like(|callback| async move {
         lore::file::stage(
             LoreGlobalArgs::default(),
@@ -687,8 +694,8 @@ async fn stage_paths(paths: Vec<String>) -> anyhow::Result<Hash> {
     })
     .await;
     match staged {
-        Some(rev) if status == 0 => Ok(rev),
-        _ if status == 0 => anyhow::bail!("stage emitted no staged revision"),
+        Some(rev) if status == 0 => Ok(Some(rev)),
+        None if status == 0 => Ok(None), // nothing (re)staged — success no-op
         _ => anyhow::bail!("stage failed (status {status}): {}", errors.join("; ")),
     }
 }
@@ -746,6 +753,12 @@ where
 /// Returns `Ok(Some(hash))` for an effective commit and `Ok(None)` for the
 /// *nothing staged* outcome — single-version semantics treat a mutation that
 /// changes nothing (e.g. re-uploading identical content) as a success no-op.
+/// `Complete` status emitted by `lore::revision::commit` for the
+/// `CommitError::NothingStaged` outcome (observed empirically: NothingStaged
+/// is the first variant of the commit error-set and maps to status 21; no
+/// error *event* accompanies it).
+const COMMIT_STATUS_NOTHING_STAGED: i32 = 21;
+
 async fn commit_staged(message: &str) -> anyhow::Result<Option<Hash>> {
     let revision_sink: Arc<Mutex<Option<Hash>>> = Arc::new(Mutex::new(None));
     let rev_cb = revision_sink.clone();
@@ -777,6 +790,14 @@ async fn commit_staged(message: &str) -> anyhow::Result<Option<Hash>> {
     let errors = errors.lock().unwrap().clone();
     match revision {
         Some(revision) if status == 0 => Ok(Some(revision)),
+        // Verified in the smoke-test task: a NothingStaged commit outcome
+        // emits *no* error event at all — the only observable signal is the
+        // Complete status, which carries the variant's discriminant in the
+        // `CommitError` error-set (`lore-revision/src/commit.rs`):
+        // NothingStaged is the first variant ⇒ status 21 (error-set codes
+        // start at 21). The message matcher below stays as belt-and-braces
+        // for builds where an error event is emitted too.
+        _ if status == COMMIT_STATUS_NOTHING_STAGED => Ok(None),
         _ if is_nothing_staged(&errors) => Ok(None),
         _ => anyhow::bail!(
             "commit failed (status {status}): {}",
@@ -1202,8 +1223,12 @@ async fn handle_mkdir(
     let commit_msg = format!("lore-drive: mkdir {virtual_path}");
     let result: anyhow::Result<Hash> = async {
         let staged = stage_paths(vec![rel.clone()]).await?;
-        if !state.versioned && staged == prev_revision {
-            anyhow::bail!("empty directory staged nothing");
+        match staged {
+            None => anyhow::bail!("empty directory staged nothing"),
+            Some(rev) if !state.versioned && rev == prev_revision => {
+                anyhow::bail!("empty directory staged nothing")
+            }
+            Some(_) => {}
         }
         finalize_mutation(&state, &commit_msg).await
     }
@@ -1332,8 +1357,12 @@ async fn handle_upload(
     }
 
     // 3. Materialize into the workspace, then stage (+ commit when versioned).
+    //    Overwritten files are backed up into the request tempdir first so a
+    //    later failure can *restore* them — deleting them (the old behavior)
+    //    destroyed user data on overwrite rollbacks.
     let mut rel_paths: Vec<String> = Vec::new();
-    let mut placed: Vec<PathBuf> = Vec::new();
+    let mut placed: Vec<(PathBuf, Option<PathBuf>)> = Vec::new(); // (dest, backup)
+    let mut backup_counter: u64 = 0;
     for (segments, temp_path, _) in &incoming {
         let virtual_path = segments
             .iter()
@@ -1346,11 +1375,27 @@ async fn handle_upload(
                 return Err(err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
             }
         }
+        let backup = if fs_path.is_file() {
+            backup_counter += 1;
+            let b = tmp.path().join(format!("bak{backup_counter}"));
+            match tokio::fs::copy(&fs_path, &b).await {
+                Ok(_) => Some(b),
+                Err(e) => {
+                    rollback_files(&placed).await;
+                    return Err(err_resp(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("backup before overwrite: {e}"),
+                    ));
+                }
+            }
+        } else {
+            None
+        };
         if let Err(e) = tokio::fs::copy(temp_path, &fs_path).await {
             rollback_files(&placed).await;
             return Err(err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
         }
-        placed.push(fs_path);
+        placed.push((fs_path, backup));
         rel_paths.push(rel);
     }
 
@@ -1425,10 +1470,19 @@ async fn handle_upload(
     ))
 }
 
-/// Best-effort removal of files placed in the workspace before a failure.
-async fn rollback_files(placed: &[PathBuf]) {
-    for path in placed {
-        let _ = tokio::fs::remove_file(path).await;
+/// Best-effort undo of files placed in the workspace before a failure:
+/// restore the pre-overwrite backup when one exists, otherwise remove the
+/// newly created file.
+async fn rollback_files(placed: &[(PathBuf, Option<PathBuf>)]) {
+    for (path, backup) in placed {
+        match backup {
+            Some(b) => {
+                let _ = tokio::fs::copy(b, path).await;
+            }
+            None => {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+        }
     }
 }
 
