@@ -1,8 +1,16 @@
 # HANDOFF
 
-## 1. Setup
+## 1. Tasks (see below)
 
-Firstly, apply RUST.md to correctly setup the required Rust toolchain
+I want you to perform the tasks not yet done in below Tasks section (hint: most recent first).
+For that you need to clone <https://github.com/nsauzede/lore.git> and checkout branch `f-drive`
+(be smart and `git remote update;git pull` if there is a local/previous `lore` destination git path
+or remove if it is a bare directory!).
+If needed by task(s), also look at 2. and 3.
+
+## 2. Optional: Setup
+
+If needed, apply RUST.md to correctly setup the required Rust toolchain
 (the workspace uses edition 2024 which requires Rust ≥ 1.85), and install
 `protobuf-compiler` (tonic/prost need `protoc`).
 
@@ -47,15 +55,9 @@ Firstly, apply RUST.md to correctly setup the required Rust toolchain
 For the frontend: Node/npm are preinstalled; `npm install` + `npm run build`
 inside `lore-drive/frontend/` just work (registry is whitelisted).
 
-## 2. Tasks (see below)
+## 3. Optional: Check
 
-Then I want you to perform the tasks not yet done in below Tasks section (hint: most recent first).
-For that you need to clone <https://github.com/nsauzede/lore.git> and checkout branch `f-drive`
-(be smart and remove any local/previous `lore` destination path!).
-
-## 3. Check
-
-Quick health check of the current state, in a scratch workspace
+If needed, quick health check of the current state, in a scratch workspace
 (`lore repository create --offline <name>` inside an empty dir):
 
 ```bash
@@ -85,15 +87,29 @@ scratch workspace, then `node frontend/e2e.mjs` (against `npm run dev` on
 
 ## 4. Update project
 
-Then I want you to update the present HANDOFF.md + any other relevant documents to reflect the current state of the project,
+Finally, I want you to update the present HANDOFF.md + any other relevant documents to reflect the current state of the project,
 for your future self to take over new tasks I'll append here (mark as done those which are to keep this HANDOFF clean & maintainable).
-The step 1 (eg: Rust, maybe Sveltekit) shall always be instructed because of peculiar AI's sandbox constraints wrt Rust.
+The Setup step (eg: Rust, maybe Sveltekit) shall always be instructed because of peculiar AI's sandbox constraints wrt Rust.
 Eg: if you face any crates version issue in Cargo.toml, please find a working crate set and update it too.
-Add all your work (`cargo clean` !!) in a new git commit (use your identity !) then `git gc` and create a ZIP archive of the whole project + git history and present
+Don't hesitate to enhance this HANDOFF.md and other sibling docs if need be.
+Add all your work (`cargo clean` !!) in a new git commit (use your identity !).
+If you're able to, produce a downloadable zip archive file of an `git format-patch` text output that I can locally inspect/apply.
+Or, just do `git gc;git clean -dxf` and create a ZIP archive of the whole project + git history and present
 it as downloadble zip archive file.
-Don't hesitate to enhance this HANDOFF.md if need be.
 
 # Tasks
+
+- [ ] In the browser, show the *deleted* nodes (with visual distinction), maybe separated in second tree, or even a separate page/view ? use wisdom to apply best practices
+      And also a related menu/button to purge them (gc).
+
+- [ ] The search *all* bar is nice, but possible to add optional filters like `name=x`, `prop_key=x`, `prop_val=x` ?
+      maybe add simple logical connectors to instruct `a AND b`, `a OR b` etc.. ?
+      show some "hit sugestion" after few input chars, showing which filter matches ?
+
+- [ ] what about "role/permissions" ? audit the feasibility to introduce setting optional user/group read/write/admin attributes to protect the nodes ?
+      Eg: by default no protections: everyone is admin; then only some user/group (of users) can selectively read/write/admin given node ?
+      can that be done cheaply, reusing lore's concept of identites ? would that require implementing a "login" infra ?
+      draft a spec/audit result
 
 - [x] **Ghost-conflict on re-upload after delete — reproduced, root-caused,
       fixed, regression-tested** (this session).
