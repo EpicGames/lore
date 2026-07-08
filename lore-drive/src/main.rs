@@ -23,12 +23,18 @@
 //! - `GET /api/v1/tree?node_id=<u64>`    — directory listing
 //! - `GET /api/v1/node/{node_id}`        — single-node record + full path
 //! - `GET /api/v1/download/{node_id}`    — file bytes (CAS, workdir fallback) or folder ZIP
+//! - `GET /api/v1/search?q=<query>`      — names + user-property keys/values
+//! - `GET /api/v1/node/{node_id}/properties` — the node's user properties
 //!
 //! Write (filesystem change → stage[/commit]):
 //! - `POST   /api/v1/mkdir`                              — create directory
 //! - `POST   /api/v1/upload?parent_id=&overwrite=`       — multipart file/folder upload
 //! - `PATCH  /api/v1/node/{node_id}`                     — rename / move
-//! - `DELETE /api/v1/node/{node_id}`                     — delete subtree
+//! - `DELETE /api/v1/node/{node_id}`                     — delete subtree (+ its properties)
+//!
+//! Write (mutable store only — no tree mutation):
+//! - `PUT    /api/v1/node/{node_id}/properties`          — set one key/value property
+//! - `DELETE /api/v1/node/{node_id}/properties/{key}`    — remove one property
 //!
 //! See `REST_API.md` for the authoritative JSON shapes and semantics.
 //!
@@ -81,12 +87,24 @@ use lore::revision_tree::node_path::LoreRevisionTreeNodePathArgs;
 use lore::revision_tree::node_path::node_path;
 use lore::revision_tree::resolve_path::LoreRevisionTreeResolvePathArgs;
 use lore::revision_tree::resolve_path::resolve_path;
+use lore::storage::get::LoreStorageGetArgs;
+use lore::storage::get::LoreStorageGetItem;
+use lore::storage::get::get as storage_get;
 use lore::storage::get_file::LoreStorageGetFileArgs;
 use lore::storage::get_file::LoreStorageGetFileItem;
 use lore::storage::get_file::get_file;
 use lore::storage::handle::LoreStore;
+use lore::storage::mutable_load::LoreStorageMutableLoadArgs;
+use lore::storage::mutable_load::LoreStorageMutableLoadItem;
+use lore::storage::mutable_load::mutable_load;
+use lore::storage::mutable_store::LoreStorageMutableStoreArgs;
+use lore::storage::mutable_store::LoreStorageMutableStoreItem;
+use lore::storage::mutable_store::mutable_store;
 use lore::storage::open::LoreStorageOpenArgs;
 use lore::storage::open::open as storage_open;
+use lore::storage::put::LoreStoragePutArgs;
+use lore::storage::put::LoreStoragePutItem;
+use lore::storage::put::put as storage_put;
 use lore::storage::put_file::LoreStoragePutFileArgs;
 use lore::storage::put_file::LoreStoragePutFileItem;
 use lore::storage::put_file::put_file;
@@ -95,7 +113,9 @@ use lore_base::types::Address;
 use lore_base::types::BranchId;
 use lore_base::types::Context;
 use lore_base::types::Hash;
+use lore_base::types::KeyType;
 use lore_base::types::RepositoryId;
+use lore_revision::event::LoreBytes;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_tree::LoreRevisionTreeChildEventData;
@@ -117,6 +137,15 @@ use serde::Serialize;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 use tracing::warn;
+
+mod props;
+
+use props::decode_blob;
+use props::encode_blob;
+use props::props_context;
+use props::props_key;
+use props::search_matches;
+use props::validate_prop;
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -606,6 +635,252 @@ async fn cas_put_file(
         Some((_, code)) => anyhow::bail!("put_file failed: {code:?}"),
         None => anyhow::bail!("put_file emitted no completion (status {status})"),
     }
+}
+
+/// Store a small in-memory buffer into the CAS at `(partition, context)`
+/// via `lore_storage_put`. Returns the computed content address.
+async fn cas_put_bytes(
+    store: LoreStore,
+    partition: RepositoryId,
+    context: Context,
+    bytes: &[u8],
+) -> anyhow::Result<Address> {
+    let sink: Arc<Mutex<Option<(Address, LoreErrorCode)>>> = Arc::new(Mutex::new(None));
+    let cb_sink = sink.clone();
+    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+        if let LoreEvent::StoragePutItemComplete(data) = event {
+            *cb_sink.lock().unwrap() = Some((data.address, data.error_code));
+        }
+    }));
+
+    let item = LoreStoragePutItem {
+        id: 0,
+        partition,
+        context,
+        data: LoreBytes {
+            ptr: bytes.as_ptr().cast(),
+            len: bytes.len(),
+        },
+        remote_write: 0,
+        local_cache: 0,
+        fixed_size_chunk: 0,
+    };
+
+    let status = storage_put(
+        LoreGlobalArgs::default(),
+        LoreStoragePutArgs {
+            handle: store,
+            items: LoreArray::from_vec(vec![item]),
+        },
+        callback,
+    )
+    .await;
+
+    let data = *sink.lock().unwrap();
+    match data {
+        Some((address, LoreErrorCode::None)) if status == 0 => Ok(address),
+        Some((_, code)) => anyhow::bail!("put failed: {code:?}"),
+        None => anyhow::bail!("put emitted no completion (status {status})"),
+    }
+}
+
+/// Fetch a CAS buffer into memory via `lore_storage_get` (non-streaming:
+/// one reassembled `GET_DATA` payload). `Ok(None)` when the address is
+/// absent from the store.
+async fn cas_get_bytes(
+    store: LoreStore,
+    partition: RepositoryId,
+    address: Address,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    struct GetSink {
+        bytes: Vec<u8>,
+        code: Option<LoreErrorCode>,
+    }
+    let sink = Arc::new(Mutex::new(GetSink { bytes: Vec::new(), code: None }));
+    let cb_sink = sink.clone();
+    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| match event {
+        LoreEvent::StorageGetData(data) => {
+            // LoreBytes is a borrowed view valid only inside the callback —
+            // copy immediately.
+            // SAFETY: the view was just received in this callback.
+            cb_sink.lock().unwrap().bytes.extend_from_slice(unsafe { data.bytes.as_slice() });
+        }
+        LoreEvent::StorageGetItemComplete(data) => {
+            cb_sink.lock().unwrap().code = Some(data.error_code);
+        }
+        _ => {}
+    }));
+
+    let item = LoreStorageGetItem {
+        id: 0,
+        partition,
+        address,
+        streaming: 0,
+        local_cache: 0,
+    };
+
+    let status = storage_get(
+        LoreGlobalArgs::default(),
+        LoreStorageGetArgs {
+            handle: store,
+            items: LoreArray::from_vec(vec![item]),
+        },
+        callback,
+    )
+    .await;
+
+    let mut s = sink.lock().unwrap();
+    match s.code {
+        Some(LoreErrorCode::None) if status == 0 => Ok(Some(std::mem::take(&mut s.bytes))),
+        Some(LoreErrorCode::AddressNotFound) => Ok(None),
+        Some(code) => anyhow::bail!("get failed: {code:?}"),
+        None => anyhow::bail!("get emitted no completion (status {status})"),
+    }
+}
+
+/// Read the mutable-store value for `key` (`KeyType::Untyped`).
+/// `Ok(None)` when the key holds no value.
+async fn mutable_load_hash(
+    store: LoreStore,
+    partition: RepositoryId,
+    key: Hash,
+) -> anyhow::Result<Option<Hash>> {
+    let sink: Arc<Mutex<Option<(Hash, LoreErrorCode)>>> = Arc::new(Mutex::new(None));
+    let cb_sink = sink.clone();
+    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+        if let LoreEvent::StorageMutableLoadItemComplete(data) = event {
+            *cb_sink.lock().unwrap() = Some((data.value, data.error_code));
+        }
+    }));
+
+    let item = LoreStorageMutableLoadItem {
+        id: 0,
+        partition,
+        key,
+        key_type: KeyType::Untyped,
+    };
+
+    let status = mutable_load(
+        LoreGlobalArgs::default(),
+        LoreStorageMutableLoadArgs {
+            handle: store,
+            items: LoreArray::from_vec(vec![item]),
+        },
+        callback,
+    )
+    .await;
+
+    let data = *sink.lock().unwrap();
+    match data {
+        Some((value, LoreErrorCode::None)) if status == 0 => Ok(Some(value)),
+        Some((_, LoreErrorCode::AddressNotFound)) => Ok(None),
+        Some((_, code)) => anyhow::bail!("mutable_load failed: {code:?}"),
+        None => anyhow::bail!("mutable_load emitted no completion (status {status})"),
+    }
+}
+
+/// Write the mutable-store value for `key` (`KeyType::Untyped`). Storing
+/// `Hash::default()` removes the key.
+async fn mutable_store_hash(
+    store: LoreStore,
+    partition: RepositoryId,
+    key: Hash,
+    value: Hash,
+) -> anyhow::Result<()> {
+    let sink: Arc<Mutex<Option<LoreErrorCode>>> = Arc::new(Mutex::new(None));
+    let cb_sink = sink.clone();
+    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+        if let LoreEvent::StorageMutableStoreItemComplete(data) = event {
+            *cb_sink.lock().unwrap() = Some(data.error_code);
+        }
+    }));
+
+    let item = LoreStorageMutableStoreItem {
+        id: 0,
+        partition,
+        key,
+        value,
+        key_type: KeyType::Untyped,
+    };
+
+    let status = mutable_store(
+        LoreGlobalArgs::default(),
+        LoreStorageMutableStoreArgs {
+            handle: store,
+            items: LoreArray::from_vec(vec![item]),
+        },
+        callback,
+    )
+    .await;
+
+    let code = *sink.lock().unwrap();
+    match code {
+        Some(LoreErrorCode::None) if status == 0 => Ok(()),
+        Some(code) => anyhow::bail!("mutable_store failed: {code:?}"),
+        None => anyhow::bail!("mutable_store emitted no completion (status {status})"),
+    }
+}
+
+/// Load `node_id`'s user property map. Missing entry, missing blob, or a
+/// blob that fails provenance checks all read as the empty map.
+async fn load_props(
+    state: &AppState,
+    node_id: u32,
+) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+    let Some(value) = mutable_load_hash(state.store, state.repository_id, props_key(node_id)).await?
+    else {
+        return Ok(Default::default());
+    };
+    if value.is_zero() {
+        return Ok(Default::default());
+    }
+    let address = Address { hash: value, context: props_context(node_id) };
+    let Some(bytes) = cas_get_bytes(state.store, state.repository_id, address).await? else {
+        warn!("props blob {value} for node {node_id} missing from CAS; treating as empty");
+        return Ok(Default::default());
+    };
+    Ok(decode_blob(node_id, &bytes).unwrap_or_default())
+}
+
+/// Persist `node_id`'s user property map: blob → CAS, hash → mutable store.
+/// An empty map removes the mutable key outright.
+async fn save_props(
+    state: &AppState,
+    node_id: u32,
+    map: &std::collections::BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    let key = props_key(node_id);
+    if map.is_empty() {
+        return mutable_store_hash(state.store, state.repository_id, key, Hash::default()).await;
+    }
+    let bytes = encode_blob(node_id, map);
+    let address =
+        cas_put_bytes(state.store, state.repository_id, props_context(node_id), &bytes).await?;
+    mutable_store_hash(state.store, state.repository_id, key, address.hash).await
+}
+
+/// Collect `root` plus every descendant node id (used by delete to clean
+/// up property entries before the nodes tombstone).
+async fn collect_subtree_node_ids(
+    tree: LoreRevisionTree,
+    root: u32,
+    root_is_dir: bool,
+) -> Result<Vec<u32>, ApiError> {
+    let mut out = vec![root];
+    if !root_is_dir {
+        return Ok(out);
+    }
+    let mut queue = vec![root];
+    while let Some(dir) = queue.pop() {
+        let (_, _, children) = fetch_children(tree, dir).await?;
+        for child in children {
+            out.push(child.node_id);
+            if is_dir(child.kind) {
+                queue.push(child.node_id);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// The address to expose for a node — directories get `None`.
@@ -1612,6 +1887,12 @@ async fn handle_node_delete(
     let rel = rel_of(&virtual_path).to_owned();
     let fs_path = state.workdir.join(&rel);
 
+    // Collect the subtree's node ids *before* the nodes tombstone, so their
+    // user-property entries can be removed from the mutable store after the
+    // delete succeeds (node slots may be reused later; stale properties must
+    // not attach to unrelated future nodes).
+    let subtree = collect_subtree_node_ids(tree, node_id, is_dir(info.kind)).await?;
+
     if is_dir(info.kind) {
         tokio::fs::remove_dir_all(&fs_path).await
     } else {
@@ -1627,8 +1908,223 @@ async fn handle_node_delete(
     .await
     .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
+    // Best-effort property cleanup — the delete itself already succeeded.
+    for id in subtree {
+        if let Err(e) =
+            mutable_store_hash(state.store, state.repository_id, props_key(id), Hash::default())
+                .await
+        {
+            warn!("failed to clear properties of deleted node {id}: {e}");
+        }
+    }
+
     Ok(Json(DeleteResponse {
         revision: revision.to_string(),
+    }))
+}
+
+// ─── Properties & search ─────────────────────────────────────────────────────
+
+/// Response shape shared by every `/properties` verb.
+#[derive(Serialize)]
+struct PropertiesResponse {
+    node_id: u32,
+    properties: std::collections::BTreeMap<String, String>,
+}
+
+/// `PUT /api/v1/node/{id}/properties` request body.
+#[derive(Deserialize)]
+struct PropertySetRequest {
+    key: String,
+    value: String,
+}
+
+fn parse_path_node_id(raw: &str) -> Result<u32, ApiError> {
+    parse_node_id(
+        raw.parse()
+            .map_err(|_| err_resp(StatusCode::BAD_REQUEST, "node_id must be a u64"))?,
+    )
+}
+
+/// `GET /api/v1/node/{node_id}/properties` — list a node's user properties.
+async fn handle_props_get(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(node_id_str): Path<String>,
+) -> Result<Json<PropertiesResponse>, ApiError> {
+    let node_id = parse_path_node_id(&node_id_str)?;
+    let tree = state.tree().await;
+    fetch_node_info(tree, node_id).await?; // 404 for unknown nodes
+    let properties = load_props(&state, node_id)
+        .await
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(PropertiesResponse { node_id, properties }))
+}
+
+/// `PUT /api/v1/node/{node_id}/properties` — set (create or overwrite) one
+/// `key = value` user property. Returns the full updated map.
+async fn handle_props_put(
+    Extension(state): Extension<Arc<AppState>>,
+    Path(node_id_str): Path<String>,
+    Json(req): Json<PropertySetRequest>,
+) -> Result<Json<PropertiesResponse>, ApiError> {
+    let node_id = parse_path_node_id(&node_id_str)?;
+
+    // Property writes don't touch the revision tree, but serialize through
+    // the same write gate anyway: read-modify-write of the blob must not
+    // interleave, and delete's cleanup must not race a concurrent set.
+    let _write = state.write_gate.lock().await;
+    let tree = state.tree().await;
+    fetch_node_info(tree, node_id).await?;
+
+    let mut properties = load_props(&state, node_id)
+        .await
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    validate_prop(&req.key, &req.value, &properties)
+        .map_err(|reason| err_resp(StatusCode::BAD_REQUEST, reason))?;
+    properties.insert(req.key, req.value);
+    save_props(&state, node_id, &properties)
+        .await
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(PropertiesResponse { node_id, properties }))
+}
+
+/// `DELETE /api/v1/node/{node_id}/properties/{key}` — remove one user
+/// property. 404 when the node or the property does not exist.
+async fn handle_props_delete(
+    Extension(state): Extension<Arc<AppState>>,
+    Path((node_id_str, key)): Path<(String, String)>,
+) -> Result<Json<PropertiesResponse>, ApiError> {
+    let node_id = parse_path_node_id(&node_id_str)?;
+
+    let _write = state.write_gate.lock().await;
+    let tree = state.tree().await;
+    fetch_node_info(tree, node_id).await?;
+
+    let mut properties = load_props(&state, node_id)
+        .await
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if properties.remove(&key).is_none() {
+        return Err(err_resp(StatusCode::NOT_FOUND, "property not found"));
+    }
+    save_props(&state, node_id, &properties)
+        .await
+        .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(PropertiesResponse { node_id, properties }))
+}
+
+/// `GET /api/v1/search?q=` query parameters.
+#[derive(Deserialize)]
+struct SearchParams {
+    q: String,
+    limit: Option<usize>,
+}
+
+/// One reason a node matched the query.
+#[derive(Serialize)]
+struct SearchMatchDetail {
+    /// `"name"` or `"property"`.
+    field: &'static str,
+    /// Property key (for `field == "property"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
+    /// Property value (for `field == "property"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+}
+
+/// One search hit.
+#[derive(Serialize)]
+struct SearchResult {
+    node_id: u32,
+    name: String,
+    path: String,
+    kind: String,
+    size: u64,
+    matches: Vec<SearchMatchDetail>,
+}
+
+/// `GET /api/v1/search` response.
+#[derive(Serialize)]
+struct SearchResponse {
+    revision: String,
+    query: String,
+    truncated: bool,
+    results: Vec<SearchResult>,
+}
+
+/// `GET /api/v1/search?q=<query>[&limit=<n>]` — walk the served tree and
+/// return every node whose *name*, *property key* or *property value*
+/// contains the query (case-insensitive substring). `.lorekeep`
+/// placeholders are invisible, matching the UI.
+async fn handle_search(
+    Extension(state): Extension<Arc<AppState>>,
+    Query(params): Query<SearchParams>,
+) -> Result<Json<SearchResponse>, ApiError> {
+    let needle = params.q.trim().to_lowercase();
+    if needle.is_empty() {
+        return Err(err_resp(StatusCode::BAD_REQUEST, "query must not be empty"));
+    }
+    let limit = params.limit.unwrap_or(100).clamp(1, 500);
+
+    let tree = state.tree().await;
+    let revision = state.revision().await;
+
+    let mut results: Vec<SearchResult> = Vec::new();
+    let mut truncated = false;
+    // BFS with the parent's virtual path carried along — one `node_path`
+    // reconstruction per hit is avoided by building paths as we walk.
+    let mut queue: Vec<(u32, String)> = vec![(ROOT_NODE, "/".to_owned())];
+    'walk: while let Some((dir, dir_path)) = queue.pop() {
+        let (_, _, children) = fetch_children(tree, dir).await?;
+        for child in children {
+            let name = child.name.as_str().to_owned();
+            if name == ".lorekeep" {
+                continue;
+            }
+            let child_path = join_virtual(&dir_path, &name);
+            if is_dir(child.kind) {
+                queue.push((child.node_id, child_path.clone()));
+            }
+
+            let mut matches: Vec<SearchMatchDetail> = Vec::new();
+            if search_matches(&name, &needle) {
+                matches.push(SearchMatchDetail { field: "name", key: None, value: None });
+            }
+            let props = load_props(&state, child.node_id)
+                .await
+                .map_err(|e| err_resp(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            for (k, v) in &props {
+                if search_matches(k, &needle) || search_matches(v, &needle) {
+                    matches.push(SearchMatchDetail {
+                        field: "property",
+                        key: Some(k.clone()),
+                        value: Some(v.clone()),
+                    });
+                }
+            }
+
+            if !matches.is_empty() {
+                if results.len() >= limit {
+                    truncated = true;
+                    break 'walk;
+                }
+                results.push(SearchResult {
+                    node_id: child.node_id,
+                    name,
+                    path: child_path,
+                    kind: kind_str(child.kind).to_owned(),
+                    size: child.size,
+                    matches,
+                });
+            }
+        }
+    }
+
+    Ok(Json(SearchResponse {
+        revision: revision.to_string(),
+        query: params.q,
+        truncated,
+        results,
     }))
 }
 
@@ -1783,6 +2279,15 @@ async fn main() -> anyhow::Result<()> {
                 .patch(handle_node_patch)
                 .delete(handle_node_delete),
         )
+        .route(
+            "/api/v1/node/{node_id}/properties",
+            get(handle_props_get).put(handle_props_put),
+        )
+        .route(
+            "/api/v1/node/{node_id}/properties/{key}",
+            axum::routing::delete(handle_props_delete),
+        )
+        .route("/api/v1/search", get(handle_search))
         .route("/api/v1/download/{node_id}", get(handle_download))
         .route("/api/v1/mkdir", post(handle_mkdir))
         .route("/api/v1/upload", post(handle_upload));

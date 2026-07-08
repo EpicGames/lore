@@ -299,7 +299,13 @@ also computed at commit); their `address` is `null` as usual.
 - **Staged deletions are tombstones.**  The underlying sibling chain keeps
   staged-deleted nodes; the `list_children` verb has been fixed to skip
   `is_staged_delete()` nodes (the child event carries no deletion flag, so
-  streaming them would be indistinguishable from live entries).  Direct
+  streaming them would be indistinguishable from live entries), and the
+  `resolve_path` verb now reports tombstoned paths as **not found** — before
+  this fix, uploading `folder1/file1`, deleting `folder1/`, then re-uploading
+  the same path popped a **ghost 409 conflict** for a path gone from every
+  listing and from disk (the conflict checks of upload/mkdir/rename all
+  resolve paths).  Staging already knew how to *undelete* a tombstone when
+  the same path comes back, so only the read layer needed fixing.  Direct
   `GET /node/{id}` of a tombstoned id may still resolve — don't navigate by
   remembered ids.
 - **CLI coexistence is sequential, not concurrent.**  A running lore-drive
@@ -609,6 +615,119 @@ Delete a file or a directory subtree.
 | `400 Bad Request` | root node targeted, sentinel/unparsable id |
 | `404 Not Found` | unknown `node_id` |
 | `500 Internal Server Error` | filesystem or stage/commit failure |
+
+Deleting a node also removes the **user properties** (below) of every node
+in the deleted subtree, so property entries never outlive their item and can
+never re-attach to an unrelated node when a node slot is later reused.
+
+---
+
+## User properties (custom metadata)
+
+Every tree item (file **or** folder) can carry an arbitrary set of user
+properties — `string key → string value` pairs, e.g. `owner = alice`,
+`status = draft`.  They are what the frontend's per-item **Properties**
+dialog edits and what `GET /search` matches alongside names.
+
+**Storage model** (the "cheap" design, using only existing lore machinery —
+implemented in `lore-drive/src/props.rs`):
+
+```text
+mutable-store[ blake3("lore-drive:props:v1:" ++ node_id_le) ]      (KeyType::Untyped)
+        └──> Hash of a CAS (immutable-store) JSON blob:
+             {"v":1, "node_id":N, "props":{"owner":"alice", …}}
+```
+
+- One mutable entry **per node** (not per property): a property edit is a
+  read-modify-write of one small JSON blob, serialized by the same write
+  gate as every other mutation.
+- `BTreeMap` serialization is deterministic, so identical maps deduplicate
+  to a single CAS blob for free.
+- The blob **self-describes** (`v`, `node_id`) and loads are provenance-
+  checked, so foreign `Untyped` keys can never masquerade as properties.
+- Keyed by `node_id`, which lore preserves across **rename, move and
+  content replacement** — properties follow the item.  (File `file_id`s
+  cannot be used: directories never get one — their `address.context` is
+  reserved for link targets.)
+- Storing the null hash removes a mutable key, so an emptied map costs
+  nothing; property writes never touch the revision tree, so the `revision`
+  change-tag does not move.
+- Limits: keys ≤ 256 bytes, values ≤ 4096 bytes, ≤ 256 properties per node,
+  no control characters, keys non-empty.
+- **Caveat**: deletions made by the `lore` CLI while lore-drive is stopped
+  bypass the cleanup and orphan the affected entries.  Orphans are invisible
+  (loads are per-node and `/search` walks the live tree) until a node slot
+  is reused; a `--versioned` workspace that interleaves CLI deletes with
+  drive usage should not rely on properties surviving that pattern.
+
+### `GET /api/v1/node/{node_id}/properties`
+
+#### Response `200 OK`
+
+```json
+{ "node_id": 7, "properties": { "owner": "alice", "status": "draft" } }
+```
+
+`404` for unknown nodes; a node without properties answers `{}`.
+
+### `PUT /api/v1/node/{node_id}/properties`
+
+Set (create or overwrite) **one** property.
+
+#### Request body (`application/json`)
+
+```json
+{ "key": "owner", "value": "alice" }
+```
+
+#### Response `200 OK`
+
+The full updated map, same shape as `GET`.
+
+| Status | Condition |
+|--------|-----------|
+| `400 Bad Request` | empty key, over-limit key/value, control chars, > 256 props |
+| `404 Not Found` | unknown `node_id` |
+
+### `DELETE /api/v1/node/{node_id}/properties/{key}`
+
+Remove one property (`key` URL-encoded).  `200` with the updated map;
+`404` when the node or the property does not exist.
+
+### `GET /api/v1/search?q=<query>[&limit=<n>]`
+
+Walk the served tree and return every item whose **name**, **property key**
+or **property value** contains `q` (case-insensitive substring).
+`.lorekeep` placeholders are invisible, matching the UI.  `limit` defaults
+to 100 (clamped to 1–500); `truncated: true` signals more hits existed.
+Empty/whitespace `q` is `400`.
+
+#### Response `200 OK`
+
+```json
+{
+  "revision": "<64-hex>",
+  "query": "alice",
+  "truncated": false,
+  "results": [
+    {
+      "node_id": 7,
+      "name": "report.txt",
+      "path": "/docs/report.txt",
+      "kind": "file",
+      "size": 1234,
+      "matches": [
+        { "field": "name" },
+        { "field": "property", "key": "owner", "value": "alice" }
+      ]
+    }
+  ]
+}
+```
+
+Search is an `O(nodes)` tree walk with one mutable-store load per node —
+appropriate for drive-scale workspaces; an inverted index is a possible
+future task if trees grow large.
 
 ---
 

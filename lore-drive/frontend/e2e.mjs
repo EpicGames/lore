@@ -272,6 +272,107 @@ console.log('— 13. Revision change-tag visible in header —');
 const revText = await page.locator('.workspace').textContent();
 ok(/[0-9a-f]{8}/.test(revText), 'header shows a revision change-tag');
 
+console.log('— 14. Properties modal (set / list / remove / persist) —');
+// back to root
+await page.locator('.crumb').first().click();
+await card('beta.txt').waitFor();
+await openMenu('beta.txt');
+await card('beta.txt').getByRole('menuitem', { name: 'Properties' }).click();
+const propDlg = page.locator('.veil[aria-label^="Properties"]');
+await propDlg.waitFor();
+await propDlg.locator('.hint', { hasText: 'No properties yet' }).waitFor();
+ok(true, 'fresh node shows "No properties yet"');
+await propDlg.getByPlaceholder('key').fill('owner');
+await propDlg.getByPlaceholder('value').fill('nsauzede');
+await propDlg.getByRole('button', { name: 'Add' }).click();
+await propDlg.locator('.proplist li').waitFor();
+ok(await propDlg.locator('.proplist li').textContent().then((t) => t.includes('owner') && t.includes('nsauzede')),
+	'property owner=nsauzede listed after Add');
+await propDlg.getByPlaceholder('key').fill('color');
+await propDlg.getByPlaceholder('value').fill('teal');
+await propDlg.getByRole('button', { name: 'Add' }).click();
+await page.waitForFunction(() => document.querySelectorAll('.proplist li').length === 2);
+ok(true, 'second property listed');
+await propDlg.getByRole('button', { name: 'Remove property color' }).click();
+await page.waitForFunction(() => document.querySelectorAll('.proplist li').length === 1);
+ok(true, 'removing a property updates the list');
+await propDlg.getByRole('button', { name: 'Close' }).click();
+await propDlg.waitFor({ state: 'detached' });
+// persistence: reopen
+await openMenu('beta.txt');
+await card('beta.txt').getByRole('menuitem', { name: 'Properties' }).click();
+await propDlg.locator('.proplist li').waitFor();
+ok(await propDlg.locator('.proplist li').textContent().then((t) => t.includes('owner')),
+	'property persists across modal close/reopen');
+await propDlg.getByRole('button', { name: 'Close' }).click();
+await propDlg.waitFor({ state: 'detached' });
+
+console.log('— 15. Search toolbar (names + properties, click-to-navigate) —');
+const searchBox = page.getByLabel('Search names and properties');
+// name match: the nested file docs/bundle/sub/two.txt from section 4
+await searchBox.fill('two.txt');
+await searchBox.press('Enter');
+await page.locator('.results').waitFor();
+const nameHit = page.locator('.result', { hasText: 'two.txt' });
+ok(await nameHit.locator('.tag').first().textContent().then((t) => t.trim() === 'name'),
+	'search by name tags the match as "name"');
+ok(await nameHit.locator('.rpath').textContent().then((t) => t.trim() === '/docs/bundle/sub/two.txt'),
+	'result shows the full virtual path');
+// property match (set in section 14 on /beta.txt)
+await searchBox.fill('nsauzede');
+await searchBox.press('Enter');
+await page.waitForFunction(() =>
+	document.querySelector('.resulthead')?.textContent.includes('nsauzede'));
+const propHit = page.locator('.result', { hasText: 'beta.txt' });
+ok(await propHit.locator('.tag.prop').textContent().then((t) => t.includes('owner=nsauzede')),
+	'search by property value tags the match with key=value');
+// no-hit query
+await searchBox.fill('zzz-nothing');
+await searchBox.press('Enter');
+await page.waitForFunction(() =>
+	document.querySelector('.resulthead')?.textContent.includes('0 result'));
+ok(true, 'no-hit query reports 0 results');
+// click-to-navigate: a file hit opens its containing folder
+await searchBox.fill('two.txt');
+await searchBox.press('Enter');
+await page.locator('.result', { hasText: 'two.txt' }).click();
+await card('two.txt').waitFor();
+ok(await page.locator('.crumb').allTextContents().then((c) => c.join('/').includes('sub')),
+	'clicking a file result navigates to its containing folder');
+ok((await page.locator('.results').count()) === 0, 'results panel closes after navigation');
+
+console.log('— 16. Ghost-conflict regression: delete folder, re-upload same nested path —');
+// back to root; upload ghost/inner.txt via the folder picker
+await page.locator('.crumb').first().click();
+await waitIdle();
+mkfile('ghost/inner.txt', 'GGGG');
+const ghostDir = path.join(tmp, 'ghost');
+const fcG1 = page.waitForEvent('filechooser');
+await page.getByRole('button', { name: '↑ Upload folder' }).click();
+await (await fcG1).setFiles(ghostDir);
+await card('ghost').waitFor();
+// delete the folder
+page.once('dialog', (d) => d.accept());
+await openMenu('ghost');
+await card('ghost').getByRole('menuitem', { name: 'Delete' }).click();
+await card('ghost').waitFor({ state: 'detached' });
+ok(true, 'folder "ghost" deleted');
+// re-upload the SAME nested path: before the resolve_path fix this popped
+// the "already exist" conflict modal for a path gone from UI and disk.
+const fcG2 = page.waitForEvent('filechooser');
+await page.getByRole('button', { name: '↑ Upload folder' }).click();
+await (await fcG2).setFiles(ghostDir);
+await card('ghost').waitFor();
+await page.waitForTimeout(400); // give a would-be modal time to appear
+ok((await page.locator('.veil[aria-label="Upload conflicts"]').count()) === 0,
+	're-upload after delete shows NO ghost conflict modal');
+await card('ghost').locator('.name.asdir').click();
+await card('inner.txt').waitFor();
+ok(await cardMeta('inner.txt').textContent().then((t) => t.includes('4 B')),
+	'resurrected ghost/inner.txt listed with correct size');
+await page.locator('.crumb').first().click();
+await waitIdle();
+
 await browser.close();
 console.log(failures === 0 ? '\nALL E2E CHECKS PASSED' : `\n${failures} E2E CHECK(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

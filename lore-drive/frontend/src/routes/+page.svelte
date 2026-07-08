@@ -17,6 +17,11 @@
 	// Conflict modal: { files: [{relPath,file}], conflicts: [paths], selected: Set }
 	let conflict = $state(null);
 	let busy = $state(false);
+	// Properties modal: { node, map: {k:v}, newKey, newValue, error, saving }
+	let props = $state(null);
+	// Search: query string + results panel
+	let searchQ = $state('');
+	let searchState = $state(null); // { results, truncated, error, loading, forQ }
 
 	const here = $derived(trail[trail.length - 1]);
 	const visible = $derived(children.filter((c) => c.name !== '.lorekeep'));
@@ -241,6 +246,89 @@
 		conflict = { ...conflict, selected: next };
 	}
 
+	// ── Custom properties (key/value strings in the mutable store) ────────
+	async function openProperties(node) {
+		menuFor = null;
+		props = { node, map: {}, newKey: '', newValue: '', error: '', saving: false, loading: true };
+		try {
+			const res = await api.properties(node.node_id);
+			props = { ...props, map: res.properties, loading: false };
+		} catch (e) {
+			props = { ...props, error: e.message, loading: false };
+		}
+	}
+
+	async function addProperty() {
+		if (!props) return;
+		const key = props.newKey.trim();
+		if (!key) return;
+		props = { ...props, saving: true, error: '' };
+		try {
+			const res = await api.setProperty(props.node.node_id, key, props.newValue);
+			props = { ...props, map: res.properties, newKey: '', newValue: '', saving: false };
+		} catch (e) {
+			props = { ...props, error: e.message, saving: false };
+		}
+	}
+
+	async function removeProperty(key) {
+		if (!props) return;
+		props = { ...props, saving: true, error: '' };
+		try {
+			const res = await api.deleteProperty(props.node.node_id, key);
+			props = { ...props, map: res.properties, saving: false };
+		} catch (e) {
+			props = { ...props, error: e.message, saving: false };
+		}
+	}
+
+	// ── Search (names + property keys/values) ─────────────────────────────
+	async function runSearch() {
+		const q = searchQ.trim();
+		if (!q) {
+			searchState = null;
+			return;
+		}
+		searchState = { results: [], truncated: false, error: '', loading: true, forQ: q };
+		try {
+			const res = await api.search(q);
+			searchState = {
+				results: res.results,
+				truncated: res.truncated,
+				error: '',
+				loading: false,
+				forQ: q
+			};
+		} catch (e) {
+			searchState = { results: [], truncated: false, error: e.message, loading: false, forQ: q };
+		}
+	}
+
+	function clearSearch() {
+		searchQ = '';
+		searchState = null;
+	}
+
+	// Navigate to a search hit: directories open themselves, files open
+	// their containing folder. The breadcrumb trail is rebuilt by walking
+	// `parent_id` links up to the root (node records carry both).
+	async function gotoResult(result) {
+		try {
+			let dirId =
+				result.kind === 'directory' ? result.node_id : (await api.node(result.node_id)).parent_id;
+			const parts = [];
+			while (dirId !== 0) {
+				const rec = await api.node(dirId);
+				parts.unshift({ node_id: rec.node_id, name: rec.name });
+				dirId = rec.parent_id;
+			}
+			trail = [{ node_id: 0, name: '/' }, ...parts];
+			clearSearch();
+		} catch (e) {
+			errorMsg = e.message;
+		}
+	}
+
 	// ── Display helpers ───────────────────────────────────────────────────
 	function fmtSize(n) {
 		if (n < 1024) return `${n} B`;
@@ -293,6 +381,20 @@
 				<span class="mode" class:versioned={info.mode === 'versioned'}>{info.mode}</span>
 			{/if}
 		</div>
+		<div class="searchbar" role="search">
+			<input
+				class="search mono"
+				type="search"
+				placeholder="Search names & properties…"
+				aria-label="Search names and properties"
+				bind:value={searchQ}
+				onkeydown={(e) => {
+					if (e.key === 'Enter') runSearch();
+					if (e.key === 'Escape') clearSearch();
+				}}
+			/>
+			<button class="action" onclick={runSearch} disabled={!searchQ.trim()}>Search</button>
+		</div>
 		{#if info}
 			<div class="workspace mono">
 				<span title="repository id">{info.repository_id}</span>
@@ -324,6 +426,45 @@
 			{errorMsg}
 			<button class="dismiss" onclick={() => (errorMsg = '')}>×</button>
 		</div>
+	{/if}
+
+	{#if searchState}
+		<section class="results" aria-label="Search results">
+			<div class="resulthead">
+				{#if searchState.loading}
+					Searching…
+				{:else if searchState.error}
+					<span class="dim">search failed:</span> {searchState.error}
+				{:else}
+					{searchState.results.length} result(s) for
+					<span class="mono">“{searchState.forQ}”</span>
+					{#if searchState.truncated}<span class="dim">(truncated)</span>{/if}
+				{/if}
+				<button class="dismiss" aria-label="Close search results" onclick={clearSearch}>×</button>
+			</div>
+			{#if !searchState.loading && !searchState.error}
+				<ul class="resultlist">
+					{#each searchState.results as r (r.node_id)}
+						<li>
+							<button class="result" onclick={() => gotoResult(r)}>
+								<span class="ricon">{r.kind === 'directory' ? '📁' : '▤'}</span>
+								<span class="rname">{r.name}</span>
+								<span class="rpath mono dim">{r.path}</span>
+								<span class="rwhy">
+									{#each r.matches as m}
+										{#if m.field === 'name'}
+											<span class="tag">name</span>
+										{:else}
+											<span class="tag prop" title="{m.key} = {m.value}">{m.key}={m.value}</span>
+										{/if}
+									{/each}
+								</span>
+							</button>
+						</li>
+					{/each}
+				</ul>
+			{/if}
+		</section>
 	{/if}
 
 	<main>
@@ -406,6 +547,15 @@
 									<button role="menuitem" onclick={() => download(node)}>
 										Download{node.kind === 'directory' ? ' as ZIP' : ''}
 									</button>
+									<button
+										role="menuitem"
+										onclick={(e) => {
+											e.stopPropagation();
+											openProperties(node);
+										}}
+									>
+										Properties
+									</button>
 									<button role="menuitem" class="danger" onclick={() => remove(node)}>
 										Delete
 									</button>
@@ -480,6 +630,73 @@
 						Replace selected
 					</button>
 					<button class="action primary" onclick={conflictAll}>Replace all</button>
+				</div>
+			</div>
+		</div>
+	{/if}
+
+	{#if props}
+		<div class="veil" role="dialog" aria-label="Properties of {props.node.name}">
+			<div class="modal">
+				<h2>Properties — <span class="mono">{props.node.name}</span></h2>
+				<p class="hint">
+					Custom key/value properties, stored in the workspace's mutable store. They are
+					searchable and follow the item across renames and moves.
+				</p>
+				{#if props.error}
+					<div class="error" role="alert">{props.error}</div>
+				{/if}
+				{#if props.loading}
+					<p class="hint">Loading…</p>
+				{:else}
+					{@const entries = Object.entries(props.map)}
+					{#if entries.length === 0}
+						<p class="hint">No properties yet.</p>
+					{:else}
+						<ul class="proplist mono">
+							{#each entries as [k, v] (k)}
+								<li>
+									<span class="pkey">{k}</span>
+									<span class="dim">=</span>
+									<span class="pval">{v}</span>
+									<button
+										class="dismiss"
+										aria-label="Remove property {k}"
+										disabled={props.saving}
+										onclick={() => removeProperty(k)}
+									>
+										×
+									</button>
+								</li>
+							{/each}
+						</ul>
+					{/if}
+					<div class="proprow">
+						<input
+							class="mono"
+							placeholder="key"
+							aria-label="New property key"
+							bind:value={props.newKey}
+							onkeydown={(e) => e.key === 'Enter' && addProperty()}
+						/>
+						<input
+							class="mono"
+							placeholder="value"
+							aria-label="New property value"
+							bind:value={props.newValue}
+							onkeydown={(e) => e.key === 'Enter' && addProperty()}
+						/>
+						<button
+							class="action primary"
+							onclick={addProperty}
+							disabled={props.saving || !props.newKey.trim()}
+						>
+							Add
+						</button>
+					</div>
+				{/if}
+				<div class="row">
+					<button class="action" onclick={() => (props = null)}>Close</button>
 				</div>
 			</div>
 		</div>
@@ -836,5 +1053,126 @@
 		.card {
 			transition: border-color 120ms ease;
 		}
+	}
+
+	/* ── Search ── */
+	.searchbar {
+		display: flex;
+		gap: 6px;
+		align-items: center;
+		flex: 1;
+		max-width: 380px;
+		margin: 0 16px;
+	}
+	.search {
+		flex: 1;
+		padding: 7px 10px;
+		border: 1px solid var(--line);
+		border-radius: 8px;
+		font-size: 13px;
+		background: var(--panel);
+	}
+	.results {
+		background: var(--panel);
+		border: 1px solid var(--line);
+		border-radius: 10px;
+		padding: 10px 12px;
+		margin: 8px 0;
+	}
+	.resulthead {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		font-weight: 600;
+	}
+	.resulthead .dismiss {
+		margin-left: auto;
+	}
+	.resultlist {
+		list-style: none;
+		margin: 8px 0 0;
+		padding: 0;
+	}
+	.result {
+		display: flex;
+		align-items: baseline;
+		gap: 10px;
+		width: 100%;
+		padding: 7px 8px;
+		border: 0;
+		border-radius: 8px;
+		background: transparent;
+		text-align: left;
+		cursor: pointer;
+		font: inherit;
+		color: inherit;
+	}
+	.result:hover {
+		background: var(--bg);
+	}
+	.rname {
+		font-weight: 600;
+	}
+	.rpath {
+		font-size: 12px;
+	}
+	.rwhy {
+		margin-left: auto;
+		display: flex;
+		gap: 4px;
+		flex-wrap: wrap;
+	}
+	.tag {
+		font-size: 11px;
+		padding: 1px 7px;
+		border-radius: 999px;
+		background: var(--bg);
+		border: 1px solid var(--line);
+		color: var(--dim);
+	}
+	.tag.prop {
+		color: var(--accent);
+		border-color: var(--accent);
+		font-family: var(--mono);
+	}
+
+	/* ── Properties modal ── */
+	.proplist {
+		list-style: none;
+		margin: 4px 0 10px;
+		padding: 0;
+		max-height: 260px;
+		overflow: auto;
+	}
+	.proplist li {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 5px 4px;
+		border-bottom: 1px dashed var(--line);
+		font-size: 13px;
+	}
+	.pkey {
+		font-weight: 600;
+		color: var(--accent);
+	}
+	.pval {
+		overflow-wrap: anywhere;
+	}
+	.proplist .dismiss {
+		margin-left: auto;
+	}
+	.proprow {
+		display: flex;
+		gap: 6px;
+		margin-top: 6px;
+	}
+	.proprow input {
+		flex: 1;
+		min-width: 0;
+		padding: 7px 10px;
+		border: 1px solid var(--line);
+		border-radius: 8px;
+		font-size: 13px;
 	}
 </style>

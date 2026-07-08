@@ -147,6 +147,36 @@ async fn resolve_path_impl(
                 .await
             {
                 Ok(link) => {
+                    // Staged deletions remain in the tree as tombstones (in
+                    // drive mode nothing ever commits them away), and
+                    // `find_node_link` resolves them like live entries. A
+                    // resolved-but-deleted path must read as "does not exist"
+                    // — otherwise consumers (e.g. lore-drive's upload/mkdir/
+                    // rename conflict checks) report ghost conflicts for
+                    // paths whose every trace is gone from listings and disk.
+                    // Only nodes of the local repository are checked: a link
+                    // resolution into another repository passes through
+                    // unchanged.
+                    let tombstoned = link.repository == internal.repository
+                        && matches!(
+                            internal
+                                .state
+                                .node(internal.repository_context.clone(), link.node)
+                                .await,
+                            Ok(node) if node.is_staged_delete()
+                        );
+                    if tombstoned {
+                        emit_resolve_complete(
+                            id,
+                            INVALID_NODE,
+                            RepositoryId::default(),
+                            Hash::default(),
+                            LoreErrorCode::InvalidArguments,
+                        );
+                        return Err(ResolvePathError::from(InvalidArguments {
+                            reason: "path does not resolve to a node".into(),
+                        }));
+                    }
                     emit_resolve_complete(
                         id,
                         link.node,
@@ -355,6 +385,80 @@ mod tests {
         storage_handle::unregister(crate::storage::handle::LoreStore {
             handle_id: store_handle_id,
         });
+    }
+
+    #[tokio::test]
+    async fn resolve_staged_delete_tombstone_reports_not_found() {
+        // Regression (lore-drive ghost-conflict): in drive mode deletions are
+        // never committed away, so deleted nodes remain in the tree as
+        // `StagedDelete` tombstones. Resolving such a path must answer
+        // "does not exist" — otherwise existence checks built on this verb
+        // report conflicts for paths gone from every listing.
+        let (handle, store_handle_id) =
+            load_handle("resolve-tombstone", Partition::from([0x66u8; 16])).await;
+        let (state, repository_context) = handle_state(handle);
+
+        let tombstone = Node {
+            flags: (NodeFlags::File | NodeFlags::StagedDelete).bits(),
+            name_hash: hash_string("deleted.txt"),
+            ..Default::default()
+        };
+        state
+            .node_add(repository_context.clone(), ROOT_NODE, tombstone, "deleted.txt")
+            .await
+            .expect("node_add tombstone must succeed");
+        let live = Node {
+            flags: NodeFlags::File.bits(),
+            name_hash: hash_string("alive.txt"),
+            ..Default::default()
+        };
+        let live_id = state
+            .node_add(repository_context, ROOT_NODE, live, "alive.txt")
+            .await
+            .expect("node_add live sibling must succeed");
+
+        // The tombstoned path reads as not-found…
+        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let status = resolve_path(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeResolvePathArgs {
+                id: 31,
+                handle,
+                path: LoreString::from("deleted.txt"),
+            },
+            make_callback(sink.clone()),
+        )
+        .await;
+        assert_ne!(status, 0, "resolving a tombstoned path must fail");
+        let events = sink.lock().unwrap().clone();
+        let (node_id, _, _, error_code) =
+            resolve_outcome(&events, 31).expect("ResolvePathComplete must fire");
+        assert_eq!(
+            node_id, INVALID_NODE,
+            "tombstoned path must not resolve to a node, got {events:?}"
+        );
+        assert_eq!(error_code, LoreErrorCode::InvalidArguments);
+
+        // …while an untombstoned sibling still resolves.
+        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let status = resolve_path(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeResolvePathArgs {
+                id: 32,
+                handle,
+                path: LoreString::from("alive.txt"),
+            },
+            make_callback(sink.clone()),
+        )
+        .await;
+        assert_eq!(status, 0, "resolving a live sibling must succeed");
+        let events = sink.lock().unwrap().clone();
+        let (node_id, _, _, error_code) =
+            resolve_outcome(&events, 32).expect("ResolvePathComplete must fire");
+        assert_eq!(node_id, live_id, "live sibling resolves, got {events:?}");
+        assert_eq!(error_code, LoreErrorCode::None);
+
+        release(handle, store_handle_id);
     }
 
     #[tokio::test]

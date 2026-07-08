@@ -33,6 +33,16 @@ Firstly, apply RUST.md to correctly setup the required Rust toolchain
   `/opt/pw-browsers` also has Playwright-layout chromium builds, but their
   revision rarely matches the npm playwright version — `executablePath` to
   system Chrome is the reliable route.
+- **hurl works** (integration tests): not in Ubuntu 24.04 apt, but
+  `cargo install hurl@7.1.0 --profile dev` from crates.io succeeds after
+  `apt-get update && apt-get install -y libssl-dev pkg-config libxml2-dev
+  libclang-dev clang` (openssl-sys and bindgen need them; run `apt-get
+  update` first or half the -dev debs 404).  Pin **7.1.0** — hurl ≥ 8 needs
+  rustc ≥ 1.95 which apt does not ship.  Lands in `~/.cargo/bin/hurl`
+  (~4 chunked tool calls with `CARGO_TARGET_DIR=/tmp/hurl-target` to resume).
+  Bonus: hurl sends `file,relative/path;` multipart entries with the
+  RELATIVE PATH as the filename — exactly what lore-drive's folder-upload
+  protocol wants, so nested-path scenarios are testable from .hurl files.
 
 For the frontend: Node/npm are preinstalled; `npm install` + `npm run build`
 inside `lore-drive/frontend/` just work (registry is whitelisted).
@@ -57,7 +67,18 @@ curl -F "file=@bigger_somefile;filename=somefile" "localhost:8080/api/v1/upload?
 curl -s localhost:8080/api/v1/tree  # → the file's size and address are the NEW ones
 ```
 
-Full browser E2E (29 checks): build the frontend, start lore-drive in a
+Integration suite (hurl, 15 requests over 2 files — covers the write API,
+the ghost-conflict and stale-size regressions, properties and search):
+
+```bash
+cargo build -p lore-drive && cargo build -p lore-client
+lore-drive/tests/hurl/run.sh          # self-contained: scratch ws + server
+```
+
+Unit tests: `cargo test -p lore-drive` (props key derivation / blob codec /
+validation / search matching).
+
+Full browser E2E (44 checks): build the frontend, start lore-drive in a
 scratch workspace, then `node frontend/e2e.mjs` (against `npm run dev` on
 :5173) or `E2E_BASE=http://localhost:8080 node frontend/e2e.mjs` (against
 `lore-drive --ui frontend/build`).  See `frontend/README.md`.
@@ -74,21 +95,80 @@ Don't hesitate to enhance this HANDOFF.md if need be.
 
 # Tasks
 
-- [ ] Discovered a bug:
-      1. upload nested folder1/file1
-      2. delete folder1/
-      3. it "works" as in: browser shows empty root, and on-disk FS shows an empty lore reop (remains only .lore)
-      4. HOWEVER: trying to upload again nested folder1/file1, shows the popup "replace?"
-      Please fix/test that.
+- [x] **Ghost-conflict on re-upload after delete — reproduced, root-caused,
+      fixed, regression-tested** (this session).
+      - Repro (curl): upload `folder1/file1` → `DELETE /node/{folder1}` →
+        `/tree` empty, disk empty → re-upload same path → **409**
+        `{"conflicts":["/folder1/file1"]}`.
+      - Root cause: same family as the earlier `list_children` fix.  In
+        drive mode deletions are never committed away, so deleted nodes stay
+        in the tree as `StagedDelete` **tombstones** — and the `resolve_path`
+        verb (`lore/src/revision_tree/resolve_path.rs` →
+        `State::find_node_link`) resolved them like live entries.  Every
+        conflict check in lore-drive (upload / mkdir / rename destination)
+        goes through `try_resolve_path`, hence the ghost 409.  The *staging*
+        layer was already correct — `stage.rs` has an explicit
+        "Undelete node before staging" path — only the read layer lied.
+      - Fix (in `resolve_path.rs`): after a successful `find_node_link`,
+        load the node and report local-repo `is_staged_delete()` hits as
+        "path does not resolve to a node" (link-repo resolutions pass
+        through untouched) — mirroring the `list_children` precedent.
+      - Regression-verified (curl + hurl + browser E2E §16): re-upload after
+        delete → 201 with the node resurrected and bytes on disk; live
+        conflicts still 409; overwrite-replace still refreshes size+address
+        (stale-size fix intact); delete-a-FILE-then-mkdir-a-DIR of the same
+        name works (fresh node, kind change handled by staging); rename onto
+        a tombstoned name works (file_id preserved); `.lorekeep`, dedup and
+        downloads unaffected.
 
-- [ ] Let's talk about /metadata/
-      What if I'd like for the browser user, to set/list custom metadata per browser item (folder/file), possible ?
-      Eg: in the "..." menu of those, add a "Properties" submenu that lists those set user-properties, and let add
-      new ones. Let's start simple: such a property is key/value (string/string)
-      Can we elegantly stuff that with minimal effort, eg: inside the existing "mutable store", for cheap ?
-      Can we then add a global "search" toolbar, letting us search for folder/file names, and/or property key/value ?
-      Could this be elegant/minimalist/fast ? Can that be unit(cargo)/integration(hurl)/e2e(playwright) tested ?
-      If complex, this task could result in drafting spec for further task(s)
+- [x] **Custom user properties per item + global search — implemented,
+      not just spec'd** (this session).  Your hunch was right: the mutable
+      store carries it for cheap, using ONLY existing lore verbs (zero
+      schema/proto changes).
+      - **Storage** (`lore-drive/src/props.rs` + helpers in `main.rs`):
+        `mutable_store[blake3("lore-drive:props:v1:"++node_id_le)]`
+        (`KeyType::Untyped`) → hash of a CAS JSON blob
+        `{"v":1,"node_id":N,"props":{k:v,…}}` — a mutable pointer into
+        immutable content, the lore idiom.  One entry per NODE (an edit is a
+        read-modify-write of one small blob, serialized by the existing
+        write gate); deterministic `BTreeMap` serialization dedups identical
+        maps in the CAS; blobs self-describe and loads are provenance-checked
+        so foreign Untyped keys can't masquerade; storing the null hash
+        removes the key, so an emptied map costs nothing.  Keyed by
+        `node_id` (survives rename/move/replace) — file_ids can't work:
+        only files get one; a directory's `address.context` is reserved for
+        link-target repository ids (`stage.rs:1699`, `stage.rs:483`).
+        Delete removes the whole subtree's property entries (collected
+        before tombstoning), so reused node slots never inherit stale props;
+        CLI deletes behind lore-drive's back orphan entries (harmless until
+        slot reuse — documented in REST_API.md).
+      - **REST**: `GET/PUT /api/v1/node/{id}/properties`,
+        `DELETE …/properties/{key}`, `GET /api/v1/search?q=&limit=` —
+        case-insensitive substring over names + property keys/values,
+        `.lorekeep`-invisible, BFS with parent-path threading, limit
+        clamp 1–500 + `truncated` flag.  Property writes don't touch the
+        revision tree (change-tag stays put).  Validation: key ≤ 256 B,
+        value ≤ 4 KiB, ≤ 256 props/node, no control chars.  Full spec in
+        REST_API.md ("User properties" section).
+      - **Frontend**: "Properties" item in the ⋮ menu → modal listing
+        `key = value` rows with per-row remove, plus key/value inputs + Add
+        (Enter submits); search box in the header → results panel showing
+        each hit's name, full path and WHY it matched (`name` tag or
+        `key=value` tag); clicking a hit rebuilds the breadcrumb trail by
+        walking `parent_id` links and opens the containing folder (dirs open
+        themselves).
+      - **Tested at all three levels, all green**: cargo unit (5 tests —
+        key derivation stability/distinctness, blob roundtrip + provenance,
+        validation, matching), hurl integration
+        (`tests/hurl/run.sh`: drive.hurl + replace.hurl, fresh scratch
+        workspace per run; also covers both regressions above), Playwright
+        E2E (44 checks total incl. §14 properties modal, §15 search
+        toolbar + click-to-navigate, §16 ghost-conflict; green on BOTH the
+        :5173 dev-proxy and the :8080 single-server topologies).
+      - Verified extras: properties on folders AND files; persistence across
+        server restarts (mutable store is durable); search hit limits;
+        `O(nodes)` walk with one mutable load per node is fine at drive
+        scale — an inverted index is a possible future task.
 
 - [x] **End-to-end test the frontend against the backend in a browser-like
       environment** — done this session with Playwright driving the system

@@ -58,5 +58,27 @@ export const api = {
 
 	remove: (nodeId) => request(`/node/${nodeId}`, { method: 'DELETE' }),
 
-	downloadUrl: (nodeId) => `${BASE}/api/v1/download/${nodeId}`
+	downloadUrl: (nodeId) => `${BASE}/api/v1/download/${nodeId}`,
+
+	// ── Custom user properties (key/value strings per node) ──
+	properties: (nodeId) => request(`/node/${nodeId}/properties`),
+
+	setProperty: (nodeId, key, value) =>
+		request(`/node/${nodeId}/properties`, {
+			method: 'PUT',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ key, value })
+		}),
+
+	deleteProperty: (nodeId, key) =>
+		request(`/node/${nodeId}/properties/${encodeURIComponent(key)}`, {
+			method: 'DELETE'
+		}),
+
+	// ── Search names and property keys/values ──
+	search: (q, limit) => {
+		const qs = new URLSearchParams({ q });
+		if (limit) qs.set('limit', String(limit));
+		return request(`/search?${qs}`);
+	}
 };

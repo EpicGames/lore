@@ -38,8 +38,12 @@ upload (including the `webkitdirectory` picker and drag'n'drop), the 409
 abort / replace-all / replace-selected modal (with absolute-virtual-path
 matching after navigating into a subfolder), rename, delete (confirm
 dialog), file download (bytes verified) and folder download (ZIP magic
-verified), `.lorekeep` hiding, and the replace-upload metadata-refresh
-scenario (size must update along with content and address).
+verified), `.lorekeep` hiding, the replace-upload metadata-refresh
+scenario (size must update along with content and address), the
+**Properties dialog** (add / list / remove / persistence across reopen),
+the **search toolbar** (name and property matches, tags, click-to-navigate
+into the containing folder), and the **ghost-conflict regression** (delete
+a folder, re-upload the same nested path: no conflict modal may appear).
 
 ```bash
 npm install                    # pulls playwright (dev dependency)
@@ -50,7 +54,7 @@ E2E_BASE=http://localhost:8080 node e2e.mjs    # single-server mode
 # E2E_CHROME=/path/to/chrome to override the browser binary
 ```
 
-All 29 checks pass in both topologies (Chromium 141).
+All 44 checks pass in both topologies (Chromium 141).
 
 ## What it does
 
@@ -58,7 +62,10 @@ All 29 checks pass in both topologies (Chromium 141).
 - Cards show name + `node_id`; files additionally show size and the
   `address` (`<b3-hash>-<file-id>`) **verbatim** — 1-to-1 with the CAS.
   The colored swatch is a *content fingerprint* derived from the b3 hash.
-- ⋮ menu: rename, download (folders arrive as ZIP), delete
+- ⋮ menu: rename, download (folders arrive as ZIP), **Properties**
+  (custom `key = value` string pairs per file/folder, stored in the
+  workspace's mutable store — searchable, and they follow the item across
+  renames/moves), delete
 - "Create folder" / "Upload files" / "Upload folder" buttons
 - The whole page is a drag'n'drop zone for files **and** folders
   (`webkitGetAsEntry` traversal preserves relative paths)
@@ -67,3 +74,7 @@ All 29 checks pass in both topologies (Chromium 141).
   treated as an ETag (it may stay unchanged on idempotent no-ops) and stale
   `node_id`s are never reused
 - `.lorekeep` placeholder entries are hidden
+- Search box in the header matches **names and property keys/values**
+  (case-insensitive substring, `GET /api/v1/search`); each hit shows its
+  full path plus *why* it matched (`name` tag or `key=value` tag) and
+  clicking it navigates to the item's containing folder
