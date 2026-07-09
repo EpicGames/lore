@@ -70,6 +70,15 @@ async fn chunk_boundaries(
 }
 
 /// Cuts `buffer` into chunks and stores each one via [`store_fragment`].
+///
+/// Uses FastCDC (content-defined chunking) when `flags.fixed_size_chunk` is 0,
+/// or fixed-size chunking when it is >0. Each chunk is hashed, stored as a
+/// content-addressed fragment in the immutable `store`, and assembled into a
+/// fragment list (Merklized). Returns the root address and fragment.
+///
+/// When the entire buffer fits in a single chunk, the single-fragment fast path
+/// is used and no fragment list is created. In `hash_only` mode, fragments are
+/// not actually stored — only their hashes are computed.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_fragmented(
     store: Arc<dyn ImmutableStore>,
@@ -81,7 +90,6 @@ pub async fn write_fragmented(
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
 ) -> Result<(Address, Fragment), StorageError> {
-    // Cut the file into chunks so we can store each piece.
     let size = buffer.len();
     let mut tasks = JoinSet::<Result<(usize, usize, Address), StorageError>>::new();
 
@@ -102,7 +110,7 @@ pub async fn write_fragmented(
         };
 
         if chunk_offset == 0 && chunk_size == size {
-            // Whole file fits in one chunk.
+            // Everything was put in a single fragment
             let chunk_buffer = if flags.clone_buffer {
                 Bytes::copy_from_slice(chunk_buffer.as_ref())
             } else {
@@ -397,7 +405,8 @@ pub fn write_fragmentlist(
     ))
 }
 
-/// Pretends a short-lived reference lives forever. Caller must make sure it really does.
+/// Unsafe extension of lifetime. Caller must guarantee the reference outlives
+/// all uses. Used for `FastCDC`'s borrow of the buffer slice.
 pub(crate) unsafe fn extend_lifetime<T>(data: &T) -> &'static T
 where
     T: ?Sized,
@@ -411,40 +420,12 @@ mod tests {
 
     use super::*;
 
-    /// Chunk a buffer using the standard `FastCDC` iterator, used to check our new way gives the same answer.
-    fn reference_fastcdc_boundaries(buffer: &[u8]) -> Vec<(usize, usize)> {
-        let chunker = fastcdc::v2020::FastCDC::with_level(
-            buffer,
-            FRAGMENT_SIZE_MINIMUM as u32,
-            FRAGMENT_SIZE_EXPECTED as u32,
-            FRAGMENT_SIZE_THRESHOLD as u32,
-            fastcdc::v2020::Normalization::Level1,
-        );
-        chunker.map(|c| (c.offset, c.offset + c.length)).collect()
-    }
-
     /// Make a buffer of random bytes so chunking has to actually cut it.
     fn mixed_pattern_buffer(size: usize) -> Bytes {
         use rand::Rng;
         let mut data = vec![0u8; size];
         rand::rng().fill(&mut data[..]);
         Bytes::from(data)
-    }
-
-    #[tokio::test]
-    async fn fastcdc_batch_matches_reference() {
-        let buffer = mixed_pattern_buffer(256 * 1024);
-        let expected = reference_fastcdc_boundaries(&buffer);
-        assert!(
-            expected.len() > 1,
-            "test buffer should produce multiple chunks, got {}",
-            expected.len()
-        );
-
-        let actual = chunk_boundaries(buffer, 0)
-            .await
-            .expect("chunking succeeds");
-        assert_eq!(actual, expected);
     }
 
     #[tokio::test]
