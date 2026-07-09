@@ -1406,6 +1406,64 @@ pub mod forwarded_revision_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        pub async fn branch_delete(
+            &mut self,
+            request: impl tonic::IntoRequest<super::BranchDeleteRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::BranchDeleteResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.revision.v1.ForwardedRevisionService/BranchDelete",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.revision.v1.ForwardedRevisionService",
+                        "BranchDelete",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn branch_get(
+            &mut self,
+            request: impl tonic::IntoRequest<super::BranchGetRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::BranchGetResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.revision.v1.ForwardedRevisionService/BranchGet",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new(
+                        "lore.revision.v1.ForwardedRevisionService",
+                        "BranchGet",
+                    ),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -1426,6 +1484,20 @@ pub mod forwarded_revision_service_server {
             request: tonic::Request<super::BranchCreateRequest>,
         ) -> std::result::Result<
             tonic::Response<super::BranchCreateResponse>,
+            tonic::Status,
+        >;
+        async fn branch_delete(
+            &self,
+            request: tonic::Request<super::BranchDeleteRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::BranchDeleteResponse>,
+            tonic::Status,
+        >;
+        async fn branch_get(
+            &self,
+            request: tonic::Request<super::BranchGetRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::BranchGetResponse>,
             tonic::Status,
         >;
     }
@@ -1542,6 +1614,101 @@ pub mod forwarded_revision_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = BranchCreateSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.revision.v1.ForwardedRevisionService/BranchDelete" => {
+                    #[allow(non_camel_case_types)]
+                    struct BranchDeleteSvc<T: ForwardedRevisionService>(pub Arc<T>);
+                    impl<
+                        T: ForwardedRevisionService,
+                    > tonic::server::UnaryService<super::BranchDeleteRequest>
+                    for BranchDeleteSvc<T> {
+                        type Response = super::BranchDeleteResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::BranchDeleteRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ForwardedRevisionService>::branch_delete(
+                                        &inner,
+                                        request,
+                                    )
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = BranchDeleteSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.revision.v1.ForwardedRevisionService/BranchGet" => {
+                    #[allow(non_camel_case_types)]
+                    struct BranchGetSvc<T: ForwardedRevisionService>(pub Arc<T>);
+                    impl<
+                        T: ForwardedRevisionService,
+                    > tonic::server::UnaryService<super::BranchGetRequest>
+                    for BranchGetSvc<T> {
+                        type Response = super::BranchGetResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::BranchGetRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as ForwardedRevisionService>::branch_get(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = BranchGetSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

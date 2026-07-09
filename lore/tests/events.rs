@@ -38,7 +38,12 @@ mod tests {
         LazyLock::new(|| Arc::new(Mutex::new(false)));
     static REPOSITORY_CREATE_C_COMPLETE: LazyLock<Arc<Mutex<bool>>> =
         LazyLock::new(|| Arc::new(Mutex::new(false)));
-    static REPOSITORY_CREATE_FAIL_ERROR: LazyLock<Arc<Mutex<bool>>> =
+    // Set if any `Error` event is seen on the failing create.
+    static REPOSITORY_CREATE_FAIL_ERROR_EVENT_SEEN: LazyLock<Arc<Mutex<bool>>> =
+        LazyLock::new(|| Arc::new(Mutex::new(false)));
+    // Set when the failing create reports its failure through the enriched
+    // `Complete` event (non-zero status with a populated detail).
+    static REPOSITORY_CREATE_FAIL_COMPLETE_IS_FAILURE: LazyLock<Arc<Mutex<bool>>> =
         LazyLock::new(|| Arc::new(Mutex::new(false)));
     static REPOSITORY_CREATE_FAIL_COMPLETE: LazyLock<Arc<Mutex<bool>>> =
         LazyLock::new(|| Arc::new(Mutex::new(false)));
@@ -140,11 +145,17 @@ mod tests {
                     error.error_type,
                     error.error_inner.as_str()
                 );
-                *REPOSITORY_CREATE_FAIL_ERROR.lock() = true;
+                // Record that an `Error` event arrived on the failing create.
+                *REPOSITORY_CREATE_FAIL_ERROR_EVENT_SEEN.lock() = true;
             }
             LoreEvent::Complete(complete) => {
                 println!("Received CompleteEvent! (status: {})", complete.status);
                 *REPOSITORY_CREATE_FAIL_COMPLETE.lock() = true;
+                // A failing create now reports failure through the enriched
+                // `Complete`: non-zero status that matches the carried detail.
+                if complete.status != 0 && complete.status == complete.error.error_code {
+                    *REPOSITORY_CREATE_FAIL_COMPLETE_IS_FAILURE.lock() = true;
+                }
             }
             _ => (),
         }
@@ -178,9 +189,11 @@ mod tests {
             .await
             .expect("[Repository create CompleteEvent not received in time.");
 
-        // Run the task to check until create has failed and completed
+        // Run the task to check until the failing create reports its failure
+        // through the enriched `Complete` event.
         let fail_callback_task = tokio::spawn(timeout(TIMEOUT_DURATION, async {
-            while !(*REPOSITORY_CREATE_FAIL_COMPLETE.lock() && *REPOSITORY_CREATE_FAIL_ERROR.lock())
+            while !(*REPOSITORY_CREATE_FAIL_COMPLETE.lock()
+                && *REPOSITORY_CREATE_FAIL_COMPLETE_IS_FAILURE.lock())
             {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
@@ -192,6 +205,11 @@ mod tests {
             .expect(
                 "[repo_initialize_fail] Repository initialize CompleteEvent not received in time.",
             );
+
+        assert!(
+            !*REPOSITORY_CREATE_FAIL_ERROR_EVENT_SEEN.lock(),
+            "failing create must not emit an Error event; the failure is carried by Complete"
+        );
     }
 
     #[serial]

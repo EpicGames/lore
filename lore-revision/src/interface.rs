@@ -114,13 +114,25 @@ impl LoreString {
         }
     }
 
+    pub fn as_bytes(&self) -> &[u8] {
+        if self.is_empty() {
+            &[]
+        } else {
+            // SAFETY: a non-empty string points to `length` initialized bytes that outlive this
+            // borrow, per the FFI contract and the `from_bytes` / `from_str` constructors.
+            unsafe { std::slice::from_raw_parts(self.string.cast::<u8>(), self.length) }
+        }
+    }
+
     pub fn from_path(source: impl AsRef<Path>) -> Self {
         let source = source.as_ref().display().to_string();
         Self::from_str(source.as_str())
     }
 
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(source: &str) -> Self {
+    /// Build an owning `LoreString` from raw bytes, copied into a freshly
+    /// allocated NUL-terminated buffer. The bytes need not be valid UTF-8;
+    /// `Drop` frees the buffer with the matching layout.
+    pub fn from_bytes(source: &[u8]) -> Self {
         unsafe {
             let length = source.len();
             let layout = std::alloc::Layout::from_size_align_unchecked(length + 1, 1);
@@ -132,6 +144,11 @@ impl LoreString {
                 length,
             }
         }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(source: &str) -> Self {
+        Self::from_bytes(source.as_bytes())
     }
 
     fn free(&mut self) {
@@ -869,7 +886,7 @@ pub enum LoreError {
     /// The backing store is overloaded; the caller should retry later.
     SlowDown = 5,
     /// A blob exceeded a size limit enforced by the caller or the protocol.
-    /// Discriminant matches the FFI code of the underlying `Oversized` struct
+    /// Discriminant matches the error code of the underlying `Oversized` struct
     /// in `lore-base` so callers see a single consistent code.
     Oversized = 26,
 

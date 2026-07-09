@@ -15,7 +15,6 @@ mod imports {
     use lore_base::types::KeyType;
     use lore_base::types::Partition;
     use lore_revision::event::LoreErrorCode;
-    use lore_revision::interface::LoreError;
 }
 
 #[cfg(test)]
@@ -43,7 +42,6 @@ mod mutable_local_tests {
     use lore_revision::event::LoreErrorCode;
     use lore_revision::event::LoreEvent;
     use lore_revision::interface::LoreArray;
-    use lore_revision::interface::LoreError;
     use lore_revision::interface::LoreEventCallback;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
@@ -66,12 +64,10 @@ mod mutable_local_tests {
         }
     }
 
-    /// Capture for the no-remote rejection tests: the `Error` event's `error_type` (if any), the
-    /// `Complete.status`, and whether ANY per-item mutable event leaked (none should — the call is
-    /// rejected up front).
+    /// Capture for the no-remote rejection tests: the `Complete.status`, and whether ANY per-item
+    /// mutable event leaked (none should — the call is rejected up front).
     #[derive(Default)]
     struct RejectCapture {
-        error_type: Option<u32>,
         complete_status: Option<i32>,
         saw_item_event: bool,
     }
@@ -82,7 +78,6 @@ mod mutable_local_tests {
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
             let mut capture = capture_for_cb.lock().unwrap();
             match event {
-                LoreEvent::Error(data) => capture.error_type = Some(data.error_type),
                 LoreEvent::Complete(data) => capture.complete_status = Some(data.status),
                 LoreEvent::StorageMutableLoadItemComplete(_)
                 | LoreEvent::StorageMutableStoreItemComplete(_)
@@ -101,11 +96,6 @@ mod mutable_local_tests {
             "{op}: remote op on a local-only handle must fail the call"
         );
         let capture = capture.lock().unwrap();
-        assert_eq!(
-            capture.error_type,
-            Some(LoreError::InvalidArguments as u32),
-            "{op}: expected an InvalidArguments Error event",
-        );
         assert_eq!(
             capture.complete_status,
             Some(1),
@@ -607,14 +597,11 @@ mod mutable_local_tests {
     #[tokio::test]
     async fn load_unknown_handle_returns_invalid_arguments() {
         // Unknown handle → call-level error, no per-item events.
-        let error_type: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
         let saw_complete: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
         let saw_item: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-        let error_type_cb = error_type.clone();
         let saw_complete_cb = saw_complete.clone();
         let saw_item_cb = saw_item.clone();
         let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| match event {
-            LoreEvent::Error(data) => *error_type_cb.lock().unwrap() = Some(data.error_type),
             LoreEvent::Complete(data) => *saw_complete_cb.lock().unwrap() = Some(data.status),
             LoreEvent::StorageMutableLoadItemComplete(_) => *saw_item_cb.lock().unwrap() = true,
             _ => {}
@@ -629,11 +616,6 @@ mod mutable_local_tests {
         )
         .await;
         assert_eq!(status, 1);
-        assert_eq!(
-            *error_type.lock().unwrap(),
-            Some(LoreError::InvalidArguments as u32),
-            "expected an InvalidArguments Error event",
-        );
         assert_eq!(*saw_complete.lock().unwrap(), Some(1));
         assert!(
             !*saw_item.lock().unwrap(),

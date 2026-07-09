@@ -157,6 +157,22 @@ impl fmt::Display for Trace {
 }
 
 // ---------------------------------------------------------------------------
+// HasTrace — trait access to an error's trace
+// ---------------------------------------------------------------------------
+
+/// Trait exposing an error's [`Trace`] through a trait bound.
+///
+/// Each `#[error_set]` enum has an inherent `trace()` method, but no shared
+/// trait bound exposes it. Generic code that holds an error behind a bound
+/// (rather than a concrete type) needs trait access to the trace. `#[error_set]`
+/// implements this trait for every generated enum, delegating to that inherent
+/// method, so a generic function can bound on `HasTrace` and read the trace.
+pub trait HasTrace {
+    /// Returns a reference to this error's trace.
+    fn trace(&self) -> &Trace;
+}
+
+// ---------------------------------------------------------------------------
 // Send + Sync assertions for Trace
 // ---------------------------------------------------------------------------
 fn _assert_trace_send_sync() {

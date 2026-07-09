@@ -2575,6 +2575,181 @@ def test_dirty_partial_commit_keeps_uncommitted_adds(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_dirty_sequential_single_file_commits_keep_uncommitted_adds(new_lore_repo):
+    """Dirty-added files keep their add classification while sibling adds are
+    committed one at a time.
+
+    Every new file is flagged dirty in a single `dirty` call, then committed one
+    at a time (`stage` a single file, then `commit`). Files sit both directly in
+    the repository root and under a brand-new subdirectory of an
+    already-committed directory, so an uncommitted new file's parent chain runs
+    through a committed ancestor. After each single-file commit, a plain status
+    (no rescan) must report every not-yet-committed file as a dirty add -- never
+    demoted to a modify and never with the dirty flag cleared -- and each
+    committed file must drop out of status.
+    """
+    repo: Lore = new_lore_repo()
+
+    # Base revision so the root and `existing/` already hold committed content;
+    # the new files below are added alongside already-tracked nodes.
+    repo.write_files(
+        {
+            "existing/base_one.bin": os.urandom(64),
+            "existing/base_two.bin": os.urandom(64),
+        }
+    )
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    # Sibling adds in the repository root plus a brand-new subdirectory of the
+    # committed `existing/` directory, so some new files sit under a committed
+    # ancestor.
+    new_files = [f"root_add_{i:02d}.bin" for i in range(8)] + [
+        f"existing/added/sub_add_{i:02d}.bin" for i in range(4)
+    ]
+    repo.write_files({name: os.urandom(64) for name in new_files})
+
+    # Flag every new file through a single dirty call (not status --scan).
+    repo.dirty(new_files, offline=True)
+
+    def dirty_files(**kwargs) -> dict[str, dict]:
+        return {
+            to_posix(e["path"]): e
+            for e in get_status_files(repo, **kwargs)
+            if e.get("type") == "file"
+        }
+
+    new_posix = {to_posix(p) for p in new_files}
+
+    # Every new file starts life as a dirty add.
+    initial = dirty_files()
+    assert set(initial) == new_posix, (
+        f"dirty + status should report exactly the new files, got {sorted(initial)}"
+    )
+    for p in new_files:
+        entry = initial[to_posix(p)]
+        assert entry["action"] == "add", f"{p} should start as a dirty add: {entry}"
+        assert entry["flagDirty"] is True, f"{p} should start dirty: {entry}"
+
+    # Commit one file at a time in a deliberately non-sorted order, interleaving
+    # the two placements, so the committed file is rarely the lexicographically
+    # first remaining sibling and the new subdirectory is created mid-sequence.
+    commit_order = [
+        "root_add_03.bin",
+        "existing/added/sub_add_01.bin",
+        "root_add_00.bin",
+        "root_add_07.bin",
+        "existing/added/sub_add_03.bin",
+        "root_add_01.bin",
+        "root_add_05.bin",
+        "existing/added/sub_add_00.bin",
+        "root_add_02.bin",
+        "root_add_06.bin",
+        "existing/added/sub_add_02.bin",
+        "root_add_04.bin",
+    ]
+    assert set(commit_order) == set(new_files), (
+        "commit_order must cover every new file exactly once"
+    )
+
+    committed: set[str] = set()
+    for path in commit_order:
+        # Stage exactly one file (scan=False) then commit.
+        repo.stage([path], offline=True)
+        repo.commit(offline=True)
+        committed.add(to_posix(path))
+        remaining = new_posix - committed
+
+        # Plain status (no rescan): the remaining adds must survive the commit.
+        after = dirty_files()
+        assert set(after) == remaining, (
+            f"after committing {path}, plain status should report exactly the "
+            f"still-uncommitted new files {sorted(remaining)}, got {sorted(after)}"
+        )
+        for p in remaining:
+            entry = after[p]
+            assert entry["action"] == "add", (
+                f"committing {path} demoted uncommitted new file {p} from add to "
+                f"{entry['action']!r}: {entry}"
+            )
+            assert entry["flagDirty"] is True, (
+                f"committing {path} cleared the dirty flag on still-uncommitted "
+                f"new file {p}: {entry}"
+            )
+
+    # Every new file is committed: status must be clean of them.
+    assert dirty_files() == {}, (
+        "all new files committed one at a time; status should report none of them"
+    )
+
+    repo.repository_verify(offline=True)
+
+
+@pytest.mark.smoke
+def test_dirty_add_under_dirtied_committed_dir_keeps_add_on_partial_commit(
+    new_lore_repo,
+):
+    """New files added directly inside an already-committed directory keep their
+    add classification when one of them is committed, even when that committed
+    directory is itself flagged dirty alongside the new files.
+
+    A directory is committed so it exists in the revision. New files are then
+    created directly inside it and flagged dirty in a single `dirty` call
+    together with the directory itself. Status reports every new file as a dirty
+    add. After staging and committing exactly one of those files, a plain status
+    must still report each remaining new file as a dirty add -- never
+    reclassified to keep or modify, and never with the dirty flag cleared.
+    """
+    repo: Lore = new_lore_repo()
+
+    # Commit a directory so it exists in the revision.
+    repo.write_files({"folder/seed.bin": os.urandom(32)})
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    # New files directly inside the committed directory, flagged dirty in one
+    # call together with the committed directory itself.
+    new_files = [f"folder/added_{i:02d}.bin" for i in range(6)]
+    repo.write_files({name: os.urandom(64) for name in new_files})
+    repo.dirty(new_files + ["folder"], offline=True)
+
+    def dirty_adds(**kwargs) -> dict[str, dict]:
+        return {
+            to_posix(e["path"]): e
+            for e in get_status_files(repo, **kwargs)
+            if e.get("type") == "file"
+        }
+
+    new_posix = {to_posix(p) for p in new_files}
+
+    # Every new file starts as a dirty add.
+    initial = dirty_adds()
+    for p in new_files:
+        entry = initial.get(to_posix(p))
+        assert entry is not None and entry["action"] == "add", (
+            f"{p} should start as a dirty add: {entry}"
+        )
+
+    # Commit exactly one of the new files.
+    repo.stage([new_files[0]], offline=True)
+    repo.commit(offline=True)
+
+    # Every still-uncommitted new file must remain a dirty add.
+    remaining = new_posix - {to_posix(new_files[0])}
+    after = dirty_adds()
+    for p in sorted(remaining):
+        entry = after.get(p)
+        assert entry is not None, f"{p} dropped from status after a partial commit"
+        assert entry["action"] == "add", (
+            f"partial commit reclassified uncommitted new file {p} from add to "
+            f"{entry['action']!r}: {entry}"
+        )
+        assert entry["flagDirty"] is True, f"{p} should remain dirty: {entry}"
+
+    repo.repository_verify(offline=True)
+
+
+@pytest.mark.smoke
 def test_dirty_add_repeated_is_idempotent(new_lore_repo):
     """Marking the same added files dirty twice reports the same nodes both
     times, in plain status and under --check-dirty.

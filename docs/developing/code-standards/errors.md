@@ -8,8 +8,10 @@ Lore uses a layered error handling approach:
 
 1. **Domain-specific error enums** — Defined per module using `thiserror`.
 2. **Extension traits** — For error transformation with automatic logging.
-3. **Public error interface** — The `LoreError` enum exposed to API consumers.
-4. **EventError trait** — Translates internal errors to public errors.
+3. **Public error interface** — The `LoreError` enum exposed to API consumers (legacy; see section 4).
+4. **EventError trait** — Translates internal errors to public errors (legacy; see section 4).
+
+The canonical contract a C API consumer reads on a failure is the FFI error code on `status`, the return value, and the `error` detail on the `Complete` event. See [section 4](#4-ffi-error-reporting-contract). `LoreError` and `EventError` are legacy and kept only for transition.
 
 ---
 
@@ -74,7 +76,49 @@ impl EventError for ModuleError {
 
 ---
 
-## 4. Error extension traits
+## 4. FFI error reporting contract
+
+This section describes what a consumer of the C API reads on a failure. It is the canonical contract; the older `LoreError` and `EventError` paths above are legacy and kept only for transition.
+
+### The code carries on `status` and the return value
+
+A failed operation reports its FFI error code in two places:
+
+- The synchronous entry points return the FFI error code as their `int32` result, and `0` on success.
+- The `Complete` event carries the same code in its `status` field: `0` on success, the FFI error code on failure.
+
+The synchronous return value and `Complete.status` always agree, because both derive from the same outcome. An asynchronous (`_async`) entry point returns `void`, so for those callers `Complete.status` is the only place the code arrives.
+
+### The error detail on the `Complete` event
+
+The `Complete` event also carries a `LoreErrorDetail` in its `error` field. It is the empty default on success and the populated detail on failure:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `error_code` | `i32` | The error's FFI code. `0` on success, `-1` for an internal error. |
+| `message` | `LoreString` | The error message. Empty on success. |
+| `trace_locations` | `LoreArray<LoreTraceLocation>` | The captured trace, one entry per location. Empty when no trace was captured. |
+
+Each `LoreTraceLocation` holds a `file`, a `line`, a `column`, and a per-location `context` string. A consumer reconstructs where the error was created or forwarded from these entries, without server logs.
+
+`status` and `error.error_code` always hold the same value, by construction.
+
+### `error_code` is canonical; `error_type` and `LoreError` are legacy
+
+- `error_code` (on `LoreErrorDetail`, and the equal `Complete.status`) is the canonical code a consumer reads. It is the error's FFI code.
+- `error_type` on the legacy `LoreErrorEventData`, and the `LoreError` enum, are legacy. They disagree with `error_code` for most errors. Do not use them for new consumers.
+
+### No mid-stream `Error` event on a terminal failure
+
+The library no longer emits a mid-stream `LORE_EVENT_ERROR` event on a terminal failure. The full error detail arrives on the `Complete` event instead. A failing operation delivers exactly one error-bearing event: the enriched `Complete`.
+
+### Memory lifetime
+
+The library owns all error-detail memory. The pointers a consumer reads from `LoreErrorDetail` and `LoreTraceLocation` (the strings and the trace array) are valid only for the single callback invocation that delivers the event. A consumer that keeps any of this data must copy it out before the callback returns.
+
+---
+
+## 5. Error extension traits
 
 Defined in `lore-revision/src/error.rs`. These transform errors with automatic logging.
 
@@ -107,7 +151,7 @@ The traits check the execution context's `failure` flag to prevent duplicate log
 
 ---
 
-## 5. Panics and unwrap
+## 6. Panics and unwrap
 
 **Never use `unwrap()`, `expect()`, or code that can panic in production code.** This is especially critical in `lore-server` where a panic can crash the entire server process.
 
@@ -135,7 +179,7 @@ static RE: Lazy<Regex> = Lazy::new(|| {
 
 ---
 
-## 6. Crate-specific patterns
+## 7. Crate-specific patterns
 
 ### Full pattern (thiserror + EventError + extension traits)
 
@@ -164,7 +208,7 @@ Libraries must expose typed errors so callers can match on specific error varian
 
 ---
 
-## 7. Lore server errors
+## 8. Lore server errors
 
 In lore-server gRPC handlers, use `warn_map_err`, `warn_error_to_status`, or `warn_mapped_error_status` when converting internal errors into a gRPC `Status`. All three log the original error at WARN level with additional structured fields, ensuring the cause and response are visible in our observability for investigation.
 
@@ -178,7 +222,7 @@ Don't use them for expected, user-caused errors (for example, `NotFound`, `Inval
 
 ---
 
-## 8. Best practices
+## 9. Best practices
 
 1. **Never panic in production code** — Avoid `unwrap()`, `expect()`, and panic-inducing code.
 2. **Always use thiserror** for error enum definitions in libraries.

@@ -140,6 +140,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             const struct lore_global_args_t globals = {0};
             const struct lore_repository_clone_args_t args = {0};
             struct lore_event_callback_config_t callback = {0};
+            // A consumer that reads only the original Complete field must still
+            // compile and link after error detail was appended to the struct.
+            const struct lore_complete_event_data_t complete = {0};
+            (void)complete.status;
             return lore_repository_clone(&globals, &args, callback);
         }
         ",
@@ -177,6 +181,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 const struct lore_global_args_t globals = {};
                 const struct lore_repository_clone_args_t args = {};
                 struct lore_event_callback_config_t callback = {};
+                // A consumer that reads only the original Complete field must still
+                // compile and link after error detail was appended to the struct.
+                const struct lore_complete_event_data_t complete = {};
+                (void)complete.status;
                 return lore_repository_clone(&globals, &args, callback);
             }
             ",

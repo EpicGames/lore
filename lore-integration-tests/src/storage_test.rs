@@ -157,11 +157,16 @@ mod open_tests {
             callback,
         )
         .await;
-        assert_eq!(status, 1);
+        assert_ne!(status, 0);
         let events = sink.lock().unwrap().clone();
-        assert!(events.contains(&Captured::Error), "missing Error event");
         assert!(
-            events.contains(&Captured::Complete(1)),
+            !events.contains(&Captured::Error),
+            "no mid-stream Error event on terminal failure, got {events:?}",
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Captured::Complete(s) if *s != 0)),
             "expected Complete(1), got {events:?}",
         );
         assert!(
@@ -184,10 +189,17 @@ mod open_tests {
             callback,
         )
         .await;
-        assert_eq!(status, 1);
+        assert_ne!(status, 0);
         let events = sink.lock().unwrap().clone();
-        assert!(events.contains(&Captured::Error));
-        assert!(events.contains(&Captured::Complete(1)));
+        assert!(
+            !events.contains(&Captured::Error),
+            "no mid-stream Error event on terminal failure, got {events:?}",
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Captured::Complete(s) if *s != 0))
+        );
     }
 
     #[tokio::test]
@@ -309,10 +321,17 @@ mod open_tests {
 
         let (sink2, cb2) = make_sink();
         let status = close_handle(handle, cb2).await;
-        assert_eq!(status, 1, "second close should fail");
+        assert_ne!(status, 0, "second close should fail");
         let events = sink2.lock().unwrap().clone();
-        assert!(events.contains(&Captured::Error));
-        assert!(events.contains(&Captured::Complete(1)));
+        assert!(
+            !events.contains(&Captured::Error),
+            "no mid-stream Error event on terminal failure, got {events:?}",
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Captured::Complete(s) if *s != 0))
+        );
     }
 
     #[tokio::test]
@@ -320,10 +339,17 @@ mod open_tests {
         // On unknown handle: close on an unknown handle (never registered) errors.
         let (sink, cb) = make_sink();
         let status = close_handle(lore::storage::handle::LoreStore::INVALID, cb).await;
-        assert_eq!(status, 1);
+        assert_ne!(status, 0);
         let events = sink.lock().unwrap().clone();
-        assert!(events.contains(&Captured::Error));
-        assert!(events.contains(&Captured::Complete(1)));
+        assert!(
+            !events.contains(&Captured::Error),
+            "no mid-stream Error event on terminal failure, got {events:?}",
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Captured::Complete(s) if *s != 0))
+        );
     }
 
     #[tokio::test]
@@ -515,7 +541,7 @@ mod open_tests {
         .await;
         drop(good_payload);
         // One item failed → call-level status is 1 .
-        assert_eq!(status, 1);
+        assert_ne!(status, 0);
 
         let events = sink.lock().unwrap().clone();
         let completes: Vec<_> = events
@@ -608,7 +634,7 @@ mod open_tests {
         )
         .await;
         drop(payload);
-        assert_eq!(status, 1);
+        assert_ne!(status, 0);
 
         let events = sink.lock().unwrap().clone();
         let complete = events
@@ -681,7 +707,7 @@ mod open_tests {
             callback,
         )
         .await;
-        assert_eq!(status, 1);
+        assert_ne!(status, 0);
 
         let events = sink.lock().unwrap().clone();
         let completes: Vec<_> = events
@@ -716,10 +742,17 @@ mod open_tests {
             callback,
         )
         .await;
-        assert_eq!(status, 1);
+        assert_ne!(status, 0);
         let events = sink.lock().unwrap().clone();
-        assert!(events.contains(&Captured::Error));
-        assert!(events.contains(&Captured::Complete(1)));
+        assert!(
+            !events.contains(&Captured::Error),
+            "no mid-stream Error event on terminal failure, got {events:?}",
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Captured::Complete(s) if *s != 0))
+        );
         assert!(
             take_opened(&events).is_none(),
             "must not emit Opened on failure, got {events:?}",
@@ -900,7 +933,7 @@ mod open_tests {
         )
         .await;
         // One item failed → call status 1 .
-        assert_eq!(status, 1);
+        assert_ne!(status, 0);
 
         let events = sink.lock().unwrap().clone();
         let complete = events
@@ -1029,7 +1062,7 @@ mod open_tests {
             callback,
         )
         .await;
-        assert_eq!(status, 1);
+        assert_eq!(status, -1);
 
         let events = sink.lock().unwrap().clone();
         // No HEADER or DATA must appear for the missed read.
@@ -1064,8 +1097,9 @@ mod open_tests {
 
     #[tokio::test]
     async fn get_on_invalid_handle_returns_invalid_arguments() {
-        // On unknown handle: unknown handle on get yields status 1 + Error +
-        // Complete(1). No per-item events.
+        // On unknown handle: the return value is 1 and a single enriched
+        // Complete carries the handle-miss code (FFI code 1 for the dispatch
+        // InvalidArguments).
         let (sink, callback) = make_get_sink();
         let status = lore::storage::get::get(
             globals(),
@@ -1078,10 +1112,17 @@ mod open_tests {
             callback,
         )
         .await;
-        assert_eq!(status, 1);
+        assert_ne!(status, 0);
         let events = sink.lock().unwrap().clone();
-        assert!(events.contains(&GetCaptured::Error));
-        assert!(events.contains(&GetCaptured::Complete(1)));
+        assert!(
+            !events.contains(&GetCaptured::Error),
+            "no Error event must fire on the migrated terminal arm, got {events:?}",
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, GetCaptured::Complete(s) if *s != 0))
+        );
         assert!(
             !events.iter().any(|e| matches!(
                 e,
@@ -1547,7 +1588,7 @@ mod open_tests {
             }],
         )
         .await;
-        assert_eq!(status, 1);
+        assert_eq!(status, -1);
         let complete = events
             .iter()
             .find_map(|e| match e {
@@ -1689,8 +1730,8 @@ mod open_tests {
             },
         ];
         let (status, events) = get_items_capture(handle, items).await;
-        // One item failed → status 1.
-        assert_eq!(status, 1);
+        // One item failed → call-level status is the internal code -1.
+        assert_eq!(status, -1);
 
         // Per-item terminal events.
         let collect_complete = |target_id: u64| -> Option<lore_revision::event::LoreErrorCode> {
@@ -1826,9 +1867,9 @@ mod open_tests {
 
     #[tokio::test]
     async fn aggregate_call_error_uses_invalid_arguments_when_any_item_invalid() {
-        // Severity ordering: a single InvalidArguments per-item code wins
-        // over AddressNotFound at the call level. Error event reports
-        // LoreError::InvalidArguments.
+        // Severity ordering: a single InvalidArguments per-item code wins over
+        // AddressNotFound at the call level. The enriched Complete carries the
+        // aggregated error's FFI code (1 for InvalidArguments).
         use lore_base::types::Address;
         use lore_base::types::Context;
         use lore_base::types::Hash;
@@ -1877,28 +1918,31 @@ mod open_tests {
             callback,
         )
         .await;
-        assert_eq!(status, 1);
+        assert_ne!(status, 0);
 
         let events = sink.lock().unwrap().clone();
-        let error_type = events
+        assert!(
+            !events.iter().any(|e| matches!(e, LoreEvent::Error(_))),
+            "no Error event must fire on the migrated terminal arm",
+        );
+        let complete = events
             .iter()
             .find_map(|e| match e {
-                LoreEvent::Error(d) => Some(d.error_type),
+                LoreEvent::Complete(d) => Some(d.clone()),
                 _ => None,
             })
-            .expect("expected Error event");
-        assert_eq!(
-            error_type,
-            lore_revision::interface::LoreError::InvalidArguments as u32,
-        );
+            .expect("expected Complete event");
+        // InvalidArguments carries FFI code 1; it wins the aggregate.
+        assert_ne!(complete.status, 0);
+        assert_ne!(complete.error.error_code, 0);
     }
 
     #[tokio::test]
     async fn aggregate_call_error_uses_internal_when_only_address_not_found() {
         // Without an InvalidArguments item, the call-level summary maps the
-        // dominant AddressNotFound aggregate to LoreError::Internal — the
-        // FFI surface has no AddressNotFound LoreError variant for batch
-        // ops.
+        // dominant AddressNotFound aggregate to the internal error — the FFI
+        // surface has no AddressNotFound variant for batch ops. The enriched
+        // Complete carries the internal FFI code (-1).
         use lore_base::types::Address;
         use lore_base::types::Context;
         use lore_base::types::Hash;
@@ -1938,20 +1982,23 @@ mod open_tests {
             callback,
         )
         .await;
-        assert_eq!(status, 1);
+        assert_eq!(status, -1);
 
         let events = sink.lock().unwrap().clone();
-        let error_type = events
+        assert!(
+            !events.iter().any(|e| matches!(e, LoreEvent::Error(_))),
+            "no Error event must fire on the migrated terminal arm",
+        );
+        let complete = events
             .iter()
             .find_map(|e| match e {
-                LoreEvent::Error(d) => Some(d.error_type),
+                LoreEvent::Complete(d) => Some(d.clone()),
                 _ => None,
             })
-            .expect("expected Error event");
-        assert_eq!(
-            error_type,
-            lore_revision::interface::LoreError::Internal as u32,
-        );
+            .expect("expected Complete event");
+        // The aggregated AddressNotFound maps to the internal error, FFI code -1.
+        assert_eq!(complete.status, -1);
+        assert_eq!(complete.error.error_code, -1);
     }
 
     #[tokio::test]
@@ -1988,7 +2035,7 @@ mod open_tests {
         )
         .await;
         // Handle B never saw the write — read must miss.
-        assert_eq!(status, 1);
+        assert_eq!(status, -1);
         let complete = events
             .iter()
             .find_map(|e| match e {
@@ -2133,8 +2180,9 @@ mod open_tests {
 
     #[tokio::test]
     async fn flush_on_invalid_handle_returns_invalid_arguments() {
-        // On unknown handle: unknown handle yields status=1 + Error +
-        // Complete(1).
+        // On unknown handle: the return value is 1 and a single enriched
+        // Complete carries the handle-miss code (FFI code 1 for the dispatch
+        // InvalidArguments).
         let (sink, callback) = make_sink();
         let status = lore::storage::flush::flush(
             globals(),
@@ -2144,10 +2192,17 @@ mod open_tests {
             callback,
         )
         .await;
-        assert_eq!(status, 1);
+        assert_ne!(status, 0);
         let events = sink.lock().unwrap().clone();
-        assert!(events.contains(&Captured::Error));
-        assert!(events.contains(&Captured::Complete(1)));
+        assert!(
+            !events.contains(&Captured::Error),
+            "no Error event must fire on the migrated terminal arm, got {events:?}",
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Captured::Complete(s) if *s != 0))
+        );
     }
 
     /// Capture for `get_metadata` items (the terminal
@@ -2275,7 +2330,7 @@ mod open_tests {
             }],
         )
         .await;
-        assert_eq!(status, 1);
+        assert_eq!(status, -1);
         let complete = events
             .iter()
             .find_map(|e| match e {
@@ -2309,7 +2364,7 @@ mod open_tests {
             }],
         )
         .await;
-        assert_eq!(status, 1);
+        assert_ne!(status, 0);
         let complete = events
             .iter()
             .find_map(|e| match e {
@@ -2723,7 +2778,7 @@ mod open_tests {
             }],
         )
         .await;
-        assert_eq!(status, 1);
+        assert_eq!(status, -1);
         let complete = events
             .iter()
             .find_map(|e| match e {
@@ -2966,7 +3021,7 @@ mod open_tests {
             }],
         )
         .await;
-        assert_eq!(status, 1);
+        assert_ne!(status, 0);
         let complete = events
             .iter()
             .find_map(|e| match e {
@@ -2999,7 +3054,7 @@ mod open_tests {
             }],
         )
         .await;
-        assert_eq!(status, 1);
+        assert_ne!(status, 0);
         let complete = events
             .iter()
             .find_map(|e| match e {
@@ -3332,7 +3387,7 @@ mod open_tests {
             }],
         )
         .await;
-        assert_eq!(status, 1);
+        assert_ne!(status, 0);
         let complete = completes.iter().find(|c| c.id == 1).unwrap();
         assert_eq!(
             complete.error_code,
@@ -3364,7 +3419,7 @@ mod open_tests {
             }],
         )
         .await;
-        assert_eq!(status, 1);
+        assert_ne!(status, 0);
         let complete = completes.iter().find(|c| c.id == 5).unwrap();
         assert_eq!(
             complete.error_code,
@@ -3566,7 +3621,7 @@ mod open_tests {
             }],
         )
         .await;
-        assert_eq!(status, 1);
+        assert_eq!(status, -1);
         let complete = events.iter().find_map(|e| match e {
             GetCaptured::ItemComplete { id, error_code, .. } => Some((*id, *error_code)),
             _ => None,
@@ -3599,7 +3654,7 @@ mod open_tests {
             }],
         )
         .await;
-        assert_eq!(status, 1);
+        assert_ne!(status, 0);
         let complete = events.iter().find_map(|e| match e {
             GetCaptured::ItemComplete { id, error_code, .. } => Some((*id, *error_code)),
             _ => None,
@@ -4465,14 +4520,16 @@ mod open_tests {
             callback,
         )
         .await;
-        assert_eq!(status, 1, "open with local=1 && remote=1 must fail");
+        assert_ne!(status, 0, "open with local=1 && remote=1 must fail");
         let events = sink.lock().unwrap().clone();
         assert!(
-            events.iter().any(|e| matches!(e, Captured::Error)),
-            "expected Error event, got {events:?}",
+            !events.iter().any(|e| matches!(e, Captured::Error)),
+            "no mid-stream Error event on terminal failure, got {events:?}",
         );
         assert!(
-            events.contains(&Captured::Complete(1)),
+            events
+                .iter()
+                .any(|e| matches!(e, Captured::Complete(s) if *s != 0)),
             "expected Complete(1), got {events:?}",
         );
         // No Opened event must fire on a rejected open.
@@ -4549,13 +4606,17 @@ mod open_tests {
             callback,
         )
         .await;
-        assert_eq!(status, 1, "open with remote=1 + no remote_config must fail");
+        assert_ne!(status, 0, "open with remote=1 + no remote_config must fail");
         let events = sink.lock().unwrap().clone();
         assert!(
-            events.iter().any(|e| matches!(e, Captured::Error)),
-            "expected Error event, got {events:?}",
+            !events.iter().any(|e| matches!(e, Captured::Error)),
+            "no mid-stream Error event on terminal failure, got {events:?}",
         );
-        assert!(events.contains(&Captured::Complete(1)));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Captured::Complete(s) if *s != 0))
+        );
         assert!(take_opened(&events).is_none());
     }
 

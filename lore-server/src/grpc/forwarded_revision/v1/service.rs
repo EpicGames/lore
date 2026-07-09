@@ -6,6 +6,10 @@ use std::time::Duration;
 
 use lore_proto::lore::revision::v1::BranchCreateRequest;
 use lore_proto::lore::revision::v1::BranchCreateResponse;
+use lore_proto::lore::revision::v1::BranchDeleteRequest;
+use lore_proto::lore::revision::v1::BranchDeleteResponse;
+use lore_proto::lore::revision::v1::BranchGetRequest;
+use lore_proto::lore::revision::v1::BranchGetResponse;
 use lore_proto::lore::revision::v1::forwarded_revision_service_server::ForwardedRevisionService;
 use lore_revision::notification::NotificationSender;
 use lore_telemetry::InstrumentProvider;
@@ -14,6 +18,8 @@ use tonic::Response;
 use tonic::Status;
 
 use super::branch_create;
+use super::branch_delete;
+use super::branch_get;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
 
@@ -72,6 +78,39 @@ impl ForwardedRevisionService for LoreForwardedRevisionV1Service {
                 self.notification.clone(),
                 &self.hook_dispatcher,
                 &self.instrument_provider,
+            ),
+        )
+        .await
+    }
+
+    async fn branch_delete(
+        &self,
+        request: Request<BranchDeleteRequest>,
+    ) -> Result<Response<BranchDeleteResponse>, Status> {
+        timeout_grpc(
+            self.rpc_timeout,
+            branch_delete::handler(
+                request,
+                self.immutable_store.clone(),
+                self.mutable_store.clone(),
+                self.notification.clone(),
+                &self.hook_dispatcher,
+                &self.instrument_provider,
+            ),
+        )
+        .await
+    }
+
+    async fn branch_get(
+        &self,
+        request: Request<BranchGetRequest>,
+    ) -> Result<Response<BranchGetResponse>, Status> {
+        timeout_grpc(
+            self.rpc_timeout,
+            branch_get::handler(
+                request,
+                self.immutable_store.clone(),
+                self.mutable_store.clone(),
             ),
         )
         .await

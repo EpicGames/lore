@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use lore::interface::LoreArray;
+use lore::interface::LoreGlobalArgs;
 use lore::interface::LoreMaintenanceEventData;
 use lore::interface::LorePathIgnoreEventData;
 use lore::interface::LoreRevisionSyncProgressEventData;
@@ -94,6 +95,15 @@ pub fn relativize_for_display(repo_root: &Path, cwd: &Path, repo_relative: &str)
         Some(rel) => rel.to_string_lossy().replace('\\', "/"),
         None => repo_relative.to_string(),
     }
+}
+
+/// Build a closure that rebases repo-root-relative paths onto the current
+/// working directory for display, capturing the repo root and cwd once.
+pub fn cwd_relativizer(globals: &LoreGlobalArgs) -> impl Fn(&str) -> String + 'static {
+    let repo_root = std::path::absolute(globals.repository_path())
+        .unwrap_or_else(|_| PathBuf::from(globals.repository_path()));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| repo_root.clone());
+    move |path: &str| relativize_for_display(&repo_root, &cwd, path)
 }
 
 pub fn read_targets_file(path: &String) -> Vec<String> {

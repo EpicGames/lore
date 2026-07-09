@@ -199,17 +199,28 @@ async fn dirty_path(
     let exists_on_disk = metadata.is_ok();
     let is_dir = metadata.as_ref().is_ok_and(|m| m.is_dir());
 
-    // Check if path exists in current revision
-    let in_current_revision = state_current
-        .find_node_link(repository.clone(), relative_path.as_str())
-        .await
-        .is_ok();
-
-    // Check if path exists in staged tree (for reverted add detection)
     let staged_link = state_staged
         .find_node_link(repository.clone(), relative_path.as_str())
         .await
         .ok();
+
+    let staged_pending_add = match &staged_link {
+        Some(link) => state_staged
+            .node(repository.clone(), link.node)
+            .await
+            .is_ok_and(|node| node.is_dirty_add()),
+        None => false,
+    };
+
+    // A pending add is never committed, but when the staged tree has no anchor
+    // yet it shares storage with `state_current` and resolves there too; exclude
+    // it so re-dirtying that node (e.g. recursing a dirtied committed parent)
+    // keeps it an add rather than a modify.
+    let in_current_revision = !staged_pending_add
+        && state_current
+            .find_node_link(repository.clone(), relative_path.as_str())
+            .await
+            .is_ok();
 
     if exists_on_disk && is_dir {
         // A new directory is itself an add; mark it so an empty one is tracked

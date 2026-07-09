@@ -3323,7 +3323,9 @@ pub fn allow_all_repositories() -> CanReadRepository {
     Arc::new(|_| true)
 }
 
-const MAX_LINK_DEPTH: usize = 8;
+/// Maximum number of link hops a tree walk follows before giving up. Bounds
+/// both unbounded link chains and link cycles so a walk terminates.
+pub const MAX_LINK_DEPTH: usize = 8;
 
 pub async fn gather_tree_paths(
     state: Arc<State>,

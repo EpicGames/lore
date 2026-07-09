@@ -913,6 +913,7 @@ fn handle_branch_merge_unresolve(globals: LoreGlobalArgs, args: &BranchMergeUnre
     let merge_unresolve_args = LoreBranchMergeUnresolveArgs { paths };
 
     let count_atomic = AtomicU64::default();
+    let display_path = util::cwd_relativizer(&globals);
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
@@ -928,7 +929,7 @@ fn handle_branch_merge_unresolve(globals: LoreGlobalArgs, args: &BranchMergeUnre
                 println!(
                     "{}{}{}",
                     BranchStyles::CONFLICT,
-                    data.path.as_str(),
+                    display_path(data.path.as_str()),
                     anstyle::Reset
                 );
 
@@ -971,6 +972,8 @@ fn handle_branch_merge_into(globals: LoreGlobalArgs, args: &BranchMergeIntoArgs)
     let debug = progress_debug();
     let progress_bar = ProgressBar::new(0);
 
+    let display_path = util::cwd_relativizer(&globals);
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::BranchMergeIntoFileBegin(data) => {
@@ -980,7 +983,7 @@ fn handle_branch_merge_into(globals: LoreGlobalArgs, args: &BranchMergeIntoArgs)
                 );
             }
             LoreEvent::BranchMergeIntoFile(data) => {
-                println!("{}", data.path.as_str());
+                println!("{}", display_path(data.path.as_str()));
             }
             LoreEvent::BranchMergeIntoFragmentBegin(data) => {
                 if data.fragments > 0 {
@@ -1035,6 +1038,8 @@ fn handle_branch_merge_start(globals: LoreGlobalArgs, args: &BranchMergeStartArg
     let debug = progress_debug();
     let progress_bar = ProgressBar::new(0);
 
+    let display_path = util::cwd_relativizer(&globals);
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::BranchMergeStartBegin(_data) => {}
@@ -1062,7 +1067,12 @@ fn handle_branch_merge_start(globals: LoreGlobalArgs, args: &BranchMergeStartArg
                 );
             }
             LoreEvent::BranchMergeConflictFile(data) => {
-                println!("{}{}{}", BranchStyles::CONFLICT, data.path, anstyle::Reset);
+                println!(
+                    "{}{}{}",
+                    BranchStyles::CONFLICT,
+                    display_path(data.path.as_str()),
+                    anstyle::Reset
+                );
             }
             LoreEvent::Complete(_) => {}
             LoreEvent::Maintenance(data) => {
@@ -1106,6 +1116,7 @@ fn handle_branch_merge_resolve_impl(
     let merge_resolve_args = LoreBranchMergeResolveArgs { paths };
 
     let count_atomic = AtomicU64::default();
+    let display_path = util::cwd_relativizer(&globals);
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
@@ -1121,7 +1132,7 @@ fn handle_branch_merge_resolve_impl(
                 println!(
                     "{}{}{}",
                     CommonStyles::SUCCESS,
-                    data.path.as_str(),
+                    display_path(data.path.as_str()),
                     anstyle::Reset
                 );
 

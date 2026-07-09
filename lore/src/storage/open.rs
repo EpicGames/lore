@@ -166,9 +166,9 @@ impl EventError for OpenError {
 /// Acquire a handle to a content-addressed store.
 ///
 /// On success the caller receives `LORE_EVENT_STORAGE_OPENED` carrying
-/// `{handle}` before `Complete {status: 0}`. On failure, one
-/// `LORE_EVENT_ERROR` fires followed by `Complete {status: 1}` and no
-/// `STORAGE_OPENED`.
+/// `{handle}` before `Complete` with `status` `0`. On failure, no
+/// `STORAGE_OPENED` and no `LORE_EVENT_ERROR` fire; `Complete` carries the
+/// error code in `status` and the full detail in its `error` field.
 pub async fn open(
     globals: LoreGlobalArgs,
     args: LoreStorageOpenArgs,

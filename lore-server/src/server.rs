@@ -66,6 +66,8 @@ use crate::auth::jwk::JwkServiceImpl;
 use crate::auth::jwt::JwtVerifier;
 use crate::grpc::GrpcInternalServerBuilder;
 use crate::grpc::GrpcServerBuilder;
+use crate::grpc::forwarded_requests::ForwardedRequests;
+use crate::grpc::forwarded_requests::GrpcForwardedRequests;
 use crate::grpc::notification_service::NotificationService;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookRegistrationContext;
@@ -417,6 +419,7 @@ async fn launch_grpc_server(
     notification_service: Option<NotificationService>,
     hook_dispatcher: Arc<HookDispatcher>,
     user_agent_filter: Arc<UserAgentFilter>,
+    forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let grpc_settings = settings
@@ -488,6 +491,7 @@ async fn launch_grpc_server(
             Duration::from_secs(grpc_settings.request_handler_timeout_seconds),
             service_settings,
             user_agent_filter,
+            forwarded_requests,
         )
         .with_jwt_verifier(jwt_verifier)?
         .serve(addr, async move {
@@ -1751,6 +1755,16 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         None => None,
     };
 
+    let forwarded_requests: Option<Arc<dyn ForwardedRequests>> = if let Some(grpc_public_services) =
+        &settings.server.grpc_public_services
+        && let Some(forwarded_requests_settings) = &grpc_public_services.forwarded_requests
+    {
+        let factory = GrpcForwardedRequests::new(forwarded_requests_settings).await?;
+        Some(Arc::new(factory))
+    } else {
+        None
+    };
+
     let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
     let mut endpoints = JoinSet::new();
 
@@ -1796,6 +1810,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let settings = settings.clone();
             let notification = notification.clone();
             let user_agent_filter = user_agent_filter.clone();
+            let forwarded_requests = forwarded_requests.clone();
             let shutdown_rx = _shutdown_rx.clone();
 
             let local_immutable_store = local_store().unwrap_or_else(|| {
@@ -1814,6 +1829,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 notification_service,
                 hook_dispatcher.clone(),
                 user_agent_filter,
+                forwarded_requests,
                 shutdown_rx,
             )
         });

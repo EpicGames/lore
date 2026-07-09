@@ -717,6 +717,8 @@ pub fn handle_revision_info(globals: LoreGlobalArgs, args: &RevisionInfoArgs) ->
         return info_result;
     }
 
+    let display_path = util::cwd_relativizer(&globals);
+
     let auth_data = resolve_revision_user_ids(globals, info_entry_data.clone());
 
     let info_entry_data = info_entry_data.lock();
@@ -784,7 +786,7 @@ pub fn handle_revision_info(globals: LoreGlobalArgs, args: &RevisionInfoArgs) ->
                     action_style,
                     delta.action,
                     anstyle::Reset,
-                    delta.path,
+                    display_path(delta.path.as_str()),
                     delta.merged
                 );
                 if let Some(metadata) = delta.metadata.as_ref() {
@@ -1237,7 +1239,7 @@ pub fn handle_revision_commit(globals: LoreGlobalArgs, args: &RevisionCommitArgs
         layer: LoreString::from(args.layer.as_deref().unwrap_or("")),
         layer_paths: LoreArray::from_vec(layer_paths),
         layer_messages: LoreArray::from_vec(layer_msgs),
-        stats: args.stats,
+        stats: args.stats.into(),
     };
 
     let commit_entry_data: Arc<Mutex<Vec<RevisionEntryData>>> =
@@ -1618,6 +1620,8 @@ pub fn handle_revision_diff(globals: LoreGlobalArgs, args: &RevisionDiffArgs) ->
 
     let _pager = Pager::new();
 
+    let display_path = util::cwd_relativizer(&globals);
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::RevisionDiffFile(data) => {
@@ -1626,7 +1630,7 @@ pub fn handle_revision_diff(globals: LoreGlobalArgs, args: &RevisionDiffArgs) ->
                     FileActionStyle::from_action(data.action),
                     data.action_as_string_short(),
                     anstyle::Reset,
-                    data.path.as_str()
+                    display_path(data.path.as_str())
                 );
             }
             LoreEvent::Complete(_) => {}
@@ -1684,6 +1688,8 @@ pub fn handle_revision_restore(globals: LoreGlobalArgs, args: &RevisionRestoreAr
     let debug = progress_debug();
     let progress_bar = ProgressBar::new(0);
 
+    let display_path = util::cwd_relativizer(&globals);
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::RevisionRestoreFileBegin(data) => {
@@ -1694,7 +1700,7 @@ pub fn handle_revision_restore(globals: LoreGlobalArgs, args: &RevisionRestoreAr
                 );
             }
             LoreEvent::RevisionRestoreFile(data) => {
-                println!("{}", data.path.as_str());
+                println!("{}", display_path(data.path.as_str()));
             }
             LoreEvent::RevisionRestoreFragmentBegin(data) if data.fragments > 0 => {
                 println!("Query {} fragment(s)", data.fragments);
@@ -1761,6 +1767,8 @@ pub fn handle_revision_cherry_pick(globals: LoreGlobalArgs, args: &RevisionCherr
         let debug = progress_debug();
         let progress_bar = ProgressBar::new(0);
 
+        let display_path = util::cwd_relativizer(&globals);
+
         let callback = output_formatter().unwrap_or(Some(
             (Box::new(move |event: &LoreEvent| match event {
                 LoreEvent::CherryPickStartBegin(_data) => {}
@@ -1788,7 +1796,12 @@ pub fn handle_revision_cherry_pick(globals: LoreGlobalArgs, args: &RevisionCherr
                     );
                 }
                 LoreEvent::CherryPickConflictFile(data) => {
-                    println!("{}{}{}", BranchStyles::CONFLICT, data.path, anstyle::Reset);
+                    println!(
+                        "{}{}{}",
+                        BranchStyles::CONFLICT,
+                        display_path(data.path.as_str()),
+                        anstyle::Reset
+                    );
                 }
                 LoreEvent::Complete(_) => {}
                 LoreEvent::Maintenance(data) => {
@@ -1850,6 +1863,7 @@ fn handle_revision_cherry_pick_unresolve(
     let cherry_pick_unresolve_args = revision::LoreRevisionCherryPickUnresolveArgs { paths };
 
     let count_atomic = AtomicU64::default();
+    let display_path = util::cwd_relativizer(&globals);
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
@@ -1865,7 +1879,7 @@ fn handle_revision_cherry_pick_unresolve(
                 println!(
                     "{}{}{}",
                     BranchStyles::CONFLICT,
-                    data.path.as_str(),
+                    display_path(data.path.as_str()),
                     anstyle::Reset
                 );
 
@@ -1951,6 +1965,7 @@ fn handle_revision_cherry_pick_resolve_impl(
     let cherry_pick_resolve_args = revision::LoreRevisionCherryPickResolveArgs { paths };
 
     let count_atomic = AtomicU64::default();
+    let display_path = util::cwd_relativizer(&globals);
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
@@ -1963,7 +1978,7 @@ fn handle_revision_cherry_pick_resolve_impl(
                         anstyle::Reset
                     );
                 }
-                println!("{}", data.path.as_str());
+                println!("{}", display_path(data.path.as_str()));
 
                 count_atomic.fetch_add(1, Ordering::Relaxed);
             }
@@ -2068,6 +2083,8 @@ pub fn handle_revision_revert(globals: LoreGlobalArgs, args: &RevisionRevertArgs
         let debug = progress_debug();
         let progress_bar = ProgressBar::new(0);
 
+        let display_path = util::cwd_relativizer(&globals);
+
         let callback = output_formatter().unwrap_or(Some(
             (Box::new(move |event: &LoreEvent| match event {
                 LoreEvent::RevertStartBegin(_data) => {}
@@ -2091,10 +2108,20 @@ pub fn handle_revision_revert(globals: LoreGlobalArgs, args: &RevisionRevertArgs
                     );
                 }
                 LoreEvent::RevertConflictFile(data) => {
-                    println!("{}{}{}", BranchStyles::CONFLICT, data.path, anstyle::Reset);
+                    println!(
+                        "{}{}{}",
+                        BranchStyles::CONFLICT,
+                        display_path(data.path.as_str()),
+                        anstyle::Reset
+                    );
                 }
                 LoreEvent::RevertUnresolveFile(data) => {
-                    println!("{}{}{}", BranchStyles::CONFLICT, data.path, anstyle::Reset);
+                    println!(
+                        "{}{}{}",
+                        BranchStyles::CONFLICT,
+                        display_path(data.path.as_str()),
+                        anstyle::Reset
+                    );
                 }
                 LoreEvent::Complete(_) => {}
                 LoreEvent::Maintenance(data) => {
@@ -2152,6 +2179,7 @@ fn handle_revision_revert_unresolve(
     let revert_unresolve_args = revision::LoreRevisionRevertUnresolveArgs { paths };
 
     let count_atomic = AtomicU64::default();
+    let display_path = util::cwd_relativizer(&globals);
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
@@ -2163,7 +2191,7 @@ fn handle_revision_revert_unresolve(
                 println!(
                     "{}{}{}",
                     BranchStyles::CONFLICT,
-                    data.path.as_str(),
+                    display_path(data.path.as_str()),
                     anstyle::Reset
                 );
 
@@ -2243,6 +2271,7 @@ fn handle_revision_revert_resolve_impl(
     let revert_resolve_args = revision::LoreRevisionRevertResolveArgs { paths };
 
     let count_atomic = AtomicU64::default();
+    let display_path = util::cwd_relativizer(&globals);
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
@@ -2251,7 +2280,7 @@ fn handle_revision_revert_resolve_impl(
                 if count == 0 {
                     println!("Resolved conflicts:");
                 }
-                println!("{}", data.path.as_str());
+                println!("{}", display_path(data.path.as_str()));
 
                 count_atomic.fetch_add(1, Ordering::Relaxed);
             }
