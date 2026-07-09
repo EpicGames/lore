@@ -25,7 +25,7 @@ use crate::types::Partition;
 use crate::write::store_fragment;
 
 /// Figure out where to cut `buffer` into chunks, all in one go.
-async fn chunk_boundaries(
+pub async fn chunk_boundaries(
     buffer: Bytes,
     fixed_size_chunk: usize,
 ) -> Result<Vec<(usize, usize)>, StorageError> {
