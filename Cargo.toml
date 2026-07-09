@@ -57,6 +57,7 @@ clap = { version = "4.5.47", features = ["derive", "string", "unicode"] }
 clap-markdown = "0.1.5"
 config = { version = "0.15.15", features = ["toml"], default-features = false }
 ctor = "0.2"
+criterion = { version = "0.6", default-features = false }
 crossbeam = "0.8.4"
 dashmap = "6.1.0"
 diffy = "0.4.2"
