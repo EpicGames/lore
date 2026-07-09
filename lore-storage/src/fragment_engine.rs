@@ -71,7 +71,7 @@ async fn chunk_boundaries(
 
 /// Cuts `buffer` into chunks and stores each one via [`store_fragment`].
 ///
-/// Uses FastCDC (content-defined chunking) when `flags.fixed_size_chunk` is 0,
+/// Uses `FastCDC` (content-defined chunking) when `flags.fixed_size_chunk` is 0,
 /// or fixed-size chunking when it is >0. Each chunk is hashed, stored as a
 /// content-addressed fragment in the immutable `store`, and assembled into a
 /// fragment list (Merklized). Returns the root address and fragment.
