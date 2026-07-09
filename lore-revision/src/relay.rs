@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::event::EventError;
 use crate::event::LoreCompleteEventData;
 use crate::event::LoreEndEventData;
+use crate::event::LoreErrorDetail;
 use crate::event::LoreErrorEventData;
 use crate::event::LoreEvent;
 use crate::event::LoreLogEventData;
@@ -135,8 +136,17 @@ impl EventDispatcher {
         )));
     }
 
-    pub async fn complete(&self, status: i32) {
-        self.send(LoreEvent::Complete(LoreCompleteEventData { status }));
+    pub async fn complete(&self, error: LoreErrorDetail) -> i32 {
+        // `status` is the detail's `error_code` so the two agree by
+        // construction: `0` with the empty default detail on success, the
+        // detail's `error_code` with that detail on failure.
+        let status = error.error_code;
+        // Log a failing completion so consumers that surface log events (the
+        // CLI, the server) show the message and trace.
+        if status != 0 {
+            crate::lore_error!("{}", error.message_with_trace());
+        }
+        self.send(LoreEvent::Complete(LoreCompleteEventData { status, error }));
 
         // Drop this strong reference, let the dispatcher task exit out and signal the end event
         // if this is the only strong reference to the event channel
@@ -153,6 +163,17 @@ impl EventDispatcher {
         {
             self.completed.cancelled().await;
         }
+
+        status
+    }
+
+    /// Completes a command from its `Result`: builds the detail and returns the
+    /// status the `Complete` event carries.
+    pub async fn complete_result<T, E>(&self, result: Result<T, E>) -> i32
+    where
+        E: lore_error_set::FfiError + std::fmt::Display + lore_error_set::HasTrace,
+    {
+        self.complete(LoreErrorDetail::from_result(result)).await
     }
 
     pub fn make_log(level: LoreLogLevel, message: String) -> LoreLogEventData {
@@ -163,5 +184,63 @@ impl EventDispatcher {
             location: Default::default(),
             message: message.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod complete_outcome_tests {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    use super::EventDispatcher;
+    use crate::event::LoreCompleteEventData;
+    use crate::event::LoreErrorDetail;
+    use crate::event::LoreEvent;
+    use crate::interface::LoreString;
+
+    // Captures the single `Complete` event a `complete` call emits. The
+    // callback is the real dispatch boundary, so the assertion reads the
+    // event a consumer would actually receive.
+    fn capture_complete(error: LoreErrorDetail) -> LoreCompleteEventData {
+        let captured: Arc<Mutex<Option<LoreCompleteEventData>>> = Arc::new(Mutex::new(None));
+        let sink = captured.clone();
+        let callback: crate::interface::LoreEventCallback =
+            Some(Box::new(move |event: &LoreEvent| {
+                if let LoreEvent::Complete(data) = event {
+                    *sink.lock().unwrap() = Some(data.clone());
+                }
+            }));
+
+        let dispatcher = EventDispatcher::new(callback);
+        lore_base::runtime::runtime().block_on(dispatcher.complete(error));
+
+        let data = captured.lock().unwrap().take();
+        data.expect("complete must emit a Complete event")
+    }
+
+    #[test]
+    fn default_detail_completes_with_status_zero_and_empty_detail() {
+        let data = capture_complete(LoreErrorDetail::default());
+
+        assert_eq!(data.status, 0);
+        assert_eq!(data.error.error_code, 0);
+        assert!(data.error.message.is_empty());
+        assert!(data.error.trace_locations.is_empty());
+    }
+
+    #[test]
+    fn populated_detail_completes_with_its_code_and_carries_detail() {
+        let detail = LoreErrorDetail {
+            error_code: 13,
+            message: LoreString::from("not found"),
+            ..LoreErrorDetail::default()
+        };
+
+        let data = capture_complete(detail);
+
+        // `status` is the detail's `error_code`, so the two agree.
+        assert_eq!(data.status, 13);
+        assert_eq!(data.error.error_code, 13);
+        assert_eq!(data.error.message.as_str(), "not found");
     }
 }

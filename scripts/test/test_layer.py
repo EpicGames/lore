@@ -1236,11 +1236,10 @@ def test_layer_remove_modified_file_errors(new_lore_repo):
     assert complete is not None and complete.get("status") != 0, (
         f"Expected non-zero complete status, got: {output}"
     )
-    errors = parse_jsonl(output, "error")
-    assert any(
-        "local modifications" in (e.get("errorInner") or "").lower()
-        for e in errors
-    ), f"Expected local modifications error in: {errors}"
+    message = (complete.get("error") or {}).get("message", "")
+    assert "local modifications" in message.lower(), (
+        f"Expected local modifications error in complete detail, got: {output}"
+    )
 
 
 @pytest.mark.smoke

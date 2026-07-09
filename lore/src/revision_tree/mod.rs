@@ -13,6 +13,7 @@ pub mod close;
 pub mod commit;
 pub mod delete;
 pub mod handle;
+pub mod info;
 pub mod list_children;
 pub mod load;
 pub mod metadata_get;

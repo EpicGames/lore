@@ -223,4 +223,6 @@ message RevisionListResponse {
 service ForwardedRevisionService {
 
   rpc BranchCreate     (BranchCreateRequest)      returns (BranchCreateResponse);
+  rpc BranchDelete     (BranchDeleteRequest)      returns (BranchDeleteResponse);
+  rpc BranchGet        (BranchGetRequest)         returns (BranchGetResponse);
 }

@@ -723,6 +723,8 @@ pub fn handle_file_info(globals: LoreGlobalArgs, args: &FileInfoArgs) -> u8 {
         filtered: args.filtered as u8,
     };
 
+    let display_path = util::cwd_relativizer(&globals);
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::FileInfo(data) => {
@@ -730,7 +732,7 @@ pub fn handle_file_info(globals: LoreGlobalArgs, args: &FileInfoArgs) -> u8 {
                     "{}Path:{}    {}",
                     CommonStyles::HEADERS,
                     anstyle::Reset,
-                    data.path.as_str()
+                    display_path(data.path.as_str())
                 );
                 println!(
                     "{}Type:{}    {}",
@@ -834,6 +836,8 @@ pub fn handle_file_diff(globals: LoreGlobalArgs, args: &FileDiffArgs) -> u8 {
 
     let _pager = Pager::new();
 
+    let display_path = util::cwd_relativizer(&globals);
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::FileDiff(data) => {
@@ -848,7 +852,7 @@ pub fn handle_file_diff(globals: LoreGlobalArgs, args: &FileDiffArgs) -> u8 {
                         println!(
                             "{}{}{}",
                             CommonStyles::HEADERS,
-                            data.path.as_str(),
+                            display_path(data.path.as_str()),
                             anstyle::Reset
                         );
                         let patch_str = data.patch.as_str();
@@ -878,7 +882,7 @@ pub fn handle_file_diff(globals: LoreGlobalArgs, args: &FileDiffArgs) -> u8 {
                             FileActionStyle::from_action(data.action),
                             data.action.as_string_short(),
                             anstyle::Reset,
-                            data.path.as_str()
+                            display_path(data.path.as_str())
                         );
                     }
                 }
@@ -1396,6 +1400,8 @@ pub fn handle_file_history(globals: LoreGlobalArgs, args: &FileHistoryArgs) -> u
     // Shared state for oneline mode: buffer the current entry's revision_number and message
     let oneline_state = OnelineState::default();
 
+    let display_path = util::cwd_relativizer(&globals);
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::FileHistory(data) => {
@@ -1423,7 +1429,11 @@ pub fn handle_file_history(globals: LoreGlobalArgs, args: &FileHistoryArgs) -> u
                         || data.action == LoreFileAction::Move
                         || data.action == LoreFileAction::Copy
                     {
-                        print!(" {}{}", CommonStyles::HEADERS, data.path.as_str());
+                        print!(
+                            " {}{}",
+                            CommonStyles::HEADERS,
+                            display_path(data.path.as_str())
+                        );
                     }
 
                     println!("{}", anstyle::Reset);
@@ -1768,6 +1778,8 @@ pub fn handle_file_dependency_list(globals: LoreGlobalArgs, args: &FileDependenc
 
     let reverse = args.reverse;
 
+    let display_path = util::cwd_relativizer(&globals);
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::FileDependencyListFile(data) => {
@@ -1780,7 +1792,12 @@ pub fn handle_file_dependency_list(globals: LoreGlobalArgs, args: &FileDependenc
             LoreEvent::FileDependencyListEntry(data) => {
                 let tags_display = format_tag_list(&data.tags);
                 let indent = "  ".repeat(data.depth.max(1) as usize);
-                println!("{}{}{}", indent, data.path.as_str(), tags_display);
+                println!(
+                    "{}{}{}",
+                    indent,
+                    display_path(data.path.as_str()),
+                    tags_display
+                );
             }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);

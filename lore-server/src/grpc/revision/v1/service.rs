@@ -37,6 +37,7 @@ use super::branch_metadata_get;
 use super::branch_metadata_set;
 use super::branch_push;
 use super::revision_list;
+use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
 
@@ -73,12 +74,14 @@ pub struct LoreRevisionV1Service {
     hook_dispatcher: Arc<HookDispatcher>,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
+    forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
     rpc_timeout: Duration,
     instrument_provider: RevisionServiceInstrumentProvider,
     revision_list_instruments: RevisionListInstruments,
 }
 
 impl LoreRevisionV1Service {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
@@ -86,6 +89,7 @@ impl LoreRevisionV1Service {
         hook_dispatcher: Arc<HookDispatcher>,
         history_step_size: u64,
         acceleration: crate::grpc::server::RevisionListAcceleration,
+        forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
         rpc_timeout: Duration,
     ) -> Self {
         let instrument_provider = RevisionServiceInstrumentProvider;
@@ -116,6 +120,7 @@ impl LoreRevisionV1Service {
             hook_dispatcher,
             history_step_size,
             acceleration,
+            forwarded_requests,
             rpc_timeout,
             instrument_provider,
             revision_list_instruments,
@@ -156,6 +161,7 @@ impl RevisionService for LoreRevisionV1Service {
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),
+                &self.forwarded_requests,
                 &self.hook_dispatcher,
                 &self.instrument_provider,
             ),
@@ -174,6 +180,7 @@ impl RevisionService for LoreRevisionV1Service {
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 self.notification.clone(),
+                &self.forwarded_requests,
                 &self.hook_dispatcher,
                 &self.instrument_provider,
             ),
@@ -191,6 +198,7 @@ impl RevisionService for LoreRevisionV1Service {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                &self.forwarded_requests,
             ),
         )
         .await

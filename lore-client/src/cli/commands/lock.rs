@@ -105,6 +105,8 @@ fn handle_lock_acquire(globals: LoreGlobalArgs, args: &FileLockAcquireArgs) -> u
         branch: LoreString::from(&args.branch),
     };
 
+    let display_path = util::cwd_relativizer(&globals);
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::LockFileAcquireBegin(data) if data.count > 0 => {
@@ -118,7 +120,7 @@ fn handle_lock_acquire(globals: LoreGlobalArgs, args: &FileLockAcquireArgs) -> u
                 println!("{}{}{}", CommonStyles::HEADERS, header, anstyle::Reset);
             }
             LoreEvent::LockFileAcquire(data) => {
-                println!("{}", data.path.as_str());
+                println!("{}", display_path(data.path.as_str()));
             }
             _ => {}
         }) as EventCallbackFn)
@@ -176,13 +178,20 @@ fn handle_lock_status(globals: LoreGlobalArgs, args: &FileLockStatusArgs) -> u8 
     let result_status =
         runtime().block_on(lock::file_status(globals.clone(), status_args, callback)) as u8;
 
+    let display_path = util::cwd_relativizer(&globals);
+
     let auth_data = resolve_user_ids(globals, status_data.clone());
 
     let status_data = status_data.lock();
     let auth_data = auth_data.lock();
     for data in status_data.iter() {
         let owner = auth_data.get(&data.owner).unwrap_or(&data.owner);
-        println!("{} by {} on {}", data.path, owner, data.timestamp);
+        println!(
+            "{} by {} on {}",
+            display_path(&data.path),
+            owner,
+            data.timestamp
+        );
     }
 
     result_status
@@ -221,12 +230,19 @@ fn handle_lock_query(globals: LoreGlobalArgs, args: &FileLockQueryArgs) -> u8 {
     let result_query =
         runtime().block_on(lock::file_query(globals.clone(), query_args, callback)) as u8;
 
+    let display_path = util::cwd_relativizer(&globals);
+
     let auth_data = resolve_user_ids(globals, query_data.clone());
     let query_data = query_data.lock();
     let auth_data = auth_data.lock();
     for data in query_data.iter() {
         let owner = auth_data.get(&data.owner).unwrap_or(&data.owner);
-        println!("{} by {} on branch {}", data.path, owner, data.branch);
+        println!(
+            "{} by {} on branch {}",
+            display_path(&data.path),
+            owner,
+            data.branch
+        );
     }
 
     result_query
@@ -243,6 +259,8 @@ fn handle_lock_release(globals: LoreGlobalArgs, args: &FileLockReleaseArgs) -> u
     };
 
     let globals = globals.clone();
+
+    let display_path = util::cwd_relativizer(&globals);
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
@@ -263,7 +281,7 @@ fn handle_lock_release(globals: LoreGlobalArgs, args: &FileLockReleaseArgs) -> u
                 }
             }
             LoreEvent::LockFileRelease(data) => {
-                println!("{}", data.path.as_str());
+                println!("{}", display_path(data.path.as_str()));
             }
             _ => {}
         }) as EventCallbackFn)

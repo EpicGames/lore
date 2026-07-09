@@ -134,8 +134,8 @@ pub type EventCallbackFn = Box<dyn Fn(&LoreEvent) + Send + Sync>;
 
 pub trait EventCallbackExt {
     /// Wraps the callback with default handling for `LoreEvent::Log`.
-    /// `LoreEvent::Error` is swallowed — `Dispatcher::send_error`
-    /// already routes errors through `LoreEvent::Log(level=Error)`.
+    /// `LoreEvent::Error` is swallowed — a failing completion routes its
+    /// message through `LoreEvent::Log(level=Error)`.
     fn with_defaults(self) -> Self;
 }
 

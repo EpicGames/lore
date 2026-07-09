@@ -47,6 +47,8 @@ use crate::correlation::span::MakeCorrelationIdSpan;
 use crate::grpc::admin_service::LoreAdminService;
 use crate::grpc::environment::LoreEnvironmentV1Service;
 use crate::grpc::environment_service::LoreEnvironmentService;
+use crate::grpc::forwarded_requests::ForwardedRequests;
+use crate::grpc::forwarded_requests::ForwardedRequestsSettings;
 use crate::grpc::notification_service::NotificationService;
 use crate::grpc::repository::LoreRepositoryV1Service;
 use crate::grpc::repository_service::LoreRepositoryService;
@@ -93,6 +95,7 @@ pub struct GrpcServiceSettings {
 #[derive(Clone, Debug, Deserialize)]
 pub struct GrpcPublicServicesSettings {
     pub lock_service: Option<GrpcServiceSettings>,
+    pub forwarded_requests: Option<ForwardedRequestsSettings>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -431,6 +434,7 @@ impl GrpcServerBuilder<WantsHttp2Config> {
         request_handler_timeout: Duration,
         service_settings: Option<GrpcPublicServicesSettings>,
         user_agent_filter: Arc<UserAgentFilter>,
+        forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
     ) -> GrpcServerBuilder<MaybeJwtVerifier> {
         GrpcServerBuilder(MaybeJwtVerifier {
             environment: self.0.environment,
@@ -449,6 +453,7 @@ impl GrpcServerBuilder<WantsHttp2Config> {
             request_handler_timeout,
             service_settings,
             user_agent_filter,
+            forwarded_requests,
         })
     }
 }
@@ -470,6 +475,7 @@ pub struct MaybeJwtVerifier {
     request_handler_timeout: Duration,
     service_settings: Option<GrpcPublicServicesSettings>,
     user_agent_filter: Arc<UserAgentFilter>,
+    forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
 }
 
 impl GrpcServerBuilder<MaybeJwtVerifier> {
@@ -522,6 +528,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             self.0.hook_dispatcher.clone(),
             history_step_size,
             acceleration,
+            self.0.forwarded_requests.clone(),
             rpc_timeout,
         );
         let revision_diff_config = crate::grpc::thinclient::v1::revision_diff::RevisionDiffConfig {

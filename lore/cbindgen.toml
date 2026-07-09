@@ -72,6 +72,7 @@ include = [
     "LoreRevisionTreeResolvePathArgs",
     "LoreRevisionTreeListChildrenArgs",
     "LoreRevisionTreeNodeInfoArgs",
+    "LoreRevisionTreeInfoArgs",
     "LoreRevisionTreeNodePathArgs",
     "LoreRevisionTreeAddArgs",
     "LoreRevisionTreeDeleteArgs",
@@ -216,6 +217,7 @@ include = [
 "LoreCompleteEventData" = "lore_complete_event_data_t"
 "LoreEndEventData" = "lore_end_event_data_t"
 "LoreErrorCode" = "lore_error_code_t"
+"LoreErrorDetail" = "lore_error_detail_t"
 "LoreErrorEventData" = "lore_error_event_data_t"
 "LoreEvent" = "lore_event_t"
 "LoreEventCallbackConfig" = "lore_event_callback_config_t"
@@ -467,12 +469,13 @@ include = [
 "LoreStorageMutableCompareAndSwapItemCompleteEventData" = "lore_storage_mutable_compare_and_swap_item_complete_event_data_t"
 "LoreStorageMutableListEntryEventData" = "lore_storage_mutable_list_entry_event_data_t"
 "LoreStorageMutableListItemCompleteEventData" = "lore_storage_mutable_list_item_complete_event_data_t"
+"LoreTraceLocation" = "lore_trace_location_t"
 "NodeID" = "lore_node_id_t"
 "LoreRevisionTreeLoadedEventData" = "lore_revision_tree_loaded_event_data_t"
 "LoreRevisionTreeResolvePathCompleteEventData" = "lore_revision_tree_resolve_path_complete_event_data_t"
 "LoreRevisionTreeChildEventData" = "lore_revision_tree_child_event_data_t"
 "LoreRevisionTreeNodeInfoEventData" = "lore_revision_tree_node_info_event_data_t"
-"LoreRevisionTreeRootInfoData" = "lore_revision_tree_root_info_data_t"
+"LoreRevisionTreeInfoEventData" = "lore_revision_tree_info_event_data_t"
 "LoreRevisionTreeNodePathEventData" = "lore_revision_tree_node_path_event_data_t"
 "LoreRevisionTreeAddCompleteEventData" = "lore_revision_tree_add_complete_event_data_t"
 "LoreRevisionTreeDeleteCompleteEventData" = "lore_revision_tree_delete_complete_event_data_t"
@@ -482,12 +485,14 @@ include = [
 "LoreRevisionTreeMetadataGetCompleteEventData" = "lore_revision_tree_metadata_get_complete_event_data_t"
 "LoreRevisionTreeCommitCompleteEventData" = "lore_revision_tree_commit_complete_event_data_t"
 "LoreRevisionTreeCloseCompleteEventData" = "lore_revision_tree_close_complete_event_data_t"
+"LoreRevisionTreeListChildrenBeginEventData" = "lore_revision_tree_list_children_begin_event_data_t"
 "LoreRevisionTree" = "lore_revision_tree_t"
 "LoreRevisionTreeLoadArgs" = "lore_revision_tree_load_args_t"
 "LoreRevisionTreeCloseArgs" = "lore_revision_tree_close_args_t"
 "LoreRevisionTreeResolvePathArgs" = "lore_revision_tree_resolve_path_args_t"
 "LoreRevisionTreeListChildrenArgs" = "lore_revision_tree_list_children_args_t"
 "LoreRevisionTreeNodeInfoArgs" = "lore_revision_tree_node_info_args_t"
+"LoreRevisionTreeInfoArgs" = "lore_revision_tree_info_args_t"
 "LoreRevisionTreeNodePathArgs" = "lore_revision_tree_node_path_args_t"
 "LoreRevisionTreeAddArgs" = "lore_revision_tree_add_args_t"
 "LoreRevisionTreeDeleteArgs" = "lore_revision_tree_delete_args_t"
@@ -505,6 +510,7 @@ include = [
 "LoreArray_lore_branch_point" = "lore_branch_point_array_t"
 "LoreArray_lore_metadata_type" = "lore_metadata_type_array_t"
 "LoreArray_lore_string" = "lore_string_array_t"
+"LoreArray_lore_trace_location" = "lore_trace_location_array_t"
 "LoreNodeType" = "lore_node_type_t"
 "LoreNotificationBranchCreatedEventData" = "lore_notification_branch_created_event_data_t"
 "LoreNotificationBranchDeletedEventData" = "lore_notification_branch_deleted_event_data_t"

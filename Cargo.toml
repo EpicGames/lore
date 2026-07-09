@@ -22,7 +22,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.4-nightly"
+version = "0.8.5-nightly"
 
 [workspace.dependencies]
 lore = { path = "lore" }
@@ -43,7 +43,7 @@ lore-telemetry = { path = "lore-telemetry" }
 lore-transport = { path = "lore-transport" }
 anstyle = "1.0.11"
 anstream = "0.6.20"
-anyhow = "1.0.99"
+anyhow = "1.0.103"
 async-stream = "0.3.6"
 async-trait = "0.1.89"
 axum = "0.8.4"
@@ -82,7 +82,7 @@ keyring = { version = "3.6.3", features = [
 libc = "0.2.175"
 lz4-sys = "1.11"
 zstd-sys = { version = "2.0", default-features = false, features = ["experimental"] }
-memmap2 = "0.9.8"
+memmap2 = "0.9.11"
 mockall = "0.13.1"
 opentelemetry = "0.31.0"
 opentelemetry-otlp = { version = "0.31.0", features = ["grpc-tonic", "tls", "tls-roots"] }

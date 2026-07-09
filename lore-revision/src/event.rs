@@ -84,6 +84,8 @@ use crate::event::revision_tree::LoreRevisionTreeChildEventData;
 use crate::event::revision_tree::LoreRevisionTreeCloseCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeCommitCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeDeleteCompleteEventData;
+use crate::event::revision_tree::LoreRevisionTreeInfoEventData;
+use crate::event::revision_tree::LoreRevisionTreeListChildrenBeginEventData;
 use crate::event::revision_tree::LoreRevisionTreeLoadedEventData;
 use crate::event::revision_tree::LoreRevisionTreeMetadataGetCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeMetadataSetCompleteEventData;
@@ -113,6 +115,7 @@ use crate::find::LoreRevisionFindEventData;
 use crate::immutable::LoreFragmentWriteEventData;
 use crate::instance::LoreBranchMultipleInstanceEventData;
 use crate::instance::LoreRepositoryInstanceEventData;
+use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreEventCallbackConfig;
@@ -340,9 +343,10 @@ impl<'de> serde::Deserialize<'de> for LoreBytes {
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum LoreErrorCode {
     /// No error; the operation succeeded.
+    #[default]
     None = 0,
     /// The arguments supplied to the operation were invalid.
     InvalidArguments = 1,
@@ -359,7 +363,7 @@ pub enum LoreErrorCode {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreErrorEventData {
-    /// The error code, matching one of the FFI error codes.
+    /// The error code, matching one of the error codes.
     pub error_type: u32,
     /// The underlying error message.
     pub error_inner: LoreString,
@@ -381,6 +385,12 @@ impl LoreErrorEventData {
 pub struct LoreCompleteEventData {
     /// The completion status code of the operation.
     pub status: i32,
+    /// The error detail for the operation. The empty default detail on
+    /// success; the populated detail on failure. `#[serde(default)]` lets an
+    /// older payload that lacks this field deserialize: the detail then reads
+    /// back as the empty default with an empty trace list.
+    #[serde(default)]
+    pub error: LoreErrorDetail,
 }
 
 /// Data for a metadata event, carrying a single key and value.
@@ -448,6 +458,156 @@ pub struct LoreMaintenanceEventData {
     pub message: LoreString,
 }
 
+/// One captured trace entry, carried across the FFI boundary as structured
+/// data.
+///
+/// It records the source location where an error was created or forwarded:
+/// the file path, line, column, and an optional per-location context string.
+/// The struct owns its `file` and `context` strings. `Clone` deep-clones them
+/// and `Drop` frees them.
+///
+/// Memory: the library owns this data. The pointers a consumer reads from this
+/// struct are valid only for the single callback invocation that delivers the
+/// event. A consumer that keeps any of this data must copy it out before the
+/// callback returns.
+#[repr(C)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreTraceLocation {
+    /// The source file path.
+    pub file: LoreString,
+    /// The line number in the source file.
+    pub line: u32,
+    /// The column number in the source file.
+    pub column: u32,
+    /// The context describing the operation at this location, or an empty
+    /// string when the location has none.
+    pub context: LoreString,
+}
+
+impl LoreTraceLocation {
+    /// Builds a trace location from a `lore-error-set` [`Location`], copying
+    /// its file and context into owned [`LoreString`]s. A location with no
+    /// context yields an empty `context` string.
+    ///
+    /// [`Location`]: lore_error_set::Location
+    pub fn from_location(location: &lore_error_set::Location) -> Self {
+        Self {
+            file: LoreString::from(location.file),
+            line: location.line,
+            column: location.column,
+            context: LoreString::from(location.context()),
+        }
+    }
+}
+
+impl std::fmt::Display for LoreTraceLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.context.is_empty() {
+            write!(f, "{}:{}:{}", self.file, self.line, self.column)
+        } else {
+            write!(f, "{}:{} - {}", self.file, self.line, self.context)
+        }
+    }
+}
+
+/// The shared error payload carried on a failed operation.
+///
+/// Every consumer reads this on a failure. It holds the error's error code, the
+/// error message, and the captured trace as structured data. `Default` yields
+/// the empty detail used on success: code `0`, an empty message, and an empty
+/// trace array.
+///
+/// The number of trace locations is bounded by the trace capacity in
+/// `lore-error-set` ([`MAX_TRACE_DEPTH`]). The trace array is empty when the
+/// `track-locations` feature is off or when the error carries no trace.
+///
+/// Memory: the library owns this data. The pointers a consumer reads from this
+/// struct (the `message` string and the `trace_locations` array, and the
+/// strings inside each location) are valid only for the single callback
+/// invocation that delivers the event. A consumer that keeps any of this data
+/// must copy it out before the callback returns.
+///
+/// [`MAX_TRACE_DEPTH`]: lore_error_set::MAX_TRACE_DEPTH
+#[repr(C)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreErrorDetail {
+    /// The error's error code. `0` on success; `-1` for an internal error.
+    #[serde(default)]
+    pub error_code: i32,
+    /// The error message, taken from the error's `Display` output. Empty on
+    /// success.
+    #[serde(default)]
+    pub message: LoreString,
+    /// The captured trace, one location per trace entry. Empty when
+    /// `track-locations` is off or the error carries no trace.
+    #[serde(default)]
+    pub trace_locations: LoreArray<LoreTraceLocation>,
+}
+
+impl LoreErrorDetail {
+    /// Renders the message followed by the captured trace, one indented line
+    /// per location, for human-readable logging. With no trace it is just the
+    /// message.
+    pub fn message_with_trace(&self) -> String {
+        use std::fmt::Write as _;
+        let mut text = self.message.as_str().to_string();
+        for location in self.trace_locations.as_slice() {
+            let _ = write!(text, "\n  at {location}");
+        }
+        text
+    }
+
+    /// Builds an error detail from a concrete `#[error_set]` error, reading its
+    /// own captured trace.
+    ///
+    /// The error supplies its error code through [`FfiError::ffi_code`], its
+    /// message through [`Display`], and its trace through [`HasTrace`]. The
+    /// trace supplies one [`LoreTraceLocation`] per recorded location. When
+    /// `track-locations` is off the trace reports no locations, so the array is
+    /// empty.
+    ///
+    /// [`FfiError::ffi_code`]: lore_error_set::FfiError::ffi_code
+    /// [`HasTrace`]: lore_error_set::HasTrace
+    pub fn from_error<E>(error: &E) -> Self
+    where
+        E: lore_error_set::FfiError + std::fmt::Display + lore_error_set::HasTrace,
+    {
+        Self::from_error_with_trace(error, error.trace())
+    }
+
+    /// Builds an error detail from an error and an explicitly supplied trace.
+    fn from_error_with_trace<E>(error: &E, trace: &lore_error_set::Trace) -> Self
+    where
+        E: lore_error_set::FfiError + std::fmt::Display,
+    {
+        let trace_locations = trace
+            .locations()
+            .iter()
+            .map(LoreTraceLocation::from_location)
+            .collect::<Vec<_>>();
+
+        Self {
+            error_code: error.ffi_code(),
+            message: LoreString::from(error.to_string()),
+            trace_locations: LoreArray::from_vec(trace_locations),
+        }
+    }
+
+    /// Builds the detail for a command result: the empty success detail on
+    /// `Ok`, the populated detail (read from the error's own trace) on `Err`.
+    pub fn from_result<T, E>(result: Result<T, E>) -> Self
+    where
+        E: lore_error_set::FfiError + std::fmt::Display + lore_error_set::HasTrace,
+    {
+        match result {
+            Ok(_) => Self::default(),
+            Err(err) => Self::from_error(&err),
+        }
+    }
+}
+
 /// Data for the start of a store eviction pass.
 #[repr(C)]
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -513,7 +673,8 @@ pub enum LoreEvent {
     // Standard events
     /// A progress update.
     Progress(LoreProgressEventData),
-    /// An error.
+    /// An error encountered during an operation. A terminal failure is
+    /// reported on the `Complete` event in its `error` field.
     Error(LoreErrorEventData),
     /// An operation completed.
     Complete(LoreCompleteEventData),
@@ -940,6 +1101,10 @@ pub enum LoreEvent {
     RevisionTreeCommitComplete(LoreRevisionTreeCommitCompleteEventData),
     /// A close call completed.
     RevisionTreeCloseComplete(LoreRevisionTreeCloseCompleteEventData),
+    /// A list-children call began; carries the target repository and revision.
+    RevisionTreeListChildrenBegin(LoreRevisionTreeListChildrenBeginEventData),
+    /// Revision-record metadata for a loaded revision tree.
+    RevisionTreeInfo(LoreRevisionTreeInfoEventData),
     // Mutable-store API events are appended here rather than grouped with the other storage
     // events above so that adding them does not renumber the `#[repr(C, u32)]` discriminants of
     // the existing variants — new variants go at the end of this enum.
@@ -984,5 +1149,302 @@ impl LoreEvent {
                 ptr.read_unaligned()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod trace_location_tests {
+    use std::sync::Arc;
+
+    use lore_error_set::Location;
+
+    use super::LoreTraceLocation;
+
+    #[test]
+    fn builds_from_location_with_context() {
+        let location = Location::with_context("src/main.rs", 42, 7, Arc::from("loading config"));
+
+        let trace = LoreTraceLocation::from_location(&location);
+
+        assert_eq!(trace.file.as_str(), "src/main.rs");
+        assert_eq!(trace.line, 42);
+        assert_eq!(trace.column, 7);
+        assert_eq!(trace.context.as_str(), "loading config");
+    }
+
+    #[test]
+    fn builds_from_location_without_context_yields_empty_context() {
+        let location = Location::new("src/lib.rs", 1, 1);
+
+        let trace = LoreTraceLocation::from_location(&location);
+
+        assert_eq!(trace.file.as_str(), "src/lib.rs");
+        assert_eq!(trace.line, 1);
+        assert_eq!(trace.column, 1);
+        assert!(trace.context.is_empty());
+        assert_eq!(trace.context.as_str(), "");
+    }
+
+    #[test]
+    fn clone_is_independent_deep_copy_and_both_drop_cleanly() {
+        let location = Location::with_context("src/clone.rs", 3, 9, Arc::from("deep copy"));
+        let trace = LoreTraceLocation::from_location(&location);
+
+        let clone = trace.clone();
+
+        // The clone holds its own allocations, not shared pointers.
+        assert_ne!(trace.file.string, clone.file.string);
+        assert_ne!(trace.context.string, clone.context.string);
+
+        // The clone is value-equal to the original. `LoreTraceLocation` does
+        // not derive `Debug`, so compare through `PartialEq` directly.
+        assert!(trace == clone);
+        assert_eq!(clone.file.as_str(), "src/clone.rs");
+        assert_eq!(clone.context.as_str(), "deep copy");
+
+        // Dropping the original must not affect the clone's strings.
+        drop(trace);
+        assert_eq!(clone.file.as_str(), "src/clone.rs");
+        assert_eq!(clone.context.as_str(), "deep copy");
+
+        // Dropping the clone frees its own strings; under leak detection this
+        // confirms no double free and no leak.
+        drop(clone);
+    }
+
+    #[test]
+    fn displays_file_line_column_without_context() {
+        let trace = LoreTraceLocation::from_location(&Location::new("src/lib.rs", 12, 4));
+        assert_eq!(trace.to_string(), "src/lib.rs:12:4");
+    }
+
+    #[test]
+    fn displays_context_in_place_of_column_when_present() {
+        let location = Location::with_context("src/main.rs", 7, 2, Arc::from("loading config"));
+        let trace = LoreTraceLocation::from_location(&location);
+        assert_eq!(trace.to_string(), "src/main.rs:7 - loading config");
+    }
+}
+
+#[cfg(test)]
+mod error_detail_tests {
+    use lore_base::error::NotFound;
+    use lore_error_set::FfiError;
+    use lore_error_set::Location;
+    use lore_error_set::Trace;
+    use lore_error_set::prelude::*;
+
+    use super::LoreErrorDetail;
+
+    // A concrete `#[error_set]` error used to exercise the constructor. Its
+    // `NotFound` variant wraps `lore_base::error::NotFound`, which carries FFI
+    // code 13, so the detail's `error_code` has a known, non-internal value to
+    // assert against.
+    #[error_set]
+    enum SampleError {
+        NotFound,
+    }
+
+    #[test]
+    fn from_error_holds_code_message_and_one_location_per_trace_entry() {
+        // Build a concrete error and give it a trace with two entries.
+        let mut error: SampleError = NotFound.into();
+        error.push_trace(Location::new("src/first.rs", 10, 2));
+        error.push_trace(Location::new("src/second.rs", 20, 4));
+
+        let detail = LoreErrorDetail::from_error(&error);
+
+        // The code is the error's error code.
+        assert_eq!(detail.error_code, error.ffi_code());
+        // The message is the error's `Display` output.
+        assert_eq!(detail.message.as_str(), error.to_string());
+
+        // One trace location per trace entry. The `From` conversion adds its
+        // own caller location ahead of the two we pushed, so the count and
+        // the contents must match the trace exactly.
+        let locations = error.trace().locations();
+        assert_eq!(detail.trace_locations.len(), locations.len());
+        for (built, source) in detail.trace_locations.as_slice().iter().zip(locations) {
+            assert_eq!(built.file.as_str(), source.file);
+            assert_eq!(built.line, source.line);
+            assert_eq!(built.column, source.column);
+        }
+    }
+
+    #[test]
+    fn default_is_the_empty_success_detail() {
+        let detail = LoreErrorDetail::default();
+
+        assert_eq!(detail.error_code, 0);
+        assert!(detail.message.is_empty());
+        assert!(detail.trace_locations.is_empty());
+    }
+
+    #[test]
+    fn error_set_enum_exposes_trace_through_has_trace_bound() {
+        use lore_error_set::HasTrace;
+
+        // A generic function can only read the trace through the bound, not the
+        // inherent method, so this exercises the trait `#[error_set]` generates.
+        fn locations_through_bound<E: HasTrace>(error: &E) -> usize {
+            error.trace().locations().len()
+        }
+
+        let mut error: SampleError = NotFound.into();
+        error.push_trace(Location::new("src/bound.rs", 5, 1));
+
+        // The trait access matches the inherent access on the same error.
+        assert_eq!(
+            locations_through_bound(&error),
+            error.trace().locations().len()
+        );
+    }
+
+    #[test]
+    fn empty_trace_yields_empty_location_array() {
+        // An empty trace is the observable behavior when `track-locations` is
+        // off: `Trace::locations()` reports no entries, so the array is empty
+        // and the path stays safe. With the feature on, an error built with an
+        // empty trace exercises the same empty-array path.
+        let error: SampleError = NotFound.into();
+        let empty_trace = Trace::new();
+
+        let detail = LoreErrorDetail::from_error_with_trace(&error, &empty_trace);
+
+        assert!(detail.trace_locations.is_empty());
+        assert_eq!(detail.error_code, error.ffi_code());
+    }
+
+    #[test]
+    fn message_with_trace_appends_one_indented_line_per_location() {
+        use super::LoreTraceLocation;
+        use crate::interface::LoreArray;
+        use crate::interface::LoreString;
+
+        let detail = LoreErrorDetail {
+            error_code: 13,
+            message: LoreString::from("not found"),
+            trace_locations: LoreArray::from_vec(vec![
+                LoreTraceLocation {
+                    file: LoreString::from("src/a.rs"),
+                    line: 10,
+                    column: 2,
+                    context: LoreString::default(),
+                },
+                LoreTraceLocation {
+                    file: LoreString::from("src/b.rs"),
+                    line: 20,
+                    column: 4,
+                    context: LoreString::from("loading"),
+                },
+            ]),
+        };
+
+        assert_eq!(
+            detail.message_with_trace(),
+            "not found\n  at src/a.rs:10:2\n  at src/b.rs:20 - loading"
+        );
+    }
+
+    #[test]
+    fn message_with_trace_is_just_the_message_when_no_trace() {
+        use crate::interface::LoreString;
+
+        let detail = LoreErrorDetail {
+            error_code: 13,
+            message: LoreString::from("boom"),
+            trace_locations: Default::default(),
+        };
+
+        assert_eq!(detail.message_with_trace(), "boom");
+    }
+}
+
+#[cfg(test)]
+mod complete_event_tests {
+    use super::LoreCompleteEventData;
+    use super::LoreErrorDetail;
+    use super::LoreTraceLocation;
+    use crate::interface::LoreArray;
+    use crate::interface::LoreString;
+
+    // Builds a populated error detail with one trace location so the
+    // serialized form carries non-default values to assert against.
+    fn populated_detail() -> LoreErrorDetail {
+        let location = LoreTraceLocation {
+            file: LoreString::from("src/op.rs"),
+            line: 11,
+            column: 5,
+            context: LoreString::from("running op"),
+        };
+
+        LoreErrorDetail {
+            error_code: 13,
+            message: LoreString::from("not found"),
+            trace_locations: LoreArray::from_vec(vec![location]),
+        }
+    }
+
+    #[test]
+    fn serializes_error_detail_fields_in_camel_case() {
+        let event = LoreCompleteEventData {
+            status: 13,
+            error: populated_detail(),
+        };
+
+        let json: serde_json::Value = serde_json::to_value(&event).unwrap();
+
+        // The `status` field keeps its key and value.
+        assert_eq!(json["status"], 13);
+
+        // The appended detail nests under `error` and uses camelCase keys for
+        // its own fields.
+        let error = &json["error"];
+        assert_eq!(error["errorCode"], 13);
+        assert_eq!(error["message"], "not found");
+
+        let traces = error["traceLocations"].as_array().unwrap();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0]["file"], "src/op.rs");
+        assert_eq!(traces[0]["line"], 11);
+        assert_eq!(traces[0]["column"], 5);
+        assert_eq!(traces[0]["context"], "running op");
+    }
+
+    #[test]
+    fn deserializes_old_payload_without_error_detail() {
+        // A serialized payload that carries only the `status` field.
+        let json = r#"{ "status": 7 }"#;
+
+        let event: LoreCompleteEventData = serde_json::from_str(json).unwrap();
+
+        // The status is read back unchanged.
+        assert_eq!(event.status, 7);
+
+        // The missing detail defaults to the empty success detail: code 0,
+        // empty message, and an empty trace list.
+        assert_eq!(event.error.error_code, 0);
+        assert!(event.error.message.is_empty());
+        assert!(event.error.trace_locations.is_empty());
+    }
+
+    #[test]
+    fn legacy_status_field_keeps_its_name_position_and_type() {
+        // The `status` field serializes under its existing key.
+        let event = LoreCompleteEventData {
+            status: 42,
+            error: LoreErrorDetail::default(),
+        };
+        let json: serde_json::Value = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["status"], 42);
+
+        // `status` keeps its `i32` type: an `i32` binds directly into the
+        // first field, so a change of type or position would fail to compile.
+        let status: i32 = -1;
+        let by_position = LoreCompleteEventData {
+            status,
+            error: LoreErrorDetail::default(),
+        };
+        assert_eq!(by_position.status, status);
     }
 }

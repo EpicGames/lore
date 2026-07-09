@@ -340,6 +340,13 @@ pub struct ServerSettings {
     pub user_agent: UserAgentSettings,
 }
 
+// For when this server acts as a client to another server's Internal port
+#[derive(Clone, Debug, Deserialize)]
+pub struct GrpcInternalClientSettings {
+    pub url: String,
+    pub certs: Option<CertificateSettings>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct UserAgentSettings {
     #[serde(default)]
