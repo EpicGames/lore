@@ -38,7 +38,7 @@ async fn chunk_boundaries(
             .collect())
     } else {
         let chunker = {
-            // The chunker borrows `buffer` via a forged `'static` slice (see
+            // SAFETY: The chunker borrows `buffer` via a forged `'static` slice (see
             // `extend_lifetime`). The compute-pool task is detached and is not
             // cancelled if this future is dropped at the `rx.await` below, so
             // we must keep the buffer allocation alive for the whole task.
@@ -56,16 +56,17 @@ async fn chunk_boundaries(
         let buffer_guard = buffer.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         lore_base::runtime::compute_pool().spawn(move || {
-            let _ = tx.send(chunker.collect::<Vec<_>>());
+            let _ = tx.send(
+                chunker
+                    .map(|c| (c.offset, c.offset + c.length))
+                    .collect::<Vec<_>>(),
+            );
             drop(buffer_guard);
         });
-        let chunks = rx
+        let boundaries = rx
             .await
             .map_err(|e| StorageError::internal_with_context(e, "chunker task failed"))?;
-        Ok(chunks
-            .into_iter()
-            .map(|c| (c.offset, c.offset + c.length))
-            .collect())
+        Ok(boundaries)
     }
 }
 
