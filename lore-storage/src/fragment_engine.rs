@@ -38,7 +38,7 @@ pub async fn chunk_boundaries(
             .collect())
     } else {
         let chunker = {
-            // The chunker borrows `buffer` via a forged `'static` slice (see
+            // SAFETY: The chunker borrows `buffer` via a forged `'static` slice (see
             // `extend_lifetime`). The compute-pool task is detached and is not
             // cancelled if this future is dropped at the `rx.await` below, so
             // we must keep the buffer allocation alive for the whole task.
@@ -56,22 +56,23 @@ pub async fn chunk_boundaries(
         let buffer_guard = buffer.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
         lore_base::runtime::compute_pool().spawn(move || {
-            let _ = tx.send(chunker.collect::<Vec<_>>());
+            let _ = tx.send(
+                chunker
+                    .map(|c| (c.offset, c.offset + c.length))
+                    .collect::<Vec<_>>(),
+            );
             drop(buffer_guard);
         });
-        let chunks = rx
+        let boundaries = rx
             .await
             .map_err(|e| StorageError::internal_with_context(e, "chunker task failed"))?;
-        Ok(chunks
-            .into_iter()
-            .map(|c| (c.offset, c.offset + c.length))
-            .collect())
+        Ok(boundaries)
     }
 }
 
 /// Cuts `buffer` into chunks and stores each one via [`store_fragment`].
 ///
-/// Uses FastCDC (content-defined chunking) when `flags.fixed_size_chunk` is 0,
+/// Uses `FastCDC` (content-defined chunking) when `flags.fixed_size_chunk` is 0,
 /// or fixed-size chunking when it is >0. Each chunk is hashed, stored as a
 /// content-addressed fragment in the immutable `store`, and assembled into a
 /// fragment list (Merklized). Returns the root address and fragment.
