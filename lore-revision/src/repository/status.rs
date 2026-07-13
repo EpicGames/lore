@@ -806,52 +806,45 @@ async fn count_subtrees(roots: Vec<CountWork>) -> Result<(u64, u64), StatusError
     Ok((directories, files))
 }
 
-const REMOTE_RESOLVE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-
-/// Time-boxed remote branch resolution that degrades gracefully on timeout.
+/// Remote branch resolution that degrades gracefully on unavailability.
 ///
 /// Resolves the latest revision and authorization status of a branch on the
-/// configured remote, timing out after the given deadline. On timeout or remote
-/// unavailability, degrades to (None, false, false) — same shape as `NoRemote` —
-/// ensuring an unreachable remote never stalls a local status read.
+/// configured remote. On remote unavailability, degrades to (None, false, false) —
+/// same shape as `NoRemote` — ensuring an unreachable remote never stalls a local
+/// status read. Transport-level connect timeouts in lore-transport bound the wait;
+/// status is a local read that reports remote state opportunistically.
 ///
 /// # Arguments
 ///
 /// * `repository` — repository context with the configured remote.
 /// * `branch_id` — the branch to query on the remote.
-/// * `deadline` — maximum time to wait for remote resolution.
 ///
 /// # Returns
 ///
 /// A 3-tuple `(latest, authorized, available)` where:
 /// - `latest` is the remote branch's latest revision hash, or None if unresolved.
 /// - `authorized` is true iff the remote query returned an authoritative answer.
-/// - `available` is true iff the remote connected and responded within the deadline
+/// - `available` is true iff the remote connected and responded successfully
 ///   (even if with a non-branch-not-found error; a reachable server that errors is not unavailable).
 async fn resolve_remote_latest(
     repository: &Arc<RepositoryContext>,
     branch_id: BranchId,
-    deadline: std::time::Duration,
 ) -> (Option<Hash>, bool, bool) {
-    async fn inner(
-        repository: &Arc<RepositoryContext>,
-        branch_id: BranchId,
-    ) -> (Option<Hash>, bool, bool) {
-        let remote = match repository.remote().await {
-            Ok(r) => r,
-            Err(_) => return (None, false, false),
-        };
-
-        match branch::load_remote(remote, repository.id, branch_id).await {
-            Ok(status) => (Some(status.latest), true, true),
-            Err(err) if err.is_branch_not_found() => (None, true, true),
-            Err(_) => (None, false, true),
+    let remote = match repository.remote().await {
+        Ok(r) => r,
+        Err(err) => {
+            lore_debug!("Remote unavailable for status: {err}");
+            return (None, false, false);
         }
-    }
+    };
 
-    match tokio::time::timeout(deadline, inner(repository, branch_id)).await {
-        Ok((latest, authorized, available)) => (latest, authorized, available),
-        Err(_) => (None, false, false),
+    match branch::load_remote(remote, repository.id, branch_id).await {
+        Ok(status) => (Some(status.latest), true, true),
+        Err(err) if err.is_branch_not_found() => (None, true, true),
+        Err(err) => {
+            lore_debug!("Remote branch query failed: {err}");
+            (None, false, true)
+        }
     }
 }
 
@@ -957,7 +950,7 @@ pub async fn status(
     // Authorized only on an authoritative answer — a latest revision
     // or branch not found; proving the identity is authorized and has access
     let (remote_latest, remote_authorized, remote_available) =
-        resolve_remote_latest(&repository, branch.id, REMOTE_RESOLVE_TIMEOUT).await;
+        resolve_remote_latest(&repository, branch.id).await;
 
     let remote_state = if let Some(remote_latest) = remote_latest {
         state::State::deserialize(repository.clone(), remote_latest)
@@ -1504,16 +1497,19 @@ pub async fn status(
 
 #[cfg(test)]
 mod remote_resolve_tests {
-    use std::future::pending;
-
-    use futures::FutureExt;
+    use lore_transport::ProtocolError;
 
     use super::*;
+    use crate::errors::Disconnected;
     use crate::lore::BranchId;
     use crate::repository::RemoteState;
     use crate::repository::RepositoryContext;
     use crate::repository::RepositoryFormat;
     use crate::repository::create_client_memory_stores;
+
+    fn disconnected() -> ProtocolError {
+        ProtocolError::from(Disconnected)
+    }
 
     async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
         let (immutable, mutable) = create_client_memory_stores()
@@ -1532,37 +1528,28 @@ mod remote_resolve_tests {
     }
 
     #[tokio::test]
-    async fn hung_remote_resolution_times_out_and_degrades() {
-        let never: futures::future::BoxFuture<'static, _> = pending().boxed();
-        let shared = never.shared();
-        let ctx = context_with_state(RemoteState::Pending(shared)).await;
-
-        let result = resolve_remote_latest(
-            &ctx,
-            BranchId::default(),
-            std::time::Duration::from_millis(10),
-        )
-        .await;
-
-        assert_eq!(
-            result,
-            (None, false, false),
-            "timeout should degrade to unavailable"
-        );
-    }
-
-    #[tokio::test]
     async fn offline_remote_resolves_to_unavailable() {
         let ctx = context_with_state(RemoteState::Offline).await;
 
-        let result =
-            resolve_remote_latest(&ctx, BranchId::default(), std::time::Duration::from_secs(3))
-                .await;
+        let result = resolve_remote_latest(&ctx, BranchId::default()).await;
 
         assert_eq!(
             result,
             (None, false, false),
             "offline should degrade to unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_remote_resolves_to_unavailable() {
+        let ctx = context_with_state(RemoteState::Failed(disconnected())).await;
+
+        let result = resolve_remote_latest(&ctx, BranchId::default()).await;
+
+        assert_eq!(
+            result,
+            (None, false, false),
+            "failed remote should degrade to unavailable"
         );
     }
 }
