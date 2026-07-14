@@ -806,26 +806,12 @@ async fn count_subtrees(roots: Vec<CountWork>) -> Result<(u64, u64), StatusError
     Ok((directories, files))
 }
 
-/// Remote branch resolution that degrades gracefully on unavailability.
+/// Resolve the remote's latest revision for a branch, degrading to the existing
+/// `NoRemote` state when the remote is unavailable so an unreachable remote never
+/// stalls a local status read; transport connect timeouts bound the wait.
 ///
-/// Resolves the latest revision and authorization status of a branch on the
-/// configured remote. On remote unavailability, degrades to (None, false, false) —
-/// same shape as `NoRemote` — ensuring an unreachable remote never stalls a local
-/// status read. Transport-level connect timeouts in lore-transport bound the wait;
-/// status is a local read that reports remote state opportunistically.
-///
-/// # Arguments
-///
-/// * `repository` — repository context with the configured remote.
-/// * `branch_id` — the branch to query on the remote.
-///
-/// # Returns
-///
-/// A 3-tuple `(latest, authorized, available)` where:
-/// - `latest` is the remote branch's latest revision hash, or None if unresolved.
-/// - `authorized` is true iff the remote query returned an authoritative answer.
-/// - `available` is true iff the remote connected and responded successfully
-///   (even if with a non-branch-not-found error; a reachable server that errors is not unavailable).
+/// Returns `(latest, authorized, available)`, where `available` reflects
+/// connectivity, not query success — a reachable remote that errors is still available.
 async fn resolve_remote_latest(
     repository: &Arc<RepositoryContext>,
     branch_id: BranchId,
