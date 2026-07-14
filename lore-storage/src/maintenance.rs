@@ -297,9 +297,19 @@ mod tests {
     }
 
     async fn create_test_store(path: Option<PathBuf>) -> Arc<dyn ImmutableStore> {
-        LocalImmutableStore::new(path, ImmutableStoreSettings::default())
-            .await
-            .unwrap()
+        // These GC-mechanics tests put non-durable fragments and then expect
+        // eviction/compaction to act on them, so they run with local-fragment
+        // protection disabled (server behavior). Protection itself is covered by
+        // the `evict_bucket_*` unit tests.
+        LocalImmutableStore::new(
+            path,
+            ImmutableStoreSettings {
+                protect_local_fragment: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
     }
 
     #[tokio::test]
@@ -354,6 +364,63 @@ mod tests {
     async fn gc_skips_compaction_when_max_size_zero() {
         let store = create_test_store(None).await;
         gc(store, 0, 0, false, None).await;
+    }
+
+    /// With local-fragment protection on, an aggressive size/capacity GC pass must
+    /// not evict or orphan a non-durable fragment, even when it is the only data and
+    /// the caps force the per-bucket target to zero (regression: an empty durable
+    /// candidate set left the size-eviction cutoff at `u64::MAX`, orphaning everything).
+    #[tokio::test]
+    async fn gc_protects_non_durable_fragment() {
+        let dir = generate_tempdir();
+        let store = LocalImmutableStore::new(
+            Some(dir.to_path_buf()),
+            ImmutableStoreSettings {
+                protect_local_fragment: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let partition = crate::Partition::from([0x09; 16]);
+        let data = vec![0xab_u8; 4096];
+        let hash = crate::hash_slice(&data);
+        let address = crate::Address {
+            hash,
+            context: crate::Context::from([1; 16]),
+        };
+        let frag = crate::Fragment {
+            flags: 0, // non-durable: no PayloadStoredDurable bit
+            size_payload: data.len() as u32,
+            size_content: data.len() as u64,
+        };
+        store
+            .clone()
+            .put(
+                partition,
+                address,
+                frag,
+                Some(bytes::Bytes::from(data.clone())),
+                false,
+            )
+            .await
+            .unwrap();
+        store.clone().flush(true).await.unwrap();
+
+        // Tiny caps drive both eviction and compaction with a zero per-bucket target.
+        gc(store.clone(), 1, 1, false, None).await;
+
+        let (_frag, payload) = store
+            .clone()
+            .get(
+                partition,
+                address,
+                crate::store_types::StoreMatch::MatchHash,
+            )
+            .await
+            .expect("non-durable fragment must survive GC");
+        assert_eq!(payload.len(), data.len());
     }
 
     #[tokio::test]
@@ -511,7 +578,8 @@ mod tests {
         let bucket = Arc::new(RwLock::new(bucket));
         let dirty = std::sync::atomic::AtomicBool::new(false);
 
-        let evict_count = LocalImmutableStore::evict_oldest_bucket(bucket.clone(), &dirty, 3).await;
+        let evict_count =
+            LocalImmutableStore::evict_oldest_bucket(bucket.clone(), &dirty, 3, false).await;
 
         assert_eq!(evict_count, 3);
 
@@ -521,6 +589,127 @@ mod tests {
             // We marked the entries to be the same last access as size, make sure data was preserved
             assert_eq!(entry.data.last_access, entry.data.size_payload as u64);
         }
+    }
+
+    /// With local-fragment protection enabled, non-durable fragments must never be
+    /// evicted and must not count toward the capacity target, even when the bucket
+    /// is far over capacity and the oldest fragments are the non-durable ones.
+    #[tokio::test]
+    async fn evict_bucket_protects_non_durable() {
+        use tokio::sync::RwLock;
+
+        use crate::FragmentFlags;
+        use crate::local::immutable_store::ImmutableData;
+        use crate::local::immutable_store::ImmutableStoreBucket;
+        use crate::local::immutable_store::ImmutableStoreEntry;
+
+        let durable = FragmentFlags::PayloadStoredDurable.bits();
+
+        // (last_access, durable?) — the two oldest fragments are non-durable and
+        // would be the first to go under a pure-LRU policy.
+        let fixtures = [
+            (10, false),
+            (20, false),
+            (100, true),
+            (200, true),
+            (300, true),
+            (400, true),
+        ];
+
+        let mut bucket = ImmutableStoreBucket::default();
+        for (i, (last_access, is_durable)) in fixtures.iter().enumerate() {
+            bucket.entry.push(ImmutableStoreEntry {
+                address: rand::random::<crate::Address>(),
+                partition: rand::random::<crate::Partition>(),
+                data: ImmutableData {
+                    flags: if *is_durable { durable } else { 0 },
+                    size_payload: 100,
+                    size_content: 100,
+                    pack_offset: 0,
+                    pack_file: 0,
+                    last_access: *last_access,
+                },
+            });
+            bucket.sorted_index.push(i as u32);
+        }
+
+        let bucket = Arc::new(RwLock::new(bucket));
+        let dirty = std::sync::atomic::AtomicBool::new(false);
+
+        // target_capacity = 2 over 4 durable fragments → evict the 2 oldest durable
+        // (last_access 100 and 200). The 2 non-durable fragments are protected and
+        // do not count toward the target.
+        let evict_count =
+            LocalImmutableStore::evict_oldest_bucket(bucket.clone(), &dirty, 2, true).await;
+
+        assert_eq!(evict_count, 2);
+
+        let bucket = bucket.read().await;
+        // Both non-durable fragments survived despite being the oldest.
+        assert_eq!(
+            bucket
+                .entry
+                .iter()
+                .filter(|e| e.data.flags & durable == 0)
+                .count(),
+            2
+        );
+        // Only the two newest durable fragments remain.
+        let mut durable_access: Vec<u64> = bucket
+            .entry
+            .iter()
+            .filter(|e| e.data.flags & durable != 0)
+            .map(|e| e.data.last_access)
+            .collect();
+        durable_access.sort_unstable();
+        assert_eq!(durable_access, vec![300, 400]);
+    }
+
+    /// With protection disabled (server behavior) eviction is pure LRU and the
+    /// durable flag is ignored — the oldest fragments are evicted regardless.
+    #[tokio::test]
+    async fn evict_bucket_unprotected_ignores_durable_flag() {
+        use tokio::sync::RwLock;
+
+        use crate::FragmentFlags;
+        use crate::local::immutable_store::ImmutableData;
+        use crate::local::immutable_store::ImmutableStoreBucket;
+        use crate::local::immutable_store::ImmutableStoreEntry;
+
+        let durable = FragmentFlags::PayloadStoredDurable.bits();
+        let fixtures = [(10, false), (20, false), (100, true), (200, true)];
+
+        let mut bucket = ImmutableStoreBucket::default();
+        for (i, (last_access, is_durable)) in fixtures.iter().enumerate() {
+            bucket.entry.push(ImmutableStoreEntry {
+                address: rand::random::<crate::Address>(),
+                partition: rand::random::<crate::Partition>(),
+                data: ImmutableData {
+                    flags: if *is_durable { durable } else { 0 },
+                    size_payload: 100,
+                    size_content: 100,
+                    pack_offset: 0,
+                    pack_file: 0,
+                    last_access: *last_access,
+                },
+            });
+            bucket.sorted_index.push(i as u32);
+        }
+
+        let bucket = Arc::new(RwLock::new(bucket));
+        let dirty = std::sync::atomic::AtomicBool::new(false);
+
+        // target_capacity = 2 over all 4 fragments → evict the 2 oldest, which are
+        // the non-durable ones, since protection is off.
+        let evict_count =
+            LocalImmutableStore::evict_oldest_bucket(bucket.clone(), &dirty, 2, false).await;
+
+        assert_eq!(evict_count, 2);
+
+        let bucket = bucket.read().await;
+        let mut remaining: Vec<u64> = bucket.entry.iter().map(|e| e.data.last_access).collect();
+        remaining.sort_unstable();
+        assert_eq!(remaining, vec![100, 200]);
     }
 
     #[tokio::test]

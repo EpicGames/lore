@@ -168,121 +168,207 @@ pub async fn stage(
 
     let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
     let stats = Arc::new(StageStats::default());
-    let mut layer_staged = vec![];
-    let mut main_count = 0;
     let link_tracker = LinkTracker::new();
 
-    let layer_target_paths: Vec<&str> = layers
-        .iter()
-        .map(|(layer, _)| layer.target_path.as_str())
-        .collect();
+    // Every layer mount is staged by its own task, never the parent walk, so
+    // masking every layer subtree on every main-repo walk is correct: an entry
+    // not under a given target is never reached anyway.
+    let global_mask: Option<Arc<Vec<String>>> = if layers.is_empty() {
+        None
+    } else {
+        Some(Arc::new(
+            layers
+                .iter()
+                .map(|(layer, _)| layer.target_path.clone())
+                .collect(),
+        ))
+    };
+    let layer_target_refs: Vec<&str> = global_mask
+        .as_deref()
+        .map(|paths| paths.iter().map(String::as_str).collect())
+        .unwrap_or_default();
+
+    let mut main_targets: Vec<RelativePath> = Vec::new();
+    let mut layer_jobs: Vec<(usize, String)> = Vec::new();
+    let mut staged_layers: Vec<usize> = Vec::new();
 
     for path in paths.as_slice().iter() {
         let Some(relative_path) = try_stage_path(repository.clone(), path).await else {
             continue;
         };
 
-        // TODO(mjansson): Fix parallel path staging to allow this to collect all paths
-        let mut tasks = JoinSet::new();
-
-        let route = classify_stage_path(relative_path.as_str(), &layer_target_paths);
-
-        match route {
+        match classify_stage_path(relative_path.as_str(), &layer_target_refs) {
             LayerRoute::Inside {
                 layer_index,
                 remain,
             } => {
-                let (layer, layer_state) = &layers[layer_index];
-                stage_into_single_layer(
-                    &mut tasks,
-                    layer,
-                    layer_state,
-                    repository.clone(),
-                    &remain,
-                    stats.clone(),
-                    options,
-                )
-                .await?;
-                layer_staged.push((layer, layer_state));
+                layer_jobs.push((layer_index, remain));
+                staged_layers.push(layer_index);
             }
             LayerRoute::AncestorOf { layer_indices } => {
-                // Stage the parent walking from the input path with the matched
-                // layers' target_paths masked so we don't double-count files
-                // already owned by a layer.
-                let mask: Vec<String> = layer_indices
-                    .iter()
-                    .map(|i| layers[*i].0.target_path.clone())
-                    .collect();
-                let mask_arc = if mask.is_empty() {
-                    None
-                } else {
-                    Some(Arc::new(mask))
-                };
-
-                main_count += spawn_stage_tasks(
-                    &mut tasks,
-                    repository.clone(),
-                    state.clone(),
-                    relative_path.clone(),
-                    stats.clone(),
-                    options,
-                    link_tracker.clone(),
-                    mask_arc,
-                )
-                .await?;
-
-                // Plus one task per matched layer, staging the layer's whole
-                // contents (no remain — the input path is above the mount).
+                let expanded =
+                    expand_stage_target(repository.clone(), state.clone(), relative_path, options)
+                        .await?;
+                main_targets.extend(expanded);
                 for layer_index in layer_indices {
-                    let (layer, layer_state) = &layers[layer_index];
-                    stage_into_single_layer(
-                        &mut tasks,
-                        layer,
-                        layer_state,
-                        repository.clone(),
-                        "",
-                        stats.clone(),
-                        options,
-                    )
-                    .await?;
-                    layer_staged.push((layer, layer_state));
+                    layer_jobs.push((layer_index, String::new()));
+                    staged_layers.push(layer_index);
                 }
             }
             LayerRoute::Disjoint => {
-                main_count += spawn_stage_tasks(
-                    &mut tasks,
-                    repository.clone(),
-                    state.clone(),
-                    relative_path.clone(),
-                    stats.clone(),
-                    options,
-                    link_tracker.clone(),
-                    None,
-                )
-                .await?;
+                let expanded =
+                    expand_stage_target(repository.clone(), state.clone(), relative_path, options)
+                        .await?;
+                main_targets.extend(expanded);
             }
         }
+    }
 
-        let mut failure = None;
-        while !tasks.is_empty() {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    event::LoreEvent::FileStageProgress(LoreFileStageProgressEventData {
-                        count: LoreFileStageCountData::new(stats.clone()),
-                    }).send();
-                },
-                result = tasks.join_next() => {
-                    if let Some(result) = result {
-                        failure = failure.or(result.map_err(|e| StageError::internal_with_context(e, "Failed to join task")).flatten().err());
-                    }
+    // A root target covers the whole tree; otherwise collapse overlaps so a
+    // parent target subsumes anything that would be staged beneath it.
+    let stage_root = main_targets.iter().any(|p| p.is_empty());
+    let antichain: Vec<RelativePath> = if stage_root {
+        vec![RelativePath::new()]
+    } else {
+        RelativePath::dedup_to_supersets(main_targets)
+    };
+    let antichain_len = antichain.len();
+
+    // Only a directory shared as an ancestor by two or more targets is a place
+    // where parallel walks would race to create the same node. Pre-create
+    // exactly those, in sequence, so no shared ancestor is ever created twice.
+    // A single target — or targets sharing only the root — needs none, leaving
+    // its walk identical to the non-parallel path.
+    let mut ancestor_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    for target in &antichain {
+        let mut ancestor = target.clone();
+        ancestor.pop();
+        while !ancestor.is_empty() {
+            *ancestor_counts
+                .entry(ancestor.as_str().to_string())
+                .or_insert(0) += 1;
+            ancestor.pop();
+        }
+    }
+    let mut shared_ancestors: Vec<String> = ancestor_counts
+        .into_iter()
+        .filter_map(|(path, count)| (count >= 2).then_some(path))
+        .collect();
+    // Shallowest first, so each walk only has to create its own final component.
+    shared_ancestors.sort_unstable_by_key(String::len);
+    let precreate_count = shared_ancestors.len();
+
+    let mut precreate_options = options;
+    precreate_options.no_children = true;
+    for ancestor in shared_ancestors {
+        let ancestor_path = RelativePath::new_from_initial_path(&ancestor).unwrap_or_default();
+        Box::pin(stage::stage_filesystem_path(
+            repository.clone(),
+            state.clone(),
+            repository.require_path()?.to_path_buf(),
+            RelativePathBuf::new(),
+            ROOT_NODE,
+            ancestor_path,
+            stats.clone(),
+            precreate_options,
+            Some(link_tracker.clone()),
+            global_mask.clone(),
+        ))
+        .await?;
+    }
+
+    // Shared ancestors now exist and the targets are disjoint, so every
+    // remaining creation is single-writer or a distinct sibling — race-free via
+    // the node_add fix. Layer jobs run against their own separate states.
+    let repository_path = repository.require_path()?.to_path_buf();
+    let mut failure = None;
+    let mut tasks: JoinSet<Result<crate::node::NodeLink, StageError>> = JoinSet::new();
+    for target in antichain {
+        lore_spawn!(
+            tasks,
+            stage::stage_filesystem_path(
+                repository.clone(),
+                state.clone(),
+                repository_path.clone(),
+                RelativePathBuf::new(),
+                ROOT_NODE,
+                target,
+                stats.clone(),
+                options,
+                Some(link_tracker.clone()),
+                global_mask.clone(),
+            )
+        );
+        while let Some(result) = tasks.try_join_next() {
+            failure = failure.or(result
+                .map_err(|e| StageError::internal_with_context(e, "Failed to join task"))
+                .flatten()
+                .err());
+        }
+        if failure.is_some() {
+            break;
+        }
+    }
+    let main_count = antichain_len + precreate_count;
+
+    if failure.is_none() {
+        for (layer_index, remain) in &layer_jobs {
+            let (layer, layer_state) = &layers[*layer_index];
+            if let Err(err) = stage_into_single_layer(
+                &mut tasks,
+                layer,
+                layer_state,
+                repository.clone(),
+                remain,
+                stats.clone(),
+                options,
+            )
+            .await
+            {
+                failure = Some(err);
+                break;
+            }
+            while let Some(result) = tasks.try_join_next() {
+                failure = failure.or(result
+                    .map_err(|e| StageError::internal_with_context(e, "Failed to join task"))
+                    .flatten()
+                    .err());
+            }
+            if failure.is_some() {
+                break;
+            }
+        }
+    }
+
+    while !tasks.is_empty() {
+        tokio::select! {
+            _ = ticker.tick() => {
+                event::LoreEvent::FileStageProgress(LoreFileStageProgressEventData {
+                    count: LoreFileStageCountData::new(stats.clone()),
+                }).send();
+            },
+            result = tasks.join_next() => {
+                if let Some(result) = result {
+                    failure = failure.or(result
+                        .map_err(|e| StageError::internal_with_context(e, "Failed to join task"))
+                        .flatten()
+                        .err());
                 }
             }
         }
-
-        if let Some(err) = failure {
-            return Err(err);
-        }
     }
+    if let Some(err) = failure {
+        return Err(err);
+    }
+
+    // A layer may be targeted by several paths; serialize each only once.
+    staged_layers.sort_unstable();
+    staged_layers.dedup();
+    let layer_staged: Vec<_> = staged_layers
+        .iter()
+        .map(|&i| (&layers[i].0, &layers[i].1))
+        .collect();
 
     let count = LoreFileStageCountData::new(stats.clone());
     let total_count = count.total_count;
@@ -391,34 +477,21 @@ pub async fn stage(
     Ok(staged_revision)
 }
 
-/// Spawn staging tasks for a path, using dirty-based staging or filesystem walk.
+/// Resolve `relative_path` to the concrete set of repository-relative paths to
+/// stage. Without `scan`, a directory expands to its dirty descendants (empty
+/// when none); `scan`, single files, and unresolved paths expand to the path
+/// itself.
 ///
-/// When `options.scan` is false, checks if the target path is a directory in the
-/// state tree. If so, collects dirty file paths under it and spawns a staging task
-/// for each one. Single file paths always use the filesystem walk for backward
-/// compatibility. When `options.scan` is true, always uses the filesystem walk.
-///
-/// Returns the number of tasks spawned for the main repository.
-#[allow(clippy::too_many_arguments)]
-async fn spawn_stage_tasks(
-    tasks: &mut JoinSet<Result<crate::node::NodeLink, StageError>>,
+/// `find_node_link` follows link mounts transparently — a crossed link is read
+/// from the state that owns it, otherwise a colliding block at the same
+/// coordinates in the parent state would misclassify the target. The returned
+/// paths stay parent-relative, since the filesystem walk traverses links itself.
+async fn expand_stage_target(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     relative_path: RelativePath,
-    stats: Arc<StageStats>,
     options: StageOptions,
-    link_tracker: Arc<LinkTracker>,
-    layer_mask: Option<Arc<Vec<String>>>,
-) -> Result<usize, StageError> {
-    // When scan is not requested, try dirty-based staging for directories.
-    //
-    // `find_node_link` follows link mounts transparently — if the path
-    // crosses one, the returned `NodeLink` references a node in the linked
-    // repository. We must read the node from the state that actually owns
-    // it, otherwise we'd hit a colliding block at the same coordinates in
-    // the parent state and misclassify the target (e.g. a linked file would
-    // appear as a parent-state directory and route through the dirty path,
-    // which then collects nothing).
+) -> Result<Vec<RelativePath>, StageError> {
     if !options.scan {
         let resolved: Option<(
             Arc<State>,
@@ -461,9 +534,6 @@ async fn spawn_stage_tasks(
         };
 
         if let Some((resolved_state, resolved_repository, root_node, true)) = resolved {
-            // `relative_path` is the path in the parent repository — prepend it
-            // so dirty paths come back as parent-relative paths suitable for
-            // the filesystem walk below, which traverses links itself.
             let dirty_paths = resolved_state
                 .collect_dirty_paths(
                     resolved_repository,
@@ -472,52 +542,11 @@ async fn spawn_stage_tasks(
                 )
                 .await
                 .forward::<StageError>("Failed to collect dirty paths")?;
-
-            if dirty_paths.is_empty() {
-                return Ok(0);
-            }
-
-            let count = dirty_paths.len();
-            for dirty_path in dirty_paths {
-                let dirty_relative =
-                    RelativePath::new_from_initial_path(dirty_path.as_str()).unwrap_or_default();
-                lore_spawn!(
-                    tasks,
-                    stage::stage_filesystem_path(
-                        repository.clone(),
-                        state.clone(),
-                        repository.require_path()?.to_path_buf(),
-                        RelativePathBuf::new(),
-                        ROOT_NODE,
-                        dirty_relative,
-                        stats.clone(),
-                        options,
-                        Some(link_tracker.clone()),
-                        layer_mask.clone(),
-                    )
-                );
-            }
-            return Ok(count);
+            return Ok(dirty_paths);
         }
     }
 
-    // Filesystem walk: scan requested, or path is a single file
-    lore_spawn!(
-        tasks,
-        stage::stage_filesystem_path(
-            repository.clone(),
-            state.clone(),
-            repository.require_path()?.to_path_buf(),
-            RelativePathBuf::new(),
-            ROOT_NODE,
-            relative_path,
-            stats.clone(),
-            options,
-            Some(link_tracker.clone()),
-            layer_mask,
-        )
-    );
-    Ok(1)
+    Ok(vec![relative_path])
 }
 
 /// Recursively mark all children of a directory node as moved.

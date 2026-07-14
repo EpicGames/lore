@@ -1722,6 +1722,21 @@ impl State {
         data.flags |= StateFlags::Dirty;
     }
 
+    /// Allocate a fresh node, initialize it, and prepend it to `parent`'s child
+    /// chain, returning the new node's ID.
+    ///
+    /// # Concurrency
+    ///
+    /// Safe to call concurrently to add **distinct siblings** under a parent: the
+    /// node is fully initialized before it is published and the publish is an
+    /// atomic CAS prepend, so concurrent sibling adds neither lose an update nor
+    /// expose a half-initialized node to a chain walk.
+    ///
+    /// **Not** safe for two tasks to add the **same** `(parent, name)`: this is
+    /// always-create, not get-or-add, so they produce duplicate siblings. The
+    /// find-then-add is a check-then-act at the call site that this cannot close;
+    /// callers fanning out across paths must ensure at most one add per
+    /// `(parent, name)` (e.g. pre-create shared ancestors sequentially).
     pub async fn node_add(
         &self,
         repository: Arc<RepositoryContext>,
@@ -1824,25 +1839,11 @@ impl State {
         lore_trace!("Block {} node {} added", block_index, Node::index(node_id));
         let parent_block_index = NodeBlock::index(parent);
         let parent_block = self.block(repository.clone(), parent_block_index).await?;
-        let (dirtied, sibling) = {
-            let mut parent_lock = parent_block.write();
-            let parent_node = parent_lock.node(Node::index(parent));
-            let sibling = parent_node.child;
-            parent_node.child = node_id;
-            (parent_lock.mark_dirty(), sibling)
-        };
-        if dirtied {
-            self.block_modified(parent_block, parent_block_index);
-        }
 
-        lore_trace!(
-            "Block {} node {} parent {} sibling {}",
-            block_index,
-            Node::index(node_id),
-            parent,
-            sibling
-        );
-
+        // Initialize the slot fully (except `sibling`) before it is reachable:
+        // `grab_node_unused` left it zeroed, so a concurrent chain walk that
+        // observed it published-but-uninitialized would read `parent`/`sibling`
+        // as 0 and error or truncate. `sibling` is set atomically at publish.
         let block = self
             .block_with_nametable(repository.clone(), block_index)
             .await?;
@@ -1854,14 +1855,51 @@ impl State {
             let target_node = block_lock.node(Node::index(node_id));
             *target_node = node;
             target_node.parent = parent;
-            target_node.sibling = sibling;
             target_node.name_offset = name_offset;
             target_node.name_length = name_length;
             block_lock.mark_dirty()
         };
         if dirtied {
-            self.block_modified(block, block_index);
+            self.block_modified(block.clone(), block_index);
         }
+
+        // Prepend into the child chain via CAS: stash the current head as our
+        // `sibling`, then swap ourselves in as the head. Keeps capture+publish
+        // atomic (no lost updates) without nesting the parent/child block locks,
+        // which may be the same block or invert order across concurrent adds.
+        // ABA-free: prepends only ever use freshly grabbed IDs.
+        let sibling = loop {
+            let old_head = parent_block.node(Node::index(parent)).child;
+            {
+                let mut block_lock = block.write();
+                block_lock.node(Node::index(node_id)).sibling = old_head;
+                block_lock.mark_dirty();
+            }
+            let publish_result = {
+                let mut parent_lock = parent_block.write();
+                let parent_node = parent_lock.node(Node::index(parent));
+                if parent_node.child == old_head {
+                    parent_node.child = node_id;
+                    Some(parent_lock.mark_dirty())
+                } else {
+                    None
+                }
+            };
+            if let Some(parent_dirtied) = publish_result {
+                if parent_dirtied {
+                    self.block_modified(parent_block.clone(), parent_block_index);
+                }
+                break old_head;
+            }
+        };
+
+        lore_trace!(
+            "Block {} node {} parent {} sibling {}",
+            block_index,
+            Node::index(node_id),
+            parent,
+            sibling
+        );
 
         let metadata_node_id = node::node_to_file_metadata(node_id);
         let metadata_block_index = NodeFileMetadataBlock::index(metadata_node_id);

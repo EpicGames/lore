@@ -82,6 +82,14 @@ def test_store_compaction(new_lore_repo, lore_executable_path):
     assert parse_jsonl(gc_out, "evictionEnd"), "eviction should end"
     repo.repository_verify()
 
+    # Repository metadata is among the very first fragments written and lives in
+    # the local store. Reading it locally must still succeed right after the
+    # aggressive eviction/compaction pass: non-durable local fragments are now
+    # protected from GC, so `repository info --local` resolves the metadata from
+    # the local store rather than failing on an evicted fragment.
+    info_out = repo.repository_info(local=True)
+    assert "Remote URL:" in info_out, info_out
+
     # Restore realistic caps so the remaining commands don't keep aggressively
     # evicting the re-fetched store (client defaults: 10 GiB / 2M fragments).
     _set_store_caps(repo, "10_737_418_240", "2_000_000")
@@ -119,6 +127,29 @@ def test_store_compaction(new_lore_repo, lore_executable_path):
     repo.repository_verify()
 
 
+@pytest.mark.smoke
+def test_repository_info_local_on_fresh_repo(new_lore_repo):
+    """`repository info --local` resolves repository metadata from the local store
+    without contacting the remote, even on a brand-new repository before any writes."""
+    repo: Lore = new_lore_repo()
+    out = repo.repository_info(local=True)
+    assert "Remote URL:" in out, out
+
+
+@pytest.mark.smoke
+def test_repository_info_local_survives_gc(new_lore_repo):
+    """Repository metadata is a non-durable local fragment that is never pushed and
+    is among the first fragments written. After an aggressive eviction/compaction
+    pass it must still load via `repository info --local` — non-durable local
+    fragments are protected from GC."""
+    repo: Lore = new_lore_repo()
+    _seed_committed_data(repo, count=8)
+    _set_store_caps(repo, "100", "100")
+    repo.repository_gc()
+    out = repo.repository_info(local=True)
+    assert "Remote URL:" in out, out
+
+
 def _seed_committed_data(repo: Lore, count: int = 8) -> None:
     """Write and commit some MB locally so the store holds real fragments."""
     repo.make_dirs("data")
@@ -147,6 +178,9 @@ def test_repository_gc_emits_event_series(new_lore_repo):
     store is over its configured caps."""
     repo: Lore = new_lore_repo()
     _seed_committed_data(repo, count=64)
+    # Push so the fragments are durable: eviction protects non-durable local
+    # fragments, so only durable data drives the eviction event series.
+    repo.push(max_connections=16)
     # Tiny caps so both passes do real work and emit their begin/end events.
     _set_store_caps(repo, max_size="100", max_capacity="100")
 

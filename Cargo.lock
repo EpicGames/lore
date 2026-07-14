@@ -117,9 +117,9 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.103"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "2a4385e2e34eb35d6b3efe798b9eb88096925d87726c0798709bf56d9ed84af3"
 
 [[package]]
 name = "arc-swap"
@@ -1203,9 +1203,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -2433,7 +2433,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "lore"
-version = "0.8.5-nightly"
+version = "0.8.6-nightly"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -2469,7 +2469,7 @@ dependencies = [
 
 [[package]]
 name = "lore-aws"
-version = "0.8.5-nightly"
+version = "0.8.6-nightly"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2511,7 +2511,7 @@ dependencies = [
 
 [[package]]
 name = "lore-base"
-version = "0.8.5-nightly"
+version = "0.8.6-nightly"
 dependencies = [
  "anyhow",
  "backtrace",
@@ -2540,7 +2540,7 @@ dependencies = [
 
 [[package]]
 name = "lore-chaos-client"
-version = "0.8.5-nightly"
+version = "0.8.6-nightly"
 dependencies = [
  "anyhow",
  "clap",
@@ -2557,7 +2557,7 @@ dependencies = [
 
 [[package]]
 name = "lore-client"
-version = "0.8.5-nightly"
+version = "0.8.6-nightly"
 dependencies = [
  "anstream 0.6.21",
  "anstyle",
@@ -2584,7 +2584,7 @@ dependencies = [
 
 [[package]]
 name = "lore-credential"
-version = "0.8.5-nightly"
+version = "0.8.6-nightly"
 dependencies = [
  "base64 0.22.1",
  "jsonwebtoken",
@@ -2622,7 +2622,7 @@ dependencies = [
 
 [[package]]
 name = "lore-hashicorp"
-version = "0.8.5-nightly"
+version = "0.8.6-nightly"
 dependencies = [
  "async-trait",
  "lore-base",
@@ -2677,7 +2677,7 @@ dependencies = [
 
 [[package]]
 name = "lore-macro"
-version = "0.8.5-nightly"
+version = "0.8.6-nightly"
 dependencies = [
  "quote",
  "syn",
@@ -2685,7 +2685,7 @@ dependencies = [
 
 [[package]]
 name = "lore-notification"
-version = "0.8.5-nightly"
+version = "0.8.6-nightly"
 dependencies = [
  "async-trait",
  "lore-base",
@@ -2713,7 +2713,7 @@ dependencies = [
 
 [[package]]
 name = "lore-revision"
-version = "0.8.5-nightly"
+version = "0.8.6-nightly"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2775,7 +2775,7 @@ dependencies = [
 
 [[package]]
 name = "lore-server"
-version = "0.8.5-nightly"
+version = "0.8.6-nightly"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2854,7 +2854,7 @@ dependencies = [
 
 [[package]]
 name = "lore-storage"
-version = "0.8.5-nightly"
+version = "0.8.6-nightly"
 dependencies = [
  "async-trait",
  "bitflags",
@@ -2890,7 +2890,7 @@ dependencies = [
 
 [[package]]
 name = "lore-telemetry"
-version = "0.8.5-nightly"
+version = "0.8.6-nightly"
 dependencies = [
  "axum",
  "http 1.4.0",
@@ -2912,7 +2912,7 @@ dependencies = [
 
 [[package]]
 name = "lore-transport"
-version = "0.8.5-nightly"
+version = "0.8.6-nightly"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -3000,9 +3000,9 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "memmap2"
-version = "0.9.10"
+version = "0.9.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
 ]

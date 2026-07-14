@@ -1827,6 +1827,12 @@ impl LocalImmutableStore {
                     continue;
                 }
 
+                if protect_local_fragment
+                    && entry.data.flags & FragmentFlags::PayloadStoredDurable == 0
+                {
+                    continue;
+                }
+
                 let key = (entry.data.pack_file, entry.data.pack_offset);
                 if !payloads.contains(&key) {
                     stored_size += entry.data.size_payload as usize;
@@ -1932,6 +1938,14 @@ impl LocalImmutableStore {
                     if entry.data.pack_file == 0 {
                         continue;
                     }
+                    // Protected fragments are absent from the candidate set, so the
+                    // cutoff (which stays u64::MAX for an all-non-durable bucket) must
+                    // not be applied to them.
+                    if protect_local_fragment
+                        && entry.data.flags & FragmentFlags::PayloadStoredDurable == 0
+                    {
+                        continue;
+                    }
                     if entry.data.last_access > cutoff_point {
                         continue;
                     }
@@ -2019,6 +2033,7 @@ impl LocalImmutableStore {
         } else {
             80
         };
+        let protect_local_fragment = self.settings.protect_local_fragment;
         let mut buckets = Vec::with_capacity(BUCKET_COUNT);
         let mut total_count = 0;
         let mut group_count = 0;
@@ -2036,7 +2051,17 @@ impl LocalImmutableStore {
                     };
                     let entry_count = {
                         let bucket = bucket_ref.read().await;
-                        bucket.entry.len()
+                        if protect_local_fragment {
+                            bucket
+                                .entry
+                                .iter()
+                                .filter(|entry| {
+                                    entry.data.flags & FragmentFlags::PayloadStoredDurable != 0
+                                })
+                                .count()
+                        } else {
+                            bucket.entry.len()
+                        }
                     };
                     total_count += entry_count;
                     if entry_count > target_capacity {
@@ -2060,9 +2085,13 @@ impl LocalImmutableStore {
 
             for bucket_index in &buckets {
                 let bucket = group.bucket(*bucket_index).clone();
-                let bucket_evicted =
-                    Self::evict_oldest_bucket(bucket, &group.dirty[*bucket_index], target_capacity)
-                        .await;
+                let bucket_evicted = Self::evict_oldest_bucket(
+                    bucket,
+                    &group.dirty[*bucket_index],
+                    target_capacity,
+                    protect_local_fragment,
+                )
+                .await;
                 evict_count += bucket_evicted;
                 if bucket_evicted > 0
                     && let Some(sink) = sink
@@ -2093,16 +2122,33 @@ impl LocalImmutableStore {
         bucket: Arc<RwLock<ImmutableStoreBucket>>,
         dirty: &AtomicBool,
         target_capacity: usize,
+        protect_local_fragment: bool,
     ) -> usize {
         let cutoff_point = {
             let bucket = bucket.read().await;
-            if bucket.entry.len() <= target_capacity {
+
+            // Non-durable fragments are protected: excluded from the count and never evicted.
+            let evictable_count = if protect_local_fragment {
+                bucket
+                    .entry
+                    .iter()
+                    .filter(|entry| entry.data.flags & FragmentFlags::PayloadStoredDurable != 0)
+                    .count()
+            } else {
+                bucket.entry.len()
+            };
+            if evictable_count <= target_capacity {
                 return 0;
             }
-            let to_evict = bucket.entry.len() - target_capacity;
+            let to_evict = evictable_count - target_capacity;
 
             let mut heap: BinaryHeap<u64> = BinaryHeap::with_capacity(to_evict);
             for entry in bucket.entry.iter() {
+                if protect_local_fragment
+                    && entry.data.flags & FragmentFlags::PayloadStoredDurable == 0
+                {
+                    continue;
+                }
                 let key = entry.data.last_access;
                 if heap.len() < to_evict {
                     heap.push(key);
@@ -2124,8 +2170,10 @@ impl LocalImmutableStore {
         for index in bucket.sorted_index.iter() {
             let index = *index as usize;
 
-            let this_last_access = bucket.entry[index].data.last_access;
-            if this_last_access <= cutoff_point {
+            let data = &bucket.entry[index].data;
+            let protected =
+                protect_local_fragment && data.flags & FragmentFlags::PayloadStoredDurable == 0;
+            if !protected && data.last_access <= cutoff_point {
                 continue;
             }
 

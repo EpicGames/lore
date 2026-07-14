@@ -1841,9 +1841,10 @@ class Lore:
         case: str | None = None,
         targets: str | None = None,
         scan: bool = False,
+        relative_paths: bool = False,
         **kwargs: Unpack[GlobalOptions],
     ):
-        paths = self._fix_paths(paths)
+        paths = self._paths_arg(paths, relative_paths)
         return self.run(
             ["stage"]
             + paths
@@ -1880,9 +1881,10 @@ class Lore:
         self,
         paths: str | list[str] | Path | list[Path] | None = None,
         targets: str | None = None,
+        relative_paths: bool = False,
         **kwargs: Unpack[GlobalOptions],
     ):
-        paths = self._fix_paths(paths)
+        paths = self._paths_arg(paths, relative_paths)
         return self.run(
             ["dirty"] + paths + (["--targets", targets] if targets else []), **kwargs
         )
@@ -2432,6 +2434,21 @@ class Lore:
         else:
             raise TypeError("files should be a filename or a list of filenames")
         return result
+
+    def _paths_arg(
+        self,
+        files: list[str] | str | list[Path] | Path | None,
+        relative: bool,
+    ) -> list[str]:
+        if not relative:
+            return self._fix_paths(files)
+        if files is None:
+            return [self.path]
+        if isinstance(files, (str, Path)):
+            return [str(files)]
+        if isinstance(files, list):
+            return [str(f) for f in files]
+        raise TypeError("files should be a filename or a list of filenames")
 
 
 class GlobalOptionsParseable(TypedDict, total=False):

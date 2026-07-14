@@ -276,11 +276,17 @@ async fn info_local(
 
             let time_start = Instant::now();
 
-            let result = repository::info::info(
-                (&args.repository_url).into(),
-                execution_context().globals().identity().unwrap_or_default(),
-            )
-            .await;
+            // The global `--local` flag reads metadata from the working
+            // repository's own stores instead of issuing a remote query.
+            let result = if execution_context().globals().local() {
+                repository::info::info_local().await
+            } else {
+                repository::info::info(
+                    (&args.repository_url).into(),
+                    execution_context().globals().identity().unwrap_or_default(),
+                )
+                .await
+            };
 
             log_command_done(&info, time_start);
             execution_context().dispatcher.complete_result(result).await
