@@ -183,6 +183,21 @@ pub async fn reset(
         ));
     }
 
+    let mapped = branch::load_name_to_id_local(repository.clone(), branch_name)
+        .await
+        .unwrap_or_default();
+    if mapped != Context::default() && mapped != branch.id {
+        return Err(ResetError::internal(
+            "Given branch's name is already used by another branch",
+        ));
+    }
+    if mapped == Context::default() {
+        // Restore the name-to-id mapping for the branch to ensure it shows up in the local branch list.
+        branch::store_name_to_id(repository.clone(), branch.id, &branch_name)
+            .await
+            .forward::<ResetError>("restoring name-to-id mapping")?;
+    }
+
     let latest = branch::load_latest(repository.clone(), branch.id)
         .await
         .unwrap_or_default();
