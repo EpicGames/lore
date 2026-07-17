@@ -23,7 +23,7 @@ override_data {
 }
 
 variables {
-  container_image = "123456789012.dkr.ecr.us-west-2.amazonaws.com/loreserver:latest"
+  container_image = "123456789012.dkr.ecr.us-west-2.amazonaws.com/loreserver:v0.8.3"
   allowed_cidrs   = ["10.0.0.0/8"]
   region          = "us-west-2"
   name            = "lore"

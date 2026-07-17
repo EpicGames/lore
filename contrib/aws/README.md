@@ -31,7 +31,7 @@ docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/loreserver:v0.8.3
 ### 2. Deploy
 
 ```sh
-cd examples/aws
+cd contrib/aws
 cp terraform.tfvars.example terraform.tfvars
 ```
 
@@ -153,7 +153,8 @@ See `tests/TEST_PLAN.md` for the manual equivalent with AWS resource validation.
 | Smaller instances (dev/test) | Set `instance_type = "c8gd.xlarge"` — same architecture, less capacity |
 | External access | Add an NLB in public subnets |
 | Authentication | Set `LORE__SERVER__AUTH__JWK__ENDPOINT` ([docs](https://epicgames.github.io/lore/reference/lore-server-config/#authentication)) |
-| More edge nodes | Increase ASG `max_size` + edge service `desired_count` |
+| More edge nodes | Increase ASG `min_size`/`max_size`/`desired_capacity` + edge service `desired_count` |
+| Dynamic scaling | Add an `aws_ecs_capacity_provider` with managed scaling (see the capacity note in `compute.tf`) |
 | Faster edge startup | Consider adding a startup probe that polls `primary.lore.internal` before starting loreserver |
 | Presigned URLs | Already configured via HMAC key in Secrets Manager |
 | Production hardening | Add `deletion_protection_enabled = true` to DynamoDB tables |
@@ -162,7 +163,7 @@ Full server configuration: [Lore Server config reference](https://epicgames.gith
 
 ## Destroy
 
-The S3 bucket has `force_destroy = false` (prevents accidental data loss). Teardown takes ~6 minutes (capacity provider reconciliation). To destroy:
+The S3 bucket has `force_destroy = false` (prevents accidental data loss). Teardown takes ~5 minutes. To destroy:
 
 ```sh
 aws s3 rm s3://$(terraform output -raw s3_bucket) --recursive

@@ -73,18 +73,15 @@ resource "aws_autoscaling_group" "ecs" {
     version = "$Latest"
   }
 
-  protect_from_scale_in = true
+  # This example uses fixed capacity (min = max = desired), so no scale-in
+  # events can occur and scale-in protection provides no value. See the
+  # capacity note below for why there is no ECS capacity provider.
+  protect_from_scale_in = false
 
-  # Allows terraform destroy to delete the ASG without waiting for capacity
-  # provider reconciliation (~6 min). Remove for production if you want
-  # graceful drain before ASG deletion.
+  # Allows terraform destroy to delete the ASG without waiting for graceful
+  # instance termination. Remove for production if you want graceful drain
+  # before ASG deletion.
   force_delete = true
-
-  tag {
-    key                 = "AmazonECSManaged"
-    value               = "true"
-    propagate_at_launch = true
-  }
 
   tag {
     key                 = "Name"
@@ -98,36 +95,17 @@ resource "aws_autoscaling_group" "ecs" {
 }
 
 # =============================================================================
-# Capacity Provider — links ASG to ECS cluster
+# Capacity — services use launch_type = "EC2" against the ASG directly.
+#
+# No capacity provider: this example runs fixed capacity (min = max = desired),
+# so managed scaling, managed termination protection, and managed draining
+# provide no value here — and their automation (per-instance scale-in
+# protection, capacity reconciliation, termination lifecycle hooks) deadlocks
+# `terraform destroy`, leaving ECS services stuck DRAINING past the provider's
+# 20-minute timeout. If you adapt this example for dynamic scaling, add an
+# aws_ecs_capacity_provider with managed scaling and switch the services from
+# launch_type to a capacity_provider_strategy.
 # =============================================================================
-
-resource "aws_ecs_capacity_provider" "ec2" {
-  name = "${local.name}-ec2"
-
-  auto_scaling_group_provider {
-    auto_scaling_group_arn         = aws_autoscaling_group.ecs.arn
-    managed_termination_protection = "ENABLED"
-
-    managed_scaling {
-      status                    = "ENABLED"
-      target_capacity           = 100
-      minimum_scaling_step_size = 1
-      maximum_scaling_step_size = 1
-    }
-  }
-
-  tags = local.tags
-}
-
-resource "aws_ecs_cluster_capacity_providers" "this" {
-  cluster_name       = aws_ecs_cluster.this.name
-  capacity_providers = [aws_ecs_capacity_provider.ec2.name]
-
-  default_capacity_provider_strategy {
-    capacity_provider = aws_ecs_capacity_provider.ec2.name
-    weight            = 100
-  }
-}
 
 # =============================================================================
 # Primary — Composite store (NVMe cache + durable S3), serves replication
@@ -261,10 +239,7 @@ resource "aws_ecs_service" "lore" {
 
   health_check_grace_period_seconds = 120
 
-  capacity_provider_strategy {
-    capacity_provider = aws_ecs_capacity_provider.ec2.name
-    weight            = 100
-  }
+  launch_type = "EC2"
 
   network_configuration {
     subnets         = aws_subnet.private[*].id
@@ -468,10 +443,7 @@ resource "aws_ecs_service" "edge" {
 
   health_check_grace_period_seconds = 300
 
-  capacity_provider_strategy {
-    capacity_provider = aws_ecs_capacity_provider.ec2.name
-    weight            = 100
-  }
+  launch_type = "EC2"
 
   network_configuration {
     subnets         = aws_subnet.private[*].id

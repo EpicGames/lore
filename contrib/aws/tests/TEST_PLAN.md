@@ -1,6 +1,6 @@
 # Test Plan: Lore on AWS — E2E Validation
 
-Manual steps to deploy, validate, and tear down the `examples/aws/` infrastructure.
+Manual steps to deploy, validate, and tear down the `contrib/aws/` infrastructure.
 Run these steps to confirm the example works end-to-end before merging.
 
 > **Source:** These steps mirror the official [Lore quickstart](https://epicgames.github.io/lore/tutorials/quickstart/)
@@ -116,7 +116,7 @@ One row with today's date confirms the image landed. If empty — the push faile
 > **Requires:** `$ECR_URI` set from Phase 0.4. If running in a fresh shell, reconstruct it: `ECR_URI="<ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/loreserver:v0.8.3"`
 
 ```bash
-cd examples/aws
+cd contrib/aws
 cat > terraform.tfvars <<EOF
 region          = "us-west-2"
 container_image = "$ECR_URI"
@@ -131,7 +131,7 @@ EOF
 ### 1.1 Apply
 
 ```bash
-cd examples/aws
+cd contrib/aws
 terraform init
 terraform apply
 ```
@@ -139,7 +139,7 @@ terraform apply
 **Expected plan output:**
 
 ```
-Plan: 69 to add, 0 to change, 0 to destroy.
+Plan: 67 to add, 0 to change, 0 to destroy.
 
 Changes to Outputs:
   + cluster_name       = "lore-cluster"
@@ -667,7 +667,7 @@ aws s3api list-object-versions --bucket "$BUCKET" --region us-west-2 \
 terraform destroy
 ```
 
-**Expected:** Completes in ~6 min. If destroy fails (provider crash, timeout, or Cloud Map dependency error), re-run `terraform destroy` — ECS services will already be draining and the retry typically succeeds. If it still fails after 2 attempts:
+**Expected:** Completes in ~5 min. If destroy fails (provider crash, timeout, or Cloud Map dependency error), re-run `terraform destroy` — ECS services will already be draining and the retry typically succeeds. If it still fails after 2 attempts:
 
 ```bash
 aws ecs update-service --cluster lore-cluster \
