@@ -48,7 +48,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define LORE_INTERFACE_VERSION "0.8.5-nightly"
+#define LORE_INTERFACE_VERSION "0.8.6-nightly"
 
 // Severity level of a log message.
 typedef enum lore_log_level_t {

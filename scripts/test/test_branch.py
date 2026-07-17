@@ -1277,6 +1277,45 @@ def test_query_deleted_branch_by_id(new_lore_repo):
     )
 
 
+@pytest.mark.smoke
+def test_branch_reset_relists_locally_archived_branch(new_lore_repo):
+    """A deleted branch should re-appear in the local branch list after a reset."""
+    repo: Lore = new_lore_repo()
+
+    # Base revision on main.
+    with repo.open_file("base.txt", "w+") as f:
+        f.write("base v1\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit("v1", offline=True)
+
+    # Feature branch with a known id, carrying its own revision.
+    feature_id = generate_branch_id()
+    repo.branch_create("feature", id=feature_id, offline=True)
+    repo.branch_switch("feature", offline=True)
+    with repo.open_file("feature.txt", "w+") as f:
+        f.write("feature v1\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit("feature v1", offline=True)
+    feature_rev = repo.revision_history(1, offline=True)[0].signature
+
+    # Archive it locally while it is not the current branch — this zeroes
+    # the local name->id mapping and drops it from the local branch list.
+    repo.branch_switch("main", offline=True)
+    repo.branch_archive("feature", local=True)
+    assert "feature" not in repo.branch_list(offline=True).local_branches, (
+        "local archive should remove the branch from the local branch list"
+    )
+
+    # Reset the archived branch by id (its name no longer resolves locally).
+    repo.branch_reset(feature_rev, branch=feature_id, offline=True)
+
+    # The reset must have restored the branch's local name->id mapping, so
+    # it shows up in the local branch list again.
+    assert "feature" in repo.branch_list(offline=True).local_branches, (
+        "branch reset should restore the branch's local name->id mapping"
+    )
+
+
 ZERO_HASH = "0" * 64
 
 
