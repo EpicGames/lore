@@ -38,6 +38,13 @@ uuid = { workspace = true, features = ["zerocopy"] }
 xxhash-rust = { workspace = true }
 zerocopy = { workspace = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "chunking"
+harness = false
+
 [features]
 default = []
 failure_generator = []
