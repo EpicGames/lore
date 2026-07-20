@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import platform
 import subprocess
 import sys
 from pathlib import Path
@@ -167,6 +168,19 @@ def global_dir_name(tmp_path_factory):
     yield path
 
 
+def _service_unreachable(output):
+    """Whether a probe failed because it could not reach the service.
+
+    On Windows the failure also carries WinSock error 10022, which is kept as a
+    separate marker rather than relying on the wrapping context alone. It is
+    scoped to Windows so that a repository path echoed back in the output cannot
+    match it by accident on the other platforms.
+    """
+    if "connecting to local socket" in output:
+        return True
+    return platform.system() == "Windows" and "10022" in output
+
+
 def _wait_for_service_ready(lore_executable_path, service_process, attempts=30):
     """Block until the background service answers a probe."""
     probe_env = os.environ.copy()
@@ -184,7 +198,7 @@ def _wait_for_service_ready(lore_executable_path, service_process, attempts=30):
             env=probe_env,
         )
         out = probe.stdout + probe.stderr
-        if "connecting to local socket" not in out:
+        if not _service_unreachable(out):
             return
         sleep(1)
     pytest.fail("Timed out waiting for Lore background service to accept connections")
