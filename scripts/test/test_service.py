@@ -3,6 +3,7 @@
 import logging
 import os
 import platform
+import subprocess
 
 import pytest
 
@@ -19,6 +20,7 @@ def service_supported():
 
 
 @pytest.mark.smoke
+@pytest.mark.xdist_group("lore_service")
 @pytest.mark.skip(reason="Unknown issue specifically running in CI for OSS")
 @pytest.mark.skipif(
     not service_supported(), reason="Service not supported on " + platform.system()
@@ -29,6 +31,7 @@ def test_service_down(new_lore_repo):
 
 
 @pytest.mark.smoke
+@pytest.mark.xdist_group("lore_service")
 @pytest.mark.skipif(
     not service_supported(), reason="Service not supported on " + platform.system()
 )
@@ -48,3 +51,71 @@ def test_service_call(new_lore_repo, background_lore_service):
     assert "A " + file_name in map(
         lambda line: line.strip(" "), status_output.splitlines()
     )
+
+
+@pytest.mark.smoke
+@pytest.mark.xdist_group("lore_service")
+@pytest.mark.skipif(
+    not service_supported(), reason="Service not supported on " + platform.system()
+)
+def test_service_resolves_relative_paths_against_caller(
+    new_lore_repo, lore_executable_path, lore_service_in_directory, tmp_path
+):
+    """Relative paths belong to the directory the command was run in.
+
+    The service resolves them, and its own working directory is unrelated to
+    the caller's, so a service started elsewhere must not pull them towards
+    itself. Every other service test passes an absolute repository path, which
+    cannot catch this.
+    """
+    repo: Lore = new_lore_repo()
+    with repo.open_file("seed.txt", "w+") as seed_file:
+        seed_file.write("seed\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit("Seed", offline=True)
+    repo.push()
+
+    service_directory = tmp_path / "service_elsewhere"
+    caller_directory = tmp_path / "caller"
+    service_directory.mkdir()
+    caller_directory.mkdir()
+    lore_service_in_directory(service_directory)
+
+    environment = os.environ.copy()
+    environment.update(LORE_SERVICE_ENVIRONMENT)
+
+    def run_in(directory, args):
+        result = subprocess.run(
+            [lore_executable_path, *args],
+            capture_output=True,
+            text=True,
+            cwd=str(directory),
+            env=environment,
+        )
+        assert result.returncode == 0, (
+            f"{args} failed in {directory}: {result.stdout}{result.stderr}"
+        )
+        return result.stdout + result.stderr
+
+    clone_name = "relative_clone"
+    run_in(caller_directory, ["clone", repo.remote_path, clone_name])
+
+    clone_path = caller_directory / clone_name
+    assert (clone_path / ".lore").is_dir(), (
+        f"Clone must land under the caller's directory, not the service's. "
+        f"{caller_directory} contains {list(caller_directory.iterdir())}"
+    )
+    assert not (service_directory / clone_name).exists(), (
+        f"Clone must not land under the service's directory. "
+        f"{service_directory} contains {list(service_directory.iterdir())}"
+    )
+
+    file_name = "added.uasset"
+    (clone_path / file_name).write_bytes(os.urandom(30))
+
+    run_in(clone_path, ["stage", file_name])
+
+    status_output = run_in(clone_path, ["status"])
+    assert "A " + file_name in map(
+        lambda line: line.strip(" "), status_output.splitlines()
+    ), f"Staged file should show as added: {status_output}"
