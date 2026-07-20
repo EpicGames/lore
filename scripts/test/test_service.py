@@ -42,6 +42,7 @@ def stopped_service(lore_executable_path, global_dir_name):
 
 
 @pytest.mark.smoke
+@pytest.mark.xdist_group("lore_service")
 @pytest.mark.skipif(
     not service_supported(), reason="Service not supported on " + platform.system()
 )
@@ -63,6 +64,7 @@ def test_service_start_stop(lore_executable_path, global_dir_name, stopped_servi
 
 
 @pytest.mark.smoke
+@pytest.mark.xdist_group("lore_service")
 @pytest.mark.skipif(
     not service_supported(), reason="Service not supported on " + platform.system()
 )
@@ -185,6 +187,7 @@ def test_service_resolves_relative_paths_against_caller(
 
 
 @pytest.mark.smoke
+@pytest.mark.xdist_group("lore_service")
 @pytest.mark.skipif(
     not service_supported(), reason="Service not supported on " + platform.system()
 )
