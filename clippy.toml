@@ -1,4 +1,5 @@
 disallowed-methods = [
+    { path = "std::env::current_dir", reason = "The library must not depend on the process working directory: a call executed by the Lore service runs in a process whose directory is unrelated to the caller's. Use lore_revision::util::path::make_absolute, which resolves against the working directory the call carries." },
     { path = "dashmap::DashMap::entry", reason = "This function internally takes a write lock and returns it in the entry handle. This can potentially block worker threads and cause deadlocks if used incorrectly. If you're sure it's ok add #[allow(clippy::disallowed_methods)] with a comment explaining why its safe" },
     { path = "tokio::spawn", reason = "Use lore_base::lore_spawn! so LORE_CONTEXT is propagated to the spawned task." },
     { path = "tokio::task::spawn", reason = "Use lore_base::lore_spawn! so LORE_CONTEXT is propagated to the spawned task." },
