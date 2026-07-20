@@ -74,6 +74,7 @@ pub struct GlobalConfig {
     default_shared_stores: BTreeMap<String, DefaultSharedStoreConfigValue>,
     #[serde(alias = "use_global_store_automatically")]
     pub use_shared_store_automatically: Option<bool>,
+    pub use_service_automatically: Option<bool>,
 }
 
 impl GlobalConfig {
@@ -114,6 +115,9 @@ impl GlobalConfig {
     }
     pub fn use_shared_store_automatically(&self) -> bool {
         self.use_shared_store_automatically.unwrap_or(false)
+    }
+    pub fn use_service_automatically(&self) -> bool {
+        self.use_service_automatically.unwrap_or(false)
     }
     pub fn suggested_path_for_remote_url(remote_url: &str) -> Result<PathBuf, GlobalConfigError> {
         let data_dir = get_global_data_dir()?;

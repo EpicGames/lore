@@ -79,6 +79,10 @@ pub async fn service_call_impl<ArgsType: LoreArgs + Clone + Send + 'static>(
         return Err(ServiceCallError::internal("OS doesn't support IPC"));
     }
 
+    crate::remote::process::ensure_running()
+        .await
+        .forward::<ServiceCallError>("starting the Lore service")?;
+
     let connection = lore_base::lore_spawn_blocking!(|| {
         let mut connection =
             UdsStream::connect().forward::<ServiceCallError>("connecting to local socket")?;
@@ -122,6 +126,40 @@ pub async fn service_call_impl<ArgsType: LoreArgs + Clone + Send + 'static>(
     Err(ServiceCallError::internal(
         "Lore service closed connection without sending a result",
     ))
+}
+
+/// Sends one command to a service that is already running and returns as soon
+/// as it is written, without waiting for a result. Used for requests whose
+/// effect is that the service exits, where waiting for a reply would race the
+/// service's own shutdown. Does not start a service.
+pub async fn service_send_no_reply<ArgsType: LoreArgs + Clone + Send + 'static>(
+    globals: LoreGlobalArgs,
+    args: ArgsType,
+) -> Result<(), ServiceCallError> {
+    if !uds_supported() {
+        return Err(ServiceCallError::internal("OS doesn't support IPC"));
+    }
+
+    lore_base::lore_spawn_blocking!(|| {
+        let mut connection =
+            UdsStream::connect().forward::<ServiceCallError>("connecting to local socket")?;
+
+        let message = MessageToServer {
+            globals,
+            command: args.to_command(),
+        };
+
+        let message_bytes = write_v1_message(message, SerializationType::Json)
+            .forward::<ServiceCallError>("serializing message")?;
+
+        connection
+            .writer()
+            .write_all(&message_bytes)
+            .internal("sending message")?;
+        Ok::<(), ServiceCallError>(())
+    })
+    .await
+    .internal("joining send task")?
 }
 
 pub fn handle_message(

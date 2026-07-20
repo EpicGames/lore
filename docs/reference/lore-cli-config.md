@@ -4,10 +4,11 @@
 
 ```text
 <repo>/.lore/config.toml   # per-repository client settings (created on init/clone)
+~/.config/lore/config.toml # user-level global settings (OS user config dir; Linux shown)
 ~/.config/lore/cli.toml    # user-level CLI settings (OS user config dir; Linux shown)
 ```
 
-This page documents the **Lore CLI** client configuration: the per-repository `config.toml` and the user-level `cli.toml` that the `lore` binary reads. These are distinct from the Lore Server daemon's configuration — for server stores, endpoints, topology, and plugin backends, see the [Lore Server configuration reference](lore-server-config.md). The fields below are written by `lore repository create` and `lore clone`, or you edit them by hand; you don't need to read the source to look one up.
+This page documents the **Lore CLI** client configuration: the per-repository `config.toml`, the user-level global `config.toml`, and the user-level `cli.toml` that the `lore` binary reads. These are distinct from the Lore Server daemon's configuration — for server stores, endpoints, topology, and plugin backends, see the [Lore Server configuration reference](lore-server-config.md). The fields below are written by `lore repository create` and `lore clone`, or you edit them by hand; you don't need to read the source to look one up.
 
 ## Per-repository `config.toml`
 
@@ -86,6 +87,36 @@ The table key and both fields accept legacy serde aliases for backward compatibi
 A config that uses the legacy names still loads. New configs use the current names.
 
 Lore normally writes this table for you when you clone with `--use-shared-store`. For how shared stores work and how to set one up, see [Step 6 of the Quickstart](../tutorials/quickstart.md#step-6-set-up-a-shared-store-and-clone-a-second-working-tree); for the `lore clone` and `lore shared-store` flags, see the [Lore CLI command reference](lore-cli-commands.md).
+
+## User-level global `config.toml`
+
+### Location
+
+The global `config.toml` holds settings that apply to every repository, rather than to one. It shares the OS user config directory with `cli.toml`, so on a typical Linux setup it is `~/.config/lore/config.toml`; see the table under `cli.toml` below for the other platforms. Setting `LORE_GLOBAL_PATH` moves the whole directory, which is how the test suite isolates it.
+
+The file is optional. When it is absent, every setting below takes its default.
+
+### Fields
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `use_shared_store_automatically` | bool | `false` | Whether `lore repository create` and `lore clone` configure a shared store without being asked. Read only when a repository is created or cloned; the result is written into that repository's own config. |
+| `use_service_automatically` | bool | `false` | Whether Lore runs every command in the background service process. See below. |
+| `default_shared_stores` | table | empty | Per-remote default shared store paths, keyed by remote URL. |
+
+### Running commands through the service
+
+With `use_service_automatically` enabled, Lore sends each command to a background service process over a local socket instead of executing it in the CLI process, and starts that service automatically if it is not already running. Set it with:
+
+```bash
+lore service set-use-automatically true
+```
+
+`lore service start` and `lore service stop` control the process explicitly. Starting when a service is already running, and stopping when none is, are both no-ops rather than errors.
+
+The `LORE_USE_SERVICE` environment variable overrides the setting for a single invocation: any value other than `0` or `false` forces the service on, and `0`, `false`, or an empty value forces it off.
+
+Automatic start-up only applies to the `lore` CLI. When Lore is embedded as a library the running executable is the host application, which Lore will not relaunch as a service; start the service separately in that case.
 
 ## User-level `cli.toml`
 

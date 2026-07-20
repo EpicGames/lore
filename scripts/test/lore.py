@@ -2256,8 +2256,16 @@ class Lore:
     def service_start(self, **kwargs: Unpack[GlobalOptions]):
         return self.run(["service", "start"], **kwargs)
 
-    def service_stop(self, stop_all: bool = False, **kwargs: Unpack[GlobalOptions]):
-        return self.run(["service", "stop", "true" if stop_all else "false"], **kwargs)
+    def service_stop(self, **kwargs: Unpack[GlobalOptions]):
+        return self.run(["service", "stop"], **kwargs)
+
+    def service_set_use_automatically(
+        self, enabled: bool, **kwargs: Unpack[GlobalOptions]
+    ):
+        return self.run(
+            ["service", "set-use-automatically", "true" if enabled else "false"],
+            **kwargs,
+        )
 
     def notification_subscribe(
         self, timeout: int | None = None, **kwargs: Unpack[GlobalOptions]

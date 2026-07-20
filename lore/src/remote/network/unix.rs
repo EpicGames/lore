@@ -8,10 +8,10 @@ use std::path::PathBuf;
 
 use lore_error_set::prelude::*;
 
-use crate::remote::LORE_SERVICE_SOCKET_NAME;
 use crate::remote::network::UdsAcceptError;
 use crate::remote::network::UdsConnectionError;
 use crate::remote::network::UdsListenerError;
+use crate::remote::service_socket_name;
 
 pub fn uds_supported() -> bool {
     true
@@ -37,7 +37,7 @@ fn uds_sock_dir() -> PathBuf {
 }
 
 fn uds_sock_path() -> PathBuf {
-    uds_sock_dir().join(LORE_SERVICE_SOCKET_NAME)
+    uds_sock_dir().join(service_socket_name())
 }
 
 pub struct UdsListener {
@@ -53,7 +53,7 @@ impl UdsListener {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))
             .internal_with(|| format!("restricting socket directory {}", dir.display()))?;
 
-        let path = dir.join(LORE_SERVICE_SOCKET_NAME);
+        let path = dir.join(service_socket_name());
 
         if path.exists() {
             if UnixStream::connect(&path).is_ok() {

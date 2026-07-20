@@ -9,7 +9,7 @@ Reference is the technical description of the machinery and how to operate it. A
 ## Reference pages
 
 - [Lore CLI command reference](lore-cli-commands.md) — every `lore` command, subcommand, argument, and flag, generated from `lore --markdown-help`.
-- [Lore CLI configuration reference](lore-cli-config.md) — every field in the per-repository `config.toml` and user-level `cli.toml`, with each field's type, default, and on-disk location.
+- [Lore CLI configuration reference](lore-cli-config.md) — every field in the per-repository `config.toml`, the user-level global `config.toml`, and the user-level `cli.toml`, with each field's type, default, and on-disk location.
 - [Lore Server configuration reference](lore-server-config.md) — every `loreserver` CLI flag, config-file layer, and settings field, including the AWS, DynamoDB, Consul, and hook plugin backends.
 
 ## Suggested starting points

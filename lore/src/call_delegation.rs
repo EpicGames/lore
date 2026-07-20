@@ -1,11 +1,64 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use lore_revision::global::GlobalConfig;
 use lore_revision::interface::LoreGlobalArgs;
+use lore_revision::lore_debug;
+use parking_lot::RwLock;
 
 use crate::args::InvokableLoreArgs;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreEventCallbackConfig;
 use crate::remote::call::service_call;
+use crate::remote::process;
+
+const USE_SERVICE_VAR: &str = "LORE_USE_SERVICE";
+
+/// Caches `use_service_automatically` for the life of the process. Every public
+/// API entry point consults it, and reading it means parsing the global TOML
+/// config, so it must not happen per call.
+static USE_SERVICE: RwLock<Option<bool>> = RwLock::new(None);
+
+/// Drops the cached setting so the next call rereads it. Called after the
+/// setting is written, so a long-lived embedder does not keep using the old
+/// value.
+pub(crate) fn invalidate_use_service_cache() {
+    *USE_SERVICE.write() = None;
+}
+
+/// `LORE_USE_SERVICE` overrides the stored setting when set, so that tests and
+/// one-off invocations can route through the service without writing config.
+/// An empty value, or `0`/`false`, means "do not use the service".
+fn use_service_override() -> Option<bool> {
+    let value = std::env::var(USE_SERVICE_VAR).ok()?;
+    if value.is_empty() {
+        return Some(false);
+    }
+    Some(!value.eq_ignore_ascii_case("0") && !value.eq_ignore_ascii_case("false"))
+}
+
+/// Whether calls should be routed through the service process.
+///
+/// Test builds never read the stored setting, so that the suite runs against a
+/// clean global config rather than whatever the developer has configured on
+/// their own machine. `LORE_USE_SERVICE` is still honoured, so a test that wants
+/// the service path can ask for it explicitly.
+pub(crate) async fn use_service() -> bool {
+    if let Some(value) = use_service_override() {
+        return value;
+    }
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(cached) = *USE_SERVICE.read() {
+        return cached;
+    }
+    let enabled = GlobalConfig::load()
+        .await
+        .map(|config| config.use_service_automatically())
+        .unwrap_or(false);
+    *USE_SERVICE.write() = Some(enabled);
+    enabled
+}
 
 pub(crate) fn run_synchronously<
     ArgsType: InvokableLoreArgs + Clone + Send + 'static,
@@ -39,6 +92,9 @@ pub(crate) fn run_asynchronously<
     drop(lore_base::lore_spawn!(handler(globals, args, callback)));
 }
 
+/// Runs a call either in the service process or locally, according to
+/// [`use_service`]. A call already executing inside the service always runs
+/// locally, so that it cannot dispatch back into the service it is running in.
 pub(crate) async fn dispatch_call<
     ArgsType: InvokableLoreArgs + Clone + Send + 'static,
     Handler: Fn(LoreGlobalArgs, ArgsType, LoreEventCallback) -> Fut,
@@ -49,9 +105,11 @@ pub(crate) async fn dispatch_call<
     callback: LoreEventCallback,
     handler: Handler,
 ) -> i32 {
-    if let Ok(environment_value) = std::env::var("LORE_USE_SERVICE")
-        && !environment_value.is_empty()
-    {
+    if use_service().await && !process::running_as_service() {
+        lore_debug!(
+            "Using Lore service process for {}",
+            std::any::type_name::<ArgsType>()
+        );
         service_call(globals, args, callback).await
     } else {
         handler(globals, args, callback).await

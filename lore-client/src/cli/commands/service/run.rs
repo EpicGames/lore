@@ -4,7 +4,6 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use lore::interface::LoreEvent;
 use lore::remote::connection::ConnectionError;
@@ -19,6 +18,7 @@ use lore::remote::message::write_v1_message;
 use lore::remote::network::UdsListener;
 use lore::remote::network::UdsStream;
 use lore::remote::network::uds_supported;
+use lore::remote::process;
 use lore::runtime;
 use lore_error_set::prelude::*;
 use tokio::sync::mpsc;
@@ -29,11 +29,6 @@ use crate::util::listen_for_termination;
 
 #[error_set]
 pub enum ServiceMainError {}
-
-/// Bounds how long shutdown waits for the accept loop to unwind, so that a
-/// wake-up connection that never lands cannot keep the process alive. Anything
-/// left behind is a stale socket, which the next start detects and removes.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where the service parks its working directory. It inherits one from whoever
 /// started it, which is unrelated to the directories its callers run in, and
@@ -54,6 +49,13 @@ fn detached_working_directory() -> std::path::PathBuf {
     }
 }
 
+/// Runs this process as the Lore service until it is stopped.
+///
+/// Shutdown has two triggers, a termination signal and a `service stop`
+/// delivered over IPC, and both end the same way: they set the shared flag and
+/// connect to the socket so the blocked `accept` returns and the loop can
+/// observe it. Waiting on the accept loop rather than on the signal is what
+/// makes the IPC trigger end the process too.
 pub async fn service_main(
     listening_signal: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), ServiceMainError> {
@@ -79,6 +81,7 @@ pub async fn service_main(
 
     let shutting_down = Arc::new(AtomicBool::new(false));
     let accept_shutting_down = Arc::clone(&shutting_down);
+    process::register_shutdown_flag(Arc::clone(&shutting_down));
 
     let accept_task = runtime().spawn_blocking(move || {
         let mut connection_id = 0;
@@ -106,27 +109,18 @@ pub async fn service_main(
         }
     });
 
-    match listen_for_termination(None).await {
-        Ok(()) => {
-            println!("Shutting down Lore service");
-            shutting_down.store(true, Ordering::SeqCst);
-            if let Err(error) = UdsStream::connect() {
-                eprintln!("Failed to wake the accept loop: {error}");
-            }
-            if tokio::time::timeout(SHUTDOWN_TIMEOUT, accept_task)
-                .await
-                .is_err()
-            {
-                eprintln!("Timed out waiting for the accept loop to stop");
-            }
-        }
-        Err(error) => {
-            // Without signal handling there is no graceful path, so keep
-            // serving until the process is killed.
+    runtime().spawn(async move {
+        if let Err(error) = listen_for_termination(None).await {
             eprintln!("Failed to listen for termination signals: {error}");
-            let _ = accept_task.await;
+            return;
         }
-    }
+        println!("Shutting down Lore service");
+        if let Err(error) = process::request_shutdown() {
+            eprintln!("Failed to stop the accept loop: {error}");
+        }
+    });
+
+    let _ = accept_task.await;
 
     Ok(())
 }

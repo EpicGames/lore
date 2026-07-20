@@ -3,10 +3,10 @@
 import logging
 import os
 import platform
+import subprocess
 
 import pytest
 
-from error_types import ServiceCallError
 from lore import Lore
 
 logger = logging.getLogger(__name__)
@@ -18,15 +18,74 @@ def service_supported():
     return platform.system() in ("Windows", "Linux", "Darwin")
 
 
+def run_lore(lore_executable_path, args, global_dir):
+    """Runs the Lore CLI with an isolated global config directory."""
+    environment = os.environ.copy()
+    environment["LORE_GLOBAL_PATH"] = global_dir
+    return subprocess.run(
+        [lore_executable_path, *args],
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+
+@pytest.fixture
+def stopped_service(lore_executable_path, global_dir_name):
+    """Leaves no service process behind.
+
+    The socket is per user rather than per test, so a service surviving one
+    test would be picked up by the next one.
+    """
+    yield
+    run_lore(lore_executable_path, ["service", "stop"], global_dir_name)
+
+
 @pytest.mark.smoke
-@pytest.mark.xdist_group("lore_service")
-@pytest.mark.skip(reason="Unknown issue specifically running in CI for OSS")
 @pytest.mark.skipif(
     not service_supported(), reason="Service not supported on " + platform.system()
 )
-def test_service_down(new_lore_repo):
-    with pytest.raises(ServiceCallError):
-        new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+def test_service_start_stop(lore_executable_path, global_dir_name, stopped_service):
+    start = run_lore(lore_executable_path, ["service", "start"], global_dir_name)
+    assert start.returncode == 0, start.stdout + start.stderr
+
+    # Starting again is a no-op rather than an error, because a service is
+    # already listening.
+    again = run_lore(lore_executable_path, ["service", "start"], global_dir_name)
+    assert again.returncode == 0, again.stdout + again.stderr
+
+    stop = run_lore(lore_executable_path, ["service", "stop"], global_dir_name)
+    assert stop.returncode == 0, stop.stdout + stop.stderr
+
+    # Stopping when nothing is running is also a no-op.
+    stop_again = run_lore(lore_executable_path, ["service", "stop"], global_dir_name)
+    assert stop_again.returncode == 0, stop_again.stdout + stop_again.stderr
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(
+    not service_supported(), reason="Service not supported on " + platform.system()
+)
+def test_service_set_use_automatically(lore_executable_path, global_dir_name):
+    config_path = os.path.join(global_dir_name, "config", "config.toml")
+
+    enable = run_lore(
+        lore_executable_path,
+        ["service", "set-use-automatically", "true"],
+        global_dir_name,
+    )
+    assert enable.returncode == 0, enable.stdout + enable.stderr
+    with open(config_path, encoding="utf-8") as config_file:
+        assert "use_service_automatically = true" in config_file.read()
+
+    disable = run_lore(
+        lore_executable_path,
+        ["service", "set-use-automatically", "false"],
+        global_dir_name,
+    )
+    assert disable.returncode == 0, disable.stdout + disable.stderr
+    with open(config_path, encoding="utf-8") as config_file:
+        assert "use_service_automatically" not in config_file.read()
 
 
 @pytest.mark.smoke
@@ -123,3 +182,26 @@ def test_service_resolves_relative_paths_against_caller(
     assert "A " + file_name in map(
         lambda line: line.strip(" "), status_output.splitlines()
     ), f"Staged file should show as added: {status_output}"
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(
+    not service_supported(), reason="Service not supported on " + platform.system()
+)
+def test_service_starts_on_demand(new_lore_repo, stopped_service):
+    """A call routed to the service starts one when none is running.
+
+    This replaces an older test asserting the opposite: before automatic
+    start-up, the same call failed with a connection error.
+    """
+    repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+
+    file_name = "test.uasset"
+    with repo.open_file(file_name, "w+b") as output_file:
+        output_file.write(os.urandom(30))
+
+    repo.stage(scan=True)
+
+    assert "A " + file_name in map(
+        lambda line: line.strip(" "), repo.status().splitlines()
+    )
