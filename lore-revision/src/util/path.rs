@@ -16,21 +16,43 @@ pub enum PathError {
     InvalidPath,
 }
 
+/// The directory the call in progress resolves relative paths against, when it
+/// named one. A call arriving over IPC carries the directory of the process
+/// that made it, because the service's own is unrelated to the caller's.
+fn call_working_directory() -> Option<PathBuf> {
+    let context = crate::runtime::try_execution_context()?;
+    let directory = context.globals().working_directory()?;
+    Some(PathBuf::from(directory))
+}
+
+/// Resolves `path` against the working directory of the call in progress, or
+/// against this process's own when the call did not name one.
 pub fn make_absolute(path: impl AsRef<str>) -> Result<PathBuf, PathError> {
+    make_absolute_from(path, call_working_directory())
+}
+
+/// [`make_absolute`] with the base directory supplied by the caller, for the
+/// call wrappers that resolve paths before the execution context exists and so
+/// cannot look it up.
+pub fn make_absolute_from(
+    path: impl AsRef<str>,
+    base: Option<PathBuf>,
+) -> Result<PathBuf, PathError> {
     let path = path.as_ref();
     let cleanpath = clean(path.to_owned());
     let pathbuf = PathBuf::from_str(cleanpath.as_str()).emit_map_err(InvalidPath {
         path: path.to_string(),
     })?;
-    if !pathbuf.is_absolute() {
-        Ok(std::env::current_dir()
-            .emit_map_err(PathError::internal(
-                "failed to get current working directory",
-            ))?
-            .join(pathbuf))
-    } else {
-        Ok(pathbuf)
+    if pathbuf.is_absolute() {
+        return Ok(pathbuf);
     }
+    let base = match base {
+        Some(base) => base,
+        None => std::env::current_dir().emit_map_err(PathError::internal(
+            "failed to get current working directory",
+        ))?,
+    };
+    Ok(base.join(pathbuf))
 }
 
 /// Returns `true` when `candidate` resolves to a location inside

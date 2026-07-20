@@ -3530,6 +3530,12 @@ typedef struct lore_event_t {
 typedef struct lore_global_args_t {
   // Repository path
   struct lore_string_t repository_path;
+  // Directory that relative paths in this call are resolved against. Set it
+  // when a call may be executed by another process, such as the Lore
+  // service, whose own working directory is unrelated to the caller's. When
+  // empty, relative paths resolve against the working directory of the
+  // process performing the call.
+  struct lore_string_t working_directory;
   // Correlation ID
   struct lore_string_t correlation_id;
   // Identity to use

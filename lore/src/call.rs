@@ -221,13 +221,15 @@ async fn prepare_repository_call(
     mut globals: LoreGlobalArgs,
     callback: LoreEventCallback,
 ) -> Result<(PathBuf, Arc<ExecutionContext>), i32> {
-    let repository_path =
-        if let Ok(path) = util::path::make_absolute(globals.repository_path.as_str()) {
-            globals.repository_path = path.display().to_string().into();
-            path
-        } else {
-            PathBuf::from(globals.repository_path.as_str())
-        };
+    let working_directory = globals.working_directory().map(PathBuf::from);
+    let repository_path = if let Ok(path) =
+        util::path::make_absolute_from(globals.repository_path.as_str(), working_directory)
+    {
+        globals.repository_path = path.display().to_string().into();
+        path
+    } else {
+        PathBuf::from(globals.repository_path.as_str())
+    };
 
     let execution = setup_execution(globals, callback);
 

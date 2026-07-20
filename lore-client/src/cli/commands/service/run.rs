@@ -35,11 +35,38 @@ pub enum ServiceMainError {}
 /// left behind is a stale socket, which the next start detects and removes.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Where the service parks its working directory. It inherits one from whoever
+/// started it, which is unrelated to the directories its callers run in, and
+/// holding that directory would also keep the filesystem under it busy. Callers
+/// send the directory their relative paths belong to, so the service never
+/// needs one of its own.
+fn detached_working_directory() -> std::path::PathBuf {
+    #[cfg(target_family = "unix")]
+    {
+        std::path::PathBuf::from("/")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("SystemRoot").map_or_else(
+            || std::path::PathBuf::from("C:\\"),
+            std::path::PathBuf::from,
+        )
+    }
+}
+
 pub async fn service_main(
     listening_signal: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), ServiceMainError> {
     if !uds_supported() {
         return Err(ServiceMainError::internal("IPC not supported on this OS"));
+    }
+
+    let detached = detached_working_directory();
+    if let Err(error) = std::env::set_current_dir(&detached) {
+        eprintln!(
+            "Failed to set working directory to {}: {error}",
+            detached.display()
+        );
     }
 
     let listener: UdsListener = UdsListener::new().internal("Failed to start listener socket")?;

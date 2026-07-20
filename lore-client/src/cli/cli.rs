@@ -349,6 +349,10 @@ pub enum LoreCliError {
 pub fn lore_globals_from_args(cli: &LoreCli) -> LoreGlobalArgs {
     let mut args = LoreGlobalArgs {
         repository_path: get_repository_path(cli.repository.clone()),
+        working_directory: std::env::current_dir()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default()
+            .into(),
 
         force: cli.force.into(),
         dry_run: cli.dry_run.into(),

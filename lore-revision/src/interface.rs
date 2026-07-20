@@ -527,6 +527,12 @@ pub enum LoreLoadConfig {
 pub struct LoreGlobalArgs {
     /// Repository path
     pub repository_path: LoreString,
+    /// Directory that relative paths in this call are resolved against. Set it
+    /// when a call may be executed by another process, such as the Lore
+    /// service, whose own working directory is unrelated to the caller's. When
+    /// empty, relative paths resolve against the working directory of the
+    /// process performing the call.
+    pub working_directory: LoreString,
     /// Correlation ID
     pub correlation_id: LoreString,
     /// Identity to use
@@ -577,6 +583,10 @@ pub struct LoreGlobalArgs {
 impl LoreGlobalArgs {
     pub fn repository_path(&self) -> &str {
         self.repository_path.as_str()
+    }
+
+    pub fn working_directory(&self) -> Option<&str> {
+        (&self.working_directory).into()
     }
 
     pub fn identity(&self) -> Option<&str> {
