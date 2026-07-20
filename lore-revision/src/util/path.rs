@@ -673,15 +673,13 @@ impl RelativePathBuf {
 
         let mut absolute_path = Path::new(user_path).to_path_buf();
         if !absolute_path.is_absolute() {
-            absolute_path = std::path::absolute(absolute_path)
-                .emit_map_err(PathError::internal("failed to resolve absolute path"))?;
+            absolute_path = make_absolute(absolute_path.to_string_lossy())?;
         }
         let absolute_path = clean(absolute_path.display().to_string());
 
         let mut repository_path = Path::new(repository_path).to_path_buf();
         if !repository_path.is_absolute() {
-            repository_path = std::path::absolute(repository_path)
-                .emit_map_err(PathError::internal("failed to resolve absolute path"))?;
+            repository_path = make_absolute(repository_path.to_string_lossy())?;
         }
         let repository_path = clean(repository_path.display().to_string()).to_lowercase();
 
