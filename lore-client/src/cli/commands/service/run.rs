@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use lore::interface::LoreEvent;
 use lore::remote::connection::ConnectionError;
@@ -19,7 +22,9 @@ use lore::runtime;
 use lore_error_set::prelude::*;
 use tokio::sync::mpsc;
 
+use crate::eprintln;
 use crate::println;
+use crate::util::listen_for_termination;
 
 #[error_set]
 pub enum ServiceMainError {}
@@ -41,11 +46,30 @@ pub async fn service_main(
             .map_err(|_err| ServiceMainError::internal("Couldn't signal listening"))?;
     }
 
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let signal_shutting_down = Arc::clone(&shutting_down);
+
+    runtime().spawn(async move {
+        if let Err(error) = listen_for_termination(None).await {
+            eprintln!("Failed to listen for termination signals: {error}");
+            return;
+        }
+        println!("Shutting down Lore service");
+        signal_shutting_down.store(true, Ordering::SeqCst);
+        if let Err(error) = UdsStream::connect() {
+            eprintln!("Failed to wake the accept loop, exiting immediately: {error}");
+            std::process::exit(1);
+        }
+    });
+
     runtime()
         .spawn_blocking(move || {
             loop {
                 match listener.accept() {
                     Ok(stream) => {
+                        if shutting_down.load(Ordering::SeqCst) {
+                            break;
+                        }
                         let new_connection_id = connection_id;
                         connection_id += 1;
                         runtime().spawn(async move {
@@ -55,7 +79,10 @@ pub async fn service_main(
                         });
                     }
                     Err(err) => {
-                        println!("Failed when accepting: {err}");
+                        if shutting_down.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        eprintln!("Failed when accepting: {err}");
                     }
                 }
             }
@@ -94,7 +121,7 @@ impl IpcConnection {
     async fn handle_connection(self) {
         let id = self.id;
         if let Err(error) = self.handle_connection_impl().await {
-            println!(
+            eprintln!(
                 "Error in connection: {}",
                 ConnectionErrorWithId::new(error, id)
             );
@@ -103,12 +130,15 @@ impl IpcConnection {
 
     async fn handle_connection_impl(self) -> Result<(), ConnectionError> {
         let mut connection = self.connection.try_clone().internal("cloning connection")?;
-        let (header, command): (V1Header, MessageToServer) = runtime()
+        let message: Option<(V1Header, MessageToServer)> = runtime()
             .spawn_blocking(move || blocking_read_v1_message(connection.reader()))
             .await
             .internal("failed reading")?
-            .forward::<ConnectionError>("reading message")?
-            .ok_or_else(|| ConnectionError::internal("message too short"))?;
+            .forward::<ConnectionError>("reading message")?;
+
+        let Some((header, command)) = message else {
+            return Ok(());
+        };
 
         //TODO(UCS-16094): Determine if this should be unbounded or bounded
         // Create a channel so the callback task can send messages to this network thread, so they
@@ -130,7 +160,7 @@ impl IpcConnection {
                         MessageToClient::Event(event.clone()),
                         header.serialization_type,
                     )) {
-                        println!("Failed to send Event message to connection task: {error}");
+                        eprintln!("Failed to send Event message to connection task: {error}");
                     }
                 })))
                 .await;
@@ -139,14 +169,14 @@ impl IpcConnection {
                 MessageToClient::ApiResult(cli_result),
                 header.serialization_type,
             )) {
-                println!("Failed to send ApiResult message to connection task: {error}");
+                eprintln!("Failed to send ApiResult message to connection task: {error}");
             }
         });
 
         while let Some((message, serialization_type)) = to_client_receiver.recv().await {
             let stream = self.connection.try_clone().internal("cloning connection")?;
             if let Err(error) = Self::send_message(stream, message, serialization_type).await {
-                println!(
+                eprintln!(
                     "Failed to send message to client: {}",
                     ConnectionErrorWithId::new(error, self.id)
                 );

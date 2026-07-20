@@ -15,7 +15,7 @@ use crate::cli::EventCallbackExt;
 use crate::cli::EventCallbackFn;
 use crate::cli::output_formatter;
 use crate::commands::service::run::service_main;
-use crate::println;
+use crate::eprintln;
 use crate::styling::CommonStyles;
 use crate::util;
 
@@ -54,7 +54,7 @@ fn handle_service_run(_globals: LoreGlobalArgs, _args: &ServiceRunArgs) -> u8 {
     match runtime().block_on(async move { service_main(None).await }) {
         Ok(_) => 0,
         Err(error) => {
-            println!(
+            eprintln!(
                 "{}Error running service:{} {error}",
                 CommonStyles::FAILURE,
                 anstyle::Reset
