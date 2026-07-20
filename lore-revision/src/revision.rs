@@ -1219,9 +1219,7 @@ pub async fn resolve(
             branch_status.id
         };
 
-        let remote_latest = if let Ok(remote) = repository.remote().await
-            && should_search_remote
-        {
+        let remote_latest = if should_search_remote && let Ok(remote) = repository.remote().await {
             branch::load_remote_latest(remote.clone(), repository.id, branch)
                 .await
                 .ok()

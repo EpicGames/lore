@@ -91,10 +91,22 @@ pub struct LoreAuthIdentityEventData {
 /// remote path. Because the local path reads a cached token captured at
 /// login, a name change made server-side since then is not reflected until
 /// the token is refreshed.
+///
+/// In offline or local-only mode, returns without emitting any events —
+/// resolution requires the remote auth service, and callers fall back to
+/// displaying the raw ids.
 pub async fn resolve_user_info(
     repository: Arc<RepositoryContext>,
     ids: LoreArray<LoreString>,
 ) -> Result<(), UserInfoError> {
+    // Resolution needs the remote auth service; a local-only or offline
+    // operation must not drive a connect just to prettify display names.
+    // Callers fall back to showing the raw ids.
+    if execution_context().globals().offline_or_local() {
+        lore_debug!("Skipping user info resolution in offline/local mode");
+        return Ok(());
+    }
+
     let remote = repository
         .remote()
         .await

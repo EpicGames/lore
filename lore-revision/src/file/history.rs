@@ -374,6 +374,13 @@ async fn find_start_revision(
         resolved.id
     };
 
+    let local_latest = branch::load_latest(repository.clone(), branch)
+        .await
+        .unwrap_or_default();
+    if execution_context().globals().local() {
+        return Ok(local_latest);
+    }
+
     let remote_latest = if let Ok(remote) = repository.remote().await {
         branch::load_remote_latest(remote.clone(), repository.id, branch)
             .await
@@ -383,13 +390,6 @@ async fn find_start_revision(
     };
     if execution_context().globals().remote() {
         return Ok(remote_latest);
-    }
-
-    let local_latest = branch::load_latest(repository.clone(), branch)
-        .await
-        .unwrap_or_default();
-    if execution_context().globals().local() {
-        return Ok(local_latest);
     }
 
     // Is there a latest?

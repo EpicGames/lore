@@ -177,15 +177,14 @@ async fn find_start_revision(
             .await
             .internal("loading branch name")?;
 
-        let remote_latest = if let Ok(remote) = repository.remote().await {
-            branch::load_remote_latest(remote.clone(), repository.id, branch)
-                .await
-                .unwrap_or_default()
-        } else {
-            Hash::default()
-        };
-
         if execution_context().globals().remote() {
+            let remote_latest = if let Ok(remote) = repository.remote().await {
+                branch::load_remote_latest(remote.clone(), repository.id, branch)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                Hash::default()
+            };
             return Ok((remote_latest, Some(branch)));
         }
 
