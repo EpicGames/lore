@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use lore_revision::global::CONFIG as GLOBAL_CONFIG;
 use lore_revision::global::GlobalConfig;
+use lore_revision::global::get_global_config_dir;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::lore_debug;
 use parking_lot::RwLock;
@@ -56,6 +58,30 @@ pub(crate) async fn use_service() -> bool {
         .await
         .map(|config| config.use_service_automatically())
         .unwrap_or(false);
+    *USE_SERVICE.write() = Some(enabled);
+    enabled
+}
+
+/// Answers the same question as [`use_service`] without a runtime, for callers
+/// that must decide before one exists. Reads the global config directly rather
+/// than through its async loader, and fills the same cache, so a later
+/// [`use_service`] cannot reach a different answer.
+pub fn will_use_service() -> bool {
+    if let Some(value) = use_service_override() {
+        return value;
+    }
+    if cfg!(test) {
+        return false;
+    }
+    if let Some(cached) = *USE_SERVICE.read() {
+        return cached;
+    }
+    let enabled = get_global_config_dir()
+        .ok()
+        .map(|dir| dir.join(GLOBAL_CONFIG))
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| toml::from_str::<GlobalConfig>(&text).ok())
+        .is_some_and(|config| config.use_service_automatically());
     *USE_SERVICE.write() = Some(enabled);
     enabled
 }

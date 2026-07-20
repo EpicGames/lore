@@ -541,6 +541,15 @@ pub struct TokioSettings {
     #[serde(default = "default_thread_keep_alive")]
     pub thread_keep_alive_seconds: u64,
     pub worker_threads: Option<usize>,
+    /// Whether to build the rayon compute pool up front. Turning this off does
+    /// not make the pool unavailable: [`compute_pool`] still builds it on first
+    /// use, so this only decides whether its threads are paid for eagerly.
+    #[serde(default = "default_eager_compute_pool")]
+    pub eager_compute_pool: bool,
+}
+
+fn default_eager_compute_pool() -> bool {
+    true
 }
 
 impl Default for TokioSettings {
@@ -549,6 +558,23 @@ impl Default for TokioSettings {
             max_blocking_threads: default_blocking_threads(),
             thread_keep_alive_seconds: default_thread_keep_alive(),
             worker_threads: None,
+            eager_compute_pool: true,
+        }
+    }
+}
+
+impl TokioSettings {
+    /// Settings for a process that only relays work elsewhere, such as a client
+    /// whose calls all execute in the Lore service. Sized for IPC rather than
+    /// for doing the work, and with no compute pool, which such a process never
+    /// touches. Each pool keeps [`MIN_THREADS_PER_POOL`] so that neither can
+    /// starve the other.
+    pub fn relay_only() -> Self {
+        TokioSettings {
+            max_blocking_threads: MIN_THREADS_PER_POOL,
+            thread_keep_alive_seconds: default_thread_keep_alive(),
+            worker_threads: Some(MIN_THREADS_PER_POOL),
+            eager_compute_pool: false,
         }
     }
 }
@@ -600,10 +626,12 @@ pub fn runtime_with_settings(settings: Option<TokioSettings>) -> Handle {
             // Build the compute pool off-thread so runtime creation isn't
             // blocked on spawning N rayon workers. No LORE_CONTEXT is active
             // yet, so Handle::spawn directly rather than lore_spawn!.
-            #[allow(clippy::disallowed_methods)]
-            handle.spawn(async {
-                let _ = COMPUTE_POOL.get_or_init(build_compute_pool);
-            });
+            if settings.eager_compute_pool {
+                #[allow(clippy::disallowed_methods)]
+                handle.spawn(async {
+                    let _ = COMPUTE_POOL.get_or_init(build_compute_pool);
+                });
+            }
 
             handle
         }
@@ -693,6 +721,7 @@ mod tests {
             max_blocking_threads: 4,
             thread_keep_alive_seconds: 5,
             worker_threads: Some(2),
+            eager_compute_pool: true,
         };
         let handle = runtime_with_settings(Some(settings));
         handle.block_on(async {

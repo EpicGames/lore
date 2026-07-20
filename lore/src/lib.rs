@@ -79,6 +79,23 @@ pub fn set_thread_limit(count: usize) -> bool {
     lore_base::runtime::set_thread_limit(count)
 }
 
+/// Whether calls will be executed by the Lore service process rather than in
+/// this one. Safe to call before a runtime exists, so a caller can size its
+/// threading before doing any work. See [`size_threads_for_relaying`].
+pub fn will_use_service() -> bool {
+    call_delegation::will_use_service()
+}
+
+/// Sizes the shared runtime for a process that only relays its work to the Lore
+/// service, rather than performing it. Creates the runtime, so it must be
+/// called before the first Lore operation and only by a process that does no
+/// work of its own; the service process itself must never call it.
+pub fn size_threads_for_relaying() {
+    drop(lore_base::runtime::runtime_with_settings(Some(
+        lore_base::runtime::TokioSettings::relay_only(),
+    )));
+}
+
 pub fn log_file_path() -> LoreString {
     log::get_logs_path().into()
 }

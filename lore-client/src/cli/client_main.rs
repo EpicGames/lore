@@ -5,10 +5,22 @@ use clap::CommandFactory;
 use clap::Parser;
 
 use crate::cli::LoreCli;
+use crate::cli::LoreCommands;
 use crate::cli::handle_lore_commands;
 use crate::cli::lore_globals_from_args;
+use crate::commands::service::ServiceCommands;
 use crate::config::setup_config;
 use crate::logging;
+
+/// Whether this command does its own work rather than relaying it to the Lore
+/// service. Only `service run` does: it *is* the service, so it needs the full
+/// complement of threads however the calling user has configured routing.
+fn runs_work_in_this_process(command: &LoreCommands) -> bool {
+    matches!(
+        command,
+        LoreCommands::Service(args) if matches!(args.command, ServiceCommands::Run(_))
+    )
+}
 
 pub fn client_main() -> ExitCode {
     #[cfg(target_family = "windows")]
@@ -54,6 +66,10 @@ pub fn client_main() -> ExitCode {
 
     if let Some(max_threads) = cli.max_threads {
         lore::set_thread_limit(max_threads);
+    }
+
+    if !runs_work_in_this_process(cli_command) && lore::will_use_service() {
+        lore::size_threads_for_relaying();
     }
 
     let globals = lore_globals_from_args(&cli);
