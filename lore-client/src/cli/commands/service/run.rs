@@ -4,6 +4,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use lore::interface::LoreEvent;
 use lore::remote::connection::ConnectionError;
@@ -29,11 +30,14 @@ use crate::util::listen_for_termination;
 #[error_set]
 pub enum ServiceMainError {}
 
+/// Bounds how long shutdown waits for the accept loop to unwind, so that a
+/// wake-up connection that never lands cannot keep the process alive. Anything
+/// left behind is a stale socket, which the next start detects and removes.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub async fn service_main(
     listening_signal: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), ServiceMainError> {
-    let mut connection_id = 0;
-
     if !uds_supported() {
         return Err(ServiceMainError::internal("IPC not supported on this OS"));
     }
@@ -47,48 +51,56 @@ pub async fn service_main(
     }
 
     let shutting_down = Arc::new(AtomicBool::new(false));
-    let signal_shutting_down = Arc::clone(&shutting_down);
+    let accept_shutting_down = Arc::clone(&shutting_down);
 
-    runtime().spawn(async move {
-        if let Err(error) = listen_for_termination(None).await {
-            eprintln!("Failed to listen for termination signals: {error}");
-            return;
-        }
-        println!("Shutting down Lore service");
-        signal_shutting_down.store(true, Ordering::SeqCst);
-        if let Err(error) = UdsStream::connect() {
-            eprintln!("Failed to wake the accept loop, exiting immediately: {error}");
-            std::process::exit(1);
+    let accept_task = runtime().spawn_blocking(move || {
+        let mut connection_id = 0;
+        loop {
+            match listener.accept() {
+                Ok(stream) => {
+                    if accept_shutting_down.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let new_connection_id = connection_id;
+                    connection_id += 1;
+                    runtime().spawn(async move {
+                        IpcConnection::new(ConnectionId(new_connection_id), stream)
+                            .handle_connection()
+                            .await;
+                    });
+                }
+                Err(err) => {
+                    if accept_shutting_down.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    eprintln!("Failed when accepting: {err}");
+                }
+            }
         }
     });
 
-    runtime()
-        .spawn_blocking(move || {
-            loop {
-                match listener.accept() {
-                    Ok(stream) => {
-                        if shutting_down.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let new_connection_id = connection_id;
-                        connection_id += 1;
-                        runtime().spawn(async move {
-                            IpcConnection::new(ConnectionId(new_connection_id), stream)
-                                .handle_connection()
-                                .await;
-                        });
-                    }
-                    Err(err) => {
-                        if shutting_down.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        eprintln!("Failed when accepting: {err}");
-                    }
-                }
+    match listen_for_termination(None).await {
+        Ok(()) => {
+            println!("Shutting down Lore service");
+            shutting_down.store(true, Ordering::SeqCst);
+            if let Err(error) = UdsStream::connect() {
+                eprintln!("Failed to wake the accept loop: {error}");
             }
-        })
-        .await
-        .unwrap();
+            if tokio::time::timeout(SHUTDOWN_TIMEOUT, accept_task)
+                .await
+                .is_err()
+            {
+                eprintln!("Timed out waiting for the accept loop to stop");
+            }
+        }
+        Err(error) => {
+            // Without signal handling there is no graceful path, so keep
+            // serving until the process is killed.
+            eprintln!("Failed to listen for termination signals: {error}");
+            let _ = accept_task.await;
+        }
+    }
+
     Ok(())
 }
 

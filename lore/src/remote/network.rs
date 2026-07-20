@@ -69,7 +69,7 @@ mod tests {
         let mut buf = Vec::new();
         stream.reader().read_to_end(&mut buf).unwrap();
         let result = str::from_utf8(&buf).unwrap();
-        println!("RECEIVED: {}", result);
+        println!("RECEIVED: {result}");
 
         result.to_string()
     }
