@@ -801,9 +801,10 @@ pub async fn connect(
         }
     }
 
-    // Silent propagation of connection errors
+    // Every candidate address failed; the server is unreachable. Classify as
+    // `Disconnected`. Per-attempt details are logged above.
     lore_debug!("QUIC connect failed {remote_url}");
-    Err(ProtocolError::internal(format!("connect: {remote_url}")))
+    Err(ProtocolError::from(Disconnected))
 }
 
 pub async fn reconnect<AuthErrorType>(

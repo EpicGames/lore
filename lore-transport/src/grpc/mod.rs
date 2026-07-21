@@ -578,11 +578,16 @@ async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
 
     endpoint = endpoint.connect_timeout(Duration::from_secs(GRPC_CONNECT_TIMEOUT_SECS));
 
-    // Silent propagation of connection errors
-    let channel = endpoint
-        .connect()
-        .await
-        .internal_with(|| format!("gRPC connection to {remote}"))?;
+    // A failed transport connect means the server is unreachable; classify it
+    // as `Disconnected`. The transport error has no variant to preserve, so log
+    // it before collapsing.
+    let channel = match endpoint.connect().await {
+        Ok(channel) => channel,
+        Err(err) => {
+            lore_debug!("gRPC connection to {remote} failed: {err}");
+            return Err(ProtocolError::from(lore_base::error::Disconnected));
+        }
+    };
 
     let channel = ServiceBuilder::new()
         .layer(RequestLoggerLayer {})

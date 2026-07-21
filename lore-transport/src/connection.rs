@@ -196,15 +196,16 @@ async fn connect_impl(
 ) -> Result<Arc<Connection>, ProtocolError> {
     let remote_domain = lore_credential::domain_from_url_or_url(&remote_url);
 
-    // Get the server config from environment endpoint
+    // Forward rather than `internal`-wrap so a classified failure (such as
+    // `Disconnected`) survives instead of collapsing to `Internal`.
     let environment_client = protocol
         .environment(Weak::default(), remote_url.as_str())
         .await
-        .internal_with(|| format!("connect: {remote_url}"))?;
+        .forward_with::<ProtocolError, _>(|| format!("connect: {remote_url}"))?;
     let environment = environment_client
         .get()
         .await
-        .internal("failed to get environment config")?;
+        .forward::<ProtocolError>("failed to get environment config")?;
 
     let auth_url = environment
         .endpoint
