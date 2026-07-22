@@ -34,6 +34,12 @@ static SHUTDOWN_FLAG: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 
 /// Called by the service process at startup to publish the flag that stops its
 /// accept loop, so that a `ServiceStop` arriving over IPC can trip it.
+///
+/// Supports a single service per process: the `OnceLock` keeps the first flag,
+/// so a second `service_main` in the same process would run an accept loop
+/// watching a flag this never trips, and could not be stopped. The CLI runs
+/// `service run` once per process, so this only constrains a future embedder or
+/// in-process test that starts the service more than once.
 pub fn register_shutdown_flag(flag: Arc<AtomicBool>) {
     let _ = SHUTDOWN_FLAG.set(flag);
 }
