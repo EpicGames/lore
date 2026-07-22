@@ -56,6 +56,13 @@ fn detached_working_directory() -> std::path::PathBuf {
 /// connect to the socket so the blocked `accept` returns and the loop can
 /// observe it. Waiting on the accept loop rather than on the signal is what
 /// makes the IPC trigger end the process too.
+///
+/// Only the accept loop is awaited, not the per-connection handlers it spawned.
+/// In-flight requests are therefore not drained: a client mid-operation sees the
+/// connection close and reports it, and a request that was writing is truncated,
+/// with recovery left to the store's crash-consistency (the same guarantee a
+/// locally interrupted command relies on). A bounded drain of outstanding
+/// handlers before exit is a possible future improvement.
 pub async fn service_main(
     listening_signal: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), ServiceMainError> {
