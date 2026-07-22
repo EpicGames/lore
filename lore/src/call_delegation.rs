@@ -18,11 +18,23 @@ const USE_SERVICE_VAR: &str = "LORE_USE_SERVICE";
 /// Caches `use_service_automatically` for the life of the process. Every public
 /// API entry point consults it, and reading it means parsing the global TOML
 /// config, so it must not happen per call.
+///
+/// The cache lives for the whole process and is only refreshed by a write in
+/// this process (see [`invalidate_use_service_cache`]). A change made elsewhere
+/// — an external `lore service set-use-automatically`, or a hand-edited config —
+/// is not observed until the process restarts. That is acceptable because the
+/// setting is a deploy-time choice that rarely changes under a running process,
+/// and the CLI runs one command per process regardless.
 static USE_SERVICE: RwLock<Option<bool>> = RwLock::new(None);
 
-/// Drops the cached setting so the next call rereads it. Called after the
-/// setting is written, so a long-lived embedder does not keep using the old
-/// value.
+/// Drops the cached setting so the next call in this process rereads it. Called
+/// after the setting is written here.
+///
+/// This refreshes only writes made by this process, and it races a concurrent
+/// reader: a [`use_service`] that loads the old config and fills the cache after
+/// this runs can leave the stale value in place until the next write. The window
+/// is narrow and self-heals on any later write; only a long-lived multi-threaded
+/// embedder that flips the setting mid-run is exposed.
 pub(crate) fn invalidate_use_service_cache() {
     *USE_SERVICE.write() = None;
 }
