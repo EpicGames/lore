@@ -124,7 +124,8 @@ pub async fn service_call_impl<ArgsType: LoreArgs + Clone + Send + 'static>(
     }
 
     Err(ServiceCallError::internal(
-        "Lore service closed connection without sending a result",
+        "Lore service closed the connection without sending a result; \
+         it may have been stopped or terminated while the request was in flight",
     ))
 }
 
