@@ -45,7 +45,15 @@ pub fn running_as_service() -> bool {
 /// Stops this process's own service loop. The accept loop is blocked in
 /// `accept`, so it also needs a connection to wake it before it can observe the
 /// flag; a failure to make that connection leaves the loop parked, so it is
-/// reported rather than ignored.
+/// returned rather than ignored.
+///
+/// Shutdown therefore depends on this wake-up connection succeeding. A caller
+/// that polls afterwards (the client `service stop`, via `wait_until_stopped`)
+/// self-corrects, because its probes are themselves connections that wake the
+/// loop. The termination-signal path does not poll and discards this error to a
+/// detached process's null stderr, so on the rare failure — connecting to one's
+/// own listening socket essentially only fails under backlog exhaustion or a
+/// removed socket file — exit is delayed until another connection arrives.
 pub fn request_shutdown() -> Result<(), ServiceProcessError> {
     let Some(flag) = SHUTDOWN_FLAG.get() else {
         return Err(ServiceProcessError::internal(
