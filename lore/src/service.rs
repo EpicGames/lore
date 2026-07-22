@@ -114,9 +114,16 @@ async fn stop_local(
             return Ok(());
         }
 
-        service_send_no_reply(globals_for_send, args)
-            .await
-            .forward::<ServiceError>("sending stop to the Lore service")?;
+        // The service can exit between the check above and the send below —
+        // another stop, or a termination signal. A failed send is then only an
+        // error if the service is somehow still running; a stopped service is
+        // exactly the outcome asked for.
+        if let Err(error) = service_send_no_reply(globals_for_send, args).await {
+            if process::is_running() {
+                return Err(error).forward::<ServiceError>("sending stop to the Lore service");
+            }
+            return Ok(());
+        }
 
         if !process::wait_until_stopped().await {
             return Err(ServiceError::internal(
