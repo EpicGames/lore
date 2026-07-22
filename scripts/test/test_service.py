@@ -3,7 +3,6 @@
 import logging
 import os
 import platform
-import subprocess
 
 import pytest
 
@@ -59,7 +58,7 @@ def test_service_call(new_lore_repo, background_lore_service):
     not service_supported(), reason="Service not supported on " + platform.system()
 )
 def test_service_resolves_relative_paths_against_caller(
-    new_lore_repo, lore_executable_path, lore_service_in_directory, tmp_path
+    new_lore_repo, lore_service_in_directory, tmp_path
 ):
     """Relative paths belong to the directory the command was run in.
 
@@ -68,37 +67,32 @@ def test_service_resolves_relative_paths_against_caller(
     itself. Every other service test passes an absolute repository path, which
     cannot catch this.
     """
-    repo: Lore = new_lore_repo()
-    with repo.open_file("seed.txt", "w+") as seed_file:
-        seed_file.write("seed\n")
-    repo.stage(scan=True, offline=True)
-    repo.commit("Seed", offline=True)
-    repo.push()
-
+    # Start the service in a directory unrelated to where the commands run, so
+    # that a relative path resolved there rather than at the caller would show.
     service_directory = tmp_path / "service_elsewhere"
     caller_directory = tmp_path / "caller"
     service_directory.mkdir()
     caller_directory.mkdir()
     lore_service_in_directory(service_directory)
 
-    environment = os.environ.copy()
-    environment.update(LORE_SERVICE_ENVIRONMENT)
+    # Seed a remote to clone from. Routed through the service like the rest,
+    # but against the repository's own absolute path, so unaffected by the
+    # service's directory.
+    source: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+    with source.open_file("seed.txt", "w+") as seed_file:
+        seed_file.write("seed\n")
+    source.stage(scan=True, offline=True)
+    source.commit("Seed", offline=True)
+    source.push()
 
-    def run_in(directory, args):
-        result = subprocess.run(
-            [lore_executable_path, *args],
-            capture_output=True,
-            text=True,
-            cwd=str(directory),
-            env=environment,
-        )
-        assert result.returncode == 0, (
-            f"{args} failed in {directory}: {result.stdout}{result.stderr}"
-        )
-        return result.stdout + result.stderr
-
+    # Clone to a relative path from the caller's directory. It must land there,
+    # not under the service's directory.
     clone_name = "relative_clone"
-    run_in(caller_directory, ["clone", repo.remote_path, clone_name])
+    source.run(
+        ["repository", "clone", source.remote_path, clone_name],
+        cwd=str(caller_directory),
+        use_os_dir=True,
+    )
 
     clone_path = caller_directory / clone_name
     assert (clone_path / ".lore").is_dir(), (
@@ -110,12 +104,22 @@ def test_service_resolves_relative_paths_against_caller(
         f"{service_directory} contains {list(service_directory.iterdir())}"
     )
 
+    # Stage a relative path from inside the clone.
+    clone = Lore(
+        lore_executable_path=source.lore_executable_path,
+        path=str(clone_path),
+        name=clone_name,
+        global_dir=source.global_dir,
+        environment_vars=LORE_SERVICE_ENVIRONMENT.copy(),
+        remote_url=source.remote,
+        remote_path=source.remote_path,
+        create_repo=False,
+    )
     file_name = "added.uasset"
     (clone_path / file_name).write_bytes(os.urandom(30))
+    clone.stage(file_name, relative_paths=True)
 
-    run_in(clone_path, ["stage", file_name])
-
-    status_output = run_in(clone_path, ["status"])
+    status_output = clone.status()
     assert "A " + file_name in map(
         lambda line: line.strip(" "), status_output.splitlines()
     ), f"Staged file should show as added: {status_output}"
