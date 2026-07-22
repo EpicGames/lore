@@ -34,11 +34,28 @@ impl EventError for ServiceCallError {
     }
 }
 
+/// Records the directory the service resolves this call's relative paths
+/// against, when the caller left it unset. The service runs in a directory
+/// unrelated to the caller's, so without this a relative path would resolve
+/// there rather than where the caller ran. A caller that set the field, such as
+/// an installed tool that runs from a fixed directory but wants relative paths
+/// resolved elsewhere, keeps its value.
+#[allow(clippy::disallowed_methods)]
+fn fill_working_directory(globals: &mut LoreGlobalArgs) {
+    if globals.working_directory().is_some() {
+        return;
+    }
+    if let Ok(directory) = std::env::current_dir() {
+        globals.working_directory = directory.display().to_string().into();
+    }
+}
+
 pub async fn service_call<ArgsType: LoreArgs + Clone + Send + 'static>(
-    globals: LoreGlobalArgs,
+    mut globals: LoreGlobalArgs,
     args: ArgsType,
     callback: LoreEventCallback,
 ) -> i32 {
+    fill_working_directory(&mut globals);
     let mut event_dispatcher = EventDispatcher::new(callback);
 
     service_call_impl(&mut event_dispatcher, globals, args)
