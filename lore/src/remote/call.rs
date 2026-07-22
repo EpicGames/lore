@@ -70,6 +70,22 @@ pub async fn service_call<ArgsType: LoreArgs + Clone + Send + 'static>(
         })
 }
 
+/// Opens a connection to the service and writes the already-serialized message,
+/// returning the connection to read the reply from.
+async fn connect_and_send(message_bytes: Vec<u8>) -> Result<UdsStream, ServiceCallError> {
+    lore_base::lore_spawn_blocking!(move || {
+        let mut connection =
+            UdsStream::connect().forward::<ServiceCallError>("connecting to local socket")?;
+        connection
+            .writer()
+            .write_all(&message_bytes)
+            .internal("sending message")?;
+        Ok::<UdsStream, ServiceCallError>(connection)
+    })
+    .await
+    .internal("joining connection task")?
+}
+
 pub async fn service_call_impl<ArgsType: LoreArgs + Clone + Send + 'static>(
     event_dispatcher: &mut EventDispatcher,
     globals: LoreGlobalArgs,
@@ -79,30 +95,25 @@ pub async fn service_call_impl<ArgsType: LoreArgs + Clone + Send + 'static>(
         return Err(ServiceCallError::internal("OS doesn't support IPC"));
     }
 
-    crate::remote::process::ensure_running()
-        .await
-        .forward::<ServiceCallError>("starting the Lore service")?;
+    let message = MessageToServer {
+        globals,
+        command: args.to_command(),
+    };
+    let message_bytes = write_v1_message(message, SerializationType::Json)
+        .forward::<ServiceCallError>("serializing message")?;
 
-    let connection = lore_base::lore_spawn_blocking!(|| {
-        let mut connection =
-            UdsStream::connect().forward::<ServiceCallError>("connecting to local socket")?;
-
-        let message = MessageToServer {
-            globals,
-            command: args.to_command(),
-        };
-
-        let message_bytes = write_v1_message(message, SerializationType::Json)
-            .forward::<ServiceCallError>("serializing message")?;
-
-        connection
-            .writer()
-            .write_all(&message_bytes)
-            .internal("sending message")?;
-        Ok::<UdsStream, ServiceCallError>(connection)
-    })
-    .await
-    .internal("joining connection task")??;
+    // Send to an existing service first, and only start one if that fails, so
+    // the common path opens a single connection rather than a liveness probe
+    // followed by the real one.
+    let connection = match connect_and_send(message_bytes.clone()).await {
+        Ok(connection) => connection,
+        Err(_) => {
+            crate::remote::process::ensure_running()
+                .await
+                .forward::<ServiceCallError>("starting the Lore service")?;
+            connect_and_send(message_bytes).await?
+        }
+    };
 
     'read_from_stream: loop {
         let mut connection = connection.try_clone().internal("cloning connection")?;
