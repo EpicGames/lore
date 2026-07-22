@@ -90,6 +90,13 @@ pub fn will_use_service() -> bool {
 /// service, rather than performing it. Creates the runtime, so it must be
 /// called before the first Lore operation and only by a process that does no
 /// work of its own; the service process itself must never call it.
+///
+/// The sizing is applied once, when the runtime is built, and cannot be undone:
+/// later settings are ignored because the runtime already exists. A long-lived
+/// process that turns the service off after this has been called (for example
+/// via [`service::set_use_automatically`](crate::service::set_use_automatically))
+/// then runs its work locally on this relay-sized runtime, which is correct but
+/// slow. Decide routing once at start-up and do not flip it mid-process.
 pub fn size_threads_for_relaying() {
     drop(lore_base::runtime::runtime_with_settings(Some(
         lore_base::runtime::TokioSettings::relay_only(),
