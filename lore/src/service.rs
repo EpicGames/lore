@@ -56,9 +56,6 @@ async fn start_local(
     callback: LoreEventCallback,
 ) -> i32 {
     let command = async move |_args| -> Result<(), ServiceError> {
-        if process::running_as_service() {
-            return Ok(());
-        }
         process::ensure_running()
             .await
             .forward::<ServiceError>("starting the Lore service")?;
