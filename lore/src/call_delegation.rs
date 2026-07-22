@@ -27,15 +27,23 @@ pub(crate) fn invalidate_use_service_cache() {
     *USE_SERVICE.write() = None;
 }
 
+/// Whether a `LORE_USE_SERVICE` value turns the service on. Off values, matched
+/// case-insensitively with surrounding whitespace ignored, are an empty value
+/// and `0`, `false`, `f`, `no`, `n`, and `off`; any other value is on.
+fn use_service_from_value(value: &str) -> bool {
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false" | "f" | "no" | "n" | "off"
+    )
+}
+
 /// `LORE_USE_SERVICE` overrides the stored setting when set, so that tests and
 /// one-off invocations can route through the service without writing config.
-/// An empty value, or `0`/`false`, means "do not use the service".
+/// See [`use_service_from_value`] for how the value is interpreted.
 fn use_service_override() -> Option<bool> {
-    let value = std::env::var(USE_SERVICE_VAR).ok()?;
-    if value.is_empty() {
-        return Some(false);
-    }
-    Some(!value.eq_ignore_ascii_case("0") && !value.eq_ignore_ascii_case("false"))
+    std::env::var(USE_SERVICE_VAR)
+        .ok()
+        .map(|value| use_service_from_value(&value))
 }
 
 /// Whether calls should be routed through the service process.
@@ -159,6 +167,24 @@ mod tests {
 
     use super::*;
     use crate::interface::LoreString;
+
+    #[test]
+    fn use_service_value_parsing() {
+        for on in ["1", "true", "TRUE", "yes", "on", "enabled", "  1 "] {
+            assert!(
+                use_service_from_value(on),
+                "{on:?} should enable the service"
+            );
+        }
+        for off in [
+            "", "  ", "0", "false", "FALSE", "f", "no", "n", "off", " off ",
+        ] {
+            assert!(
+                !use_service_from_value(off),
+                "{off:?} should disable the service"
+            );
+        }
+    }
 
     // A concrete error whose `NotFound` variant carries error code 13, so the
     // async failure path has a known non-`1` code to assert against.
