@@ -181,10 +181,13 @@ def _service_unreachable(output):
     return platform.system() == "Windows" and "10022" in output
 
 
-def _wait_for_service_ready(lore_executable_path, service_process, attempts=30):
+def _wait_for_service_ready(
+    lore_executable_path, service_process, global_dir, attempts=30
+):
     """Block until the background service answers a probe."""
     probe_env = os.environ.copy()
     probe_env["LORE_USE_SERVICE"] = "1"
+    probe_env["LORE_GLOBAL_PATH"] = global_dir
     for _ in range(attempts):
         if service_process.poll() is not None:
             pytest.fail(
@@ -219,7 +222,7 @@ def lore_service_in_directory(lore_executable_path, global_dir_name):
             [lore_executable_path, "service", "run"], cwd=str(directory), env=env
         )
         processes.append(service_process)
-        _wait_for_service_ready(lore_executable_path, service_process)
+        _wait_for_service_ready(lore_executable_path, service_process, global_dir_name)
         return service_process
 
     yield start
@@ -234,12 +237,17 @@ def lore_service_in_directory(lore_executable_path, global_dir_name):
 
 
 @pytest.fixture(scope="function")
-def background_lore_service(lore_executable_path):
+def background_lore_service(lore_executable_path, global_dir_name):
+    # Give the service the test's isolated global config so that anything it
+    # writes there (for example a shared store created while serving a command)
+    # never lands in the developer's real global config.
+    env = os.environ.copy()
+    env["LORE_GLOBAL_PATH"] = global_dir_name
     command_args = [lore_executable_path, "service", "run"]
     logger.info("Executing Lore service command: %s", command_args)
-    service_process = subprocess.Popen(command_args)
+    service_process = subprocess.Popen(command_args, env=env)
 
-    _wait_for_service_ready(lore_executable_path, service_process)
+    _wait_for_service_ready(lore_executable_path, service_process, global_dir_name)
 
     yield service_process
 

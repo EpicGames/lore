@@ -3,6 +3,7 @@
 import logging
 import os
 import platform
+import shutil
 import subprocess
 
 import pytest
@@ -88,6 +89,73 @@ def test_service_set_use_automatically(lore_executable_path, global_dir_name):
     assert disable.returncode == 0, disable.stdout + disable.stderr
     with open(config_path, encoding="utf-8") as config_file:
         assert "use_service_automatically" not in config_file.read()
+
+
+@pytest.mark.smoke
+@pytest.mark.xdist_group("lore_service")
+@pytest.mark.skipif(
+    not service_supported(), reason="Service not supported on " + platform.system()
+)
+def test_config_setting_routes_to_service(
+    lore_executable_path, global_dir_name, tmp_path, stopped_service
+):
+    """The use_service_automatically config setting routes commands through the
+    service, without the LORE_USE_SERVICE override.
+
+    Everything runs against the test's isolated LORE_GLOBAL_PATH, so the
+    developer's real global config is never read or written. Routing is proven
+    without starting a real daemon: a binary not named `lore` refuses to
+    auto-start the service, so a command that tries to route fails with that
+    refusal, while the same binary forced to run locally does not.
+    """
+    refusal = "start the Lore service automatically"
+
+    # No service must be listening, so a routed command takes the auto-start
+    # path where a non-`lore` binary refuses.
+    run_lore(lore_executable_path, ["service", "stop"], global_dir_name)
+
+    enable = run_lore(
+        lore_executable_path,
+        ["service", "set-use-automatically", "true"],
+        global_dir_name,
+    )
+    assert enable.returncode == 0, enable.stdout + enable.stderr
+
+    binary_name = "notlore.exe" if platform.system() == "Windows" else "notlore"
+    not_lore = tmp_path / binary_name
+    shutil.copy(lore_executable_path, not_lore)
+    not_lore.chmod(0o755)
+
+    env = os.environ.copy()
+    env["LORE_GLOBAL_PATH"] = global_dir_name
+
+    routed = subprocess.run(
+        [str(not_lore), "status"],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+        env=env,
+    )
+    assert refusal in (routed.stdout + routed.stderr), (
+        "the config setting should have routed the command to the service, "
+        f"got: {routed.stdout}{routed.stderr}"
+    )
+
+    # Control: the same binary forced to run locally does not try to reach the
+    # service, so the failure above was the routing decision, not the rename.
+    local_env = env.copy()
+    local_env["LORE_USE_SERVICE"] = "0"
+    local = subprocess.run(
+        [str(not_lore), "status"],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+        env=local_env,
+    )
+    assert refusal not in (local.stdout + local.stderr), (
+        f"forcing local execution should not route to the service: "
+        f"{local.stdout}{local.stderr}"
+    )
 
 
 @pytest.mark.smoke
