@@ -42,6 +42,9 @@ pub struct ServiceSetUseAutomaticallyArgs {
     enabled: bool,
 }
 
+// TODO: add a `status` command reporting whether the service is running
+// (process::is_running) and whether use_service_automatically is enabled,
+// mirroring the `shared-store info` command.
 #[derive(Subcommand)]
 pub enum ServiceCommands {
     ///Run this process as the service
