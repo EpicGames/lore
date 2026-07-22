@@ -84,3 +84,38 @@ pub fn client_main() -> ExitCode {
 
     return ExitCode::from(result);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command(args: &[&str]) -> LoreCommands {
+        LoreCli::try_parse_from(args)
+            .expect("args should parse")
+            .command
+            .expect("a subcommand should be present")
+    }
+
+    #[test]
+    fn only_service_run_does_work_in_this_process() {
+        // The service process itself keeps the full runtime.
+        assert!(runs_work_in_this_process(&command(&[
+            "lore", "service", "run"
+        ])));
+
+        // Everything else relays to the service and must not be excluded, so it
+        // can be sized lean. The service-control commands run locally but are
+        // light, and a regular command routes through the service.
+        for relaying in [
+            vec!["lore", "service", "start"],
+            vec!["lore", "service", "stop"],
+            vec!["lore", "service", "set-use-automatically", "true"],
+            vec!["lore", "status"],
+        ] {
+            assert!(
+                !runs_work_in_this_process(&command(&relaying)),
+                "{relaying:?} must not be treated as doing work in this process"
+            );
+        }
+    }
+}
