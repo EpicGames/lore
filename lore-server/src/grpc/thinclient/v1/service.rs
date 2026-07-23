@@ -19,6 +19,7 @@ use tonic::Response;
 use tonic::Status;
 use tonic::codegen::tokio_stream::Stream;
 
+use super::content_diff;
 use super::revision_diff;
 use super::revision_info;
 use super::revision_tree;
@@ -88,11 +89,9 @@ impl ThinClientService for LoreThinClientV1Service {
 
     async fn content_diff(
         &self,
-        _request: Request<ContentDiffRequest>,
+        request: Request<ContentDiffRequest>,
     ) -> Result<Response<Self::ContentDiffStream>, Status> {
-        Err(Status::unimplemented(
-            "lore.thin_client.v1.ThinClientService.ContentDiff not yet implemented",
-        ))
+        content_diff::handler(request, self.immutable_store().clone()).await
     }
 
     async fn revision_info(

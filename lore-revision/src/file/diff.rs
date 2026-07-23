@@ -837,7 +837,12 @@ fn emit_diff_event(
     true
 }
 
-fn build_unified_patch(
+/// Build a unified-diff patch between two text bodies, honouring the
+/// whitespace options (normalised comparison, original text emitted).
+/// Returns `None` when the sides are equal under the selected rules.
+/// Public so server-side diff surfaces (the thin-client `ContentDiff`
+/// RPC) produce byte-identical output to the client diff pipeline.
+pub fn build_unified_patch(
     old: &str,
     new: &str,
     from_label: &str,
