@@ -76,8 +76,7 @@ pub(crate) async fn use_service() -> bool {
     }
     let enabled = GlobalConfig::load()
         .await
-        .map(|config| config.use_service_automatically())
-        .unwrap_or(false);
+        .is_ok_and(|config| config.use_service_automatically());
     *USE_SERVICE.write() = Some(enabled);
     enabled
 }

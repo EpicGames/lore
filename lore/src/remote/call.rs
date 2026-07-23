@@ -105,14 +105,13 @@ pub async fn service_call_impl<ArgsType: LoreArgs + Clone + Send + 'static>(
     // Send to an existing service first, and only start one if that fails, so
     // the common path opens a single connection rather than a liveness probe
     // followed by the real one.
-    let connection = match connect_and_send(message_bytes.clone()).await {
-        Ok(connection) => connection,
-        Err(_) => {
-            crate::remote::process::ensure_running()
-                .await
-                .forward::<ServiceCallError>("starting the Lore service")?;
-            connect_and_send(message_bytes).await?
-        }
+    let connection = if let Ok(connection) = connect_and_send(message_bytes.clone()).await {
+        connection
+    } else {
+        crate::remote::process::ensure_running()
+            .await
+            .forward::<ServiceCallError>("starting the Lore service")?;
+        connect_and_send(message_bytes).await?
     };
 
     'read_from_stream: loop {
