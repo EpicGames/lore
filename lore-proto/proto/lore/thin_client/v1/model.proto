@@ -127,7 +127,7 @@ message Revision {
   lore.model.v1.RevisionIdentifier identifier = 2;
   // Free-form commit message.
   string commit_message = 3;
-  // Commit timestamp (Unix epoch seconds). Always commit time, never
+  // Commit timestamp (Unix epoch milliseconds). Always commit time, never
   // authorship time.
   uint64 timestamp = 4;
   // Identity that originally created the revision.

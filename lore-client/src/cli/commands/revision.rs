@@ -131,7 +131,8 @@ pub struct RevisionHistoryArgs {
     #[clap(long, value_name = "branch")]
     branch: Option<String>,
 
-    /// Stop when reaching a revision created before this date (Unix timestamp)
+    /// Stop when reaching a revision created before this date (milliseconds
+    /// since the Unix epoch)
     #[clap(long, value_name = "date", hide = true)]
     date: Option<u64>,
 

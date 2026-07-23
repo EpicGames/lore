@@ -149,7 +149,7 @@ pub struct Repository {
     /// else the authenticated JWT identity).
     #[prost(string, tag = "6")]
     pub creator: ::prost::alloc::string::String,
-    /// Server-assigned creation timestamp (Unix epoch seconds).
+    /// Server-assigned creation timestamp (Unix epoch milliseconds).
     #[prost(uint64, tag = "7")]
     pub created: u64,
     /// Current metadata pointer hash; mutated atomically via
@@ -188,7 +188,7 @@ pub struct Branch {
     /// intent. Server stores verbatim; no enforced vocabulary.
     #[prost(string, tag = "4")]
     pub category: ::prost::alloc::string::String,
-    /// Server-assigned creation timestamp (Unix epoch seconds).
+    /// Server-assigned creation timestamp (Unix epoch milliseconds).
     #[prost(uint64, tag = "5")]
     pub created: u64,
     /// Signature of the current branch tip.

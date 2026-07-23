@@ -42,7 +42,8 @@ pub struct LoreRepositoryDataEventData {
     pub default_branch_name: LoreString,
     /// Name of the user who created the repository.
     pub creator: LoreString,
-    /// Creation time of the repository, in seconds since the Unix epoch.
+    /// Creation time of the repository, in milliseconds since the Unix
+    /// epoch.
     pub created: u64,
 }
 
