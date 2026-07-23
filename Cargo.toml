@@ -194,4 +194,5 @@ debug-assertions = false
 debug-assertions = false
 
 [patch.crates-io]
+diffy = { path = "vendor/diffy" }
 quinn-proto = { path = "vendor/quinn-proto" }

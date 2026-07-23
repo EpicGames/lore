@@ -29,6 +29,9 @@ repos:
     hooks:
       - id: end-of-file-fixer
       - id: trailing-whitespace
+        # vendor/diffy is pristine upstream source; its diff tests contain
+        # semantically significant trailing whitespace
+        exclude: vendor/diffy
       - id: check-executables-have-shebangs
       # Ignore for now until executable flag handling is easier in Lore
       # - id: check-shebang-scripts-are-executable
@@ -45,8 +48,9 @@ repos:
     rev: v1.5.5
     hooks:
       - id: remove-tabs
-        # lore-core/native uses clangformat, which expects to use tabs so leave that path alone
-        exclude: lore-core/native
+        # lore-core/native uses clangformat, which expects to use tabs so leave that path alone;
+        # vendor/diffy is pristine upstream source (tab-indented LICENSE text)
+        exclude: lore-core/native|vendor/diffy
 
   - repo: https://github.com/shellcheck-py/shellcheck-py
     rev: v0.10.0.1
