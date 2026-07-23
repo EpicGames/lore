@@ -549,6 +549,7 @@ pub async fn read_into(
         let (_, decompressed) = compress::decompress_async(fragment, buffer)
             .await
             .map_err(|e| StorageError::internal_with_context(e, "decompress failed"))?;
+        let decompressed = decompressed.freeze().slice(range);
         if slice.len() != decompressed.len() {
             return Err(StorageError::internal(format!(
                 "unexpected size: slice {} vs decompressed {}",
@@ -558,6 +559,7 @@ pub async fn read_into(
         }
         slice.copy_from_slice(decompressed.as_ref());
     } else {
+        let buffer = buffer.slice(range);
         if slice.len() != buffer.len() {
             return Err(StorageError::internal(format!(
                 "unexpected size: slice {} vs buffer {}",
@@ -949,5 +951,54 @@ mod tests {
             matches!(err, StorageError::AddressNotFound(_)),
             "expected AddressNotFound, got {err:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_into_single_fragment_respects_range() {
+        let (_dir, store) = make_test_store().await;
+
+        let mut payload = vec![0u8; 100];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+
+        let hash_value = hash::hash_slice(&payload);
+        let partition = Partition::from([0; 16]);
+        let address = Address {
+            hash: hash_value,
+            context: Context::from([0; 16]),
+        };
+        let fragment = Fragment {
+            flags: FragmentFlags::PayloadStoredLocal.bits(),
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+
+        store
+            .clone()
+            .put(
+                partition,
+                address,
+                fragment,
+                Some(Bytes::from(payload.clone())),
+                false,
+            )
+            .await
+            .expect("put test data");
+
+        let mut out = [0u8; 40];
+        read_into(
+            store,
+            partition,
+            address,
+            Some(10..50),
+            &mut out,
+            ReadOptions::default().no_verify(),
+            None,
+        )
+        .await
+        .expect("read_into should respect range");
+
+        assert_eq!(&out[..], &payload[10..50]);
     }
 }
