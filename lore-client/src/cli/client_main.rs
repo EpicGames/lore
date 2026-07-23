@@ -49,7 +49,6 @@ pub fn client_main() -> ExitCode {
         cli.non_interactive,
     );
 
-    lore::log::initialize();
     lore::log::configure(&log_config);
 
     if let Some(max_threads) = cli.max_threads {
