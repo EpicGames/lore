@@ -106,6 +106,20 @@ pub fn will_use_service() -> bool {
     enabled
 }
 
+/// Sizes the shared runtime before an FFI entry point first builds it: lean when
+/// the call will be relayed to the service, so an embedder whose first call is a
+/// routed API does not build the full runtime it never uses. A no-op once the
+/// runtime exists, and when the service is not in use. The routed operations all
+/// relay and the local ones (`service start`/`stop`/`set-use-automatically`) are
+/// lightweight, so the lean runtime suits both.
+fn size_runtime_for_dispatch() {
+    if will_use_service() {
+        drop(lore_base::runtime::runtime_with_settings(Some(
+            lore_base::runtime::TokioSettings::relay_only(),
+        )));
+    }
+}
+
 pub(crate) fn run_synchronously<
     ArgsType: InvokableLoreArgs + Clone + Send + 'static,
     Handler: Fn(LoreGlobalArgs, ArgsType, LoreEventCallback) -> Fut,
@@ -116,6 +130,7 @@ pub(crate) fn run_synchronously<
     callback: LoreEventCallbackConfig,
     handler: Handler,
 ) -> i32 {
+    size_runtime_for_dispatch();
     let callback = lore_revision::event::convert_event_callback(callback);
     let globals = globals.clone();
     let args = args.clone();
@@ -132,6 +147,7 @@ pub(crate) fn run_asynchronously<
     callback: LoreEventCallbackConfig,
     handler: Handler,
 ) {
+    size_runtime_for_dispatch();
     let callback = lore_revision::event::convert_event_callback(callback);
     let globals = globals.clone();
     let args = args.clone();
