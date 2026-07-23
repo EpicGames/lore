@@ -6,14 +6,14 @@ readme = "README.md"
 classifiers = ["Private :: Do Not Upload"]
 requires-python = ">=3.13"
 dependencies = [
-    "grpcio>=1.81.0",
+    "grpcio>=1.82.1",
     "pytest>=8.4.2",
-    "pytest-json-ctrf>=0.3.6",
+    "pytest-json-ctrf>=0.5.2",
     "pytest-xdist>=3.8.0",
 ]
 
 [dependency-groups]
-dev = ["ruff>=0.9.6", "pyright>=1.1.396"]
+dev = ["ruff>=0.15.21", "pyright>=1.1.411"]
 
 [tool.ruff]
 target-version = "py313"
