@@ -5,10 +5,22 @@ use clap::CommandFactory;
 use clap::Parser;
 
 use crate::cli::LoreCli;
+use crate::cli::LoreCommands;
 use crate::cli::handle_lore_commands;
 use crate::cli::lore_globals_from_args;
+use crate::commands::service::ServiceCommands;
 use crate::config::setup_config;
 use crate::logging;
+
+/// Whether this command does its own work rather than relaying it to the Lore
+/// service. Only `service run` does: it *is* the service, so it needs the full
+/// complement of threads however the calling user has configured routing.
+fn runs_work_in_this_process(command: &LoreCommands) -> bool {
+    matches!(
+        command,
+        LoreCommands::Service(args) if matches!(args.command, ServiceCommands::Run(_))
+    )
+}
 
 pub fn client_main() -> ExitCode {
     #[cfg(target_family = "windows")]
@@ -56,6 +68,10 @@ pub fn client_main() -> ExitCode {
         lore::set_thread_limit(max_threads);
     }
 
+    if !runs_work_in_this_process(cli_command) && lore::will_use_service() {
+        lore::size_threads_for_relaying();
+    }
+
     let globals = lore_globals_from_args(&cli);
 
     let result = handle_lore_commands(cli_command, globals);
@@ -67,4 +83,39 @@ pub fn client_main() -> ExitCode {
     }
 
     return ExitCode::from(result);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn command(args: &[&str]) -> LoreCommands {
+        LoreCli::try_parse_from(args)
+            .expect("args should parse")
+            .command
+            .expect("a subcommand should be present")
+    }
+
+    #[test]
+    fn only_service_run_does_work_in_this_process() {
+        // The service process itself keeps the full runtime.
+        assert!(runs_work_in_this_process(&command(&[
+            "lore", "service", "run"
+        ])));
+
+        // Everything else relays to the service and must not be excluded, so it
+        // can be sized lean. The service-control commands run locally but are
+        // light, and a regular command routes through the service.
+        for relaying in [
+            vec!["lore", "service", "start"],
+            vec!["lore", "service", "stop"],
+            vec!["lore", "service", "set-use-automatically", "true"],
+            vec!["lore", "status"],
+        ] {
+            assert!(
+                !runs_work_in_this_process(&command(&relaying)),
+                "{relaying:?} must not be treated as doing work in this process"
+            );
+        }
+    }
 }

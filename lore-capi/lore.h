@@ -4940,16 +4940,21 @@ typedef struct lore_storage_upload_args_t {
   struct lore_storage_upload_item_array_t items;
 } lore_storage_upload_args_t;
 
-// Arguments for starting the Lore service process for the current repository (no parameters).
+// Arguments for starting the Lore service process (no parameters).
 typedef struct lore_service_start_args_t {
   int _unused;
 } lore_service_start_args_t;
 
-// Arguments for stopping the Lore service process for the current or all repositories.
+// Arguments for stopping the Lore service process (no parameters).
 typedef struct lore_service_stop_args_t {
-  // Stop all repositories rather than just the current one
-  uint8_t all;
+  int _unused;
 } lore_service_stop_args_t;
+
+// Arguments for setting whether Lore automatically routes calls through the service process.
+typedef struct lore_service_set_use_automatically_args_t {
+  // Automatically use the service process
+  uint8_t enabled;
+} lore_service_set_use_automatically_args_t;
 
 // Arguments for subscribing to repository notifications (no parameters).
 typedef struct lore_notification_subscribe_args_t {
@@ -10471,6 +10476,49 @@ int32_t lore_service_stop(const struct lore_global_args_t *globals,
 void lore_service_stop_async(const struct lore_global_args_t *globals,
                              const struct lore_service_stop_args_t *args,
                              struct lore_event_callback_config_t callback);
+
+// Set whether Lore automatically routes calls through the background service.
+//
+// When enabled, every Lore call is executed by the service process, which is
+// started automatically if it is not already running.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+int32_t lore_service_set_use_automatically(const struct lore_global_args_t *globals,
+                                           const struct lore_service_set_use_automatically_args_t *args,
+                                           struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_service_set_use_automatically`.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+void lore_service_set_use_automatically_async(const struct lore_global_args_t *globals,
+                                              const struct lore_service_set_use_automatically_args_t *args,
+                                              struct lore_event_callback_config_t callback);
 
 // Subscribe to repository notifications.
 //

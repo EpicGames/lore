@@ -3,10 +3,12 @@
 import logging
 import os
 import platform
+import shutil
+import signal
+import subprocess
 
 import pytest
 
-from error_types import ServiceCallError
 from lore import Lore
 
 logger = logging.getLogger(__name__)
@@ -18,15 +20,143 @@ def service_supported():
     return platform.system() in ("Windows", "Linux", "Darwin")
 
 
+def run_lore(lore_executable_path, args, global_dir):
+    """Runs the Lore CLI with an isolated global config directory."""
+    environment = os.environ.copy()
+    environment["LORE_GLOBAL_PATH"] = global_dir
+    return subprocess.run(
+        [lore_executable_path, *args],
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+
+@pytest.fixture
+def stopped_service(lore_executable_path, global_dir_name):
+    """Leaves no service process behind.
+
+    The socket is per user rather than per test, so a service surviving one
+    test would be picked up by the next one.
+    """
+    yield
+    run_lore(lore_executable_path, ["service", "stop"], global_dir_name)
+
+
 @pytest.mark.smoke
 @pytest.mark.xdist_group("lore_service")
-@pytest.mark.skip(reason="Unknown issue specifically running in CI for OSS")
 @pytest.mark.skipif(
     not service_supported(), reason="Service not supported on " + platform.system()
 )
-def test_service_down(new_lore_repo):
-    with pytest.raises(ServiceCallError):
-        new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+def test_service_start_stop(lore_executable_path, global_dir_name, stopped_service):
+    start = run_lore(lore_executable_path, ["service", "start"], global_dir_name)
+    assert start.returncode == 0, start.stdout + start.stderr
+
+    # Starting again is a no-op rather than an error, because a service is
+    # already listening.
+    again = run_lore(lore_executable_path, ["service", "start"], global_dir_name)
+    assert again.returncode == 0, again.stdout + again.stderr
+
+    stop = run_lore(lore_executable_path, ["service", "stop"], global_dir_name)
+    assert stop.returncode == 0, stop.stdout + stop.stderr
+
+    # Stopping when nothing is running is also a no-op.
+    stop_again = run_lore(lore_executable_path, ["service", "stop"], global_dir_name)
+    assert stop_again.returncode == 0, stop_again.stdout + stop_again.stderr
+
+
+@pytest.mark.smoke
+@pytest.mark.xdist_group("lore_service")
+@pytest.mark.skipif(
+    not service_supported(), reason="Service not supported on " + platform.system()
+)
+def test_service_set_use_automatically(lore_executable_path, global_dir_name):
+    config_path = os.path.join(global_dir_name, "config", "config.toml")
+
+    enable = run_lore(
+        lore_executable_path,
+        ["service", "set-use-automatically", "true"],
+        global_dir_name,
+    )
+    assert enable.returncode == 0, enable.stdout + enable.stderr
+    with open(config_path, encoding="utf-8") as config_file:
+        assert "use_service_automatically = true" in config_file.read()
+
+    disable = run_lore(
+        lore_executable_path,
+        ["service", "set-use-automatically", "false"],
+        global_dir_name,
+    )
+    assert disable.returncode == 0, disable.stdout + disable.stderr
+    with open(config_path, encoding="utf-8") as config_file:
+        assert "use_service_automatically" not in config_file.read()
+
+
+@pytest.mark.smoke
+@pytest.mark.xdist_group("lore_service")
+@pytest.mark.skipif(
+    not service_supported(), reason="Service not supported on " + platform.system()
+)
+def test_config_setting_routes_to_service(
+    lore_executable_path, global_dir_name, tmp_path, stopped_service
+):
+    """The use_service_automatically config setting routes commands through the
+    service, without the LORE_USE_SERVICE override.
+
+    Everything runs against the test's isolated LORE_GLOBAL_PATH, so the
+    developer's real global config is never read or written. Routing is proven
+    without starting a real daemon: a binary not named `lore` refuses to
+    auto-start the service, so a command that tries to route fails with that
+    refusal, while the same binary forced to run locally does not.
+    """
+    refusal = "start the Lore service automatically"
+
+    # No service must be listening, so a routed command takes the auto-start
+    # path where a non-`lore` binary refuses.
+    run_lore(lore_executable_path, ["service", "stop"], global_dir_name)
+
+    enable = run_lore(
+        lore_executable_path,
+        ["service", "set-use-automatically", "true"],
+        global_dir_name,
+    )
+    assert enable.returncode == 0, enable.stdout + enable.stderr
+
+    binary_name = "notlore.exe" if platform.system() == "Windows" else "notlore"
+    not_lore = tmp_path / binary_name
+    shutil.copy(lore_executable_path, not_lore)
+    not_lore.chmod(0o755)
+
+    env = os.environ.copy()
+    env["LORE_GLOBAL_PATH"] = global_dir_name
+
+    routed = subprocess.run(
+        [str(not_lore), "status"],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+        env=env,
+    )
+    assert refusal in (routed.stdout + routed.stderr), (
+        "the config setting should have routed the command to the service, "
+        f"got: {routed.stdout}{routed.stderr}"
+    )
+
+    # Control: the same binary forced to run locally does not try to reach the
+    # service, so the failure above was the routing decision, not the rename.
+    local_env = env.copy()
+    local_env["LORE_USE_SERVICE"] = "0"
+    local = subprocess.run(
+        [str(not_lore), "status"],
+        capture_output=True,
+        text=True,
+        cwd=str(tmp_path),
+        env=local_env,
+    )
+    assert refusal not in (local.stdout + local.stderr), (
+        f"forcing local execution should not route to the service: "
+        f"{local.stdout}{local.stderr}"
+    )
 
 
 @pytest.mark.smoke
@@ -123,3 +253,86 @@ def test_service_resolves_relative_paths_against_caller(
     assert "A " + file_name in map(
         lambda line: line.strip(" "), status_output.splitlines()
     ), f"Staged file should show as added: {status_output}"
+
+
+@pytest.mark.smoke
+@pytest.mark.xdist_group("lore_service")
+@pytest.mark.skipif(
+    not service_supported(), reason="Service not supported on " + platform.system()
+)
+def test_service_starts_on_demand(new_lore_repo, stopped_service):
+    """A call routed to the service starts one when none is running.
+
+    This replaces an older test asserting the opposite: before automatic
+    start-up, the same call failed with a connection error.
+    """
+    repo: Lore = new_lore_repo(environment_vars=LORE_SERVICE_ENVIRONMENT.copy())
+
+    file_name = "test.uasset"
+    with repo.open_file(file_name, "w+b") as output_file:
+        output_file.write(os.urandom(30))
+
+    repo.stage(scan=True)
+
+    assert "A " + file_name in map(
+        lambda line: line.strip(" "), repo.status().splitlines()
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.xdist_group("lore_service")
+@pytest.mark.skipif(
+    platform.system() not in ("Linux", "Darwin"),
+    reason="POSIX termination signals",
+)
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+def test_service_shuts_down_gracefully_on_signal(
+    lore_service_in_directory, tmp_path, sig
+):
+    """A termination signal stops the service cleanly, exiting with code 0."""
+    service_directory = tmp_path / f"service_{sig}"
+    service_directory.mkdir()
+    service_process = lore_service_in_directory(service_directory)
+
+    service_process.send_signal(sig)
+    try:
+        code = service_process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        service_process.kill()
+        pytest.fail(f"the service did not exit on {sig!r}")
+    assert code == 0, f"the service should exit cleanly on {sig!r}, got {code}"
+
+
+@pytest.mark.smoke
+@pytest.mark.xdist_group("lore_service")
+@pytest.mark.skipif(
+    not service_supported(), reason="Service not supported on " + platform.system()
+)
+def test_concurrent_service_stop_all_succeed(
+    lore_executable_path, global_dir_name, stopped_service
+):
+    """Two stops racing one live service both report success.
+
+    The one whose send finds the service already gone must still exit 0 rather
+    than fail on the closed connection.
+    """
+    env = os.environ.copy()
+    env["LORE_GLOBAL_PATH"] = global_dir_name
+
+    for _ in range(3):
+        start = run_lore(lore_executable_path, ["service", "start"], global_dir_name)
+        assert start.returncode == 0, start.stdout + start.stderr
+
+        stops = [
+            subprocess.Popen(
+                [lore_executable_path, "service", "stop"],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(2)
+        ]
+        for stop in stops:
+            out, err = stop.communicate(timeout=15)
+            assert stop.returncode == 0, f"a concurrent stop failed: {out}{err}"

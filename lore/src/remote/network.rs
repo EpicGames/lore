@@ -80,6 +80,10 @@ mod tests {
     }
 
     fn run_both() -> String {
+        crate::remote::set_service_socket_name_for_test(&format!(
+            "lore_service_test_{}",
+            std::process::id()
+        ));
         let (sender, receiver) = std::sync::mpsc::channel::<()>();
         let service = std::thread::spawn(move || run_service(sender));
         receiver.recv().unwrap();

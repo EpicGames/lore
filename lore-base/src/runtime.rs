@@ -541,6 +541,15 @@ pub struct TokioSettings {
     #[serde(default = "default_thread_keep_alive")]
     pub thread_keep_alive_seconds: u64,
     pub worker_threads: Option<usize>,
+    /// Whether to build the rayon compute pool up front. Turning this off does
+    /// not make the pool unavailable: [`compute_pool`] still builds it on first
+    /// use, so this only decides whether its threads are paid for eagerly.
+    #[serde(default = "default_eager_compute_pool")]
+    pub eager_compute_pool: bool,
+}
+
+fn default_eager_compute_pool() -> bool {
+    true
 }
 
 impl Default for TokioSettings {
@@ -549,6 +558,23 @@ impl Default for TokioSettings {
             max_blocking_threads: default_blocking_threads(),
             thread_keep_alive_seconds: default_thread_keep_alive(),
             worker_threads: None,
+            eager_compute_pool: true,
+        }
+    }
+}
+
+impl TokioSettings {
+    /// Settings for a process that only relays work elsewhere, such as a client
+    /// whose calls all execute in the Lore service. Sized for IPC rather than
+    /// for doing the work, and with no compute pool, which such a process never
+    /// touches. Each pool keeps [`MIN_THREADS_PER_POOL`] so that neither can
+    /// starve the other.
+    pub fn relay_only() -> Self {
+        TokioSettings {
+            max_blocking_threads: MIN_THREADS_PER_POOL,
+            thread_keep_alive_seconds: default_thread_keep_alive(),
+            worker_threads: Some(MIN_THREADS_PER_POOL),
+            eager_compute_pool: false,
         }
     }
 }
@@ -563,6 +589,38 @@ pub fn runtime() -> Handle {
 /// If no runtime exists yet, creates one with the provided settings (or defaults if `None`).
 /// If a tokio runtime is already active on the current thread, returns its handle instead.
 /// Respects the `LORE_WORKER_THREADS` environment variable for overriding worker thread count.
+/// The number of tokio worker threads a runtime with these settings is built
+/// with. Precedence: the `LORE_WORKER_THREADS` env override, then an explicit
+/// positive count in the settings, then the budget-derived default. Always a
+/// concrete count, because leaving it unset makes tokio use the raw core count
+/// and ignore the thread limit.
+fn resolve_worker_threads(settings: &TokioSettings) -> usize {
+    match (
+        env_thread_override("LORE_WORKER_THREADS"),
+        settings.worker_threads,
+    ) {
+        (Some(val), _) => val,
+        (None, Some(val)) if val > 0 => val,
+        _ => default_worker_threads(),
+    }
+}
+
+/// Builds a fresh multi-thread tokio runtime from the settings. Does not touch
+/// the shared runtime or the compute pool, so it is safe to call in isolation.
+fn build_tokio_runtime(settings: &TokioSettings) -> tokio::runtime::Runtime {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
+        .enable_all()
+        .max_blocking_threads(settings.max_blocking_threads)
+        .thread_keep_alive(Duration::from_secs(settings.thread_keep_alive_seconds))
+        .thread_name_fn(|| {
+            static ID: AtomicUsize = AtomicUsize::new(0);
+            format!("lore-tokio-{}", ID.fetch_add(1, Ordering::Relaxed))
+        })
+        .worker_threads(resolve_worker_threads(settings));
+    builder.build().expect("Failed to create runtime")
+}
+
 pub fn runtime_with_settings(settings: Option<TokioSettings>) -> Handle {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle
@@ -572,38 +630,19 @@ pub fn runtime_with_settings(settings: Option<TokioSettings>) -> Handle {
             runtime.handle().clone()
         } else {
             let settings = settings.unwrap_or_default();
-            let mut builder = tokio::runtime::Builder::new_multi_thread();
-            builder
-                .enable_all()
-                .max_blocking_threads(settings.max_blocking_threads)
-                .thread_keep_alive(Duration::from_secs(settings.thread_keep_alive_seconds))
-                .thread_name_fn(|| {
-                    static ID: AtomicUsize = AtomicUsize::new(0);
-                    format!("lore-tokio-{}", ID.fetch_add(1, Ordering::Relaxed))
-                });
-            // Always set an explicit count, else tokio would default to the raw
-            // core count and ignore the thread limit. Precedence: env override,
-            // explicit setting, budget-derived default.
-            let worker_threads = match (
-                env_thread_override("LORE_WORKER_THREADS"),
-                settings.worker_threads,
-            ) {
-                (Some(val), _) => val,
-                (None, Some(val)) if val > 0 => val,
-                _ => default_worker_threads(),
-            };
-            builder.worker_threads(worker_threads);
-            let runtime = builder.build().expect("Failed to create runtime");
+            let runtime = build_tokio_runtime(&settings);
             let handle = runtime.handle().clone();
             *default_runtime = Some(runtime);
 
             // Build the compute pool off-thread so runtime creation isn't
             // blocked on spawning N rayon workers. No LORE_CONTEXT is active
             // yet, so Handle::spawn directly rather than lore_spawn!.
-            #[allow(clippy::disallowed_methods)]
-            handle.spawn(async {
-                let _ = COMPUTE_POOL.get_or_init(build_compute_pool);
-            });
+            if settings.eager_compute_pool {
+                #[allow(clippy::disallowed_methods)]
+                handle.spawn(async {
+                    let _ = COMPUTE_POOL.get_or_init(build_compute_pool);
+                });
+            }
 
             handle
         }
@@ -693,6 +732,7 @@ mod tests {
             max_blocking_threads: 4,
             thread_keep_alive_seconds: 5,
             worker_threads: Some(2),
+            eager_compute_pool: true,
         };
         let handle = runtime_with_settings(Some(settings));
         handle.block_on(async {
@@ -706,6 +746,55 @@ mod tests {
         assert_eq!(counts.worker, 8);
         assert_eq!(counts.blocking, std::cmp::min(2 * (8 + 1), 128));
         assert_eq!(counts.compute, 7);
+    }
+
+    #[test]
+    fn relay_only_settings_are_minimal() {
+        let relay = TokioSettings::relay_only();
+        assert_eq!(relay.worker_threads, Some(MIN_THREADS_PER_POOL));
+        assert_eq!(relay.max_blocking_threads, MIN_THREADS_PER_POOL);
+        assert!(
+            !relay.eager_compute_pool,
+            "a relay process never touches the compute pool, so it must not build it eagerly"
+        );
+        assert!(
+            TokioSettings::default().eager_compute_pool,
+            "a full runtime builds the compute pool eagerly"
+        );
+    }
+
+    #[test]
+    fn relay_runtime_is_smaller_than_full() {
+        // The env override, if set in the test environment, would defeat the
+        // per-settings worker count both branches resolve, so skip then.
+        if env_thread_override("LORE_WORKER_THREADS").is_some() {
+            return;
+        }
+
+        let relay = build_tokio_runtime(&TokioSettings::relay_only());
+        let full = build_tokio_runtime(&TokioSettings::default());
+
+        assert_eq!(
+            relay.metrics().num_workers(),
+            MIN_THREADS_PER_POOL,
+            "a relay runtime is sized for IPC, not for doing the work"
+        );
+        assert!(
+            full.metrics().num_workers() >= relay.metrics().num_workers(),
+            "the full runtime is never smaller than the relay one"
+        );
+    }
+
+    #[test]
+    fn built_runtime_honors_resolved_worker_count() {
+        // Independent of any env override: whatever count is resolved is the
+        // count the runtime is actually built with.
+        let settings = TokioSettings::relay_only();
+        let runtime = build_tokio_runtime(&settings);
+        assert_eq!(
+            runtime.metrics().num_workers(),
+            resolve_worker_threads(&settings)
+        );
     }
 
     #[test]

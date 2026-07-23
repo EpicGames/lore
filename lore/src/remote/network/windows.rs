@@ -17,10 +17,10 @@ use windows_sys::Win32::Networking::WinSock::WSAGetLastError;
 use windows_sys::Win32::Storage::FileSystem::DeleteFileW;
 use windows_sys::Win32::Storage::FileSystem::GetTempPathW;
 
-use crate::remote::LORE_SERVICE_SOCKET_NAME;
 use crate::remote::network::UdsAcceptError;
 use crate::remote::network::UdsConnectionError;
 use crate::remote::network::UdsListenerError;
+use crate::remote::service_socket_name;
 
 const LISTENER_BACKLOG: i32 = 10;
 
@@ -190,7 +190,7 @@ fn uds_sock_path() -> Vec<u16> {
     }
     // Append the file name, taking into account the null terminator.
     path.resize(path.len() - 1, 0);
-    path.extend(LORE_SERVICE_SOCKET_NAME.encode_utf16());
+    path.extend(service_socket_name().encode_utf16());
     // Reinsert the null terminator.
     path.push(0);
     path

@@ -6,6 +6,7 @@ use clap::Args;
 use clap::Subcommand;
 use lore::interface::LoreEvent;
 use lore::interface::LoreGlobalArgs;
+use lore::interface::LoreServiceSetUseAutomaticallyArgs;
 use lore::interface::LoreServiceStartArgs;
 use lore::interface::LoreServiceStopArgs;
 use lore::runtime;
@@ -32,22 +33,31 @@ pub struct ServiceRunArgs {}
 pub struct ServiceStartArgs {}
 
 #[derive(Args)]
-pub struct ServiceStopArgs {
-    /// Flag to stop servicing all repositories
-    #[clap(value_name = "all")]
-    all: Option<bool>,
+pub struct ServiceStopArgs {}
+
+#[derive(Args)]
+pub struct ServiceSetUseAutomaticallyArgs {
+    /// Automatically run Lore commands through the service process
+    #[clap(value_name = "enabled", value_parser = clap::value_parser!(bool), action = clap::ArgAction::Set)]
+    enabled: bool,
 }
 
+// TODO: add a `status` command reporting whether the service is running
+// (process::is_running) and whether use_service_automatically is enabled,
+// mirroring the `shared-store info` command.
 #[derive(Subcommand)]
 pub enum ServiceCommands {
     ///Run this process as the service
     Run(ServiceRunArgs),
 
-    /// Start service for a repository
+    /// Start the service process
     Start(ServiceStartArgs),
 
-    /// Stop service for a repository
+    /// Stop the service process
     Stop(ServiceStopArgs),
+
+    /// Set whether to automatically use the service process
+    SetUseAutomatically(ServiceSetUseAutomaticallyArgs),
 }
 
 fn handle_service_run(_globals: LoreGlobalArgs, _args: &ServiceRunArgs) -> u8 {
@@ -81,10 +91,8 @@ fn handle_service_start(globals: LoreGlobalArgs, _args: &ServiceStartArgs) -> u8
     return runtime().block_on(service::start(globals, start_args, callback)) as u8;
 }
 
-fn handle_service_stop(globals: LoreGlobalArgs, args: &ServiceStopArgs) -> u8 {
-    let stop_args = LoreServiceStopArgs {
-        all: if args.all.unwrap_or_default() { 1 } else { 0 },
-    };
+fn handle_service_stop(globals: LoreGlobalArgs, _args: &ServiceStopArgs) -> u8 {
+    let stop_args = LoreServiceStopArgs {};
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
@@ -100,6 +108,28 @@ fn handle_service_stop(globals: LoreGlobalArgs, args: &ServiceStopArgs) -> u8 {
     return runtime().block_on(service::stop(globals, stop_args, callback)) as u8;
 }
 
+fn handle_service_set_use_automatically(
+    globals: LoreGlobalArgs,
+    args: &ServiceSetUseAutomaticallyArgs,
+) -> u8 {
+    let set_args = LoreServiceSetUseAutomaticallyArgs {
+        enabled: u8::from(args.enabled),
+    };
+
+    let callback = output_formatter().unwrap_or(Some(
+        (Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::Complete(_) => {}
+            LoreEvent::Maintenance(data) => {
+                util::handle_maintenance_event(data);
+            }
+            _ => (),
+        }) as EventCallbackFn)
+            .with_defaults(),
+    ));
+
+    return runtime().block_on(service::set_use_automatically(globals, set_args, callback)) as u8;
+}
+
 pub fn handle_service_commands(cmd: &ServiceCommands, globals: LoreGlobalArgs) -> u8 {
     match cmd {
         ServiceCommands::Run(args) => {
@@ -110,6 +140,9 @@ pub fn handle_service_commands(cmd: &ServiceCommands, globals: LoreGlobalArgs) -
         }
         ServiceCommands::Stop(args) => {
             return handle_service_stop(globals, args);
+        }
+        ServiceCommands::SetUseAutomatically(args) => {
+            return handle_service_set_use_automatically(globals, args);
         }
     }
 }

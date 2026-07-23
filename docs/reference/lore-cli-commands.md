@@ -161,6 +161,7 @@ This page is generated from `lore --markdown-help` (CLI `0.8.2-nightly+31`). Eve
 * [`lore service run`↴](#lore-service-run)
 * [`lore service start`↴](#lore-service-start)
 * [`lore service stop`↴](#lore-service-stop)
+* [`lore service set-use-automatically`↴](#lore-service-set-use-automatically)
 * [`lore notification`↴](#lore-notification)
 * [`lore notification subscribe`↴](#lore-notification-subscribe)
 * [`lore completions`↴](#lore-completions)
@@ -219,8 +220,9 @@ This page is generated from `lore --markdown-help` (CLI `0.8.2-nightly+31`). Eve
 * `--compress-limit <count>` — Set maximum number of parallel compress operations
 * `--search-limit <SEARCH_LIMIT>` — Set maximum number of revisions to search when matching or finding revisions
 * `--search-nearest` — Set to search for nearest match when matching revisions
-* `--gc` — Set to run automatic garbage collection on local store in background
+* `--no-gc` — Prevent automatic incremental garbage collection for this command; it otherwise runs in the background on writes. `lore repository gc` always runs a full pass regardless
 * `--sync-data` — Force sync data to storage media during flush
+* `--cache` — Cache fragment payloads fetched from remote in the local store
 * `--non-interactive` — Disable interactive prompts (e.g., per-link commit messages)
 
 
@@ -2598,8 +2600,9 @@ Manage the repository in a service process
 ###### **Subcommands:**
 
 * `run` — Run this process as the service
-* `start` — Start service for a repository
-* `stop` — Stop service for a repository
+* `start` — Start the service process
+* `stop` — Stop the service process
+* `set-use-automatically` — Set whether to automatically use the service process
 
 
 
@@ -2613,7 +2616,7 @@ Run this process as the service
 
 ## `lore service start`
 
-Start service for a repository
+Start the service process
 
 **Usage:** `lore service start`
 
@@ -2621,13 +2624,21 @@ Start service for a repository
 
 ## `lore service stop`
 
-Stop service for a repository
+Stop the service process
 
-**Usage:** `lore service stop [all]`
+**Usage:** `lore service stop`
+
+
+
+## `lore service set-use-automatically`
+
+Set whether to automatically use the service process
+
+**Usage:** `lore service set-use-automatically <enabled>`
 
 ###### **Arguments:**
 
-* `<all>` — Flag to stop servicing all repositories
+* `<enabled>` — Automatically run Lore commands through the service process
 
   Possible values: `true`, `false`
 

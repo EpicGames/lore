@@ -414,6 +414,7 @@ include = [
 "LoreSharedStoreSetUseAutomaticallyArgs" = "lore_shared_store_set_use_automatically_args_t"
 "LoreServiceStartArgs" = "lore_service_start_args_t"
 "LoreServiceStopArgs" = "lore_service_stop_args_t"
+"LoreServiceSetUseAutomaticallyArgs" = "lore_service_set_use_automatically_args_t"
 "LoreStore" = "lore_store_t"
 "LoreStorageCloseArgs" = "lore_storage_close_args_t"
 "LoreStorageFlushArgs" = "lore_storage_flush_args_t"
