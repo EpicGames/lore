@@ -94,7 +94,7 @@ message Repository {
   // Identity that created the repository (caller-supplied when permitted,
   // else the authenticated JWT identity).
   string creator = 6;
-  // Server-assigned creation timestamp (Unix epoch seconds).
+  // Server-assigned creation timestamp (Unix epoch milliseconds).
   uint64 created = 7;
   // Current metadata pointer hash; mutated atomically via
   // RepositoryMetadataSet.
@@ -117,7 +117,7 @@ message Branch {
   // Free-form caller-defined tag for grouping or filtering branches by
   // intent. Server stores verbatim; no enforced vocabulary.
   string category = 4;
-  // Server-assigned creation timestamp (Unix epoch seconds).
+  // Server-assigned creation timestamp (Unix epoch milliseconds).
   uint64 created = 5;
   // Signature of the current branch tip.
   bytes latest = 6;

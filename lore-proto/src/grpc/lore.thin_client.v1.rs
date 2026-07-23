@@ -138,7 +138,7 @@ pub struct Revision {
     /// Free-form commit message.
     #[prost(string, tag = "3")]
     pub commit_message: ::prost::alloc::string::String,
-    /// Commit timestamp (Unix epoch seconds). Always commit time, never
+    /// Commit timestamp (Unix epoch milliseconds). Always commit time, never
     /// authorship time.
     #[prost(uint64, tag = "4")]
     pub timestamp: u64,
