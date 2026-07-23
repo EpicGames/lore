@@ -1696,7 +1696,7 @@ Specific file paths are checked against the filesystem and staged if content dif
 
 `--scan` walks the filesystem under the given paths, marks every detected modification/add/delete dirty, and stages them in one step.
 
-**Usage:** `lore file stage [OPTIONS] <paths|--targets <file>>
+**Usage:** `lore file stage [OPTIONS] [paths|--targets <file>]
        stage [OPTIONS] <COMMAND>`
 
 ###### **Subcommands:**
@@ -1725,6 +1725,8 @@ Specific file paths are checked against the filesystem and staged if content dif
    Detected changes are marked dirty and staged in a single pass. Use this when changes were made externally (without going through `lore dirty`), or to recover after losing track of dirty state. Equivalent in effect to running `lore status --scan` followed by `lore stage`, but performed in one traversal.
 
    Without `--scan`, directory staging stages only files already marked dirty under that directory — mark them first with `lore dirty <paths>`, or run `lore status --scan` to reconcile dirty flags across a tree. Single-file stage paths are always checked against the filesystem regardless of this flag.
+
+   With `--scan` and no path, `lore` reconciles and stages the entire working tree from the repository root, matching the bulk reconciliation `lore dirty` recommends.
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 
 
@@ -2261,7 +2263,7 @@ Specific file path: checked against the filesystem and staged if its on-disk con
 
 `--scan`: forces a filesystem walk under the given paths, marks modified, added, and deleted files dirty, and stages them in one step. Use this when changes were made externally without going through `lore dirty`, or to recover after losing track of dirty state.
 
-**Usage:** `lore stage [OPTIONS] <paths|--targets <file>>
+**Usage:** `lore stage [OPTIONS] [paths|--targets <file>]
        stage [OPTIONS] <COMMAND>`
 
 ###### **Subcommands:**
@@ -2290,6 +2292,8 @@ Specific file path: checked against the filesystem and staged if its on-disk con
    Detected changes are marked dirty and staged in a single pass. Use this when changes were made externally (without going through `lore dirty`), or to recover after losing track of dirty state. Equivalent in effect to running `lore status --scan` followed by `lore stage`, but performed in one traversal.
 
    Without `--scan`, directory staging stages only files already marked dirty under that directory — mark them first with `lore dirty <paths>`, or run `lore status --scan` to reconcile dirty flags across a tree. Single-file stage paths are always checked against the filesystem regardless of this flag.
+
+   With `--scan` and no path, `lore` reconciles and stages the entire working tree from the repository root, matching the bulk reconciliation `lore dirty` recommends.
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 
 
