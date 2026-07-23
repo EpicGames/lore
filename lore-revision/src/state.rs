@@ -4722,6 +4722,30 @@ async fn apply_pending_discards(
         }
 
         let initial_ancestor = discard_node.parent;
+
+        // For a directory, discard the whole subtree below it first so its node
+        // slots are reclaimed; the node itself is unlinked from its parent and
+        // discarded by node_discard_patch below. Each child's sibling pointer is
+        // captured before discarding it, since discard_node repurposes that
+        // pointer for the block's free list.
+        if discard_node.is_directory() {
+            let mut child_ref = discard_node.child();
+            while let Some(child_id) = child_ref {
+                let child_node = state.node(repository.clone(), child_id).await?;
+                let next_sibling = child_node.sibling();
+                node_discard_recurse(
+                    state.clone(),
+                    repository.clone(),
+                    child_id,
+                    true, /* recurse */
+                    true, /* discard */
+                    |_, _| {},
+                )
+                .await?;
+                child_ref = next_sibling;
+            }
+        }
+
         node_discard_patch(
             state.clone(),
             repository.clone(),
@@ -5644,6 +5668,14 @@ async fn emit_filesystem_subtree_deletes(
     Ok(false)
 }
 
+/// Match each filesystem item from `file_receiver` against `node_list` (the
+/// `from` state's children) and `current_node_list` (the `current` state's
+/// children), emitting changes into `changes`, marking matched entries in
+/// `node_list_found`, spawning subtree-recursion tasks into `tasks`, and
+/// queueing stale directory nodes into `pending_discards`. Items with no
+/// match in `node_list` are buffered and processed as new adds once the
+/// receiver is drained. `node_list` and `current_node_list` must be sorted by
+/// name; the binary searches here rely on that ordering.
 #[allow(clippy::too_many_arguments)]
 async fn diff_filesystem_directory_walk(
     ctx: &DiffFilesystemContext,
@@ -5975,6 +6007,25 @@ async fn diff_filesystem_directory_walk(
             continue;
         };
 
+        // Directory staged then removed from disk before any commit: discard it
+        // rather than emit a Delete, since nothing committed backs it.
+        if ctx.scan_dirty && from_node.node.is_directory() {
+            let in_current = current_node_list
+                .children
+                .as_slice()
+                .binary_search_by(|child| child.name.cmp(&from_named_node.name))
+                .is_ok();
+            if !in_current {
+                lore_trace!(
+                    "Queueing reverted uncommitted directory node {} (no entry at {}, not in current)",
+                    from_named_node.node,
+                    from_node.path
+                );
+                pending_discards.push(from_named_node.node);
+                continue;
+            }
+        }
+
         // Emit deletes only for the materialized portion of the subtree,
         // suppressing directories the filter merely descended through but never
         // wrote to disk (see emit_filesystem_subtree_deletes).
@@ -5995,11 +6046,8 @@ async fn diff_filesystem_directory_walk(
             continue;
         }
 
-        // A leaf node present in state_from but not in state_current, with
-        // no file on disk, is an unstaged add that the user reverted by
-        // removing the file. Discard the node so state_staged matches the
-        // filesystem rather than emitting a Delete change for a node that
-        // shouldn't exist.
+        // Leaf staged but absent from both the commit and disk: a reverted
+        // unstaged add. Discard it rather than emit a Delete.
         let in_current = current_node_list
             .children
             .as_slice()

@@ -1187,6 +1187,125 @@ pub async fn status(
         return Ok(());
     }
 
+    // Scan before the staged diff: the scan discards reverted uncommitted
+    // adds from the shared staged state, which the staged diff must not
+    // report as stale adds.
+    if show_scan {
+        lore_debug!(
+            "Calculating deltas against filesystem for {} paths",
+            paths.len()
+        );
+
+        let mut tasks = JoinSet::new();
+        for path in paths.iter() {
+            let repository = repository.clone();
+            let state_current = state_current.clone();
+            let state_staged = state_staged.clone();
+            let path = path.clone();
+            let layer_mounts = layer_mounts.clone();
+            let summary = summary.clone();
+            let exists = if let Some(path) = path.as_ref() {
+                let mut exists_in_state = false;
+                let mut exists_in_filesystem = false;
+
+                let state = if has_staged {
+                    state_staged.clone()
+                } else {
+                    state_current.clone()
+                };
+
+                let node_link = state
+                    .find_node_link(repository.clone(), path.as_str())
+                    .await
+                    .unwrap_or_default();
+                if node_link.is_valid() {
+                    exists_in_state = true;
+                } else {
+                    let absolute_path = path.to_absolute_path(repository.require_path()?);
+                    exists_in_filesystem = std::fs::exists(absolute_path).unwrap_or_default();
+                }
+
+                if !exists_in_state && !exists_in_filesystem {
+                    emit_path_ignore(path.as_str()).await;
+                    lore_trace!("Ignoring invalid path: {path}");
+                }
+
+                exists_in_state || exists_in_filesystem
+            } else {
+                true
+            };
+
+            if exists {
+                lore_spawn!(tasks, {
+                    async move {
+                        if let Some(path) = path.as_ref() {
+                            lore_debug!(
+                                "Calculating deltas against filesystem path: {}",
+                                path.as_str()
+                            );
+                        } else {
+                            lore_debug!(
+                                "Calculating deltas against filesystem for full repository"
+                            );
+                        }
+
+                        let start = Instant::now();
+
+                        // Scan uses staged state as diff base with scan_dirty=true.
+                        // Content hashes in staged state are either zero (add nodes)
+                        // or equal to current revision hashes, so the comparison is
+                        // effectively filesystem vs committed content.
+                        // The current revision is passed as the second pair so the
+                        // walk can distinguish "node exists in staged but not in
+                        // committed" — i.e. unstaged adds — from regular tracked
+                        // files. Dirty flags are set/cleared inline during the walk.
+                        let (changes, _stats) = state::diff_filesystem_ex(
+                            repository.clone(),
+                            state_staged.clone(),
+                            repository.clone(),
+                            state_current.clone(),
+                            path,
+                            FilterMode::Full,
+                            true, // scan_dirty
+                            layer_mounts.clone(),
+                        )
+                        .await
+                        .forward::<StatusError>("computing diff against filesystem")?;
+
+                        lore_debug!(
+                            "Scan found {} file system changes in {:.3}s",
+                            changes.len(),
+                            start.elapsed().as_secs_f64(),
+                        );
+
+                        for change in changes.iter() {
+                            let size =
+                                file_size_from_node_change_path(repository.require_path()?, change)
+                                    .await?;
+
+                            // Emit event for display (dirty set/clear handled inline by diff)
+                            if !change.flags.is_stage() {
+                                summary.classify(change);
+                                event::LoreEvent::RepositoryStatusFile(
+                                    LoreRepositoryStatusFileEventData::from_node_change(
+                                        change, size,
+                                    ),
+                                )
+                                .send();
+                            } else {
+                                lore_debug!("Ignore staged file {}", change.path);
+                            }
+                        }
+
+                        Ok(())
+                    }
+                });
+            }
+
+            lore_drain_tasks!(tasks, StatusError::internal("Recursion task failed"))?;
+        }
+    }
+
     // Compare current state against staged state
     if show_staged && has_staged {
         lore_debug!("Calculating deltas against staged revision");
@@ -1315,123 +1434,6 @@ pub async fn status(
         }
 
         lore_drain_tasks!(tasks, StatusError::internal("Recursion task failed"))?;
-    }
-
-    // Compare current/staged state against filesystem
-    if show_scan {
-        lore_debug!(
-            "Calculating deltas against filesystem for {} paths",
-            paths.len()
-        );
-
-        let mut tasks = JoinSet::new();
-        for path in paths.iter() {
-            let repository = repository.clone();
-            let state_current = state_current.clone();
-            let state_staged = state_staged.clone();
-            let path = path.clone();
-            let layer_mounts = layer_mounts.clone();
-            let summary = summary.clone();
-            let exists = if let Some(path) = path.as_ref() {
-                let mut exists_in_state = false;
-                let mut exists_in_filesystem = false;
-
-                let state = if has_staged {
-                    state_staged.clone()
-                } else {
-                    state_current.clone()
-                };
-
-                let node_link = state
-                    .find_node_link(repository.clone(), path.as_str())
-                    .await
-                    .unwrap_or_default();
-                if node_link.is_valid() {
-                    exists_in_state = true;
-                } else {
-                    let absolute_path = path.to_absolute_path(repository.require_path()?);
-                    exists_in_filesystem = std::fs::exists(absolute_path).unwrap_or_default();
-                }
-
-                if !exists_in_state && !exists_in_filesystem {
-                    emit_path_ignore(path.as_str()).await;
-                    lore_trace!("Ignoring invalid path: {path}");
-                }
-
-                exists_in_state || exists_in_filesystem
-            } else {
-                true
-            };
-
-            if exists {
-                lore_spawn!(tasks, {
-                    async move {
-                        if let Some(path) = path.as_ref() {
-                            lore_debug!(
-                                "Calculating deltas against filesystem path: {}",
-                                path.as_str()
-                            );
-                        } else {
-                            lore_debug!(
-                                "Calculating deltas against filesystem for full repository"
-                            );
-                        }
-
-                        let start = Instant::now();
-
-                        // Scan uses staged state as diff base with scan_dirty=true.
-                        // Content hashes in staged state are either zero (add nodes)
-                        // or equal to current revision hashes, so the comparison is
-                        // effectively filesystem vs committed content.
-                        // The current revision is passed as the second pair so the
-                        // walk can distinguish "node exists in staged but not in
-                        // committed" — i.e. unstaged adds — from regular tracked
-                        // files. Dirty flags are set/cleared inline during the walk.
-                        let (changes, _stats) = state::diff_filesystem_ex(
-                            repository.clone(),
-                            state_staged.clone(),
-                            repository.clone(),
-                            state_current.clone(),
-                            path,
-                            FilterMode::Full,
-                            true, // scan_dirty
-                            layer_mounts.clone(),
-                        )
-                        .await
-                        .forward::<StatusError>("computing diff against filesystem")?;
-
-                        lore_debug!(
-                            "Scan found {} file system changes in {:.3}s",
-                            changes.len(),
-                            start.elapsed().as_secs_f64(),
-                        );
-
-                        for change in changes.iter() {
-                            let size =
-                                file_size_from_node_change_path(repository.require_path()?, change)
-                                    .await?;
-
-                            // Emit event for display (dirty set/clear handled inline by diff)
-                            if !change.flags.is_stage() {
-                                summary.classify(change);
-                                event::LoreEvent::RepositoryStatusFile(
-                                    LoreRepositoryStatusFileEventData::from_node_change(
-                                        change, size,
-                                    ),
-                                )
-                                .send();
-                            } else {
-                                lore_debug!("Ignore staged file {}", change.path);
-                            }
-                        }
-
-                        Ok(())
-                    }
-                });
-            }
-
-            lore_drain_tasks!(tasks, StatusError::internal("Recursion task failed"))?;
-        }
     }
 
     // Emit the aggregate dirty-node summary for reconciling status runs. For
