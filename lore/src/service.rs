@@ -61,7 +61,7 @@ async fn start_local(
             .forward::<ServiceError>("starting the Lore service")?;
         Ok(())
     };
-    no_repository_call(globals, callback, args, "service start", command).await
+    no_repository_call(globals, callback, args, start, command).await
 }
 
 #[repr(C)]
@@ -129,7 +129,7 @@ async fn stop_local(
         }
         Ok(())
     };
-    no_repository_call(globals, callback, args, "service stop", command).await
+    no_repository_call(globals, callback, args, stop, command).await
 }
 
 #[repr(C)]
@@ -185,12 +185,5 @@ async fn set_use_automatically_local(
             invalidate_use_service_cache();
             Ok(())
         };
-    no_repository_call(
-        globals,
-        callback,
-        args,
-        "service set-use-automatically",
-        command,
-    )
-    .await
+    no_repository_call(globals, callback, args, set_use_automatically, command).await
 }
