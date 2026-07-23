@@ -4,6 +4,7 @@ import logging
 import os
 import platform
 import shutil
+import signal
 import subprocess
 
 import pytest
@@ -276,3 +277,62 @@ def test_service_starts_on_demand(new_lore_repo, stopped_service):
     assert "A " + file_name in map(
         lambda line: line.strip(" "), repo.status().splitlines()
     )
+
+
+@pytest.mark.smoke
+@pytest.mark.xdist_group("lore_service")
+@pytest.mark.skipif(
+    platform.system() not in ("Linux", "Darwin"),
+    reason="POSIX termination signals",
+)
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])
+def test_service_shuts_down_gracefully_on_signal(
+    lore_service_in_directory, tmp_path, sig
+):
+    """A termination signal stops the service cleanly, exiting with code 0."""
+    service_directory = tmp_path / f"service_{sig}"
+    service_directory.mkdir()
+    service_process = lore_service_in_directory(service_directory)
+
+    service_process.send_signal(sig)
+    try:
+        code = service_process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        service_process.kill()
+        pytest.fail(f"the service did not exit on {sig!r}")
+    assert code == 0, f"the service should exit cleanly on {sig!r}, got {code}"
+
+
+@pytest.mark.smoke
+@pytest.mark.xdist_group("lore_service")
+@pytest.mark.skipif(
+    not service_supported(), reason="Service not supported on " + platform.system()
+)
+def test_concurrent_service_stop_all_succeed(
+    lore_executable_path, global_dir_name, stopped_service
+):
+    """Two stops racing one live service both report success.
+
+    The one whose send finds the service already gone must still exit 0 rather
+    than fail on the closed connection.
+    """
+    env = os.environ.copy()
+    env["LORE_GLOBAL_PATH"] = global_dir_name
+
+    for _ in range(3):
+        start = run_lore(lore_executable_path, ["service", "start"], global_dir_name)
+        assert start.returncode == 0, start.stdout + start.stderr
+
+        stops = [
+            subprocess.Popen(
+                [lore_executable_path, "service", "stop"],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for _ in range(2)
+        ]
+        for stop in stops:
+            out, err = stop.communicate(timeout=15)
+            assert stop.returncode == 0, f"a concurrent stop failed: {out}{err}"
