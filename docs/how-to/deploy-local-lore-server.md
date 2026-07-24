@@ -39,6 +39,12 @@ The binary and Docker paths are mutually exclusive, and each is complete on its 
     $env:LORE_SERVER=1; irm https://raw.githubusercontent.com/EpicGames/lore/main/scripts/install.ps1 | iex
     ```
 
+    Or install with [Scoop](https://scoop.sh):
+
+    ```powershell
+    scoop install loreserver
+    ```
+
     <!-- tabs:end -->
 
 2. **Run it with default settings.**

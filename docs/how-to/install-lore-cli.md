@@ -39,6 +39,12 @@ Pick this path for a normal install from a published release.
     irm https://raw.githubusercontent.com/EpicGames/lore/main/scripts/install.ps1 | iex
     ```
 
+    Or install with [Scoop](https://scoop.sh):
+
+    ```powershell
+    scoop install lore
+    ```
+
     <!-- tabs:end -->
 
     The installer downloads the binary for your platform and adds it to your PATH. Open a new terminal session for the PATH change to take effect.
