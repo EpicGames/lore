@@ -122,7 +122,8 @@ pub async fn gc(
     max_capacity: usize,
     sync_data: bool,
     sink: Option<GcEventSinkRef>,
-) {
+    grace_period: Option<Duration>,
+) -> Result<(), crate::gc::GcError> {
     let mut at = store.clone().compact_resume_at().await;
 
     if max_size > 0 {
@@ -146,7 +147,7 @@ pub async fn gc(
                 }
                 Err(err) => {
                     lore_base::lore_warn!("Store compactor failed: {err}");
-                    break;
+                    return Err(crate::gc::GcError::CompactionFailed(err.to_string()));
                 }
             }
         }
@@ -154,9 +155,16 @@ pub async fn gc(
     }
 
     if max_capacity > 0 {
-        let _ = store.evict(max_capacity, sync_data, sink).await;
+        // Enforce staging leases and grace period timestamp checking for atomic rollbacks
+        let _transaction = crate::gc_lease::acquire_exclusive_sweep()
+            .map_err(|e| crate::gc::GcError::LeaseDenied(e.to_string()))?;
+            
+        store.evict_with_grace(max_capacity, sync_data, sink, grace_period).await
+            .map_err(|e| crate::gc::GcError::EvictionFailed(e.to_string()))?;
         lore_base::lore_debug!("Store evictor done");
     }
+    
+    Ok(())
 }
 
 /// Per-store running totals, collected purely as a byproduct of LOADING data from
