@@ -1,6 +1,10 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
 
+# Validates a pull request by fanning out the full test suite across every
+# supported platform. Everything here runs on public GitHub-hosted runners with
+# no secrets: the source is checked out from git and all backing services for
+# the integration tests come from public container images.
 name: PR Validate
 
 on:
@@ -13,17 +17,196 @@ concurrency:
   group: pr-validate-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
 jobs:
-  validate:
-    name: validate
-    runs-on: ubuntu-latest
+  # Unit tests: plain `cargo test` across all platforms. The integration-test
+  # suite is feature-gated, so it does not run here.
+  unit:
+    name: unit (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
     permissions:
-      contents: read # Check out the PR head to validate it
+      contents: read # Check out the PR head to test it
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-latest }
+          # TODO: re-enable once the aarch64-linux debug-info method is changed.
+          # `cargo test --workspace` links every test binary with full embedded
+          # DWARF (split-debuginfo=off for aarch64-unknown-linux-gnu in
+          # .cargo/config.toml), so the linker exhausts the 16 GB hosted arm64
+          # runner and it is killed (SIGTERM/143) mid-compile, before any test
+          # runs. Switching that target to split-debuginfo=packed/unpacked (or a
+          # line-tables-only test profile) cuts peak linker memory and lets this
+          # come back. Smoke still covers linux-aarch64 below.
+          # - { name: linux-aarch64, os: ubuntu-24.04-arm }
+          - { name: macos-aarch64, os: macos-latest }
+          - { name: windows-x86_64, os: windows-latest }
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
 
-      # TODO: add validation steps.
-      - name: Validate
-        run: echo "pr-validate stub — no checks yet"
+      # Rust ships preinstalled on the hosted runners; this just pins the stable
+      # channel. Actions below are pinned to SHAs for first-party ones (matching
+      # lint.yml); third-party actions use release tags — pin these to SHAs too
+      # if the repo adopts a stricter supply-chain policy.
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: unit-${{ matrix.name }}
+
+      - name: cargo test
+        run: cargo test --workspace --verbose
+
+  # Integration tests: exercise the AWS store, gRPC, and Consul suites against
+  # local approximations (MinIO, DynamoDB Local, Consul) started via Docker
+  # Compose. Docker is only available on the Linux runners, so this is
+  # Linux-x86_64 only. The tests hard-code 127.0.0.1:9000/9090/8500, which the
+  # compose file maps.
+  integration:
+    name: integration (linux-x86_64)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # Check out the PR head to test it
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: integration
+
+      - name: Start backing services (MinIO, DynamoDB Local, Consul)
+        run: docker compose --file lore-integration-tests/compose.yaml up --detach
+
+      - name: Wait for services to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9000/minio/health/ready \
+               && curl -sf http://127.0.0.1:8500/v1/status/leader \
+               && curl -s -o /dev/null http://127.0.0.1:9090; then
+              echo "services ready"
+              exit 0
+            fi
+            echo "waiting for services (attempt $i)..."
+            sleep 2
+          done
+          echo "services did not become ready in time"
+          exit 1
+
+      - name: cargo test (integration)
+        env:
+          AWS_ACCESS_KEY_ID: lorelocal
+          AWS_SECRET_ACCESS_KEY: lorelocal
+          AWS_REGION: us-east-1
+        run: >
+          cargo test --package lore-integration-tests
+          --features integration_tests --verbose
+
+      - name: Dump service logs on failure
+        if: failure()
+        run: docker compose --file lore-integration-tests/compose.yaml logs
+
+      - name: Stop services
+        if: always()
+        run: docker compose --file lore-integration-tests/compose.yaml down --volumes
+
+  # Smoke tests: the pytest suite under scripts/test (marked `smoke`), run via uv
+  # against locally built release binaries. Runs on every platform. The server is
+  # built with `failure_generator` so fault-injection tests execute rather than
+  # skip.
+  smoke:
+    name: smoke (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read # Check out the PR head to test it
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # basetemp-arg points pytest's working data at the tmpfs mounted below
+          # (Linux only; see the "Grow /dev/shm" step). Empty on macOS/Windows.
+          - { name: linux-x86_64, os: ubuntu-latest, basetemp-arg: "--basetemp=/dev/shm/lore-smoke" }
+          - { name: linux-aarch64, os: ubuntu-24.04-arm, basetemp-arg: "--basetemp=/dev/shm/lore-smoke" }
+          - { name: macos-aarch64, os: macos-latest }
+          # Windows needs explicit loopback ports for the local remote server.
+          - name: windows-x86_64
+            os: windows-latest
+            extra-args: >-
+              --lore-remote-http-port 41339
+              --lore-remote-quic-port 41338
+              --lore-remote-grpc-port 41338
+              --lore-remote-internal-port 41340
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: smoke-${{ matrix.name }}
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Build lore and loreserver (release)
+        run: >
+          cargo build --release
+          --package lore-client --package lore-server
+          --features lore-server/failure_generator
+          --bin lore --bin loreserver
+
+      # Smoke working data (server stores + per-test repos) is disk-I/O heavy and
+      # pytest never cleans it up mid-session, so the full -n 4 suite writes ~10 GB
+      # (dominated by a handful of large-file tests: test_push, test_manyfiles,
+      # test_commit, test_rest, test_branch_switch_reconnect). Hosting it on tmpfs
+      # (RAM) rather than the runner disk speeds up the I/O-bound tests. The hosted
+      # Linux runners have 16 GB RAM; /dev/shm defaults to ~half that (8 GB), which
+      # the suite overflows, so grow it to 12 GB — above the observed footprint,
+      # still leaving headroom for the OS and test processes. tmpfs only consumes
+      # RAM as data is written, so the 12 GB cap is a safety valve, not a reserve.
+      # Linux only: macOS and Windows have no tmpfs (see basetemp-arg above).
+      - name: Grow /dev/shm for smoke test data (tmpfs)
+        if: runner.os == 'Linux'
+        run: sudo mount -o remount,size=12G /dev/shm
+
+      # conftest resolves the `release` keyword to target/release/{lore,loreserver}
+      # (adding .exe on Windows). `uv run` provisions Python and installs the test
+      # dependencies from uv.lock automatically.
+      - name: Smoke tests
+        run: >
+          uv run pytest scripts/test -m smoke -n 4
+          --lore-client-binary release
+          --lore-server-binary release
+          ${{ matrix.basetemp-arg }}
+          ${{ matrix.extra-args }}
+
+  # Single required status check: branch protection can require just this job,
+  # which passes only when every validation job above succeeded.
+  pr-validate:
+    name: PR Validate
+    if: ${{ always() }}
+    needs: [unit, integration, smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all validation jobs passed
+        run: |
+          echo "unit=${{ needs.unit.result }}"
+          echo "integration=${{ needs.integration.result }}"
+          echo "smoke=${{ needs.smoke.result }}"
+          if [ "${{ needs.unit.result }}" != "success" ] \
+             || [ "${{ needs.integration.result }}" != "success" ] \
+             || [ "${{ needs.smoke.result }}" != "success" ]; then
+            echo "One or more validation jobs failed."
+            exit 1
+          fi
+          echo "All validation jobs passed."

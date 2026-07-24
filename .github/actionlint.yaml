@@ -1,0 +1,8 @@
+# actionlint's bundled list of GitHub-hosted runner labels does not yet include
+# the arm64 Linux runner image `ubuntu-24.04-arm`. It is a real GitHub-hosted
+# runner (not self-hosted), but declaring it here is actionlint's supported way
+# to teach it a label it doesn't know, which stops the [runner-label] check from
+# failing the lint hook. Remove once actionlint ships knowledge of this label.
+self-hosted-runner:
+  labels:
+    - ubuntu-24.04-arm
