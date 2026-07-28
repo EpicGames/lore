@@ -593,10 +593,9 @@ async fn leader_body(
     }
 
     // Remote upload if session provided and not already durable. A failed
-    // upload must not be silently downgraded to a local-only write: the caller
-    // (e.g. a commit about to publish a branch) needs to see the error. The
-    // payload is still written to the local store below (non-durable, cached)
-    // so the bytes remain recoverable via `repository push-content`.
+    // upload must not be silently downgraded to a local-only write; the error
+    // must propagate. The payload is still written to the local store below
+    // (non-durable, cached) so the bytes remain locally recoverable.
     let mut upload_error: Option<StorageError> = None;
     if !stored_durable && let Some(session) = remote_session.clone() {
         match remote_put_retry(session, address, fragment, Some(buffer.clone())).await {
@@ -1550,8 +1549,7 @@ mod tests {
             "expected Disconnected, got: {err:?}"
         );
 
-        // The payload must still be written locally (non-durable, cached) so
-        // it stays recoverable via `repository push-content`.
+        // The payload must still be written locally (non-durable, cached).
         let query = store
             .query(partition, address, StoreMatch::MatchFull)
             .await

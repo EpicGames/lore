@@ -1638,13 +1638,7 @@ impl LocalImmutableStore {
                     pack_file = packref.id;
                     pack_offset = packref.offset;
 
-                    // These bytes were just written and are not yet fsynced. If the caller
-                    // is about to record this fragment as `PayloadStoredDurable`, that claim
-                    // must not outrun an actual fsync, or a crash before the next background
-                    // durable-flush tick leaves a "durable" entry pointing at bytes that
-                    // never made it to disk (the mechanism behind a confirmed data-loss
-                    // incident). Wait for the store-wide `durable_flush_loop` ticker to
-                    // confirm this write rather than fsync-per-write.
+                    // These bytes are not yet fsynced; see `durable_flush_tick_ms`'s doc.
                     if self.settings.durable_flush_tick_ms > 0
                         && (fragment_flags & FragmentFlags::PayloadStoredDurable) != 0
                     {
@@ -4013,9 +4007,8 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
 impl LocalImmutableStore {
     /// Enumerate every entry whose payload is stored locally but has not been
     /// confirmed durable on the remote — i.e. `PayloadStoredLocal` set,
-    /// `PayloadStoredDurable` clear, and not obliterated. These are payloads a
-    /// failed/timed-out upload left behind; `repository push-content` uses this
-    /// scan to find what needs re-uploading. Optionally filtered by partition.
+    /// `PayloadStoredDurable` clear, and not obliterated. Optionally filtered by
+    /// partition.
     ///
     /// Deserializes all buckets, so this is a full-store scan.
     pub async fn non_durable_entries(

@@ -485,8 +485,7 @@ fn verify_node_recurse(
 
 /// Check every durability suspect against the remote store: a file's content
 /// that is not confirmed durable locally must exist on the remote, otherwise
-/// the published revision references content other clients cannot fetch (fix
-/// with `repository push-content` on the machine holding the payload).
+/// the published revision references content other clients cannot fetch.
 ///
 /// Skipped when no remote is available (offline/local repository).
 async fn verify_content_durability(
