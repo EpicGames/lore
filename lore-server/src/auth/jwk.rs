@@ -86,7 +86,7 @@ impl JwkServiceImpl {
         let mut cache = self.cached_set.write().await;
 
         // Check to see if the desired key was fetched while we waited for the lock.
-        if desired.map(|d| cache.get(d)).is_some() {
+        if desired.and_then(|d| cache.get(d)).is_some() {
             return Ok(());
         }
 
@@ -187,5 +187,79 @@ impl JWKService for JwkServiceImpl {
 impl InstrumentProvider for JwkServiceImpl {
     fn namespace(&self) -> &'static str {
         "urc.auth.jwk_service"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use axum::Json;
+    use axum::Router;
+    use axum::extract::State;
+    use axum::routing::get;
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    async fn jwks_handler(State(requests): State<Arc<AtomicUsize>>) -> Json<serde_json::Value> {
+        let kid = if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+            "old-kid"
+        } else {
+            "new-kid"
+        };
+
+        Json(json!({
+            "keys": [{
+                "kty": "oct",
+                "use": "sig",
+                "kid": kid,
+                "alg": "HS256",
+                "k": "c2VjcmV0"
+            }]
+        }))
+    }
+
+    async fn spawn_jwks_server(requests: Arc<AtomicUsize>) -> SocketAddr {
+        let app = Router::new()
+            .route("/jwks", get(jwks_handler))
+            .with_state(requests);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test jwks server");
+        let address = listener.local_addr().expect("get test jwks server address");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve test jwks server");
+        });
+
+        address
+    }
+
+    #[tokio::test]
+    async fn fetch_new_keys_refreshes_when_desired_key_is_missing() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let address = spawn_jwks_server(requests.clone()).await;
+        let service = JwkServiceImpl::new(JWKServiceSettings {
+            endpoint: format!("http://{address}/jwks"),
+        });
+
+        service
+            .fetch_new_keys(None)
+            .await
+            .expect("initial key fetch should succeed");
+
+        service
+            .get_key("new-kid")
+            .await
+            .expect("missing desired key should trigger a refresh");
+
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 }
