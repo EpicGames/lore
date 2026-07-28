@@ -22,7 +22,6 @@ use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
 use crate::link;
 use crate::link::LinkContext;
-use crate::link::LinkFlags;
 use crate::link::LinkTracker;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
@@ -548,6 +547,64 @@ async fn unstage_directory(
     Ok(())
 }
 
+async fn unstage_parent_chain(
+    repository: Arc<RepositoryContext>,
+    state_staged: Arc<State>,
+    starting_parent: NodeID,
+    link_tracker: Arc<LinkTracker>,
+    stop_at_staged_add: bool,
+) -> Result<(), UnstageError> {
+    let mut parent_node_id = starting_parent;
+    while !state_staged
+        .node_has_staged_children(repository.clone(), parent_node_id)
+        .await
+        .forward::<UnstageError>("Failed to check node children")?
+    {
+        lore_trace!("Unstage parent node {parent_node_id}");
+
+        let parent_block_index = NodeBlock::index(parent_node_id);
+        let parent_node_index = Node::index(parent_node_id);
+        let parent_block = state_staged
+            .block(repository.clone(), parent_block_index)
+            .await
+            .forward::<UnstageError>("Failed deserializing state node block")?;
+        let parent = parent_block.node(parent_node_index);
+
+        // A parent that is itself a staged ADD is a legitimate independent
+        // staged node (not merely staged to carry a descendant), so leave
+        // it staged — unstaging a child must not unstage the parent.
+        if stop_at_staged_add && parent.is_staged_add() {
+            break;
+        }
+
+        let dirtied = {
+            let mut block_writer = parent_block.write();
+            let parent_node = block_writer.node(parent_node_index);
+            if stop_at_staged_add {
+                parent_node.clear_staged_flags();
+            } else {
+                parent_node.clear_all_change_flags();
+            }
+            block_writer.mark_dirty()
+        };
+
+        link_tracker.on_node_changed(repository.id);
+
+        if dirtied {
+            state_staged.block_modified(parent_block.clone(), parent_block_index);
+            state_staged.mark_dirty();
+        }
+
+        if parent_node_id == ROOT_NODE {
+            break;
+        }
+
+        parent_node_id = parent.parent;
+    }
+
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn unstage_node(
     repository: Arc<RepositoryContext>,
@@ -686,15 +743,16 @@ async fn unstage_node(
                 if node.is_link() {
                     lore_debug!("Discarding staged-add link {found_node_id}");
 
-                    let link_metadata = node.linked_node();
-                    current_state_staged
-                        .link_remove(
-                            current_repository.clone(),
-                            link_metadata.repository,
-                            found_node_id,
-                        )
-                        .await
-                        .forward::<UnstageError>("Failed to remove link registry entry")?;
+                    link::reset::reset_staged_add_link(
+                        current_repository.clone(),
+                        current_state.clone(),
+                        current_state_staged.clone(),
+                        found_node_id,
+                        node,
+                        node_path.clone(),
+                    )
+                    .await
+                    .forward::<UnstageError>("Failed to reset staged-add link")?;
 
                     stats.file_discarded_count.fetch_add(1, Ordering::Relaxed);
                     event::LoreEvent::FileUnstageFile(LoreFileUnstageFileEventData {
@@ -715,6 +773,15 @@ async fn unstage_node(
                         .entry(current_repository.id)
                         .or_default()
                         .push(found_node_id);
+
+                    unstage_parent_chain(
+                        current_repository.clone(),
+                        current_state_staged.clone(),
+                        node.parent,
+                        link_tracker.clone(),
+                        false,
+                    )
+                    .await?;
 
                     return Ok(());
                 }
@@ -761,17 +828,36 @@ async fn unstage_node(
 
                 was_staged_delete = node.is_staged_delete();
 
-                let was_modified = {
-                    if node.is_staged_modify() && node.is_file() {
-                        node.flags |= NodeFlags::File;
-                        node.child = current_node.child;
-                        node.mode = current_node.mode;
-                        node.size = current_node.size;
+                let is_staged_update_link =
+                    link::is_staged_pin_change(&node, &current_node, current_repository.clone())
+                        .await
+                        .forward::<UnstageError>("Failed to check link staged pin change")?;
 
-                        true
-                    } else {
-                        false
-                    }
+                let was_modified = if node.is_staged_modify() && node.is_file() {
+                    node.flags |= NodeFlags::File;
+                    node.child = current_node.child;
+                    node.mode = current_node.mode;
+                    node.size = current_node.size;
+                    true
+                } else if is_staged_update_link {
+                    link::reset::reset_staged_update_link(
+                        current_repository.clone(),
+                        current_state.clone(),
+                        current_state_staged.clone(),
+                        found_node_id,
+                        node,
+                        current_node,
+                        node_path.clone(),
+                    )
+                    .await
+                    .forward::<UnstageError>("Failed to reset staged-update link")?;
+
+                    node.flags |= NodeFlags::Link;
+                    node.address.hash = current_node.address.hash;
+                    node.child = current_node.child;
+                    true
+                } else {
+                    false
                 };
 
                 node.clear_staged_flags();
@@ -838,49 +924,14 @@ async fn unstage_node(
                 }
             }
 
-            let mut parent_node_id = node.parent;
-
-            while !current_state_staged
-                .node_has_staged_children(current_repository.clone(), parent_node_id)
-                .await
-                .forward::<UnstageError>("Failed to check node children")?
-            {
-                lore_trace!("Unstage parent node {parent_node_id}");
-
-                let parent_block_index = NodeBlock::index(parent_node_id);
-                let parent_node_index = Node::index(parent_node_id);
-                let parent_block = current_state_staged
-                    .block(current_repository.clone(), parent_block_index)
-                    .await
-                    .forward::<UnstageError>("Failed deserializing state node block")?;
-                let parent = parent_block.node(parent_node_index);
-
-                // A parent that is itself a staged ADD is a legitimate independent
-                // staged node (not merely staged to carry a descendant), so leave
-                // it staged — unstaging a child must not unstage the parent.
-                if parent.is_staged_add() {
-                    break;
-                }
-
-                let dirtied = {
-                    let mut block_writer = parent_block.write();
-                    block_writer.node(parent_node_index).clear_staged_flags();
-                    block_writer.mark_dirty()
-                };
-
-                link_tracker.on_node_changed(current_repository.id);
-
-                if dirtied {
-                    current_state_staged.block_modified(parent_block.clone(), parent_block_index);
-                    current_state_staged.mark_dirty();
-                }
-
-                if parent_node_id == ROOT_NODE {
-                    break;
-                }
-
-                parent_node_id = parent.parent;
-            }
+            unstage_parent_chain(
+                current_repository.clone(),
+                current_state_staged.clone(),
+                node.parent,
+                link_tracker.clone(),
+                true,
+            )
+            .await?;
 
             // Dirty parent cleanup: if the node is no longer dirty, walk up and clear
             // Dirty on parents that have no remaining dirty children
@@ -952,28 +1003,19 @@ async fn unstage_node(
 
                 link_tracker.add_link(link_context);
 
-                // If we're unstaging a link removal, restore the link registry entry
+                // If we're unstaging a link removal, restore the link registry
+                // entry and re-materialize the linked content on disk.
                 if was_staged_delete {
-                    let current_link_ref = current_state
-                        .link_find(
-                            current_repository.clone(),
-                            link_metadata.repository,
-                            found_node_id,
-                        )
-                        .await
-                        .forward::<UnstageError>("Failed to find link registry entry")?;
-
-                    current_state_staged
-                        .link_add(
-                            current_repository.clone(),
-                            current_link_ref.repository,
-                            current_link_ref.branch,
-                            current_link_ref.signature,
-                            current_link_ref.local_node,
-                            LinkFlags::from_bits_truncate(current_link_ref.flags),
-                        )
-                        .await
-                        .forward::<UnstageError>("Failed to restore link registry entry")?;
+                    link::reset::reset_staged_remove_link(
+                        current_repository.clone(),
+                        current_state.clone(),
+                        current_state_staged.clone(),
+                        found_node_id,
+                        current_node,
+                        node_path.clone(),
+                    )
+                    .await
+                    .forward::<UnstageError>("Failed to reset staged-remove link")?;
 
                     node.clear_dirty_flags();
                     let dirtied = {

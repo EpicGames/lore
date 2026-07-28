@@ -167,14 +167,14 @@ pub async fn write_file(
     let destination = {
         let mut absolute_path = Path::new(&output).to_path_buf();
         if !absolute_path.is_absolute() {
-            let Ok(current_path) = std::env::current_dir() else {
+            let Ok(resolved) = crate::util::path::make_absolute(&output) else {
                 return Err(InvalidPath {
                     path: output.clone(),
                 }
                 .into());
             };
 
-            absolute_path = current_path.join(output);
+            absolute_path = resolved;
         }
         absolute_path
     };
@@ -295,14 +295,14 @@ pub async fn write_address(
     let destination = {
         let mut absolute_path = Path::new(&output).to_path_buf();
         if !absolute_path.is_absolute() {
-            let Ok(current_path) = std::env::current_dir() else {
+            let Ok(resolved) = crate::util::path::make_absolute(&output) else {
                 return Err(InvalidPath {
                     path: output.clone(),
                 }
                 .into());
             };
 
-            absolute_path = current_path.join(output);
+            absolute_path = resolved;
         }
         absolute_path
     };

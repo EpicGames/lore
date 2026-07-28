@@ -30,6 +30,7 @@ use super::repository_get;
 use super::repository_list;
 use super::repository_metadata_get;
 use super::repository_metadata_set;
+use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
 
@@ -57,16 +58,19 @@ pub struct LoreRepositoryV1Service {
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: Arc<HookDispatcher>,
+    forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
     rpc_timeout: Duration,
     instrument_provider: RepositoryServiceInstrumentProvider,
 }
 
 impl LoreRepositoryV1Service {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         environment: EnvironmentConfig,
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         hook_dispatcher: Arc<HookDispatcher>,
+        forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
         rpc_timeout: Duration,
     ) -> Self {
         Self {
@@ -74,6 +78,7 @@ impl LoreRepositoryV1Service {
             immutable_store,
             mutable_store,
             hook_dispatcher,
+            forwarded_requests,
             rpc_timeout,
             instrument_provider: RepositoryServiceInstrumentProvider,
         }
@@ -101,6 +106,7 @@ impl RepositoryService for LoreRepositoryV1Service {
                 self.auth_url(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                &self.forwarded_requests,
                 &self.hook_dispatcher,
                 &self.instrument_provider,
             ),

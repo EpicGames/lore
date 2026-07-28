@@ -58,33 +58,33 @@ class TestReplicatedStore:
             "quic": shared_port,
             "grpc": shared_port,
             "http": allocate_free_port(),
-            "replication": allocate_free_port(),
+            "internal": allocate_free_port(),
         }
         (new_server_root, server_2_env) = generate_server_config(
             request, tmp_path_factory, server_2_ports
         )
-        main_server_replication_port = lore_main_server_ports["replication"]
+        main_server_internal_port = lore_main_server_ports["internal"]
 
         # we want to test the replicated store in isolation,
-        # but the GRPC Replication server (not to be confused with the Quic service)
+        # but the gRPC internal server (not to be confused with the QUIC internal service)
         # requires a local store, so disable that service.
         # This allows us to also not have to worry about composite local store caching
         # of results when doing immutable get tests
         server_2_env["LORE__IMMUTABLE_STORE__MODE"] = "replicated"
-        server_2_env["LORE__SERVER__REPLICATION__ENABLED"] = "false"
+        server_2_env["LORE__SERVER__GRPC_INTERNAL__ENABLED"] = "false"
 
         # Override the replicated-store settings via local.toml. The server no
         # longer reads default.toml from disk (it is baked into the binary), so
         # local.toml is the override file that gets loaded, layered last.
         with open(
-                os.path.join(new_server_root, "lore-server", "config", "local.toml"),
-                "a",
-                encoding="utf-8",
+            os.path.join(new_server_root, "lore-server", "config", "local.toml"),
+            "a",
+            encoding="utf-8",
         ) as server_2_config:
             server_hostname = request.config.getoption("--lore-server-hostname")
             server_2_config.write("[immutable_store.replicated]\n")
             server_2_config.write(
-                f'remote_url = "quic://{server_hostname}:{main_server_replication_port}"\n'
+                f'remote_url = "quic://{server_hostname}:{main_server_internal_port}"\n'
             )
             server_2_config.write("regenerate_retry.initial_backoff_ms = 1\n")
             server_2_config.write("regenerate_retry.max_backoff_ms = 1\n")
@@ -95,7 +95,7 @@ class TestReplicatedStore:
 
     @pytest.fixture(scope="class")
     def lore_server_with_replicated_store(
-            self, lore_local_server_2_config, lore_server_executable_path
+        self, lore_local_server_2_config, lore_server_executable_path
     ):
         """
         Runs a loreserver that delegates store operations to the main lore server
@@ -115,13 +115,13 @@ class TestReplicatedStore:
 
     @pytest.fixture()
     def same_repo_id_different_remotes(
-            self,
-            request,
-            lore_local_server_config,
-            lore_local_server_2_config,
-            auto_lore_local_server,
-            lore_server_with_replicated_store,
-            new_lore_repo,
+        self,
+        request,
+        lore_local_server_config,
+        lore_local_server_2_config,
+        auto_lore_local_server,
+        lore_server_with_replicated_store,
+        new_lore_repo,
     ):
         server_host_name = request.config.getoption("--lore-server-hostname")
         (server_1_root, server_1_env) = lore_local_server_config

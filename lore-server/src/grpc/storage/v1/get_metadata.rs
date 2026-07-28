@@ -29,13 +29,13 @@ use tonic::Status;
 use tonic::Streaming;
 use tracing::Instrument;
 use tracing::debug;
-use tracing::info;
 use tracing::info_span;
 
 use super::get::GetResponseStream;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
+use crate::grpc::interpret_streaming_error;
 use crate::grpc::log_server_error;
 use crate::grpc::map_message_handle_error_to_status;
 use crate::grpc::rpc_code_to_str;
@@ -106,7 +106,12 @@ pub async fn handler(
                             let start = Instant::now();
                             let metric_context = create_operation_context_attribute("get_metadata");
 
-                            let parsed: Result<Address, Status> = request.map(Into::into);
+                            let parsed: Result<Address, Status>;
+                            if let Err(stream_error) = request {
+                                parsed = Err(interpret_streaming_error(stream_error));
+                            } else {
+                                parsed = request.map(Into::into);
+                            }
                             let parsed_address = parsed.as_ref().ok().copied();
 
                             let response = match parsed {
@@ -165,7 +170,7 @@ pub async fn handler(
                             );
 
                             if let Err(err) = tx.send(response).await {
-                                info!(err = ?err,
+                                debug!(err = ?err,
                                     {{ ADDRESS }} = ?parsed_address,
                                     "Error sending response for get_metadata"
                                 );

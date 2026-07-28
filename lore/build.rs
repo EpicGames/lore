@@ -29,6 +29,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
+    // `LoreEvent` is a cbindgen-exported C-API type defined in lore-revision, not in `lore`.
+    // Cargo does not re-run this build script when only a dependency crate changes, so watch the
+    // event source explicitly to keep the generated header in sync with the event enum.
+    println!("cargo:rerun-if-changed=../lore-revision/src/event.rs");
+
     // list input configuration files so that we run this script to update the c header
     println!("cargo:rerun-if-changed=cbindgen.toml");
 
@@ -135,6 +140,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             const struct lore_global_args_t globals = {0};
             const struct lore_repository_clone_args_t args = {0};
             struct lore_event_callback_config_t callback = {0};
+            // A consumer that reads only the original Complete field must still
+            // compile and link after error detail was appended to the struct.
+            const struct lore_complete_event_data_t complete = {0};
+            (void)complete.status;
             return lore_repository_clone(&globals, &args, callback);
         }
         ",
@@ -143,40 +152,50 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     cc_builder.clone().file(source_gen).compile("headertest");
 
-    // Also validate the header is C++ compatible by compiling a C++ file including it
-    let cpp_source_gen = format!("{out_dir}{path_sep}lore.cpp");
-    let mut cxx_base_builder = cc::Build::new();
-    let cxx_builder = cxx_base_builder
-        .cpp(true)
-        .cargo_metadata(false)
-        .static_crt(true)
-        .force_frame_pointer(false)
-        .opt_level(3);
+    // Also validate the header is C++ compatible by compiling a C++ file
+    // including it. Skipped for musl targets: the CI musl toolchain
+    // (musl-tools) ships only a C compiler (musl-gcc), no musl g++, and this is
+    // purely a header-compatibility check — the gnu/macOS/Windows builds still
+    // exercise the C++ path, so coverage is unchanged.
+    if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() != Ok("musl") {
+        let cpp_source_gen = format!("{out_dir}{path_sep}lore.cpp");
+        let mut cxx_base_builder = cc::Build::new();
+        let cxx_builder = cxx_base_builder
+            .cpp(true)
+            .cargo_metadata(false)
+            .static_crt(true)
+            .force_frame_pointer(false)
+            .opt_level(3);
 
-    if cxx_builder.get_compiler().is_like_msvc() {
-        cxx_builder.flag("/std:c++14");
+        if cxx_builder.get_compiler().is_like_msvc() {
+            cxx_builder.flag("/std:c++14");
+        }
+
+        std::fs::write(
+            cpp_source_gen.as_str(),
+            "\
+            extern \"C\" {
+            #include \"lore.h\"
+            }
+            int main(void) {
+                const struct lore_global_args_t globals = {};
+                const struct lore_repository_clone_args_t args = {};
+                struct lore_event_callback_config_t callback = {};
+                // A consumer that reads only the original Complete field must still
+                // compile and link after error detail was appended to the struct.
+                const struct lore_complete_event_data_t complete = {};
+                (void)complete.status;
+                return lore_repository_clone(&globals, &args, callback);
+            }
+            ",
+        )
+        .expect("Unable to write C++ test source file");
+
+        cxx_builder
+            .clone()
+            .file(cpp_source_gen)
+            .compile("headertest_cpp");
     }
-
-    std::fs::write(
-        cpp_source_gen.as_str(),
-        "\
-        extern \"C\" {
-        #include \"lore.h\"
-        }
-        int main(void) {
-            const struct lore_global_args_t globals = {};
-            const struct lore_repository_clone_args_t args = {};
-            struct lore_event_callback_config_t callback = {};
-            return lore_repository_clone(&globals, &args, callback);
-        }
-        ",
-    )
-    .expect("Unable to write C++ test source file");
-
-    cxx_builder
-        .clone()
-        .file(cpp_source_gen)
-        .compile("headertest_cpp");
 
     // if the header contents changed, copy it to the /lore-capi directory
     let header_target = format!("{crate_dir}{path_sep}..{path_sep}lore-capi{path_sep}lore.h");

@@ -20,6 +20,7 @@ use lore_base::types::Address;
 use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
+use lore_macro::ValidateText;
 use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
@@ -41,7 +42,7 @@ use crate::storage::store::StoreInternal;
 
 /// One obliterate item — the `(partition, address)` to delete.
 #[repr(C)]
-#[derive(Copy, Clone, Default, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Deserialize, Serialize, ValidateText)]
 pub struct LoreStorageObliterateItem {
     /// Caller-chosen id echoed back in `OBLITERATE_ITEM_COMPLETE`
     pub id: u64,
@@ -146,13 +147,12 @@ async fn obliterate_item(
     effective: crate::storage::store::EffectiveFlags,
 ) -> LoreErrorCode {
     if item.partition == Partition::default() {
-        emit_complete(
+        return emit_complete(
             &item,
             LegOutcome::Failed(LoreErrorCode::InvalidArguments),
             LegOutcome::Skipped,
             LoreErrorCode::InvalidArguments,
         );
-        return LoreErrorCode::InvalidArguments;
     }
 
     let store_for_local = store.clone();
@@ -211,16 +211,17 @@ async fn obliterate_item(
         (LegOutcome::Failed(code), _) | (_, LegOutcome::Failed(code)) => *code,
         _ => LoreErrorCode::None,
     };
-    emit_complete(&item, local_outcome, remote_outcome, error_code);
-    error_code
+    emit_complete(&item, local_outcome, remote_outcome, error_code)
 }
 
+/// Emit the item's terminal event and return the `error_code` that was sent, so callers can
+/// `return emit_complete(..)` directly.
 fn emit_complete(
     item: &LoreStorageObliterateItem,
     local: LegOutcome,
     remote: LegOutcome,
     error_code: LoreErrorCode,
-) {
+) -> LoreErrorCode {
     let local_success = u8::from(matches!(local, LegOutcome::Success));
     let local_skipped = u8::from(matches!(local, LegOutcome::Skipped));
     let remote_success = u8::from(matches!(remote, LegOutcome::Success));
@@ -240,4 +241,5 @@ fn emit_complete(
         error_code,
     })
     .send();
+    error_code
 }

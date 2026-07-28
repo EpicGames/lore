@@ -426,6 +426,10 @@ pub async fn restore(
     .await
     .forward::<RestoreError>("preparing commit metadata")?;
 
+    commit::prune_dirty_for_commit(state_staged.clone(), repository.clone())
+        .await
+        .forward::<RestoreError>("pruning dirty nodes before rehash")?;
+
     // Own tracker scoped to this rehash step: await_all always runs before
     // propagating the rehash result so no spawned leader outlives the
     // function holding references to local state.

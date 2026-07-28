@@ -10,7 +10,7 @@ Anyone who has had a pull request merged. Contributors participate in discussion
 
 ### Maintainer
 
-A trusted contributor with merge authority. Maintainers take responsibility for the quality and consistency of what lands in the codebase and can approve and merge pull requests. The current Maintainers are listed in [MAINTAINERS.md](MAINTAINERS.md).
+A trusted contributor with merge authority. Maintainers take responsibility for the quality and consistency of what lands in the codebase and can approve and merge pull requests. A maintainer's remit may span the whole project or focus on a specific area — such as documentation, the desktop client, CI, or the client SDKs. The current Maintainers, and any area focus, are listed in [MAINTAINERS.md](MAINTAINERS.md).
 
 **Path to Maintainer:** Consistent contributions over at least 3 months — bug fixes, features, or documentation — and working knowledge of the relevant parts of the codebase. Nominated by a Core Maintainer; existing Maintainers have 7 days to object.
 

@@ -43,16 +43,21 @@ def create_repo(
     def create_repo_impl(
         use_shared_store: bool | None = None,
         shared_store_path: str | None = None,
+        **kwargs,
     ):
         if request.param == CreationType.CREATE:
             repo = new_lore_repo(create_repo=False)
             repo.repository_create(
-                use_shared_store=use_shared_store, shared_store_path=shared_store_path
+                use_shared_store=use_shared_store,
+                shared_store_path=shared_store_path,
+                **kwargs,
             )
             return repo
         else:
             return new_lore_repo().clone(
-                use_shared_store=use_shared_store, shared_store_path=shared_store_path
+                use_shared_store=use_shared_store,
+                shared_store_path=shared_store_path,
+                **kwargs,
             )
 
     return create_repo_impl
@@ -311,7 +316,9 @@ def test_create_repo_relative_path(
 
     # Create a repo using the non-default shared store and verify it used the correct immutable store
     repo = create_repo(
-        use_shared_store=True, shared_store_path=non_default_store_relative_path
+        use_shared_store=True,
+        shared_store_path=non_default_store_relative_path,
+        cwd=os.getcwd(),
     )
 
     monkeypatch.chdir(repo.path)

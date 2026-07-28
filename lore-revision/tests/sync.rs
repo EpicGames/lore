@@ -86,6 +86,7 @@ mod tests {
                     link: None,
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
+                    stats: false,
                 };
                 let first_signature =
                     Box::pin(commit::commit(repository.clone(), &write_token, options))
@@ -126,6 +127,7 @@ mod tests {
                     link: None,
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
+                    stats: false,
                 };
                 let second_signature =
                     Box::pin(commit::commit(repository.clone(), &write_token, options))

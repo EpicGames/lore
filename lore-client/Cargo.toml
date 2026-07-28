@@ -18,12 +18,14 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
-windows-sys = { workspace = true, features = ["Win32_System_Console", "Win32_Networking_WinSock"] }
 
 lore = { workspace = true }
 lore-base = { workspace = true }
 lore-error-set = { workspace = true }
 lore-revision = { workspace = true }
+
+[target.'cfg(target_family = "windows")'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Console", "Win32_Networking_WinSock", "Win32_Globalization"] }
 
 [features]
 default = []

@@ -607,6 +607,7 @@ impl ImmutableStore for GrpcReplica {
         self: Arc<Self>,
         _max_capacity: usize,
         _sync_data: bool,
+        _sink: Option<lore_storage::gc_event::GcEventSinkRef>,
     ) -> Result<usize, StoreError> {
         Ok(0)
     }
@@ -616,6 +617,7 @@ impl ImmutableStore for GrpcReplica {
         _max_size: usize,
         _at: Option<usize>,
         _sync_data: bool,
+        _sink: Option<lore_storage::gc_event::GcEventSinkRef>,
     ) -> Result<Option<usize>, StoreError> {
         Ok(None)
     }

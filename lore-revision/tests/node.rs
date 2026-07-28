@@ -410,39 +410,55 @@ mod tests {
             .expect("Test task failed");
     }
 
-    #[test]
-    fn node_name_rejects_path_traversal() {
-        let malicious_names = [
-            "..",
-            "../something",
-            "..\\something",
-            "/etc/passwd",
-            "\0malicious",
-            "foo\\bar",
-            "a/b",
-            "a/",
-            "a/\\..",
-        ];
+    /// Names no writer may store. `node_name_store` is the enforcement point, so
+    /// none of these can reach a name table through the API at all.
+    const PATH_TRAVERSAL_NAMES: [&str; 9] = [
+        "..",
+        "../something",
+        "..\\something",
+        "/etc/passwd",
+        "\0malicious",
+        "foo\\bar",
+        "a/b",
+        "a/",
+        "a/\\..",
+    ];
 
-        for name in &malicious_names {
+    #[test]
+    fn node_name_store_rejects_path_traversal() {
+        for name in &PATH_TRAVERSAL_NAMES {
             let block = NodeBlock::new_zeroed();
-            let node_index = {
-                let mut writer = block.write();
-                let idx = writer.grab_node_unused(0) as usize;
-                let (offset, length) = writer
-                    .node_name_store(name, 0, 0)
-                    .expect("node_name_store should succeed in test");
-                let node = writer.node(idx);
-                node.name_offset = offset;
-                node.name_length = length;
-                idx
-            };
+            let err = block
+                .write()
+                .node_name_store(name, 0, 0)
+                .expect_err("node_name_store should reject name");
             assert!(
-                block.node_name_clone(node_index).is_err(),
+                err.is_invalid_arguments(),
+                "expected invalid arguments for {name:?}, got: {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_name_read_rejects_path_traversal_planted_in_the_name_table() {
+        use bytes::BytesMut;
+        use lore_revision::node::NodeBlockData;
+
+        // A name table can arrive from a fragment written before the store-side
+        // check existed, so the read path validates independently of it.
+        for name in &PATH_TRAVERSAL_NAMES {
+            let mut data = NodeBlockData::new_from_heap_zeroed();
+            data.node_count = 1;
+            data.node[0].name_offset = 0;
+            data.node[0].name_length = name.len() as u32;
+            let block = NodeBlock::new_with_name(data, BytesMut::from(name.as_bytes()));
+
+            assert!(
+                block.node_name_clone(0).is_err(),
                 "node_name_clone should reject name: {name:?}"
             );
             assert!(
-                block.node_name_ref(node_index).is_err(),
+                block.node_name_ref(0).is_err(),
                 "node_name_ref should reject name: {name:?}"
             );
         }
@@ -677,12 +693,14 @@ mod tests {
 
     #[test]
     fn node_name_store_rejects_when_cap_exceeded() {
+        use lore_revision::node::MAX_NODE_NAME_LEN;
         use lore_revision::node::NODE_NAME_MAX_SIZE;
 
         let block = NodeBlock::new_zeroed();
         let mut writer = block.write();
-        // Fill the buffer up to exactly NODE_NAME_MAX_SIZE (which is allowed).
-        let chunk = "A".repeat(64 * 1024); // 64 KiB per entry
+        // Fill the buffer with the longest name a single node may carry, until
+        // one more of them would cross NODE_NAME_MAX_SIZE.
+        let chunk = "A".repeat(MAX_NODE_NAME_LEN);
         let mut total = 0usize;
         while total + chunk.len() <= NODE_NAME_MAX_SIZE {
             let (_, _) = writer
@@ -690,25 +708,45 @@ mod tests {
                 .expect("fill-up should succeed up to the cap");
             total += chunk.len();
         }
-        // Any further byte must be rejected.
         let err = writer
-            .node_name_store("x", 0, 0)
+            .node_name_store(chunk.as_str(), 0, 0)
             .expect_err("node_name_store should reject appends that exceed NODE_NAME_MAX_SIZE");
         assert!(err.is_oversized(), "expected oversize error, got: {err:?}");
     }
 
     #[test]
-    fn node_name_store_single_oversize_append_rejected() {
-        use lore_revision::node::NODE_NAME_MAX_SIZE;
+    fn node_name_store_rejects_a_name_over_the_length_bound() {
+        use lore_revision::node::MAX_NODE_NAME_LEN;
 
         let block = NodeBlock::new_zeroed();
-        // A single allocation that exceeds the cap outright.
-        let big = "b".repeat(NODE_NAME_MAX_SIZE + 1);
-        let err = block
-            .write()
-            .node_name_store(big.as_str(), 0, 0)
-            .expect_err("oversize single append must be rejected");
+        let mut writer = block.write();
+        // The bound itself is storable; one byte past it is not.
+        let (_, length) = writer
+            .node_name_store("a".repeat(MAX_NODE_NAME_LEN).as_str(), 0, 0)
+            .expect("a name at the length bound must be storable");
+        assert_eq!(length as usize, MAX_NODE_NAME_LEN);
+
+        let err = writer
+            .node_name_store("a".repeat(MAX_NODE_NAME_LEN + 1).as_str(), 0, 0)
+            .expect_err("a name past the length bound must be rejected");
         assert!(err.is_oversized(), "expected oversize error, got: {err:?}");
+    }
+
+    #[test]
+    fn node_name_store_validates_a_reused_slot() {
+        let block = NodeBlock::new_zeroed();
+        let mut writer = block.write();
+        // A rename takes the in-place reuse path, which must validate too.
+        let (offset, length) = writer
+            .node_name_store("original", 0, 0)
+            .expect("initial append");
+        let err = writer
+            .node_name_store("..", offset, length)
+            .expect_err("reusing a slot must not bypass validation");
+        assert!(
+            err.is_invalid_arguments(),
+            "expected invalid arguments, got: {err:?}"
+        );
     }
 
     #[test]

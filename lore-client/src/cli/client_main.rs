@@ -11,6 +11,14 @@ use crate::config::setup_config;
 use crate::logging;
 
 pub fn client_main() -> ExitCode {
+    #[cfg(target_family = "windows")]
+    // safety: safe Win32 call; no invariants to uphold
+    unsafe {
+        windows_sys::Win32::System::Console::SetConsoleOutputCP(
+            windows_sys::Win32::Globalization::CP_UTF8,
+        )
+    };
+
     let time_start = Instant::now();
 
     let cli = LoreCli::parse();

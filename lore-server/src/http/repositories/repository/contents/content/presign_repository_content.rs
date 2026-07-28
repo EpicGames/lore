@@ -24,6 +24,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::http::log_http_error;
 use crate::http::presign_token::CURRENT_TOKEN_VERSION;
 use crate::http::presign_token::PresignTokenPayload;
 use crate::http::presign_token::sign;
@@ -39,6 +40,8 @@ pub enum PresignError {
     ParseAddress(FromHexError),
     #[error("Presign feature is not configured")]
     NotConfigured,
+    #[error("Only service accounts may vend presigned URLs")]
+    NotServiceAccount,
     #[error("Content not found")]
     NotFound,
     #[error("Store error checking content existence")]
@@ -49,15 +52,17 @@ pub enum PresignError {
 
 impl IntoResponse for PresignError {
     fn into_response(self) -> axum::response::Response {
-        warn!("presign_repository_content error: {:?}", &self);
-
-        let (status, msg) = match self {
-            e @ (PresignError::ParseRepository(_) | PresignError::ParseAddress(_)) => {
-                (StatusCode::BAD_REQUEST, e.to_string())
+        let (status, msg) = match &self {
+            PresignError::ParseRepository(_) | PresignError::ParseAddress(_) => {
+                (StatusCode::BAD_REQUEST, self.to_string())
             }
             PresignError::NotConfigured => (
                 StatusCode::NOT_FOUND,
                 "presigned URL feature is not enabled".to_string(),
+            ),
+            PresignError::NotServiceAccount => (
+                StatusCode::FORBIDDEN,
+                "only service accounts may vend presigned URLs".to_string(),
             ),
             PresignError::StoreError | PresignError::SystemTime(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -65,6 +70,8 @@ impl IntoResponse for PresignError {
             ),
             PresignError::NotFound => (StatusCode::NOT_FOUND, "address not found".to_string()),
         };
+
+        log_http_error(&self, status);
 
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "text/plain".parse().unwrap());
@@ -86,6 +93,18 @@ pub struct PresignResponse {
     pub expires_at: u64,
 }
 
+/// Whether the caller is a service account.
+///
+/// Reads the `is_service_account` claim from the token. A `None` token means no
+/// JWT verifier is configured and auth is disabled server-wide, which counts as
+/// a service account.
+fn call_is_service_account(user_info: &Option<AuthorizationToken>) -> bool {
+    match user_info {
+        Some(token) => token.is_service_account.unwrap_or(false),
+        None => true,
+    }
+}
+
 pub async fn handler(
     State(state): State<Arc<ServerState>>,
     Path((repository_id, address)): Path<(String, String)>,
@@ -98,6 +117,10 @@ pub async fn handler(
         .as_ref()
         .ok_or(PresignError::NotConfigured)?
         .clone();
+
+    if !call_is_service_account(&user_info) {
+        return Err(PresignError::NotServiceAccount);
+    }
 
     let repository = repository_id
         .parse::<RepositoryId>()
@@ -177,21 +200,53 @@ pub async fn handler(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use axum::Extension;
-    use axum::Router;
     use axum::http::StatusCode;
-    use axum::routing;
     use axum_test::TestServer;
     use lore_base::runtime::LORE_CONTEXT;
     use rand::random;
     use serde_json::json;
 
+    use super::call_is_service_account;
     use crate::auth::jwt::AuthorizationToken;
+    use crate::http::server::LoreHttpServerSettings;
     use crate::http::server::PresignConfig;
+    use crate::http::server::ServerHealth;
     use crate::http::server::ServerState;
+    use crate::http::server::create_router;
     use crate::store::test_store_create;
+
+    fn token_with_service_account(is_service_account: Option<bool>) -> AuthorizationToken {
+        AuthorizationToken {
+            is_service_account,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn service_account_may_vend() {
+        assert!(call_is_service_account(&Some(token_with_service_account(
+            Some(true)
+        ))));
+    }
+
+    #[test]
+    fn non_service_account_may_not_vend() {
+        assert!(!call_is_service_account(&Some(token_with_service_account(
+            Some(false)
+        ))));
+    }
+
+    #[test]
+    fn missing_service_account_claim_may_not_vend() {
+        assert!(!call_is_service_account(&Some(token_with_service_account(
+            None
+        ))));
+    }
+
+    #[test]
+    fn no_auth_configured_may_vend() {
+        assert!(call_is_service_account(&None));
+    }
 
     fn test_presign_config() -> PresignConfig {
         let key_bytes = [0u8; 32];
@@ -204,16 +259,6 @@ mod tests {
         }
     }
 
-    fn handler_router(state: ServerState) -> Router {
-        Router::new()
-            .route(
-                "/repository/{repository_id}/content/{address}/presign",
-                routing::post(super::handler),
-            )
-            .layer(Extension(None::<AuthorizationToken>))
-            .with_state(Arc::new(state))
-    }
-
     #[tokio::test]
     async fn returns_404_when_address_not_found() {
         let (immutable_store, mutable_store, execution) =
@@ -223,6 +268,7 @@ mod tests {
                 let repository = random::<lore_revision::lore::RepositoryId>();
                 let address = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff-ffffffffffffffffffffffffffffffff";
 
+                let test_health = ServerHealth::new_without_availability(immutable_store.clone());
                 let state = ServerState {
                     immutable_store,
                     mutable_store,
@@ -231,11 +277,12 @@ mod tests {
                     presign_config: Some(test_presign_config()),
                 };
                 let repo_hex = format!("{repository}");
-                let app = handler_router(state);
+                let settings = LoreHttpServerSettings::default();
+                let app = create_router(state, test_health, &settings);
                 let server = TestServer::new(app).unwrap();
 
                 let response = server
-                    .post(&format!("/repository/{repo_hex}/content/{address}/presign"))
+                    .post(&format!("/v1/repository/{repo_hex}/content/{address}/presign"))
                     .json(&json!({"ttl_seconds": 3600}))
                     .await;
 

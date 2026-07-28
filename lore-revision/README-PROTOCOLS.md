@@ -172,7 +172,7 @@ Reply payload
 ### Branch destroy
 Destroy a named branch
 
-Command ayload
+Command payload
 ```
 [16 bytes] Branch identifier
 [32 bytes] Current latest pointer

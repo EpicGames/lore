@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use lore::interface::LoreEvent;
 use lore::remote::connection::ConnectionError;
@@ -19,18 +23,50 @@ use lore::runtime;
 use lore_error_set::prelude::*;
 use tokio::sync::mpsc;
 
+use crate::eprintln;
 use crate::println;
+use crate::util::listen_for_termination;
 
 #[error_set]
 pub enum ServiceMainError {}
 
+/// Bounds how long shutdown waits for the accept loop to unwind, so that a
+/// wake-up connection that never lands cannot keep the process alive. Anything
+/// left behind is a stale socket, which the next start detects and removes.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Where the service parks its working directory. It inherits one from whoever
+/// started it, which is unrelated to the directories its callers run in, and
+/// holding that directory would also keep the filesystem under it busy. Callers
+/// send the directory their relative paths belong to, so the service never
+/// needs one of its own.
+fn detached_working_directory() -> std::path::PathBuf {
+    #[cfg(target_family = "unix")]
+    {
+        std::path::PathBuf::from("/")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::env::var_os("SystemRoot").map_or_else(
+            || std::path::PathBuf::from("C:\\"),
+            std::path::PathBuf::from,
+        )
+    }
+}
+
 pub async fn service_main(
     listening_signal: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), ServiceMainError> {
-    let mut connection_id = 0;
-
     if !uds_supported() {
         return Err(ServiceMainError::internal("IPC not supported on this OS"));
+    }
+
+    let detached = detached_working_directory();
+    if let Err(error) = std::env::set_current_dir(&detached) {
+        eprintln!(
+            "Failed to set working directory to {}: {error}",
+            detached.display()
+        );
     }
 
     let listener: UdsListener = UdsListener::new().internal("Failed to start listener socket")?;
@@ -41,27 +77,57 @@ pub async fn service_main(
             .map_err(|_err| ServiceMainError::internal("Couldn't signal listening"))?;
     }
 
-    runtime()
-        .spawn_blocking(move || {
-            loop {
-                match listener.accept() {
-                    Ok(stream) => {
-                        let new_connection_id = connection_id;
-                        connection_id += 1;
-                        runtime().spawn(async move {
-                            IpcConnection::new(ConnectionId(new_connection_id), stream)
-                                .handle_connection()
-                                .await;
-                        });
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let accept_shutting_down = Arc::clone(&shutting_down);
+
+    let accept_task = runtime().spawn_blocking(move || {
+        let mut connection_id = 0;
+        loop {
+            match listener.accept() {
+                Ok(stream) => {
+                    if accept_shutting_down.load(Ordering::SeqCst) {
+                        break;
                     }
-                    Err(err) => {
-                        println!("Failed when accepting: {err}");
+                    let new_connection_id = connection_id;
+                    connection_id += 1;
+                    runtime().spawn(async move {
+                        IpcConnection::new(ConnectionId(new_connection_id), stream)
+                            .handle_connection()
+                            .await;
+                    });
+                }
+                Err(err) => {
+                    if accept_shutting_down.load(Ordering::SeqCst) {
+                        break;
                     }
+                    eprintln!("Failed when accepting: {err}");
                 }
             }
-        })
-        .await
-        .unwrap();
+        }
+    });
+
+    match listen_for_termination(None).await {
+        Ok(()) => {
+            println!("Shutting down Lore service");
+            shutting_down.store(true, Ordering::SeqCst);
+            if let Err(error) = UdsStream::connect() {
+                eprintln!("Failed to wake the accept loop: {error}");
+            }
+            if tokio::time::timeout(SHUTDOWN_TIMEOUT, accept_task)
+                .await
+                .is_err()
+            {
+                eprintln!("Timed out waiting for the accept loop to stop");
+            }
+        }
+        Err(error) => {
+            // Without signal handling there is no graceful path, so keep
+            // serving until the process is killed.
+            eprintln!("Failed to listen for termination signals: {error}");
+            let _ = accept_task.await;
+        }
+    }
+
     Ok(())
 }
 
@@ -94,7 +160,7 @@ impl IpcConnection {
     async fn handle_connection(self) {
         let id = self.id;
         if let Err(error) = self.handle_connection_impl().await {
-            println!(
+            eprintln!(
                 "Error in connection: {}",
                 ConnectionErrorWithId::new(error, id)
             );
@@ -103,12 +169,15 @@ impl IpcConnection {
 
     async fn handle_connection_impl(self) -> Result<(), ConnectionError> {
         let mut connection = self.connection.try_clone().internal("cloning connection")?;
-        let (header, command): (V1Header, MessageToServer) = runtime()
+        let message: Option<(V1Header, MessageToServer)> = runtime()
             .spawn_blocking(move || blocking_read_v1_message(connection.reader()))
             .await
             .internal("failed reading")?
-            .forward::<ConnectionError>("reading message")?
-            .ok_or_else(|| ConnectionError::internal("message too short"))?;
+            .forward::<ConnectionError>("reading message")?;
+
+        let Some((header, command)) = message else {
+            return Ok(());
+        };
 
         //TODO(UCS-16094): Determine if this should be unbounded or bounded
         // Create a channel so the callback task can send messages to this network thread, so they
@@ -130,7 +199,7 @@ impl IpcConnection {
                         MessageToClient::Event(event.clone()),
                         header.serialization_type,
                     )) {
-                        println!("Failed to send Event message to connection task: {error}");
+                        eprintln!("Failed to send Event message to connection task: {error}");
                     }
                 })))
                 .await;
@@ -139,14 +208,14 @@ impl IpcConnection {
                 MessageToClient::ApiResult(cli_result),
                 header.serialization_type,
             )) {
-                println!("Failed to send ApiResult message to connection task: {error}");
+                eprintln!("Failed to send ApiResult message to connection task: {error}");
             }
         });
 
         while let Some((message, serialization_type)) = to_client_receiver.recv().await {
             let stream = self.connection.try_clone().internal("cloning connection")?;
             if let Err(error) = Self::send_message(stream, message, serialization_type).await {
-                println!(
+                eprintln!(
                     "Failed to send message to client: {}",
                     ConnectionErrorWithId::new(error, self.id)
                 );

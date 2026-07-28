@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+
+name: PR Validate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions: {}
+
+concurrency:
+  group: pr-validate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # Check out the PR head to validate it
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      # TODO: add validation steps.
+      - name: Validate
+        run: echo "pr-validate stub — no checks yet"

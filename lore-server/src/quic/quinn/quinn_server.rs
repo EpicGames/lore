@@ -121,13 +121,14 @@ impl QuinnServer {
             Some(Protocol::UDP),
         )?;
 
-        socket.bind(&socket2::SockAddr::from(settings.address))?;
-
+        // Reuse must be configured before bind.
         socket.reuse_address()?;
 
         // set_reuse_port is not implemented on Windows
         #[cfg(target_family = "unix")]
         socket.set_reuse_port(true)?;
+
+        socket.bind(&socket2::SockAddr::from(settings.address))?;
 
         let endpoint = quinn::Endpoint::new(
             endpoint_config,

@@ -16,20 +16,42 @@ pub enum PathError {
     InvalidPath,
 }
 
+/// Resolves `path` against the working directory of the call in progress, or
+/// against this process's own when the call did not name one.
+///
+/// A call arriving over IPC carries the directory of the process that made it,
+/// because the service's own is unrelated to the caller's.
 pub fn make_absolute(path: impl AsRef<str>) -> Result<PathBuf, PathError> {
+    let context = crate::runtime::try_execution_context();
+    let base = context
+        .as_ref()
+        .and_then(|context| context.globals().working_directory())
+        .map(Path::new);
+    make_absolute_from(path, base)
+}
+
+/// [`make_absolute`] with the base directory supplied by the caller, for the
+/// call wrappers that resolve paths before the execution context exists and so
+/// cannot look it up.
+pub fn make_absolute_from(
+    path: impl AsRef<str>,
+    base: Option<&Path>,
+) -> Result<PathBuf, PathError> {
     let path = path.as_ref();
     let cleanpath = clean(path.to_owned());
     let pathbuf = PathBuf::from_str(cleanpath.as_str()).emit_map_err(InvalidPath {
         path: path.to_string(),
     })?;
-    if !pathbuf.is_absolute() {
-        Ok(std::env::current_dir()
+    if pathbuf.is_absolute() {
+        return Ok(pathbuf);
+    }
+    match base {
+        Some(base) => Ok(base.join(pathbuf)),
+        None => Ok(std::env::current_dir()
             .emit_map_err(PathError::internal(
                 "failed to get current working directory",
             ))?
-            .join(pathbuf))
-    } else {
-        Ok(pathbuf)
+            .join(pathbuf)),
     }
 }
 
@@ -404,6 +426,11 @@ impl RelativePath {
         overlaps_impl(self.as_str(), other.as_ref())
     }
 
+    /// Returns `true` if `self` equals `child` or is a path-ancestor of it.
+    pub fn covers(&self, child: &impl AsRef<str>) -> bool {
+        covers_impl(self.as_str(), child.as_ref())
+    }
+
     /// Reduces a set of paths to the minimal covering set by removing exact
     /// duplicates and replacing any descendant path with its ancestor — so each
     /// returned path is a superset of the input paths it covers.
@@ -646,15 +673,13 @@ impl RelativePathBuf {
 
         let mut absolute_path = Path::new(user_path).to_path_buf();
         if !absolute_path.is_absolute() {
-            absolute_path = std::path::absolute(absolute_path)
-                .emit_map_err(PathError::internal("failed to resolve absolute path"))?;
+            absolute_path = make_absolute(absolute_path.to_string_lossy())?;
         }
         let absolute_path = clean(absolute_path.display().to_string());
 
         let mut repository_path = Path::new(repository_path).to_path_buf();
         if !repository_path.is_absolute() {
-            repository_path = std::path::absolute(repository_path)
-                .emit_map_err(PathError::internal("failed to resolve absolute path"))?;
+            repository_path = make_absolute(repository_path.to_string_lossy())?;
         }
         let repository_path = clean(repository_path.display().to_string()).to_lowercase();
 

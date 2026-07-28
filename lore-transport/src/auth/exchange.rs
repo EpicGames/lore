@@ -81,9 +81,10 @@ pub async fn exchange(
 ) -> Result<String, ExchangeError> {
     if auth_url.is_empty() {
         lore_debug!("No auth url, unable to perform authz exchange");
-        return Err(ExchangeError::internal(
-            "Environment does not use authentication",
-        ));
+        return Err(NotSupported {
+            operation: "No authentication configured on server".to_string(),
+        }
+        .into());
     }
     if identity.is_empty() {
         lore_debug!("No identity, unable to perform authz exchange");
@@ -234,9 +235,10 @@ pub async fn exchange_custom_resource(
 ) -> Result<String, ExchangeError> {
     if auth_url.is_empty() {
         lore_debug!("No auth url, unable to perform authz exchange");
-        return Err(ExchangeError::internal(
-            "Environment does not use authentication",
-        ));
+        return Err(NotSupported {
+            operation: "No authentication configured on server".to_string(),
+        }
+        .into());
     }
     if identity.is_empty() {
         lore_debug!("No identity, unable to perform authz exchange");

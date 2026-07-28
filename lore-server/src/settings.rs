@@ -321,7 +321,7 @@ pub struct ServerSettings {
     pub auth: Option<AuthSettings>,
     pub grpc: Option<GrpcSettings>,
     pub grpc_public_services: Option<GrpcPublicServicesSettings>,
-    pub replication: Option<GrpcSettings>,
+    pub grpc_internal: Option<GrpcSettings>,
     pub http: Option<HttpSettings>,
     // the public facing QUIC server settings
     pub quic: Option<QuicSettings>,
@@ -338,6 +338,13 @@ pub struct ServerSettings {
     pub runtime_shutdown_timeout_seconds: u16,
     #[serde(default)]
     pub user_agent: UserAgentSettings,
+}
+
+// For when this server acts as a client to another server's Internal port
+#[derive(Clone, Debug, Deserialize)]
+pub struct GrpcInternalClientSettings {
+    pub url: String,
+    pub certs: Option<CertificateSettings>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -369,6 +376,7 @@ pub struct CompositeStoreSettings {
     pub replica: Option<Vec<CompositeSubStoreSettings>>,
     pub replica_factory: Option<ReplicaFactorySettings>,
     pub should_cache_query_results: Option<bool>,
+    pub durable_store_delay_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

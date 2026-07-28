@@ -32,9 +32,9 @@ use tokio::sync::mpsc::channel;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
-use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::http::log_http_error;
 use crate::http::server::ServerState;
 use crate::util::get_user_id_from_token;
 use crate::util::setup_execution;
@@ -56,13 +56,11 @@ pub enum GetContentError {
 
 impl IntoResponse for GetContentError {
     fn into_response(self) -> axum::response::Response {
-        warn!("get_repository_content error: {:?} ", &self);
-
-        let (status, msg) = match self {
-            e @ (GetContentError::ParseContext(_) | GetContentError::ParseAddress(_)) => {
-                (StatusCode::BAD_REQUEST, e.to_string())
+        let (status, msg) = match &self {
+            GetContentError::ParseContext(_) | GetContentError::ParseAddress(_) => {
+                (StatusCode::BAD_REQUEST, self.to_string())
             }
-            GetContentError::ReadStream(ref e)
+            GetContentError::ReadStream(e)
                 if e.is_address_not_found() || e.is_payload_not_found() =>
             {
                 (StatusCode::NOT_FOUND, "address not found".to_string())
@@ -72,6 +70,8 @@ impl IntoResponse for GetContentError {
                 "Something went wrong. See server log for more info.".to_string(),
             ),
         };
+
+        log_http_error(&self, status);
 
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "text/plain".parse().unwrap());

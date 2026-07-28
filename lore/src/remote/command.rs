@@ -137,4 +137,18 @@ pub enum LoreCommand {
     StoragePutFile(crate::storage::put_file::LoreStoragePutFileArgs),
     StorageGetFile(crate::storage::get_file::LoreStorageGetFileArgs),
     StorageUpload(crate::storage::upload::LoreStorageUploadArgs),
+    StorageMutableLoad(crate::storage::mutable_load::LoreStorageMutableLoadArgs),
+    StorageMutableStore(crate::storage::mutable_store::LoreStorageMutableStoreArgs),
+    StorageMutableCompareAndSwap(
+        crate::storage::mutable_compare_and_swap::LoreStorageMutableCompareAndSwapArgs,
+    ),
+    StorageMutableList(crate::storage::mutable_list::LoreStorageMutableListArgs),
+    RevisionTreeLoad(crate::revision_tree::load::LoreRevisionTreeLoadArgs),
+    RevisionTreeClose(crate::revision_tree::close::LoreRevisionTreeCloseArgs),
+    RevisionTreeResolvePath(crate::revision_tree::resolve_path::LoreRevisionTreeResolvePathArgs),
+    RevisionTreeListChildren(crate::revision_tree::list_children::LoreRevisionTreeListChildrenArgs),
+    RevisionTreeNodeInfo(crate::revision_tree::node_info::LoreRevisionTreeNodeInfoArgs),
+    RevisionTreeInfo(crate::revision_tree::info::LoreRevisionTreeInfoArgs),
+    RevisionTreeNodePath(crate::revision_tree::node_path::LoreRevisionTreeNodePathArgs),
+    RevisionTreeAdd(crate::revision_tree::add::LoreRevisionTreeAddArgs),
 }

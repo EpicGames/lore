@@ -26,12 +26,12 @@ use tracing::info;
 use tracing::warn;
 
 use super::branch_record::build_branch;
-use crate::grpc::extract_correlation_id;
-use crate::grpc::get_repository;
-use crate::grpc::get_user_id;
+use crate::grpc::ServerResultExt;
+use crate::grpc::forwarded_requests::CallerContext;
+use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::util::setup_execution;
 
-type BranchListStream =
+pub type BranchListStream =
     Pin<Box<dyn Stream<Item = Result<BranchListResponse, Status>> + Send + 'static>>;
 
 /// `lore.revision.v1.RevisionService.BranchList` handler.
@@ -53,24 +53,65 @@ type BranchListStream =
 /// a supplementary `BranchMetadata` scan: the metadata blob preserves the
 /// branch id even after the name → id mapping is erased on delete, and
 /// any id already seen in the live pass is skipped.
+///
+/// Depending on server configuration, this request may get completely delegated to another server
+/// via `ForwardedRevisionService`
 #[tracing::instrument(name = "BranchList::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchListRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    forwarded_requests: &Option<Arc<dyn ForwardedRequests>>,
 ) -> Result<Response<BranchListStream>, Status> {
-    let repository_id = get_repository(request.metadata())?;
-    let user_id = get_user_id(request.extensions());
-    let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+    let caller_context = CallerContext::from_original_request(&request)?;
     let req = request.into_inner();
+    if let Some(forwarded_requests) = forwarded_requests
+        && forwarded_requests.rpc_flags().revision_branch_list
+    {
+        return forward_branch_list(req, caller_context, forwarded_requests).await;
+    }
+    branch_list_implementation(req, caller_context, immutable_store, mutable_store).await
+}
+
+/// This `BranchListRequest` should be handled by another server and the response stream
+/// forwarded on to the client.
+async fn forward_branch_list(
+    req: BranchListRequest,
+    context: CallerContext,
+    forwarded_requests: &Arc<dyn ForwardedRequests>,
+) -> Result<Response<BranchListStream>, Status> {
+    let mut client = forwarded_requests.forwarded_revision_service();
+    let request = context.to_forwarded_request(req)?;
+
+    let branch_list_result = client
+        .branch_list(request)
+        .await
+        .warn_map_err(|_err| Status::internal("Error making forwarded request"))?;
+
+    // the Error arm of this result is for the client
+    let response = branch_list_result?;
+    Ok(response)
+}
+
+/// This `BranchListRequest` should be fulfilled by this server.
+pub async fn branch_list_implementation(
+    req: BranchListRequest,
+    caller_context: CallerContext,
+    immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    mutable_store: Arc<dyn lore_storage::MutableStore>,
+) -> Result<Response<BranchListStream>, Status> {
     let creator_filter = req.creator;
     let include_deleted = req.include_deleted;
 
-    let execution = setup_execution(module_path!(), correlation_id, user_id);
+    let execution = setup_execution(
+        module_path!(),
+        caller_context.correlation_id,
+        caller_context.user_id,
+    );
     let repository = Arc::new(RepositoryContext::new_server_context(
         immutable_store,
         mutable_store,
-        repository_id,
+        caller_context.repository_id,
     ));
 
     let (tx, rx) = mpsc::channel(64);
@@ -255,7 +296,7 @@ async fn emit_branch(
 }
 
 #[cfg(test)]
-mod test {
+pub mod test {
     use std::sync::Arc;
 
     use lore_base::runtime::LORE_CONTEXT;
@@ -277,7 +318,7 @@ mod test {
     use crate::store::test_store_create;
 
     /// Creates a root-style branch (empty stack); not deletable.
-    async fn create_root_branch(
+    pub async fn create_root_branch(
         repository_context: &Arc<RepositoryContext>,
         name: &str,
         creator: &str,
@@ -378,331 +419,600 @@ mod test {
         response.into_inner().collect().await
     }
 
-    #[tokio::test]
-    async fn list_streams_all_live_branches() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
+    mod direct_handling {
+        use super::*;
 
-        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                repository,
-            ));
-            let main = create_root_branch(&repository_context, "main", "alice").await;
-            let main_latest = seed_revision(&repository_context, main).await;
-            create_child_branch(&repository_context, "feature", "bob", main, main_latest).await;
+        #[tokio::test]
+        async fn list_streams_all_live_branches() {
+            let repository = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
 
-            let response = handler(
-                make_request(repository, None, false),
-                immutable_store.clone(),
-                mutable_store.clone(),
-            )
-            .await
-            .expect("Request failed");
-
-            let items: Vec<_> = collect_response(response)
-                .await
-                .into_iter()
-                .map(|r| r.expect("stream item ok"))
-                .collect();
-
-            assert_eq!(items.len(), 2);
-            let names: Vec<String> = items
-                .iter()
-                .map(|r| r.branch.as_ref().unwrap().name.clone())
-                .collect();
-            assert!(names.contains(&"main".to_string()));
-            assert!(names.contains(&"feature".to_string()));
-            assert!(items.iter().all(|r| !r.branch.as_ref().unwrap().deleted));
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn list_excludes_deleted_by_default() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                repository,
-            ));
-            let main = create_root_branch(&repository_context, "main", "alice").await;
-            let main_latest = seed_revision(&repository_context, main).await;
-            let to_delete =
+            Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+                let repository_context = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository,
+                ));
+                let main = create_root_branch(&repository_context, "main", "alice").await;
+                let main_latest = seed_revision(&repository_context, main).await;
                 create_child_branch(&repository_context, "feature", "bob", main, main_latest).await;
-            branch::delete(repository_context.clone(), to_delete)
+
+                let response = handler(
+                    make_request(repository, None, false),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    &None, /* no forwarded requests */
+                )
                 .await
-                .expect("delete should succeed");
+                .expect("Request failed");
 
-            let response = handler(
-                make_request(repository, None, false),
-                immutable_store.clone(),
-                mutable_store.clone(),
-            )
-            .await
-            .expect("Request failed");
+                let items: Vec<_> = collect_response(response)
+                    .await
+                    .into_iter()
+                    .map(|r| r.expect("stream item ok"))
+                    .collect();
 
-            let items: Vec<_> = collect_response(response)
-                .await
-                .into_iter()
-                .map(|r| r.expect("stream item ok"))
-                .collect();
-
-            assert_eq!(items.len(), 1);
-            assert_eq!(items[0].branch.as_ref().unwrap().name, "main");
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn list_includes_deleted_when_flag_set() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                repository,
-            ));
-            let main = create_root_branch(&repository_context, "main", "alice").await;
-            let main_latest = seed_revision(&repository_context, main).await;
-            let to_delete =
-                create_child_branch(&repository_context, "feature", "bob", main, main_latest).await;
-            branch::delete(repository_context.clone(), to_delete)
-                .await
-                .expect("delete should succeed");
-
-            let response = handler(
-                make_request(repository, None, true),
-                immutable_store.clone(),
-                mutable_store.clone(),
-            )
-            .await
-            .expect("Request failed");
-
-            let items: Vec<_> = collect_response(response)
-                .await
-                .into_iter()
-                .map(|r| r.expect("stream item ok"))
-                .collect();
-
-            assert_eq!(items.len(), 2);
-            let deleted_count = items
-                .iter()
-                .filter(|r| r.branch.as_ref().unwrap().deleted)
-                .count();
-            assert_eq!(deleted_count, 1);
-            let deleted_branch = items
-                .iter()
-                .find(|r| r.branch.as_ref().unwrap().deleted)
-                .unwrap()
-                .branch
-                .as_ref()
-                .unwrap();
-            assert_eq!(deleted_branch.name, "feature");
-            assert_eq!(deleted_branch.creator, "bob");
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn list_creator_filter_combines_with_include_deleted() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                repository,
-            ));
-            let main = create_root_branch(&repository_context, "main", "alice").await;
-            let main_latest = seed_revision(&repository_context, main).await;
-            // Three branches by alice (one deleted), one by bob.
-            create_child_branch(
-                &repository_context,
-                "alice-live",
-                "alice",
-                main,
-                main_latest,
-            )
+                assert_eq!(items.len(), 2);
+                let names: Vec<String> = items
+                    .iter()
+                    .map(|r| r.branch.as_ref().unwrap().name.clone())
+                    .collect();
+                assert!(names.contains(&"main".to_string()));
+                assert!(names.contains(&"feature".to_string()));
+                assert!(items.iter().all(|r| !r.branch.as_ref().unwrap().deleted));
+            }))
             .await;
-            let alice_dead = create_child_branch(
-                &repository_context,
-                "alice-dead",
-                "alice",
-                main,
-                main_latest,
-            )
+        }
+
+        #[tokio::test]
+        async fn list_excludes_deleted_by_default() {
+            let repository = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+                let repository_context = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository,
+                ));
+                let main = create_root_branch(&repository_context, "main", "alice").await;
+                let main_latest = seed_revision(&repository_context, main).await;
+                let to_delete =
+                    create_child_branch(&repository_context, "feature", "bob", main, main_latest)
+                        .await;
+                branch::delete(repository_context.clone(), to_delete)
+                    .await
+                    .expect("delete should succeed");
+
+                let response = handler(
+                    make_request(repository, None, false),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    &None, /* no forwarded requests */
+                )
+                .await
+                .expect("Request failed");
+
+                let items: Vec<_> = collect_response(response)
+                    .await
+                    .into_iter()
+                    .map(|r| r.expect("stream item ok"))
+                    .collect();
+
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].branch.as_ref().unwrap().name, "main");
+            }))
             .await;
-            create_child_branch(&repository_context, "bob-live", "bob", main, main_latest).await;
-            branch::delete(repository_context.clone(), alice_dead)
-                .await
-                .expect("delete should succeed");
+        }
 
-            // include_deleted=false → only live alice branches (main + alice-live = 2)
-            let live_only = handler(
-                make_request(repository, Some("alice".into()), false),
-                immutable_store.clone(),
-                mutable_store.clone(),
-            )
-            .await
-            .expect("Request failed");
-            let live_items: Vec<_> = collect_response(live_only)
-                .await
-                .into_iter()
-                .map(|r| r.expect("stream item ok"))
-                .collect();
-            assert_eq!(live_items.len(), 2);
-            assert!(
-                live_items
-                    .iter()
-                    .all(|r| r.branch.as_ref().unwrap().creator == "alice")
-            );
-            assert!(
-                live_items
-                    .iter()
-                    .all(|r| !r.branch.as_ref().unwrap().deleted)
-            );
+        #[tokio::test]
+        async fn list_includes_deleted_when_flag_set() {
+            let repository = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
 
-            // include_deleted=true → all alice branches including the deleted one (3)
-            let with_deleted = handler(
-                make_request(repository, Some("alice".into()), true),
-                immutable_store.clone(),
-                mutable_store.clone(),
-            )
-            .await
-            .expect("Request failed");
-            let all_items: Vec<_> = collect_response(with_deleted)
+            Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+                let repository_context = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository,
+                ));
+                let main = create_root_branch(&repository_context, "main", "alice").await;
+                let main_latest = seed_revision(&repository_context, main).await;
+                let to_delete =
+                    create_child_branch(&repository_context, "feature", "bob", main, main_latest)
+                        .await;
+                branch::delete(repository_context.clone(), to_delete)
+                    .await
+                    .expect("delete should succeed");
+
+                let response = handler(
+                    make_request(repository, None, true),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    &None, /* no forwarded requests */
+                )
                 .await
-                .into_iter()
-                .map(|r| r.expect("stream item ok"))
-                .collect();
-            assert_eq!(all_items.len(), 3);
-            assert!(
-                all_items
+                .expect("Request failed");
+
+                let items: Vec<_> = collect_response(response)
+                    .await
+                    .into_iter()
+                    .map(|r| r.expect("stream item ok"))
+                    .collect();
+
+                assert_eq!(items.len(), 2);
+                let deleted_count = items
                     .iter()
-                    .all(|r| r.branch.as_ref().unwrap().creator == "alice")
-            );
-            let dead_count = all_items
-                .iter()
-                .filter(|r| r.branch.as_ref().unwrap().deleted)
-                .count();
-            assert_eq!(dead_count, 1);
-        }))
-        .await;
+                    .filter(|r| r.branch.as_ref().unwrap().deleted)
+                    .count();
+                assert_eq!(deleted_count, 1);
+                let deleted_branch = items
+                    .iter()
+                    .find(|r| r.branch.as_ref().unwrap().deleted)
+                    .unwrap()
+                    .branch
+                    .as_ref()
+                    .unwrap();
+                assert_eq!(deleted_branch.name, "feature");
+                assert_eq!(deleted_branch.creator, "bob");
+            }))
+            .await;
+        }
+
+        #[tokio::test]
+        async fn list_creator_filter_combines_with_include_deleted() {
+            let repository = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+                let repository_context = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository,
+                ));
+                let main = create_root_branch(&repository_context, "main", "alice").await;
+                let main_latest = seed_revision(&repository_context, main).await;
+                // Three branches by alice (one deleted), one by bob.
+                create_child_branch(
+                    &repository_context,
+                    "alice-live",
+                    "alice",
+                    main,
+                    main_latest,
+                )
+                .await;
+                let alice_dead = create_child_branch(
+                    &repository_context,
+                    "alice-dead",
+                    "alice",
+                    main,
+                    main_latest,
+                )
+                .await;
+                create_child_branch(&repository_context, "bob-live", "bob", main, main_latest)
+                    .await;
+                branch::delete(repository_context.clone(), alice_dead)
+                    .await
+                    .expect("delete should succeed");
+
+                // include_deleted=false → only live alice branches (main + alice-live = 2)
+                let live_only = handler(
+                    make_request(repository, Some("alice".into()), false),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    &None, /* no forwarded requests */
+                )
+                .await
+                .expect("Request failed");
+                let live_items: Vec<_> = collect_response(live_only)
+                    .await
+                    .into_iter()
+                    .map(|r| r.expect("stream item ok"))
+                    .collect();
+                assert_eq!(live_items.len(), 2);
+                assert!(
+                    live_items
+                        .iter()
+                        .all(|r| r.branch.as_ref().unwrap().creator == "alice")
+                );
+                assert!(
+                    live_items
+                        .iter()
+                        .all(|r| !r.branch.as_ref().unwrap().deleted)
+                );
+
+                // include_deleted=true → all alice branches including the deleted one (3)
+                let with_deleted = handler(
+                    make_request(repository, Some("alice".into()), true),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    &None, /* no forwarded requests */
+                )
+                .await
+                .expect("Request failed");
+                let all_items: Vec<_> = collect_response(with_deleted)
+                    .await
+                    .into_iter()
+                    .map(|r| r.expect("stream item ok"))
+                    .collect();
+                assert_eq!(all_items.len(), 3);
+                assert!(
+                    all_items
+                        .iter()
+                        .all(|r| r.branch.as_ref().unwrap().creator == "alice")
+                );
+                let dead_count = all_items
+                    .iter()
+                    .filter(|r| r.branch.as_ref().unwrap().deleted)
+                    .count();
+                assert_eq!(dead_count, 1);
+            }))
+            .await;
+        }
+
+        #[tokio::test]
+        async fn list_filters_by_creator() {
+            let repository = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+                let repository_context = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository,
+                ));
+                create_root_branch(&repository_context, "main", "alice").await;
+                create_root_branch(&repository_context, "feature", "bob").await;
+                create_root_branch(&repository_context, "extra", "alice").await;
+
+                let response = handler(
+                    make_request(repository, Some("alice".into()), false),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    &None, /* no forwarded requests */
+                )
+                .await
+                .expect("Request failed");
+
+                let items: Vec<_> = collect_response(response)
+                    .await
+                    .into_iter()
+                    .map(|r| r.expect("stream item ok"))
+                    .collect();
+
+                assert_eq!(items.len(), 2);
+                assert!(
+                    items
+                        .iter()
+                        .all(|r| r.branch.as_ref().unwrap().creator == "alice")
+                );
+            }))
+            .await;
+        }
+
+        #[tokio::test]
+        async fn list_delivers_items_incrementally() {
+            let repository = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+                let repository_context = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository,
+                ));
+                create_root_branch(&repository_context, "main", "alice").await;
+                create_root_branch(&repository_context, "feature1", "alice").await;
+                create_root_branch(&repository_context, "feature2", "bob").await;
+
+                // The handler's Response is returned before the producer
+                // task has touched the mutable store; pulling one item at a
+                // time proves incremental delivery rather than batched
+                // buffering of the full result.
+                let response = handler(
+                    make_request(repository, None, false),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    &None, /* no forwarded requests */
+                )
+                .await
+                .expect("Request failed");
+
+                let mut stream = response.into_inner();
+                let first = stream.next().await.expect("first item ready");
+                first.expect("first item ok");
+
+                let second = stream.next().await.expect("second item ready");
+                second.expect("second item ok");
+
+                let third = stream.next().await.expect("third item ready");
+                third.expect("third item ok");
+
+                assert!(stream.next().await.is_none(), "expected end of stream");
+            }))
+            .await;
+        }
+
+        #[tokio::test]
+        async fn list_empty_repository_yields_empty_stream() {
+            let repository = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+                let response = handler(
+                    make_request(repository, None, false),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    &None, /* no forwarded requests */
+                )
+                .await
+                .expect("Request failed");
+
+                let items: Vec<_> = collect_response(response).await;
+                assert!(items.is_empty());
+            }))
+            .await;
+        }
     }
 
-    #[tokio::test]
-    async fn list_filters_by_creator() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
+    mod forwarded_request {
+        use std::sync::Mutex;
 
-        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                repository,
+        use async_trait::async_trait;
+        use tonic::Response;
+        use tonic::Status;
+
+        use super::*;
+        use crate::grpc::forwarded_requests::ForwardedRequestResult;
+        use crate::grpc::forwarded_requests::ForwardedRequests;
+        use crate::grpc::forwarded_requests::InternalClientError;
+        use crate::grpc::forwarded_requests::RpcFlags;
+        use crate::grpc::forwarded_requests::revision_service::ForwardedRevisionServiceClient;
+
+        /// Single-use client that returns a pre-configured result on its one call.
+        struct SingleShotClient {
+            response: Arc<Mutex<Option<ForwardedRequestResult<BranchListStream>>>>,
+        }
+
+        #[async_trait]
+        impl ForwardedRevisionServiceClient for SingleShotClient {
+            async fn branch_create(
+                &mut self,
+                _request: Request<lore_proto::lore::revision::v1::BranchCreateRequest>,
+            ) -> ForwardedRequestResult<lore_proto::lore::revision::v1::BranchCreateResponse>
+            {
+                unreachable!("branch_create should not be called in branch_list tests")
+            }
+
+            async fn branch_delete(
+                &mut self,
+                _request: Request<lore_proto::lore::revision::v1::BranchDeleteRequest>,
+            ) -> ForwardedRequestResult<lore_proto::lore::revision::v1::BranchDeleteResponse>
+            {
+                unreachable!("branch_delete should not be called in branch_list tests")
+            }
+
+            async fn branch_get(
+                &mut self,
+                _request: Request<lore_proto::lore::revision::v1::BranchGetRequest>,
+            ) -> ForwardedRequestResult<lore_proto::lore::revision::v1::BranchGetResponse>
+            {
+                unreachable!("branch_get should not be called in branch_list tests")
+            }
+
+            async fn branch_list(
+                &mut self,
+                _request: Request<lore_proto::lore::revision::v1::BranchListRequest>,
+            ) -> ForwardedRequestResult<BranchListStream> {
+                self.response
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("branch_list called more than once")
+            }
+        }
+
+        struct StubForwardedRequests {
+            flags: RpcFlags,
+            response: Arc<Mutex<Option<ForwardedRequestResult<BranchListStream>>>>,
+        }
+
+        impl StubForwardedRequests {
+            fn forwarding_enabled(response: ForwardedRequestResult<BranchListStream>) -> Arc<Self> {
+                Arc::new(Self {
+                    flags: RpcFlags {
+                        revision_branch_list: true,
+                        ..Default::default()
+                    },
+                    response: Arc::new(Mutex::new(Some(response))),
+                })
+            }
+
+            fn forwarding_disabled(
+                response: ForwardedRequestResult<BranchListStream>,
+            ) -> Arc<Self> {
+                Arc::new(Self {
+                    flags: RpcFlags {
+                        revision_branch_list: false,
+                        ..Default::default()
+                    },
+                    response: Arc::new(Mutex::new(Some(response))),
+                })
+            }
+        }
+
+        impl ForwardedRequests for StubForwardedRequests {
+            fn rpc_flags(&self) -> &RpcFlags {
+                &self.flags
+            }
+
+            fn forwarded_revision_service(&self) -> Box<dyn ForwardedRevisionServiceClient> {
+                Box::new(SingleShotClient {
+                    response: Arc::clone(&self.response),
+                })
+            }
+
+            fn forwarded_repository_service(
+                &self,
+            ) -> Box<dyn crate::grpc::forwarded_requests::repository_service::ForwardedRepositoryServiceClient>
+{
+                unreachable!(
+                    "forwarded_repository_service should not be called in branch_list tests"
+                )
+            }
+        }
+
+        #[tokio::test]
+        async fn delegates_to_remote_and_returns_stream() {
+            // When the flag is enabled the remote stream is relayed directly;
+            // branch_list_implementation is NOT called so the local store is not read.
+            let repository = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            let make_branch = |name: &str| lore_proto::lore::model::v1::Branch {
+                name: name.into(),
+                ..Default::default()
+            };
+            let stream: BranchListStream = Box::pin(tokio_stream::iter(vec![
+                Ok(BranchListResponse {
+                    branch: Some(make_branch("remote-alpha")),
+                }),
+                Ok(BranchListResponse {
+                    branch: Some(make_branch("remote-beta")),
+                }),
+            ]));
+            let forwarded_requests =
+                StubForwardedRequests::forwarding_enabled(Ok(Ok(Response::new(stream))));
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let response = handler(
+                    make_request(repository, None, false),
+                    immutable_store,
+                    mutable_store,
+                    &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
+                )
+                .await
+                .expect("should succeed");
+
+                let items: Vec<_> = collect_response(response)
+                    .await
+                    .into_iter()
+                    .map(|r| r.expect("stream item ok"))
+                    .collect();
+                let names: Vec<&str> = items
+                    .iter()
+                    .map(|r| r.branch.as_ref().unwrap().name.as_str())
+                    .collect();
+                assert_eq!(items.len(), 2);
+                assert!(names.contains(&"remote-alpha"));
+                assert!(names.contains(&"remote-beta"));
+            }))
+            .await;
+        }
+
+        #[tokio::test]
+        async fn error_status_returned_to_caller() {
+            // An error status from the forwarded server is forwarded directly to the original caller.
+            let repository = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            let forwarded_requests = StubForwardedRequests::forwarding_enabled(Ok(Err(
+                Status::not_found("test error forwarded"),
+            )));
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let err = handler(
+                    make_request(repository, None, false),
+                    immutable_store,
+                    mutable_store,
+                    &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
+                )
+                .await
+                .map(|_| ())
+                .expect_err("forwarded error should propagate");
+
+                assert_eq!(err.code(), tonic::Code::NotFound);
+                assert!(err.message().contains("test error forwarded"));
+            }))
+            .await;
+        }
+
+        #[tokio::test]
+        async fn internal_client_error_maps_to_internal_status() {
+            // A transport-level failure (InternalClientError) is mapped to Status::internal.
+            let repository = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            let forwarded_requests = StubForwardedRequests::forwarding_enabled(Err(
+                InternalClientError::internal("oops"),
             ));
-            create_root_branch(&repository_context, "main", "alice").await;
-            create_root_branch(&repository_context, "feature", "bob").await;
-            create_root_branch(&repository_context, "extra", "alice").await;
 
-            let response = handler(
-                make_request(repository, Some("alice".into()), false),
-                immutable_store.clone(),
-                mutable_store.clone(),
-            )
-            .await
-            .expect("Request failed");
-
-            let items: Vec<_> = collect_response(response)
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let err = handler(
+                    make_request(repository, None, false),
+                    immutable_store,
+                    mutable_store,
+                    &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
+                )
                 .await
-                .into_iter()
-                .map(|r| r.expect("stream item ok"))
-                .collect();
+                .map(|_| ())
+                .expect_err("transport error should become internal status");
 
-            assert_eq!(items.len(), 2);
-            assert!(
-                items
-                    .iter()
-                    .all(|r| r.branch.as_ref().unwrap().creator == "alice")
-            );
-        }))
-        .await;
-    }
+                assert_eq!(err.code(), tonic::Code::Internal);
+                assert!(err.message().contains("Error making forwarded request"));
+            }))
+            .await;
+        }
 
-    #[tokio::test]
-    async fn list_delivers_items_incrementally() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
+        #[tokio::test]
+        async fn flag_disabled_falls_through_to_local_execution() {
+            // When revision_branch_list is false the local path runs, even if a
+            // ForwardedRequests is present. The stub client is not called.
+            let repository = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
 
-        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store.clone(),
-                mutable_store.clone(),
-                repository,
-            ));
-            create_root_branch(&repository_context, "main", "alice").await;
-            create_root_branch(&repository_context, "feature1", "alice").await;
-            create_root_branch(&repository_context, "feature2", "bob").await;
+            // response is irrelevant — client must never be called
+            let forwarded_result: ForwardedRequestResult<BranchListStream> =
+                Ok(Err(Status::internal("should not be called")));
+            let forwarded_requests = StubForwardedRequests::forwarding_disabled(forwarded_result);
 
-            // The handler's Response is returned before the producer
-            // task has touched the mutable store; pulling one item at a
-            // time proves incremental delivery rather than batched
-            // buffering of the full result.
-            let response = handler(
-                make_request(repository, None, false),
-                immutable_store.clone(),
-                mutable_store.clone(),
-            )
-            .await
-            .expect("Request failed");
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository_context = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository,
+                ));
+                create_root_branch(&repository_context, "local-branch", "alice").await;
 
-            let mut stream = response.into_inner();
-            let first = stream.next().await.expect("first item ready");
-            first.expect("first item ok");
+                let response = handler(
+                    make_request(repository, None, false),
+                    immutable_store,
+                    mutable_store,
+                    &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
+                )
+                .await
+                .expect("local execution should succeed");
 
-            let second = stream.next().await.expect("second item ready");
-            second.expect("second item ok");
-
-            let third = stream.next().await.expect("third item ready");
-            third.expect("third item ok");
-
-            assert!(stream.next().await.is_none(), "expected end of stream");
-        }))
-        .await;
-    }
-
-    #[tokio::test]
-    async fn list_empty_repository_yields_empty_stream() {
-        let repository = random::<RepositoryId>();
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
-            let response = handler(
-                make_request(repository, None, false),
-                immutable_store.clone(),
-                mutable_store.clone(),
-            )
-            .await
-            .expect("Request failed");
-
-            let items: Vec<_> = collect_response(response).await;
-            assert!(items.is_empty());
-        }))
-        .await;
+                let items: Vec<_> = collect_response(response)
+                    .await
+                    .into_iter()
+                    .map(|r| r.expect("stream item ok"))
+                    .collect();
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].branch.as_ref().unwrap().name, "local-branch");
+            }))
+            .await;
+        }
     }
 }

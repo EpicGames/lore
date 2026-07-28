@@ -352,20 +352,24 @@ pub trait ImmutableStore: Any + Send + Sync {
 
     /// Evict fragments from the store until the given max capacity is reached.
     /// When `sync_data` is true, data is synced to the storage media (fsync).
+    /// `sink`, when present, receives eviction lifecycle and per-bucket progress.
     async fn evict(
         self: Arc<Self>,
         max_capacity: usize,
         sync_data: bool,
+        sink: Option<crate::gc_event::GcEventSinkRef>,
     ) -> Result<usize, StoreError>;
 
     /// Compact storage and remove unreferenced payloads. Returns an optional non-zero
     /// resume point to denote it has completed a step.
     /// When `sync_data` is true, data is synced to the storage media (fsync).
+    /// `sink`, when present, receives compaction lifecycle and per-group progress.
     async fn compact(
         self: Arc<Self>,
         max_size: usize,
         at: Option<usize>,
         sync_data: bool,
+        sink: Option<crate::gc_event::GcEventSinkRef>,
     ) -> Result<Option<usize>, StoreError>;
 
     /// Return the current resume point for compaction

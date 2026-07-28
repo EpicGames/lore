@@ -70,6 +70,7 @@ pub struct EndpointConfig {
 
 const IDLE_TIMEOUT_MS: u32 = 30000;
 const KEEP_ALIVE_MS: u64 = 500;
+const HANDSHAKE_TIMEOUT_SECS: u64 = 5;
 pub const DEFAULT_EXPECTED_RTT_MS: u64 = 100;
 
 #[derive(Clone, Debug)]
@@ -203,6 +204,8 @@ pub struct TransportConfig {
     pub max_bytes_bandwidth_per_second: u64,
     pub expected_rtt_ms: u64,
     pub congestion_algorithm: CongestionAlgorithm,
+    /// Warm-start hint for Congestion Algorithms: seed the initial congestion window
+    pub initial_cwnd: Option<u64>,
 }
 
 /// When working within a QUIC connection, these are the opportunities
@@ -737,8 +740,21 @@ pub async fn connect(
 
     let congestion_controller: Arc<dyn congestion::ControllerFactory + Send + Sync + 'static> =
         match transport.congestion_algorithm {
-            CongestionAlgorithm::Bbr => Arc::new(congestion::BbrConfig::default()),
-            CongestionAlgorithm::Cubic => Arc::new(congestion::CubicConfig::default()),
+            CongestionAlgorithm::Bbr => {
+                let mut bbr = congestion::BbrConfig::default();
+                if let Some(cwnd) = transport.initial_cwnd {
+                    bbr.initial_window(cwnd);
+                }
+                Arc::new(bbr)
+            }
+            CongestionAlgorithm::Cubic => {
+                let mut cubic = congestion::CubicConfig::default();
+                if let Some(cwnd) = transport.initial_cwnd {
+                    cubic.initial_window(cwnd);
+                }
+
+                Arc::new(cubic)
+            }
         };
     transport_config.congestion_controller_factory(congestion_controller);
 
@@ -757,13 +773,21 @@ pub async fn connect(
             Ok(mut endpoint) => {
                 endpoint.set_default_client_config(client_config.clone());
                 match endpoint.connect(remote_addr, server_name) {
-                    Ok(connecting) => match connecting.await {
-                        Ok(connection) => {
+                    Ok(connecting) => match tokio::time::timeout(
+                        Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+                        connecting,
+                    )
+                    .await
+                    {
+                        Ok(Ok(connection)) => {
                             lore_debug!("Success QUIC connecting to {remote_addr}");
                             return Ok(connection);
                         }
-                        Err(err) => {
+                        Ok(Err(err)) => {
                             lore_debug!("Failed QUIC connecting to {remote_addr}: {err}");
+                        }
+                        Err(_) => {
+                            lore_debug!("QUIC handshake timeout to {remote_addr}");
                         }
                     },
                     Err(err) => {
@@ -777,9 +801,10 @@ pub async fn connect(
         }
     }
 
-    // Silent propagation of connection errors
+    // Every candidate address failed; the server is unreachable. Classify as
+    // `Disconnected`. Per-attempt details are logged above.
     lore_debug!("QUIC connect failed {remote_url}");
-    Err(ProtocolError::internal(format!("connect: {remote_url}")))
+    Err(ProtocolError::from(Disconnected))
 }
 
 pub async fn reconnect<AuthErrorType>(

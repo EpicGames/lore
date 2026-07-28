@@ -1070,36 +1070,50 @@ pub async fn open_mmap_write(
 /// copy the bytes themselves). The file size is queried from the open handle to
 /// avoid a separate metadata syscall on the path. All filesystem work runs on a
 /// blocking thread via [`lore_spawn_blocking!`].
-pub async fn open_mmap_read(path: impl AsRef<Path>) -> Result<(Bytes, bool), std::io::Error> {
+pub async fn open_mmap_read(
+    path: impl AsRef<Path>,
+) -> Result<(Bytes, bool, Option<tokio::sync::OwnedSemaphorePermit>), std::io::Error> {
     let path = path.as_ref().to_path_buf();
-    lore_base::lore_spawn_blocking!(move || -> std::io::Result<(Bytes, bool)> {
-        use std::io::Read;
 
-        let mut file = std::fs::File::options()
-            .create(false)
-            .truncate(false)
-            .read(true)
-            .write(false)
-            .open(&path)?;
-
-        let size = file.metadata()?.len();
-
-        if size <= MMAP_READ_THRESHOLD {
-            let size = size as usize;
-            let mut buf = BytesMut::with_capacity(size);
-            // Safety: `with_capacity(size)` guarantees that the allocation holds
-            // at least `size` bytes. The following `read_exact` initialises every
-            // byte up to `size`, so no uninitialised memory is ever observed.
-            unsafe { buf.set_len(size) };
-            file.read_exact(&mut buf)?;
-            Ok((buf.freeze(), false))
-        } else {
-            let mmap = unsafe { Mmap::map(&file)? };
-            Ok((Bytes::from_owner(mmap), true))
+    // Reserve before allocating; mmapped files aren't copied, so they take none.
+    let read_permit = match tokio::fs::metadata(&path).await {
+        Ok(meta) if meta.len() > 0 && meta.len() <= MMAP_READ_THRESHOLD => {
+            crate::concurrency::acquire_fragment_memory_permit(meta.len() as usize).await
         }
-    })
-    .await
-    .map_err(std::io::Error::other)?
+        _ => None,
+    };
+
+    let (bytes, is_mmapped) =
+        lore_base::lore_spawn_blocking!(move || -> std::io::Result<(Bytes, bool)> {
+            use std::io::Read;
+
+            let mut file = std::fs::File::options()
+                .create(false)
+                .truncate(false)
+                .read(true)
+                .write(false)
+                .open(&path)?;
+
+            let size = file.metadata()?.len();
+
+            if size <= MMAP_READ_THRESHOLD {
+                let size = size as usize;
+                let mut buf = BytesMut::with_capacity(size);
+                // Safety: `with_capacity(size)` guarantees that the allocation holds
+                // at least `size` bytes. The following `read_exact` initialises every
+                // byte up to `size`, so no uninitialised memory is ever observed.
+                unsafe { buf.set_len(size) };
+                file.read_exact(&mut buf)?;
+                Ok((buf.freeze(), false))
+            } else {
+                let mmap = unsafe { Mmap::map(&file)? };
+                Ok((Bytes::from_owner(mmap), true))
+            }
+        })
+        .await
+        .map_err(std::io::Error::other)??;
+
+    Ok((bytes, is_mmapped, read_permit))
 }
 
 /// Files at or below this size are read into a heap buffer rather than memory mapped.

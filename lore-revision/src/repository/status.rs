@@ -806,6 +806,34 @@ async fn count_subtrees(roots: Vec<CountWork>) -> Result<(u64, u64), StatusError
     Ok((directories, files))
 }
 
+/// Resolve the remote's latest revision for a branch, degrading to the existing
+/// `NoRemote` state when the remote is unavailable so an unreachable remote never
+/// stalls a local status read; transport connect timeouts bound the wait.
+///
+/// Returns `(latest, authorized, available)`, where `available` reflects
+/// connectivity, not query success — a reachable remote that errors is still available.
+async fn resolve_remote_latest(
+    repository: &Arc<RepositoryContext>,
+    branch_id: BranchId,
+) -> (Option<Hash>, bool, bool) {
+    let remote = match repository.remote().await {
+        Ok(r) => r,
+        Err(err) => {
+            lore_debug!("Remote unavailable for status: {err}");
+            return (None, false, false);
+        }
+    };
+
+    match branch::load_remote(remote, repository.id, branch_id).await {
+        Ok(status) => (Some(status.latest), true, true),
+        Err(err) if err.is_branch_not_found() => (None, true, true),
+        Err(err) => {
+            lore_debug!("Remote branch query failed: {err}");
+            (None, false, true)
+        }
+    }
+}
+
 pub async fn status(
     repository: Arc<RepositoryContext>,
     paths: Option<Vec<RelativePath>>,
@@ -907,14 +935,8 @@ pub async fn status(
 
     // Authorized only on an authoritative answer — a latest revision
     // or branch not found; proving the identity is authorized and has access
-    let (remote_latest, remote_authorized) = match repository.remote().await {
-        Ok(remote) => match branch::load_remote(remote, repository.id, branch.id).await {
-            Ok(status) => (Some(status.latest), true),
-            Err(err) if err.is_branch_not_found() => (None, true),
-            Err(_) => (None, false),
-        },
-        Err(_) => (None, false),
-    };
+    let (remote_latest, remote_authorized, remote_available) =
+        resolve_remote_latest(&repository, branch.id).await;
 
     let remote_state = if let Some(remote_latest) = remote_latest {
         state::State::deserialize(repository.clone(), remote_latest)
@@ -1080,7 +1102,7 @@ pub async fn status(
             },
             local_ahead,
             remote_ahead,
-            repository.remote().await.is_ok(),
+            remote_available,
             remote_authorized,
             remote_latest.is_some(),
         );
@@ -1193,9 +1215,13 @@ pub async fn status(
                     for change in changes.iter() {
                         // When scanning, skip dirty-only changes from the
                         // state diff — the scan section re-detects them from
-                        // the filesystem and handles set/clear inline.
-                        let dominated_by_scan =
-                            show_scan && change.flags.is_dirty() && !change.flags.is_stage();
+                        // the filesystem and handles set/clear inline. Moves
+                        // are exempt: only this diff pairs the add and delete
+                        // by file context to recover the source path.
+                        let dominated_by_scan = show_scan
+                            && change.flags.is_dirty()
+                            && !change.flags.is_stage()
+                            && change.action != FileAction::Move;
                         if dominated_by_scan
                             || !(change.flags.is_stage() || change.flags.is_dirty())
                         {
@@ -1457,4 +1483,63 @@ pub async fn status(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod remote_resolve_tests {
+    use lore_transport::ProtocolError;
+
+    use super::*;
+    use crate::errors::Disconnected;
+    use crate::lore::BranchId;
+    use crate::repository::RemoteState;
+    use crate::repository::RepositoryContext;
+    use crate::repository::RepositoryFormat;
+    use crate::repository::create_client_memory_stores;
+
+    fn disconnected() -> ProtocolError {
+        ProtocolError::from(Disconnected)
+    }
+
+    async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
+        let (immutable, mutable) = create_client_memory_stores()
+            .await
+            .expect("in-memory stores should be creatable");
+        Arc::new(RepositoryContext::new_with_state(
+            None,
+            immutable,
+            mutable,
+            crate::lore::RepositoryId::default(),
+            crate::instance::InstanceId::default(),
+            state,
+            Arc::default(),
+            RepositoryFormat::Lore,
+        ))
+    }
+
+    #[tokio::test]
+    async fn offline_remote_resolves_to_unavailable() {
+        let ctx = context_with_state(RemoteState::Offline).await;
+
+        let result = resolve_remote_latest(&ctx, BranchId::default()).await;
+
+        assert_eq!(
+            result,
+            (None, false, false),
+            "offline should degrade to unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_remote_resolves_to_unavailable() {
+        let ctx = context_with_state(RemoteState::Failed(disconnected())).await;
+
+        let result = resolve_remote_latest(&ctx, BranchId::default()).await;
+
+        assert_eq!(
+            result,
+            (None, false, false),
+            "failed remote should degrade to unavailable"
+        );
+    }
 }

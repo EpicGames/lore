@@ -65,6 +65,9 @@ pub struct LoreRevisionCommitArgs {
     /// Array of messages corresponding to each layer path (parallel array with `layer_paths`)
     #[serde(default)]
     pub layer_messages: LoreArray<LoreString>,
+    /// Emit per-fragment write stats during the commit
+    #[serde(default)]
+    pub stats: u8,
 }
 
 /// Commits all staged changes to the current branch as a new revision.
@@ -78,8 +81,8 @@ pub struct LoreRevisionCommitArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Commit Events
@@ -158,6 +161,7 @@ async fn commit_local(
                 link_messages,
                 layer,
                 layer_messages,
+                stats: args.stats != 0,
             };
 
             // Enable upload to remote during commit unless offline or local
@@ -238,8 +242,8 @@ pub struct LoreRevisionAmendArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Commit Events
@@ -301,8 +305,8 @@ pub struct LoreRevisionInfoArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Revision Info Events
@@ -353,8 +357,8 @@ pub struct LoreRevisionMetadataClearArgs {}
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Metadata Events
@@ -409,8 +413,8 @@ pub struct LoreRevisionMetadataGetArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Metadata Events
@@ -461,8 +465,8 @@ pub struct LoreRevisionMetadataListArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Metadata Events
@@ -524,8 +528,8 @@ pub struct LoreRevisionMetadataSetArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 pub async fn metadata_set(
     globals: LoreGlobalArgs,
@@ -613,8 +617,8 @@ pub struct LoreRevisionHistoryArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## History Events
@@ -669,8 +673,8 @@ pub struct LoreRevisionRestoreArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Restore Events
@@ -755,8 +759,8 @@ pub struct LoreRevisionSyncArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Sync Events
@@ -893,8 +897,8 @@ pub struct LoreRevisionFindArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Find Events
@@ -961,8 +965,8 @@ pub struct LoreRevisionDiffArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Diff Events
@@ -1308,8 +1312,8 @@ pub struct LoreRevisionRevertArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Revert Events
@@ -1389,8 +1393,8 @@ pub struct LoreRevisionRevertAbortArgs {}
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Revert Events
@@ -1443,8 +1447,8 @@ pub struct LoreRevisionRevertUnresolveArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Revert Events
@@ -1498,8 +1502,8 @@ pub struct LoreRevisionRevertRestartArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Revert Events
@@ -1554,8 +1558,8 @@ pub struct LoreRevisionRevertResolveArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Revert Events
@@ -1609,8 +1613,8 @@ pub struct LoreRevisionRevertResolveMineArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Revert Events
@@ -1666,8 +1670,8 @@ pub struct LoreRevisionRevertResolveTheirsArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Revert Events

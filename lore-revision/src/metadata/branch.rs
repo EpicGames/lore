@@ -270,6 +270,18 @@ pub async fn set(
     values: &[&[u8]],
     formats: &[MetadataType],
 ) -> Result<(), BranchMetadataError> {
+    if keys.len() != values.len() || keys.len() != formats.len() {
+        return Err(InvalidArguments {
+            reason: format!(
+                "metadata requires matching keys, values, and formats (got {} keys, {} values, {} formats)",
+                keys.len(),
+                values.len(),
+                formats.len()
+            ),
+        }
+        .into());
+    }
+
     for key_bytes in keys.iter() {
         let key = std::str::from_utf8(key_bytes).internal("invalid key encoding")?;
         validate_key(key)?;

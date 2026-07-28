@@ -9,7 +9,6 @@ use lore_transport::auth::authentication;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::error::LoreResultExt;
 use crate::errors::*;
 use crate::event::EventError;
 use crate::event::LoreEvent;
@@ -157,7 +156,7 @@ pub async fn resolve_user_info(
         get_domain_or_empty(&auth_url),
     )
     .await
-    .debug_map_err(UserInfoError::from(NotAuthenticated))?;
+    .forward::<UserInfoError>("Failed authorization token exchange")?;
 
     let auth_impl = authentication::find(&auth_url)
         .forward::<UserInfoError>("Unable to connect to auth info endpoint")?;
@@ -391,7 +390,7 @@ pub async fn user_display_name(
         get_domain_or_empty(&auth_url),
     )
     .await
-    .debug_map_err(UserInfoError::from(NotAuthenticated))?;
+    .forward::<UserInfoError>("Failed authorization token exchange")?;
 
     let auth_impl = authentication::find(&auth_url)
         .forward::<UserInfoError>("Unable to connect to auth info endpoint")?;
@@ -455,7 +454,7 @@ pub async fn user_id(
         get_domain_or_empty(&auth_url),
     )
     .await
-    .debug_map_err(UserInfoError::from(NotAuthenticated))?;
+    .forward::<UserInfoError>("Failed authorization token exchange")?;
 
     let auth_impl = authentication::find(&auth_url)
         .forward::<UserInfoError>("Unable to connect to auth info endpoint")?;

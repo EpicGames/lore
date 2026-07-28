@@ -153,7 +153,7 @@ xcuserdata
 
 # claude
 *.local.*
-.claude/skills/review-feedback/
+.claude/
 .claude-worktrees/
 
 # test report

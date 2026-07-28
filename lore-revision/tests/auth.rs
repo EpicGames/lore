@@ -95,5 +95,34 @@ mod tests {
 
             verify_jwt_usage_for_remote(&token, "lore-server.lore.example.com").unwrap();
         }
+
+        #[test]
+        fn leading_dot_aud_matches_subdomains_and_apex() {
+            let token = make_jwt_with_audience(vec![".lore.example.com".to_string()]);
+
+            // Subdomains ("*.lore.example.com") match.
+            verify_jwt_usage_for_remote(&token, "lore-server.lore.example.com").unwrap();
+            // The bare apex domain ("lore.example.com") also matches.
+            verify_jwt_usage_for_remote(&token, "lore.example.com").unwrap();
+        }
+
+        #[test]
+        fn leading_dot_aud_rejects_unrelated_domain() {
+            let token = make_jwt_with_audience(vec![".lore.example.com".to_string()]);
+
+            verify_jwt_usage_for_remote(&token, "attackerlore.example.com").unwrap_err();
+        }
+
+        #[test]
+        fn naked_aud_rejects_mid_label_suffix_domain() {
+            // A dotless `aud` must respect the label boundary.
+            let token = make_jwt_with_audience(vec!["epicgames.net".to_string()]);
+
+            // The apex and true subdomains match.
+            verify_jwt_usage_for_remote(&token, "epicgames.net").unwrap();
+            verify_jwt_usage_for_remote(&token, "lore.epicgames.net").unwrap();
+            // The look-alike registrable domain does not.
+            verify_jwt_usage_for_remote(&token, "evilepicgames.net").unwrap_err();
+        }
     }
 }

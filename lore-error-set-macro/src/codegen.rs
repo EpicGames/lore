@@ -85,6 +85,7 @@ pub fn generate_error_set(input: &ItemEnum, derive_clone: bool) -> TokenStream {
     let accessor_methods = generate_accessor_methods(vis, enum_name, &variants);
     let error_set_impl = generate_error_set_impl(enum_name, &variants);
     let ffi_error_impl = generate_ffi_error_impl(enum_name, &variants);
+    let has_trace_impl = generate_has_trace_impl(enum_name);
     let matched_enum = generate_matched_enum(vis, enum_name, &variants);
     let has_impls = generate_has_impls(enum_name, &variants);
     let strict_forward = generate_strict_forward(vis, enum_name, &variants);
@@ -97,6 +98,7 @@ pub fn generate_error_set(input: &ItemEnum, derive_clone: bool) -> TokenStream {
         #accessor_methods
         #error_set_impl
         #ffi_error_impl
+        #has_trace_impl
         #matched_enum
         #has_impls
         #strict_forward
@@ -855,6 +857,21 @@ fn generate_ffi_error_impl(enum_name: &Ident, variants: &[&Ident]) -> TokenStrea
                     #(#ffi_arms,)*
                     Self::Internal(_) => lore_error_set::Internal::FFI_CODE,
                 }
+            }
+        }
+    }
+}
+
+/// Generates the `HasTrace` trait impl.
+///
+/// The inherent `trace()` method (in the `impl #enum_name` block) already
+/// returns the trace; this impl exposes it through the `HasTrace` bound so
+/// generic code can read the trace without naming the concrete enum.
+fn generate_has_trace_impl(enum_name: &Ident) -> TokenStream {
+    quote! {
+        impl lore_error_set::HasTrace for #enum_name {
+            fn trace(&self) -> &lore_error_set::Trace {
+                Self::trace(self)
             }
         }
     }

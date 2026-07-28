@@ -96,21 +96,23 @@ impl EventError for AcquireError {
     }
 }
 
-/// Data for an event reporting a path whose lock was acquired.
+/// Data for an event that marks the start of a lock acquire report.
+#[repr(C)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreLockFileAcquireBeginEventData {
+    /// Number of acquire entries that follow.
+    pub count: u64,
+    /// Whether the entries that follow were already owned.
+    pub ignored: u8,
+}
+
+/// Data for an event reporting a path whose lock is being acquired.
 #[repr(C)]
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreLockFileAcquireEventData {
-    /// Path whose lock was acquired.
-    pub path: LoreString,
-}
-
-/// Data for an event reporting a path that was skipped because its lock was already held.
-#[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LoreLockFileAcquireIgnoreEventData {
-    /// Path that was skipped.
+    /// The path whose lock is being acquired.
     pub path: LoreString,
 }
 
@@ -180,6 +182,25 @@ pub async fn acquire(
 
     if resources.is_empty() {
         lore_debug!("No paths to acquire lock on");
+        return Ok(());
+    }
+
+    // We cannot know which locks are going to be acquired or which ones are owned without contacting the server, so every path is reported as a would-be acquisition.
+    if execution_context().globals().dry_run() {
+        let mut paths = resources.keys().cloned().collect::<Vec<_>>();
+        paths.sort();
+
+        event::LoreEvent::LockFileAcquireBegin(LoreLockFileAcquireBeginEventData {
+            count: paths.len() as u64,
+            ignored: 0,
+        })
+        .send();
+
+        for path in paths {
+            event::LoreEvent::LockFileAcquire(LoreLockFileAcquireEventData { path: path.into() })
+                .send();
+        }
+
         return Ok(());
     }
 
@@ -272,6 +293,13 @@ pub async fn acquire(
 
     // Generate structured output for locks successfully acquired
     lore_debug!("Locked {} path(s)", locks.len());
+    if !locks.is_empty() {
+        event::LoreEvent::LockFileAcquireBegin(LoreLockFileAcquireBeginEventData {
+            count: locks.len() as u64,
+            ignored: 0,
+        })
+        .send();
+    }
     for lock in locks {
         let path = lock.resource.description;
 
@@ -282,12 +310,16 @@ pub async fn acquire(
             .send();
     }
 
-    // Generate structured output for locks already own by the user
-    for (key, _) in resources {
-        event::LoreEvent::LockFileAcquireIgnore(LoreLockFileAcquireIgnoreEventData {
-            path: key.into(),
+    // Generate structured output for locks already owned by the user.
+    if !resources.is_empty() {
+        event::LoreEvent::LockFileAcquireBegin(LoreLockFileAcquireBeginEventData {
+            count: resources.len() as u64,
+            ignored: 1,
         })
         .send();
+    }
+    for (key, _) in resources {
+        event::LoreEvent::LockFileAcquire(LoreLockFileAcquireEventData { path: key.into() }).send();
     }
 
     Ok(())

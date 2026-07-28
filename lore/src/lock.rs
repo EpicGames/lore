@@ -37,16 +37,16 @@ pub struct LoreLockFileAcquireArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Lock Events
 ///
 /// | Event | Description |
 /// |-------|-------------|
-/// | [`LoreEvent::LockFileAcquire`](crate::interface::LoreEvent::LockFileAcquire) | Emitted for each file for which a lock was successfully acquired |
-/// | [`LoreEvent::LockFileAcquireIgnore`](crate::interface::LoreEvent::LockFileAcquireIgnore) | Emitted for each file for which a lock was ignored (already owned) |
+/// | [`LoreEvent::LockFileAcquireBegin`](crate::interface::LoreEvent::LockFileAcquireBegin) | Emitted before each group of lock-acquire results |
+/// | [`LoreEvent::LockFileAcquire`](crate::interface::LoreEvent::LockFileAcquire) | Emitted for each file related to the lock-acquired report |
 pub async fn file_acquire(
     globals: LoreGlobalArgs,
     args: LoreLockFileAcquireArgs,
@@ -124,8 +124,8 @@ pub struct LoreLockFileStatusArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Lock Events
@@ -188,8 +188,8 @@ pub struct LoreLockFileQueryArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Lock Events
@@ -255,16 +255,16 @@ pub struct LoreLockFileReleaseArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Lock Events
 ///
 /// | Event | Description |
 /// |-------|-------------|
-/// | [`LoreEvent::LockFileRelease`](crate::interface::LoreEvent::LockFileRelease) | Emitted for each file lock successfully released |
-/// | [`LoreEvent::LockFileReleaseNotFound`](crate::interface::LoreEvent::LockFileReleaseNotFound) | Emitted for each file whose lock was not found |
+/// | [`LoreEvent::LockFileReleaseBegin`](crate::interface::LoreEvent::LockFileReleaseBegin) | Emitted before each group of lock-release results |
+/// | [`LoreEvent::LockFileRelease`](crate::interface::LoreEvent::LockFileRelease) | Emitted for each file related to the lock-released report |
 pub async fn file_release(
     globals: LoreGlobalArgs,
     args: LoreLockFileReleaseArgs,

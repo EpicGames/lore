@@ -10,6 +10,8 @@ use std::sync::Once;
 use std::sync::atomic::AtomicBool;
 
 use lore_base::runtime::runtime_shutdown_timeout;
+use lore_base::text::TextNotUtf8;
+use lore_base::text::ValidateText;
 use lore_base::types::BranchPoint;
 pub use lore_credential::user_info;
 pub use lore_transport::drop_connections;
@@ -19,6 +21,7 @@ use serde::ser::SerializeSeq;
 use tokio::sync::Mutex;
 
 use crate::change::FileAction;
+use crate::event::LoreBytes;
 pub use crate::event::LoreEvent;
 pub use crate::logging::LoreLogLevel;
 use crate::lore::Address;
@@ -72,9 +75,11 @@ impl<'de> Deserialize<'de> for LoreBinary {
 /// A string described by a pointer to its character data and a length, holding
 /// text as a sequence of bytes.
 ///
-/// The text is UTF-8. The length field counts the bytes before the trailing
-/// NUL. An empty string is a NULL pointer with length 0, and a length of 0
-/// means the string is empty.
+/// The text is UTF-8 by convention, but the bytes are never validated on
+/// construction: a string carrying any other encoding is accepted here and
+/// rejected by whichever verb needs to read it as text. The length field counts
+/// the bytes before the trailing NUL. An empty string is a NULL pointer with
+/// length 0, and a length of 0 means the string is empty.
 #[repr(C)]
 pub struct LoreString {
     /// Pointer to the start of the character data.
@@ -88,7 +93,7 @@ unsafe impl Sync for LoreString {}
 
 impl std::fmt::Debug for LoreString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{}", self.as_str()))
+        f.write_fmt(format_args!("{}", String::from_utf8_lossy(self.as_bytes())))
     }
 }
 
@@ -101,6 +106,12 @@ impl LoreString {
         self.length
     }
 
+    /// The text as `&str`, assuming it is valid UTF-8.
+    ///
+    /// Sound for arguments reaching a command handler, because the entry point
+    /// checks every text field a call carries before dispatching it. Not sound
+    /// for a string built by [`Self::from_bytes`] outside that path, which
+    /// accepts any byte sequence — read those through [`Self::as_bytes`].
     pub fn as_str(&self) -> &str {
         if !self.is_empty() {
             unsafe {
@@ -114,13 +125,25 @@ impl LoreString {
         }
     }
 
+    pub fn as_bytes(&self) -> &[u8] {
+        if self.is_empty() {
+            &[]
+        } else {
+            // SAFETY: a non-empty string points to `length` initialized bytes that outlive this
+            // borrow, per the FFI contract and the `from_bytes` / `from_str` constructors.
+            unsafe { std::slice::from_raw_parts(self.string.cast::<u8>(), self.length) }
+        }
+    }
+
     pub fn from_path(source: impl AsRef<Path>) -> Self {
         let source = source.as_ref().display().to_string();
         Self::from_str(source.as_str())
     }
 
-    #[allow(clippy::should_implement_trait)]
-    pub fn from_str(source: &str) -> Self {
+    /// Build an owning `LoreString` from raw bytes, copied into a freshly
+    /// allocated NUL-terminated buffer. The bytes need not be valid UTF-8;
+    /// `Drop` frees the buffer with the matching layout.
+    pub fn from_bytes(source: &[u8]) -> Self {
         unsafe {
             let length = source.len();
             let layout = std::alloc::Layout::from_size_align_unchecked(length + 1, 1);
@@ -132,6 +155,11 @@ impl LoreString {
                 length,
             }
         }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(source: &str) -> Self {
+        Self::from_bytes(source.as_bytes())
     }
 
     fn free(&mut self) {
@@ -156,8 +184,11 @@ impl Default for LoreString {
 }
 
 impl Clone for LoreString {
+    /// Copies the raw bytes, like [`Self::clone_from`]. Cloning must not read
+    /// the text as `&str`: every call clones its arguments before anything has
+    /// checked them, so this runs on whatever the caller passed in.
     fn clone(&self) -> Self {
-        LoreString::from_str(self.as_str())
+        Self::from_bytes(self.as_bytes())
     }
 
     fn clone_from(&mut self, source: &Self) {
@@ -177,13 +208,13 @@ impl Clone for LoreString {
 
 impl PartialEq for LoreString {
     fn eq(&self, other: &Self) -> bool {
-        self.as_str() == other.as_str()
+        self.as_bytes() == other.as_bytes()
     }
 }
 
 impl Display for LoreString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(&String::from_utf8_lossy(self.as_bytes()))
     }
 }
 
@@ -194,6 +225,8 @@ impl Drop for LoreString {
 }
 
 impl AsRef<str> for LoreString {
+    /// Carries [`LoreString::as_str`]'s assumption without showing it at the
+    /// call site.
     fn as_ref(&self) -> &str {
         self.as_str()
     }
@@ -220,6 +253,8 @@ impl From<&LoreString> for Option<String> {
 }
 
 impl<'a> From<&'a LoreString> for Option<&'a str> {
+    /// Carries [`LoreString::as_str`]'s assumption without showing it at the
+    /// call site.
     fn from(value: &'a LoreString) -> Self {
         if !value.is_empty() {
             Some(value.as_str())
@@ -309,12 +344,19 @@ impl From<RelativePath> for LoreString {
     }
 }
 
+/// Serializes as a string, failing on bytes that are not UTF-8.
+///
+/// Serialization is how a command reaches the Lore service, so substituting
+/// replacement characters here would let the service accept text the in-process
+/// path rejects, storing a mangled name instead of reporting a bad argument.
+/// Failing keeps both paths refusing the same input.
 impl Serialize for LoreString {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(self.as_str())
+        let text = std::str::from_utf8(self.as_bytes()).map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(text)
     }
 }
 
@@ -325,6 +367,51 @@ impl<'de> Deserialize<'de> for LoreString {
     {
         let value: String = Deserialize::deserialize(deserializer)?;
         Ok(LoreString::from_str(&value))
+    }
+}
+
+impl ValidateText for LoreString {
+    fn validate_text(&self) -> Result<(), TextNotUtf8> {
+        match std::str::from_utf8(self.as_bytes()) {
+            Ok(_) => Ok(()),
+            Err(_) => Err(TextNotUtf8::here()),
+        }
+    }
+}
+
+impl<T: ValidateText> ValidateText for LoreArray<T> {
+    fn validate_text(&self) -> Result<(), TextNotUtf8> {
+        for (index, item) in self.as_slice().iter().enumerate() {
+            if let Err(error) = item.validate_text() {
+                return Err(error.at(index));
+            }
+        }
+        Ok(())
+    }
+}
+
+lore_base::carries_no_text!(LoreBinary, LoreBytes, LoreMetadataType);
+
+impl ValidateText for LoreGlobalArgs {
+    fn validate_text(&self) -> Result<(), TextNotUtf8> {
+        self.repository_path
+            .validate_text()
+            .map_err(|error| error.inside("repository_path"))
+            .and_then(|()| {
+                self.working_directory
+                    .validate_text()
+                    .map_err(|error| error.inside("working_directory"))
+            })
+            .and_then(|()| {
+                self.correlation_id
+                    .validate_text()
+                    .map_err(|error| error.inside("correlation_id"))
+            })
+            .and_then(|()| {
+                self.identity
+                    .validate_text()
+                    .map_err(|error| error.inside("identity"))
+            })
     }
 }
 
@@ -399,8 +486,9 @@ impl<T> LoreArray<T> {
     }
 
     fn new(count: usize) -> Self {
+        let layout =
+            std::alloc::Layout::array::<T>(count).expect("layout overflow in LoreArray<T>::new");
         unsafe {
-            let layout = std::alloc::Layout::from_size_align_unchecked(count * size_of::<T>(), 1);
             let ptr = std::alloc::alloc(layout).cast::<T>();
             if ptr.is_null() {
                 panic!("unable to alloc for LoreArray<T>::new");
@@ -444,10 +532,8 @@ impl<T> Drop for LoreArray<T> {
             unsafe {
                 let items = std::ptr::slice_from_raw_parts_mut(self.ptr.cast_mut(), self.count);
                 std::ptr::drop_in_place(items);
-                let layout = std::alloc::Layout::from_size_align_unchecked(
-                    self.count * size_of::<LoreString>(),
-                    1,
-                );
+                let layout = std::alloc::Layout::array::<T>(self.count)
+                    .expect("layout overflow in LoreArray<T>::drop");
                 std::alloc::dealloc(self.ptr as *mut u8, layout);
             }
             self.ptr = std::ptr::null();
@@ -511,6 +597,12 @@ pub enum LoreLoadConfig {
 pub struct LoreGlobalArgs {
     /// Repository path
     pub repository_path: LoreString,
+    /// Directory that relative paths in this call are resolved against. Set it
+    /// when a call may be executed by another process, such as the Lore
+    /// service, whose own working directory is unrelated to the caller's. When
+    /// empty, relative paths resolve against the working directory of the
+    /// process performing the call.
+    pub working_directory: LoreString,
     /// Correlation ID
     pub correlation_id: LoreString,
     /// Identity to use
@@ -533,8 +625,8 @@ pub struct LoreGlobalArgs {
     pub search_limit: u32,
     /// Allow matching to the nearest matching revision when a perfect match is not available
     pub search_nearest: u8,
-    /// Run store compaction and eviction in the background
-    pub gc: u8,
+    /// Prevent the automatic incremental/step GC for this operation; it otherwise runs in the background on write operations. `repository gc` always runs a full pass regardless
+    pub no_gc: u8,
     /// Use in-memory stores instead of file-backed stores. No store data is
     /// read from or written to the .urc/immutable/ and .urc/mutable/ directories.
     pub in_memory: u8,
@@ -561,6 +653,10 @@ pub struct LoreGlobalArgs {
 impl LoreGlobalArgs {
     pub fn repository_path(&self) -> &str {
         self.repository_path.as_str()
+    }
+
+    pub fn working_directory(&self) -> Option<&str> {
+        (&self.working_directory).into()
     }
 
     pub fn identity(&self) -> Option<&str> {
@@ -625,8 +721,8 @@ impl LoreGlobalArgs {
         self.search_nearest != 0
     }
 
-    pub fn gc(&self) -> bool {
-        self.gc != 0
+    pub fn no_gc(&self) -> bool {
+        self.no_gc != 0
     }
 
     pub fn in_memory(&self) -> bool {
@@ -870,7 +966,7 @@ pub enum LoreError {
     /// The backing store is overloaded; the caller should retry later.
     SlowDown = 5,
     /// A blob exceeded a size limit enforced by the caller or the protocol.
-    /// Discriminant matches the FFI code of the underlying `Oversized` struct
+    /// Discriminant matches the error code of the underlying `Oversized` struct
     /// in `lore-base` so callers see a single consistent code.
     Oversized = 26,
 
@@ -1058,5 +1154,119 @@ pub fn shutdown() {
         }
 
         rpmalloc_finalize();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A name arriving across the C boundary can hold any byte sequence. The
+    /// formatting paths run on every dispatched command, so they must render
+    /// such a string instead of assuming UTF-8.
+    #[test]
+    fn lore_string_renders_invalid_utf8_as_replacement_characters() {
+        let value = LoreString::from_bytes(&[b'a', 0xff, 0xfe, b'b']);
+
+        assert_eq!(value.as_bytes(), &[b'a', 0xff, 0xfe, b'b']);
+        assert_eq!(format!("{value}"), "a\u{fffd}\u{fffd}b");
+        assert_eq!(format!("{value:?}"), "a\u{fffd}\u{fffd}b");
+    }
+
+    /// Unlike formatting, serialization must not substitute: it carries the
+    /// command to the service, where a replacement-character name would be
+    /// accepted as valid text that the in-process path would have rejected.
+    #[test]
+    fn lore_string_serialization_rejects_invalid_utf8() {
+        let value = LoreString::from_bytes(&[b'a', 0xff, 0xfe, b'b']);
+        assert!(
+            serde_json::to_string(&value).is_err(),
+            "serializing non-UTF-8 text must fail rather than substitute"
+        );
+
+        let valid = LoreString::from_str("doc.md");
+        assert_eq!(
+            serde_json::to_string(&valid).expect("valid text must serialize"),
+            "\"doc.md\""
+        );
+    }
+
+    /// Equality compares the raw bytes, so strings that differ only in an
+    /// invalid sequence stay distinguishable.
+    #[test]
+    fn lore_string_equality_compares_bytes() {
+        assert_eq!(LoreString::from_str("same"), LoreString::from_str("same"));
+        assert_ne!(
+            LoreString::from_bytes(&[0xff]),
+            LoreString::from_bytes(&[0xfe])
+        );
+    }
+
+    /// Every call clones its arguments before anything checks them, so cloning
+    /// must copy the bytes rather than read them as text.
+    #[test]
+    fn lore_string_clone_copies_bytes_that_are_not_utf8() {
+        let value = LoreString::from_bytes(&[b'a', 0xff, 0xfe, b'b']);
+
+        let cloned = value.clone();
+        assert_eq!(cloned.as_bytes(), &[b'a', 0xff, 0xfe, b'b']);
+
+        let mut assigned = LoreString::from_str("replaced");
+        assigned.clone_from(&value);
+        assert_eq!(assigned.as_bytes(), &[b'a', 0xff, 0xfe, b'b']);
+    }
+
+    #[test]
+    fn validate_text_accepts_valid_utf8_and_empty_strings() {
+        assert!(LoreString::from_str("doc.md").validate_text().is_ok());
+        assert!(LoreString::default().validate_text().is_ok());
+        assert!(LoreString::from_str("ünïcøde").validate_text().is_ok());
+    }
+
+    #[test]
+    fn validate_text_rejects_bytes_that_are_not_utf8() {
+        assert!(
+            LoreString::from_bytes(&[b'a', 0xff])
+                .validate_text()
+                .is_err()
+        );
+    }
+
+    /// An array reports which element failed, so the rejection points at one
+    /// entry rather than the whole field.
+    #[test]
+    fn validate_text_names_the_array_element_that_failed() {
+        let strings = LoreArray::from_vec(vec![
+            LoreString::from_str("first"),
+            LoreString::from_str("second"),
+            LoreString::from_bytes(&[0xff]),
+        ]);
+
+        let error = strings
+            .validate_text()
+            .map_err(|error| error.inside("paths"))
+            .expect_err("the element must fail");
+
+        assert_eq!(error.field(), "paths[2]");
+    }
+
+    #[test]
+    fn validate_text_passes_arguments_that_hold_no_text() {
+        assert!(LoreArray::<LoreString>::default().validate_text().is_ok());
+        assert!(LoreGlobalArgs::default().validate_text().is_ok());
+    }
+
+    #[test]
+    fn validate_text_names_the_failing_field_of_the_global_arguments() {
+        let globals = LoreGlobalArgs {
+            identity: LoreString::from_bytes(&[b'i', 0xff]),
+            ..LoreGlobalArgs::default()
+        };
+
+        let error = globals
+            .validate_text()
+            .map_err(|error| error.inside("globals"))
+            .expect_err("the identity must fail");
+        assert_eq!(error.field(), "globals.identity");
     }
 }

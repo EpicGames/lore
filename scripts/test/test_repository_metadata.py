@@ -5,6 +5,7 @@ import os
 
 import pytest
 
+from error_types import ImproperArgumentsError
 from lore import Lore
 from lore_parsers import parse_jsonl
 
@@ -212,6 +213,43 @@ def test_repository_metadata_get_all_includes_user_and_builtin(new_lore_repo):
     assert "name" in metadata, "Built-in key should be present"
     assert "custom-tag" in metadata, "User-defined key should be present"
     assert metadata["custom-tag"]["value"]["data"] == "my-value"
+
+
+@pytest.mark.smoke
+def test_repository_metadata_set_single_arg_rejected(new_lore_repo):
+    """A lone argument has no value; the set must be rejected, not panic.
+
+    Reproduces the original bug report: `metadata set mjansson=testing` was
+    parsed as a single key with no value and panicked on an out-of-bounds index.
+    """
+    repo: Lore = new_lore_repo()
+
+    with pytest.raises(ImproperArgumentsError):
+        repo.repository_metadata_set(["mjansson=testing"])
+
+
+@pytest.mark.smoke
+def test_repository_metadata_set_odd_args_rejected(new_lore_repo):
+    """An odd number of arguments leaves the trailing key without a value and
+    must be rejected rather than dropping the key or panicking."""
+    repo: Lore = new_lore_repo()
+
+    with pytest.raises(ImproperArgumentsError):
+        repo.repository_metadata_set(["key1", "value1", "key2"])
+
+
+@pytest.mark.smoke
+def test_repository_metadata_set_odd_args_leaves_metadata_unchanged(new_lore_repo):
+    """A rejected odd-args set must not partially apply any of its keys."""
+    repo: Lore = new_lore_repo()
+
+    with pytest.raises(ImproperArgumentsError):
+        repo.repository_metadata_set(["applied", "yes", "dangling"])
+
+    output = repo.repository_metadata_get(json=True)
+    metadata = get_metadata_dict(output)
+    assert "applied" not in metadata, "Rejected set must not partially apply keys"
+    assert "dangling" not in metadata
 
 
 @pytest.mark.smoke

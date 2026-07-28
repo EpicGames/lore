@@ -26,6 +26,9 @@ use crate::types::Fragment;
 /// Result type every leader / follower task yields.
 pub type TrackedResult = Result<(Address, Fragment), StorageError>;
 
+/// Callback invoked per stored fragment with its header and dedup status.
+pub type FragmentObserver = Arc<dyn Fn(&Fragment, bool) + Send + Sync>;
+
 /// Per-operation background-write tracker.
 ///
 /// Construct one per top-level operation (commit, import, …). Dispatch is
@@ -42,6 +45,7 @@ pub struct WriteTracker {
     /// tracker's own lifetime if a task outlives `await_all` for any reason
     /// (shouldn't happen, but is sound).
     state: Arc<SharedState>,
+    on_fragment: Option<FragmentObserver>,
 }
 
 /// State shared between the tracker and every running task.
@@ -76,6 +80,30 @@ impl WriteTracker {
                 first_error: Mutex::new(None),
                 idle: Notify::new(),
             }),
+            on_fragment: None,
+        }
+    }
+
+    /// Construct a tracker that invokes `observer` for each stored fragment.
+    pub fn with_observer(observer: FragmentObserver) -> Self {
+        Self {
+            on_fragment: Some(observer),
+            ..Self::new()
+        }
+    }
+
+    /// Construct a fresh tracker carrying the same observer as `self`.
+    pub fn new_like(&self) -> Self {
+        Self {
+            on_fragment: self.on_fragment.clone(),
+            ..Self::new()
+        }
+    }
+
+    /// Invoke the observer, if one is installed.
+    pub fn notify_fragment(&self, fragment: &Fragment, deduplicated: bool) {
+        if let Some(observer) = &self.on_fragment {
+            observer(fragment, deduplicated);
         }
     }
 

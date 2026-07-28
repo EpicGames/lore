@@ -203,6 +203,8 @@ async fn create_shared_store_at(
     .await
     .forward::<SharedStoreError>("creating immutable store")?;
 
+    lore_storage::maintenance::spawn_gc(&immutable_store, &options);
+
     mutable::create(
         Some(shared_store_path),
         mutable::MutableStoreSettings::default(),

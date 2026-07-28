@@ -251,7 +251,8 @@ pub async fn store_fragment(
         )));
     }
 
-    match tracker {
+    let observer = tracker.clone();
+    let result = match tracker {
         None => {
             store_fragment_inline(
                 store,
@@ -279,7 +280,12 @@ pub async fn store_fragment(
             )
             .await
         }
+    };
+
+    if let (Some(tracker), Ok(result)) = (observer, &result) {
+        tracker.notify_fragment(&result.fragment, result.deduplicated);
     }
+    result
 }
 
 /// Backward-compatible synchronous fragment store. Acquires the in-flight
@@ -624,6 +630,7 @@ pub async fn write_content(
     flags: WriteOptions,
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<WriteTracker>>,
+    permit: Option<OwnedSemaphorePermit>,
 ) -> Result<(Address, Fragment), StorageError> {
     // Check if data should be a single fragment
     if buffer.len() <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
@@ -641,7 +648,11 @@ pub async fn write_content(
             size_payload: buffer.len() as u32,
             size_content: buffer.len() as u64,
         };
-        let permit = crate::concurrency::acquire_fragment_memory_permit(buffer.len()).await;
+        // Reuse the caller's read reservation if provided, else reserve here.
+        let permit = match permit {
+            Some(permit) => Some(permit),
+            None => crate::concurrency::acquire_fragment_memory_permit(buffer.len()).await,
+        };
         let result = store_fragment(
             store,
             partition,
@@ -665,6 +676,7 @@ pub async fn write_content(
             false,
             remote_session,
             tracker,
+            permit,
         )
         .await
     }
@@ -688,7 +700,7 @@ pub async fn write_from_file(
         .forward::<StorageError>("permit failed")?;
     {
         let mut retry = crate::retry(10, 10_000, 10);
-        let (buffer, is_mmapped) = loop {
+        let (buffer, is_mmapped, read_permit) = loop {
             match crate::defragment::open_mmap_read(path).await {
                 Ok(result) => break result,
                 Err(err) => {
@@ -725,6 +737,7 @@ pub async fn write_from_file(
                 flags,
                 remote_session,
                 tracker,
+                read_permit,
             )
             .await?;
 
@@ -814,7 +827,7 @@ pub async fn hash_file(
 
     // Open the file for fragmented hashing (mmap for large files, buffered otherwise)
     let mut retry = crate::retry(10, 10_000, 10);
-    let (buffer, _is_mmapped) = loop {
+    let (buffer, _is_mmapped, _read_permit) = loop {
         match crate::defragment::open_mmap_read(path).await {
             Ok(result) => break result,
             Err(err) => {
@@ -938,6 +951,7 @@ pub async fn hash_file(
         buffer,
         WriteOptions::default().no_remote_write(),
         true,
+        None,
         None,
         None,
     )
@@ -1380,8 +1394,12 @@ mod tests {
             self: Arc<Self>,
             max_capacity: usize,
             sync_data: bool,
+            sink: Option<crate::gc_event::GcEventSinkRef>,
         ) -> Result<usize, StoreError> {
-            self.inner.clone().evict(max_capacity, sync_data).await
+            self.inner
+                .clone()
+                .evict(max_capacity, sync_data, sink)
+                .await
         }
 
         async fn compact(
@@ -1389,8 +1407,12 @@ mod tests {
             max_size: usize,
             at: Option<usize>,
             sync_data: bool,
+            sink: Option<crate::gc_event::GcEventSinkRef>,
         ) -> Result<Option<usize>, StoreError> {
-            self.inner.clone().compact(max_size, at, sync_data).await
+            self.inner
+                .clone()
+                .compact(max_size, at, sync_data, sink)
+                .await
         }
 
         async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
@@ -1670,8 +1692,12 @@ mod tests {
             self: Arc<Self>,
             max_capacity: usize,
             sync_data: bool,
+            sink: Option<crate::gc_event::GcEventSinkRef>,
         ) -> Result<usize, StoreError> {
-            self.inner.clone().evict(max_capacity, sync_data).await
+            self.inner
+                .clone()
+                .evict(max_capacity, sync_data, sink)
+                .await
         }
 
         async fn compact(
@@ -1679,8 +1705,12 @@ mod tests {
             max_size: usize,
             at: Option<usize>,
             sync_data: bool,
+            sink: Option<crate::gc_event::GcEventSinkRef>,
         ) -> Result<Option<usize>, StoreError> {
-            self.inner.clone().compact(max_size, at, sync_data).await
+            self.inner
+                .clone()
+                .compact(max_size, at, sync_data, sink)
+                .await
         }
 
         async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
@@ -1915,8 +1945,12 @@ mod tests {
             self: Arc<Self>,
             max_capacity: usize,
             sync_data: bool,
+            sink: Option<crate::gc_event::GcEventSinkRef>,
         ) -> Result<usize, StoreError> {
-            self.inner.clone().evict(max_capacity, sync_data).await
+            self.inner
+                .clone()
+                .evict(max_capacity, sync_data, sink)
+                .await
         }
 
         async fn compact(
@@ -1924,8 +1958,12 @@ mod tests {
             max_size: usize,
             at: Option<usize>,
             sync_data: bool,
+            sink: Option<crate::gc_event::GcEventSinkRef>,
         ) -> Result<Option<usize>, StoreError> {
-            self.inner.clone().compact(max_size, at, sync_data).await
+            self.inner
+                .clone()
+                .compact(max_size, at, sync_data, sink)
+                .await
         }
 
         async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {

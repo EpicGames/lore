@@ -79,6 +79,10 @@ const NODE_INDEX_MASK: u32 = (1u32 << BLOCK_NODE_SHIFT) - 1;
 /// block from consuming unbounded memory, and bounds the allocation on
 /// deserialize.
 pub const NODE_NAME_MAX_SIZE: usize = 4 * 1024 * 1024;
+/// Maximum byte length of a single node name, matching the bound branch and
+/// repository names use. Enforced when a name is stored, not when one is read,
+/// so a tree written before the bound existed stays readable.
+pub const MAX_NODE_NAME_LEN: usize = 1000;
 
 bitflags! {
     #[repr(transparent)]
@@ -1064,6 +1068,25 @@ fn validate_node_name(name: &str) -> Result<(), NodeNameError> {
     Ok(())
 }
 
+/// Check `name` against every rule [`NodeBlockWriter::node_name_store`] enforces:
+/// the content rules the read path also applies, plus the [`MAX_NODE_NAME_LEN`]
+/// bound that only writers are held to.
+///
+/// Exposed so a caller writing several nodes can reject a bad name up front
+/// instead of discovering it part-way through and leaving the rest applied.
+pub fn validate_node_name_for_store(name: &str) -> Result<(), NodeNameError> {
+    validate_node_name(name)?;
+    if name.len() > MAX_NODE_NAME_LEN {
+        return Err(NodeNameError::from(Oversized {
+            context: format!(
+                "node name is {} bytes, exceeds MAX_NODE_NAME_LEN {MAX_NODE_NAME_LEN}",
+                name.len()
+            ),
+        }));
+    }
+    Ok(())
+}
+
 /// Owned node name backed by an arc read lock on the containing node block.
 /// Since this holds a read lock on the node block, make sure to drop it as soon as possible.
 /// Dereferences to `&str` for zero-copy name access. This type is `Send`
@@ -1584,12 +1607,22 @@ impl NodeBlockWriter<'_> {
         self.lock.data.as_mut()
     }
 
+    /// Store `name` in the block's name table, reusing the slot at
+    /// `(prev_offset, prev_length)` when the new name fits in it, and return the
+    /// slot the name now occupies.
+    ///
+    /// The name is validated first, by the same rules
+    /// [`NodeBlock::node_name_clone`] applies when reading one back plus a
+    /// [`MAX_NODE_NAME_LEN`] bound, so no writer can store a name the read path
+    /// will later refuse — such a node is invisible to a listing and errors from
+    /// a per-node read.
     pub fn node_name_store(
         &mut self,
         name: &str,
         prev_offset: u32,
         prev_length: u32,
     ) -> Result<(u32, u32), NodeNameError> {
+        validate_node_name_for_store(name)?;
         let prev_offset = prev_offset as usize;
         let prev_length = prev_length as usize;
         if name.len() <= prev_length && (prev_offset + prev_length) < self.lock.name.len() {

@@ -134,6 +134,7 @@ impl StorageClient {
             max_bytes_bandwidth_per_second: MAX_BYTES_BANDWIDTH_PER_SEC,
             expected_rtt_ms: DEFAULT_EXPECTED_RTT_MS,
             congestion_algorithm: CongestionAlgorithm::Bbr,
+            initial_cwnd: None,
         };
 
         lore_trace!("QUIC connecting to {remote_url} for repository {repository}");

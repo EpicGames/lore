@@ -210,6 +210,13 @@ struct MutableStoreHeader {
     // entry[MutableStoreEntry; count]
 }
 
+/// Classification of a failed bucket parse. A `FutureVersion` file must propagate untouched;
+/// deleting it would destroy data written by a newer binary. A `Corrupt` file is safe to reset.
+enum DeserializeFileError {
+    FutureVersion(u32),
+    Corrupt(String),
+}
+
 impl MutableStoreBucket {
     fn deserialize_files(
         path: PathBuf,
@@ -227,7 +234,7 @@ impl MutableStoreBucket {
             .read(true)
             .write(false)
             .create(false)
-            .open(path)
+            .open(&path)
         {
             Ok(file) => file,
             Err(err) => {
@@ -241,41 +248,101 @@ impl MutableStoreBucket {
             }
         };
 
+        // Reset a corrupt bucket to empty rather than failing the whole store open.
+        match Self::deserialize_files_parse(&mut file, latest_version) {
+            Ok(result) => Ok(result),
+            Err(DeserializeFileError::FutureVersion(_version)) => {
+                Err(LocalMutableStoreError::internal_with_context(
+                    io::Error::other(
+                        "Incompatible store version encountered, please update your client to the latest version",
+                    ),
+                    "Failed to deserialize storage bucket",
+                ))
+            }
+            Err(DeserializeFileError::Corrupt(reason)) => {
+                Self::recover_corrupt_bucket(&path, reason, latest_version)
+            }
+        }
+    }
+
+    fn deserialize_files_parse(
+        file: &mut std::fs::File,
+        latest_version: u32,
+    ) -> Result<
+        (
+            GrowVec<u32, CHUNK_SIZE_U32>,
+            GrowVec<MutableStoreEntry, CHUNK_SIZE_ENTRY>,
+            u32,
+        ),
+        DeserializeFileError,
+    > {
         let file_size = file
             .metadata()
-            .internal("reading mutable store bucket file metadata")?
+            .map_err(|err| DeserializeFileError::Corrupt(format!("read metadata: {err}")))?
             .len() as usize;
-        let expected_count = (file_size - size_of::<MutableStoreHeader>())
-            / (size_of::<u32>() + size_of::<MutableStoreEntry>());
+        // Guard against underflow before the count subtraction below.
+        let header_size = size_of::<MutableStoreHeader>();
+        if file_size < header_size {
+            return Err(DeserializeFileError::Corrupt(format!(
+                "file size {file_size} smaller than header size {header_size}"
+            )));
+        }
+        let expected_count =
+            (file_size - header_size) / (size_of::<u32>() + size_of::<MutableStoreEntry>());
         if expected_count == 0 {
             return Ok((GrowVec::new(), GrowVec::new(), latest_version));
         }
 
         let mut header = MutableStoreHeader::new_zeroed();
         file.read_exact(header.as_mut_bytes())
-            .internal("reading mutable store bucket header")?;
+            .map_err(|err| DeserializeFileError::Corrupt(format!("read header: {err}")))?;
 
         if (header.version > latest_version) && (header.version < 0xFFFF) {
-            return Err(LocalMutableStoreError::internal_with_context(
-                io::Error::other(
-                    "Incompatible store version encountered, please update your client to the latest version",
-                ),
-                "Failed to deserialize storage bucket",
-            ));
+            return Err(DeserializeFileError::FutureVersion(header.version));
         }
 
         if header.count != expected_count as u32 {
-            return Err(LocalMutableStoreError::internal(
-                "mutable store bucket header has invalid count",
-            ));
+            return Err(DeserializeFileError::Corrupt(format!(
+                "mutable store bucket header has invalid count {} when expecting {expected_count}",
+                header.count,
+            )));
         }
 
-        let sorted_index = GrowVec::read_from_file(&mut file, expected_count)
-            .internal("reading mutable store bucket sorted index")?;
-        let entry = GrowVec::read_from_file(&mut file, expected_count)
-            .internal("reading mutable store bucket entries")?;
+        let sorted_index = GrowVec::read_from_file(file, expected_count)
+            .map_err(|err| DeserializeFileError::Corrupt(format!("read sorted index: {err}")))?;
+        let entry = GrowVec::read_from_file(file, expected_count)
+            .map_err(|err| DeserializeFileError::Corrupt(format!("read entries: {err}")))?;
 
         Ok((sorted_index, entry, header.version))
+    }
+
+    /// Drop the corrupt file and return an empty bucket. The lost entries repopulate from the
+    /// immutable store or remote on the next sync.
+    fn recover_corrupt_bucket(
+        path: &Path,
+        reason: String,
+        latest_version: u32,
+    ) -> Result<
+        (
+            GrowVec<u32, CHUNK_SIZE_U32>,
+            GrowVec<MutableStoreEntry, CHUNK_SIZE_ENTRY>,
+            u32,
+        ),
+        LocalMutableStoreError,
+    > {
+        lore_base::lore_warn!(
+            "Resetting corrupt mutable bucket {} after deserialize failure: {reason}. Bucket lookup state lost; entries repopulate from the immutable store / remote on next sync.",
+            path.display()
+        );
+        if let Err(err) = std::fs::remove_file(path)
+            && err.kind() != ErrorKind::NotFound
+        {
+            return Err(LocalMutableStoreError::internal_with_context(
+                err,
+                "Failed to remove corrupt mutable store bucket",
+            ));
+        }
+        Ok((GrowVec::new(), GrowVec::new(), latest_version))
     }
 
     pub async fn deserialize(
@@ -1637,6 +1704,25 @@ mod tests {
         assert!(result.is_err(), "v100 bucket should be rejected as too new");
     }
 
+    /// A torn write can leave a bucket file at its correct byte length but entirely
+    /// zero-filled, so the header reads count=0 while the size implies a nonzero count. This
+    /// recovers to an empty bucket rather than hard-erroring.
+    #[test]
+    fn deserialize_recovers_zero_filled_bucket() {
+        let dir = crate::test_util::TempDir::new("ms_zerofill_");
+        let path = dir.path().join("bucket");
+        // Correct length for a 1-entry bucket, but all zeros.
+        let len =
+            size_of::<MutableStoreHeader>() + size_of::<u32>() + size_of::<MutableStoreEntry>();
+        std::fs::write(&path, vec![0u8; len]).unwrap();
+
+        let (sorted_index, entry, version) = MutableStoreBucket::deserialize_files(path)
+            .expect("zero-filled bucket should recover to empty");
+        assert_eq!(sorted_index.len(), 0);
+        assert_eq!(entry.len(), 0);
+        assert_eq!(version, MutableStoreVersion::LazyFanOut as u32);
+    }
+
     #[test]
     fn lazy_fan_out_version_is_three() {
         assert_eq!(MutableStoreVersion::LazyFanOut as u32, 3);
@@ -1660,6 +1746,80 @@ mod tests {
             s.fan_out_threshold,
             crate::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT
         );
+    }
+
+    /// End-to-end: after a bucket file is zero-filled, the store still opens and the bucket is
+    /// usable for a store/load round-trip.
+    #[tokio::test]
+    async fn store_recovers_from_zero_filled_bucket_and_remains_usable() {
+        use crate::mutable_store::MutableStore;
+
+        let dir = crate::test_util::TempDir::new("ms_e2e_recover_");
+        let store_path = dir.path().to_path_buf();
+        let partition = Partition::default();
+        let mut key = Hash::default();
+        key.data_mut()[0] = 0x10;
+        key.data_mut()[1] = 0xAB;
+        let value = Hash::from_u64(42);
+
+        {
+            let store: Arc<dyn MutableStore> = Arc::new(
+                LocalMutableStore::new(
+                    Some(&store_path),
+                    MutableStoreSettings {
+                        initial_fan_out_level: 1,
+                        ..Default::default()
+                    },
+                    make_in_memory_immutable().await,
+                )
+                .await
+                .unwrap(),
+            );
+            store
+                .clone()
+                .store(partition, key, value, KeyType::BranchMetadata)
+                .await
+                .unwrap();
+            store.clone().flush(true).await.unwrap();
+        }
+
+        // initial_fan_out_level=1 → bucket index is always 0; group is (typed) key[0].
+        // `LocalMutableStore::new` roots the store under a `mutable/` subdirectory.
+        let group_index = key.data()[0] as usize;
+        let bucket_path = format_bucket_path(&store_path.join("mutable"), group_index, 0);
+        assert!(
+            bucket_path.exists(),
+            "bucket file should exist after flush at {bucket_path:?}"
+        );
+
+        // Torn write: correct byte length, entirely zero-filled.
+        let len = std::fs::metadata(&bucket_path).unwrap().len() as usize;
+        std::fs::write(&bucket_path, vec![0u8; len]).unwrap();
+
+        let store: Arc<dyn MutableStore> = Arc::new(
+            LocalMutableStore::new(
+                Some(&store_path),
+                MutableStoreSettings {
+                    initial_fan_out_level: 1,
+                    ..Default::default()
+                },
+                make_in_memory_immutable().await,
+            )
+            .await
+            .unwrap(),
+        );
+
+        store
+            .clone()
+            .store(partition, key, value, KeyType::BranchMetadata)
+            .await
+            .unwrap();
+        let reloaded = store
+            .clone()
+            .load(partition, key, KeyType::BranchMetadata)
+            .await
+            .unwrap();
+        assert_eq!(reloaded, value, "bucket must be usable after recovery");
     }
 
     async fn make_in_memory_immutable() -> Arc<dyn ImmutableStore> {

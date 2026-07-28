@@ -113,6 +113,8 @@ mod presign_tests {
         let app = create_router(state, health, &settings);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        // Background server task in a test; LORE_CONTEXT propagation is unnecessary here.
+        #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
             axum::serve(listener, app)
                 .with_graceful_shutdown(async {

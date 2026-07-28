@@ -88,6 +88,7 @@ pub use crate::set::Has;
 pub use crate::set::HasAll;
 pub use crate::set::TracedBox;
 pub use crate::traced::ChainError;
+pub use crate::traced::HasTrace;
 pub use crate::traced::Trace;
 pub use crate::traced::Traced;
 pub use crate::traced::MAX_TRACE_DEPTH;
@@ -117,5 +118,6 @@ pub mod prelude {
     pub use crate::set::ErrorSet;
     pub use crate::set::Has;
     pub use crate::traced::ChainError;
+    pub use crate::traced::HasTrace;
     pub use crate::traced::Traced;
 }

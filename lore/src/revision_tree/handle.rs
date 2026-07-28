@@ -59,6 +59,8 @@ impl LoreRevisionTree {
     pub const INVALID: Self = Self { handle_id: 0 };
 }
 
+lore_base::carries_no_text!(LoreRevisionTree);
+
 /// Runtime state for one open revision tree handle.
 ///
 /// Holds an `Arc<StoreInternal>` clone of the parent storage handle so

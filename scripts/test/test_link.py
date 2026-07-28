@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
+import json
 import logging
 import os
 import re
@@ -944,11 +945,12 @@ def test_link_add_remove(new_lore_repo):
         "Link path should not appear in link list after unstaging a staged-add link"
     )
 
-    # Clean up link files left on disk after unstage (unstage discards the node
-    # but does not remove cloned files from the filesystem)
+    # Unstaging a staged-add link must remove the cloned files from the
+    # filesystem.
     link_abs_path = os.path.join(main_repo.path, link_path)
-    if os.path.exists(link_abs_path):
-        shutil.rmtree(link_abs_path)
+    assert not os.path.exists(link_abs_path), (
+        "Unstage of a staged-add link must remove the cloned link directory"
+    )
 
     # Original test: add link without committing
     main_repo.link_add(link_path, source_repo.get_id(), "/")
@@ -1141,22 +1143,41 @@ def test_link_add_remove(new_lore_repo):
     # --- Committed link: remove then unstage to restore ---
     main_repo.link_remove(link_path)
 
-    # Verify link is gone
+    # Verify link is gone — registry and on-disk content
     link_list_after_remove_for_unstage = main_repo.link_list()
     assert source_repo.get_id() not in link_list_after_remove_for_unstage, (
         "Source repo should not appear in link list after removal for unstage test"
+    )
+    assert not main_repo.file_exists(expected_file1), (
+        "Linked file 1 should not exist after link_remove"
+    )
+    assert not main_repo.file_exists(expected_file2), (
+        "Linked file 2 should not exist after link_remove"
     )
 
     # Unstage the removal to restore the link
     main_repo.unstage(link_path)
 
-    # Verify link is fully restored — registry entry and file access
+    # Verify link is fully restored — registry entry, file access, and on-disk
+    # content.
     link_list_after_unstage = main_repo.link_list()
     assert source_repo.get_id() in link_list_after_unstage, (
         "Source repo should appear in link list after unstaging removal"
     )
     assert link_path in link_list_after_unstage, (
         "Link path should appear in link list after unstaging removal"
+    )
+    assert main_repo.file_exists(expected_file1), (
+        "Linked file 1 should be re-materialized after unstaging removal"
+    )
+    assert main_repo.file_exists(expected_file2), (
+        "Linked file 2 should be re-materialized after unstaging removal"
+    )
+    assert main_repo.compare_file(main_repo, expected_file1), (
+        "Re-materialized file 1 content should match"
+    )
+    assert main_repo.compare_file(main_repo, expected_file2), (
+        "Re-materialized file 2 content should match"
     )
 
 
@@ -2092,6 +2113,377 @@ def test_link_reset(new_lore_repo):
         assert "second link file original" in f.read(), (
             "Second link file should be restored after multi-link root reset"
         )
+
+
+# ---------------------------------------------------------------------------
+# Helpers for the link-reset tests below.
+# ---------------------------------------------------------------------------
+
+
+def _assert_crr_clean(
+    repo: Lore,
+    expected_files_present: list[str],
+    expected_files_absent: list[str],
+    expected_link_registry: dict[str, bool],
+):
+    """Clean status, realized disk, registry-correct.
+
+    `expected_link_registry` maps a needle (repo id or link path) to whether
+    it should appear in `link_list()` output.
+    """
+    staged = parse_status_json(repo.status(json=True))
+    assert staged == [], f"Expected clean staged status, got {staged}"
+    unstaged = [
+        e
+        for e in parse_status_json(repo.status(json=True, unstaged=True))
+        if not e.get("flagStaged", False)
+    ]
+    assert unstaged == [], f"Expected clean unstaged status, got {unstaged}"
+    for path in expected_files_present:
+        assert repo.file_exists(path), f"Expected file present: {path}"
+    for path in expected_files_absent:
+        assert not repo.file_exists(path), f"Expected file absent: {path}"
+    link_list_output = repo.link_list()
+    for needle, present in expected_link_registry.items():
+        if present:
+            assert needle in link_list_output, (
+                f"Expected {needle!r} in link_list, got: {link_list_output}"
+            )
+        else:
+            assert needle not in link_list_output, (
+                f"Expected {needle!r} not in link_list, got: {link_list_output}"
+            )
+
+
+def _commit_initial_main(new_lore_repo, file_name: str) -> Lore:
+    """Create a main repo with one committed file and push."""
+    repo: Lore = new_lore_repo()
+    with repo.open_file(file_name, "w+") as f:
+        f.writelines(["main repo initial content\n"])
+    repo.stage(scan=True)
+    repo.commit("initial main")
+    repo.push()
+    return repo
+
+
+def _make_link_source(
+    new_lore_repo, file_paths: list[str]
+) -> tuple[Lore, list[str]]:
+    """Create a link source repo with the given files committed and pushed."""
+    repo: Lore = new_lore_repo()
+    for path in file_paths:
+        directory = os.path.dirname(path)
+        if directory:
+            repo.make_dirs(directory)
+        with repo.open_file(path, "w+") as f:
+            f.writelines([f"link source content for {path}\n"])
+    repo.stage(scan=True)
+    repo.commit("initial source")
+    repo.push()
+    return repo, file_paths
+
+
+# ---------------------------------------------------------------------------
+# Reset for added/removed/updated links.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.smoke
+def test_link_reset_staged_add(new_lore_repo):
+    """`lore file reset` undoes a staged-add link: registry, on-disk content,
+    and parent state are restored to pre-add."""
+    main_repo = _commit_initial_main(new_lore_repo, "main.txt")
+    source_repo, source_files = _make_link_source(
+        new_lore_repo, ["a.txt", "nested/b.txt"]
+    )
+
+    link_path = "linked"
+    expected = [f"{link_path}/{p}" for p in source_files]
+
+    main_repo.link_add(link_path, source_repo.get_id(), "/")
+    for p in expected:
+        assert main_repo.file_exists(p), f"Pre-reset: expected {p} on disk"
+    assert source_repo.get_id() in main_repo.link_list()
+
+    main_repo.reset(link_path)
+
+    _assert_crr_clean(
+        main_repo,
+        expected_files_present=["main.txt"],
+        expected_files_absent=expected,
+        expected_link_registry={source_repo.get_id(): False, link_path: False},
+    )
+
+
+def test_link_reset_staged_add_reports_reset(new_lore_repo):
+    """Resetting a staged-add link counts the node it reset in the summary."""
+    main_repo = _commit_initial_main(new_lore_repo, "main.txt")
+    source_repo, _ = _make_link_source(new_lore_repo, ["a.txt"])
+
+    link_path = "linked"
+    main_repo.link_add(link_path, source_repo.get_id(), "/")
+
+    output = main_repo.reset(link_path, json=True)
+
+    events = [json.loads(line) for line in output.splitlines() if line.strip()]
+    reset_end = next(e for e in events if e.get("tagName") == "fileResetEnd")
+    count = reset_end["data"]["count"]
+    total = (
+        count["directoryResetCount"]
+        + count["directoryDeleteCount"]
+        + count["fileResetCount"]
+        + count["fileDeleteCount"]
+    )
+    assert total >= 1, f"Reset of a staged link must count the reset, got: {count}"
+
+
+def test_link_reset_staged_add_into_existing_directory(new_lore_repo):
+    """If the link path was a committed directory before `link add`, reset
+    restores the empty directory rather than removing it."""
+    main_repo = _commit_initial_main(new_lore_repo, "main.txt")
+    source_repo, _ = _make_link_source(new_lore_repo, ["a.txt"])
+
+    # Commit an empty directory at the link path so it predates the link add.
+    link_path = "linked"
+    main_repo.make_dirs(link_path)
+    main_repo.stage(scan=True)
+    main_repo.commit("add empty linked directory")
+    main_repo.push()
+
+    main_repo.link_add(link_path, source_repo.get_id(), "/")
+    assert main_repo.file_exists(f"{link_path}/a.txt")
+
+    main_repo.reset(link_path)
+
+    _assert_crr_clean(
+        main_repo,
+        expected_files_present=["main.txt"],
+        expected_files_absent=[f"{link_path}/a.txt"],
+        expected_link_registry={source_repo.get_id(): False},
+    )
+    assert main_repo.path_exists(link_path), (
+        "Pre-existing committed directory must survive reset"
+    )
+
+
+def test_link_reset_staged_add_creates_parent_directories(new_lore_repo):
+    """If `link add` had to auto-stage parent directories, reset removes
+    both the link and the auto-staged parents."""
+    main_repo = _commit_initial_main(new_lore_repo, "main.txt")
+    source_repo, _ = _make_link_source(new_lore_repo, ["a.txt"])
+
+    link_path = "deep/parent/chain/linked"
+    main_repo.link_add(link_path, source_repo.get_id(), "/")
+
+    staged_paths = {
+        e["path"] for e in parse_status_json(main_repo.status(json=True))
+    }
+    assert any(p.startswith("deep") for p in staged_paths), (
+        f"Auto-staged parents should be visible in pre-reset status, got: {staged_paths}"
+    )
+
+    main_repo.reset(link_path)
+
+    _assert_crr_clean(
+        main_repo,
+        expected_files_present=["main.txt"],
+        expected_files_absent=[f"{link_path}/a.txt"],
+        expected_link_registry={source_repo.get_id(): False},
+    )
+    assert not main_repo.path_exists("deep"), (
+        "Parent chain that didn't exist before the link must be gone"
+    )
+
+
+@pytest.mark.smoke
+def test_link_reset_staged_remove(new_lore_repo):
+    """`lore file reset` of a staged-remove link restores the registry, the
+    link node, and re-materializes content on disk."""
+    main_repo = _commit_initial_main(new_lore_repo, "main.txt")
+    source_repo, source_files = _make_link_source(
+        new_lore_repo, ["a.txt", "nested/b.txt"]
+    )
+
+    link_path = "linked"
+    expected = [f"{link_path}/{p}" for p in source_files]
+
+    main_repo.link_add(link_path, source_repo.get_id(), "/")
+    main_repo.commit("add link")
+    main_repo.push()
+
+    main_repo.link_remove(link_path)
+    for p in expected:
+        assert not main_repo.file_exists(p), (
+            f"Pre-reset: expected {p} absent after link_remove"
+        )
+
+    main_repo.reset(link_path)
+
+    _assert_crr_clean(
+        main_repo,
+        expected_files_present=["main.txt", *expected],
+        expected_files_absent=[],
+        expected_link_registry={source_repo.get_id(): True, link_path: True},
+    )
+    for p in expected:
+        source_relative = p.removeprefix(f"{link_path}/")
+        assert main_repo.compare_file(
+            source_repo, p, other_file_path=source_relative
+        ), f"Restored content of {p} must match source repo content"
+
+
+@pytest.mark.smoke
+def test_link_reset_staged_update(new_lore_repo):
+    """`lore file reset` of a staged pin change restores the previous pin in
+    the registry and re-realizes content from the previous pin."""
+    main_repo = _commit_initial_main(new_lore_repo, "main.txt")
+
+    source_repo: Lore = new_lore_repo()
+    with source_repo.open_file("v1.txt", "w+") as f:
+        f.writelines(["v1\n"])
+    source_repo.stage(scan=True)
+    source_repo.commit("v1")
+    source_repo.push()
+
+    source_repo.branch_create("feature")
+    with source_repo.open_file("v2.txt", "w+") as f:
+        f.writelines(["v2\n"])
+    source_repo.stage(scan=True)
+    source_repo.commit("v2")
+    source_repo.push()
+
+    link_path = "linked"
+    main_repo.link_add(link_path, source_repo.get_id(), "/", pin="main@LATEST")
+    main_repo.commit("add link")
+    main_repo.push()
+
+    pre_link_list = main_repo.link_list()
+    assert main_repo.file_exists(f"{link_path}/v1.txt")
+    assert not main_repo.file_exists(f"{link_path}/v2.txt")
+
+    main_repo.link_update(link_path, pin="feature@LATEST")
+    assert main_repo.file_exists(f"{link_path}/v2.txt"), (
+        "Pre-reset: link_update should have realized v2.txt"
+    )
+
+    main_repo.reset(link_path)
+
+    _assert_crr_clean(
+        main_repo,
+        expected_files_present=["main.txt", f"{link_path}/v1.txt"],
+        expected_files_absent=[f"{link_path}/v2.txt"],
+        expected_link_registry={source_repo.get_id(): True, link_path: True},
+    )
+    assert main_repo.link_list() == pre_link_list, (
+        "Registry must match pre-update exactly (branch + signature)"
+    )
+
+
+def test_link_reset_root_handles_staged_link_changes(new_lore_repo):
+    """Root reset (`reset(".")`) traverses into the link node and reverts
+    a staged add/remove/update there."""
+    # --- staged-add ---
+    main_repo = _commit_initial_main(new_lore_repo, "main.txt")
+    source_repo, _ = _make_link_source(new_lore_repo, ["a.txt"])
+    link_path = "linked"
+    main_repo.link_add(link_path, source_repo.get_id(), "/")
+    main_repo.reset(".")
+    _assert_crr_clean(
+        main_repo,
+        expected_files_present=["main.txt"],
+        expected_files_absent=[f"{link_path}/a.txt"],
+        expected_link_registry={source_repo.get_id(): False},
+    )
+
+    # --- staged-remove ---
+    main_repo.link_add(link_path, source_repo.get_id(), "/")
+    main_repo.commit("add link")
+    main_repo.push()
+    main_repo.link_remove(link_path)
+    main_repo.reset(".")
+    _assert_crr_clean(
+        main_repo,
+        expected_files_present=["main.txt", f"{link_path}/a.txt"],
+        expected_files_absent=[],
+        expected_link_registry={source_repo.get_id(): True, link_path: True},
+    )
+
+    # --- staged-update ---
+    source_repo.branch_create("feature")
+    with source_repo.open_file("a.txt", "w+") as f:
+        f.writelines(["feature a\n"])
+    source_repo.stage(scan=True)
+    source_repo.commit("feature a")
+    source_repo.push()
+
+    pre_link_list = main_repo.link_list()
+    main_repo.link_update(link_path, pin="feature@LATEST")
+    main_repo.reset(".")
+    _assert_crr_clean(
+        main_repo,
+        expected_files_present=["main.txt", f"{link_path}/a.txt"],
+        expected_files_absent=[],
+        expected_link_registry={source_repo.get_id(): True, link_path: True},
+    )
+    assert main_repo.link_list() == pre_link_list, (
+        "Registry must match pre-update after root reset"
+    )
+
+
+def test_link_reset_does_not_affect_unrelated_links(new_lore_repo):
+    """Reset of one staged link change must not touch unrelated committed
+    links."""
+    main_repo = _commit_initial_main(new_lore_repo, "main.txt")
+    source_repo_a, _ = _make_link_source(new_lore_repo, ["a.txt"])
+    source_repo_b, _ = _make_link_source(new_lore_repo, ["b.txt"])
+
+    link_a = "linkA"
+    link_b = "linkB"
+
+    main_repo.link_add(link_a, source_repo_a.get_id(), "/")
+    main_repo.link_add(link_b, source_repo_b.get_id(), "/")
+    main_repo.commit("add both links")
+    main_repo.push()
+
+    # Stage a remove on linkA only; reset only that. linkB untouched.
+    main_repo.link_remove(link_a)
+    main_repo.reset(link_a)
+
+    _assert_crr_clean(
+        main_repo,
+        expected_files_present=[
+            "main.txt",
+            f"{link_a}/a.txt",
+            f"{link_b}/b.txt",
+        ],
+        expected_files_absent=[],
+        expected_link_registry={
+            source_repo_a.get_id(): True,
+            link_a: True,
+            source_repo_b.get_id(): True,
+            link_b: True,
+        },
+    )
+
+
+def test_link_reset_idempotent(new_lore_repo):
+    """Running reset twice on the same staged-add link change is a no-op
+    on the second call."""
+    main_repo = _commit_initial_main(new_lore_repo, "main.txt")
+    source_repo, _ = _make_link_source(new_lore_repo, ["a.txt"])
+
+    link_path = "linked"
+    main_repo.link_add(link_path, source_repo.get_id(), "/")
+    main_repo.reset(link_path)
+    # Second reset is a no-op (path no longer exists).
+    main_repo.reset(link_path)
+
+    _assert_crr_clean(
+        main_repo,
+        expected_files_present=["main.txt"],
+        expected_files_absent=[f"{link_path}/a.txt"],
+        expected_link_registry={source_repo.get_id(): False},
+    )
 
 
 def test_link_merge_specific(new_lore_repo):

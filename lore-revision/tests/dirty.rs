@@ -2247,6 +2247,7 @@ mod tests {
                 // Reset the file
                 file::reset::reset(
                     repository.clone(),
+                    &write_token,
                     LoreArray::from_vec(vec![LoreString::from(
                         subdir.join("file.txt").to_string_lossy().as_ref(),
                     )]),
@@ -2380,6 +2381,7 @@ mod tests {
                 // Reset only a.txt
                 file::reset::reset(
                     repository.clone(),
+                    &write_token,
                     LoreArray::from_vec(vec![LoreString::from(
                         subdir.join("a.txt").to_string_lossy().as_ref(),
                     )]),
@@ -2433,6 +2435,7 @@ mod tests {
                 // Now reset b.txt too
                 file::reset::reset(
                     repository.clone(),
+                    &write_token,
                     LoreArray::from_vec(vec![LoreString::from(
                         subdir.join("b.txt").to_string_lossy().as_ref(),
                     )]),
@@ -2563,6 +2566,7 @@ mod tests {
                 // Reset should refuse (file is staged)
                 let result = file::reset::reset(
                     repository.clone(),
+                    &write_token,
                     LoreArray::from_vec(vec![LoreString::from(
                         path.join("file.txt").to_string_lossy().as_ref(),
                     )]),

@@ -156,8 +156,25 @@ pub struct ProtocolErrorInfo {
 
 #[cfg(test)]
 pub mod tests {
+    use std::env;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
     use bytes::Bytes;
     use bytes::BytesMut;
+    use lore_storage::ImmutableStore;
+    use lore_storage::MutableStore;
+    use lore_transport::quic::client::ServiceClient;
+
+    use crate::protocol::attribute_map::AttributeMap;
+    use crate::quic::StreamHandlerFactory;
+    use crate::quic::quinn::service_store::ServiceStore;
+    use crate::quic::quinn::service_store::StreamDataHandlerBuilder;
+    use crate::quic::replication_store_service::client::ReplicationStoreClient;
+    use crate::quic::replication_store_service::server::ReplicationStoreService;
+    use crate::quic::storage_service::StorageService;
+    use crate::quic::storage_service_v4::StorageServiceV4;
+    use crate::quic::stream_handler::StreamHandler;
 
     pub fn collapse_bytes_with_skip(chunks: &[Bytes], num_to_skip: usize) -> Bytes {
         let mut bytes = BytesMut::with_capacity(chunks.len() - 1);
@@ -176,5 +193,123 @@ pub mod tests {
 
     pub fn collapse_bytes(chunks: &[Bytes]) -> Bytes {
         collapse_bytes_with_skip(chunks, 0)
+    }
+
+    pub fn test_data_path() -> PathBuf {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("protocol")
+            .join("test_data");
+        println!("Test data path: {}", path.display());
+        assert!(
+            path.exists(),
+            "Test data directory does not exist: {}",
+            path.display()
+        );
+        path
+    }
+
+    pub fn server_certs() -> anyhow::Result<(PathBuf, PathBuf, PathBuf)> {
+        let path = test_data_path();
+        let cert = path.join("test_cert.pem");
+        let key = path.join("test_key.pem");
+        let ca = path.join("test_ca.pem");
+        println!(
+            "Server certs: cert={}, key={}, ca={}",
+            cert.display(),
+            key.display(),
+            ca.display()
+        );
+        Ok((cert, key, ca))
+    }
+
+    pub struct TestHandlerFactory {
+        service_store: ServiceStore,
+    }
+
+    pub const TEST_PROTOCOL: &str = "test/0.2";
+    pub const TEST_PROTOCOL_V4: &str = "lore-storage/0.4";
+
+    impl TestHandlerFactory {
+        pub fn new(
+            immutable_store: Arc<dyn ImmutableStore>,
+            mutable_store: Arc<dyn MutableStore>,
+        ) -> Self {
+            let mut service_store = ServiceStore::default();
+            {
+                let immutable_store = immutable_store.clone();
+                let mutable_store = mutable_store.clone();
+                service_store.add_service(
+                    TEST_PROTOCOL,
+                    Box::new(move |context: Arc<AttributeMap>| {
+                        let storage_protocol = StorageService::new(
+                            Arc::new(None),
+                            immutable_store.clone(),
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        );
+                        Box::new(StreamHandler::new(
+                            Arc::new(storage_protocol),
+                            context,
+                            100,
+                            None, /* handler timeout */
+                        ))
+                    }),
+                );
+            }
+            {
+                let immutable_store = immutable_store.clone();
+                let mutable_store = mutable_store.clone();
+                service_store.add_service(
+                    TEST_PROTOCOL_V4,
+                    Box::new(move |context: Arc<AttributeMap>| {
+                        let v4_service = StorageServiceV4::new(
+                            Arc::new(None),
+                            immutable_store.clone(),
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        );
+                        Box::new(StreamHandler::new(
+                            Arc::new(v4_service),
+                            context,
+                            100,
+                            None, /* handler timeout */
+                        ))
+                    }),
+                );
+            }
+            {
+                let immutable_store = immutable_store.clone();
+                service_store.add_service(
+                    ReplicationStoreClient::ALPN,
+                    Box::new(move |context: Arc<AttributeMap>| {
+                        let service = ReplicationStoreService::new(
+                            immutable_store.clone(),
+                            immutable_store.clone(),
+                        );
+                        Box::new(StreamHandler::new(
+                            Arc::new(service),
+                            context,
+                            100,
+                            None, /* handler timeout */
+                        ))
+                    }),
+                );
+            }
+            Self { service_store }
+        }
+    }
+
+    impl StreamHandlerFactory for TestHandlerFactory {
+        fn supported_protocols(&self) -> Vec<String> {
+            self.service_store.get_supported_services()
+        }
+
+        fn get_stream_handler_builder(
+            &self,
+            protocol: &str,
+        ) -> Option<(&&'static str, &StreamDataHandlerBuilder)> {
+            self.service_store.get_stream_builder(protocol)
+        }
     }
 }

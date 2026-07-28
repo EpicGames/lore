@@ -80,12 +80,12 @@ class TestTopology:
             "quic": shared_port,
             "grpc": shared_port,
             "http": allocate_free_port(),
-            "replication": allocate_free_port(),
+            "internal": allocate_free_port(),
         }
         (new_server_root, server_2_env) = generate_server_config(
             request, tmp_path_factory, server_2_ports
         )
-        main_server_replication_port = lore_main_server_ports["replication"]
+        main_server_internal_port = lore_main_server_ports["internal"]
         # set up a composite store for replication
         server_2_env["LORE__IMMUTABLE_STORE__MODE"] = "composite"
         server_2_env["LORE__IMMUTABLE_STORE__COMPOSITE__LOCAL__MODE"] = "local"
@@ -121,7 +121,7 @@ class TestTopology:
             server_2_config.write("\n")
             server_2_config.write("[topology.fixed]\n")
             server_2_config.write(
-                f'peers = [{{ address = "{server_hostname}", port = {main_server_replication_port}, locality = "SameRegion" }}]\n'
+                f'peers = [{{ address = "{server_hostname}", port = {main_server_internal_port}, locality = "SameRegion" }}]\n'
             )
 
         return new_server_root, server_2_env
@@ -136,12 +136,12 @@ class TestTopology:
             "quic": shared_port,
             "grpc": shared_port,
             "http": allocate_free_port(),
-            "replication": allocate_free_port(),
+            "internal": allocate_free_port(),
         }
         (new_server_root, server_3_env) = generate_server_config(
             request, tmp_path_factory, server_3_ports
         )
-        main_server_replication_port = lore_main_server_ports["replication"]
+        main_server_internal_port = lore_main_server_ports["internal"]
         # set up a composite store for replication
         server_3_env["LORE__IMMUTABLE_STORE__MODE"] = "composite"
         server_3_env["LORE__IMMUTABLE_STORE__COMPOSITE__LOCAL__MODE"] = "local"
@@ -176,7 +176,7 @@ class TestTopology:
             server_3_config.write("\n")
             server_3_config.write("[topology.fixed]\n")
             server_3_config.write(
-                f'peers = [{{ address = "{server_hostname}", port = {main_server_replication_port}, locality = "SameRegion" }}]\n'
+                f'peers = [{{ address = "{server_hostname}", port = {main_server_internal_port}, locality = "SameRegion" }}]\n'
             )
 
         return new_server_root, server_3_env
@@ -459,7 +459,7 @@ class TestCompositeTopology:
             "quic": shared_port,
             "grpc": shared_port,
             "http": allocate_free_port(),
-            "replication": allocate_free_port(),
+            "internal": allocate_free_port(),
         }
         return generate_server_config(request, tmp_path_factory, ports), ports
 
@@ -495,7 +495,7 @@ class TestCompositeTopology:
             "quic": shared_port,
             "grpc": shared_port,
             "http": allocate_free_port(),
-            "replication": allocate_free_port(),
+            "internal": allocate_free_port(),
         }
         (new_server_root, server_env) = generate_server_config(
             request, tmp_path_factory, composite_ports
@@ -524,9 +524,9 @@ class TestCompositeTopology:
 
         # composite topology with two fixed sources
         server_hostname = request.config.getoption("--lore-server-hostname")
-        same_region_port = lore_main_server_ports["replication"]
+        same_region_port = lore_main_server_ports["internal"]
         (_other_root, _other_env), other_ports = other_region_server_config
-        other_region_port = other_ports["replication"]
+        other_region_port = other_ports["internal"]
 
         with open(
             os.path.join(new_server_root, "lore-server", "config", "local.toml"),

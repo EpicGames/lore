@@ -12,7 +12,7 @@ import logging
 import os
 
 import pytest
-from lore_parsers import parse_status_json, parse_status_summary_json
+from lore_parsers import parse_jsonl, parse_status_json, parse_status_summary_json
 from test_utils import to_posix
 
 from lore import Lore
@@ -225,6 +225,119 @@ def test_dirty_move(new_lore_repo):
     entry = find_status_entry(entries, os.path.join("dest", "file.txt"))
     assert entry is not None, "dest/file.txt should appear in status"
     assert entry["flagDirty"] is True
+
+
+@pytest.mark.smoke
+def test_dirty_move_of_uncommitted_source_stays_add(new_lore_repo):
+    """A `file dirty move` whose source is not in the revision state reports
+    the destination as action=add with no fromPath, in both a plain status and
+    a `status --scan`.
+
+    The source was never recorded in a commit — it exists only as a dirty add —
+    so there is nothing to move from: the destination inherits the add instead
+    of becoming a move, and --scan retains that add.
+    """
+    repo: Lore = new_lore_repo()
+
+    with repo.open_file("base.txt", "w+") as f:
+        f.write("base\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    # old.txt is only ever a dirty add, never recorded in a commit
+    with repo.open_file("old.txt", "w+") as f:
+        f.write("movable content\n")
+    repo.dirty("old.txt", offline=True)
+
+    pre_move = find_status_entry(get_status_files(repo), "old.txt")
+    assert pre_move is not None, "old.txt should appear in status as a dirty add"
+    assert pre_move["action"] == "add", (
+        f"old.txt should be action=add before the move, got {pre_move['action']!r}"
+    )
+
+    # Rename on disk, then notify Lore of the move
+    os.rename(
+        os.path.join(repo.path, "old.txt"),
+        os.path.join(repo.path, "new.txt"),
+    )
+    repo.dirty_move("old.txt", "new.txt", offline=True)
+
+    # Status without --scan: still an add, with no move provenance
+    entries = get_status_files(repo)
+    entry = find_status_entry(entries, "new.txt")
+    assert entry is not None, "new.txt should appear in status before scan"
+    assert entry["action"] == "add", (
+        "moving a source that is not in the revision state keeps it an add; "
+        f"got action={entry['action']!r} for new.txt"
+    )
+    assert entry.get("fromPath", "") == "", (
+        "new.txt should carry no move provenance, "
+        f"got fromPath={entry.get('fromPath')!r}"
+    )
+    assert entry["flagDirty"] is True, "new.txt should be flagDirty before scan"
+    assert find_status_entry(entries, "old.txt") is None, (
+        "the vacated source path must not appear before scan"
+    )
+
+    # Status with --scan: the add is retained
+    scanned = get_status_files(repo, scan=True)
+    scanned_entry = find_status_entry(scanned, "new.txt")
+    assert scanned_entry is not None, "new.txt should appear in status after scan"
+    assert scanned_entry["action"] == "add", (
+        f"--scan must retain the add; got action={scanned_entry['action']!r} for new.txt"
+    )
+    assert scanned_entry.get("fromPath", "") == "", (
+        "--scan must not invent move provenance, "
+        f"got fromPath={scanned_entry.get('fromPath')!r}"
+    )
+    assert scanned_entry["flagDirty"] is True, "new.txt should stay flagDirty after scan"
+    assert find_status_entry(scanned, "old.txt") is None, (
+        "the vacated source path must not reappear after scan"
+    )
+
+
+@pytest.mark.smoke
+def test_dirty_move_scan_without_prior_status(new_lore_repo):
+    """A file committed at its old path, renamed on disk and marked with
+    `file dirty move`, is reported by `status --scan` as action=move with
+    fromPath=source rather than as a delete of the source plus an add of the
+    destination.
+
+    The scan is the first status run on the working tree, so the filesystem
+    reconciliation has to pick the move up from the dirty marking alone
+    instead of from state a preceding plain status already reported.
+    """
+    repo: Lore = new_lore_repo()
+
+    with repo.open_file("old.txt", "w+") as f:
+        f.write("movable content\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    # Rename on disk, then notify Lore of the move
+    os.rename(
+        os.path.join(repo.path, "old.txt"),
+        os.path.join(repo.path, "new.txt"),
+    )
+    repo.dirty_move("old.txt", "new.txt", offline=True)
+
+    # No plain status in between: --scan is the first status of the tree
+    scanned = get_status_files(repo, scan=True)
+    entry = find_status_entry(scanned, "new.txt")
+    assert entry is not None, "new.txt should appear in status after scan"
+    assert entry["action"] == "move", (
+        "--scan must report the dirty move as a move, not an add; "
+        f"got action={entry['action']!r} for new.txt"
+    )
+    assert to_posix(entry.get("fromPath", "")) == "old.txt", (
+        "--scan must preserve the move provenance; "
+        f"got fromPath={entry.get('fromPath')!r} for new.txt"
+    )
+    assert entry["flagDirty"] is True, "new.txt should be flagDirty after scan"
+    assert find_status_entry(scanned, "old.txt") is None, (
+        "--scan must not report the move source as a separate delete entry; "
+        "a move must not degrade into delete + add"
+    )
 
 
 @pytest.mark.smoke
@@ -690,7 +803,9 @@ def test_scan_clears_stale_dirty_on_reverted_file(new_lore_repo):
 
     # Verify dirty
     entries = get_status_files(repo)
-    assert find_status_entry(entries, "file.txt") is not None, "Should be dirty before revert"
+    assert find_status_entry(entries, "file.txt") is not None, (
+        "Should be dirty before revert"
+    )
 
     # Revert the file back to original content
     with repo.open_file("file.txt", "w+") as f:
@@ -767,9 +882,11 @@ def test_scan_after_commit_shows_remaining_dirty(new_lore_repo):
     assert entry is not None, "remaining.txt should still appear after commit + scan"
     assert entry["flagDirty"] is True
 
+
 # ===========================================================================
 # Stage from dirty-marked files
 # ===========================================================================
+
 
 @pytest.mark.smoke
 def test_stage_from_dirty_marks(new_lore_repo):
@@ -937,14 +1054,112 @@ def test_stage_directory_recurses_dirty_added_subdirectory(new_lore_repo):
     repo.status(reset=True, offline=True)
     dump = repo.repository_dump()
     for name in ("alpha.txt", "beta.txt"):
-        assert name in dump, (
-            f"{name} should appear in the committed revision:\n{dump}"
+        assert name in dump, f"{name} should appear in the committed revision:\n{dump}"
+
+
+@pytest.mark.smoke
+def test_dirty_stage_commit_empty_directories(new_lore_repo):
+    """Empty directories flagged dirty stage and commit as directory adds.
+
+    A base revision commits a root file and a subdirectory holding a file. Two
+    brand-new empty directories are then created -- one in the repository root
+    and one inside the committed subdirectory -- and flagged with the dirty API
+    (no scan). Each empty directory is its own change with no child file to
+    anchor it.
+
+    Plain `status` (no scan) must report exactly those two directories as
+    unstaged adds and nothing else (the committed `subdir` parent gaining a
+    child is not itself a reported change). `status --check-dirty` must report
+    the exact same set. Staging the two directories must report two directory
+    adds and no files, after which plain `status` reports them as staged adds.
+    Committing then succeeds and leaves a clean status.
+    """
+    repo: Lore = new_lore_repo()
+
+    # Base revision: a root file and a subdirectory with a file.
+    with repo.open_file("file.txt", "w+") as f:
+        f.write("root content\n")
+    repo.make_dirs("subdir")
+    with repo.open_file("subdir/sub_file.txt", "w+") as f:
+        f.write("sub content\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    # Empty directory in the root and an empty directory inside the committed
+    # subdirectory, both absent from the base revision.
+    empty_dirs = ["empty_root", "subdir/empty_sub"]
+    for path in empty_dirs:
+        repo.make_dirs(path)
+
+    repo.dirty(empty_dirs, offline=True)
+
+    expected = {to_posix(p) for p in empty_dirs}
+
+    def assert_empty_dir_adds(entries: list[dict], *, staged: bool, label: str) -> None:
+        by_path = {to_posix(e["path"]): e for e in entries}
+        assert set(by_path) == expected, (
+            f"{label}: status should report exactly the two empty directories, "
+            f"got {sorted(by_path)}"
         )
+        for path in expected:
+            entry = by_path[path]
+            assert entry["type"] == "directory", (
+                f"{label}: {path} should be a directory: {entry}"
+            )
+            assert entry["action"] == "add", (
+                f"{label}: {path} should be an add: {entry}"
+            )
+            assert entry["flagDirty"] is True, (
+                f"{label}: {path} should be dirty: {entry}"
+            )
+            assert entry["flagStaged"] is staged, (
+                f"{label}: {path} flagStaged should be {staged}: {entry}"
+            )
+
+    # Expect: plain status (no scan) reports exactly the two empty directories
+    # as unstaged dirty adds -- and nothing else.
+    assert_empty_dir_adds(get_status_files(repo), staged=False, label="plain status")
+
+    # Expect: --check-dirty re-verifies the dirty markers against the filesystem
+    # and reports the exact same two unstaged dirty adds (a dir add is never
+    # cleared as "unmodified").
+    assert_empty_dir_adds(
+        get_status_files(repo, check_dirty=True), staged=False, label="--check-dirty"
+    )
+
+    # Stage both directories by their own paths. Expect: the stage summary
+    # counts exactly two directory adds and nothing else -- no files, and no
+    # modify of the committed `subdir` parent that one of them lives under.
+    stage_output = repo.stage(empty_dirs, json=True, offline=True)
+    stage_ends = parse_jsonl(stage_output, "fileStageEnd")
+    assert stage_ends, f"stage should emit a fileStageEnd event:\n{stage_output}"
+    count = stage_ends[-1]["count"]
+    assert count["directoryAddCount"] == 2, count
+    assert count["directoryModifyCount"] == 0, count
+    assert count["directoryDeleteCount"] == 0, count
+    assert count["directoryMoveCount"] == 0, count
+    assert count["fileAddCount"] == 0, count
+    assert count["fileModifyCount"] == 0, count
+    assert count["fileDeleteCount"] == 0, count
+    assert count["fileMoveCount"] == 0, count
+    assert count["totalCount"] == 2, count
+
+    # Expect: plain status now reports the same two directories, still adds, but
+    # flagged staged.
+    assert_empty_dir_adds(get_status_files(repo), staged=True, label="after stage")
+
+    # Expect: the commit succeeds and, with nothing left pending, a following
+    # plain status reports no changes at all.
+    repo.commit(offline=True)
+    assert get_status_files(repo) == [], (
+        "status should report no changes after committing the empty directories"
+    )
 
 
 # ===========================================================================
 # Dirty add in new directories, nonexistent paths, ignored paths
 # ===========================================================================
+
 
 @pytest.mark.smoke
 def test_dirty_add_in_new_directory(new_lore_repo):
@@ -1504,15 +1719,11 @@ def test_status_scan_partial_revert_with_remaining(new_lore_repo):
     )
 
     entries = get_status_files(repo, scan=True)
-    by_path = {
-        to_posix(e["path"]): e for e in entries if e.get("type") == "file"
-    }
+    by_path = {to_posix(e["path"]): e for e in entries if e.get("type") == "file"}
 
     for p in paths_to_keep:
         entry = by_path.get(to_posix(p))
-        assert entry is not None, (
-            f"kept dirty-add {p} should still appear in status"
-        )
+        assert entry is not None, f"kept dirty-add {p} should still appear in status"
         assert entry.get("flagDirty") is True, (
             f"kept dirty-add {p} should still be flagDirty, got {entry}"
         )
@@ -1716,9 +1927,11 @@ def test_branch_merge_abort_keeps_dirty_carry(new_lore_repo):
         "staged_post.txt should be clean after commit"
     )
     carry = find_status_entry(entries, "base.txt")
-    assert carry is not None and carry["flagDirty"] is True and carry["flagStaged"] is False, (
-        "merge abort preserves the pre-existing dirty-only carry"
-    )
+    assert (
+        carry is not None
+        and carry["flagDirty"] is True
+        and carry["flagStaged"] is False
+    ), "merge abort preserves the pre-existing dirty-only carry"
 
 
 # ===========================================================================
@@ -1914,9 +2127,13 @@ def test_cherry_pick_abort_keeps_dirty_carry(new_lore_repo):
         "staged_post.txt should be clean after commit"
     )
     carry = find_status_entry(entries, "base.txt")
-    assert carry is not None and carry["flagDirty"] is True and carry["flagStaged"] is False, (
-        "cherry-pick abort preserves the pre-existing dirty-only carry"
-    )
+    assert (
+        carry is not None
+        and carry["flagDirty"] is True
+        and carry["flagStaged"] is False
+    ), "cherry-pick abort preserves the pre-existing dirty-only carry"
+
+
 # ===========================================================================
 # Branch reset with dirty-only tracking
 # ===========================================================================
@@ -2188,9 +2405,11 @@ def test_revert_abort_keeps_dirty_carry(new_lore_repo):
         "staged_post.txt should be clean after commit"
     )
     carry = find_status_entry(entries, "base.txt")
-    assert carry is not None and carry["flagDirty"] is True and carry["flagStaged"] is False, (
-        "revert abort preserves the pre-existing dirty-only carry"
-    )
+    assert (
+        carry is not None
+        and carry["flagDirty"] is True
+        and carry["flagStaged"] is False
+    ), "revert abort preserves the pre-existing dirty-only carry"
 
 
 def write_view_filter(repo: Lore, lines: list[str]) -> None:
@@ -2469,6 +2688,181 @@ def test_dirty_partial_commit_keeps_uncommitted_adds(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_dirty_sequential_single_file_commits_keep_uncommitted_adds(new_lore_repo):
+    """Dirty-added files keep their add classification while sibling adds are
+    committed one at a time.
+
+    Every new file is flagged dirty in a single `dirty` call, then committed one
+    at a time (`stage` a single file, then `commit`). Files sit both directly in
+    the repository root and under a brand-new subdirectory of an
+    already-committed directory, so an uncommitted new file's parent chain runs
+    through a committed ancestor. After each single-file commit, a plain status
+    (no rescan) must report every not-yet-committed file as a dirty add -- never
+    demoted to a modify and never with the dirty flag cleared -- and each
+    committed file must drop out of status.
+    """
+    repo: Lore = new_lore_repo()
+
+    # Base revision so the root and `existing/` already hold committed content;
+    # the new files below are added alongside already-tracked nodes.
+    repo.write_files(
+        {
+            "existing/base_one.bin": os.urandom(64),
+            "existing/base_two.bin": os.urandom(64),
+        }
+    )
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    # Sibling adds in the repository root plus a brand-new subdirectory of the
+    # committed `existing/` directory, so some new files sit under a committed
+    # ancestor.
+    new_files = [f"root_add_{i:02d}.bin" for i in range(8)] + [
+        f"existing/added/sub_add_{i:02d}.bin" for i in range(4)
+    ]
+    repo.write_files({name: os.urandom(64) for name in new_files})
+
+    # Flag every new file through a single dirty call (not status --scan).
+    repo.dirty(new_files, offline=True)
+
+    def dirty_files(**kwargs) -> dict[str, dict]:
+        return {
+            to_posix(e["path"]): e
+            for e in get_status_files(repo, **kwargs)
+            if e.get("type") == "file"
+        }
+
+    new_posix = {to_posix(p) for p in new_files}
+
+    # Every new file starts life as a dirty add.
+    initial = dirty_files()
+    assert set(initial) == new_posix, (
+        f"dirty + status should report exactly the new files, got {sorted(initial)}"
+    )
+    for p in new_files:
+        entry = initial[to_posix(p)]
+        assert entry["action"] == "add", f"{p} should start as a dirty add: {entry}"
+        assert entry["flagDirty"] is True, f"{p} should start dirty: {entry}"
+
+    # Commit one file at a time in a deliberately non-sorted order, interleaving
+    # the two placements, so the committed file is rarely the lexicographically
+    # first remaining sibling and the new subdirectory is created mid-sequence.
+    commit_order = [
+        "root_add_03.bin",
+        "existing/added/sub_add_01.bin",
+        "root_add_00.bin",
+        "root_add_07.bin",
+        "existing/added/sub_add_03.bin",
+        "root_add_01.bin",
+        "root_add_05.bin",
+        "existing/added/sub_add_00.bin",
+        "root_add_02.bin",
+        "root_add_06.bin",
+        "existing/added/sub_add_02.bin",
+        "root_add_04.bin",
+    ]
+    assert set(commit_order) == set(new_files), (
+        "commit_order must cover every new file exactly once"
+    )
+
+    committed: set[str] = set()
+    for path in commit_order:
+        # Stage exactly one file (scan=False) then commit.
+        repo.stage([path], offline=True)
+        repo.commit(offline=True)
+        committed.add(to_posix(path))
+        remaining = new_posix - committed
+
+        # Plain status (no rescan): the remaining adds must survive the commit.
+        after = dirty_files()
+        assert set(after) == remaining, (
+            f"after committing {path}, plain status should report exactly the "
+            f"still-uncommitted new files {sorted(remaining)}, got {sorted(after)}"
+        )
+        for p in remaining:
+            entry = after[p]
+            assert entry["action"] == "add", (
+                f"committing {path} demoted uncommitted new file {p} from add to "
+                f"{entry['action']!r}: {entry}"
+            )
+            assert entry["flagDirty"] is True, (
+                f"committing {path} cleared the dirty flag on still-uncommitted "
+                f"new file {p}: {entry}"
+            )
+
+    # Every new file is committed: status must be clean of them.
+    assert dirty_files() == {}, (
+        "all new files committed one at a time; status should report none of them"
+    )
+
+    repo.repository_verify(offline=True)
+
+
+@pytest.mark.smoke
+def test_dirty_add_under_dirtied_committed_dir_keeps_add_on_partial_commit(
+    new_lore_repo,
+):
+    """New files added directly inside an already-committed directory keep their
+    add classification when one of them is committed, even when that committed
+    directory is itself flagged dirty alongside the new files.
+
+    A directory is committed so it exists in the revision. New files are then
+    created directly inside it and flagged dirty in a single `dirty` call
+    together with the directory itself. Status reports every new file as a dirty
+    add. After staging and committing exactly one of those files, a plain status
+    must still report each remaining new file as a dirty add -- never
+    reclassified to keep or modify, and never with the dirty flag cleared.
+    """
+    repo: Lore = new_lore_repo()
+
+    # Commit a directory so it exists in the revision.
+    repo.write_files({"folder/seed.bin": os.urandom(32)})
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    # New files directly inside the committed directory, flagged dirty in one
+    # call together with the committed directory itself.
+    new_files = [f"folder/added_{i:02d}.bin" for i in range(6)]
+    repo.write_files({name: os.urandom(64) for name in new_files})
+    repo.dirty(new_files + ["folder"], offline=True)
+
+    def dirty_adds(**kwargs) -> dict[str, dict]:
+        return {
+            to_posix(e["path"]): e
+            for e in get_status_files(repo, **kwargs)
+            if e.get("type") == "file"
+        }
+
+    new_posix = {to_posix(p) for p in new_files}
+
+    # Every new file starts as a dirty add.
+    initial = dirty_adds()
+    for p in new_files:
+        entry = initial.get(to_posix(p))
+        assert entry is not None and entry["action"] == "add", (
+            f"{p} should start as a dirty add: {entry}"
+        )
+
+    # Commit exactly one of the new files.
+    repo.stage([new_files[0]], offline=True)
+    repo.commit(offline=True)
+
+    # Every still-uncommitted new file must remain a dirty add.
+    remaining = new_posix - {to_posix(new_files[0])}
+    after = dirty_adds()
+    for p in sorted(remaining):
+        entry = after.get(p)
+        assert entry is not None, f"{p} dropped from status after a partial commit"
+        assert entry["action"] == "add", (
+            f"partial commit reclassified uncommitted new file {p} from add to "
+            f"{entry['action']!r}: {entry}"
+        )
+        assert entry["flagDirty"] is True, f"{p} should remain dirty: {entry}"
+
+    repo.repository_verify(offline=True)
+
+
+@pytest.mark.smoke
 def test_dirty_add_repeated_is_idempotent(new_lore_repo):
     """Marking the same added files dirty twice reports the same nodes both
     times, in plain status and under --check-dirty.
@@ -2503,12 +2897,16 @@ def test_dirty_add_repeated_is_idempotent(new_lore_repo):
             f"{label}: duplicate file nodes reported: "
             f"{sorted(to_posix(e['path']) for e in files)}"
         )
-        assert set(by_path) == expected, f"{label}: wrong file set, got {sorted(by_path)}"
+        assert set(by_path) == expected, (
+            f"{label}: wrong file set, got {sorted(by_path)}"
+        )
         for p in expected:
             entry = by_path[p]
             assert entry["action"] == "add", f"{label}: {p} should be add: {entry}"
             assert entry["flagDirty"] is True, f"{label}: {p} should be dirty: {entry}"
-            assert entry["flagStaged"] is False, f"{label}: {p} should be unstaged: {entry}"
+            assert entry["flagStaged"] is False, (
+                f"{label}: {p} should be unstaged: {entry}"
+            )
         all_paths = [to_posix(e["path"]) for e in entries]
         assert len(all_paths) == len(set(all_paths)), (
             f"{label}: duplicate nodes reported: {sorted(all_paths)}"

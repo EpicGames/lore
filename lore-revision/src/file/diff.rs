@@ -224,6 +224,7 @@ async fn file_diff2(
         })
         .await
         .forward::<DiffError>("Failed to calculate diff")?;
+        state::detect_and_coalesce_moves(&mut changes);
         change::sort_by_path(&mut changes);
         changes
     } else {
@@ -231,15 +232,25 @@ async fn file_diff2(
             State::deserialize_current_and_staged(repository.clone())
                 .await
                 .forward::<DiffError>("Failed deserializing revision state")?;
-        let state_current = state_staged.unwrap_or(state_current);
-        diff::diff_filesystem_paths(
+        let state_staged = state_staged.unwrap_or_else(|| state_current.clone());
+        let mut changes = diff::diff_filesystem_paths(
             repository.clone(),
             state_source.clone(),
-            state_current,
+            state_staged.clone(),
             if !paths.is_empty() { Some(paths) } else { None },
         )
         .await
-        .forward::<DiffError>("Failed to calculate diff")?
+        .forward::<DiffError>("Failed to calculate diff")?;
+
+        coalesce_staged_moves(
+            repository.clone(),
+            &state_current,
+            &state_staged,
+            &mut changes,
+        )
+        .await?;
+
+        changes
     };
 
     emit_unified_diffs(
@@ -251,6 +262,60 @@ async fn file_diff2(
         options,
     )
     .await
+}
+
+async fn coalesce_staged_moves(
+    repository: Arc<RepositoryContext>,
+    state_current: &Arc<State>,
+    state_staged: &Arc<State>,
+    changes: &mut Vec<NodeChange>,
+) -> Result<(), DiffError> {
+    if Arc::ptr_eq(state_current, state_staged)
+        || state_current.revision() == state_staged.revision()
+    {
+        return Ok(());
+    }
+
+    let staged = state::diff_collect(
+        repository.clone(),
+        state_current.clone(),
+        repository.clone(),
+        state_staged.clone(),
+        None,
+        crate::filter::FilterMode::Full,
+    )
+    .await
+    .forward::<DiffError>("Failed to detect staged moves")?;
+
+    for staged_change in staged {
+        if staged_change.action != change::FileAction::Move {
+            continue;
+        }
+        let Some(from_path) = staged_change.from_path.as_ref() else {
+            continue;
+        };
+        let to_path = &staged_change.path;
+
+        let delete_idx = changes
+            .iter()
+            .position(|c| c.action == change::FileAction::Delete && c.path == *from_path);
+        let add_idx = changes
+            .iter()
+            .position(|c| c.action == change::FileAction::Add && c.path == *to_path);
+
+        let (Some(delete_idx), Some(add_idx)) = (delete_idx, add_idx) else {
+            continue;
+        };
+
+        changes[add_idx].action = change::FileAction::Move;
+        changes[add_idx].from = changes[delete_idx].from.clone();
+        changes[add_idx].from_path = Some(from_path.clone());
+
+        changes.remove(delete_idx);
+    }
+
+    change::sort_by_path(changes);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -345,6 +410,24 @@ async fn emit_diff3_changes(
     options: DiffOptions,
 ) -> Result<(), DiffError> {
     for change in changes {
+        if change.action == change::FileAction::Move
+            && let Some(from_path) = change.from_path.as_ref()
+        {
+            if !move_matches_paths(paths, &change.path, from_path) {
+                continue;
+            }
+            emit_move_diff(
+                repository.clone(),
+                state_base,
+                state_target,
+                from_path,
+                &change.path,
+                options,
+            )
+            .await?;
+            continue;
+        }
+
         let is_from_file = change.from.flags.contains(NodeFlags::File);
         let is_to_file = change.to.flags.contains(NodeFlags::File);
 
@@ -586,6 +669,24 @@ async fn emit_unified_diffs(
     options: DiffOptions,
 ) -> Result<(), DiffError> {
     for change in changes {
+        if change.action == change::FileAction::Move
+            && let Some(from_path) = change.from_path.as_ref()
+        {
+            if !move_matches_paths(paths, &change.path, from_path) {
+                continue;
+            }
+            emit_move_diff(
+                repository.clone(),
+                state_source,
+                state_target,
+                from_path,
+                &change.path,
+                options,
+            )
+            .await?;
+            continue;
+        }
+
         let is_from_file = change.from.flags.contains(NodeFlags::File);
         let is_to_file = if state_target.is_some() {
             change.to.flags.contains(NodeFlags::File)
@@ -616,16 +717,8 @@ async fn emit_unified_diffs(
             continue;
         };
 
-        let source_label = format!(
-            "{}@{}",
-            change.path.as_str(),
-            state_source.revision_number()
-        );
-        let target_label = if let Some(st) = state_target.as_ref() {
-            format!("{}@{}", change.path.as_str(), st.revision_number())
-        } else {
-            change.path.as_str().to_string()
-        };
+        let source_label = diff_label(&change.path, Some(state_source));
+        let target_label = diff_label(&change.path, state_target.as_ref());
 
         if action == LoreFileAction::Keep {
             let source =
@@ -685,6 +778,24 @@ async fn emit_unified_diffs(
     Ok(())
 }
 
+fn diff_label(path: &RelativePath, state: Option<&Arc<State>>) -> String {
+    match state {
+        Some(state) => format!("{}@{}", path.as_str(), state.revision_number()),
+        None => path.as_str().to_string(),
+    }
+}
+
+fn move_matches_paths(
+    paths: &[RelativePath],
+    to_path: &RelativePath,
+    from_path: &RelativePath,
+) -> bool {
+    paths.is_empty()
+        || paths
+            .iter()
+            .any(|p| p.is_empty() || p == to_path || p == from_path)
+}
+
 /// Emit a `Binary files differ` marker as a `FileDiff` event, bypassing the
 /// text diff/merge pipeline. Used when any participating side of a diff is
 /// detected as binary, so raw bytes are never rendered through the lossy text
@@ -714,17 +825,33 @@ fn emit_diff_event(
     action: LoreFileAction,
     options: DiffOptions,
 ) -> bool {
+    let Some(patch) = build_unified_patch(old, new, from_label, to_label, options) else {
+        return false;
+    };
+    event::LoreEvent::FileDiff(LoreFileDiffEventData {
+        path: path.clone().into(),
+        patch: patch.into(),
+        action,
+    })
+    .send();
+    true
+}
+
+fn build_unified_patch(
+    old: &str,
+    new: &str,
+    from_label: &str,
+    to_label: &str,
+    options: DiffOptions,
+) -> Option<String> {
     let patch = if options.ignore_whitespace_eol || options.ignore_whitespace_inline {
-        match format_patch_preserving_originals(
+        format_patch_preserving_originals(
             old,
             new,
             options.context_lines,
             options.ignore_whitespace_eol,
             options.ignore_whitespace_inline,
-        ) {
-            Some(s) => s,
-            None => return false,
-        }
+        )?
     } else {
         // diffy's `Display`/`to_string()` defaults to `suppress_blank_empty: true`,
         // which drops the leading space on blank context lines (bare `\n`). Standard
@@ -738,19 +865,60 @@ fn emit_diff_event(
             .fmt_patch(&patch)
             .to_string();
         if s.ends_with("+++ modified\n") {
-            return false;
+            return None;
         }
         s
     };
     let patch = patch.replace("--- original", &format!("--- {from_label}"));
     let patch = patch.replace("+++ modified", &format!("+++ {to_label}"));
+    Some(patch)
+}
+
+async fn emit_move_diff(
+    repository: Arc<RepositoryContext>,
+    state_source: &Arc<State>,
+    state_target: &Option<Arc<State>>,
+    from_path: &RelativePath,
+    to_path: &RelativePath,
+    options: DiffOptions,
+) -> Result<(), DiffError> {
+    let source = diff_read_file(repository.clone(), Some(state_source.clone()), from_path).await?;
+    let target = diff_read_file(repository.clone(), state_target.clone(), to_path).await?;
+
+    let header = format!(
+        "move from {}\nmove to {}\n",
+        from_path.as_str(),
+        to_path.as_str()
+    );
+
+    let patch = if source.is_binary() || target.is_binary() {
+        if source.text() != target.text() {
+            format!("{header}Binary files differ\n")
+        } else {
+            header
+        }
+    } else {
+        let from_label = diff_label(from_path, Some(state_source));
+        let to_label = diff_label(to_path, state_target.as_ref());
+        match build_unified_patch(
+            source.text(),
+            target.text(),
+            &from_label,
+            &to_label,
+            options,
+        ) {
+            Some(body) => format!("{header}{body}"),
+            None => header,
+        }
+    };
+
     event::LoreEvent::FileDiff(LoreFileDiffEventData {
-        path: path.clone().into(),
+        path: to_path.clone().into(),
         patch: patch.into(),
-        action,
+        action: LoreFileAction::Move,
     })
     .send();
-    true
+    Ok(())
 }
 
 /// Normalise `old` and `new` per-line for comparison, run diffy, then re-emit

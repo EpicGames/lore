@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Hash;
@@ -13,8 +15,11 @@ use lore_proto::lore::thin_client::v1::RevisionDiffResponse;
 use lore_proto::lore::thin_client::v1::revision_diff_response::Payload;
 use lore_revision::branch;
 use lore_revision::branch::BranchError;
+use lore_revision::change::FileAction;
+use lore_revision::change::NodeChange;
 use lore_revision::diff::diff_revision_paths;
 use lore_revision::lore::BranchId;
+use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision::DiffItem;
 use lore_revision::state::State;
@@ -200,6 +205,14 @@ async fn stream_diff(
             "RevisionDiff: same branch → 2-way",
         );
         true
+    } else if from_branch.is_zero() || to_branch.is_zero() {
+        debug!(
+            {REPOSITORY_ID} = %repository.id,
+            from_branch = %from_branch,
+            to_branch = %to_branch,
+            "RevisionDiff: a branch is zeroed → 2-way",
+        );
+        true
     } else {
         match is_branch_point_of_other(&repository, from_sig, to_branch, to_sig, from_branch).await
         {
@@ -318,6 +331,7 @@ async fn run_two_way(
         diff_revision_paths(repo_clone, from_state, to_state, None, producer_tx).await
     });
 
+    let mut partitions = PartitionTable::new(repository.id);
     while let Some(item) = producer_rx.recv().await {
         let change = item.map_err(|err| {
             warn!(
@@ -329,7 +343,15 @@ async fn run_two_way(
             );
             warn_error_to_status(&err, |e| Status::internal(e.to_string()))
         })?;
-        let payload = Payload::Change(node_change_to_diff_change(&change));
+        let index = match partitions
+            .resolve_or_announce(surviving_repository_id(&change), tx)
+            .await
+        {
+            Ok(index) => index,
+            Err(SendOutcome::ReceiverDropped) => return Ok(()),
+            Err(SendOutcome::Sent) => unreachable!("resolve_or_announce returns Sent only via Ok"),
+        };
+        let payload = Payload::Change(node_change_to_diff_change(&change, index));
         match send_payload(tx, payload).await {
             SendOutcome::Sent => {}
             SendOutcome::ReceiverDropped => return Ok(()),
@@ -446,6 +468,7 @@ async fn run_three_way(
         .await
     });
 
+    let mut partitions = PartitionTable::new(repository.id);
     while let Some(item) = producer_rx.recv().await {
         let item = item.map_err(|err| {
             warn!(
@@ -458,8 +481,42 @@ async fn run_three_way(
             map_branch_error_to_status(err)
         })?;
         let payload = match item {
-            DiffItem::Change(change) => Payload::Change(node_change_to_diff_change(&change)),
-            DiffItem::Conflict(pair) => Payload::Conflict(diff_conflict_from_pair(&pair)),
+            DiffItem::Change(change) => {
+                let index = match partitions
+                    .resolve_or_announce(surviving_repository_id(&change), tx)
+                    .await
+                {
+                    Ok(index) => index,
+                    Err(SendOutcome::ReceiverDropped) => return Ok(()),
+                    Err(SendOutcome::Sent) => {
+                        unreachable!("resolve_or_announce returns Sent only via Ok")
+                    }
+                };
+                Payload::Change(node_change_to_diff_change(&change, index))
+            }
+            DiffItem::Conflict(pair) => {
+                let index_from = match partitions
+                    .resolve_or_announce(surviving_repository_id(&pair.0), tx)
+                    .await
+                {
+                    Ok(index) => index,
+                    Err(SendOutcome::ReceiverDropped) => return Ok(()),
+                    Err(SendOutcome::Sent) => {
+                        unreachable!("resolve_or_announce returns Sent only via Ok")
+                    }
+                };
+                let index_to = match partitions
+                    .resolve_or_announce(surviving_repository_id(&pair.1), tx)
+                    .await
+                {
+                    Ok(index) => index,
+                    Err(SendOutcome::ReceiverDropped) => return Ok(()),
+                    Err(SendOutcome::Sent) => {
+                        unreachable!("resolve_or_announce returns Sent only via Ok")
+                    }
+                };
+                Payload::Conflict(diff_conflict_from_pair(&pair, index_from, index_to))
+            }
         };
         match send_payload(tx, payload).await {
             SendOutcome::Sent => {}
@@ -569,6 +626,7 @@ async fn send_header(
 /// The enum exists so the caller's bail path reads as deliberate
 /// cancellation (`SendOutcome::ReceiverDropped => return Ok(())`) rather
 /// than a generic ignored error.
+#[derive(Debug)]
 enum SendOutcome {
     Sent,
     ReceiverDropped,
@@ -594,8 +652,64 @@ async fn send_payload(
     SendOutcome::Sent
 }
 
+/// Per-stream map of linked-repository `RepositoryId` to its assigned
+/// index. The parent repository is index 0 and never stored here.
+struct PartitionTable {
+    parent_repository_id: RepositoryId,
+    entries: HashMap<RepositoryId, u32>,
+}
+
+impl PartitionTable {
+    fn new(parent_repository_id: RepositoryId) -> Self {
+        Self {
+            parent_repository_id,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Resolve `partition` to its index, sending a `DiffPartition` on
+    /// first sighting (before the index is returned, so the announcement
+    /// always precedes the change that references it). `Err` only when
+    /// the receiver is gone; the table is left unchanged in that case.
+    async fn resolve_or_announce(
+        &mut self,
+        partition: RepositoryId,
+        tx: &mpsc::Sender<Result<RevisionDiffResponse, Status>>,
+    ) -> Result<u32, SendOutcome> {
+        if partition == self.parent_repository_id {
+            return Ok(0);
+        }
+        if let Some(&index) = self.entries.get(&partition) {
+            return Ok(index);
+        }
+        let index = (self.entries.len() as u32) + 1;
+        let announcement = Payload::Partition(thin_client_v1::DiffPartition {
+            index,
+            link_partition: Bytes::from(partition),
+        });
+        match send_payload(tx, announcement).await {
+            SendOutcome::Sent => {
+                self.entries.insert(partition, index);
+                Ok(index)
+            }
+            SendOutcome::ReceiverDropped => Err(SendOutcome::ReceiverDropped),
+        }
+    }
+}
+
+/// Repository of the side that survives the change: `from` for a
+/// delete, `to` otherwise. This is the partition its content lives in.
+fn surviving_repository_id(change: &NodeChange) -> RepositoryId {
+    match change.action {
+        FileAction::Delete => change.from.repository.id,
+        _ => change.to.repository.id,
+    }
+}
+
 #[cfg(test)]
 mod test {
+    use std::str::FromStr;
+
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::BranchPoint;
     use lore_proto::lore::thin_client::v1::revision_diff_request::QueryFrom;
@@ -1115,6 +1229,147 @@ mod test {
     }
 
     #[tokio::test]
+    async fn zero_from_signature_diffs_as_two_way_showing_all_adds() {
+        // State::deserialize returns an empty state for the zero hash,
+        // so every file in rev1 appears as an ADD in the diff.
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let rev1 = {
+                let repository_context = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository,
+                ));
+                let main = create_branch(&repository_context, "main", vec![]).await;
+                push_revision(
+                    &repository_context,
+                    main,
+                    Hash::default(),
+                    1,
+                    &[("a.txt", b"hello".as_slice())],
+                )
+                .await
+            };
+
+            let response = handler(
+                make_request(
+                    repository,
+                    QueryFrom::SignatureFrom(Hash::default().into()),
+                    QueryTo::SignatureTo(rev1.into()),
+                    false,
+                ),
+                immutable_store,
+                mutable_store,
+                RevisionDiffConfig::default(),
+            )
+            .await
+            .expect("handler ok");
+
+            let items: Vec<_> = collect(response)
+                .await
+                .into_iter()
+                .map(|r| r.expect("stream item"))
+                .collect();
+
+            let header = match &items[0].payload {
+                Some(Payload::Header(h)) => h,
+                other => panic!("expected header first, got {other:?}"),
+            };
+            assert_eq!(Hash::from(header.signature_from.as_ref()), Hash::default());
+            assert_eq!(Hash::from(header.signature_to.as_ref()), rev1);
+            assert!(header.identifier_base.is_none(), "2-way: no base");
+
+            let changes: Vec<&thin_client_v1::DiffChange> = items[1..]
+                .iter()
+                .filter_map(|item| match &item.payload {
+                    Some(Payload::Change(c)) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                changes
+                    .iter()
+                    .any(|c| c.path == "a.txt" && c.action == thin_client_v1::Action::Add as i32),
+                "expected a.txt ADD, got {changes:?}",
+            );
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn zero_to_signature_diffs_as_two_way_showing_all_adds() {
+        // State::deserialize returns an empty state for the zero hash,
+        // so every file in rev1 appears as an DELETE in the diff.
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let rev1 = {
+                let repository_context = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository,
+                ));
+                let main = create_branch(&repository_context, "main", vec![]).await;
+                push_revision(
+                    &repository_context,
+                    main,
+                    Hash::default(),
+                    1,
+                    &[("a.txt", b"hello".as_slice())],
+                )
+                .await
+            };
+
+            let response = handler(
+                make_request(
+                    repository,
+                    QueryFrom::SignatureFrom(rev1.into()),
+                    QueryTo::SignatureTo(Hash::default().into()),
+                    false,
+                ),
+                immutable_store,
+                mutable_store,
+                RevisionDiffConfig::default(),
+            )
+            .await
+            .expect("handler ok");
+
+            let items: Vec<_> = collect(response)
+                .await
+                .into_iter()
+                .map(|r| r.expect("stream item"))
+                .collect();
+
+            let header = match &items[0].payload {
+                Some(Payload::Header(h)) => h,
+                other => panic!("expected header first, got {other:?}"),
+            };
+            assert_eq!(Hash::from(header.signature_from.as_ref()), rev1);
+            assert_eq!(Hash::from(header.signature_to.as_ref()), Hash::default());
+            assert!(header.identifier_base.is_none(), "2-way: no base");
+
+            let changes: Vec<&thin_client_v1::DiffChange> = items[1..]
+                .iter()
+                .filter_map(|item| match &item.payload {
+                    Some(Payload::Change(c)) => Some(c),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                    changes
+                        .iter()
+                        .any(|c| c.path == "a.txt"
+                            && c.action == thin_client_v1::Action::Delete as i32),
+                    "expected a.txt DELETE, got {changes:?}",
+                );
+        }))
+        .await;
+    }
+
+    #[tokio::test]
     async fn unset_query_to_returns_invalid_argument() {
         let repository = random::<RepositoryId>();
         let (immutable_store, mutable_store, execution) =
@@ -1314,5 +1569,191 @@ mod test {
             );
         }))
         .await;
+    }
+
+    fn make_partition_id() -> RepositoryId {
+        RepositoryId::from(uuid::Uuid::now_v7())
+    }
+
+    /// Drain whatever is already queued on the receiver, returning the
+    /// payloads in arrival order. Used to inspect what `PartitionTable`
+    /// announced on the wire.
+    async fn drain_now(
+        rx: &mut mpsc::Receiver<Result<RevisionDiffResponse, Status>>,
+    ) -> Vec<Payload> {
+        let mut out = Vec::new();
+        while let Ok(Some(Ok(RevisionDiffResponse { payload: Some(p) }))) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
+        {
+            out.push(p);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn partition_table_parent_id_returns_zero_no_announcement() {
+        let parent = make_partition_id();
+        let (tx, mut rx) = mpsc::channel::<Result<RevisionDiffResponse, Status>>(8);
+        let mut table = PartitionTable::new(parent);
+
+        let index = table
+            .resolve_or_announce(parent, &tx)
+            .await
+            .expect("parent partition must resolve");
+        assert_eq!(index, 0);
+
+        let drained = drain_now(&mut rx).await;
+        assert!(
+            drained.is_empty(),
+            "parent partition must not be announced, got {drained:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn partition_table_first_link_emits_partition_then_returns_one() {
+        let parent = make_partition_id();
+        let linked = make_partition_id();
+        let (tx, mut rx) = mpsc::channel::<Result<RevisionDiffResponse, Status>>(8);
+        let mut table = PartitionTable::new(parent);
+
+        let index = table
+            .resolve_or_announce(linked, &tx)
+            .await
+            .expect("linked partition resolves");
+        assert_eq!(index, 1);
+
+        let drained = drain_now(&mut rx).await;
+        assert_eq!(drained.len(), 1, "exactly one partition announcement");
+        let Payload::Partition(p) = &drained[0] else {
+            panic!("expected Partition payload, got {drained:?}");
+        };
+        assert_eq!(p.index, 1);
+        assert_eq!(RepositoryId::from(p.link_partition.as_ref()), linked);
+    }
+
+    #[tokio::test]
+    async fn partition_table_repeated_lookup_does_not_reannounce() {
+        let parent = make_partition_id();
+        let linked = make_partition_id();
+        let (tx, mut rx) = mpsc::channel::<Result<RevisionDiffResponse, Status>>(8);
+        let mut table = PartitionTable::new(parent);
+
+        let first = table.resolve_or_announce(linked, &tx).await.unwrap();
+        let _ = drain_now(&mut rx).await;
+        let second = table.resolve_or_announce(linked, &tx).await.unwrap();
+        let drained = drain_now(&mut rx).await;
+        assert_eq!(first, second);
+        assert!(
+            drained.is_empty(),
+            "repeated lookup must not announce again, got {drained:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn partition_table_two_distinct_ids_get_one_and_two_in_order() {
+        let parent = make_partition_id();
+        let a = make_partition_id();
+        let b = make_partition_id();
+        let (tx, mut rx) = mpsc::channel::<Result<RevisionDiffResponse, Status>>(8);
+        let mut table = PartitionTable::new(parent);
+
+        assert_eq!(table.resolve_or_announce(a, &tx).await.unwrap(), 1);
+        assert_eq!(table.resolve_or_announce(b, &tx).await.unwrap(), 2);
+        assert_eq!(
+            table.resolve_or_announce(a, &tx).await.unwrap(),
+            1,
+            "lookup of A after B reuses index 1",
+        );
+
+        let drained = drain_now(&mut rx).await;
+        assert_eq!(drained.len(), 2, "only two announcements total");
+        let Payload::Partition(p1) = &drained[0] else {
+            panic!("first must be Partition, got {drained:?}");
+        };
+        let Payload::Partition(p2) = &drained[1] else {
+            panic!("second must be Partition, got {drained:?}");
+        };
+        assert_eq!(p1.index, 1);
+        assert_eq!(RepositoryId::from(p1.link_partition.as_ref()), a);
+        assert_eq!(p2.index, 2);
+        assert_eq!(RepositoryId::from(p2.link_partition.as_ref()), b);
+    }
+
+    #[tokio::test]
+    async fn partition_table_receiver_dropped_propagates() {
+        let parent = make_partition_id();
+        let linked = make_partition_id();
+        let (tx, rx) = mpsc::channel::<Result<RevisionDiffResponse, Status>>(8);
+        let mut table = PartitionTable::new(parent);
+
+        drop(rx);
+        let outcome = table.resolve_or_announce(linked, &tx).await;
+        assert!(
+            matches!(outcome, Err(SendOutcome::ReceiverDropped)),
+            "got {outcome:?}",
+        );
+        assert!(
+            !table.entries.contains_key(&linked),
+            "failed announcement must not poison the table",
+        );
+    }
+
+    #[tokio::test]
+    async fn surviving_repository_id_picks_from_for_delete_to_otherwise() {
+        // Construct two contexts with distinct ids; place `from` and `to`
+        // in different repositories and verify the helper picks the
+        // correct side based on FileAction.
+        let parent_id = RepositoryId::from(uuid::Uuid::now_v7());
+        let linked_id = RepositoryId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, _) = test_store_create().await.expect("test stores");
+        let parent_ctx = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            parent_id,
+        ));
+        let linked_ctx = Arc::new(RepositoryContext::new_server_context(
+            immutable_store,
+            mutable_store,
+            linked_id,
+        ));
+        let state = Arc::new(state::State::new());
+        let address = lore_storage::Address::default();
+
+        let make = |action: lore_revision::change::FileAction| NodeChange {
+            action,
+            path: lore_revision::util::path::RelativePath::from_str("p").unwrap(),
+            from_path: None,
+            flags: lore_revision::change::Flags::None,
+            from: lore_revision::change::NodeChangeState {
+                node: 1,
+                repository: linked_ctx.clone(),
+                state: state.clone(),
+                address,
+                flags: NodeFlags::File,
+            },
+            to: lore_revision::change::NodeChangeState {
+                node: 2,
+                repository: parent_ctx.clone(),
+                state: state.clone(),
+                address,
+                flags: NodeFlags::File,
+            },
+        };
+
+        assert_eq!(
+            surviving_repository_id(&make(lore_revision::change::FileAction::Delete)),
+            linked_id,
+            "Delete surfaces the from side",
+        );
+        assert_eq!(
+            surviving_repository_id(&make(lore_revision::change::FileAction::Add)),
+            parent_id,
+            "Add surfaces the to side",
+        );
+        assert_eq!(
+            surviving_repository_id(&make(lore_revision::change::FileAction::Keep)),
+            parent_id,
+            "Keep surfaces the to side",
+        );
     }
 }

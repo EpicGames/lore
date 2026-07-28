@@ -95,8 +95,8 @@ pub struct LoreRepositoryCloneArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Clone Events
@@ -133,18 +133,10 @@ async fn clone_local(
 
             let time_start = Instant::now();
 
-            let mut status = 0;
-            if let Err(err) =
-                clone_impl(execution_context().globals().repository_path(), &args).await
-            {
-                execution_context().dispatcher.send_error(err);
-                status = 1;
-            }
+            let result = clone_impl(execution_context().globals().repository_path(), &args).await;
 
             log_command_done(&clone, time_start);
-            execution_context().dispatcher.complete(status).await;
-
-            status
+            execution_context().dispatcher.complete_result(result).await
         })
         .await
 }
@@ -254,8 +246,8 @@ pub struct LoreRepositoryInfoArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Repository Events
@@ -284,21 +276,20 @@ async fn info_local(
 
             let time_start = Instant::now();
 
-            let mut status = 0;
-            if let Err(err) = repository::info::info(
-                (&args.repository_url).into(),
-                execution_context().globals().identity().unwrap_or_default(),
-            )
-            .await
-            {
-                execution_context().dispatcher.send_error(err);
-                status = 1;
-            }
+            // The global `--local` flag reads metadata from the working
+            // repository's own stores instead of issuing a remote query.
+            let result = if execution_context().globals().local() {
+                repository::info::info_local().await
+            } else {
+                repository::info::info(
+                    (&args.repository_url).into(),
+                    execution_context().globals().identity().unwrap_or_default(),
+                )
+                .await
+            };
 
             log_command_done(&info, time_start);
-            execution_context().dispatcher.complete(status).await;
-
-            status
+            execution_context().dispatcher.complete_result(result).await
         })
         .await
 }
@@ -327,8 +318,8 @@ pub struct LoreRepositoryDumpArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Repository Events
@@ -414,8 +405,8 @@ pub struct LoreRepositoryCreateArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Repository Events
@@ -444,16 +435,10 @@ async fn create_local(
 
             let time_start = Instant::now();
 
-            let mut status = 0;
-            if let Err(err) = create_impl(&args).await {
-                execution_context().dispatcher.send_error(err);
-                status = 1;
-            }
+            let result = create_impl(&args).await;
 
             log_command_done(&create, time_start);
-            execution_context().dispatcher.complete(status).await;
-
-            status
+            execution_context().dispatcher.complete_result(result).await
         })
         .await
 }
@@ -512,16 +497,10 @@ pub async fn create_with_metadata(
 
             let time_start = Instant::now();
 
-            let mut status = 0;
-            if let Err(err) = create_with_metadata_impl(&args, &metadata).await {
-                execution_context().dispatcher.send_error(err);
-                status = 1;
-            }
+            let result = create_with_metadata_impl(&args, &metadata).await;
 
             log_command_done(&create, time_start);
-            execution_context().dispatcher.complete(status).await;
-
-            status
+            execution_context().dispatcher.complete_result(result).await
         })
         .await
 }
@@ -592,21 +571,14 @@ pub async fn delete(
 
             let repository_url = args.repository_url.as_str();
 
-            let mut status = 0;
-            if let Err(err) = lore_revision::repository::delete::delete(
+            let result = lore_revision::repository::delete::delete(
                 repository_url,
                 execution_context().globals().identity().unwrap_or_default(),
             )
-            .await
-            {
-                execution_context().dispatcher.send_error(err);
-                status = 1;
-            }
+            .await;
 
             log_command_done(&delete, time_start);
-            execution_context().dispatcher.complete(status).await;
-
-            status
+            execution_context().dispatcher.complete_result(result).await
         })
         .await
 }
@@ -633,8 +605,8 @@ pub struct LoreRepositoryReleaseArgs {}
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 pub async fn release(
     globals: LoreGlobalArgs,
@@ -676,8 +648,8 @@ pub struct LoreRepositoryFlushArgs {}
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 pub async fn flush(
     globals: LoreGlobalArgs,
@@ -720,8 +692,8 @@ pub struct LoreRepositoryGcArgs {}
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 pub async fn gc(
     globals: LoreGlobalArgs,
@@ -731,14 +703,16 @@ pub async fn gc(
     dispatch_call(globals, args, callback, gc_local).await
 }
 
+/// Runs a single full GC pass. `repository gc` always runs a full pass, so it
+/// forces `globals.no_gc = 1` to suppress the automatic incremental tasks (which
+/// would otherwise race the full pass), then runs the pass explicitly.
 async fn gc_local(
     globals: LoreGlobalArgs,
     args: LoreRepositoryGcArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    // We run gc loop explicitly, disable automatic
     let mut globals = globals;
-    globals.gc = 0;
+    globals.no_gc = 1;
 
     repository_call_write(
         globals,
@@ -770,8 +744,8 @@ pub struct LoreRepositoryListArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Repository Events
@@ -802,21 +776,14 @@ async fn list_local(
 
             let time_start = Instant::now();
 
-            let mut status = 0;
-            if let Err(err) = repository::list::list(
+            let result = repository::list::list(
                 url.as_str(),
                 execution_context().globals().identity().unwrap_or_default(),
             )
-            .await
-            {
-                execution_context().dispatcher.send_error(err);
-                status = 1;
-            }
+            .await;
 
             log_command_done(&list, time_start);
-            execution_context().dispatcher.complete(status).await;
-
-            status
+            execution_context().dispatcher.complete_result(result).await
         })
         .await
 }
@@ -888,8 +855,8 @@ pub struct LoreRepositoryStatusArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Repository Events
@@ -998,8 +965,8 @@ pub struct LoreRepositoryVerifyStateArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Verify Events
@@ -1122,8 +1089,8 @@ pub struct LoreRepositoryStoreImmutableQueryArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## Repository Events
@@ -1471,4 +1438,29 @@ async fn config_get_local(
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    // Scans the handler modules for any `send_error` call on a terminal arm,
+    // so a regression that re-emits a mid-stream `Error` event fails the build.
+    const MIGRATED_SOURCES: &[(&str, &str)] = &[
+        ("repository.rs", include_str!("repository.rs")),
+        ("auth.rs", include_str!("auth.rs")),
+    ];
+
+    #[test]
+    fn migrated_terminal_arms_have_no_send_error_call() {
+        // Build the needle from parts so this scanning test does not match its
+        // own source when it scans `repository.rs`.
+        let needle = format!(".{}(", "send_error");
+        for (name, source) in MIGRATED_SOURCES {
+            assert!(
+                !source.contains(&needle),
+                "{name} still calls the dispatcher error sink on a terminal arm; \
+                 the migrated handler must route the error through `complete` \
+                 instead of emitting a mid-stream `Error` event"
+            );
+        }
+    }
 }

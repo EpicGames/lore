@@ -32,9 +32,11 @@ header = '''// LORE C API
 // A string the library produces is a NUL-terminated buffer. A string carried
 // inside an event is valid only while the callback runs; copy its bytes to keep
 // them after the callback returns. A string the caller passes in must be valid
-// UTF-8, which the library does not check. The library copies the bytes, so the
-// caller may free the string once the call returns. See lore_string_t for the
-// layout of the type.
+// UTF-8: the library checks every string an operation carries before it starts
+// the call, and fails the whole call with error code 1 (invalid arguments)
+// naming the offending field if any of them is not. The library copies the
+// bytes, so the caller may free the string once the call returns. See
+// lore_string_t for the layout of the type.
 //
 // Argument lifetime
 //
@@ -72,6 +74,7 @@ include = [
     "LoreRevisionTreeResolvePathArgs",
     "LoreRevisionTreeListChildrenArgs",
     "LoreRevisionTreeNodeInfoArgs",
+    "LoreRevisionTreeInfoArgs",
     "LoreRevisionTreeNodePathArgs",
     "LoreRevisionTreeAddArgs",
     "LoreRevisionTreeDeleteArgs",
@@ -89,6 +92,7 @@ include = [
 "Context" = "lore_context_t"
 "Fragment" = "lore_fragment_t"
 "Hash" = "lore_hash_t"
+"KeyType" = "lore_key_type_t"
 "Partition" = "lore_partition_t"
 "RepositoryId" = "lore_repository_id_t"
 "InstanceId" = "lore_instance_id_t"
@@ -99,6 +103,12 @@ include = [
 "LoreAuthUserInfoEventData" = "lore_auth_user_info_event_data_t"
 "LoreAuthUserTokenEventData" = "lore_auth_user_token_event_data_t"
 "LoreAuthIdentityEventData" = "lore_auth_identity_event_data_t"
+"LoreEvictionBeginEventData" = "lore_eviction_begin_event_data_t"
+"LoreEvictionProgressEventData" = "lore_eviction_progress_event_data_t"
+"LoreEvictionEndEventData" = "lore_eviction_end_event_data_t"
+"LoreCompactionBeginEventData" = "lore_compaction_begin_event_data_t"
+"LoreCompactionProgressEventData" = "lore_compaction_progress_event_data_t"
+"LoreCompactionEndEventData" = "lore_compaction_end_event_data_t"
 "LoreAuthListArgs" = "lore_auth_list_args_t"
 "LoreAuthLogoutArgs" = "lore_auth_logout_args_t"
 "LoreAuthClearArgs" = "lore_auth_clear_args_t"
@@ -209,6 +219,7 @@ include = [
 "LoreCompleteEventData" = "lore_complete_event_data_t"
 "LoreEndEventData" = "lore_end_event_data_t"
 "LoreErrorCode" = "lore_error_code_t"
+"LoreErrorDetail" = "lore_error_detail_t"
 "LoreErrorEventData" = "lore_error_event_data_t"
 "LoreEvent" = "lore_event_t"
 "LoreEventCallbackConfig" = "lore_event_callback_config_t"
@@ -290,11 +301,11 @@ include = [
 "LoreLayerRemoveEventData" = "lore_layer_remove_event_data_t"
 "LoreLayerStagedEntryEventData" = "lore_layer_staged_entry_event_data_t"
 "LoreLockFileAcquireArgs" = "lore_lock_file_acquire_args_t"
+"LoreLockFileAcquireBeginEventData" = "lore_lock_file_acquire_begin_event_data_t"
 "LoreLockFileAcquireEventData" = "lore_lock_file_acquire_event_data_t"
-"LoreLockFileAcquireIgnoreEventData" = "lore_lock_file_acquire_ignore_event_data_t"
 "LoreLockFileReleaseArgs" = "lore_lock_file_release_args_t"
+"LoreLockFileReleaseBeginEventData" = "lore_lock_file_release_begin_event_data_t"
 "LoreLockFileReleaseEventData" = "lore_lock_file_release_event_data_t"
-"LoreLockFileReleaseNotFoundEventData" = "lore_lock_file_release_not_found_event_data_t"
 "LoreLockFileStatusArgs" = "lore_lock_file_status_args_t"
 "LoreLockFileStatusBeginEventData" = "lore_lock_file_status_begin_event_data_t"
 "LoreLockFileStatusEventData" = "lore_lock_file_status_event_data_t"
@@ -434,6 +445,18 @@ include = [
 "LoreStorageUploadArgs" = "lore_storage_upload_args_t"
 "LoreStorageUploadItem" = "lore_storage_upload_item_t"
 "LoreArray_lore_storage_upload_item" = "lore_storage_upload_item_array_t"
+"LoreStorageMutableLoadArgs" = "lore_storage_mutable_load_args_t"
+"LoreStorageMutableLoadItem" = "lore_storage_mutable_load_item_t"
+"LoreArray_lore_storage_mutable_load_item" = "lore_storage_mutable_load_item_array_t"
+"LoreStorageMutableStoreArgs" = "lore_storage_mutable_store_args_t"
+"LoreStorageMutableStoreItem" = "lore_storage_mutable_store_item_t"
+"LoreArray_lore_storage_mutable_store_item" = "lore_storage_mutable_store_item_array_t"
+"LoreStorageMutableCompareAndSwapArgs" = "lore_storage_mutable_compare_and_swap_args_t"
+"LoreStorageMutableCompareAndSwapItem" = "lore_storage_mutable_compare_and_swap_item_t"
+"LoreArray_lore_storage_mutable_compare_and_swap_item" = "lore_storage_mutable_compare_and_swap_item_array_t"
+"LoreStorageMutableListArgs" = "lore_storage_mutable_list_args_t"
+"LoreStorageMutableListItem" = "lore_storage_mutable_list_item_t"
+"LoreArray_lore_storage_mutable_list_item" = "lore_storage_mutable_list_item_array_t"
 "LoreStorageOpenedEventData" = "lore_storage_opened_event_data_t"
 "LoreStoragePutItemCompleteEventData" = "lore_storage_put_item_complete_event_data_t"
 "LoreStorageGetHeaderEventData" = "lore_storage_get_header_event_data_t"
@@ -443,13 +466,20 @@ include = [
 "LoreStorageObliterateItemCompleteEventData" = "lore_storage_obliterate_item_complete_event_data_t"
 "LoreStorageGetMetadataItemCompleteEventData" = "lore_storage_get_metadata_item_complete_event_data_t"
 "LoreStorageUploadItemCompleteEventData" = "lore_storage_upload_item_complete_event_data_t"
+"LoreStorageMutableLoadItemCompleteEventData" = "lore_storage_mutable_load_item_complete_event_data_t"
+"LoreStorageMutableStoreItemCompleteEventData" = "lore_storage_mutable_store_item_complete_event_data_t"
+"LoreStorageMutableCompareAndSwapItemCompleteEventData" = "lore_storage_mutable_compare_and_swap_item_complete_event_data_t"
+"LoreStorageMutableListEntryEventData" = "lore_storage_mutable_list_entry_event_data_t"
+"LoreStorageMutableListItemCompleteEventData" = "lore_storage_mutable_list_item_complete_event_data_t"
+"LoreTraceLocation" = "lore_trace_location_t"
 "NodeID" = "lore_node_id_t"
 "LoreRevisionTreeLoadedEventData" = "lore_revision_tree_loaded_event_data_t"
 "LoreRevisionTreeResolvePathCompleteEventData" = "lore_revision_tree_resolve_path_complete_event_data_t"
 "LoreRevisionTreeChildEventData" = "lore_revision_tree_child_event_data_t"
 "LoreRevisionTreeNodeInfoEventData" = "lore_revision_tree_node_info_event_data_t"
-"LoreRevisionTreeRootInfoData" = "lore_revision_tree_root_info_data_t"
+"LoreRevisionTreeInfoEventData" = "lore_revision_tree_info_event_data_t"
 "LoreRevisionTreeNodePathEventData" = "lore_revision_tree_node_path_event_data_t"
+"LoreRevisionTreeBatchCompleteEventData" = "lore_revision_tree_batch_complete_event_data_t"
 "LoreRevisionTreeAddCompleteEventData" = "lore_revision_tree_add_complete_event_data_t"
 "LoreRevisionTreeDeleteCompleteEventData" = "lore_revision_tree_delete_complete_event_data_t"
 "LoreRevisionTreeModifyCompleteEventData" = "lore_revision_tree_modify_complete_event_data_t"
@@ -458,14 +488,18 @@ include = [
 "LoreRevisionTreeMetadataGetCompleteEventData" = "lore_revision_tree_metadata_get_complete_event_data_t"
 "LoreRevisionTreeCommitCompleteEventData" = "lore_revision_tree_commit_complete_event_data_t"
 "LoreRevisionTreeCloseCompleteEventData" = "lore_revision_tree_close_complete_event_data_t"
+"LoreRevisionTreeListChildrenBeginEventData" = "lore_revision_tree_list_children_begin_event_data_t"
 "LoreRevisionTree" = "lore_revision_tree_t"
 "LoreRevisionTreeLoadArgs" = "lore_revision_tree_load_args_t"
 "LoreRevisionTreeCloseArgs" = "lore_revision_tree_close_args_t"
 "LoreRevisionTreeResolvePathArgs" = "lore_revision_tree_resolve_path_args_t"
 "LoreRevisionTreeListChildrenArgs" = "lore_revision_tree_list_children_args_t"
 "LoreRevisionTreeNodeInfoArgs" = "lore_revision_tree_node_info_args_t"
+"LoreRevisionTreeInfoArgs" = "lore_revision_tree_info_args_t"
 "LoreRevisionTreeNodePathArgs" = "lore_revision_tree_node_path_args_t"
 "LoreRevisionTreeAddArgs" = "lore_revision_tree_add_args_t"
+"LoreRevisionTreeAddEntry" = "lore_revision_tree_add_entry_t"
+"LoreArray_lore_revision_tree_add_entry" = "lore_revision_tree_add_entry_array_t"
 "LoreRevisionTreeDeleteArgs" = "lore_revision_tree_delete_args_t"
 "LoreRevisionTreeModifyArgs" = "lore_revision_tree_modify_args_t"
 "LoreRevisionTreeMoveArgs" = "lore_revision_tree_move_args_t"
@@ -481,6 +515,7 @@ include = [
 "LoreArray_lore_branch_point" = "lore_branch_point_array_t"
 "LoreArray_lore_metadata_type" = "lore_metadata_type_array_t"
 "LoreArray_lore_string" = "lore_string_array_t"
+"LoreArray_lore_trace_location" = "lore_trace_location_array_t"
 "LoreNodeType" = "lore_node_type_t"
 "LoreNotificationBranchCreatedEventData" = "lore_notification_branch_created_event_data_t"
 "LoreNotificationBranchDeletedEventData" = "lore_notification_branch_deleted_event_data_t"

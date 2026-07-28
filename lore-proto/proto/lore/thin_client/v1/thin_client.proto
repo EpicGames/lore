@@ -87,8 +87,11 @@ message RevisionDiffHeader {
 }
 
 // Server-streamed response for RevisionDiff. First message carries
-// `payload.header`; subsequent messages stream `DiffChange` always and
-// `DiffConflict` only in 3-way mode.
+// `payload.header`; subsequent messages stream `DiffChange` always,
+// `DiffConflict` only in 3-way mode, and `DiffPartition` lazily as the
+// server discovers linked repositories during the walk. Each
+// `DiffPartition` is emitted strictly before the first `DiffChange` or
+// `DiffConflict` half that references its index.
 message RevisionDiffResponse {
   oneof payload {
     // Header echoing the resolved revisions.
@@ -97,6 +100,8 @@ message RevisionDiffResponse {
     DiffChange change = 2;
     // A 3-way merge conflict pair (3-way mode only).
     DiffConflict conflict = 3;
+    // A linked-repository announcement.
+    DiffPartition partition = 4;
   }
 }
 

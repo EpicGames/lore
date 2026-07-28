@@ -158,7 +158,7 @@ def test_sync_survives_mid_flight_disconnect(
         "quic": shared_port,
         "grpc": shared_port,
         "http": allocate_free_port(),
-        "replication": allocate_free_port(),
+        "internal": allocate_free_port(),
     }
     server_root, server_env = generate_server_config(
         request, tmp_path_factory, server_ports
@@ -204,9 +204,7 @@ def test_sync_survives_mid_flight_disconnect(
         # Spawn a fresh clone in a subprocess. This drives the multi-file
         # sync we want to interrupt, exercising the same realize_state ->
         # read_into_file -> remote_get_retry path as branch switch.
-        target_path = (
-            Path(tmp_path_factory.getbasetemp()) / f"target-{source.name}"
-        )
+        target_path = Path(tmp_path_factory.getbasetemp()) / f"target-{source.name}"
         target_path.mkdir(exist_ok=True)
 
         client_env = os.environ.copy()
@@ -274,7 +272,7 @@ def test_sync_survives_mid_flight_disconnect(
             for port_key in (
                 "LORE__SERVER__HTTP__PORT",
                 "LORE__SERVER__GRPC__PORT",
-                "LORE__SERVER__REPLICATION__PORT",
+                "LORE__SERVER__GRPC_INTERNAL__PORT",
             ):
                 _wait_for_port_free("127.0.0.1", int(server_env[port_key]))
 

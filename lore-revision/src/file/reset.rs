@@ -18,11 +18,14 @@ use crate::branch;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
+use crate::file::unstage;
+use crate::file::unstage::UnstageOptions;
 use crate::filter::FilterMode;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
+use crate::link;
 use crate::lore::BranchId;
 use crate::lore::Hash;
 use crate::lore_debug;
@@ -40,6 +43,7 @@ use crate::progress::DEFAULT_WORK_CHANNEL_CAPACITY;
 use crate::repository::DOT_LORE;
 use crate::repository::DOT_URC;
 use crate::repository::RepositoryContext;
+use crate::repository::RepositoryWriteToken;
 use crate::revision;
 use crate::revision::sync;
 use crate::revision::sync::SyncRealizeStats;
@@ -251,8 +255,8 @@ struct ResetFileWorkItem {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## File Events
@@ -268,10 +272,14 @@ struct ResetFileWorkItem {
 /// | [`LoreEvent::FilterExclude`](crate::interface::LoreEvent::FilterExclude) | Emitted for each path excluded by filters |
 pub async fn reset(
     repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
     revision: LoreString,
     options: ResetOptions,
 ) -> Result<(), ResetError> {
+    let reset_link_count =
+        reset_staged_links_under_paths(repository.clone(), token, &paths).await?;
+
     let (state_current, state_staged, _branch) =
         State::deserialize_current_and_staged(repository.clone())
             .await
@@ -305,6 +313,12 @@ pub async fn reset(
     .send();
 
     let stats = Arc::new(ResetStats::default());
+    // Staged link nodes are reset by the prelude above, before the walk runs;
+    // count them here so the summary reflects the work done. Links are
+    // directory-shaped nodes, so they count as directories like the walk does.
+    stats
+        .directory_reset_count
+        .fetch_add(reset_link_count as u64, Ordering::Relaxed);
     let outer_stats = stats.clone();
     let producer_repository = repository.clone();
     let producer_stats = stats.clone();
@@ -418,8 +432,8 @@ pub async fn reset(
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
-/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted when an error occurs |
-/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end (`status: 0` success, `status: 1` failure) |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
 /// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
 ///
 /// ## File Events
@@ -590,6 +604,79 @@ pub async fn reset_to_last_merged(
     .send();
 
     result
+}
+
+/// Resets staged-link nodes under the user-supplied paths by delegating them
+/// to `unstage`, which holds the add/remove/pin-change rollbacks. No-op when no
+/// staged links overlap the given paths. Returns the number of staged link
+/// nodes that were reset so the caller can count them in the reset summary.
+async fn reset_staged_links_under_paths(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    paths: &LoreArray<LoreString>,
+) -> Result<usize, ResetError> {
+    let (state_current, state_staged, _branch) =
+        State::deserialize_current_and_staged(repository.clone())
+            .await
+            .forward::<ResetError>("Failed to deserialize revision state")?;
+    let state_staged = state_staged.unwrap_or_else(|| state_current.clone());
+
+    let staged_link_paths =
+        link::list_staged_node_paths(&state_current, &state_staged, repository.clone())
+            .await
+            .map_err(|err| {
+                ResetError::internal(format!("Failed to list staged link nodes: {err}"))
+            })?;
+    if staged_link_paths.is_empty() {
+        return Ok(0);
+    }
+
+    let mut relative_user_paths: Vec<RelativePath> = Vec::new();
+    let mut reset_all = false;
+    for path in paths.as_slice().iter() {
+        let Ok(relative_path) =
+            RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
+        else {
+            continue;
+        };
+        if relative_path.is_empty() {
+            reset_all = true;
+            break;
+        }
+        relative_user_paths.push(relative_path);
+    }
+
+    let mut matched: Vec<LoreString> = Vec::new();
+    for absolute in staged_link_paths.iter() {
+        let Ok(relative_link) =
+            RelativePath::new_from_user_path(repository.require_path()?, absolute)
+        else {
+            continue;
+        };
+        if reset_all
+            || relative_user_paths
+                .iter()
+                .any(|p| p.covers(&relative_link.as_str()))
+        {
+            matched.push(LoreString::from(absolute));
+        }
+    }
+
+    if matched.is_empty() {
+        return Ok(0);
+    }
+
+    let reset_count = matched.len();
+    unstage::unstage(
+        repository,
+        token,
+        LoreArray::from_vec(matched),
+        UnstageOptions::default(),
+    )
+    .await
+    .forward::<ResetError>("Failed to reset staged link nodes")?;
+
+    Ok(reset_count)
 }
 
 async fn wrap_path_error(

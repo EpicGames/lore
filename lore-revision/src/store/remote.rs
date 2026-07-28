@@ -284,6 +284,7 @@ impl store::ImmutableStore for RemoteImmutableStore {
         self: Arc<Self>,
         _max_capacity: usize,
         _sync_data: bool,
+        _sink: Option<lore_storage::gc_event::GcEventSinkRef>,
     ) -> Result<usize, StoreError> {
         // Noop for remote store
         Ok(0)
@@ -294,6 +295,7 @@ impl store::ImmutableStore for RemoteImmutableStore {
         _max_size: usize,
         _at: Option<usize>,
         _sync_data: bool,
+        _sink: Option<lore_storage::gc_event::GcEventSinkRef>,
     ) -> Result<Option<usize>, StoreError> {
         // Noop for remote store
         Ok(None)

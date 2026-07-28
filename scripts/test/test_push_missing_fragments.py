@@ -36,11 +36,9 @@ def missing_fragments_remote_url(
         "quic": shared_port,
         "grpc": shared_port,
         "http": allocate_free_port(),
-        "replication": allocate_free_port(),
+        "internal": allocate_free_port(),
     }
-    server_root, server_env = generate_server_config(
-        request, tmp_path_factory, ports
-    )
+    server_root, server_env = generate_server_config(request, tmp_path_factory, ports)
     server_env["LORE_MISS_FRAGMENT_WRITES"] = DROPPED_FRAGMENT_HASHES
     proc, log_path, log_fd = launch_lore_server(
         server_root, server_env, lore_server_executable_path

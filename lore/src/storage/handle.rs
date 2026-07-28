@@ -30,6 +30,8 @@ impl LoreStore {
     pub const INVALID: Self = Self { handle_id: 0 };
 }
 
+lore_base::carries_no_text!(LoreStore);
+
 static REGISTRY: LazyLock<DashMap<u64, Arc<StoreInternal>>> = LazyLock::new(DashMap::new);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -64,6 +66,14 @@ pub(crate) fn lookup(handle: LoreStore) -> Option<Arc<StoreInternal>> {
 #[doc(hidden)]
 pub fn immutable_for_test(handle: LoreStore) -> Option<Arc<dyn lore_storage::ImmutableStore>> {
     lookup(handle).map(|store| store.immutable.clone())
+}
+
+/// Test-only helper: return the underlying `Arc<dyn MutableStore>` for a registered handle.
+/// Integration tests use this to assert mutable-store state directly. `#[doc(hidden)]` keeps it
+/// out of the public surface.
+#[doc(hidden)]
+pub fn mutable_for_test(handle: LoreStore) -> Option<Arc<dyn lore_storage::MutableStore>> {
+    lookup(handle).map(|store| store.mutable.clone())
 }
 
 /// Drain every entry in the registry, returning each `(handle_id, Arc<StoreInternal>)` pair

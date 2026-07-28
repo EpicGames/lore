@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::ID;
+use super::RepositoryAccess;
 use super::RepositoryContext;
 use super::RepositoryError;
 use super::RepositoryFormat;
@@ -119,6 +120,50 @@ pub async fn info(repository_url: Option<&str>, identity: &str) -> Result<(), Re
     event::LoreEvent::RepositoryData(LoreRepositoryDataEventData {
         remote_url: remote_url.into(),
         id: data.id,
+        name: metadata.name.into(),
+        description: metadata.description.into(),
+        default_branch: metadata.default_branch,
+        default_branch_name: metadata.default_branch_name.into(),
+        creator: metadata.creator.into(),
+        created: metadata.created,
+    })
+    .send();
+
+    Ok(())
+}
+
+/// Load repository metadata from the working repository's local store, without
+/// querying the remote for it.
+///
+/// Opens the working repository, resolves the metadata hash from the local
+/// mutable store and deserializes the repository metadata fragment from the local
+/// immutable store, then emits the same [`LoreEvent::RepositoryData`] event as the
+/// remote [`info`] path. Because the repository metadata fragment is among the
+/// first fragments written, this is a good probe that local fragments survive
+/// aggressive eviction/compaction.
+pub async fn info_local() -> Result<(), RepositoryError> {
+    let repo_path = execution_context().globals().repository_path().to_string();
+    let repository = repository::load_and_connect(&repo_path, RepositoryAccess::ReadOnly)
+        .await
+        .forward::<RepositoryError>("Failed to open repository")?;
+
+    let metadata_hash = repository::metadata_hash(repository.clone())
+        .await
+        .forward::<RepositoryError>("Failed to load repository metadata")?;
+
+    let metadata = repository::metadata(repository.clone(), metadata_hash)
+        .await
+        .forward::<RepositoryError>("Failed to load repository metadata")?;
+
+    let remote_url = repository
+        .require_path()
+        .ok()
+        .and_then(|path| repository::repository_remote(path.to_string_lossy()).ok())
+        .unwrap_or_default();
+
+    event::LoreEvent::RepositoryData(LoreRepositoryDataEventData {
+        remote_url: remote_url.into(),
+        id: repository.id,
         name: metadata.name.into(),
         description: metadata.description.into(),
         default_branch: metadata.default_branch,

@@ -4,6 +4,7 @@ import logging
 import os
 
 import pytest
+from lore_parsers import parse_complete_json
 from lore_parsers import parse_jsonl
 
 from lore import Lore
@@ -281,9 +282,12 @@ def test_dependency_cycle_detection(new_lore_repo):
     output = repo.file_dependency_add(
         "src/b.rs", "src/a.rs", check=False, json=True, offline=True
     )
-    # Error event should contain cycle-related message
-    errors = parse_jsonl(output, "error")
-    assert len(errors) > 0, f"Expected error event for cycle, got: {output}"
+    # The cycle is rejected: the operation completes with a non-zero status,
+    # carrying the failure detail on the complete event.
+    complete = parse_complete_json(output)
+    assert complete is not None and complete.get("status") != 0, (
+        f"Expected non-zero complete for cycle, got: {output}"
+    )
 
     # Add B -> A with --force (should succeed, bypassing cycle detection)
     output = repo.file_dependency_add(

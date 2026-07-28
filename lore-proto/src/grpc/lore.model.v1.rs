@@ -77,9 +77,10 @@ pub struct RevisionIdentifier {
     pub branch_id: ::prost::bytes::Bytes,
     /// Per-branch revision number. In any v1 *request*, value 0 resolves to
     /// the current tip of the branch; the server resolves 0 to a concrete
-    /// number at request time. Storage and response state always carry
-    /// concrete numbers; 0 never appears there. Exception: BranchCreate
-    /// requires fully-resolved concrete signatures via BranchPoint stack.
+    /// number at request time. Valid Storage and response state always carry
+    /// concrete numbers; 0 never appears there.
+    /// Exception: BranchCreate requires fully-resolved concrete signatures via BranchPoint stack.
+    /// Exception: In responses, zeroed revision signatures resolve to a zeroed revision number
     #[prost(uint64, tag = "2")]
     pub number: u64,
 }

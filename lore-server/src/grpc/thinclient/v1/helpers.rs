@@ -161,6 +161,13 @@ pub(super) async fn identifier_for_signature(
     repository: &Arc<RepositoryContext>,
     signature: Hash,
 ) -> Result<model_v1::RevisionIdentifier, Status> {
+    if signature.is_zero() {
+        return Ok(model_v1::RevisionIdentifier {
+            branch_id: BranchId::default().into(),
+            number: 0,
+        });
+    }
+
     let state = State::deserialize(repository.clone(), signature)
         .await
         .filter_slow_down()?
@@ -233,7 +240,13 @@ fn file_action_to_v1_action(action: FileAction) -> thin_client_v1::Action {
 /// `from.flags` is the surviving record of what the path used to be.
 /// `content_from` / `content_to` carry the from / to side's CAS hash,
 /// or empty bytes for ADD (no from) and DELETE (no to).
-pub(super) fn node_change_to_diff_change(change: &NodeChange) -> thin_client_v1::DiffChange {
+///
+/// `link_repository_index` is passed through verbatim; the handler
+/// resolves it, since the per-stream partition table lives there.
+pub(super) fn node_change_to_diff_change(
+    change: &NodeChange,
+    link_repository_index: u32,
+) -> thin_client_v1::DiffChange {
     let action = file_action_to_v1_action(change.action);
     let node_type = match action {
         thin_client_v1::Action::Delete => node_flags_to_node_type(change.from.flags),
@@ -262,18 +275,156 @@ pub(super) fn node_change_to_diff_change(change: &NodeChange) -> thin_client_v1:
         content_from,
         content_to,
         automerged: change.flags.is_conflict_automerged(),
+        link_repository_index,
     }
 }
 
 /// Convert a 3-way merge conflict pair `(base→from, base→to)` into a
 /// v1 `DiffConflict`. The pair's `from.address` on both halves is the
 /// common-ancestor content for that path, so `change_from.content_from
-/// == change_to.content_from` per the proto contract.
+/// == change_to.content_from` per the proto contract. The two halves
+/// take separate indices: they can land in different partitions.
 pub(super) fn diff_conflict_from_pair(
     pair: &(NodeChange, NodeChange),
+    link_repository_index_from: u32,
+    link_repository_index_to: u32,
 ) -> thin_client_v1::DiffConflict {
     thin_client_v1::DiffConflict {
-        change_from: Some(node_change_to_diff_change(&pair.0)),
-        change_to: Some(node_change_to_diff_change(&pair.1)),
+        change_from: Some(node_change_to_diff_change(
+            &pair.0,
+            link_repository_index_from,
+        )),
+        change_to: Some(node_change_to_diff_change(
+            &pair.1,
+            link_repository_index_to,
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::str::FromStr;
+
+    use lore_proto::lore::thin_client::v1 as thin_client_v1;
+    use lore_revision::change::Flags;
+    use lore_revision::change::NodeChange;
+    use lore_revision::change::NodeChangeState;
+    use lore_revision::lore::RepositoryId;
+    use lore_revision::node::NodeFlags;
+    use lore_revision::repository::RepositoryContext;
+    use lore_revision::repository::RepositoryFormat;
+    use lore_revision::state;
+    use lore_revision::util::path::RelativePath;
+    use lore_storage::Address;
+    use lore_storage::Context;
+    use lore_storage::Hash;
+    use lore_transport::ProtocolError;
+
+    use super::*;
+
+    async fn test_context() -> Arc<RepositoryContext> {
+        let immutable = lore_storage::local::immutable_store::LocalImmutableStore::new(
+            None,
+            lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("immutable store");
+        let mutable = Arc::new(
+            lore_storage::local::mutable_store::LocalMutableStore::new(
+                None::<&std::path::Path>,
+                lore_storage::MutableStoreSettings::default(),
+                immutable.clone(),
+            )
+            .await
+            .expect("mutable store"),
+        );
+        Arc::new(RepositoryContext::new(
+            Some(PathBuf::default()),
+            immutable,
+            mutable,
+            RepositoryId::from(uuid::Uuid::now_v7()),
+            lore_revision::instance::InstanceId::generate(),
+            Err(ProtocolError::from(lore_base::error::NoRemote)),
+            Arc::default(),
+            RepositoryFormat::Lore,
+        ))
+    }
+
+    fn make_change(action: lore_revision::change::FileAction) -> NodeChange {
+        let ctx = futures::executor::block_on(test_context());
+        let state = Arc::new(state::State::new());
+        let address = Address {
+            hash: Hash::hash_buffer(&[1, 2, 3]),
+            context: Context::default(),
+        };
+        NodeChange {
+            action,
+            path: RelativePath::from_str("dir/file.txt").unwrap(),
+            from_path: None,
+            flags: Flags::None,
+            from: NodeChangeState {
+                node: 1,
+                repository: ctx.clone(),
+                state: state.clone(),
+                address,
+                flags: NodeFlags::File,
+            },
+            to: NodeChangeState {
+                node: 2,
+                repository: ctx,
+                state,
+                address,
+                flags: NodeFlags::File,
+            },
+        }
+    }
+
+    /// `node_change_to_diff_change` is a pure projection — it copies the
+    /// caller-supplied `link_repository_index` into the wire message
+    /// unchanged. Partition-id → index resolution lives in the handler
+    /// (`PartitionTable`); this helper does not look at `repository.id`.
+    #[tokio::test]
+    async fn node_change_propagates_index_as_given() {
+        let change = make_change(lore_revision::change::FileAction::Add);
+
+        let mapped = node_change_to_diff_change(&change, 0);
+        assert_eq!(mapped.link_repository_index, 0);
+        assert_eq!(mapped.path, "dir/file.txt");
+        assert_eq!(mapped.action, thin_client_v1::Action::Add as i32);
+
+        let mapped = node_change_to_diff_change(&change, 7);
+        assert_eq!(mapped.link_repository_index, 7);
+    }
+
+    /// `node_type` reflects the surviving side: `to.flags` for non-delete
+    /// actions, `from.flags` for deletes. The index passed in is opaque
+    /// to the helper, but the surviving-side rule still drives `node_type`.
+    #[tokio::test]
+    async fn node_change_delete_node_type_comes_from_from_side() {
+        let mut change = make_change(lore_revision::change::FileAction::Delete);
+        change.from.flags = NodeFlags::Link;
+        change.to.flags = NodeFlags::NoFlags;
+
+        let mapped = node_change_to_diff_change(&change, 0);
+        assert_eq!(mapped.node_type, thin_client_v1::NodeType::Link as i32);
+    }
+
+    #[tokio::test]
+    async fn diff_conflict_pair_carries_per_half_indices() {
+        let from = make_change(lore_revision::change::FileAction::Keep);
+        let to = make_change(lore_revision::change::FileAction::Keep);
+
+        let mapped = diff_conflict_from_pair(&(from, to), 0, 3);
+        assert_eq!(
+            mapped.change_from.as_ref().unwrap().link_repository_index,
+            0,
+            "from-half carries its own index",
+        );
+        assert_eq!(
+            mapped.change_to.as_ref().unwrap().link_repository_index,
+            3,
+            "to-half carries its own index, distinct from from-half",
+        );
     }
 }

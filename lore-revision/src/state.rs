@@ -296,6 +296,20 @@ impl StateNodeChildrenIterator {
             });
         }
         let parent = state.node(repository.clone(), parent_node_id).await?;
+        Self::from_parent(state, repository, parent_node_id, &parent).await
+    }
+
+    /// Create an iterator from a parent node the caller has already read.
+    ///
+    /// Saves the parent lookup [`Self::new`] performs, for a caller that has just
+    /// inspected the parent — checking that it can take children, say — and is
+    /// about to walk what is under it.
+    pub async fn from_parent(
+        state: Arc<State>,
+        repository: Arc<RepositoryContext>,
+        parent_node_id: NodeID,
+        parent: &Node,
+    ) -> Result<Self, StateError> {
         let first_child = parent.child();
 
         let (block, iblock) = if let Some(child_id) = first_child {
@@ -1722,6 +1736,24 @@ impl State {
         data.flags |= StateFlags::Dirty;
     }
 
+    /// Allocate a fresh node, initialize it, and prepend it to `parent`'s child
+    /// chain, returning the new node's ID.
+    ///
+    /// # Concurrency
+    ///
+    /// Safe to call concurrently to add **distinct siblings** under a parent: the
+    /// node is fully initialized before it is published and the publish is an
+    /// atomic CAS prepend, so concurrent sibling adds neither lose an update nor
+    /// expose a half-initialized node to a chain walk.
+    ///
+    /// **Not** safe for two tasks to add the **same** `(parent, name)`: this is
+    /// always-create, not get-or-add, so they produce duplicate siblings. The
+    /// find-then-add is a check-then-act at the call site that this cannot close;
+    /// callers fanning out across paths must ensure at most one add per
+    /// `(parent, name)` (e.g. pre-create shared ancestors sequentially).
+    ///
+    /// Slot allocation is serialized per tree by a single permit, so concurrent
+    /// adds overlap only in the initialize and publish that follow it.
     pub async fn node_add(
         &self,
         repository: Arc<RepositoryContext>,
@@ -1729,7 +1761,21 @@ impl State {
         node: Node,
         name: &str,
     ) -> Result<NodeID, StateError> {
-        let permit = self.unused.acquire().await;
+        // The parent is checked before a slot is allocated: a discarded parent is
+        // itself on the free list, so the allocator would hand its slot straight
+        // back out as the new node's, zeroing the flag that identifies it.
+        self.tree(repository.clone()).await?;
+        let parent_block_index = NodeBlock::index(parent);
+        let parent_block = self.block(repository.clone(), parent_block_index).await?;
+        if parent_block.read().node(Node::index(parent)).is_discarded() {
+            return Err(StateError::internal(
+                "cannot add a child to a discarded node",
+            ));
+        }
+
+        let permit = self.unused.acquire().await.map_err(|error| {
+            StateError::internal(format!("node allocation semaphore is closed: {error}"))
+        })?;
 
         let mut node_id = INVALID_NODE;
         let tree = self.tree(repository.clone()).await?;
@@ -1822,18 +1868,47 @@ impl State {
 
         let block_index = NodeBlock::index(node_id);
         lore_trace!("Block {} node {} added", block_index, Node::index(node_id));
-        let parent_block_index = NodeBlock::index(parent);
-        let parent_block = self.block(repository.clone(), parent_block_index).await?;
-        let (dirtied, sibling) = {
-            let mut parent_lock = parent_block.write();
-            let parent_node = parent_lock.node(Node::index(parent));
-            let sibling = parent_node.child;
-            parent_node.child = node_id;
-            (parent_lock.mark_dirty(), sibling)
+
+        let block = match self
+            .initialize_node(repository.clone(), node_id, parent, node, name)
+            .await
+        {
+            Ok(block) => block,
+            Err(error) => {
+                self.release_node(repository.clone(), node_id).await;
+                return Err(error);
+            }
         };
-        if dirtied {
-            self.block_modified(parent_block, parent_block_index);
-        }
+
+        // Prepend into the child chain via CAS: stash the current head as our
+        // `sibling`, then swap ourselves in as the head. Keeps capture+publish
+        // atomic (no lost updates) without nesting the parent/child block locks,
+        // which may be the same block or invert order across concurrent adds.
+        // ABA-free: prepends only ever use freshly grabbed IDs.
+        let sibling = loop {
+            let old_head = parent_block.node(Node::index(parent)).child;
+            {
+                let mut block_lock = block.write();
+                block_lock.node(Node::index(node_id)).sibling = old_head;
+                block_lock.mark_dirty();
+            }
+            let publish_result = {
+                let mut parent_lock = parent_block.write();
+                let parent_node = parent_lock.node(Node::index(parent));
+                if parent_node.child == old_head {
+                    parent_node.child = node_id;
+                    Some(parent_lock.mark_dirty())
+                } else {
+                    None
+                }
+            };
+            if let Some(parent_dirtied) = publish_result {
+                if parent_dirtied {
+                    self.block_modified(parent_block.clone(), parent_block_index);
+                }
+                break old_head;
+            }
+        };
 
         lore_trace!(
             "Block {} node {} parent {} sibling {}",
@@ -1842,26 +1917,6 @@ impl State {
             parent,
             sibling
         );
-
-        let block = self
-            .block_with_nametable(repository.clone(), block_index)
-            .await?;
-        let dirtied = {
-            let mut block_lock = block.write();
-            let (name_offset, name_length) = block_lock
-                .node_name_store(name, 0, 0)
-                .forward::<StateError>("Storing new node name")?;
-            let target_node = block_lock.node(Node::index(node_id));
-            *target_node = node;
-            target_node.parent = parent;
-            target_node.sibling = sibling;
-            target_node.name_offset = name_offset;
-            target_node.name_length = name_length;
-            block_lock.mark_dirty()
-        };
-        if dirtied {
-            self.block_modified(block, block_index);
-        }
 
         let metadata_node_id = node::node_to_file_metadata(node_id);
         let metadata_block_index = NodeFileMetadataBlock::index(metadata_node_id);
@@ -1889,6 +1944,68 @@ impl State {
         }
 
         Ok(node_id)
+    }
+
+    /// Fill in every field of a freshly grabbed slot except `sibling`, returning
+    /// the block that holds it.
+    ///
+    /// The slot is initialized fully before it is reachable: `grab_node_unused`
+    /// left it zeroed, so a concurrent chain walk that observed it
+    /// published-but-uninitialized would read `parent`/`sibling` as 0 and error
+    /// or truncate. `sibling` is set atomically at publish.
+    async fn initialize_node(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node_id: NodeID,
+        parent: NodeID,
+        node: Node,
+        name: &str,
+    ) -> Result<Arc<NodeBlock>, StateError> {
+        let block_index = NodeBlock::index(node_id);
+        let block = self
+            .block_with_nametable(repository.clone(), block_index)
+            .await?;
+        let dirtied = {
+            let mut block_lock = block.write();
+            let (name_offset, name_length) = block_lock
+                .node_name_store(name, 0, 0)
+                .forward::<StateError>("Storing new node name")?;
+            let target_node = block_lock.node(Node::index(node_id));
+            *target_node = node;
+            target_node.parent = parent;
+            target_node.name_offset = name_offset;
+            target_node.name_length = name_length;
+            block_lock.mark_dirty()
+        };
+        if dirtied {
+            self.block_modified(block.clone(), block_index);
+        }
+
+        Ok(block)
+    }
+
+    /// Return a grabbed but unpublished node slot to its block's free list.
+    ///
+    /// Initialization runs after the allocator hands the slot out, so a failure
+    /// there would otherwise consume it for the lifetime of the tree: it is
+    /// reachable from no chain, and nothing hands it out a second time. The
+    /// allocation permit is held for the push so it cannot interleave with a
+    /// grab walking the same block.
+    async fn release_node(&self, repository: Arc<RepositoryContext>, node_id: NodeID) {
+        let block_index = NodeBlock::index(node_id);
+        let Ok(block) = self.block(repository, block_index).await else {
+            lore_warn!("Node {node_id} slot lost: its block could not be read back");
+            return;
+        };
+        let _permit = self.unused.acquire().await;
+        let dirtied = {
+            let mut block_writer = block.write();
+            block_writer.discard_node(block_index, Node::index(node_id));
+            block_writer.mark_dirty()
+        };
+        if dirtied {
+            self.block_modified(block, block_index);
+        }
     }
 
     /// Return the most recently allocated block when it still has at least one
@@ -2280,10 +2397,9 @@ impl State {
         Ok(())
     }
 
-    /// Collect paths of all dirty file nodes under a subtree.
-    ///
-    /// Walks the state tree from `root_node`, recursing into dirty directories,
-    /// and returns the relative paths of all dirty file (leaf) nodes.
+    /// Collect the repository-relative paths of all dirty nodes at or under
+    /// `root_node`, the set to stage. `base_path` is `root_node`'s path and the
+    /// prefix of every returned path.
     pub async fn collect_dirty_paths(
         &self,
         repository: Arc<RepositoryContext>,
@@ -2303,6 +2419,17 @@ impl State {
                 .node_children(repository.clone(), node_id)
                 .await
                 .internal("Failed to get children for dirty path collection")?;
+
+            if node_id == root_node && children.is_empty() && !path.is_empty() {
+                let node = self.node(repository.clone(), node_id).await?;
+                if node.is_dirty_add()
+                    && node.is_directory()
+                    && (force || !repository.filter.excludes(&path, true, FilterMode::Full))
+                {
+                    result.push(path);
+                }
+                continue;
+            }
 
             for &child_id in &children {
                 let child = self.node(repository.clone(), child_id).await?;
@@ -2357,21 +2484,40 @@ impl State {
         parent_node: NodeID,
         name_hash: u64,
     ) -> Result<NodeID, StateError> {
-        let mut iblock = NodeBlock::index(parent_node);
-        let mut inode = Node::index(parent_node);
-        let mut block = self.block(repository.clone(), iblock).await?;
+        let iblock = NodeBlock::index(parent_node);
+        let inode = Node::index(parent_node);
+        let block = self.block(repository.clone(), iblock).await?;
 
         // TODO(mjansson): This does not actually need to grab the whole node
         let node = { *block.read().node(inode) };
-        if !node.is_directory() {
+        self.find_subnode_of(repository, parent_node, &node, name_hash)
+            .await
+    }
+
+    /// Find a child of `parent_node` by name hash, starting from a parent node
+    /// the caller has already read.
+    ///
+    /// Saves the lookup [`Self::find_subnode`] performs, for a caller that has
+    /// just inspected the parent and is about to search under it.
+    pub async fn find_subnode_of(
+        &self,
+        repository: Arc<RepositoryContext>,
+        parent_node: NodeID,
+        parent: &Node,
+        name_hash: u64,
+    ) -> Result<NodeID, StateError> {
+        if !parent.is_directory() {
             return Err(NodeNotFound.into());
         }
 
-        let mut child_node_ref = node.child();
+        let mut iblock = NodeBlock::index(parent_node);
+        let mut block = self.block(repository.clone(), iblock).await?;
+
+        let mut child_node_ref = parent.child();
         let mut cycle = SiblingCycleGuard::new(parent_node);
         while let Some(node_id) = child_node_ref {
             let inextblock = NodeBlock::index(node_id);
-            inode = Node::index(node_id);
+            let inode = Node::index(node_id);
             let node = {
                 if iblock != inextblock {
                     iblock = inextblock;
@@ -2714,6 +2860,13 @@ impl State {
         Err(StateError::internal("Tree not loaded"))
     }
 
+    /// The loaded revision's tree header, installed on first use.
+    ///
+    /// Several callers can miss the cached value before any of them takes the
+    /// write lock, so whichever one installs first wins and the rest adopt its
+    /// tree. A second install would push another placeholder onto the block
+    /// vector and make [`Self::block_count`] report a block the tree does not
+    /// have.
     pub async fn tree(&self, repository: Arc<RepositoryContext>) -> Result<Tree, StateError> {
         {
             let lock = self.runtime.read();
@@ -2732,8 +2885,12 @@ impl State {
                 tree.block_count = 1;
                 {
                     let mut lock = self.runtime.write();
-                    lock.tree = Some(tree);
-                    lock.block.push(Weak::new());
+                    if let Some(current_tree) = &lock.tree {
+                        tree = *current_tree;
+                    } else {
+                        lock.tree = Some(tree);
+                        lock.block.push(Weak::new());
+                    }
                 }
                 tree
             } else {
@@ -3315,7 +3472,9 @@ pub fn allow_all_repositories() -> CanReadRepository {
     Arc::new(|_| true)
 }
 
-const MAX_LINK_DEPTH: usize = 8;
+/// Maximum number of link hops a tree walk follows before giving up. Bounds
+/// both unbounded link chains and link cycles so a walk terminates.
+pub const MAX_LINK_DEPTH: usize = 8;
 
 pub async fn gather_tree_paths(
     state: Arc<State>,
@@ -5010,6 +5169,12 @@ impl FileDiffContext {
 /// here if it was cleared by stale reconciliation). The compare framework
 /// is bypassed because comparing the filesystem hash against the staged
 /// node's zero address is meaningless for an add.
+///
+/// A dirty-move destination is exempt: it only looks like a node missing from
+/// the current state because the walk matches by name, while the same node is
+/// present in the current revision under its source path. Emitting an add for
+/// it would drop the move provenance and overwrite `DirtyMove` with `DirtyAdd`,
+/// so the move is left to the state diff, which coalesces it by file context.
 #[allow(clippy::too_many_arguments)]
 async fn emit_unstaged_add(
     repository: Arc<RepositoryContext>,
@@ -5021,6 +5186,10 @@ async fn emit_unstaged_add(
     stats: &FilesystemDiffStats,
     filter_mode: FilterMode,
 ) -> Result<(), StateError> {
+    if from_node.is_dirty_move() {
+        lore_trace!("File {file_path} is a dirty move destination, not an unstaged add");
+        return Ok(());
+    }
     if !from_node.is_dirty_add() {
         state
             .node_mark_dirty(repository.clone(), from_node_id, NodeFlags::DirtyAdd, true)

@@ -264,6 +264,41 @@ impl StoreInternal {
     }
 }
 
+/// Reuses one remote [`StorageSession`] across a batched call's items. Batched storage ops
+/// almost always target a single partition (a batch of keys/addresses in one repository), so a
+/// single `SessionReuse` threaded through the item loop resolves the session once for the whole
+/// call and reuses it for every following item with the same partition, resolving a fresh one
+/// only when the partition changes. It is scoped to one call so the lazily-resolved session binds
+/// to that call's correlation id, and it holds no heap state beyond the one remembered session.
+#[derive(Default)]
+pub(crate) struct SessionReuse {
+    last: Option<(Partition, Option<Arc<StorageSession>>)>,
+}
+
+impl SessionReuse {
+    /// The remote session for `partition`, reusing the previously resolved one when `partition`
+    /// matches the last call. Returns `None` without resolving when `want_remote` is false (the
+    /// local path) or the handle has no remote endpoint.
+    pub(crate) fn session_for(
+        &mut self,
+        store: &StoreInternal,
+        partition: Partition,
+        want_remote: bool,
+    ) -> Option<Arc<StorageSession>> {
+        if !want_remote {
+            return None;
+        }
+        if let Some((last_partition, session)) = &self.last
+            && *last_partition == partition
+        {
+            return session.clone();
+        }
+        let session = store.remote_session_for(partition);
+        self.last = Some((partition, session.clone()));
+        session
+    }
+}
+
 /// RAII guard protecting an in-flight op. Obtained via [`OpGuard::enter`];
 /// dropping it pairs the in-flight increment with the matching decrement
 /// and, when the count reaches zero, wakes any [`mark_invalid_and_await`]

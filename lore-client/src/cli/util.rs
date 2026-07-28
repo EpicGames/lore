@@ -1,9 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::io::BufRead;
+use std::path::Component;
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use lore::interface::LoreArray;
+use lore::interface::LoreGlobalArgs;
 use lore::interface::LoreMaintenanceEventData;
 use lore::interface::LorePathIgnoreEventData;
 use lore::interface::LoreRevisionSyncProgressEventData;
@@ -30,6 +34,76 @@ pub fn get_repository_path(path: Option<String>) -> LoreString {
             }
         }
     }
+}
+
+/// Compute `target` expressed relative to `base`, inserting `..` components as
+/// needed. Returns `None` if a relative path can't be formed (e.g. mismatched
+/// path prefixes/roots, such as different Windows drives).
+fn diff_paths(target: &Path, base: &Path) -> Option<PathBuf> {
+    let mut ta = target.components();
+    let mut ba = base.components();
+
+    let mut ta_rest;
+    let mut ba_rest;
+    loop {
+        ta_rest = ta.clone();
+        ba_rest = ba.clone();
+        match (ta.next(), ba.next()) {
+            (Some(Component::Normal(t)), Some(Component::Normal(b))) => {
+                if !t.eq_ignore_ascii_case(b) {
+                    // Components diverged; rewind both to this point.
+                    break;
+                }
+            }
+            (Some(t), Some(b)) => {
+                // Root / prefix / cur-dir components must match exactly.
+                if t != b {
+                    return None;
+                }
+            }
+            // One side exhausted (or both): rewind to the pre-`next()` state.
+            _ => break,
+        }
+    }
+
+    let mut result = PathBuf::new();
+    for component in ba_rest {
+        match component {
+            Component::Normal(_) => result.push(".."),
+            Component::CurDir => {}
+            // A `..` or root/prefix in the remaining base means we can't form a
+            // sane relative path.
+            _ => return None,
+        }
+    }
+
+    for component in ta_rest {
+        result.push(component.as_os_str());
+    }
+    Some(result)
+}
+
+/// Build a repo-root-relative path for display, rebased on the current working
+/// directory. Falls back to repo-root-relative string on any failure.
+pub fn relativize_for_display(repo_root: &Path, cwd: &Path, repo_relative: &str) -> String {
+    if repo_relative.is_empty() {
+        return String::new();
+    }
+    let target = repo_root.join(repo_relative);
+    match diff_paths(&target, cwd) {
+        Some(rel) if rel.as_os_str().is_empty() => ".".to_string(),
+        Some(rel) => rel.to_string_lossy().replace('\\', "/"),
+        None => repo_relative.to_string(),
+    }
+}
+
+/// Build a closure that rebases repo-root-relative paths onto the current
+/// working directory for display, capturing the repo root and cwd once.
+pub fn cwd_relativizer(globals: &LoreGlobalArgs) -> impl Fn(&str) -> String + 'static {
+    let repo_root = std::path::absolute(globals.repository_path())
+        .unwrap_or_else(|_| PathBuf::from(globals.repository_path()));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| repo_root.clone());
+    move |path: &str| relativize_for_display(&repo_root, &cwd, path)
 }
 
 pub fn read_targets_file(path: &String) -> Vec<String> {

@@ -6,6 +6,7 @@ import os
 
 import pytest
 
+from error_types import ImproperArgumentsError
 from lore import Lore
 
 logger = logging.getLogger(__name__)
@@ -186,3 +187,60 @@ def test_metadata(new_lore_repo):
     assert "Metadata set on an unchanged file again" in output, (
         "Metadata not found in final test"
     )
+
+
+def _staged_file(repo: Lore, name: str = "staged.txt") -> str:
+    """Create and stage a file so file metadata can target it."""
+    with repo.open_file(name, "w+") as output_file:
+        output_file.write("content\n")
+    repo.stage(scan=True, offline=True)
+    return name
+
+
+@pytest.mark.smoke
+def test_file_metadata_set_single_arg_rejected(new_lore_repo):
+    """A lone argument has no value; the set must be rejected, not panic.
+
+    File metadata carries a per-path entry count and indexes keys/values by
+    offset, so an odd pair count is the case most prone to an out-of-bounds
+    panic. The trailing key without a value must be rejected up front.
+    """
+    repo: Lore = new_lore_repo()
+    text_file = _staged_file(repo)
+
+    with pytest.raises(ImproperArgumentsError):
+        repo.file_metadata_set(text_file, ["lonely-key"], offline=True)
+
+
+@pytest.mark.smoke
+def test_file_metadata_set_odd_args_rejected(new_lore_repo):
+    """An odd number of arguments leaves the trailing key without a value and
+    must be rejected rather than dropping the key or panicking."""
+    repo: Lore = new_lore_repo()
+    text_file = _staged_file(repo)
+
+    with pytest.raises(ImproperArgumentsError):
+        repo.file_metadata_set(text_file, ["k1", "v1", "k2"], offline=True)
+
+
+@pytest.mark.smoke
+def test_file_metadata_set_binary_single_arg_rejected(new_lore_repo):
+    """The binary branch reads the value as a file path; an odd pair count
+    must be rejected before that indexing happens, not panic."""
+    repo: Lore = new_lore_repo()
+    text_file = _staged_file(repo)
+
+    with pytest.raises(ImproperArgumentsError):
+        repo.file_metadata_set(text_file, ["bin-key"], binary=True, offline=True)
+
+
+@pytest.mark.smoke
+def test_file_metadata_set_even_args_succeeds(new_lore_repo):
+    """A well-formed key/value pair is accepted after the odd-args guard."""
+    repo: Lore = new_lore_repo()
+    text_file = _staged_file(repo)
+
+    repo.file_metadata_set(text_file, ["str_value", "kept"], offline=True)
+
+    output = repo.file_metadata_get(text_file, "str_value", offline=True)
+    assert "kept" in output, f"Expected metadata value in output.\nGot: {output}"

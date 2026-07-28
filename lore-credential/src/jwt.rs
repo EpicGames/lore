@@ -99,9 +99,13 @@ pub fn user_info_from_token(token: String) -> Option<UserInfo> {
 pub enum JwtUsageError {}
 
 pub fn domain_in_root_domains(domain: &str, root_domains: &[String]) -> bool {
-    root_domains
-        .iter()
-        .any(|acceptable_root| domain.ends_with(acceptable_root))
+    root_domains.iter().any(|acceptable_root| {
+        // Require a label boundary, not a raw suffix, so `epicgames.net`
+        // rejects a look-alike such as `evilepicgames.net`. A leading `.`
+        // is optional and does not change the match.
+        let apex = acceptable_root.strip_prefix('.').unwrap_or(acceptable_root);
+        domain == apex || domain.ends_with(&format!(".{apex}"))
+    })
 }
 
 pub fn verify_jwt_usage_for_remote(

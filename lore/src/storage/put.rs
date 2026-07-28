@@ -25,6 +25,7 @@ use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
+use lore_macro::ValidateText;
 use lore_revision::event::EventError;
 use lore_revision::event::LoreBytes;
 use lore_revision::event::LoreErrorCode;
@@ -47,7 +48,7 @@ use crate::storage::store::StoreInternal;
 
 /// One put item — a buffer to hash and store at `(partition, context)`.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Copy, Clone, PartialEq, Deserialize, Serialize, ValidateText)]
 pub struct LoreStoragePutItem {
     /// Caller-chosen id echoed back in `PUT_ITEM_COMPLETE`
     pub id: u64,
@@ -138,10 +139,16 @@ async fn put_local(
             let effective = store.effective_flags(per_call)?;
 
             let total = items.len();
+            let mut reuse = crate::storage::store::SessionReuse::default();
             let mut tasks: JoinSet<LoreErrorCode> = JoinSet::new();
             for item in items {
+                let session = reuse.session_for(
+                    &store,
+                    item.partition,
+                    item.remote_write != 0 && !effective.no_remote,
+                );
                 let store = store.clone();
-                lore_spawn!(tasks, async move { put_item(store, item, effective).await });
+                lore_spawn!(tasks, async move { put_item(store, item, session).await });
             }
             let codes = crate::storage::drain_codes(tasks).await;
             crate::storage::build_call_error(&codes, total, "put")
@@ -156,9 +163,9 @@ async fn put_local(
 async fn put_item(
     store: Arc<StoreInternal>,
     item: LoreStoragePutItem,
-    effective: crate::storage::store::EffectiveFlags,
+    session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
-    let (address, error_code) = resolve_put_item(store, item, effective).await;
+    let (address, error_code) = resolve_put_item(store, item, session).await;
     LoreEvent::StoragePutItemComplete(LoreStoragePutItemCompleteEventData {
         id: item.id,
         address,
@@ -171,7 +178,7 @@ async fn put_item(
 async fn resolve_put_item(
     store: Arc<StoreInternal>,
     item: LoreStoragePutItem,
-    effective: crate::storage::store::EffectiveFlags,
+    remote_session: Option<Arc<lore_transport::StorageSession>>,
 ) -> (Address, LoreErrorCode) {
     if item.partition == Partition::default() {
         return (Address::default(), LoreErrorCode::InvalidArguments);
@@ -200,12 +207,6 @@ async fn resolve_put_item(
         unsafe { std::slice::from_raw_parts(item.data.ptr.cast::<u8>(), item.data.len) };
     let bytes = Bytes::from_static(slice);
 
-    let remote_session = if item.remote_write != 0 && !effective.no_remote {
-        store.remote_session_for(item.partition)
-    } else {
-        None
-    };
-
     let mut write_options = WriteOptions::default();
     if item.fixed_size_chunk > 0 {
         write_options = write_options.with_fixed_size_chunk(item.fixed_size_chunk as usize);
@@ -221,6 +222,7 @@ async fn resolve_put_item(
         bytes,
         write_options,
         remote_session,
+        None,
         None,
     )
     .await
