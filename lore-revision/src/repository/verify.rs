@@ -380,7 +380,6 @@ async fn verify_node_single(
                 let path = state
                     .node_path(repository.clone(), node_id)
                     .await
-                    .map(|path| path.to_string())
                     .unwrap_or_default();
                 suspects
                     .lock()
