@@ -4587,6 +4587,7 @@ pub extern "C" fn lore_repository_store_immutable_query_async(
 
 pub type LoreRepositoryVerifyStateArgs = crate::repository::LoreRepositoryVerifyStateArgs;
 pub type LoreRepositoryVerifyFragmentArgs = crate::repository::LoreRepositoryVerifyFragmentArgs;
+pub type LoreRepositoryPushContentArgs = crate::repository::LoreRepositoryPushContentArgs;
 
 /// Verify the integrity of the repository's stored fragments.
 ///

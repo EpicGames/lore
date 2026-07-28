@@ -316,6 +316,19 @@ pub struct RepositoryVerifyFragmentArgs {
     heal: bool,
 }
 
+#[derive(Args)]
+pub struct RepositoryPushContentArgs {
+    /// Fragment addresses to push, as `hash` or `hash-context` (the format
+    /// printed in `Address not found` errors)
+    addresses: Vec<String>,
+
+    /// Scan the local store for all content of this repository that was never
+    /// confirmed durable on the remote (e.g. after a commit whose upload
+    /// timed out) and push all of it
+    #[clap(long, action)]
+    scan: bool,
+}
+
 #[derive(Subcommand)]
 pub enum RepositoryCommands {
     /// Show current repository status.
@@ -344,6 +357,10 @@ pub enum RepositoryCommands {
 
     /// Verify repository state consistency
     Verify(RepositoryVerifyArgs),
+
+    /// Push locally-stored content that is not yet durable on the remote
+    #[command(name = "push-content")]
+    PushContent(RepositoryPushContentArgs),
 
     /// Dump repository state information
     Dump(RepositoryDumpArgs),
@@ -1142,6 +1159,64 @@ pub fn handle_repository_verify_state(
     runtime().block_on(repository::verify_state(globals, verify_args, callback)) as u8
 }
 
+pub fn handle_repository_push_content(
+    globals: LoreGlobalArgs,
+    args: &RepositoryPushContentArgs,
+) -> u8 {
+    if !args.scan && args.addresses.is_empty() {
+        println!(
+            "{}No addresses given{}: pass one or more `hash-context` addresses or use --scan",
+            CommonStyles::FAILURE,
+            anstyle::Reset
+        );
+        return 1;
+    }
+
+    let push_args = lore::interface::LoreRepositoryPushContentArgs {
+        addresses: LoreArray::from_vec(
+            args.addresses
+                .iter()
+                .map(|address| LoreString::from(address.as_str()))
+                .collect(),
+        ),
+        scan: args.scan.into(),
+    };
+
+    let _spinner = ProgressBar::new_spinner("Pushing content to remote...");
+
+    let callback = output_formatter().unwrap_or(Some(
+        (Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::StorageUploadItemComplete(data) => {
+                if data.error_code != lore_revision::event::LoreErrorCode::None {
+                    println!(
+                        "{}Failed{} to push fragment ({:?})",
+                        CommonStyles::FAILURE,
+                        anstyle::Reset,
+                        data.error_code
+                    );
+                } else if data.already_durable != 0 {
+                    println!("Fragment {} already durable", data.address);
+                } else {
+                    println!(
+                        "{}Pushed{} fragment {}",
+                        CommonStyles::SUCCESS,
+                        anstyle::Reset,
+                        data.address
+                    );
+                }
+            }
+            LoreEvent::Complete(_) => {}
+            LoreEvent::Maintenance(data) => {
+                util::handle_maintenance_event(data);
+            }
+            _ => (),
+        }) as EventCallbackFn)
+            .with_defaults(),
+    ));
+
+    runtime().block_on(repository::push_content(globals, push_args, callback)) as u8
+}
+
 pub fn handle_repository_verify_fragment(
     globals: LoreGlobalArgs,
     args: &RepositoryVerifyFragmentArgs,
@@ -1669,6 +1744,7 @@ pub fn handle_repository_commands(cmd: &RepositoryCommands, globals: LoreGlobalA
         RepositoryCommands::Delete(args) => handle_repository_delete(globals, args),
         RepositoryCommands::Clone(args) => handle_repository_clone(globals, args),
         RepositoryCommands::Verify(args) => handle_repository_verify(globals, args),
+        RepositoryCommands::PushContent(args) => handle_repository_push_content(globals, args),
         RepositoryCommands::Dump(args) => handle_repository_dump(
             globals,
             args.revision.as_deref().unwrap_or(""),

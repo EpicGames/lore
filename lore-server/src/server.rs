@@ -1065,6 +1065,11 @@ async fn create_local_store(
             implicit_durable_stored: true, /* Server mode, consider all fragments as durably stored */
             flush_background,
             flush_delay_seconds: settings.flush_delay_seconds as u64,
+            /* Server mode: this store is the authoritative persistence layer for its content,
+            so a `PayloadStoredDurable` claim must be backed by an actual fsync. Runs a
+            background heartbeat that fsyncs on this interval; durable writes wait for it
+            to confirm (bounded worst case ~2 ticks) rather than fsync-per-write. */
+            durable_flush_tick_ms: 15,
             target_capacity_percentage: settings.target_capacity_percentage.unwrap_or(default_settings.target_capacity_percentage),
             target_size_percentage: settings.target_size_percentage.unwrap_or(default_settings.target_size_percentage),
             compaction_parallel_groups: settings.compaction_parallel_groups.unwrap_or(default_settings.compaction_parallel_groups),

@@ -1067,6 +1067,65 @@ async fn verify_fragment_impl(
     lore_revision::repository::verify::verify_fragment(repository, core_args).await
 }
 
+/// Arguments for pushing locally-stored, not-yet-durable content to the remote store.
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
+#[handler(push_content_local)]
+pub struct LoreRepositoryPushContentArgs {
+    /// Addresses to push, as `hash` or `hash-context` strings; ignored when `scan` is set
+    pub addresses: LoreArray<LoreString>,
+    /// Scan the local store for all non-durable entries of this repository and push them
+    pub scan: u8,
+}
+
+/// Pushes locally-stored content that has not been confirmed durable on the remote
+/// (e.g. after a commit whose upload timed out) back to the remote store.
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
+///
+/// ## Push Content Events
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::StorageUploadItemComplete`](crate::interface::LoreEvent::StorageUploadItemComplete) | Emitted for each pushed item with its outcome |
+pub async fn push_content(
+    globals: LoreGlobalArgs,
+    args: LoreRepositoryPushContentArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    dispatch_call(globals, args, callback, push_content_local).await
+}
+
+async fn push_content_local(
+    globals: LoreGlobalArgs,
+    args: LoreRepositoryPushContentArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    repository_call_read(globals, callback, args, push_content, push_content_impl).await
+}
+
+async fn push_content_impl(
+    repository: Arc<RepositoryContext>,
+    args: LoreRepositoryPushContentArgs,
+) -> Result<(), RepositoryError> {
+    let core_args = lore_revision::repository::push_content::PushContentArgs {
+        addresses: args.addresses.as_slice().to_vec(),
+        scan: args.scan != 0,
+    };
+    lore_revision::repository::push_content::push_content(repository, core_args).await
+}
+
 /// Arguments for querying the local immutable store by fragment address.
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]

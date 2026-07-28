@@ -42,6 +42,7 @@ use opentelemetry::metrics::Gauge;
 use opentelemetry::metrics::Histogram;
 use smallvec::SmallVec;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use tokio::sync::OwnedRwLockReadGuard;
 use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
@@ -192,6 +193,71 @@ impl ImmutableStoreBucket {
     }
 }
 
+/// Lets writers that just stored a payload wait for a durable (fsynced) copy, backed by
+/// a continuously-running background ticker (see `durable_flush_loop`) rather than a
+/// per-write sleep-then-fsync task. The ticker fsyncs every group's packstore on a fixed
+/// interval and bumps `generation` each time, regardless of whether anything was dirty.
+///
+/// # Why `wait_past` waits for +2, not +1
+///
+/// The ticker loop is single-threaded and its ticks never overlap (one
+/// `tokio::time::interval` loop). A writer sets its packfile's dirty bit, then snapshots
+/// `generation` via `current_generation()`. If a tick was already in flight at that
+/// moment (started before the write, so its per-packfile dirty check ran too early to see
+/// it), that tick can still complete and bump `generation` once — without having actually
+/// synced the writer's bytes. Waiting for only +1 past the snapshot could observe exactly
+/// that non-covering bump and return early, recreating the false-durability bug this type
+/// exists to prevent.
+///
+/// Because ticks are sequential, at most one tick can be "already in flight and
+/// non-covering" at snapshot time. The *next* tick after that one is guaranteed to start
+/// after the snapshot was taken, so it will observe the dirty bit (already set before the
+/// snapshot) and sync it. Waiting for the generation to advance by 2 past the snapshot
+/// therefore always waits past a tick that is guaranteed to cover the write, regardless of
+/// how the write and the ticker happen to interleave.
+pub struct FlushBarrier {
+    /// Bumped once after each completed tick (whether or not it found anything dirty). A
+    /// waiter that captured the generation right after its write knows its data is durable
+    /// once this counter has advanced by 2 past that value (see type-level doc for why 2).
+    generation: AtomicU64,
+    done: Notify,
+}
+
+impl Default for FlushBarrier {
+    fn default() -> Self {
+        Self {
+            generation: AtomicU64::new(0),
+            done: Notify::new(),
+        }
+    }
+}
+
+impl FlushBarrier {
+    /// Snapshot the current generation right after writing dirty bytes; pass the result
+    /// to `wait_past` to be woken once a tick guaranteed to have synced them completes.
+    pub fn current_generation(&self) -> u64 {
+        self.generation.load(atomic::Ordering::Acquire)
+    }
+
+    /// Wait until a background tick guaranteed to cover a write snapshotted at `since` has
+    /// completed. See the type-level doc for why this waits for +2 rather than +1.
+    pub async fn wait_past(&self, since: u64) {
+        loop {
+            let notified = self.done.notified();
+            if self.generation.load(atomic::Ordering::Acquire) >= since + 2 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Mark a tick complete, bumping the generation and waking all waiters.
+    pub fn complete(&self) {
+        self.generation.fetch_add(1, atomic::Ordering::AcqRel);
+        self.done.notify_waiters();
+    }
+}
+
 pub struct ImmutableStoreGroup {
     /// Per-slot lazily-initialized bucket. Empty `OnceLock` at construction; first
     /// `bucket()` call materializes the `Arc<RwLock<ImmutableStoreBucket>>`. Use
@@ -222,6 +288,10 @@ pub struct ImmutableStoreGroup {
     pub committed_level: std::sync::atomic::AtomicUsize,
     pub packstore: crate::PackStore,
     pub flush: Mutex<JoinSet<()>>,
+    /// Wakes writers waiting for a durable (fsynced) copy of freshly-written payload
+    /// bytes, driven by the store-wide `durable_flush_loop` background ticker rather than
+    /// a per-write task. See `FlushBarrier`'s docs for the wait invariant.
+    pub flush_barrier: FlushBarrier,
 }
 
 impl ImmutableStoreGroup {
@@ -284,6 +354,16 @@ pub struct ImmutableStoreSettings {
     pub flush_background: bool,
     /// Flush delay in seconds
     pub flush_delay_seconds: u64,
+    /// Interval (milliseconds) of the background `durable_flush_loop` heartbeat that
+    /// fsyncs every group's packstore. When a `store()` call writes payload bytes under a
+    /// `PayloadStoredDurable` claim, it waits for this ticker to confirm (with a bounded
+    /// worst case of ~2 ticks — see `FlushBarrier`'s docs) before returning, so the claim
+    /// is never made ahead of an actual `fsync`. `0` disables the ticker entirely (no
+    /// background task is spawned, and durable writes return without waiting, matching
+    /// pre-fix behavior) — appropriate for clients that only cache a remote-durable copy.
+    /// A store acting as the authoritative persistence layer for its content (e.g.
+    /// `lore-server`) must set this to a small positive value.
+    pub durable_flush_tick_ms: u64,
     /// Eviction target capacity as a percentage of the max capacity (0-100)
     pub target_capacity_percentage: usize,
     /// Compaction target size as a percentage of the max size (0-100)
@@ -311,6 +391,7 @@ impl Default for ImmutableStoreSettings {
             implicit_durable_stored: false,
             flush_background: false,
             flush_delay_seconds: DEFAULT_FLUSH_DELAY_SECONDS,
+            durable_flush_tick_ms: 0,
             target_capacity_percentage: 70,
             target_size_percentage: 70,
             compaction_parallel_groups: 8,
@@ -890,6 +971,28 @@ impl ImmutableStoreGroup {
     }
 }
 
+/// Background heartbeat that fsyncs every group's packstore on a fixed interval and wakes
+/// `FlushBarrier` waiters — see `FlushBarrier`'s docs for why writers wait for 2 completed
+/// ticks, not 1. Mirrors the weak-ref self-cancelling pattern used by
+/// `lore-storage::maintenance::spawn_gc`'s evictor/compactor loops: the store has no
+/// explicit shutdown hook, so this task simply exits once the store's `Arc` is dropped.
+async fn durable_flush_loop(weak_ref: Weak<LocalImmutableStore>, tick: Duration) {
+    let mut ticker = tokio::time::interval(tick);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let Some(store) = weak_ref.upgrade() else {
+            break;
+        };
+        for group in &store.group {
+            // Cheap when clean: flush_all only does I/O for packfiles whose dirty flag is
+            // still set, via a lock-free compare_exchange per packfile.
+            group.packstore.flush_all(true).await;
+            group.flush_barrier.complete();
+        }
+    }
+}
+
 impl LocalImmutableStore {
     /// Set the automatic-GC caps (from create options) on this store's load-driven GC
     /// counters. Caps of 0 leave the corresponding trigger disabled — which is how
@@ -1086,6 +1189,7 @@ impl LocalImmutableStore {
                     Some(store.gc_counters.clone()),
                 ),
                 flush: Mutex::new(JoinSet::new()),
+                flush_barrier: FlushBarrier::default(),
             }));
         }
 
@@ -1094,6 +1198,14 @@ impl LocalImmutableStore {
         // the weak self-ref the load hooks need to fire a pass.
         let dyn_store: Arc<dyn crate::immutable_store::ImmutableStore> = store.clone();
         store.gc_counters.set_store(&dyn_store);
+
+        if store.settings.durable_flush_tick_ms > 0 {
+            let weak = Arc::downgrade(&store);
+            let tick = Duration::from_millis(store.settings.durable_flush_tick_ms);
+            drop(lore_base::lore_spawn!(async move {
+                durable_flush_loop(weak, tick).await;
+            }));
+        }
         if let Some(path) = immutable_path.as_deref() {
             let mut old_packpath = path.clone();
             old_packpath.push("pack");
@@ -1525,6 +1637,20 @@ impl LocalImmutableStore {
                         )?;
                     pack_file = packref.id;
                     pack_offset = packref.offset;
+
+                    // These bytes were just written and are not yet fsynced. If the caller
+                    // is about to record this fragment as `PayloadStoredDurable`, that claim
+                    // must not outrun an actual fsync, or a crash before the next background
+                    // durable-flush tick leaves a "durable" entry pointing at bytes that
+                    // never made it to disk (the mechanism behind a confirmed data-loss
+                    // incident). Wait for the store-wide `durable_flush_loop` ticker to
+                    // confirm this write rather than fsync-per-write.
+                    if self.settings.durable_flush_tick_ms > 0
+                        && (fragment_flags & FragmentFlags::PayloadStoredDurable) != 0
+                    {
+                        let since = group.flush_barrier.current_generation();
+                        group.flush_barrier.wait_past(since).await;
+                    }
                 }
             } else {
                 if !self.settings.allow_partial_fragment {
@@ -3885,6 +4011,43 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
 }
 
 impl LocalImmutableStore {
+    /// Enumerate every entry whose payload is stored locally but has not been
+    /// confirmed durable on the remote — i.e. `PayloadStoredLocal` set,
+    /// `PayloadStoredDurable` clear, and not obliterated. These are payloads a
+    /// failed/timed-out upload left behind; `repository push-content` uses this
+    /// scan to find what needs re-uploading. Optionally filtered by partition.
+    ///
+    /// Deserializes all buckets, so this is a full-store scan.
+    pub async fn non_durable_entries(
+        &self,
+        partition: Option<Partition>,
+    ) -> Vec<(Partition, Address)> {
+        let _ = self.deserialize_all_buckets().await;
+
+        let mut found = Vec::new();
+        for group in self.group.iter() {
+            let active_buckets = group.bucket_count.load(atomic::Ordering::Relaxed);
+            for bucket_index in 0..active_buckets {
+                let bucket = group.bucket(bucket_index).read().await;
+                for entry in bucket.entry.iter() {
+                    if let Some(partition) = partition
+                        && entry.partition != partition
+                    {
+                        continue;
+                    }
+                    let flags = entry.data.flags;
+                    if flags & FragmentFlags::PayloadStoredLocal != 0
+                        && flags & FragmentFlags::PayloadStoredDurable == 0
+                        && flags & FragmentFlags::PayloadObliterated == 0
+                    {
+                        found.push((entry.partition, entry.address));
+                    }
+                }
+            }
+        }
+        found
+    }
+
     pub async fn verify_fragment(
         self: Arc<Self>,
         address: Address,
@@ -4661,6 +4824,93 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(bytes.as_ref(), payload.as_ref());
+    }
+
+    #[tokio::test]
+    async fn durable_put_waits_for_batched_fsync_before_returning() {
+        // Regression test for the false-durability data-loss bug: a store acting as the
+        // authoritative persistence layer (durable_flush_tick_ms > 0, matching
+        // lore-server's configuration) must not let a `PayloadStoredDurable` put return
+        // until the background durable-flush ticker has confirmed that write with a real
+        // fsync (i.e. `flush_barrier`'s generation has advanced by 2 — see its docs).
+        // A short tick keeps this test fast while still exercising real ticks.
+        let store = LocalImmutableStore::new(
+            None,
+            ImmutableStoreSettings {
+                initial_fan_out_level: 1,
+                durable_flush_tick_ms: 5,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let payload = Bytes::from(vec![0xABu8; 64]);
+        let hash = Hash::hash_buffer(payload.as_ref());
+        let context = Context::from([0x11u8; 16]);
+        let address = Address { context, hash };
+        let partition = Partition::from([0x22u8; 16]);
+        let group_index = address.hash.data()[0] as usize;
+
+        let fragment = Fragment {
+            flags: FragmentFlags::PayloadStoredDurable.bits(),
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+
+        let generation_before = store.group[group_index].flush_barrier.current_generation();
+
+        store
+            .clone()
+            .store(partition, address, fragment, Some(payload), false)
+            .await
+            .unwrap();
+
+        assert!(
+            store.group[group_index].flush_barrier.current_generation() > generation_before,
+            "a durable store() call must wait for a batched fsync to complete before returning"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_durable_batch_window_skips_fsync_wait() {
+        // Default (durable_flush_tick_ms: 0, matching clients caching remote-durable
+        // content) must not spawn the ticker or pay any fsync-wait cost — preserves prior
+        // behavior.
+        let store = LocalImmutableStore::new(
+            None,
+            ImmutableStoreSettings {
+                initial_fan_out_level: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let payload = Bytes::from(vec![0xCDu8; 64]);
+        let hash = Hash::hash_buffer(payload.as_ref());
+        let context = Context::from([0x33u8; 16]);
+        let address = Address { context, hash };
+        let partition = Partition::from([0x44u8; 16]);
+        let group_index = address.hash.data()[0] as usize;
+
+        let fragment = Fragment {
+            flags: FragmentFlags::PayloadStoredDurable.bits(),
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+
+        store
+            .clone()
+            .store(partition, address, fragment, Some(payload), false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.group[group_index].flush_barrier.current_generation(),
+            0,
+            "durable_batch_window_ms: 0 must not schedule/await a batched fsync"
+        );
     }
 
     #[test]

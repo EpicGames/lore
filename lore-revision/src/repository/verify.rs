@@ -12,9 +12,12 @@ use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
 
+use std::sync::Mutex;
+
 use super::RepositoryContext;
 use super::RepositoryError;
 use crate::event;
+use crate::fragment::FragmentFlags;
 use crate::hash;
 use crate::interface::LoreArray;
 use crate::interface::LoreString;
@@ -134,6 +137,16 @@ pub struct VerifyFragmentArgs {
     pub heal: bool,
 }
 
+/// A file whose content could not be confirmed durable from the local store
+/// alone: the local entry is missing or lacks `PayloadStoredDurable`. Resolved
+/// against the remote store after the node walk.
+struct DurabilitySuspect {
+    address: Address,
+    path: String,
+}
+
+type DurabilitySuspects = Arc<Mutex<Vec<DurabilitySuspect>>>;
+
 pub async fn verify(
     repository: Arc<RepositoryContext>,
     path: Option<RelativePath>,
@@ -177,7 +190,20 @@ pub async fn verify(
         return Err(RepositoryError::internal("Invalid repository path"));
     }
 
-    verify_node(repository.clone(), state.clone(), is_staged, node_id).await?;
+    let suspects: DurabilitySuspects = Arc::new(Mutex::new(Vec::new()));
+    verify_node(
+        repository.clone(),
+        state.clone(),
+        is_staged,
+        node_id,
+        suspects.clone(),
+    )
+    .await?;
+
+    // Resolve content whose durability could not be confirmed locally against
+    // the remote store. Catches revisions published with content the remote
+    // never received (e.g. a commit whose upload timed out).
+    verify_content_durability(repository.clone(), suspects, heal).await?;
 
     // Check case uniqueness of each node
     state::verify_node_name_case(repository.clone(), state.clone(), node_id)
@@ -226,10 +252,11 @@ async fn verify_node(
     state: Arc<State>,
     is_staged: bool,
     node_id: NodeID,
+    suspects: DurabilitySuspects,
 ) -> Result<(), RepositoryError> {
     let mut tasks = JoinSet::new();
     let mut result = verify_node_single(
-        repository, state, is_staged, node_id, None, &mut tasks, None,
+        repository, state, is_staged, node_id, None, &mut tasks, None, suspects,
     )
     .await;
 
@@ -261,6 +288,7 @@ async fn verify_node_single(
     expected_parent: Option<NodeID>,
     tasks: &mut JoinSet<Result<NodeID, RepositoryError>>,
     cycle: Option<&mut SiblingCycleGuard>,
+    suspects: DurabilitySuspects,
 ) -> Result<NodeID, RepositoryError> {
     let block_index = NodeBlock::index(node_id);
     let node_index = Node::index(node_id);
@@ -335,7 +363,35 @@ async fn verify_node_single(
     }
 
     if node.is_file() {
-        // ...
+        // Confirm the file's content is durable from the local store's
+        // point of view; anything unconfirmed (missing entry, or an entry
+        // whose upload never succeeded) is checked against the remote store
+        // after the walk.
+        if node.size > 0 && !node.address.hash.is_zero() {
+            let query = repository
+                .immutable_store()
+                .query(repository.id, node.address, StoreMatch::MatchFull)
+                .await;
+            let durable_locally = matches!(
+                &query,
+                Ok(qr) if qr.match_made == StoreMatch::MatchFull
+                    && qr.fragment.flags & FragmentFlags::PayloadStoredDurable != 0
+            );
+            if !durable_locally {
+                let path = state
+                    .node_path(repository.clone(), node_id)
+                    .await
+                    .map(|path| path.to_string())
+                    .unwrap_or_default();
+                suspects
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(DurabilitySuspect {
+                        address: node.address,
+                        path,
+                    });
+            }
+        }
     } else if node.is_link() {
         // TODO(vri): UCS-19231 - Links: Handle link nodes in repository verify
     } else if node.is_directory()
@@ -344,9 +400,17 @@ async fn verify_node_single(
         lore_spawn!(tasks, {
             let repository = repository.clone();
             let state = state.clone();
+            let suspects = suspects.clone();
             async move {
-                verify_node_recurse(repository.clone(), state.clone(), is_staged, child, node_id)
-                    .await
+                verify_node_recurse(
+                    repository.clone(),
+                    state.clone(),
+                    is_staged,
+                    child,
+                    node_id,
+                    suspects,
+                )
+                .await
             }
         });
     }
@@ -360,6 +424,7 @@ async fn verify_node_and_siblings(
     is_staged: bool,
     mut node_id: NodeID,
     expected_parent: NodeID,
+    suspects: DurabilitySuspects,
 ) -> Result<NodeID, RepositoryError> {
     lore_trace!("Verify node {node_id} and siblings");
 
@@ -375,6 +440,7 @@ async fn verify_node_and_siblings(
             Some(expected_parent),
             &mut tasks,
             Some(&mut cycle),
+            suspects.clone(),
         )
         .await;
 
@@ -406,6 +472,7 @@ fn verify_node_recurse(
     is_staged: bool,
     node: NodeID,
     expected_parent: NodeID,
+    suspects: DurabilitySuspects,
 ) -> Pin<Box<dyn Future<Output = Result<NodeID, RepositoryError>> + Send>> {
     Box::pin(verify_node_and_siblings(
         repository,
@@ -413,7 +480,77 @@ fn verify_node_recurse(
         is_staged,
         node,
         expected_parent,
+        suspects,
     ))
+}
+
+/// Check every durability suspect against the remote store: a file's content
+/// that is not confirmed durable locally must exist on the remote, otherwise
+/// the published revision references content other clients cannot fetch (fix
+/// with `repository push-content` on the machine holding the payload).
+///
+/// Skipped when no remote is available (offline/local repository).
+async fn verify_content_durability(
+    repository: Arc<RepositoryContext>,
+    suspects: DurabilitySuspects,
+    heal: bool,
+) -> Result<(), RepositoryError> {
+    let suspects = std::mem::take(&mut *suspects.lock().unwrap_or_else(|e| e.into_inner()));
+    if suspects.is_empty() {
+        return Ok(());
+    }
+
+    let Ok(remote) = repository.remote().await else {
+        lore_info!(
+            "Skipping content durability check for {} file(s): no remote available",
+            suspects.len()
+        );
+        return Ok(());
+    };
+    let correlation_id = execution_context().globals().correlation_id.to_string();
+    let storage = remote
+        .session(repository.id, &correlation_id)
+        .await
+        .forward::<RepositoryError>("Repository verification failed: Failed to connect")?;
+
+    lore_debug!(
+        "Checking {} file content address(es) against the remote store",
+        suspects.len()
+    );
+
+    let mut missing = Vec::new();
+    for suspect in &suspects {
+        match storage.verify(&suspect.address, heal).await {
+            Ok(_) => {}
+            Err(err) => {
+                let error_msg = match &err {
+                    ProtocolError::NotFound(_) => "Fragment not found".to_string(),
+                    _ => format!("Verification failed: {err}"),
+                };
+                event::LoreEvent::RepositoryVerifyFragmentRemote(
+                    LoreRepositoryVerifyFragmentRemoteEventData {
+                        address_hash: suspect.address.hash,
+                        address_context: suspect.address.context,
+                        corrupted: 0,
+                        healed: 0,
+                        error: LoreString::from(format!("{error_msg}: {}", suspect.path)),
+                    },
+                )
+                .send();
+                missing.push(suspect);
+            }
+        }
+    }
+
+    if let Some(first) = missing.first() {
+        return Err(RepositoryError::internal(format!(
+            "Repository verification failed: {} file(s) reference content missing from the remote store, e.g. {} ({}); run `repository push-content --scan` on the machine that committed them",
+            missing.len(),
+            first.path,
+            first.address,
+        )));
+    }
+    Ok(())
 }
 
 pub async fn verify_fragment(
