@@ -4,6 +4,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
@@ -11,8 +12,6 @@ use lore_transport::ProtocolError;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
-
-use std::sync::Mutex;
 
 use super::RepositoryContext;
 use super::RepositoryError;
