@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: MIT
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Context;
@@ -14,6 +12,7 @@ use lore_revision::lore::RepositoryId;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryMetadata;
+use lore_revision::util;
 use lore_telemetry::InstrumentProvider;
 use tonic::Request;
 use tonic::Response;
@@ -138,10 +137,7 @@ pub async fn repository_create_implementation(
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| user_id.clone());
 
-    let created = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default();
+    let created = util::time::timestamp();
 
     let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
     let repository = Arc::new(RepositoryContext::new_server_context(
