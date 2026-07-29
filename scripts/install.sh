@@ -237,5 +237,6 @@ else
         say "note: another 'lore' is at $PRIOR_LORE — ensure $INSTALL_DIR comes first on PATH"
     fi
     say ""
-    say "Done. Run 'lore --version', or re-run with --demo to launch a local server."
+    say "Done. Run 'lore --version'."
+    say "To launch a local server, re-run the installer with --demo; --demo is not a lore command."
 fi

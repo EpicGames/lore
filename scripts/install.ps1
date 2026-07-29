@@ -282,7 +282,8 @@ try {
             Say "note: another 'lore' is at $priorLore - ensure $InstallDir comes first on PATH"
         }
         Say ""
-        Say "Done. Run 'lore --version', or re-run with -Demo to launch a local server."
+        Say "Done. Run 'lore --version'."
+        Say "To launch a local server, re-run the installer with -Demo; -Demo is not a lore command."
         Remove-Item -Recurse -Force $Work -ErrorAction SilentlyContinue
     }
 }
