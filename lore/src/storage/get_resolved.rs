@@ -40,6 +40,7 @@ use lore_revision::store::event::LoreStorageGetDataEventData;
 use lore_revision::store::event::LoreStorageGetHeaderEventData;
 use lore_revision::store::event::LoreStorageGetItemCompleteEventData;
 use lore_storage::read::read_resolved;
+use lore_transport::quic::storage_service::get_resolved_flags;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
@@ -68,8 +69,10 @@ pub struct LoreStorageGetResolvedItem {
     /// Cache fetched bytes back to the local store even without the producer's
     /// `PayloadLocalCachePriority` hint
     pub local_cache: u8,
-    /// Reserved bitmask forwarded to the server, low 24 bits only; 0 for default behaviour.
-    /// Unknown bits are rejected.
+    /// Reserved bitmask; 0 for default behaviour. No bits are defined yet, and unknown bits are
+    /// rejected with `INVALID_ARGUMENTS` before the call reaches a backend — otherwise an unknown
+    /// bit would be silently ignored on a local hit and refused only when the request reached the
+    /// server, making the outcome depend on what happens to be cached.
     pub flags: u32,
 }
 
@@ -173,6 +176,13 @@ async fn get_resolved_item(
 
     if item.key == Hash::default() {
         // A zero key can never be stored, so this is a caller bug rather than a miss.
+        emit_item_complete(&item, Address::default(), LoreErrorCode::InvalidArguments);
+        return LoreErrorCode::InvalidArguments;
+    }
+
+    // Reject here rather than letting the server decide: a local hit never inspects `flags`, so
+    // deferring would make an unknown bit succeed or fail depending on cache state.
+    if item.flags & !get_resolved_flags::KNOWN != 0 {
         emit_item_complete(&item, Address::default(), LoreErrorCode::InvalidArguments);
         return LoreErrorCode::InvalidArguments;
     }

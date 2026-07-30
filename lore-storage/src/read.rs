@@ -420,10 +420,16 @@ async fn remote_get_resolved_retry(
 /// names from the local store only.
 ///
 /// `None` means the caller should ask the remote instead — the mapping is absent, it is a
-/// tombstone, or its root is not cached locally. Deliberately does not fall back to a remote read
-/// of the locally cached hash: a remote `get_resolved` answers the mapping and the root in the
-/// same single round trip, and does so against the authoritative mapping rather than one this
-/// store may have cached before the key moved.
+/// tombstone, or its root is not cached locally.
+///
+/// A mapping that *is* present is trusted as-is and not revalidated. Because the key is mutable,
+/// that is a weaker guarantee than the immutable [`load_fragment`] path gives: a cached mapping
+/// can name a hash the key has since moved off. Freshness is the caller's choice through the same
+/// flags a `get` uses — `remote` resolves authoritatively, the default prefers whatever is local.
+///
+/// On the fall-through it deliberately does not remote-read the locally cached hash. A remote
+/// `get_resolved` answers the mapping and the root in one round trip, so re-resolving costs
+/// nothing extra and answers against the authoritative mapping.
 async fn load_resolved_local(
     store: Arc<dyn ImmutableStore>,
     mutable: Arc<dyn MutableStore>,
@@ -586,41 +592,75 @@ pub async fn read_resolved(
 
     lore_base::lore_trace!("Resolve key {} from remote", key_address);
 
-    let (resolved, mut fragment, buffer) =
-        remote_get_resolved_retry(session.as_ref(), key, context, flags).await?;
+    // Verification failure gets one heal attempt then a re-resolve, as `load_fragment` does, so a
+    // corrupt server-side root is no less recoverable through `get_resolved` than through `get`.
+    // The retry re-resolves rather than re-reading: the heal targets the resolved address, and a
+    // fresh resolve costs the same single round trip.
+    let mut heal_attempted = false;
+    let (resolved, address, fragment, buffer) = loop {
+        let (resolved, mut fragment, buffer) =
+            remote_get_resolved_retry(session.as_ref(), key, context, flags).await?;
 
-    if resolved.is_zero() {
-        // A zero value means the key was deleted; treat as a miss rather than reading
-        // the zero address.
-        return Err(StorageError::from(crate::errors::AddressNotFound::from(
-            key_address,
-        )));
-    }
+        if resolved.is_zero() {
+            // A zero value means the key was deleted; treat as a miss rather than reading
+            // the zero address.
+            return Err(StorageError::from(crate::errors::AddressNotFound::from(
+                key_address,
+            )));
+        }
 
-    let address = Address {
-        hash: resolved,
-        context,
+        let address = Address {
+            hash: resolved,
+            context,
+        };
+
+        fragment.flags |= FragmentFlags::PayloadStoredDurable;
+        let store_fragment = fragment;
+        let raw_payload = buffer.clone();
+
+        match decompress_and_verify(fragment, buffer, address, options).await {
+            Ok((fragment, buffer)) => {
+                let should_store = options.cache
+                    || (fragment.flags & FragmentFlags::PayloadLocalCachePriority) != 0;
+                if should_store
+                    && store
+                        .clone()
+                        .put(partition, address, store_fragment, Some(raw_payload), false)
+                        .await
+                        .is_ok()
+                {
+                    let _ = mutable
+                        .store(partition, key, resolved, KeyType::Resolve)
+                        .await;
+                }
+                break (resolved, address, fragment, buffer);
+            }
+            Err(err) => {
+                if matches!(err, StorageError::NotSupported(_)) {
+                    return Err(err);
+                }
+                if heal_attempted {
+                    lore_base::lore_error!(
+                        "Key {key} resolved to {resolved}, still corrupt after heal: {err}"
+                    );
+                    return Err(err);
+                }
+
+                lore_base::lore_warn!("Key {key} resolved to {resolved}: {err}. Attempting heal.");
+                let healed = session
+                    .verify(&address, true)
+                    .await
+                    .is_ok_and(|r| r.healed == lore_base::types::HealResult::Healed);
+                if !healed {
+                    lore_base::lore_error!("Server did not heal fragment {resolved}");
+                    return Err(err);
+                }
+
+                lore_base::lore_debug!("Server healed fragment {resolved}, resolving again");
+                heal_attempted = true;
+            }
+        }
     };
-
-    fragment.flags |= FragmentFlags::PayloadStoredDurable;
-    let store_fragment = fragment;
-    let raw_payload = buffer.clone();
-
-    let (fragment, buffer) = decompress_and_verify(fragment, buffer, address, options).await?;
-
-    let should_store =
-        options.cache || (fragment.flags & FragmentFlags::PayloadLocalCachePriority) != 0;
-    if should_store
-        && store
-            .clone()
-            .put(partition, address, store_fragment, Some(raw_payload), false)
-            .await
-            .is_ok()
-    {
-        let _ = mutable
-            .store(partition, key, resolved, KeyType::Resolve)
-            .await;
-    }
 
     let bytes = read_resolved_content(
         store,
