@@ -3000,4 +3000,314 @@ mod storage_remote_tests {
             })
             .await
     }
+
+    /// Seed one `Resolve` mapping and the blob it names on the server, returning the key and the
+    /// payload bytes. The blob's hash is the real hash of the payload, so the server accepts the
+    /// put and the client's verification passes.
+    async fn seed_resolvable_key(
+        server: &TestServer,
+        partition: lore_base::types::Partition,
+        label: &[u8],
+    ) -> (lore_base::types::Hash, Vec<u8>) {
+        use bytes::Bytes;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Fragment;
+        use lore_base::types::Hash;
+        use lore_base::types::KeyType;
+
+        let payload_bytes = label.to_vec();
+        let payload = Bytes::from(payload_bytes.clone());
+        let resolved = lore_storage::hash_slice(payload.as_ref());
+        let fragment = Fragment {
+            flags: 0,
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+        server
+            .backend_immutable
+            .clone()
+            .put(
+                partition,
+                Address {
+                    hash: resolved,
+                    context: Context::default(),
+                },
+                fragment,
+                Some(payload),
+                false,
+            )
+            .await
+            .expect("seed server with resolved blob");
+
+        let key = Hash::hash_buffer(label);
+        server
+            .backend_mutable
+            .clone()
+            .store(partition, key, resolved, KeyType::Resolve)
+            .await
+            .expect("seed server with resolve mapping");
+
+        (key, payload_bytes)
+    }
+
+    /// A missing key must not take the rest of the batch down with it.
+    ///
+    /// The per-item failure travels in the response's `status` field. Were it an `Err(Status)`
+    /// stream item instead, tonic would convert the first one to HTTP/2 trailers and end the
+    /// stream, so `present` would never be answered — silently, as an absent event rather than an
+    /// error. A miss is the expected outcome for `get_resolved`, which is what makes this the
+    /// regression worth pinning.
+    #[tokio::test]
+    async fn get_resolved_miss_does_not_end_the_stream() -> TestResult {
+        use lore::storage::get_resolved;
+        use lore::storage::get_resolved::LoreStorageGetResolvedArgs;
+        use lore::storage::get_resolved::LoreStorageGetResolvedItem;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-get-resolved-miss".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let partition = Partition::from([0xd1u8; 16]);
+                let (present, payload_bytes) =
+                    seed_resolvable_key(&server, partition, b"resolved-present").await;
+                let missing = Hash::hash_buffer(b"resolved-missing-never-seeded");
+
+                let handle_id = open_remote_handle(&server).await;
+
+                let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+                let received_for_cb = received.clone();
+                let outcomes: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> =
+                    Arc::new(Mutex::new(Vec::new()));
+                let outcomes_for_cb = outcomes.clone();
+                let callback: LoreEventCallback =
+                    Some(Box::new(move |event: &LoreEvent| match event {
+                        LoreEvent::StorageGetData(data) => {
+                            let slice = unsafe {
+                                std::slice::from_raw_parts(
+                                    data.bytes.ptr.cast::<u8>(),
+                                    data.bytes.len,
+                                )
+                            };
+                            received_for_cb.lock().unwrap().extend_from_slice(slice);
+                        }
+                        LoreEvent::StorageGetItemComplete(data) => {
+                            outcomes_for_cb
+                                .lock()
+                                .unwrap()
+                                .push((data.id, data.error_code));
+                        }
+                        _ => {}
+                    }));
+
+                // The miss is listed first so it reaches the server first; the old Err(Status)
+                // shape would have discarded everything queued behind it.
+                let items = vec![
+                    LoreStorageGetResolvedItem {
+                        id: 1,
+                        partition,
+                        key: missing,
+                        context: Context::default(),
+                        local_cache: 0,
+                        flags: 0,
+                    },
+                    LoreStorageGetResolvedItem {
+                        id: 2,
+                        partition,
+                        key: present,
+                        context: Context::default(),
+                        local_cache: 0,
+                        flags: 0,
+                    },
+                ];
+                get_resolved::get_resolved(
+                    LoreGlobalArgs::default(),
+                    LoreStorageGetResolvedArgs {
+                        handle: lore::storage::handle::LoreStore { handle_id },
+                        items: LoreArray::from_vec(items),
+                    },
+                    callback,
+                )
+                .await;
+
+                let mut outcomes = outcomes.lock().unwrap().clone();
+                outcomes.sort_by_key(|(id, _)| *id);
+                assert_eq!(
+                    outcomes.len(),
+                    2,
+                    "both items must report a terminal event; a missing one means the stream died"
+                );
+                assert_eq!(
+                    outcomes[0],
+                    (1, LoreErrorCode::AddressNotFound),
+                    "the unseeded key must report a miss"
+                );
+                assert_eq!(
+                    outcomes[1],
+                    (2, LoreErrorCode::None),
+                    "the seeded key must still be served after the miss"
+                );
+
+                let received = received.lock().unwrap().clone();
+                assert_eq!(
+                    received, payload_bytes,
+                    "the surviving item must deliver its payload"
+                );
+
+                // The batch above races: if the server happened to answer `present` before it
+                // errored `missing`, the old shape would have passed it too. This second call
+                // does not race. It reuses the same handle and therefore the same session and
+                // stream, so under the old shape the trailers sent for the first call's miss
+                // have already ended it, and the cached sender would reject this send outright.
+                let followup: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> =
+                    Arc::new(Mutex::new(Vec::new()));
+                let followup_for_cb = followup.clone();
+                let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                    if let LoreEvent::StorageGetItemComplete(data) = event {
+                        followup_for_cb
+                            .lock()
+                            .unwrap()
+                            .push((data.id, data.error_code));
+                    }
+                }));
+                get_resolved::get_resolved(
+                    LoreGlobalArgs::default(),
+                    LoreStorageGetResolvedArgs {
+                        handle: lore::storage::handle::LoreStore { handle_id },
+                        items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                            id: 3,
+                            partition,
+                            key: present,
+                            context: Context::default(),
+                            local_cache: 0,
+                            flags: 0,
+                        }]),
+                    },
+                    callback,
+                )
+                .await;
+
+                let followup = followup.lock().unwrap().clone();
+                assert_eq!(
+                    followup,
+                    vec![(3, LoreErrorCode::None)],
+                    "the session must still serve resolves after an earlier miss"
+                );
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    /// `local_cache=1` writes the key->hash mapping back to the local mutable store, so a later
+    /// resolve can be served without the network. Default (`local_cache=0`) leaves no mapping.
+    #[tokio::test]
+    async fn get_resolved_caches_mapping_only_when_local_cache_is_set() -> TestResult {
+        use lore::storage::get_resolved;
+        use lore::storage::get_resolved::LoreStorageGetResolvedArgs;
+        use lore::storage::get_resolved::LoreStorageGetResolvedItem;
+        use lore_base::types::Context;
+        use lore_base::types::KeyType;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-get-resolved-cache".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let partition = Partition::from([0xd2u8; 16]);
+                let (cached_key, cached_payload) =
+                    seed_resolvable_key(&server, partition, b"resolved-cache-me").await;
+                let (uncached_key, _) =
+                    seed_resolvable_key(&server, partition, b"resolved-do-not-cache").await;
+
+                let handle_id = open_remote_handle(&server).await;
+
+                let outcomes: Arc<Mutex<Vec<(u64, LoreErrorCode)>>> =
+                    Arc::new(Mutex::new(Vec::new()));
+                let outcomes_for_cb = outcomes.clone();
+                let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                    if let LoreEvent::StorageGetItemComplete(data) = event {
+                        outcomes_for_cb
+                            .lock()
+                            .unwrap()
+                            .push((data.id, data.error_code));
+                    }
+                }));
+
+                let items = vec![
+                    LoreStorageGetResolvedItem {
+                        id: 1,
+                        partition,
+                        key: cached_key,
+                        context: Context::default(),
+                        local_cache: 1,
+                        flags: 0,
+                    },
+                    LoreStorageGetResolvedItem {
+                        id: 2,
+                        partition,
+                        key: uncached_key,
+                        context: Context::default(),
+                        local_cache: 0,
+                        flags: 0,
+                    },
+                ];
+                get_resolved::get_resolved(
+                    LoreGlobalArgs::default(),
+                    LoreStorageGetResolvedArgs {
+                        handle: lore::storage::handle::LoreStore { handle_id },
+                        items: LoreArray::from_vec(items),
+                    },
+                    callback,
+                )
+                .await;
+
+                let outcomes = outcomes.lock().unwrap().clone();
+                assert_eq!(outcomes.len(), 2);
+                assert!(
+                    outcomes
+                        .iter()
+                        .all(|(_, code)| *code == LoreErrorCode::None),
+                    "both resolves must succeed against the remote: {outcomes:?}"
+                );
+
+                let local_mutable =
+                    lore::storage::handle::mutable_for_test(lore::storage::handle::LoreStore {
+                        handle_id,
+                    })
+                    .expect("handle still registered");
+
+                let cached = local_mutable
+                    .clone()
+                    .load(partition, cached_key, KeyType::Resolve)
+                    .await
+                    .expect("local_cache=1 must leave a Resolve mapping behind");
+                assert_eq!(
+                    cached,
+                    lore_storage::hash_slice(cached_payload.as_slice()),
+                    "the cached mapping must name the hash the server resolved to"
+                );
+
+                assert!(
+                    local_mutable
+                        .clone()
+                        .load(partition, uncached_key, KeyType::Resolve)
+                        .await
+                        .is_err(),
+                    "local_cache=0 must not write a mapping to the local mutable store"
+                );
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
 }
