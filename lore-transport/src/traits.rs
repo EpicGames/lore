@@ -185,6 +185,25 @@ pub trait Storage: Send + Sync {
         Err(ProtocolError::internal("unsupported: get_resolved"))
     }
 
+    /// `put(address, fragment, payload)` followed by a `KeyType::Resolve` mapping of `key` to
+    /// `address.hash`, performed server-side in one round trip. The write side of
+    /// [`Storage::get_resolved`].
+    ///
+    /// The mapping lands only once the fragment is durably stored, so a key never resolves to
+    /// content the server does not hold. Only a root fragment is published this way; a fragment
+    /// list's leaves are written with ordinary [`Storage::put`] calls beforehand.
+    async fn put_resolved(
+        &self,
+        session_id: u32,
+        key: &Hash,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<(), ProtocolError> {
+        let _ = (session_id, key, address, fragment, payload);
+        Err(ProtocolError::internal("unsupported: put_resolved"))
+    }
+
     /// Store a mutable key-value pair.
     async fn mutable_store(
         &self,

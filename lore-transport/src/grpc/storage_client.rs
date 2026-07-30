@@ -40,6 +40,8 @@ use crate::error::ProtocolError;
 type GetResponseSender = oneshot::Sender<Result<Arc<storage_v1::GetResponse>, ProtocolError>>;
 type GetResolvedResponseSender =
     oneshot::Sender<Result<Arc<storage_v1::GetResolvedResponse>, ProtocolError>>;
+type PutResolvedResponseSender =
+    oneshot::Sender<Result<Arc<storage_v1::PutResolvedResponse>, ProtocolError>>;
 type PutResponseSender = oneshot::Sender<Result<Arc<storage_v1::PutResponse>, ProtocolError>>;
 type CopyResponseSender = oneshot::Sender<Result<(), ProtocolError>>;
 
@@ -47,8 +49,10 @@ type CopyResponseSender = oneshot::Sender<Result<(), ProtocolError>>;
 /// succeeded. Routing the code through `tonic::Status` reuses the existing conversion, so a miss
 /// stays `NotFound` — which `read_resolved` needs in order to report `AddressNotFound` — and an
 /// older server's `Unimplemented` stays `NotSupported` instead of collapsing to `Internal`.
-fn item_status_error(response: &storage_v1::GetResolvedResponse) -> Option<ProtocolError> {
-    let status = response.status.as_ref()?;
+fn item_status_error(
+    status: Option<&lore_proto::lore::model::v1::ItemStatus>,
+) -> Option<ProtocolError> {
+    let status = status?;
     let code = tonic::Code::from_i32(status.code);
     if code == tonic::Code::Ok {
         return None;
@@ -77,6 +81,9 @@ struct SessionStreams {
     get_resolved_stream: tokio::sync::OnceCell<
         mpsc::Sender<(storage_v1::GetResolvedRequest, GetResolvedResponseSender)>,
     >,
+    put_resolved_stream: tokio::sync::OnceCell<
+        mpsc::Sender<(storage_v1::PutResolvedRequest, PutResolvedResponseSender)>,
+    >,
     put_stream: tokio::sync::OnceCell<mpsc::Sender<(storage_v1::PutRequest, PutResponseSender)>>,
     copy_stream: tokio::sync::OnceCell<mpsc::Sender<(storage_v1::CopyRequest, CopyResponseSender)>>,
 }
@@ -86,9 +93,10 @@ pub struct StorageService {
     /// Per-session streams keyed by session ID.
     streams: DashMap<u32, Arc<SessionStreams>>,
     get_put_limiter: Semaphore,
-    /// Source of `request_id` correlation handles for `get_resolved`, mirroring the QUIC response
-    /// reader's command-id counter.
-    get_resolved_counter: std::sync::atomic::AtomicU64,
+    /// Source of `request_id` correlation handles for `get_resolved` and `put_resolved`,
+    /// mirroring the QUIC response reader's command-id counter. Shared because ids only need to
+    /// be unique within a stream, and one counter trivially satisfies that for both.
+    resolved_counter: std::sync::atomic::AtomicU64,
 }
 
 fn inject_metadata<T>(request: &mut tonic::Request<T>, ctx: &GrpcSessionContext) {
@@ -122,7 +130,7 @@ impl StorageService {
             client,
             streams: DashMap::new(),
             get_put_limiter: Semaphore::new(INFLIGHT_COMMAND_LIMIT),
-            get_resolved_counter: std::sync::atomic::AtomicU64::new(0),
+            resolved_counter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -140,6 +148,7 @@ impl StorageService {
                     get_stream: tokio::sync::OnceCell::new(),
                     get_metadata_stream: tokio::sync::OnceCell::new(),
                     get_resolved_stream: tokio::sync::OnceCell::new(),
+                    put_resolved_stream: tokio::sync::OnceCell::new(),
                     put_stream: tokio::sync::OnceCell::new(),
                     copy_stream: tokio::sync::OnceCell::new(),
                 })
@@ -297,7 +306,7 @@ impl StorageService {
 
         // Never zero: the server treats a zero id as uncorrelatable and stream-fatal.
         let request_id = self
-            .get_resolved_counter
+            .resolved_counter
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .wrapping_add(1);
         let request = storage_v1::GetResolvedRequest {
@@ -363,6 +372,62 @@ impl StorageService {
         }
 
         Ok((Hash::from(&res.resolved[..]), fragment, res.payload.clone()))
+    }
+
+    /// Store a fragment and publish `key` naming it, in one round trip. The write side of
+    /// [`Self::get_resolved`], correlated the same way.
+    pub async fn put_resolved(
+        &self,
+        session_id: u32,
+        ctx: &GrpcSessionContext,
+        key: &Hash,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<(), ProtocolError> {
+        lore_debug!("gRPC put_resolved key: {} -> {}", key, address);
+
+        let streams = self.session_streams(session_id);
+        let stream = streams
+            .put_resolved_stream
+            .get_or_try_init(|| async {
+                self.spawn_put_resolved_stream(ctx)
+                    .internal("spawning put_resolved stream")
+            })
+            .await?
+            .clone();
+
+        let request_id = self
+            .resolved_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1);
+        let request = storage_v1::PutResolvedRequest {
+            request_id,
+            key: Bytes::from_owner(*key),
+            address: Some(address.into()),
+            fragment: Some(fragment.into()),
+            payload: payload.unwrap_or_default(),
+        };
+
+        let permit = self
+            .get_put_limiter
+            .acquire()
+            .await
+            .internal("permit acquire")?;
+        let (tx, rx) = oneshot::channel();
+        let result = match stream.send((request, tx)).await {
+            Ok(_) => rx.await.unwrap_or_else(|err| {
+                lore_error!("Error receiving put_resolved result from channel: {err}");
+                Err(ProtocolError::internal_with_context(err, "put_resolved"))
+            }),
+            Err(err) => {
+                lore_error!("Error sending key to put_resolved channel: {err}");
+                Err(ProtocolError::internal_with_context(err, "put_resolved"))
+            }
+        };
+
+        drop(permit);
+        result.map(|_| ())
     }
 
     pub async fn put(
@@ -993,7 +1058,7 @@ impl StorageService {
                             );
                             continue;
                         };
-                        let result = match item_status_error(&response) {
+                        let result = match item_status_error(response.status.as_ref()) {
                             Some(err) => Err(err),
                             None => Ok(Arc::new(response)),
                         };
@@ -1011,6 +1076,91 @@ impl StorageService {
 
             drain(ProtocolError::internal(
                 "get_resolved: stream closed before responding",
+            ));
+            Ok(())
+        });
+
+        Ok(tx)
+    }
+
+    /// Long-lived `PutResolved` stream for one session. Identical in shape to
+    /// [`Self::spawn_get_resolved_stream`]: `request_id` correlation, in-band per-item status,
+    /// and every waiter failed on the way out if the stream dies.
+    fn spawn_put_resolved_stream(
+        &self,
+        ctx: &GrpcSessionContext,
+    ) -> Result<
+        mpsc::Sender<(storage_v1::PutResolvedRequest, PutResolvedResponseSender)>,
+        ProtocolError,
+    > {
+        let mut client = self.client.clone();
+        let (tx, mut rx) = mpsc::channel::<(
+            storage_v1::PutResolvedRequest,
+            PutResolvedResponseSender,
+        )>(STREAM_WRITE_BUFFER_SIZE);
+
+        let pending = Arc::new(DashMap::<u64, PutResolvedResponseSender>::new());
+
+        let request_pending = pending.clone();
+        let request = async_stream::stream! {
+            while let Some((request, sender)) = rx.recv().await {
+                request_pending.insert(request.request_id, sender);
+                yield request;
+            }
+        };
+
+        let ctx = ctx.clone();
+        let fail_pending = pending.clone();
+        lore_spawn!(async move {
+            let mut req = tonic::Request::new(request);
+            inject_metadata(&mut req, &ctx);
+
+            let drain = |err: ProtocolError| {
+                let ids: Vec<u64> = fail_pending.iter().map(|entry| *entry.key()).collect();
+                for id in ids {
+                    if let Some((_, sender)) = fail_pending.remove(&id) {
+                        let _ = sender.send(Err(err.clone()));
+                    }
+                }
+            };
+
+            let mut response_stream = match client.put_resolved(req).await {
+                Ok(response) => response.into_inner(),
+                Err(err) => {
+                    lore_error!("PutResolved request failed: {err}");
+                    let err = ProtocolError::from(err);
+                    drain(err.clone());
+                    return Err(err);
+                }
+            };
+
+            while let Some(response) = response_stream.next().await {
+                match response {
+                    Ok(response) => {
+                        let Some((_, sender)) = pending.remove(&response.request_id) else {
+                            lore_error!(
+                                "PutResolved received unexpected result for request_id {}",
+                                response.request_id
+                            );
+                            continue;
+                        };
+                        let result = match item_status_error(response.status.as_ref()) {
+                            Some(err) => Err(err),
+                            None => Ok(Arc::new(response)),
+                        };
+                        let _ = sender.send(result);
+                    }
+                    Err(e) => {
+                        lore_error!("PutResolved stream failed: {e:?}");
+                        let err = ProtocolError::from(e);
+                        drain(err.clone());
+                        return Err(err);
+                    }
+                }
+            }
+
+            drain(ProtocolError::internal(
+                "put_resolved: stream closed before responding",
             ));
             Ok(())
         });

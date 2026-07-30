@@ -1053,6 +1053,20 @@ impl Storage for GRPCStorage {
             .await
     }
 
+    async fn put_resolved(
+        &self,
+        session_id: u32,
+        key: &Hash,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<(), ProtocolError> {
+        let ctx = self.session_context(session_id)?;
+        self.client
+            .put_resolved(session_id, &ctx, key, address, fragment, payload)
+            .await
+    }
+
     async fn put(
         &self,
         session_id: u32,

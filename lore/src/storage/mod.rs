@@ -58,6 +58,7 @@ pub mod obliterate;
 pub mod open;
 pub mod put;
 pub mod put_file;
+pub mod put_resolved;
 pub(crate) mod remote;
 pub(crate) mod store;
 pub mod upload;
@@ -94,8 +95,9 @@ pub async fn close_all_handles() {
 /// and running the close sequence on each. Client-mode handles (no connection id recorded)
 /// are unaffected. Per-handle drains run in parallel.
 ///
-/// IPC buffer-bearing args policy: `lore_storage_put`, `lore_storage_get`,
-/// `lore_storage_put_file`, `lore_storage_get_file`, and `lore_storage_upload` all carry
+/// IPC buffer-bearing args policy: `lore_storage_put`, `lore_storage_put_resolved`,
+/// `lore_storage_get`, `lore_storage_get_resolved`, `lore_storage_put_file`,
+/// `lore_storage_get_file`, and `lore_storage_upload` all carry
 /// `LoreBytes` views into caller memory that have no natural cross-process representation.
 /// Their args fail to deserialize on the server side; the dispatcher must reject them with
 /// `InvalidArguments` rather than attempt to round-trip the payload bytes through IPC.

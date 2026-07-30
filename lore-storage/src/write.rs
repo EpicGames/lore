@@ -24,6 +24,7 @@ use crate::fragment_flags::FragmentFlags;
 use crate::hash;
 use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
+use crate::mutable_store::MutableStore;
 use crate::options::ReadOptions;
 use crate::options::WriteOptions;
 use crate::read::load_fragment;
@@ -35,6 +36,7 @@ use crate::types::Context;
 use crate::types::Fragment;
 use crate::types::FragmentReference;
 use crate::types::Hash;
+use crate::types::KeyType;
 use crate::types::Partition;
 use crate::write_tracker::WriteTracker;
 
@@ -614,6 +616,94 @@ pub async fn store_raw_local(
     )
     .await?;
     Ok((result.address, result.fragment))
+}
+
+/// [`write_content`] plus publication of `key` as a `KeyType::Resolve` mapping to the content's
+/// hash — the write [`crate::read::read_resolved`] reads back.
+///
+/// The local store always receives both the content and the mapping. A `remote_session` also
+/// publishes them remotely, by one of two routes depending on how the content fragments:
+///
+/// - A buffer that fits one fragment is written locally first, then the stored root and the
+///   mapping go up together in a single `put_resolved` — one round trip instead of two, which is
+///   the case this command exists for. The fragment is re-read from the local store rather than
+///   reused from `buffer`, because compression may have changed what was actually stored.
+/// - A fragmented buffer goes through [`write_content`] normally so its leaves upload as usual,
+///   and the mapping follows as a plain `mutable_store`. Fusing the mapping into the *root's* put
+///   would save the same round trip here too, but only by threading a key parameter through
+///   `write_content` and `store_fragment` to some thirty call sites — and for a buffer large
+///   enough to fragment, the leaf uploads dominate that one trip anyway.
+///
+/// In both cases the mapping is written only after the content it names is stored, so a key never
+/// resolves to content that is not there.
+#[allow(clippy::too_many_arguments)]
+pub async fn write_resolved(
+    store: Arc<dyn ImmutableStore>,
+    mutable: Arc<dyn MutableStore>,
+    partition: Partition,
+    key: Hash,
+    context: Context,
+    buffer: Bytes,
+    flags: WriteOptions,
+    remote_session: Option<Arc<StorageSession>>,
+) -> Result<(Address, Fragment), StorageError> {
+    if key.is_zero() {
+        return Err(StorageError::internal(
+            "a zero key cannot be published; it is the mutable store's tombstone value",
+        ));
+    }
+
+    let single_fragment = buffer.len() <= crate::compress::FRAGMENT_SIZE_THRESHOLD;
+    let fuse_root_with_mapping = single_fragment && remote_session.is_some();
+
+    // When fusing, the remote write is `put_resolved`'s job, so `write_content` stays local.
+    let write_session = if fuse_root_with_mapping {
+        None
+    } else {
+        remote_session.clone()
+    };
+
+    let (address, fragment) = write_content(
+        store.clone(),
+        partition,
+        context,
+        buffer,
+        flags,
+        write_session,
+        None,
+        None,
+    )
+    .await?;
+
+    if let Some(session) = remote_session {
+        if fuse_root_with_mapping {
+            let (stored_fragment, payload) = crate::read::read_raw(
+                store.clone(),
+                partition,
+                address,
+                crate::store_types::StoreMatch::MatchFull,
+            )
+            .await?;
+            session
+                .put_resolved(&key, address, stored_fragment, Some(payload))
+                .await
+                .map_err(|err| crate::error::protocol_error_to_storage(err, address))?;
+        } else {
+            session
+                .mutable_store(key, address.hash, KeyType::Resolve)
+                .await
+                .map_err(|err| crate::error::protocol_error_to_storage(err, address))?;
+        }
+    }
+
+    mutable
+        .store(partition, key, address.hash, KeyType::Resolve)
+        .await
+        .map_err(|err| {
+            StorageError::internal_with_context(err, "failed to publish local resolve mapping")
+        })?;
+
+    Ok((address, fragment))
 }
 
 /// Write content (fragmenting if needed).

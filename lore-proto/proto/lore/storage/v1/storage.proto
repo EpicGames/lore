@@ -15,6 +15,10 @@ service StorageService {
     // storage API resolves keys in batches, so requests pipeline over one long-lived stream
     // instead of paying per-call setup and metadata injection.
     rpc GetResolved(stream GetResolvedRequest) returns (stream GetResolvedResponse);
+    // PutResolved: store a fragment and publish a mutable key naming it, in one round trip. The
+    // write side of GetResolved, and the only thing that makes a key resolvable. Shares
+    // GetResolved's correlation and in-band status shape.
+    rpc PutResolved(stream PutResolvedRequest) returns (stream PutResolvedResponse);
     rpc Put(stream PutRequest) returns (stream PutResponse);
     rpc Query(QueryRequest) returns (QueryResponse);
     rpc Verify(VerifyRequest) returns (VerifyResponse);
@@ -52,6 +56,24 @@ message GetResolvedResponse {
     bytes resolved = 3;
     lore.model.v1.Fragment fragment = 4;
     bytes payload = 5;
+}
+
+message PutResolvedRequest {
+    // Transport-assigned correlation handle, unique per stream. Never zero; see GetResolvedRequest.
+    uint64 request_id = 1;
+    // Mutable key to publish `address.hash` under, as KeyType::Resolve.
+    bytes key = 2;
+    // Content address of the fragment being stored.
+    lore.model.v1.Address address = 3;
+    lore.model.v1.Fragment fragment = 4;
+    bytes payload = 5;
+}
+
+message PutResolvedResponse {
+    uint64 request_id = 1;
+    // This item's outcome; absent or code 0 (OK) means the key was published. The stream
+    // continues either way.
+    lore.model.v1.ItemStatus status = 2;
 }
 
 message PutRequest {

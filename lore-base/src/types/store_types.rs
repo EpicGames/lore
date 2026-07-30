@@ -25,7 +25,8 @@ pub enum KeyType {
     RepositoryId = 5,
     /// Key refers to a repository instance.
     Instance = 6,
-    /// Key maps to an immutable content hash resolvable with `get_resolved`. The only type that
+    /// Key maps to an immutable content hash, written by `lore_storage_put_resolved` and read by
+    /// `lore_storage_get_resolved`. The only type that
     /// command reads, which is why it is never sent on the wire.
     Resolve = 7,
 }

@@ -332,6 +332,20 @@ impl QuicService for StorageServiceV4 {
                         )
                         .await
                     }
+                    // Needs BOTH stores (store the blob, then publish the key), same reason.
+                    crate::quic::storage_service::ParsedStorageRequest::PutResolved(resolved) => {
+                        crate::protocol::storage::put_resolved::handle_put_resolved(
+                            resolved.key,
+                            resolved.put(),
+                            resolved.address,
+                            repository,
+                            correlation_id,
+                            user_id,
+                            self.mutable_store.clone(),
+                            self.immutable_store.clone(),
+                        )
+                        .await
+                    }
                     crate::quic::storage_service::ParsedStorageRequest::MutableStoreOp(store) => {
                         handle_mutable_store(
                             store.key,

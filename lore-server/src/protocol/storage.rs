@@ -16,6 +16,7 @@ pub mod mutable_load;
 pub mod mutable_store_handler;
 pub mod ping;
 pub mod put;
+pub mod put_resolved;
 pub mod query;
 pub mod session;
 pub mod verify;
@@ -31,6 +32,7 @@ pub mod requests {
     pub use crate::protocol::storage::mutable_store_handler::MutableStoreOp;
     pub use crate::protocol::storage::ping::Ping;
     pub use crate::protocol::storage::put::Put;
+    pub use crate::protocol::storage::put_resolved::PutResolved;
     pub use crate::protocol::storage::query::Query;
     pub use crate::protocol::storage::verify::Verify;
 }
@@ -47,6 +49,7 @@ pub mod responses {
     pub use crate::protocol::storage::mutable_store_handler::MutableStoreResponse;
     pub use crate::protocol::storage::ping::PingResponse;
     pub use crate::protocol::storage::put::PutResponse;
+    pub use crate::protocol::storage::put_resolved::PutResolvedResponse;
     pub use crate::protocol::storage::query::QueryResponse;
     pub use crate::protocol::storage::verify::VerifyResponse;
 }

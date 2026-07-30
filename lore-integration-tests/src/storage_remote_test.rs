@@ -3205,6 +3205,246 @@ mod storage_remote_tests {
             .await
     }
 
+    /// The loop closed: publish through `put_resolved`, read back through `get_resolved`, both
+    /// via the public API against a real server. Every other `get_resolved` test seeds the
+    /// server's mutable store directly because until `put_resolved` existed there was no
+    /// producer — a fresh server answered every resolve with `ADDRESS_NOT_FOUND`.
+    #[tokio::test]
+    async fn put_resolved_then_get_resolved_round_trips_via_remote() -> TestResult {
+        use lore::storage::get_resolved;
+        use lore::storage::get_resolved::LoreStorageGetResolvedArgs;
+        use lore::storage::get_resolved::LoreStorageGetResolvedItem;
+        use lore::storage::put_resolved;
+        use lore::storage::put_resolved::LoreStoragePutResolvedArgs;
+        use lore::storage::put_resolved::LoreStoragePutResolvedItem;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::KeyType;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreBytes;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-put-get-resolved".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let partition = Partition::from([0xd3u8; 16]);
+                let key = Hash::hash_buffer(b"round-trip-key");
+                let payload = b"published through put_resolved".to_vec();
+
+                let handle_id = open_remote_handle(&server).await;
+
+                // Publish. `remote_write = 1` sends content and mapping to the server.
+                let put_outcomes: Arc<Mutex<Vec<(u64, Address, LoreErrorCode)>>> =
+                    Arc::new(Mutex::new(Vec::new()));
+                let put_for_cb = put_outcomes.clone();
+                let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                    if let LoreEvent::StoragePutItemComplete(data) = event {
+                        put_for_cb
+                            .lock()
+                            .unwrap()
+                            .push((data.id, data.address, data.error_code));
+                    }
+                }));
+
+                let status = put_resolved::put_resolved(
+                    LoreGlobalArgs::default(),
+                    LoreStoragePutResolvedArgs {
+                        handle: lore::storage::handle::LoreStore { handle_id },
+                        items: LoreArray::from_vec(vec![LoreStoragePutResolvedItem {
+                            id: 1,
+                            partition,
+                            key,
+                            context: Context::default(),
+                            data: LoreBytes {
+                                ptr: payload.as_ptr().cast(),
+                                len: payload.len(),
+                            },
+                            remote_write: 1,
+                            local_cache: 0,
+                            fixed_size_chunk: 0,
+                        }]),
+                    },
+                    callback,
+                )
+                .await;
+                assert_eq!(status, 0, "put_resolved must succeed");
+
+                let put_outcomes = put_outcomes.lock().unwrap().clone();
+                assert_eq!(put_outcomes.len(), 1);
+                let (_, published_address, code) = put_outcomes[0];
+                assert_eq!(code, LoreErrorCode::None);
+                assert_eq!(
+                    published_address.hash,
+                    lore_storage::hash_slice(payload.as_slice()),
+                    "the reported address must be the content the key now resolves to"
+                );
+
+                // The server holds the mapping, so a resolve is answerable remotely.
+                let server_mapping = server
+                    .backend_mutable
+                    .clone()
+                    .load(partition, key, KeyType::Resolve)
+                    .await
+                    .expect("put_resolved must publish the key on the server");
+                assert_eq!(server_mapping, published_address.hash);
+
+                // Read it back through get_resolved on a second handle, whose local store is
+                // empty — so the answer can only have come from the server.
+                let reader_handle = open_remote_handle(&server).await;
+                let received: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+                let received_for_cb = received.clone();
+                let outcomes: Arc<Mutex<Vec<(u64, Address, LoreErrorCode)>>> =
+                    Arc::new(Mutex::new(Vec::new()));
+                let outcomes_for_cb = outcomes.clone();
+                let callback: LoreEventCallback =
+                    Some(Box::new(move |event: &LoreEvent| match event {
+                        LoreEvent::StorageGetData(data) => {
+                            let slice = unsafe {
+                                std::slice::from_raw_parts(
+                                    data.bytes.ptr.cast::<u8>(),
+                                    data.bytes.len,
+                                )
+                            };
+                            received_for_cb.lock().unwrap().extend_from_slice(slice);
+                        }
+                        LoreEvent::StorageGetItemComplete(data) => {
+                            outcomes_for_cb.lock().unwrap().push((
+                                data.id,
+                                data.address,
+                                data.error_code,
+                            ));
+                        }
+                        _ => {}
+                    }));
+
+                get_resolved::get_resolved(
+                    LoreGlobalArgs::default(),
+                    LoreStorageGetResolvedArgs {
+                        handle: lore::storage::handle::LoreStore {
+                            handle_id: reader_handle,
+                        },
+                        items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                            id: 2,
+                            partition,
+                            key,
+                            context: Context::default(),
+                            local_cache: 0,
+                            flags: 0,
+                        }]),
+                    },
+                    callback,
+                )
+                .await;
+
+                let outcomes = outcomes.lock().unwrap().clone();
+                assert_eq!(outcomes.len(), 1);
+                assert_eq!(outcomes[0].2, LoreErrorCode::None, "resolve must succeed");
+                assert_eq!(
+                    outcomes[0].1, published_address,
+                    "get_resolved must report the address put_resolved published"
+                );
+                assert_eq!(
+                    received.lock().unwrap().clone(),
+                    payload,
+                    "the bytes read back must be the bytes published"
+                );
+
+                close_handle(reader_handle).await;
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    /// A publish that never reached the remote must not be resolvable there. Pins that
+    /// `remote_write` actually gates the remote half rather than everything going up regardless.
+    #[tokio::test]
+    async fn put_resolved_without_remote_write_stays_local() -> TestResult {
+        use lore::storage::put_resolved;
+        use lore::storage::put_resolved::LoreStoragePutResolvedArgs;
+        use lore::storage::put_resolved::LoreStoragePutResolvedItem;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::KeyType;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreBytes;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-put-resolved-local".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let partition = Partition::from([0xd4u8; 16]);
+                let key = Hash::hash_buffer(b"local-only-key");
+                let payload = b"never leaves this machine".to_vec();
+
+                let handle_id = open_remote_handle(&server).await;
+
+                let outcomes: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                let outcomes_for_cb = outcomes.clone();
+                let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                    if let LoreEvent::StoragePutItemComplete(data) = event {
+                        outcomes_for_cb.lock().unwrap().push(data.error_code);
+                    }
+                }));
+
+                put_resolved::put_resolved(
+                    LoreGlobalArgs::default(),
+                    LoreStoragePutResolvedArgs {
+                        handle: lore::storage::handle::LoreStore { handle_id },
+                        items: LoreArray::from_vec(vec![LoreStoragePutResolvedItem {
+                            id: 1,
+                            partition,
+                            key,
+                            context: Context::default(),
+                            data: LoreBytes {
+                                ptr: payload.as_ptr().cast(),
+                                len: payload.len(),
+                            },
+                            remote_write: 0,
+                            local_cache: 0,
+                            fixed_size_chunk: 0,
+                        }]),
+                    },
+                    callback,
+                )
+                .await;
+
+                assert_eq!(outcomes.lock().unwrap().clone(), vec![LoreErrorCode::None]);
+
+                let local_mutable =
+                    lore::storage::handle::mutable_for_test(lore::storage::handle::LoreStore {
+                        handle_id,
+                    })
+                    .expect("handle still registered");
+                assert!(
+                    local_mutable
+                        .clone()
+                        .load(partition, key, KeyType::Resolve)
+                        .await
+                        .is_ok(),
+                    "the local store must always receive the mapping"
+                );
+                assert!(
+                    server
+                        .backend_mutable
+                        .clone()
+                        .load(partition, key, KeyType::Resolve)
+                        .await
+                        .is_err(),
+                    "remote_write=0 must not publish the key to the server"
+                );
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
     /// `local_cache=1` writes the key->hash mapping back to the local mutable store, so a later
     /// resolve can be served without the network. Default (`local_cache=0`) leaves no mapping.
     #[tokio::test]

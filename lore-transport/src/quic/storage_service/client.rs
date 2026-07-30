@@ -486,6 +486,29 @@ impl Storage for StorageClient {
         .map(|_| ())
     }
 
+    async fn put_resolved(
+        &self,
+        session_id: u32,
+        key: &Hash,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<(), ProtocolError> {
+        // key (32) ++ Address (48) ++ Fragment (16) ++ payload — `put`'s framing with the mutable
+        // key prepended, keeping the 96-byte header a multiple of 4.
+        send_normal_with_reconnect(self, Command::PutResolved, session_id, || {
+            [
+                Bytes::default(),
+                Bytes::from_owner(*key),
+                Bytes::from_owner(address),
+                Bytes::from_owner(fragment),
+                payload.clone().unwrap_or_default(),
+            ]
+        })
+        .await
+        .map(|_| ())
+    }
+
     async fn query(&self, session_id: u32, address: &[Address]) -> Result<Bytes, ProtocolError> {
         const MAX_BATCH: usize = lore_base::types::FRAGMENT_SIZE_EXPECTED / size_of::<Address>();
         let address_count = address.len();
