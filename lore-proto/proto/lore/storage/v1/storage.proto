@@ -31,19 +31,24 @@ message GetResponse {
 }
 
 message GetResolvedRequest {
+    // Transport-assigned correlation handle, unique per stream, mirroring the QUIC
+    // CommandHeader's `command_id`. Never zero; a zero id cannot be correlated and is the one
+    // malformed-request case the server answers with a stream-level error.
+    uint64 request_id = 1;
     // `key.hash` is a mutable key, not a content hash; `key.context` is the context the
-    // resolved hash is read at. Packed as an Address because that pair is the request's
-    // identity, and the client correlates stream responses on it.
-    lore.model.v1.Address key = 1;
-    // Reserved bitmask; unknown bits are rejected rather than ignored. Echoed in the response
-    // so a request is identified by (key, flags) even if a future bit changes what comes back.
-    uint32 flags = 2;
+    // resolved hash is read at.
+    lore.model.v1.Address key = 2;
+    // Reserved bitmask; unknown bits are rejected rather than ignored.
+    uint32 flags = 3;
 }
 
 message GetResolvedResponse {
-    lore.model.v1.Address key = 1;
-    uint32 flags = 2;
-    // What the key resolved to. Addressed at `key.context`.
+    // Echoes the request's `request_id`. Set on every response, success or failure.
+    uint64 request_id = 1;
+    // This item's outcome. Absent or code 0 (OK) means the remaining fields are valid; anything
+    // else means they are unset and the item failed. The stream continues either way.
+    lore.model.v1.ItemStatus status = 2;
+    // What the key resolved to. Addressed at the request's `key.context`.
     bytes resolved = 3;
     lore.model.v1.Fragment fragment = 4;
     bytes payload = 5;

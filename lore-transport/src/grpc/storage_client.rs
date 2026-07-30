@@ -43,10 +43,21 @@ type GetResolvedResponseSender =
 type PutResponseSender = oneshot::Sender<Result<Arc<storage_v1::PutResponse>, ProtocolError>>;
 type CopyResponseSender = oneshot::Sender<Result<(), ProtocolError>>;
 
-/// Correlation handle for an in-flight `get_resolved`: the key address plus the flags it was
-/// requested with. Flags are part of the identity because a future flag bit could change what
-/// comes back, so two requests for one key with different flags must not be coalesced.
-type ResolveKey = (Address, u32);
+/// Translate a response's in-band `status` into a [`ProtocolError`], or `None` when the item
+/// succeeded. Routing the code through `tonic::Status` reuses the existing conversion, so a miss
+/// stays `NotFound` — which `read_resolved` needs in order to report `AddressNotFound` — and an
+/// older server's `Unimplemented` stays `NotSupported` instead of collapsing to `Internal`.
+fn item_status_error(response: &storage_v1::GetResolvedResponse) -> Option<ProtocolError> {
+    let status = response.status.as_ref()?;
+    let code = tonic::Code::from_i32(status.code);
+    if code == tonic::Code::Ok {
+        return None;
+    }
+    Some(ProtocolError::from(tonic::Status::new(
+        code,
+        status.message.clone(),
+    )))
+}
 
 const STREAM_WRITE_BUFFER_SIZE: usize = 32 * 1024;
 const INFLIGHT_COMMAND_LIMIT: usize = 10000;
@@ -63,8 +74,9 @@ pub struct GrpcSessionContext {
 struct SessionStreams {
     get_stream: tokio::sync::OnceCell<mpsc::Sender<(Address, GetResponseSender)>>,
     get_metadata_stream: tokio::sync::OnceCell<mpsc::Sender<(Address, GetResponseSender)>>,
-    get_resolved_stream:
-        tokio::sync::OnceCell<mpsc::Sender<(ResolveKey, GetResolvedResponseSender)>>,
+    get_resolved_stream: tokio::sync::OnceCell<
+        mpsc::Sender<(storage_v1::GetResolvedRequest, GetResolvedResponseSender)>,
+    >,
     put_stream: tokio::sync::OnceCell<mpsc::Sender<(storage_v1::PutRequest, PutResponseSender)>>,
     copy_stream: tokio::sync::OnceCell<mpsc::Sender<(storage_v1::CopyRequest, CopyResponseSender)>>,
 }
@@ -74,6 +86,9 @@ pub struct StorageService {
     /// Per-session streams keyed by session ID.
     streams: DashMap<u32, Arc<SessionStreams>>,
     get_put_limiter: Semaphore,
+    /// Source of `request_id` correlation handles for `get_resolved`, mirroring the QUIC response
+    /// reader's command-id counter.
+    get_resolved_counter: std::sync::atomic::AtomicU64,
 }
 
 fn inject_metadata<T>(request: &mut tonic::Request<T>, ctx: &GrpcSessionContext) {
@@ -107,6 +122,7 @@ impl StorageService {
             client,
             streams: DashMap::new(),
             get_put_limiter: Semaphore::new(INFLIGHT_COMMAND_LIMIT),
+            get_resolved_counter: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -252,8 +268,9 @@ impl StorageService {
     /// Resolve a mutable key under `KeyType::Resolve` and fetch the blob it names, in one round
     /// trip. Returns `(resolved_hash, fragment, payload)`.
     ///
-    /// `key` and `context` are packed into an [`Address`] because that pair is the request's
-    /// identity on the stream; the `hash` is a mutable key, not a content hash.
+    /// `key` and `context` travel as an [`Address`] whose `hash` is a mutable key, not a content
+    /// hash. Correlation is by a transport-assigned `request_id`, mirroring the QUIC transport's
+    /// `command_id`, so the request's content plays no part in routing the response.
     pub async fn get_resolved(
         &self,
         session_id: u32,
@@ -278,13 +295,24 @@ impl StorageService {
             .await?
             .clone();
 
+        // Never zero: the server treats a zero id as uncorrelatable and stream-fatal.
+        let request_id = self
+            .get_resolved_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1);
+        let request = storage_v1::GetResolvedRequest {
+            request_id,
+            key: Some(key_address.into()),
+            flags,
+        };
+
         let permit = self
             .get_put_limiter
             .acquire()
             .await
             .internal("permit acquire")?;
         let (tx, rx) = oneshot::channel();
-        let res = match stream.send(((key_address, flags), tx)).await {
+        let res = match stream.send((request, tx)).await {
             Ok(_) => rx.await.unwrap_or_else(|err| {
                 lore_error!("Error receiving get_resolved result from channel: {err}");
                 Err(ProtocolError::internal_with_context(err, "get_resolved"))
@@ -296,6 +324,17 @@ impl StorageService {
         }?;
 
         drop(permit);
+
+        if res.resolved.len() != size_of::<Hash>() {
+            lore_error!(
+                "Invalid get_resolved response, resolved hash is {} bytes, expected {}",
+                res.resolved.len(),
+                size_of::<Hash>()
+            );
+            return Err(ProtocolError::internal(
+                "get_resolved: Invalid resolved hash length",
+            ));
+        }
 
         let Some(fragment) = res.fragment else {
             lore_error!("Invalid get_resolved response, missing fragment");
@@ -887,121 +926,92 @@ impl StorageService {
         Ok(tx)
     }
 
-    /// Long-lived `GetResolved` stream for one session, mirroring [`Self::spawn_get_stream`]:
-    /// concurrent requests for the same `(key, flags)` coalesce into one wire request, and
-    /// responses fan back out to every waiting caller.
+    /// Long-lived `GetResolved` stream for one session, correlated by `request_id` exactly as the
+    /// QUIC transport's response reader correlates by `command_id`: a `pending` map from id to
+    /// waiter, with the request's content playing no part in routing.
     ///
-    /// Status codes are preserved rather than flattened to `internal`, as `get_metadata` does, so
-    /// `read_resolved` still sees a miss as `NotFound` and reports it as `AddressNotFound`.
+    /// Per-item failures arrive in the response's `status` field, so a miss cannot end the stream.
+    /// An `Err` from the stream itself *is* fatal — tonic has already sent trailers — so every
+    /// waiter is failed on the way out rather than left to hang.
     fn spawn_get_resolved_stream(
         &self,
         ctx: &GrpcSessionContext,
-    ) -> Result<mpsc::Sender<(ResolveKey, GetResolvedResponseSender)>, ProtocolError> {
+    ) -> Result<
+        mpsc::Sender<(storage_v1::GetResolvedRequest, GetResolvedResponseSender)>,
+        ProtocolError,
+    > {
         let mut client = self.client.clone();
-        let (tx, mut rx) =
-            mpsc::channel::<(ResolveKey, GetResolvedResponseSender)>(STREAM_WRITE_BUFFER_SIZE);
+        let (tx, mut rx) = mpsc::channel::<(
+            storage_v1::GetResolvedRequest,
+            GetResolvedResponseSender,
+        )>(STREAM_WRITE_BUFFER_SIZE);
 
-        let inflight = Arc::new(DashMap::<ResolveKey, Vec<GetResolvedResponseSender>>::new());
+        let pending = Arc::new(DashMap::<u64, GetResolvedResponseSender>::new());
 
-        let request_inflight = inflight.clone();
+        let request_pending = pending.clone();
         let request = async_stream::stream! {
-            while let Some((resolve_key, sender)) = rx.recv().await {
-                let mut send = false;
-                #[allow(clippy::disallowed_methods)]
-                {
-                    request_inflight.entry(resolve_key).or_insert_with(|| { send = true; vec![] }).push(sender);
-                }
-                if send {
-                    let (key_address, flags) = resolve_key;
-                    yield storage_v1::GetResolvedRequest {
-                        key: Some(key_address.into()),
-                        flags,
-                    };
-                }
+            while let Some((request, sender)) = rx.recv().await {
+                request_pending.insert(request.request_id, sender);
+                yield request;
             }
         };
 
         let ctx = ctx.clone();
+        let fail_pending = pending.clone();
         lore_spawn!(async move {
             let mut req = tonic::Request::new(request);
             inject_metadata(&mut req, &ctx);
 
-            let mut response_stream = client
-                .get_resolved(req)
-                .await
-                .map_err(|err| {
-                    lore_error!("GetResolved request failed: {err}");
-                    match err.code() {
-                        tonic::Code::Unavailable => ProtocolError::from(SlowDown),
-                        tonic::Code::Unimplemented => {
-                            ProtocolError::internal("unsupported: get_resolved")
-                        }
-                        _ => ProtocolError::internal(format!("get_resolved: {err}")),
+            // Fail every waiter with `err`, so a dead stream surfaces as an error rather than an
+            // indefinite wait holding a `get_put_limiter` permit.
+            let drain = |err: ProtocolError| {
+                let ids: Vec<u64> = fail_pending.iter().map(|entry| *entry.key()).collect();
+                for id in ids {
+                    if let Some((_, sender)) = fail_pending.remove(&id) {
+                        let _ = sender.send(Err(err.clone()));
                     }
-                })?
-                .into_inner();
+                }
+            };
+
+            let mut response_stream = match client.get_resolved(req).await {
+                Ok(response) => response.into_inner(),
+                Err(err) => {
+                    lore_error!("GetResolved request failed: {err}");
+                    let err = ProtocolError::from(err);
+                    drain(err.clone());
+                    return Err(err);
+                }
+            };
 
             while let Some(response) = response_stream.next().await {
                 match response {
                     Ok(response) => {
-                        let Some(key) = response.key.as_ref() else {
-                            return Err(ProtocolError::internal(
-                                "get_resolved: response missing key address",
-                            ));
-                        };
-                        let resolve_key = (Address::from(key), response.flags);
-                        let senders = inflight.remove(&resolve_key);
-                        if let Some((_, senders)) = senders {
-                            let response = Arc::new(response);
-                            for sender in senders {
-                                let _ = sender.send(Ok(response.clone())).map_err(|err| {
-                                    lore_error!(
-                                        "GetResolved failed sending response to requestor: {err:?}"
-                                    );
-                                });
-                            }
-                        } else {
+                        let Some((_, sender)) = pending.remove(&response.request_id) else {
                             lore_error!(
-                                "GetResolved received unexpected result for key: {:?}",
-                                key.hash
+                                "GetResolved received unexpected result for request_id {}",
+                                response.request_id
                             );
-                        }
+                            continue;
+                        };
+                        let result = match item_status_error(&response) {
+                            Some(err) => Err(err),
+                            None => Ok(Arc::new(response)),
+                        };
+                        let _ = sender.send(result);
                     }
                     Err(e) => {
-                        let key_address = Address::from(e.details());
-                        if key_address.is_zero() {
-                            lore_error!(
-                                "GetResolved request failed and no key address details found: {e:?}"
-                            );
-                            continue;
-                        }
-                        // Details carry only the key address, so every flag variant queued for
-                        // that key has to be failed.
-                        let matching: Vec<ResolveKey> = inflight
-                            .iter()
-                            .map(|entry| *entry.key())
-                            .filter(|(address, _flags)| *address == key_address)
-                            .collect();
-                        if matching.is_empty() {
-                            lore_error!("GetResolved missing key with error: {e:?}");
-                            continue;
-                        }
+                        // tonic ends a server stream at its first error, so nothing more arrives.
+                        lore_error!("GetResolved stream failed: {e:?}");
                         let err = ProtocolError::from(e);
-                        for resolve_key in matching {
-                            if let Some((_, senders)) = inflight.remove(&resolve_key) {
-                                for sender in senders {
-                                    let _ = sender.send(Err(err.clone())).map_err(|send_err| {
-                                        lore_error!(
-                                            "GetResolved sending error to requestor failed: {send_err:?}"
-                                        );
-                                    });
-                                }
-                            }
-                        }
+                        drain(err.clone());
+                        return Err(err);
                     }
                 }
             }
 
+            drain(ProtocolError::internal(
+                "get_resolved: stream closed before responding",
+            ));
             Ok(())
         });
 

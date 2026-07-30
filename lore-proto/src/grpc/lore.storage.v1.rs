@@ -20,14 +20,17 @@ impl ::prost::Name for GetResponse {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetResolvedRequest {
+    /// Transport-assigned correlation handle, unique per stream, mirroring the QUIC
+    /// CommandHeader's `command_id`. Never zero; a zero id cannot be correlated and is the one
+    /// malformed-request case the server answers with a stream-level error.
+    #[prost(uint64, tag = "1")]
+    pub request_id: u64,
     /// `key.hash` is a mutable key, not a content hash; `key.context` is the context the
-    /// resolved hash is read at. Packed as an Address because that pair is the request's
-    /// identity, and the client correlates stream responses on it.
-    #[prost(message, optional, tag = "1")]
+    /// resolved hash is read at.
+    #[prost(message, optional, tag = "2")]
     pub key: ::core::option::Option<crate::lore::model::v1::Address>,
-    /// Reserved bitmask; unknown bits are rejected rather than ignored. Echoed in the response
-    /// so a request is identified by (key, flags) even if a future bit changes what comes back.
-    #[prost(uint32, tag = "2")]
+    /// Reserved bitmask; unknown bits are rejected rather than ignored.
+    #[prost(uint32, tag = "3")]
     pub flags: u32,
 }
 impl ::prost::Name for GetResolvedRequest {
@@ -42,11 +45,14 @@ impl ::prost::Name for GetResolvedRequest {
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetResolvedResponse {
-    #[prost(message, optional, tag = "1")]
-    pub key: ::core::option::Option<crate::lore::model::v1::Address>,
-    #[prost(uint32, tag = "2")]
-    pub flags: u32,
-    /// What the key resolved to. Addressed at `key.context`.
+    /// Echoes the request's `request_id`. Set on every response, success or failure.
+    #[prost(uint64, tag = "1")]
+    pub request_id: u64,
+    /// This item's outcome. Absent or code 0 (OK) means the remaining fields are valid; anything
+    /// else means they are unset and the item failed. The stream continues either way.
+    #[prost(message, optional, tag = "2")]
+    pub status: ::core::option::Option<crate::lore::model::v1::ItemStatus>,
+    /// What the key resolved to. Addressed at the request's `key.context`.
     #[prost(bytes = "bytes", tag = "3")]
     pub resolved: ::prost::bytes::Bytes,
     #[prost(message, optional, tag = "4")]

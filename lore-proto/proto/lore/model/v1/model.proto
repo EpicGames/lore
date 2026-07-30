@@ -14,6 +14,15 @@ message Fragment {
 }
 
 // Content-addressed handle for a stored object.
+// Per-item outcome carried inside a streaming response, so one item's failure does not end the
+// stream. Mirrors the QUIC CommandHeader's `error` bit + `size_or_status`: the transport reports
+// each request's fate in-band, reserving a transport-level error for stream-fatal conditions.
+// `code` holds a gRPC status code; absent or OK means success.
+message ItemStatus {
+    int32 code = 1;
+    string message = 2;
+}
+
 message Address {
   // Content hash uniquely identifying the object.
   bytes hash = 1;

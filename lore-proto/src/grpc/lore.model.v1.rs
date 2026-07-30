@@ -24,6 +24,27 @@ impl ::prost::Name for Fragment {
     }
 }
 /// Content-addressed handle for a stored object.
+/// Per-item outcome carried inside a streaming response, so one item's failure does not end the
+/// stream. Mirrors the QUIC CommandHeader's `error` bit + `size_or_status`: the transport reports
+/// each request's fate in-band, reserving a transport-level error for stream-fatal conditions.
+/// `code` holds a gRPC status code; absent or OK means success.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ItemStatus {
+    #[prost(int32, tag = "1")]
+    pub code: i32,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
+impl ::prost::Name for ItemStatus {
+    const NAME: &'static str = "ItemStatus";
+    const PACKAGE: &'static str = "lore.model.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.model.v1.ItemStatus".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.model.v1.ItemStatus".into()
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct Address {
     /// Content hash uniquely identifying the object.
