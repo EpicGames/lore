@@ -25,6 +25,9 @@ pub enum KeyType {
     RepositoryId = 5,
     /// Key refers to a repository instance.
     Instance = 6,
+    /// Key maps to an immutable content hash resolvable with `get_resolved`. The only type that
+    /// command reads, which is why it is never sent on the wire.
+    Resolve = 7,
 }
 
 impl TryFrom<u8> for KeyType {
@@ -39,6 +42,7 @@ impl TryFrom<u8> for KeyType {
             4 => Ok(KeyType::RepositoryMetadata),
             5 => Ok(KeyType::RepositoryId),
             6 => Ok(KeyType::Instance),
+            7 => Ok(KeyType::Resolve),
             other => Err(other),
         }
     }

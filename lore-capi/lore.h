@@ -152,6 +152,9 @@ typedef enum lore_key_type_t {
   LORE_KEY_TYPE_REPOSITORY_ID = 5,
   // Key refers to a repository instance.
   LORE_KEY_TYPE_INSTANCE = 6,
+  // Key maps to an immutable content hash resolvable with `get_resolved`. The only type that
+  // command reads, which is why it is never sent on the wire.
+  LORE_KEY_TYPE_RESOLVE = 7,
 } lore_key_type_t;
 
 // Data for a generic progress event.

@@ -168,8 +168,9 @@ pub trait Storage: Send + Sync {
     /// `mutable_load(key)` followed by `get(Address { hash: resolved, context })`, performed
     /// server-side in one round trip.
     ///
-    /// `context` is required because the mutable store yields only a hash. `flags` is a
-    /// `get_resolved_flags` bitmask; 0 for default behaviour.
+    /// The key is always read as [`KeyType::Resolve`], so no key type is sent. `context` is
+    /// required because the mutable store yields only a hash. `flags` is a `get_resolved_flags`
+    /// bitmask; 0 for default behaviour.
     ///
     /// Returns `(resolved_hash, fragment, payload)`; the hash permits caching the key->hash
     /// mapping and verifying the payload.
@@ -177,11 +178,10 @@ pub trait Storage: Send + Sync {
         &self,
         session_id: u32,
         key: &Hash,
-        key_type: KeyType,
         context: &Context,
         flags: u32,
     ) -> Result<(Hash, Fragment, Bytes), ProtocolError> {
-        let _ = (session_id, key, key_type, context, flags);
+        let _ = (session_id, key, context, flags);
         Err(ProtocolError::internal("unsupported: get_resolved"))
     }
 

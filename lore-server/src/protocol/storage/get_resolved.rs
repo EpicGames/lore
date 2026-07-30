@@ -33,18 +33,18 @@ use crate::util::setup_execution;
 /// `flags` bits this build accepts. Reserved; none are defined. Unknown bits are rejected.
 pub const KNOWN_FLAGS: u32 = 0;
 
-/// Wire width of `flags` in bytes. The 4-byte `key_type`/`flags` tail keeps the request a
-/// multiple of 4.
-pub const FLAGS_WIRE_SIZE: usize = 3;
+/// Wire width of `flags` in bytes, sized so the request stays a multiple of 4.
+pub const FLAGS_WIRE_SIZE: usize = size_of::<u32>();
 
-/// Wire request: key `Hash` (32) ++ `Context` (16) ++ `key_type` (1) ++ `flags` u24 LE (3).
+/// Wire request: key `Hash` (32) ++ `Context` (16) ++ `flags` u32 LE (4).
+///
+/// No key type is carried: the key is always read as [`KeyType::Resolve`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct GetResolved {
     pub key: Hash,
     /// Paired with the resolved hash to address the immutable read; the mutable store yields
     /// only a hash.
     pub context: Context,
-    pub key_type: KeyType,
     /// See [`KNOWN_FLAGS`].
     pub flags: u32,
 }
@@ -53,35 +53,29 @@ impl GetResolved {
     pub fn parse(bytes: Bytes) -> Result<Self, MessageParseError> {
         const KEY: usize = size_of::<Hash>();
         const CTX: usize = size_of::<Context>();
-        const TAIL: usize = 1 + FLAGS_WIRE_SIZE;
-        if bytes.len() < KEY + CTX + TAIL {
+        if bytes.len() < KEY + CTX + FLAGS_WIRE_SIZE {
             return Err(MessageParseError::InvalidFieldLength);
         }
 
         let key = Hash::from(&bytes[..KEY]);
         let context = Context::from(&bytes[KEY..KEY + CTX]);
-        let key_type = KeyType::try_from(bytes[KEY + CTX])
-            .map_err(|_err| MessageParseError::InvalidFieldLength)?;
-        // u24 LE, zero-extended into the u32 we carry internally.
-        let flags_at = KEY + CTX + 1;
-        let mut flag_bytes = [0u8; size_of::<u32>()];
-        flag_bytes[..FLAGS_WIRE_SIZE].copy_from_slice(&bytes[flags_at..flags_at + FLAGS_WIRE_SIZE]);
+        let mut flag_bytes = [0u8; FLAGS_WIRE_SIZE];
+        flag_bytes.copy_from_slice(&bytes[KEY + CTX..KEY + CTX + FLAGS_WIRE_SIZE]);
         let flags = u32::from_le_bytes(flag_bytes);
 
         Ok(Self {
             key,
             context,
-            key_type,
             flags,
         })
     }
 }
 
+/// Resolve `key` as a [`KeyType::Resolve`] mapping and return the immutable blob it names.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_get_resolved(
     key: Hash,
     context: Context,
-    key_type: KeyType,
     flags: u32,
     repository: RepositoryId,
     correlation_id: String,
@@ -92,8 +86,8 @@ pub async fn handle_get_resolved(
     let execution = setup_execution(module_path!(), correlation_id, user_id);
 
     debug!(
-        "Handling get_resolved for key: {} key_type: {:?} in repository: {}",
-        key, key_type, repository
+        "Handling get_resolved for key: {} in repository: {}",
+        key, repository
     );
 
     if flags & !KNOWN_FLAGS != 0 {
@@ -107,7 +101,7 @@ pub async fn handle_get_resolved(
     LORE_CONTEXT
         .scope(execution, async move {
             // Step 1: resolve the mutable key to an immutable content hash.
-            let resolved = match mutable_store.load(repository, key, key_type).await {
+            let resolved = match mutable_store.load(repository, key, KeyType::Resolve).await {
                 Ok(value) => value,
                 Err(StoreError::SlowDown(_)) => return Err(MessageHandleError::SlowDown),
                 Err(StoreError::AddressNotFound(_)) => {
@@ -190,20 +184,19 @@ mod tests {
     use super::*;
     use crate::store::test_store_create;
 
-    fn request_bytes(key: Hash, context: Context, key_type: KeyType, flags: u32) -> Bytes {
+    fn request_bytes(key: Hash, context: Context, flags: u32) -> Bytes {
         let mut bytes = bytes::BytesMut::with_capacity(
-            size_of::<Hash>() + size_of::<Context>() + 1 + FLAGS_WIRE_SIZE,
+            size_of::<Hash>() + size_of::<Context>() + FLAGS_WIRE_SIZE,
         );
         bytes.extend_from_slice(key.as_bytes());
         bytes.extend_from_slice(context.as_bytes());
-        bytes.extend_from_slice(&[key_type as u8]);
-        bytes.extend_from_slice(&flags.to_le_bytes()[..FLAGS_WIRE_SIZE]);
+        bytes.extend_from_slice(&flags.to_le_bytes());
         bytes.freeze()
     }
 
     #[test]
     fn test_request_is_four_byte_aligned() {
-        let len = request_bytes(Hash::default(), Context::default(), KeyType::Untyped, 0).len();
+        let len = request_bytes(Hash::default(), Context::default(), 0).len();
         assert_eq!(len, 52);
         assert_eq!(len % 4, 0, "request should stay a multiple of 4 bytes");
     }
@@ -212,32 +205,30 @@ mod tests {
     fn test_parse() {
         let key = Hash::hash_buffer(b"test-key");
         let context = Context::default();
-        let parsed =
-            GetResolved::parse(request_bytes(key, context, KeyType::BranchMetadata, 0)).unwrap();
+        let parsed = GetResolved::parse(request_bytes(key, context, 0)).unwrap();
         assert_eq!(parsed.key, key);
         assert_eq!(parsed.context, context);
-        assert_eq!(parsed.key_type, KeyType::BranchMetadata);
         assert_eq!(parsed.flags, 0);
     }
 
     #[test]
-    fn test_parse_preserves_flags_across_all_24_bits() {
+    fn test_parse_preserves_all_flag_bits() {
         let key = Hash::hash_buffer(b"test-key");
-        // Every bit that fits on the wire must survive the u24 round trip.
-        for flags in [1u32, 0x80, 0xFF_FF, 0x00FF_FFFF] {
-            let parsed =
-                GetResolved::parse(request_bytes(key, Context::default(), KeyType::Untyped, flags))
-                    .unwrap();
+        for flags in [1u32, 0x80, 0xFF_FF, 0x00FF_FFFF, u32::MAX] {
+            let parsed = GetResolved::parse(request_bytes(key, Context::default(), flags)).unwrap();
             assert_eq!(parsed.flags, flags, "flags {flags:#x} did not round trip");
         }
     }
 
     #[test]
     fn test_parse_invalid_length() {
-        // One byte short of key + context + key_type + flags.
+        // One byte short of key + context + flags.
         let bytes = Bytes::from(vec![
             0u8;
-            size_of::<Hash>() + size_of::<Context>() + FLAGS_WIRE_SIZE
+            size_of::<Hash>()
+                + size_of::<Context>()
+                + FLAGS_WIRE_SIZE
+                - 1
         ]);
         assert_eq!(
             GetResolved::parse(bytes),
@@ -257,7 +248,6 @@ mod tests {
                 handle_get_resolved(
                     key,
                     Context::default(),
-                    KeyType::Untyped,
                     0,
                     repository,
                     String::new(),
@@ -288,13 +278,12 @@ mod tests {
             .scope(execution, async move {
                 mutable_store
                     .clone()
-                    .store(repository, key, value, KeyType::Untyped)
+                    .store(repository, key, value, KeyType::Resolve)
                     .await
                     .unwrap();
                 handle_get_resolved(
                     key,
                     Context::default(),
-                    KeyType::Untyped,
                     0,
                     repository,
                     String::new(),
@@ -320,7 +309,6 @@ mod tests {
                 handle_get_resolved(
                     Hash::hash_buffer(b"any-key"),
                     Context::default(),
-                    KeyType::Untyped,
                     1, // no bits are defined yet, so any bit must be refused
                     repository,
                     String::new(),

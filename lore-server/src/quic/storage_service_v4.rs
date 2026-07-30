@@ -323,7 +323,6 @@ impl QuicService for StorageServiceV4 {
                         crate::protocol::storage::get_resolved::handle_get_resolved(
                             resolved.key,
                             resolved.context,
-                            resolved.key_type,
                             resolved.flags,
                             repository,
                             correlation_id,

@@ -25,6 +25,7 @@ use crate::fs_util;
 use crate::hash;
 use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
+use crate::mutable_store::MutableStore;
 use crate::options::ReadOptions;
 use crate::store_types::StoreMatch;
 use crate::types::Address;
@@ -381,7 +382,6 @@ pub async fn load_fragment(
 async fn remote_get_resolved_retry(
     session: &StorageSession,
     key: Hash,
-    key_type: KeyType,
     context: Context,
     flags: u32,
 ) -> Result<(Hash, Fragment, Bytes), StorageError> {
@@ -391,7 +391,7 @@ async fn remote_get_resolved_retry(
     let key_address = Address { hash: key, context };
     loop {
         debug_assert!(!key.is_zero(), "Cannot resolve zero key from store");
-        match session.get_resolved(&key, key_type, &context, flags).await {
+        match session.get_resolved(&key, &context, flags).await {
             Ok(resolved) => return Ok(resolved),
             Err(ref e) if e.is_slow_down() => {
                 if !retry.wait().await {
@@ -416,62 +416,59 @@ async fn remote_get_resolved_retry(
     }
 }
 
-/// `mutable_load(key)` + [`read`] of the resulting address, resolved server-side so both
-/// share one round trip. Returns the resolved hash alongside the content.
+/// Local half of [`read_resolved`]: resolve `key` in the local mutable store and load the root it
+/// names from the local store only.
 ///
-/// Differs from [`read`] in two ways, both inherent to saving the round trip: the root is not
-/// probed locally first (its address is unknown until the server answers), and only the root
-/// arrives this way — a fragment list's leaves go through [`load_fragment`] and are still
-/// cached locally. The root is decompressed and verified against the resolved hash as
-/// [`load_fragment`] does.
-///
-/// `flags` is a reserved bitmask forwarded to the server; 0 for default behaviour.
-pub async fn read_resolved(
+/// `None` means the caller should ask the remote instead — the mapping is absent, it is a
+/// tombstone, or its root is not cached locally. Deliberately does not fall back to a remote read
+/// of the locally cached hash: a remote `get_resolved` answers the mapping and the root in the
+/// same single round trip, and does so against the authoritative mapping rather than one this
+/// store may have cached before the key moved.
+async fn load_resolved_local(
     store: Arc<dyn ImmutableStore>,
+    mutable: Arc<dyn MutableStore>,
     partition: Partition,
     key: Hash,
-    key_type: KeyType,
     context: Context,
-    flags: u32,
-    range: Option<Range<usize>>,
     options: ReadOptions,
-    session: Arc<StorageSession>,
-) -> Result<(Hash, Bytes), StorageError> {
-    let options = options.with_decompress();
-
-    let (resolved, mut fragment, buffer) =
-        remote_get_resolved_retry(session.as_ref(), key, key_type, context, flags).await?;
-
-    if resolved.is_zero() {
-        // A zero value means the key was deleted; treat as a miss rather than reading
-        // the zero address.
-        return Err(StorageError::from(crate::errors::AddressNotFound::from(
-            Address { hash: key, context },
-        )));
-    }
+) -> Option<(Hash, Fragment, Bytes)> {
+    let resolved = match mutable.load(partition, key, KeyType::Resolve).await {
+        Ok(resolved) if !resolved.is_zero() => resolved,
+        Ok(_) => return None,
+        Err(err) => {
+            lore_base::lore_trace!("Key {key} failed to resolve from local mutable store: {err:?}");
+            return None;
+        }
+    };
 
     let address = Address {
         hash: resolved,
         context,
     };
-
-    fragment.flags |= FragmentFlags::PayloadStoredDurable;
-    let store_fragment = fragment;
-    let raw_payload = buffer.clone();
-
-    let (fragment, buffer) = decompress_and_verify(fragment, buffer, address, options).await?;
-
-    // Mirror load_fragment's local write-back so a subsequent read of the same root can be
-    // served locally (and so the caller's own mutable_load + read path sees it).
-    let should_store = options.cache
-        || (fragment.flags & FragmentFlags::PayloadLocalCachePriority) != 0;
-    if should_store {
-        let _ = store
-            .clone()
-            .put(partition, address, store_fragment, Some(raw_payload), false)
-            .await;
+    match load_fragment(store, partition, address, options.no_remote(), None).await {
+        Ok((fragment, buffer)) => Some((resolved, fragment, buffer)),
+        Err(err) => {
+            lore_base::lore_trace!(
+                "Key {key} resolved locally to {resolved}, whose root is not cached: {err:?}"
+            );
+            None
+        }
     }
+}
 
+/// Shared tail of [`read_resolved`]: enforce `max_content_size`, clamp `range` to the content, and
+/// reassemble a fragment list's leaves through [`load_fragment`], which may fetch them remotely.
+#[allow(clippy::too_many_arguments)]
+async fn read_resolved_content(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    fragment: Fragment,
+    buffer: Bytes,
+    range: Option<Range<usize>>,
+    options: ReadOptions,
+    session: Option<Arc<StorageSession>>,
+) -> Result<Bytes, StorageError> {
     if let Some(max) = options.max_content_size
         && fragment.size_content > max
     {
@@ -491,27 +488,20 @@ pub async fn read_resolved(
         None => 0..fragment.size_content as usize,
     };
     if range.is_empty() {
-        return Ok((resolved, Bytes::default()));
+        return Ok(Bytes::default());
     }
 
     if (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented {
         let mut target_buffer = BytesMut::with_capacity(range.len());
+        // Safety: the capacity was just reserved, and read_defragment fully writes the range
+        // before the buffer is read back.
         unsafe {
             target_buffer.set_len(range.len());
         }
         let target_size = target_buffer.len();
         let target = target_buffer.split();
         read_defragment(
-            store,
-            partition,
-            address,
-            range,
-            fragment,
-            buffer,
-            target,
-            options,
-            0,
-            Some(session),
+            store, partition, address, range, fragment, buffer, target, options, 0, session,
         )
         .await?;
         if !target_buffer.try_reclaim(target_size) {
@@ -519,13 +509,131 @@ pub async fn read_resolved(
                 "failed to reclaim buffer after defragmenting",
             ));
         }
+        // Safety: try_reclaim just confirmed the split-off target bytes are back in this
+        // buffer's capacity, and read_defragment initialized all of them.
         unsafe {
             target_buffer.set_len(target_size);
         }
-        Ok((resolved, target_buffer.freeze()))
+        Ok(target_buffer.freeze())
     } else {
-        Ok((resolved, buffer.slice(range)))
+        Ok(buffer.slice(range))
     }
+}
+
+/// `mutable_load(key)` + [`read`] of the resulting address, resolved server-side so both share one
+/// round trip whenever the answer is not already local. Returns the resolved hash alongside the
+/// content.
+///
+/// The key is always read as [`KeyType::Resolve`], locally and remotely alike.
+///
+/// Local-first like [`read`]: [`load_resolved_local`] tries the local mutable store and the local
+/// copy of the root it names, and only a miss there reaches the remote. A fragment list's leaves
+/// go through [`load_fragment`] either way, so they keep their own local-then-remote fallback and
+/// local caching.
+///
+/// On a remote resolve the key->hash mapping is written back to the local mutable store once the
+/// payload write-back succeeds, under the same gate — so a later call can be served entirely
+/// locally, and the mapping is never left pointing at a root this store does not hold.
+///
+/// `flags` is a reserved bitmask forwarded to the server; 0 for default behaviour.
+#[allow(clippy::too_many_arguments)]
+pub async fn read_resolved(
+    store: Arc<dyn ImmutableStore>,
+    mutable: Arc<dyn MutableStore>,
+    partition: Partition,
+    key: Hash,
+    context: Context,
+    flags: u32,
+    range: Option<Range<usize>>,
+    options: ReadOptions,
+    session: Option<Arc<StorageSession>>,
+) -> Result<(Hash, Bytes), StorageError> {
+    let options = options.with_decompress();
+    let key_address = Address { hash: key, context };
+
+    if options.local
+        && let Some((resolved, fragment, buffer)) = load_resolved_local(
+            store.clone(),
+            mutable.clone(),
+            partition,
+            key,
+            context,
+            options,
+        )
+        .await
+    {
+        let address = Address {
+            hash: resolved,
+            context,
+        };
+        let bytes = read_resolved_content(
+            store, partition, address, fragment, buffer, range, options, session,
+        )
+        .await?;
+        return Ok((resolved, bytes));
+    }
+
+    if !options.remote {
+        return Err(StorageError::from(crate::errors::AddressNotFound::from(
+            key_address,
+        )));
+    }
+    let Some(session) = session else {
+        return Err(StorageError::from(crate::errors::AddressNotFound::from(
+            key_address,
+        )));
+    };
+
+    lore_base::lore_trace!("Resolve key {} from remote", key_address);
+
+    let (resolved, mut fragment, buffer) =
+        remote_get_resolved_retry(session.as_ref(), key, context, flags).await?;
+
+    if resolved.is_zero() {
+        // A zero value means the key was deleted; treat as a miss rather than reading
+        // the zero address.
+        return Err(StorageError::from(crate::errors::AddressNotFound::from(
+            key_address,
+        )));
+    }
+
+    let address = Address {
+        hash: resolved,
+        context,
+    };
+
+    fragment.flags |= FragmentFlags::PayloadStoredDurable;
+    let store_fragment = fragment;
+    let raw_payload = buffer.clone();
+
+    let (fragment, buffer) = decompress_and_verify(fragment, buffer, address, options).await?;
+
+    let should_store =
+        options.cache || (fragment.flags & FragmentFlags::PayloadLocalCachePriority) != 0;
+    if should_store
+        && store
+            .clone()
+            .put(partition, address, store_fragment, Some(raw_payload), false)
+            .await
+            .is_ok()
+    {
+        let _ = mutable
+            .store(partition, key, resolved, KeyType::Resolve)
+            .await;
+    }
+
+    let bytes = read_resolved_content(
+        store,
+        partition,
+        address,
+        fragment,
+        buffer,
+        range,
+        options,
+        Some(session),
+    )
+    .await?;
+    Ok((resolved, bytes))
 }
 
 /// Load a single raw fragment from local store, optionally decompressing and verifying.
@@ -995,6 +1103,8 @@ mod tests {
     use crate::fragment_flags::FragmentFlags;
     use crate::local::immutable_store::ImmutableStoreSettings;
     use crate::local::immutable_store::LocalImmutableStore;
+    use crate::local::mutable_store::LocalMutableStore;
+    use crate::local::mutable_store::MutableStoreSettings;
     use crate::test_util::TempDir;
     use crate::types::Context;
     use crate::write::try_acquire_in_flight;
@@ -1008,6 +1118,26 @@ mod tests {
         .await
         .expect("create test store");
         (dir, store)
+    }
+
+    async fn make_test_stores() -> (TempDir, Arc<dyn ImmutableStore>, Arc<dyn MutableStore>) {
+        let dir = TempDir::new("lore-storage-resolve-test-");
+        let immutable = LocalImmutableStore::new(
+            Some(PathBuf::from(dir.as_ref())),
+            ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("create test immutable store");
+        let mutable: Arc<dyn MutableStore> = Arc::new(
+            LocalMutableStore::new(
+                Some(PathBuf::from(dir.as_ref())),
+                MutableStoreSettings::default(),
+                immutable.clone(),
+            )
+            .await
+            .expect("create test mutable store"),
+        );
+        (dir, immutable, mutable)
     }
 
     fn make_input(seed: u8) -> (Partition, Address, Fragment, Bytes) {
@@ -1102,6 +1232,145 @@ mod tests {
             .await
             .expect("reader task joined")
             .expect_err("reader must not invent a fragment when leader wrote nothing");
+        assert!(
+            matches!(err, StorageError::AddressNotFound(_)),
+            "expected AddressNotFound, got {err:?}"
+        );
+    }
+
+    /// A key cached under [`KeyType::Resolve`] whose root is in the local store must be served
+    /// without ever needing a session, which is the whole point of caching the mapping.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_resolved_serves_local_mapping_without_session() {
+        let (_dir, immutable, mutable) = make_test_stores().await;
+        let (partition, address, fragment, payload) = make_input(0x51);
+        let key = hash::hash_slice(b"resolve-key");
+
+        immutable
+            .clone()
+            .put(partition, address, fragment, Some(payload.clone()), false)
+            .await
+            .expect("store root");
+        mutable
+            .clone()
+            .store(partition, key, address.hash, KeyType::Resolve)
+            .await
+            .expect("store resolve mapping");
+
+        let (resolved, bytes) = read_resolved(
+            immutable,
+            mutable,
+            partition,
+            key,
+            address.context,
+            0,
+            None,
+            ReadOptions::default(),
+            None,
+        )
+        .await
+        .expect("local mapping and root are both cached");
+
+        assert_eq!(resolved, address.hash);
+        assert_eq!(bytes.as_ref(), payload.as_ref());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_resolved_without_local_mapping_is_not_found() {
+        let (_dir, immutable, mutable) = make_test_stores().await;
+        let (partition, address, fragment, payload) = make_input(0x52);
+        let key = hash::hash_slice(b"unmapped-key");
+
+        immutable
+            .clone()
+            .put(partition, address, fragment, Some(payload), false)
+            .await
+            .expect("store root");
+
+        let err = read_resolved(
+            immutable,
+            mutable,
+            partition,
+            key,
+            address.context,
+            0,
+            None,
+            ReadOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("the root is cached but nothing maps the key to it");
+        assert!(
+            matches!(err, StorageError::AddressNotFound(_)),
+            "expected AddressNotFound, got {err:?}"
+        );
+    }
+
+    /// A cached mapping whose root is absent locally must fall through to the remote resolve
+    /// rather than remote-reading the cached hash, so with no session it is a plain miss.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_resolved_falls_through_when_local_root_is_absent() {
+        let (_dir, immutable, mutable) = make_test_stores().await;
+        let (partition, address, _fragment, _payload) = make_input(0x53);
+        let key = hash::hash_slice(b"dangling-resolve-key");
+
+        mutable
+            .clone()
+            .store(partition, key, address.hash, KeyType::Resolve)
+            .await
+            .expect("store resolve mapping");
+
+        let err = read_resolved(
+            immutable,
+            mutable,
+            partition,
+            key,
+            address.context,
+            0,
+            None,
+            ReadOptions::default(),
+            None,
+        )
+        .await
+        .expect_err("mapping resolves but its root was never stored");
+        assert!(
+            matches!(err, StorageError::AddressNotFound(_)),
+            "expected AddressNotFound, got {err:?}"
+        );
+    }
+
+    /// `no_local` handles must bypass the local mutable probe exactly as they bypass the local
+    /// immutable probe, so a perfectly good local mapping is still not consulted.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_resolved_skips_local_mapping_when_local_is_disabled() {
+        let (_dir, immutable, mutable) = make_test_stores().await;
+        let (partition, address, fragment, payload) = make_input(0x54);
+        let key = hash::hash_slice(b"bypassed-resolve-key");
+
+        immutable
+            .clone()
+            .put(partition, address, fragment, Some(payload), false)
+            .await
+            .expect("store root");
+        mutable
+            .clone()
+            .store(partition, key, address.hash, KeyType::Resolve)
+            .await
+            .expect("store resolve mapping");
+
+        let err = read_resolved(
+            immutable,
+            mutable,
+            partition,
+            key,
+            address.context,
+            0,
+            None,
+            ReadOptions::default().no_local(),
+            None,
+        )
+        .await
+        .expect_err("no_local must not consult the local mutable store");
         assert!(
             matches!(err, StorageError::AddressNotFound(_)),
             "expected AddressNotFound, got {err:?}"

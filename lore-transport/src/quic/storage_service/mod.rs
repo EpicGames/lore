@@ -34,27 +34,24 @@ pub enum Command {
     /// `mutable_load` + `get` performed server-side, saving one round trip. Resolves the key,
     /// treats the value as an immutable hash, and reads it at the caller-supplied `Context`.
     ///
-    /// Request:  key `Hash` (32) ++ `Context` (16) ++ `key_type` (1) ++ `flags` u24 LE (3)
+    /// Request:  key `Hash` (32) ++ `Context` (16) ++ `flags` u32 LE (4)
     /// Response: resolved `Hash` (32) ++ `Fragment` (16) ++ payload (`size_payload`)
     ///
-    /// The 4-byte `key_type`/`flags` tail keeps the request a multiple of 4. The resolved hash
-    /// is returned so the caller can cache the key->hash mapping and verify the payload.
+    /// The key type is always [`lore_base::types::KeyType::Resolve`] and is therefore not sent;
+    /// the 4-byte `flags` tail keeps the request a multiple of 4. The resolved hash is returned
+    /// so the caller can cache the key->hash mapping and verify the payload.
     /// Opcodes 4 and 5 are reserved (ping/correlate), hence 12.
     GetResolved = 12,
 }
 
 /// `flags` field of a [`Command::GetResolved`] request. Reserved; no bits are defined.
 ///
-/// Held as `u32`, transmitted as the low 24 bits. Unknown bits are rejected, not ignored.
+/// Transmitted as a full `u32`. Unknown bits are rejected, not ignored.
 pub mod get_resolved_flags {
     /// No optional behaviour.
     pub const NONE: u32 = 0;
     /// Bits this build accepts.
     pub const KNOWN: u32 = 0;
-    /// Wire width in bytes.
-    pub const WIRE_SIZE: usize = 3;
-    /// Largest value representable in [`WIRE_SIZE`] bytes.
-    pub const MAX: u32 = 0x00FF_FFFF;
 }
 
 impl From<Command> for QuicOpCode {

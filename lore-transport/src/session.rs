@@ -230,19 +230,17 @@ impl StorageSession {
         storage.mutable_load(session_id, key, key_type).await
     }
 
-    /// `mutable_load` + `get` in one round trip. Returns `(resolved_hash, fragment, payload)`.
+    /// `mutable_load` + `get` in one round trip, always reading the key as
+    /// [`KeyType::Resolve`]. Returns `(resolved_hash, fragment, payload)`.
     /// `flags` is a `get_resolved_flags` bitmask; 0 for default behaviour.
     pub async fn get_resolved(
         &self,
         key: &Hash,
-        key_type: KeyType,
         context: &Context,
         flags: u32,
     ) -> Result<(Hash, Fragment, Bytes), ProtocolError> {
         let (storage, session_id) = self.ensure().await?;
-        storage
-            .get_resolved(session_id, key, key_type, context, flags)
-            .await
+        storage.get_resolved(session_id, key, context, flags).await
     }
 
     pub async fn mutable_store(
