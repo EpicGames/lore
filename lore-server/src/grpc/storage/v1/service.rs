@@ -12,6 +12,8 @@ use super::copy::CopyResponseStream;
 use super::get;
 use super::get::GetResponseStream;
 use super::get_metadata;
+use super::get_resolved;
+use super::get_resolved::GetResolvedResponseStream;
 use super::mutable_compare_and_swap;
 use super::mutable_load;
 use super::mutable_store;
@@ -39,6 +41,21 @@ impl StorageServiceV1 for LoreStorageService {
         request: Request<Streaming<lore_proto::lore::model::v1::Address>>,
     ) -> Result<Response<Self::GetMetadataStream>, Status> {
         get_metadata::handler(request, self.immutable_store().clone(), self).await
+    }
+
+    type GetResolvedStream = GetResolvedResponseStream;
+
+    async fn get_resolved(
+        &self,
+        request: Request<Streaming<storage_v1::GetResolvedRequest>>,
+    ) -> Result<Response<Self::GetResolvedStream>, Status> {
+        get_resolved::handler(
+            request,
+            self.mutable_store().clone(),
+            self.immutable_store().clone(),
+            self,
+        )
+        .await
     }
 
     type PutStream = PutResponseStream;

@@ -10,6 +10,11 @@ service StorageService {
     // carries Fragment only — no payload bytes. Used by callers that need fragment metadata
     // (size, flags) for existence/size lookups without paying the payload transfer cost.
     rpc GetMetadata(stream lore.model.v1.Address) returns (stream GetResponse);
+    // GetResolved: mutable key -> immutable blob in one round trip. The key is always read as
+    // KeyType::Resolve, so no key type is carried. Streaming for the same reason Get is: the
+    // storage API resolves keys in batches, so requests pipeline over one long-lived stream
+    // instead of paying per-call setup and metadata injection.
+    rpc GetResolved(stream GetResolvedRequest) returns (stream GetResolvedResponse);
     rpc Put(stream PutRequest) returns (stream PutResponse);
     rpc Query(QueryRequest) returns (QueryResponse);
     rpc Verify(VerifyRequest) returns (VerifyResponse);
@@ -23,6 +28,25 @@ message GetResponse {
     lore.model.v1.Address address = 1;
     lore.model.v1.Fragment fragment = 2;
     bytes payload = 3;
+}
+
+message GetResolvedRequest {
+    // `key.hash` is a mutable key, not a content hash; `key.context` is the context the
+    // resolved hash is read at. Packed as an Address because that pair is the request's
+    // identity, and the client correlates stream responses on it.
+    lore.model.v1.Address key = 1;
+    // Reserved bitmask; unknown bits are rejected rather than ignored. Echoed in the response
+    // so a request is identified by (key, flags) even if a future bit changes what comes back.
+    uint32 flags = 2;
+}
+
+message GetResolvedResponse {
+    lore.model.v1.Address key = 1;
+    uint32 flags = 2;
+    // What the key resolved to. Addressed at `key.context`.
+    bytes resolved = 3;
+    lore.model.v1.Fragment fragment = 4;
+    bytes payload = 5;
 }
 
 message PutRequest {

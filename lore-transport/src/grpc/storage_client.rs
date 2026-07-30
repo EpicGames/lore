@@ -38,8 +38,15 @@ use super::REPOSITORY_ID_KEY;
 use crate::error::ProtocolError;
 
 type GetResponseSender = oneshot::Sender<Result<Arc<storage_v1::GetResponse>, ProtocolError>>;
+type GetResolvedResponseSender =
+    oneshot::Sender<Result<Arc<storage_v1::GetResolvedResponse>, ProtocolError>>;
 type PutResponseSender = oneshot::Sender<Result<Arc<storage_v1::PutResponse>, ProtocolError>>;
 type CopyResponseSender = oneshot::Sender<Result<(), ProtocolError>>;
+
+/// Correlation handle for an in-flight `get_resolved`: the key address plus the flags it was
+/// requested with. Flags are part of the identity because a future flag bit could change what
+/// comes back, so two requests for one key with different flags must not be coalesced.
+type ResolveKey = (Address, u32);
 
 const STREAM_WRITE_BUFFER_SIZE: usize = 32 * 1024;
 const INFLIGHT_COMMAND_LIMIT: usize = 10000;
@@ -56,6 +63,8 @@ pub struct GrpcSessionContext {
 struct SessionStreams {
     get_stream: tokio::sync::OnceCell<mpsc::Sender<(Address, GetResponseSender)>>,
     get_metadata_stream: tokio::sync::OnceCell<mpsc::Sender<(Address, GetResponseSender)>>,
+    get_resolved_stream:
+        tokio::sync::OnceCell<mpsc::Sender<(ResolveKey, GetResolvedResponseSender)>>,
     put_stream: tokio::sync::OnceCell<mpsc::Sender<(storage_v1::PutRequest, PutResponseSender)>>,
     copy_stream: tokio::sync::OnceCell<mpsc::Sender<(storage_v1::CopyRequest, CopyResponseSender)>>,
 }
@@ -114,6 +123,7 @@ impl StorageService {
                 Arc::new(SessionStreams {
                     get_stream: tokio::sync::OnceCell::new(),
                     get_metadata_stream: tokio::sync::OnceCell::new(),
+                    get_resolved_stream: tokio::sync::OnceCell::new(),
                     put_stream: tokio::sync::OnceCell::new(),
                     copy_stream: tokio::sync::OnceCell::new(),
                 })
@@ -237,6 +247,83 @@ impl StorageService {
             size_payload: fragment.size_payload,
             size_content: fragment.size_content,
         })
+    }
+
+    /// Resolve a mutable key under `KeyType::Resolve` and fetch the blob it names, in one round
+    /// trip. Returns `(resolved_hash, fragment, payload)`.
+    ///
+    /// `key` and `context` are packed into an [`Address`] because that pair is the request's
+    /// identity on the stream; the `hash` is a mutable key, not a content hash.
+    pub async fn get_resolved(
+        &self,
+        session_id: u32,
+        ctx: &GrpcSessionContext,
+        key: &Hash,
+        context: &Context,
+        flags: u32,
+    ) -> Result<(Hash, Fragment, Bytes), ProtocolError> {
+        let key_address = Address {
+            hash: *key,
+            context: *context,
+        };
+        lore_debug!("gRPC get_resolved key: {}", key_address);
+
+        let streams = self.session_streams(session_id);
+        let stream = streams
+            .get_resolved_stream
+            .get_or_try_init(|| async {
+                self.spawn_get_resolved_stream(ctx)
+                    .internal("spawning get_resolved stream")
+            })
+            .await?
+            .clone();
+
+        let permit = self
+            .get_put_limiter
+            .acquire()
+            .await
+            .internal("permit acquire")?;
+        let (tx, rx) = oneshot::channel();
+        let res = match stream.send(((key_address, flags), tx)).await {
+            Ok(_) => rx.await.unwrap_or_else(|err| {
+                lore_error!("Error receiving get_resolved result from channel: {err}");
+                Err(ProtocolError::internal_with_context(err, "get_resolved"))
+            }),
+            Err(err) => {
+                lore_error!("Error sending key to get_resolved channel: {err}");
+                Err(ProtocolError::internal_with_context(err, "get_resolved"))
+            }
+        }?;
+
+        drop(permit);
+
+        let Some(fragment) = res.fragment else {
+            lore_error!("Invalid get_resolved response, missing fragment");
+            return Err(ProtocolError::internal("get_resolved: Missing fragment"));
+        };
+
+        let fragment = Fragment {
+            flags: fragment.flags,
+            size_payload: fragment.size_payload,
+            size_content: fragment.size_content,
+        };
+
+        if let Err(reason) = lore_base::types::validate_fragment_response(&fragment) {
+            lore_error!("Invalid fragment in get_resolved response {fragment:?}: {reason}");
+            return Err(ProtocolError::internal(format!(
+                "get_resolved: invalid fragment: {reason}"
+            )));
+        }
+        if res.payload.len() != fragment.size_payload as usize {
+            lore_error!(
+                "Fragment payload is invalid in get_resolved response: {} bytes, expected {}",
+                res.payload.len(),
+                fragment.size_payload
+            );
+            return Err(ProtocolError::internal("get_resolved: Invalid payload"));
+        }
+
+        Ok((Hash::from(&res.resolved[..]), fragment, res.payload.clone()))
     }
 
     pub async fn put(
@@ -789,6 +876,127 @@ impl StorageService {
                             lore_error!(
                                 "GetMetadata request failed and no address details found: {e:?}"
                             );
+                        }
+                    }
+                }
+            }
+
+            Ok(())
+        });
+
+        Ok(tx)
+    }
+
+    /// Long-lived `GetResolved` stream for one session, mirroring [`Self::spawn_get_stream`]:
+    /// concurrent requests for the same `(key, flags)` coalesce into one wire request, and
+    /// responses fan back out to every waiting caller.
+    ///
+    /// Status codes are preserved rather than flattened to `internal`, as `get_metadata` does, so
+    /// `read_resolved` still sees a miss as `NotFound` and reports it as `AddressNotFound`.
+    fn spawn_get_resolved_stream(
+        &self,
+        ctx: &GrpcSessionContext,
+    ) -> Result<mpsc::Sender<(ResolveKey, GetResolvedResponseSender)>, ProtocolError> {
+        let mut client = self.client.clone();
+        let (tx, mut rx) =
+            mpsc::channel::<(ResolveKey, GetResolvedResponseSender)>(STREAM_WRITE_BUFFER_SIZE);
+
+        let inflight = Arc::new(DashMap::<ResolveKey, Vec<GetResolvedResponseSender>>::new());
+
+        let request_inflight = inflight.clone();
+        let request = async_stream::stream! {
+            while let Some((resolve_key, sender)) = rx.recv().await {
+                let mut send = false;
+                #[allow(clippy::disallowed_methods)]
+                {
+                    request_inflight.entry(resolve_key).or_insert_with(|| { send = true; vec![] }).push(sender);
+                }
+                if send {
+                    let (key_address, flags) = resolve_key;
+                    yield storage_v1::GetResolvedRequest {
+                        key: Some(key_address.into()),
+                        flags,
+                    };
+                }
+            }
+        };
+
+        let ctx = ctx.clone();
+        lore_spawn!(async move {
+            let mut req = tonic::Request::new(request);
+            inject_metadata(&mut req, &ctx);
+
+            let mut response_stream = client
+                .get_resolved(req)
+                .await
+                .map_err(|err| {
+                    lore_error!("GetResolved request failed: {err}");
+                    match err.code() {
+                        tonic::Code::Unavailable => ProtocolError::from(SlowDown),
+                        tonic::Code::Unimplemented => {
+                            ProtocolError::internal("unsupported: get_resolved")
+                        }
+                        _ => ProtocolError::internal(format!("get_resolved: {err}")),
+                    }
+                })?
+                .into_inner();
+
+            while let Some(response) = response_stream.next().await {
+                match response {
+                    Ok(response) => {
+                        let Some(key) = response.key.as_ref() else {
+                            return Err(ProtocolError::internal(
+                                "get_resolved: response missing key address",
+                            ));
+                        };
+                        let resolve_key = (Address::from(key), response.flags);
+                        let senders = inflight.remove(&resolve_key);
+                        if let Some((_, senders)) = senders {
+                            let response = Arc::new(response);
+                            for sender in senders {
+                                let _ = sender.send(Ok(response.clone())).map_err(|err| {
+                                    lore_error!(
+                                        "GetResolved failed sending response to requestor: {err:?}"
+                                    );
+                                });
+                            }
+                        } else {
+                            lore_error!(
+                                "GetResolved received unexpected result for key: {:?}",
+                                key.hash
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        let key_address = Address::from(e.details());
+                        if key_address.is_zero() {
+                            lore_error!(
+                                "GetResolved request failed and no key address details found: {e:?}"
+                            );
+                            continue;
+                        }
+                        // Details carry only the key address, so every flag variant queued for
+                        // that key has to be failed.
+                        let matching: Vec<ResolveKey> = inflight
+                            .iter()
+                            .map(|entry| *entry.key())
+                            .filter(|(address, _flags)| *address == key_address)
+                            .collect();
+                        if matching.is_empty() {
+                            lore_error!("GetResolved missing key with error: {e:?}");
+                            continue;
+                        }
+                        let err = ProtocolError::from(e);
+                        for resolve_key in matching {
+                            if let Some((_, senders)) = inflight.remove(&resolve_key) {
+                                for sender in senders {
+                                    let _ = sender.send(Err(err.clone())).map_err(|send_err| {
+                                        lore_error!(
+                                            "GetResolved sending error to requestor failed: {send_err:?}"
+                                        );
+                                    });
+                                }
+                            }
                         }
                     }
                 }

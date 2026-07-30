@@ -3,6 +3,7 @@
 pub mod copy;
 pub mod get;
 pub mod get_metadata;
+pub mod get_resolved;
 pub mod mutable_compare_and_swap;
 pub mod mutable_load;
 pub mod mutable_store;
