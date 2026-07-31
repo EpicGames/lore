@@ -192,6 +192,8 @@ pub trait Storage: Send + Sync {
     /// The mapping lands only once the fragment is durably stored, so a key never resolves to
     /// content the server does not hold. Only a root fragment is published this way; a fragment
     /// list's leaves are written with ordinary [`Storage::put`] calls beforehand.
+    ///
+    /// A zero `address.hash` removes the mapping instead; `fragment` and `payload` are ignored.
     async fn put_resolved(
         &self,
         session_id: u32,

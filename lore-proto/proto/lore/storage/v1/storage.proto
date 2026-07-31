@@ -63,7 +63,8 @@ message PutResolvedRequest {
     uint64 request_id = 1;
     // Mutable key to publish `address.hash` under, as KeyType::Resolve.
     bytes key = 2;
-    // Content address of the fragment being stored.
+    // Content address of the fragment being stored. A zero hash removes the key's mapping
+    // instead of publishing one, and then `fragment` and `payload` are ignored.
     lore.model.v1.Address address = 3;
     lore.model.v1.Fragment fragment = 4;
     bytes payload = 5;

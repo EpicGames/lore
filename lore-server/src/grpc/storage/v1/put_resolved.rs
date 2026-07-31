@@ -68,7 +68,8 @@ struct ParsedRequest {
     request_id: u64,
     key: Hash,
     address: Address,
-    put: Put,
+    /// `None` when `address.hash` is zero, i.e. the request removes the mapping.
+    put: Option<Put>,
 }
 
 /// A request that cannot be correlated back to a caller; see [`super::get_resolved`].
@@ -77,6 +78,9 @@ struct Uncorrelatable(Status);
 
 /// A zero `request_id` is uncorrelatable. Everything else — a missing address or fragment, a zero
 /// key, fragment metadata that fails validation — is reported in-band against the id.
+///
+/// A zero `address.hash` is a deletion: no fragment is required or validated, because there is
+/// nothing to store.
 fn parse_request(
     request: storage_v1::PutResolvedRequest,
 ) -> Result<Result<ParsedRequest, (u64, Status)>, Uncorrelatable> {
@@ -102,33 +106,36 @@ fn parse_request(
             Status::invalid_argument("put_resolved: request missing address"),
         )));
     };
-    let Some(fragment) = request.fragment else {
-        return Ok(Err((
-            request_id,
-            Status::invalid_argument("put_resolved: request missing fragment"),
-        )));
-    };
-
     let address = Address::from(&address);
-    let payload = if request.payload.is_empty() {
+
+    let put = if address.hash.is_zero() {
         None
     } else {
-        Some(request.payload)
-    };
-
-    let put = match (UnvalidatedPut {
-        address,
-        fragment: Fragment::from(&fragment),
-        payload,
-    })
-    .validate()
-    {
-        Ok(put) => put,
-        Err(err) => {
+        let Some(fragment) = request.fragment else {
             return Ok(Err((
                 request_id,
-                Status::invalid_argument(format!("put_resolved: invalid fragment: {err}")),
+                Status::invalid_argument("put_resolved: request missing fragment"),
             )));
+        };
+        let payload = if request.payload.is_empty() {
+            None
+        } else {
+            Some(request.payload)
+        };
+        match (UnvalidatedPut {
+            address,
+            fragment: Fragment::from(&fragment),
+            payload,
+        })
+        .validate()
+        {
+            Ok(put) => Some(put),
+            Err(err) => {
+                return Ok(Err((
+                    request_id,
+                    Status::invalid_argument(format!("put_resolved: invalid fragment: {err}")),
+                )));
+            }
         }
     };
 
@@ -305,7 +312,7 @@ async fn store_item(
 
     match handle_put_resolved(
         key,
-        &put,
+        put.as_ref(),
         address,
         repository,
         correlation_id,

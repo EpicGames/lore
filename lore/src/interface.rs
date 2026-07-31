@@ -6346,9 +6346,11 @@ pub type LoreStoragePutResolvedArgs = crate::storage::put_resolved::LoreStorageP
 ///
 /// The local store always receives both the content and the mapping. `remote_write = 1` also
 /// publishes them remotely, matching `lore_storage_put`; there is no local-then-remote fallback.
-/// A zero `key`, a zero `partition`, or an empty buffer rejects with `INVALID_ARGUMENTS` — an
-/// empty buffer would publish a key resolving to the zero hash, which is what deleting it looks
-/// like.
+/// A zero `key` or a zero `partition` rejects with `INVALID_ARGUMENTS`.
+///
+/// A zero-length `data` **removes** the key's mapping rather than publishing one: no content is
+/// stored, the key is set to the zero hash, and `lore_storage_get_resolved` then reports
+/// `ADDRESS_NOT_FOUND` for it. The terminal event carries the zero address.
 ///
 /// # Events
 ///

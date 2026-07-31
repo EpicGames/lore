@@ -4703,7 +4703,8 @@ typedef struct lore_storage_put_resolved_item_t {
   // Dedup tag stored alongside the content hash in the resulting address, and the context a
   // later `get_resolved` must read the key at
   struct lore_context_t context;
-  // Borrowed view into caller memory; bytes must live until `Complete` fires
+  // Borrowed view into caller memory; bytes must live until `Complete` fires. A zero-length
+  // buffer removes the key's mapping instead of publishing one
   struct lore_bytes_t data;
   // Also publish the content and the mapping to the remote; ignored when the handle has no
   // remote or the call is offline/local
@@ -10355,9 +10356,11 @@ void lore_storage_get_resolved_async(const struct lore_global_args_t *globals,
 //
 // The local store always receives both the content and the mapping. `remote_write = 1` also
 // publishes them remotely, matching `lore_storage_put`; there is no local-then-remote fallback.
-// A zero `key`, a zero `partition`, or an empty buffer rejects with `INVALID_ARGUMENTS` — an
-// empty buffer would publish a key resolving to the zero hash, which is what deleting it looks
-// like.
+// A zero `key` or a zero `partition` rejects with `INVALID_ARGUMENTS`.
+//
+// A zero-length `data` **removes** the key's mapping rather than publishing one: no content is
+// stored, the key is set to the zero hash, and `lore_storage_get_resolved` then reports
+// `ADDRESS_NOT_FOUND` for it. The terminal event carries the zero address.
 //
 // # Events
 //

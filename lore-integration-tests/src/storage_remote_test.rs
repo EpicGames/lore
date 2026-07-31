@@ -3359,6 +3359,133 @@ mod storage_remote_tests {
             .await
     }
 
+    /// An empty buffer removes the mapping, so a key's whole lifecycle — publish, resolve,
+    /// delete, resolve again — runs through `put_resolved` and `get_resolved` alone.
+    #[tokio::test]
+    async fn put_resolved_with_empty_buffer_deletes_the_mapping() -> TestResult {
+        use lore::storage::get_resolved;
+        use lore::storage::get_resolved::LoreStorageGetResolvedArgs;
+        use lore::storage::get_resolved::LoreStorageGetResolvedItem;
+        use lore::storage::put_resolved;
+        use lore::storage::put_resolved::LoreStoragePutResolvedArgs;
+        use lore::storage::put_resolved::LoreStoragePutResolvedItem;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::KeyType;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreBytes;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-put-resolved-delete".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let partition = Partition::from([0xd5u8; 16]);
+                let key = Hash::hash_buffer(b"lifecycle-key");
+                let payload = b"published then deleted".to_vec();
+                let handle_id = open_remote_handle(&server).await;
+
+                let publish = |data: LoreBytes| LoreStoragePutResolvedItem {
+                    id: 1,
+                    partition,
+                    key,
+                    context: Context::default(),
+                    data,
+                    remote_write: 1,
+                    local_cache: 0,
+                    fixed_size_chunk: 0,
+                };
+
+                let put_once = async |item: LoreStoragePutResolvedItem| {
+                    let codes: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                    let codes_for_cb = codes.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                        if let LoreEvent::StoragePutItemComplete(data) = event {
+                            codes_for_cb.lock().unwrap().push(data.error_code);
+                        }
+                    }));
+                    put_resolved::put_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStoragePutResolvedArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id },
+                            items: LoreArray::from_vec(vec![item]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    let codes = codes.lock().unwrap().clone();
+                    assert_eq!(codes, vec![LoreErrorCode::None]);
+                };
+
+                let resolve_once = async || {
+                    let codes: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                    let codes_for_cb = codes.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                        if let LoreEvent::StorageGetItemComplete(data) = event {
+                            codes_for_cb.lock().unwrap().push(data.error_code);
+                        }
+                    }));
+                    get_resolved::get_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStorageGetResolvedArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id },
+                            items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                                id: 2,
+                                partition,
+                                key,
+                                context: Context::default(),
+                                local_cache: 0,
+                                flags: 0,
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    let codes = codes.lock().unwrap().clone();
+                    assert_eq!(codes.len(), 1);
+                    codes[0]
+                };
+
+                put_once(publish(LoreBytes {
+                    ptr: payload.as_ptr().cast(),
+                    len: payload.len(),
+                }))
+                .await;
+                assert_eq!(
+                    resolve_once().await,
+                    LoreErrorCode::None,
+                    "the key resolves once published"
+                );
+
+                // An empty buffer: no bytes to point at, so a null pointer is legitimate here.
+                put_once(publish(LoreBytes {
+                    ptr: std::ptr::null(),
+                    len: 0,
+                }))
+                .await;
+
+                assert_eq!(
+                    resolve_once().await,
+                    LoreErrorCode::AddressNotFound,
+                    "the key must stop resolving once deleted"
+                );
+                assert!(
+                    server
+                        .backend_mutable
+                        .clone()
+                        .load(partition, key, KeyType::Resolve)
+                        .await
+                        .is_err(),
+                    "the deletion must reach the server, not just the local store"
+                );
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
     /// A publish that never reached the remote must not be resolvable there. Pins that
     /// `remote_write` actually gates the remote half rather than everything going up regardless.
     #[tokio::test]

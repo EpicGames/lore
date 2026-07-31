@@ -78,7 +78,8 @@ pub struct PutResolvedRequest {
     /// Mutable key to publish `address.hash` under, as KeyType::Resolve.
     #[prost(bytes = "bytes", tag = "2")]
     pub key: ::prost::bytes::Bytes,
-    /// Content address of the fragment being stored.
+    /// Content address of the fragment being stored. A zero hash removes the key's mapping
+    /// instead of publishing one, and then `fragment` and `payload` are ignored.
     #[prost(message, optional, tag = "3")]
     pub address: ::core::option::Option<crate::lore::model::v1::Address>,
     #[prost(message, optional, tag = "4")]

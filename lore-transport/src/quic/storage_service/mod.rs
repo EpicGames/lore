@@ -52,6 +52,9 @@ pub enum Command {
     /// The mapping is written only once the fragment is durably stored, so a key never resolves
     /// to content the server does not hold. Only the root fragment goes through this command; a
     /// fragment list's leaves are written with ordinary [`Command::Put`] calls first.
+    ///
+    /// A zero `Address` hash removes the mapping instead of publishing one; the `Fragment` and
+    /// payload are then ignored, since there is nothing to store.
     PutResolved = 13,
 }
 

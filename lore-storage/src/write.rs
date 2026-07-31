@@ -636,6 +636,10 @@ pub async fn store_raw_local(
 ///
 /// In both cases the mapping is written only after the content it names is stored, so a key never
 /// resolves to content that is not there.
+///
+/// An empty `buffer` **removes** the mapping rather than publishing one, which is the same
+/// operation with no content: the zero hash is the mutable store's tombstone, and
+/// [`crate::read::read_resolved`] already reports a zero resolved value as a miss.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_resolved(
     store: Arc<dyn ImmutableStore>,
@@ -651,6 +655,29 @@ pub async fn write_resolved(
         return Err(StorageError::internal(
             "a zero key cannot be published; it is the mutable store's tombstone value",
         ));
+    }
+
+    // An empty buffer removes the mapping: there is no content to store, and storing the zero
+    // hash is how the mutable store deletes a key. `read_resolved` already reports a zero
+    // resolved value as a miss, so the read side needs nothing added.
+    if buffer.is_empty() {
+        let address = Address {
+            hash: Hash::default(),
+            context,
+        };
+        if let Some(session) = remote_session {
+            session
+                .put_resolved(&key, address, Fragment::default(), None)
+                .await
+                .map_err(|err| crate::error::protocol_error_to_storage(err, address))?;
+        }
+        mutable
+            .store(partition, key, Hash::default(), KeyType::Resolve)
+            .await
+            .map_err(|err| {
+                StorageError::internal_with_context(err, "failed to remove local resolve mapping")
+            })?;
+        return Ok((address, Fragment::default()));
     }
 
     let single_fragment = buffer.len() <= crate::compress::FRAGMENT_SIZE_THRESHOLD;

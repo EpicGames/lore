@@ -9,6 +9,11 @@
 //! `KeyType::Resolve` mapping published, so a key never names content the server does not hold —
 //! the ordering the revision layer uses for branch pointers, and the one `read_resolved`'s
 //! write-back already follows on the client.
+//!
+//! A request whose content address is the zero hash **deletes** the mapping instead: there is no
+//! fragment to store, and storing the zero value is how the mutable store removes a key. That
+//! makes publish and delete the same operation with different content, and it is what
+//! `read_resolved` already expects — it reports a zero resolved value as a miss.
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -39,10 +44,10 @@ use crate::util::setup_execution;
 pub struct PutResolved {
     /// Mutable key to publish the stored hash under.
     pub key: Hash,
-    /// Content address of the fragment; `address.hash` is what `key` will resolve to. Held
-    /// alongside `put` because `Put` does not expose it.
+    /// Content address of the fragment; `address.hash` is what `key` will resolve to. A zero hash
+    /// deletes the mapping instead. Held alongside `put` because `Put` does not expose it.
     pub address: Address,
-    put: Put,
+    put: Option<Put>,
 }
 
 impl PutResolved {
@@ -65,26 +70,35 @@ impl PutResolved {
         let fragment: Fragment = bytes.split_to(size_of::<Fragment>()).into();
         let payload = if bytes.is_empty() { None } else { Some(bytes) };
 
-        let put = UnvalidatedPut {
-            address,
-            fragment,
-            payload,
-        }
-        .validate()?;
+        // A zero content hash is a deletion: there is nothing to store, so the fragment and
+        // payload carry no meaning and are not validated. Storing a zero value is how the mutable
+        // store removes a key, so the publish and delete paths differ only in what they store.
+        let put = if address.hash.is_zero() {
+            None
+        } else {
+            Some(
+                UnvalidatedPut {
+                    address,
+                    fragment,
+                    payload,
+                }
+                .validate()?,
+            )
+        };
 
         Ok(Self { key, address, put })
     }
 
-    /// The validated fragment write this request carries.
-    pub fn put(&self) -> &Put {
-        &self.put
+    /// The validated fragment write this request carries, or `None` when it is a deletion.
+    pub fn put(&self) -> Option<&Put> {
+        self.put.as_ref()
     }
 }
 
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_put_resolved(
     key: Hash,
-    put: &Put,
+    put: Option<&Put>,
     address: Address,
     repository: RepositoryId,
     correlation_id: String,
@@ -93,34 +107,42 @@ pub async fn handle_put_resolved(
     immutable_store: Arc<dyn ImmutableStore>,
 ) -> Result<LoreResponse, MessageHandleError> {
     // Step 1: store the fragment with `put`'s own validation and semantics. A failure here
-    // leaves no mapping behind, which is the whole point of doing it first.
-    handle_put(
-        put,
-        repository,
-        correlation_id.clone(),
-        user_id.clone(),
-        immutable_store,
-    )
-    .await?;
+    // leaves no mapping behind, which is the whole point of doing it first. A deletion has no
+    // fragment, so it goes straight to step 2.
+    if let Some(put) = put {
+        handle_put(
+            put,
+            repository,
+            correlation_id.clone(),
+            user_id.clone(),
+            immutable_store,
+        )
+        .await?;
+    }
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
     LORE_CONTEXT
         .scope(execution, async move {
-            // Step 2: publish the mapping now that the content behind it is durable.
+            // Step 2: publish the mapping now that the content behind it is durable — or remove
+            // it, which is what storing the zero hash means to the mutable store.
             match mutable_store
                 .store(repository, key, address.hash, KeyType::Resolve)
                 .await
             {
                 Ok(()) => {
-                    debug!(
-                        "put_resolved: key {} -> {} in repository {}",
-                        key, address.hash, repository
-                    );
+                    if address.hash.is_zero() {
+                        debug!("put_resolved: removed key {} in repository {}", key, repository);
+                    } else {
+                        debug!(
+                            "put_resolved: key {} -> {} in repository {}",
+                            key, address.hash, repository
+                        );
+                    }
                     Ok(LoreResponse::PutResolved(PutResolvedResponse::default()))
                 }
                 Err(StoreError::SlowDown(_)) => Err(MessageHandleError::SlowDown),
                 Err(err) => {
-                    // The fragment is stored but unreachable by key. Reporting failure lets the
+                    // Any fragment is stored but unreachable by key. Reporting failure lets the
                     // caller retry; a retry re-puts the same content address idempotently.
                     warn!(error = ?err, "put_resolved: stored {} but failed to map key {}", address.hash, key);
                     Err(MessageHandleError::StoreFailure)
@@ -244,6 +266,77 @@ mod tests {
                     .await
                     .expect("fragment must be stored");
                 assert_eq!(stored.as_ref(), payload);
+            })
+            .await;
+    }
+
+    /// A zero content hash removes the mapping rather than publishing one, and does so without
+    /// requiring a valid fragment — there is nothing to store.
+    #[tokio::test]
+    async fn test_zero_hash_removes_the_mapping() {
+        let repository = random::<RepositoryId>();
+        let payload = b"put-resolved-then-delete".as_slice();
+        let (address, fragment) = fragment_for(payload);
+        let key = Hash::hash_buffer(b"delete-key");
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let publish =
+            PutResolved::parse(request_bytes(key, address, fragment, payload)).expect("parse");
+        let zero_address = Address {
+            hash: Hash::default(),
+            context: Default::default(),
+        };
+        let delete = PutResolved::parse(request_bytes(key, zero_address, Fragment::default(), &[]))
+            .expect("a zero content hash needs no valid fragment");
+        assert!(
+            delete.put().is_none(),
+            "a deletion carries no fragment to store"
+        );
+
+        LORE_CONTEXT
+            .scope(execution, async move {
+                handle_put_resolved(
+                    publish.key,
+                    publish.put(),
+                    publish.address,
+                    repository,
+                    String::new(),
+                    String::new(),
+                    mutable_store.clone(),
+                    immutable_store.clone(),
+                )
+                .await
+                .expect("publish");
+                assert!(
+                    mutable_store
+                        .clone()
+                        .load(repository, key, KeyType::Resolve)
+                        .await
+                        .is_ok(),
+                    "sanity: the key is published before the delete"
+                );
+
+                handle_put_resolved(
+                    delete.key,
+                    delete.put(),
+                    delete.address,
+                    repository,
+                    String::new(),
+                    String::new(),
+                    mutable_store.clone(),
+                    immutable_store.clone(),
+                )
+                .await
+                .expect("delete");
+
+                assert!(
+                    mutable_store
+                        .load(repository, key, KeyType::Resolve)
+                        .await
+                        .is_err(),
+                    "a zero content hash must remove the mapping"
+                );
             })
             .await;
     }

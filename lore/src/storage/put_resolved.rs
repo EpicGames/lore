@@ -13,9 +13,9 @@
 //! Per-item behaviour:
 //! - `partition == Partition::default()`, a zero `key`, or `data.len > 0 && data.ptr == NULL`:
 //!   rejects with `error_code = INVALID_ARGUMENTS`; other items run independently.
-//! - `data.len == 0`: rejects with `INVALID_ARGUMENTS`. Unlike `put`, an empty buffer has no
-//!   useful meaning here — publishing a key that resolves to the zero hash is what *deleting* it
-//!   looks like to `get_resolved`, so it is refused rather than silently doing that.
+//! - `data.len == 0`: **removes** the mapping. No content is stored; the key is set to the zero
+//!   hash, which is how the mutable store deletes a key, and `get_resolved` then reports
+//!   `ADDRESS_NOT_FOUND` for it. The terminal event carries the zero address.
 //! - Otherwise: `write_resolved`, and the stored address is reported in `PUT_ITEM_COMPLETE`.
 //!
 //! Emits the same `PUT_ITEM_COMPLETE { id, address, error_code }` as `lore_storage_put`, where
@@ -66,7 +66,8 @@ pub struct LoreStoragePutResolvedItem {
     /// Dedup tag stored alongside the content hash in the resulting address, and the context a
     /// later `get_resolved` must read the key at
     pub context: Context,
-    /// Borrowed view into caller memory; bytes must live until `Complete` fires
+    /// Borrowed view into caller memory; bytes must live until `Complete` fires. A zero-length
+    /// buffer removes the key's mapping instead of publishing one
     pub data: LoreBytes,
     /// Also publish the content and the mapping to the remote; ignored when the handle has no
     /// remote or the call is offline/local
@@ -202,21 +203,26 @@ async fn store_and_publish(
         return (Address::default(), LoreErrorCode::InvalidArguments);
     }
 
-    if item.data.len == 0 || item.data.ptr.is_null() {
-        // `put` short-circuits an empty buffer to the zero hash, but publishing a key that
-        // resolves to zero is indistinguishable from deleting it. Refuse instead.
+    if item.data.len > 0 && item.data.ptr.is_null() {
         return (Address::default(), LoreErrorCode::InvalidArguments);
     }
 
-    // SAFETY:
-    // - `item.data.ptr` is non-null (checked above) and the FFI contract requires
-    //   `item.data.len` valid bytes behind it.
-    // - The `'static` lifetime is fudged exactly as in `put`: the buffer's real lifetime is
-    //   bounded by the call's `Complete` event, which `storage_call` only emits after this
-    //   future and every spawned task has resolved.
-    let slice: &'static [u8] =
-        unsafe { std::slice::from_raw_parts(item.data.ptr.cast::<u8>(), item.data.len) };
-    let bytes = Bytes::from_static(slice);
+    // An empty buffer deletes the mapping. `write_resolved` handles it without touching the
+    // immutable store, so the null-pointer check above deliberately only guards a non-empty
+    // buffer — a caller deleting a key has no bytes to point at.
+    let bytes = if item.data.len == 0 {
+        Bytes::new()
+    } else {
+        // SAFETY:
+        // - `item.data.ptr` is non-null (checked above) and the FFI contract requires
+        //   `item.data.len` valid bytes behind it.
+        // - The `'static` lifetime is fudged exactly as in `put`: the buffer's real lifetime is
+        //   bounded by the call's `Complete` event, which `storage_call` only emits after this
+        //   future and every spawned task has resolved.
+        let slice: &'static [u8] =
+            unsafe { std::slice::from_raw_parts(item.data.ptr.cast::<u8>(), item.data.len) };
+        Bytes::from_static(slice)
+    };
 
     let mut write_options = WriteOptions::default();
     if item.fixed_size_chunk > 0 {
