@@ -665,18 +665,25 @@ pub async fn write_resolved(
             hash: Hash::default(),
             context,
         };
-        if let Some(session) = remote_session {
-            session
-                .put_resolved(&key, address, Fragment::default(), None)
-                .await
-                .map_err(|err| crate::error::protocol_error_to_storage(err, address))?;
-        }
+        // Local first, which inverts the publish ordering deliberately. Publishing writes content
+        // before the mapping so a key never points at content that is not there; deleting clears
+        // the local mapping before the remote one so a local mapping never outlives the remote
+        // deletion. If the remote call then fails, the local store simply misses and the read
+        // falls through to the remote, which still holds live content — the key keeps resolving
+        // and the caller can retry. The reverse order, on a local failure, would leave this store
+        // serving content the server has already deleted.
         mutable
             .store(partition, key, Hash::default(), KeyType::Resolve)
             .await
             .map_err(|err| {
                 StorageError::internal_with_context(err, "failed to remove local resolve mapping")
             })?;
+        if let Some(session) = remote_session {
+            session
+                .put_resolved(&key, address, Fragment::default(), None)
+                .await
+                .map_err(|err| crate::error::protocol_error_to_storage(err, address))?;
+        }
         return Ok((address, Fragment::default()));
     }
 
