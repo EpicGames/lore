@@ -169,6 +169,9 @@ async fn put_file_item(
         id: item.id,
         address,
         error_code,
+        // `put_file` does not surface placement yet; zero means "not reported" here.
+        stored_local: 0,
+        stored_remote: 0,
     })
     .send();
     error_code

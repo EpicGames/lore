@@ -117,11 +117,15 @@ fn parse_request(
                 Status::invalid_argument("put_resolved: request missing fragment"),
             )));
         };
-        let payload = if request.payload.is_empty() {
-            None
-        } else {
-            Some(request.payload)
-        };
+        if request.payload.is_empty() {
+            // See the QUIC parser: a payload-less publish would store metadata only and still
+            // map the key to it.
+            return Ok(Err((
+                request_id,
+                Status::invalid_argument("put_resolved: publishing requires a payload"),
+            )));
+        }
+        let payload = Some(request.payload);
         match (UnvalidatedPut {
             address,
             fragment: Fragment::from(&fragment),
@@ -393,6 +397,17 @@ mod tests {
         let (request_id, status) = parse_request(request)
             .expect("correlatable")
             .expect_err("an address is required");
+        assert_eq!(request_id, TEST_REQUEST_ID);
+        assert_eq!(status.code(), Code::InvalidArgument);
+    }
+
+    #[test]
+    fn parse_request_reports_missing_payload_in_band() {
+        let mut request = request_for(Hash::hash_buffer(b"k"), b"payload");
+        request.payload = bytes::Bytes::new();
+        let (request_id, status) = parse_request(request)
+            .expect("correlatable")
+            .expect_err("publishing without a payload would leave a dangling mapping");
         assert_eq!(request_id, TEST_REQUEST_ID);
         assert_eq!(status.code(), Code::InvalidArgument);
     }

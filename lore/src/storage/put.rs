@@ -165,11 +165,14 @@ async fn put_item(
     item: LoreStoragePutItem,
     session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
-    let (address, error_code) = resolve_put_item(store, item, session).await;
+    let (address, error_code, stored_local, stored_remote) =
+        resolve_put_item(store, item, session).await;
     LoreEvent::StoragePutItemComplete(LoreStoragePutItemCompleteEventData {
         id: item.id,
         address,
         error_code,
+        stored_local: u8::from(stored_local),
+        stored_remote: u8::from(stored_remote),
     })
     .send();
     error_code
@@ -179,9 +182,14 @@ async fn resolve_put_item(
     store: Arc<StoreInternal>,
     item: LoreStoragePutItem,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
-) -> (Address, LoreErrorCode) {
+) -> (Address, LoreErrorCode, bool, bool) {
     if item.partition == Partition::default() {
-        return (Address::default(), LoreErrorCode::InvalidArguments);
+        return (
+            Address::default(),
+            LoreErrorCode::InvalidArguments,
+            false,
+            false,
+        );
     }
 
     if item.data.len == 0 {
@@ -189,11 +197,17 @@ async fn resolve_put_item(
             hash: Hash::default(),
             context: item.context,
         };
-        return (address, LoreErrorCode::None);
+        // Nothing was stored anywhere, so neither flag is set.
+        return (address, LoreErrorCode::None, false, false);
     }
 
     if item.data.ptr.is_null() {
-        return (Address::default(), LoreErrorCode::InvalidArguments);
+        return (
+            Address::default(),
+            LoreErrorCode::InvalidArguments,
+            false,
+            false,
+        );
     }
 
     // SAFETY:
@@ -227,10 +241,17 @@ async fn resolve_put_item(
     )
     .await
     {
-        Ok((address, _fragment)) => (address, LoreErrorCode::None),
+        Ok(written) => (
+            written.address,
+            LoreErrorCode::None,
+            written.stored_local,
+            written.stored_remote,
+        ),
         Err(err) => (
             Address::default(),
             crate::storage::storage_error_to_code(&err),
+            false,
+            false,
         ),
     }
 }

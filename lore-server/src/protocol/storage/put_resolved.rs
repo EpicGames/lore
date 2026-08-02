@@ -76,6 +76,14 @@ impl PutResolved {
         let put = if address.hash.is_zero() {
             None
         } else {
+            // `Put` accepts a metadata-only write, and `validate_hash` is a no-op without a
+            // payload — so a payload-less request would store nothing and still publish the key,
+            // which is precisely the dangling mapping this command exists to make impossible.
+            if payload.is_none() {
+                return Err(MessageParseError::ParseFailure(
+                    "put_resolved: publishing requires a payload",
+                ));
+            }
             Some(
                 UnvalidatedPut {
                     address,
@@ -214,6 +222,19 @@ mod tests {
         let (address, fragment) = fragment_for(payload);
         assert!(matches!(
             PutResolved::parse(request_bytes(Hash::default(), address, fragment, payload)),
+            Err(MessageParseError::ParseFailure(_))
+        ));
+    }
+
+    /// A publish with no payload would store metadata only and still map the key to it — the
+    /// dangling mapping this command exists to prevent.
+    #[test]
+    fn test_parse_rejects_publish_without_payload() {
+        let payload = b"put-resolved-no-payload".as_slice();
+        let (address, fragment) = fragment_for(payload);
+        let key = Hash::hash_buffer(b"no-payload-key");
+        assert!(matches!(
+            PutResolved::parse(request_bytes(key, address, fragment, &[])),
             Err(MessageParseError::ParseFailure(_))
         ));
     }

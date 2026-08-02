@@ -3237,15 +3237,18 @@ mod storage_remote_tests {
                 let handle_id = open_remote_handle(&server).await;
 
                 // Publish. `remote_write = 1` sends content and mapping to the server.
-                let put_outcomes: Arc<Mutex<Vec<(u64, Address, LoreErrorCode)>>> =
+                let put_outcomes: Arc<Mutex<Vec<(u64, Address, LoreErrorCode, u8, u8)>>> =
                     Arc::new(Mutex::new(Vec::new()));
                 let put_for_cb = put_outcomes.clone();
                 let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
                     if let LoreEvent::StoragePutItemComplete(data) = event {
-                        put_for_cb
-                            .lock()
-                            .unwrap()
-                            .push((data.id, data.address, data.error_code));
+                        put_for_cb.lock().unwrap().push((
+                            data.id,
+                            data.address,
+                            data.error_code,
+                            data.stored_local,
+                            data.stored_remote,
+                        ));
                     }
                 }));
 
@@ -3274,8 +3277,16 @@ mod storage_remote_tests {
 
                 let put_outcomes = put_outcomes.lock().unwrap().clone();
                 assert_eq!(put_outcomes.len(), 1);
-                let (_, published_address, code) = put_outcomes[0];
+                let (_, published_address, code, stored_local, stored_remote) = put_outcomes[0];
                 assert_eq!(code, LoreErrorCode::None);
+                assert_eq!(
+                    stored_local, 1,
+                    "the local store always receives the content"
+                );
+                assert_eq!(
+                    stored_remote, 1,
+                    "remote_write=1 against a live server must report remote placement"
+                );
                 assert_eq!(
                     published_address.hash,
                     lore_storage::hash_slice(payload.as_slice()),
@@ -3511,11 +3522,16 @@ mod storage_remote_tests {
 
                 let handle_id = open_remote_handle(&server).await;
 
-                let outcomes: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                let outcomes: Arc<Mutex<Vec<(LoreErrorCode, u8, u8)>>> =
+                    Arc::new(Mutex::new(Vec::new()));
                 let outcomes_for_cb = outcomes.clone();
                 let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
                     if let LoreEvent::StoragePutItemComplete(data) = event {
-                        outcomes_for_cb.lock().unwrap().push(data.error_code);
+                        outcomes_for_cb.lock().unwrap().push((
+                            data.error_code,
+                            data.stored_local,
+                            data.stored_remote,
+                        ));
                     }
                 }));
 
@@ -3541,7 +3557,11 @@ mod storage_remote_tests {
                 )
                 .await;
 
-                assert_eq!(outcomes.lock().unwrap().clone(), vec![LoreErrorCode::None]);
+                assert_eq!(
+                    outcomes.lock().unwrap().clone(),
+                    vec![(LoreErrorCode::None, 1, 0)],
+                    "a local-only publish must report local placement and not remote"
+                );
 
                 let local_mutable =
                     lore::storage::handle::mutable_for_test(lore::storage::handle::LoreStore {

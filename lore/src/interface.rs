@@ -6228,7 +6228,7 @@ pub type LoreStoragePutArgs = crate::storage::put::LoreStoragePutArgs;
 ///
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
-/// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item — success or failure |
+/// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item — success or failure; `stored_local`/`stored_remote` report where the content landed |
 /// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 #[unsafe(no_mangle)]
@@ -6350,13 +6350,18 @@ pub type LoreStoragePutResolvedArgs = crate::storage::put_resolved::LoreStorageP
 ///
 /// A zero-length `data` **removes** the key's mapping rather than publishing one: no content is
 /// stored, the key is set to the zero hash, and `lore_storage_get_resolved` then reports
-/// `ADDRESS_NOT_FOUND` for it. The terminal event carries the zero address.
+/// `ADDRESS_NOT_FOUND` for it. The terminal event carries the zero content hash and the caller's
+/// context.
+///
+/// A remote content upload that fails still leaves a successful local write, so the key is not
+/// published remotely and `stored_remote` is `0` while `error_code` stays `NONE`. Check
+/// `stored_remote`, not `error_code`, to confirm the key is visible to other clients.
 ///
 /// # Events
 ///
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
-/// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item; `address` is the content the key now resolves to |
+/// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item; `address` is the content the key now resolves to, and `stored_local`/`stored_remote` report where it landed |
 /// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 #[unsafe(no_mangle)]

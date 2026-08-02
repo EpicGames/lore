@@ -91,10 +91,10 @@ pub async fn write_fragmented(
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<(Address, Fragment, bool, bool), StorageError> {
     let size = buffer.len();
     let mut read_permit = permit;
-    let mut tasks = JoinSet::<Result<(usize, usize, Address), StorageError>>::new();
+    let mut tasks = JoinSet::<Result<(usize, usize, Address, bool, bool), StorageError>>::new();
 
     lore_base::lore_trace!(
         "Write and fragment buffer to immutable store: {size} bytes representing {size} bytes (flags {flags:?})",
@@ -146,7 +146,12 @@ pub async fn write_fragmented(
                 chunk_permit,
             )
             .await?;
-            return Ok((result.address, result.fragment));
+            return Ok((
+                result.address,
+                result.fragment,
+                result.stored_local,
+                result.stored_remote,
+            ));
         }
 
         let store = store.clone();
@@ -159,8 +164,8 @@ pub async fn write_fragmented(
                 chunk_buffer
             };
             let hash = hash::hash_slice(chunk_buffer.as_ref());
-            let chunk_address = if hash_only {
-                Address { context, hash }
+            let (chunk_address, chunk_local, chunk_remote) = if hash_only {
+                (Address { context, hash }, false, false)
             } else {
                 let result = store_fragment(
                     store,
@@ -174,9 +179,15 @@ pub async fn write_fragmented(
                     chunk_permit,
                 )
                 .await?;
-                result.address
+                (result.address, result.stored_local, result.stored_remote)
             };
-            Ok((chunk_index, chunk_offset, chunk_address))
+            Ok((
+                chunk_index,
+                chunk_offset,
+                chunk_address,
+                chunk_local,
+                chunk_remote,
+            ))
         });
     }
 
@@ -190,14 +201,21 @@ pub async fn write_fragmented(
     };
 
     let mut failure = None;
+    // A fragment tree is only as stored as its least-stored fragment, so intersect rather than
+    // union: reporting "remote" for a tree with one leaf that failed to upload is exactly the
+    // false guarantee this field exists to prevent.
+    let mut leaves_local = true;
+    let mut leaves_remote = true;
     while let Some(result) = tasks.join_next().await {
         match result
             .map_err(|e| StorageError::internal_with_context(e, "task failure"))
             .and_then(|r| r)
         {
-            Ok((chunk_index, chunk_content_offset, chunk_address)) => {
+            Ok((chunk_index, chunk_content_offset, chunk_address, chunk_local, chunk_remote)) => {
                 list[chunk_index].hash = chunk_address.hash;
                 list[chunk_index].offset_content = chunk_content_offset as u64;
+                leaves_local &= chunk_local;
+                leaves_remote &= chunk_remote;
             }
             Err(err) => {
                 failure = failure.or(Some(err));
@@ -217,7 +235,7 @@ pub async fn write_fragmented(
     let mut flags = flags;
     flags.clone_buffer = false;
 
-    write_fragmentlist(
+    let (address, fragment, root_local, root_remote) = write_fragmentlist(
         store,
         partition,
         context,
@@ -228,7 +246,13 @@ pub async fn write_fragmented(
         remote_session,
         tracker,
     )
-    .await
+    .await?;
+    Ok((
+        address,
+        fragment,
+        root_local && leaves_local,
+        root_remote && leaves_remote,
+    ))
 }
 
 /// Helper function to write a list of fragment references
@@ -243,7 +267,7 @@ async fn write_fragmentlist_impl(
     hash_only: bool,
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<(Address, Fragment, bool, bool), StorageError> {
     let size = buffer.len();
 
     if size <= FRAGMENT_SIZE_THRESHOLD {
@@ -254,7 +278,7 @@ async fn write_fragmentlist_impl(
             size_content: content_size as u64,
         };
         if hash_only {
-            Ok((Address { context, hash }, fragment))
+            Ok((Address { context, hash }, fragment, false, false))
         } else {
             let permit = crate::concurrency::acquire_fragment_memory_permit(buffer.len()).await;
             let result = store_fragment(
@@ -269,11 +293,16 @@ async fn write_fragmentlist_impl(
                 permit,
             )
             .await?;
-            Ok((result.address, result.fragment))
+            Ok((
+                result.address,
+                result.fragment,
+                result.stored_local,
+                result.stored_remote,
+            ))
         }
     } else {
         // Fixed size chunking for fragment list
-        let mut tasks = JoinSet::<Result<(usize, usize, Address), StorageError>>::new();
+        let mut tasks = JoinSet::<Result<(usize, usize, Address, bool, bool), StorageError>>::new();
         let mut chunk_index = 0usize;
         let mut chunk_offset = 0;
         let mut chunk_content_offset = 0;
@@ -311,8 +340,8 @@ async fn write_fragmentlist_impl(
             let task_tracker = tracker.clone();
             lore_base::lore_spawn!(tasks, async move {
                 let hash = hash::hash_slice(chunk_buffer.as_ref());
-                let chunk_address = if hash_only {
-                    Address { context, hash }
+                let (chunk_address, chunk_local, chunk_remote) = if hash_only {
+                    (Address { context, hash }, false, false)
                 } else {
                     let permit =
                         crate::concurrency::acquire_fragment_memory_permit(chunk_buffer.len())
@@ -329,9 +358,15 @@ async fn write_fragmentlist_impl(
                         permit,
                     )
                     .await?;
-                    result.address
+                    (result.address, result.stored_local, result.stored_remote)
                 };
-                Ok((chunk_index, chunk_content_offset, chunk_address))
+                Ok((
+                    chunk_index,
+                    chunk_content_offset,
+                    chunk_address,
+                    chunk_local,
+                    chunk_remote,
+                ))
             });
 
             chunk_content_offset += chunk_content_size;
@@ -350,14 +385,26 @@ async fn write_fragmentlist_impl(
         };
 
         let mut failure = None;
+        // Same intersection as the leaf level: an intermediate list node that failed to upload
+        // makes the whole tree unreadable remotely, so it must drag the aggregate down.
+        let mut nodes_local = true;
+        let mut nodes_remote = true;
         while let Some(result) = tasks.join_next().await {
             match result
                 .map_err(|e| StorageError::internal_with_context(e, "task failure"))
                 .and_then(|r| r)
             {
-                Ok((chunk_index, chunk_content_offset, chunk_address)) => {
+                Ok((
+                    chunk_index,
+                    chunk_content_offset,
+                    chunk_address,
+                    chunk_local,
+                    chunk_remote,
+                )) => {
                     list[chunk_index].hash = chunk_address.hash;
                     list[chunk_index].offset_content = chunk_content_offset as u64;
+                    nodes_local &= chunk_local;
+                    nodes_remote &= chunk_remote;
                 }
                 Err(err) => {
                     failure = failure.or(Some(err));
@@ -374,7 +421,7 @@ async fn write_fragmentlist_impl(
         }
         let buffer = list_buffer.freeze();
 
-        write_fragmentlist(
+        let (address, fragment, root_local, root_remote) = write_fragmentlist(
             store,
             partition,
             context,
@@ -385,7 +432,13 @@ async fn write_fragmentlist_impl(
             remote_session,
             tracker,
         )
-        .await
+        .await?;
+        Ok((
+            address,
+            fragment,
+            root_local && nodes_local,
+            root_remote && nodes_remote,
+        ))
     }
 }
 
@@ -403,7 +456,10 @@ pub fn write_fragmentlist(
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
 ) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<(Address, Fragment), StorageError>> + Send>,
+    Box<
+        dyn std::future::Future<Output = Result<(Address, Fragment, bool, bool), StorageError>>
+            + Send,
+    >,
 > {
     Box::pin(write_fragmentlist_impl(
         store,

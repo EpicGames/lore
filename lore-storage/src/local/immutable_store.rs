@@ -4552,6 +4552,7 @@ mod tests {
         use crate::options::ReadOptions;
         use crate::options::WriteOptions;
         use crate::read::read;
+        use crate::write::StoreResult;
         use crate::write::write_content;
 
         let dir = crate::test_util::TempDir::new("is_e2e_recover_");
@@ -4573,7 +4574,7 @@ mod tests {
             .await
             .unwrap();
 
-            let (address, _) = write_content(
+            let StoreResult { address, .. } = write_content(
                 store.clone(),
                 partition,
                 context,
@@ -4638,7 +4639,10 @@ mod tests {
             "originally stored content must be reported missing after recovery"
         );
 
-        let (new_address, _) = write_content(
+        let StoreResult {
+            address: new_address,
+            ..
+        } = write_content(
             store.clone(),
             partition,
             context,
@@ -4801,6 +4805,7 @@ mod tests {
         use crate::options::ReadOptions;
         use crate::options::WriteOptions;
         use crate::read::read;
+        use crate::write::StoreResult;
         use crate::write::write_content;
 
         let store: Arc<dyn crate::immutable_store::ImmutableStore> = create(
@@ -4821,7 +4826,10 @@ mod tests {
         // Prime target (uncompressed).
         let prev_mode =
             COMPRESSION_MODE.swap(CompressionMode::NoCompression as u32, Ordering::AcqRel);
-        let (target_address, _target_fragment) = write_content(
+        let StoreResult {
+            address: target_address,
+            ..
+        } = write_content(
             store.clone(),
             target_partition,
             context,
@@ -4836,7 +4844,10 @@ mod tests {
 
         // Prime source (compressed).
         COMPRESSION_MODE.store(CompressionMode::Zstd as u32, Ordering::Release);
-        let (source_address, _source_fragment) = write_content(
+        let StoreResult {
+            address: source_address,
+            ..
+        } = write_content(
             store.clone(),
             source_partition,
             context,
@@ -4894,6 +4905,7 @@ mod tests {
         use crate::options::ReadOptions;
         use crate::options::WriteOptions;
         use crate::read::read;
+        use crate::write::StoreResult;
         use crate::write::write_content;
 
         let store: Arc<dyn crate::immutable_store::ImmutableStore> = create(
@@ -4911,7 +4923,10 @@ mod tests {
         let payload: Vec<u8> = b"in-partition new-context dedup payload".to_vec();
 
         // Seed the source tuple `(partition, hash, source_context)`.
-        let (source_address, _) = write_content(
+        let StoreResult {
+            address: source_address,
+            ..
+        } = write_content(
             store.clone(),
             partition,
             source_context,

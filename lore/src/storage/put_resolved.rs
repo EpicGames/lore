@@ -18,8 +18,14 @@
 //!   `ADDRESS_NOT_FOUND` for it. The terminal event carries the zero address.
 //! - Otherwise: `write_resolved`, and the stored address is reported in `PUT_ITEM_COMPLETE`.
 //!
-//! Emits the same `PUT_ITEM_COMPLETE { id, address, error_code }` as `lore_storage_put`, where
-//! `address` is the content the key now resolves to — so a caller can hand it straight to `get`.
+//! Emits the same `PUT_ITEM_COMPLETE` as `lore_storage_put`, where `address` is the content the
+//! key now resolves to — so a caller can hand it straight to `get` — and `stored_local` /
+//! `stored_remote` report where it actually landed.
+//!
+//! `stored_remote` is what gates the remote mapping: a remote content upload that fails still
+//! leaves a successful local write, so rather than publish a key naming content the server does
+//! not hold, the remote publish is skipped and `stored_remote` is reported as 0. A caller that
+//! needs the key visible remotely checks that field rather than `error_code`.
 
 use std::sync::Arc;
 
@@ -179,11 +185,14 @@ async fn put_resolved_item(
     item: LoreStoragePutResolvedItem,
     session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
-    let (address, error_code) = store_and_publish(store, item, session).await;
+    let (address, error_code, stored_local, stored_remote) =
+        store_and_publish(store, item, session).await;
     LoreEvent::StoragePutItemComplete(LoreStoragePutItemCompleteEventData {
         id: item.id,
         address,
         error_code,
+        stored_local: u8::from(stored_local),
+        stored_remote: u8::from(stored_remote),
     })
     .send();
     error_code
@@ -193,18 +202,33 @@ async fn store_and_publish(
     store: Arc<StoreInternal>,
     item: LoreStoragePutResolvedItem,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
-) -> (Address, LoreErrorCode) {
+) -> (Address, LoreErrorCode, bool, bool) {
     if item.partition == Partition::default() {
-        return (Address::default(), LoreErrorCode::InvalidArguments);
+        return (
+            Address::default(),
+            LoreErrorCode::InvalidArguments,
+            false,
+            false,
+        );
     }
 
     if item.key == Hash::default() {
         // The mutable store reads a zero value as a tombstone, so a zero key is never storable.
-        return (Address::default(), LoreErrorCode::InvalidArguments);
+        return (
+            Address::default(),
+            LoreErrorCode::InvalidArguments,
+            false,
+            false,
+        );
     }
 
     if item.data.len > 0 && item.data.ptr.is_null() {
-        return (Address::default(), LoreErrorCode::InvalidArguments);
+        return (
+            Address::default(),
+            LoreErrorCode::InvalidArguments,
+            false,
+            false,
+        );
     }
 
     // An empty buffer deletes the mapping. `write_resolved` handles it without touching the
@@ -244,10 +268,17 @@ async fn store_and_publish(
     )
     .await
     {
-        Ok((address, _fragment)) => (address, LoreErrorCode::None),
+        Ok(written) => (
+            written.address,
+            LoreErrorCode::None,
+            written.stored_local,
+            written.stored_remote,
+        ),
         Err(err) => (
             Address::default(),
             crate::storage::storage_error_to_code(&err),
+            false,
+            false,
         ),
     }
 }

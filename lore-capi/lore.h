@@ -2403,6 +2403,14 @@ typedef struct lore_storage_put_item_complete_event_data_t {
   struct lore_address_t address;
   // The outcome for the item.
   enum lore_error_code_t error_code;
+  // Non-zero when the local store holds the content. Appended after the original three
+  // fields, so a consumer reading only those is unaffected.
+  uint8_t stored_local;
+  // Non-zero when the content reached the remote, or was already durable there. A remote
+  // write that fails still reports `error_code = NONE` if the local write succeeded — this is
+  // how a caller tells the two apart. For fragmented content it is the intersection across
+  // every fragment, so it is set only when the whole tree is remote.
+  uint8_t stored_remote;
 } lore_storage_put_item_complete_event_data_t;
 
 // Leading event for each regular `get` item. Reports the total
@@ -10287,7 +10295,7 @@ void lore_storage_open_async(const struct lore_global_args_t *globals,
 //
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
-// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item — success or failure |
+// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item — success or failure; `stored_local`/`stored_remote` report where the content landed |
 // | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 // | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 int32_t lore_storage_put(const struct lore_global_args_t *globals,
@@ -10360,13 +10368,18 @@ void lore_storage_get_resolved_async(const struct lore_global_args_t *globals,
 //
 // A zero-length `data` **removes** the key's mapping rather than publishing one: no content is
 // stored, the key is set to the zero hash, and `lore_storage_get_resolved` then reports
-// `ADDRESS_NOT_FOUND` for it. The terminal event carries the zero address.
+// `ADDRESS_NOT_FOUND` for it. The terminal event carries the zero content hash and the caller's
+// context.
+//
+// A remote content upload that fails still leaves a successful local write, so the key is not
+// published remotely and `stored_remote` is `0` while `error_code` stays `NONE`. Check
+// `stored_remote`, not `error_code`, to confirm the key is visible to other clients.
 //
 // # Events
 //
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
-// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item; `address` is the content the key now resolves to |
+// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item; `address` is the content the key now resolves to, and `stored_local`/`stored_remote` report where it landed |
 // | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 // | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 int32_t lore_storage_put_resolved(const struct lore_global_args_t *globals,

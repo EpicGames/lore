@@ -380,6 +380,7 @@ pub async fn write_with_tracker(
         None,
     )
     .await
+    .map(|written| (written.address, written.fragment))
     .forward("writing immutable content")
 }
 
