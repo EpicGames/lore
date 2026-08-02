@@ -154,7 +154,9 @@ pub struct ProtocolErrorInfo {
     pub is_appropriate_for_logging: bool,
 }
 
-#[cfg(test)]
+// Also compiled for `integration_tests` so `lore-integration-tests` can stand up a real QUIC
+// storage server, the way it already does a gRPC one.
+#[cfg(any(test, feature = "integration_tests"))]
 pub mod tests {
     use std::env;
     use std::path::PathBuf;

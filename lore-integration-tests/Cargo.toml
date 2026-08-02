@@ -33,6 +33,7 @@ lore-revision = { workspace = true }
 lore-hashicorp = { workspace = true }
 lore-proto = { workspace = true }
 lore-server = { workspace = true, features = ["integration_tests"] }
+lore-transport = { workspace = true }
 uuid = { workspace = true }
 
 [features]
