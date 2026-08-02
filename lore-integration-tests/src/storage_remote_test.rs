@@ -3280,12 +3280,15 @@ mod storage_remote_tests {
                 let (_, published_address, code, stored_local, stored_remote) = put_outcomes[0];
                 assert_eq!(code, LoreErrorCode::None);
                 assert_eq!(
-                    stored_local, 1,
-                    "the local store always receives the content"
-                );
-                assert_eq!(
                     stored_remote, 1,
                     "remote_write=1 against a live server must report remote placement"
+                );
+                // Same as `put`: content that went durable remotely is not also retained locally
+                // unless `local_cache` asked for it. The mapping is still written locally, so a
+                // later resolve on this handle finds the key and falls through to the remote.
+                assert_eq!(
+                    stored_local, 0,
+                    "local_cache=0 must not retain the payload once it is durable remotely"
                 );
                 assert_eq!(
                     published_address.hash,
