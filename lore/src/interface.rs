@@ -6353,6 +6353,10 @@ pub type LoreStoragePutResolvedArgs = crate::storage::put_resolved::LoreStorageP
 /// `ADDRESS_NOT_FOUND` for it. The terminal event carries the zero content hash and the caller's
 /// context.
 ///
+/// With `remote_write = 0` this evicts only the locally cached mapping. The local mutable store
+/// is a cache, not an authority, so a key published remotely resolves again on the next call.
+/// Deleting a published key requires `remote_write = 1`.
+///
 /// A remote content upload that fails still leaves a successful local write, so the key is not
 /// published remotely and `stored_remote` is `0` while `error_code` stays `NONE`. Check
 /// `stored_remote`, not `error_code`, to confirm the key is visible to other clients.

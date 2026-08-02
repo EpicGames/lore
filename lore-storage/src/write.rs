@@ -755,6 +755,12 @@ pub async fn store_raw_local(
 /// An empty `buffer` **removes** the mapping rather than publishing one, which is the same
 /// operation with no content: the zero hash is the mutable store's tombstone, and
 /// [`crate::read::read_resolved`] already reports a zero resolved value as a miss.
+///
+/// The local mutable store is a cache of the remote mapping, not an authority, so clearing it is
+/// an eviction rather than a deletion: [`crate::read::load_resolved_local`] cannot distinguish a
+/// zero mapping from one that was never cached, and either way defers to the remote. A delete
+/// that does not reach the remote is therefore undone by the next resolve. Deleting a key that
+/// was published remotely requires a session — the caller's `remote_write`.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_resolved(
     store: Arc<dyn ImmutableStore>,
@@ -780,13 +786,18 @@ pub async fn write_resolved(
             hash: Hash::default(),
             context,
         };
-        // Local first, which inverts the publish ordering deliberately. Publishing writes content
-        // before the mapping so a key never points at content that is not there; deleting clears
-        // the local mapping before the remote one so a local mapping never outlives the remote
-        // deletion. If the remote call then fails, the local store simply misses and the read
-        // falls through to the remote, which still holds live content — the key keeps resolving
-        // and the caller can retry. The reverse order, on a local failure, would leave this store
-        // serving content the server has already deleted.
+        // Local first, inverting the publish ordering deliberately. Publishing writes content
+        // before the mapping so a key never points at content that is not there. Deleting clears
+        // the local mapping first so this store cannot keep serving a mapping the authority has
+        // dropped: if the remote clear then fails, the local read simply misses and falls through
+        // to the remote, which still holds the live mapping — the key keeps resolving, correctly,
+        // and the caller can retry. The reverse order would leave a cached mapping resolving to
+        // content the server has already deleted.
+        //
+        // Note this is about ordering, not durability: a local zero is an eviction, not a
+        // tombstone. `load_resolved_local` cannot tell "deleted" from "never cached", so a
+        // delete that never reaches the remote is undone by the next resolve. See
+        // `write_resolved`'s doc.
         mutable
             .store(partition, key, Hash::default(), KeyType::Resolve)
             .await

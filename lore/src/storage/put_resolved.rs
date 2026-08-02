@@ -16,6 +16,12 @@
 //! - `data.len == 0`: **removes** the mapping. No content is stored; the key is set to the zero
 //!   hash, which is how the mutable store deletes a key, and `get_resolved` then reports
 //!   `ADDRESS_NOT_FOUND` for it. The terminal event carries the zero address.
+//!
+//!   With `remote_write = 0` this only evicts the *local* mapping. The local mutable store is a
+//!   cache, not an authority — a zero mapping is indistinguishable from one that was never
+//!   cached, and a resolve falls through to the remote either way. So a key that was published
+//!   remotely reappears on the next resolve unless the delete reached the remote too. Deleting a
+//!   published key requires `remote_write = 1`.
 //! - Otherwise: `write_resolved`, and the stored address is reported in `PUT_ITEM_COMPLETE`.
 //!
 //! Emits the same `PUT_ITEM_COMPLETE` as `lore_storage_put`, where `address` is the content the
