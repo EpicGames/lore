@@ -12,7 +12,10 @@
 //! In streaming mode (`streaming=1`) the single `GET_DATA` is replaced by one event per leaf
 //! fragment with an advancing `offset`, so peak memory follows the fragment size rather than the
 //! content size. `GET_HEADER` still precedes the data, but it follows the resolve — unlike
-//! `lore_storage_get`, the address is not known until the key resolves.
+//! `lore_storage_get`, the address is not known until the key resolves. A failure partway through
+//! the tree ends the data early and reports its own code on `GET_ITEM_COMPLETE`, with a
+//! byte-count check against `size_content` as a backstop, so a partial delivery is never
+//! reported as success.
 //!
 //! `address` is the resolved address (`{ resolved_hash, context }`), so callers may cache the
 //! key->hash mapping from the event stream.
@@ -78,7 +81,9 @@ pub struct LoreStorageGetResolvedItem {
     pub local_cache: u8,
     /// Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer, as
     /// `lore_storage_get` does. Peak memory then follows the fragment size rather than the
-    /// content size, which is what makes a key naming something large usable
+    /// content size, which is what makes a key naming something large usable. A read that fails
+    /// partway reports the failure on `GET_ITEM_COMPLETE` rather than ending short with a
+    /// success code
     pub streaming: u8,
     /// Reserved bitmask; 0 for default behaviour. No bits are defined yet, and unknown bits are
     /// rejected with `INVALID_ARGUMENTS` before the call reaches a backend — otherwise an unknown
@@ -249,7 +254,8 @@ async fn get_resolved_item_streaming(
     read_options: lore_storage::options::ReadOptions,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(256);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<Result<Bytes, lore_storage::StorageError>>(256);
     let stream_future = read_resolved_stream(
         store.immutable.clone(),
         store.mutable.clone(),
@@ -278,14 +284,26 @@ async fn get_resolved_item_streaming(
     emit_header(&item, address, size_content);
 
     let mut offset: u64 = 0;
+    let mut code = LoreErrorCode::None;
     while let Some(chunk) = rx.recv().await {
-        let len = chunk.len() as u64;
-        emit_data(&item, address, chunk, offset);
-        offset += len;
+        match chunk {
+            Ok(chunk) => {
+                let len = chunk.len() as u64;
+                emit_data(&item, address, chunk, offset);
+                offset += len;
+            }
+            Err(err) => {
+                code = crate::storage::storage_error_to_code(&err);
+                break;
+            }
+        }
     }
 
-    emit_item_complete(&item, address, LoreErrorCode::None);
-    LoreErrorCode::None
+    if code == LoreErrorCode::None && offset != size_content {
+        code = LoreErrorCode::Internal;
+    }
+    emit_item_complete(&item, address, code);
+    code
 }
 
 fn emit_header(item: &LoreStorageGetResolvedItem, address: Address, size_content: u64) {

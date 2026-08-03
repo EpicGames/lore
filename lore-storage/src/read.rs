@@ -741,7 +741,7 @@ pub async fn read_resolved_stream(
     context: Context,
     flags: u32,
     options: ReadOptions,
-    sender: tokio::sync::mpsc::Sender<Bytes>,
+    sender: tokio::sync::mpsc::Sender<Result<Bytes, StorageError>>,
     session: Option<Arc<StorageSession>>,
 ) -> Result<(Hash, u64), StorageError> {
     let options = options.with_decompress();
@@ -775,6 +775,7 @@ pub async fn read_resolved_stream(
         let fragment = root.fragment;
         let buffer = root.buffer;
         let remote_session = root.session;
+        let report = sender.clone();
         lore_base::lore_spawn!(async move {
             let result = defragment_pipeline(
                 store,
@@ -793,11 +794,14 @@ pub async fn read_resolved_stream(
                     "error while defragmenting during read_resolved_stream: {0}",
                     err
                 );
+                // The size was returned before the leaves flowed, so this is the only route by
+                // which the caller can learn the content it received is short.
+                let _ = report.send(Err(err)).await;
             }
         });
     } else {
         sender
-            .send(root.buffer)
+            .send(Ok(root.buffer))
             .await
             .map_err(|_err| StorageError::internal("stream send failed"))?;
     }
@@ -1010,7 +1014,7 @@ pub async fn read_stream(
     partition: Partition,
     address: Address,
     options: ReadOptions,
-    sender: tokio::sync::mpsc::Sender<Bytes>,
+    sender: tokio::sync::mpsc::Sender<Result<Bytes, StorageError>>,
     remote_session: Option<Arc<StorageSession>>,
 ) -> Result<u64, StorageError> {
     let options = options.with_decompress();
@@ -1025,6 +1029,7 @@ pub async fn read_stream(
 
     if (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented {
         let store = store.clone();
+        let report = sender.clone();
         lore_base::lore_spawn!(async move {
             let result = defragment_pipeline(
                 store,
@@ -1040,13 +1045,16 @@ pub async fn read_stream(
 
             if let Err(err) = result {
                 lore_base::lore_warn!("error while defragmenting during read_stream: {0}", err);
+                // The size was returned before the leaves flowed, so this is the only route by
+                // which the caller can learn the content it received is short.
+                let _ = report.send(Err(err)).await;
             }
         });
 
         Ok(fragment.size_content)
     } else {
         sender
-            .send(buffer)
+            .send(Ok(buffer))
             .await
             .map_err(|_err| StorageError::internal("stream send failed"))?;
         Ok(fragment.size_content)
@@ -1593,5 +1601,93 @@ mod tests {
         .expect("read_into should respect range");
 
         assert_eq!(&out[..], &payload[10..50]);
+    }
+
+    /// A leaf that vanishes partway through the tree must reach the consumer as an error item.
+    ///
+    /// `read_stream` returns the content size before any leaf flows, so a failure after that
+    /// point has only the channel left to travel on. While the sink carried bare `Bytes` the
+    /// channel simply closed early, and a caller could not tell a truncated read from a
+    /// complete one — the pipeline's error reached the log and nothing else.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stream_reports_a_missing_leaf_rather_than_closing_short() {
+        use lore_base::types::FragmentReference;
+
+        use crate::typed_bytes::TypedBytes;
+
+        let (_dir, store) = make_test_store().await;
+        let partition = Partition::from([0xA7; 16]);
+        let context = Context::default();
+
+        let payload = Bytes::from(vec![0x5Au8; 512 * 1024]);
+        let written = crate::write::write_content(
+            store.clone(),
+            partition,
+            context,
+            payload.clone(),
+            crate::options::WriteOptions::default().with_fixed_size_chunk(64 * 1024),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("write fragmented content");
+
+        let (root, list) = load_fragment(
+            store.clone(),
+            partition,
+            written.address,
+            ReadOptions::default(),
+            None,
+        )
+        .await
+        .expect("load the root");
+        assert_eq!(
+            root.flags & FragmentFlags::PayloadFragmented,
+            FragmentFlags::PayloadFragmented,
+            "this test needs a fragment tree, not a single fragment",
+        );
+
+        let list = list.to_aligned::<FragmentReference>();
+        let leaves = list.as_type_slice::<FragmentReference>();
+        assert!(leaves.len() > 1, "this test needs more than one leaf");
+        let missing = Address {
+            hash: leaves[1].hash,
+            context,
+        };
+        store
+            .clone()
+            .obliterate(partition, missing, Arc::default())
+            .await
+            .expect("remove one leaf");
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let size = read_stream(
+            store.clone(),
+            partition,
+            written.address,
+            ReadOptions::default(),
+            tx,
+            None,
+        )
+        .await
+        .expect("the root still loads, so the read starts");
+        assert_eq!(size, payload.len() as u64);
+
+        let mut delivered = 0usize;
+        let mut reported = false;
+        while let Some(item) = rx.recv().await {
+            match item {
+                Ok(chunk) => delivered += chunk.len(),
+                Err(_) => {
+                    reported = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            reported,
+            "a missing leaf must arrive as an error item; got {delivered} bytes then a clean close",
+        );
     }
 }

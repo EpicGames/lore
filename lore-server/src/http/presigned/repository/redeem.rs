@@ -16,7 +16,6 @@ use axum::http::header::CONTENT_ENCODING;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::header::InvalidHeaderValue;
 use axum::response::IntoResponse;
-use bytes::Bytes;
 use hex::FromHexError;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
@@ -30,7 +29,6 @@ use reqwest::header::CONTENT_LENGTH;
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::mpsc::channel;
-use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::http::log_http_error;
@@ -188,7 +186,9 @@ pub async fn handler(
                     .map_err(RedeemError::HeaderGeneration)?,
             );
 
-            let stream = ReceiverStream::new(rx).map(Ok::<Bytes, RedeemError>);
+            // The channel already carries per-chunk results, so a failure partway through the
+            // tree aborts the body instead of ending it cleanly at a short length.
+            let stream = ReceiverStream::new(rx);
             Ok((StatusCode::OK, response_headers, Body::from_stream(stream)))
         })
         .await

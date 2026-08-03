@@ -223,7 +223,7 @@ pub async fn read_stream(
     repository: Arc<RepositoryContext>,
     address: Address,
     options: ReadOptions,
-    sender: Sender<Bytes>,
+    sender: Sender<Result<Bytes, lore_storage::StorageError>>,
 ) -> Result<u64, ImmutableError> {
     let store = repository.immutable_store();
     let partition = repository.id;

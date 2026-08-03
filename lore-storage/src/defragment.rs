@@ -44,7 +44,13 @@ pub enum DefragmentSink {
     /// Write at offset to a file via seek+write (unordered, mutex-serialized).
     File { file: Arc<Mutex<File>> },
     /// Stream buffers in content order to a caller-provided channel.
-    Stream { sender: Sender<Bytes> },
+    ///
+    /// The item is a `Result` so a failure partway through the tree reaches the consumer as the
+    /// final item rather than only the log. Without it the channel simply closes early and a
+    /// truncated read is indistinguishable from a complete one.
+    Stream {
+        sender: Sender<Result<Bytes, StorageError>>,
+    },
 }
 
 // SAFETY: Same invariants as the original — the mmap pointer outlives
@@ -505,7 +511,7 @@ async fn fetch_ordered_and_stream(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     mut leaf_rx: Receiver<LeafReference>,
-    sender: Sender<Bytes>,
+    sender: Sender<Result<Bytes, StorageError>>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
 ) -> Result<(), StorageError> {
@@ -578,7 +584,7 @@ async fn fetch_ordered_and_stream(
             Ok(buffer) => {
                 if result.is_ok() {
                     result = sender
-                        .send(buffer)
+                        .send(Ok(buffer))
                         .await
                         .map_err(|_err| StorageError::internal("stream send failed"));
                 }

@@ -4656,7 +4656,9 @@ typedef struct lore_storage_get_item_t {
   struct lore_partition_t partition;
   // Content address to read; `hash == Hash::default()` short-circuits to an empty buffer
   struct lore_address_t address;
-  // Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer
+  // Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer. A read
+  // that fails partway reports the failure on `GET_ITEM_COMPLETE` rather than ending short
+  // with a success code
   uint8_t streaming;
   // Cache fetched bytes back to the local store even without the producer's
   // `PayloadLocalCachePriority` hint
@@ -4697,7 +4699,9 @@ typedef struct lore_storage_get_resolved_item_t {
   uint8_t local_cache;
   // Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer, as
   // `lore_storage_get` does. Peak memory then follows the fragment size rather than the
-  // content size, which is what makes a key naming something large usable
+  // content size, which is what makes a key naming something large usable. A read that fails
+  // partway reports the failure on `GET_ITEM_COMPLETE` rather than ending short with a
+  // success code
   uint8_t streaming;
   // Reserved bitmask; 0 for default behaviour. No bits are defined yet, and unknown bits are
   // rejected with `INVALID_ARGUMENTS` before the call reaches a backend — otherwise an unknown
