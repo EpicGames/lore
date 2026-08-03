@@ -179,6 +179,14 @@ pub struct StoreResult {
     /// content to exist remotely -- `write_resolved` before it publishes a mapping — must consult
     /// this rather than the `Ok`.
     pub stored_remote: bool,
+    /// A [`RemoteWrite::PutResolved`] upload was issued and succeeded, so the server also
+    /// published the key.
+    ///
+    /// This is *not* implied by `stored_remote`: the upload is skipped whenever the content is
+    /// already durable remotely, and skipping it skips the publish with it. A caller that fused a
+    /// key into the upload must check this and publish the key itself when it is false, or the
+    /// key is silently never written — for instance when two keys name the same content.
+    pub published: bool,
 }
 
 /// Which remote command carries a fragment's upload.
@@ -404,13 +412,15 @@ async fn store_fragment_inline(
             deduplicated: true,
             stored_local,
             stored_remote: stored_durable,
+            // Nothing went to the server, so no fused publish happened either.
+            published: false,
         });
     }
 
     // Local-only fast path: skip STORE_IN_FLIGHT entirely. No follower notification needed,
     // no leader-token rendezvous — just compress+write inline.
     if remote_session.is_none() {
-        let (_, final_fragment) = leader_body(
+        let (_, final_fragment, published) = leader_body(
             store,
             partition,
             address,
@@ -433,6 +443,7 @@ async fn store_fragment_inline(
             // not ask to cache it.
             stored_local: !stored_remote || cache_local,
             stored_remote,
+            published,
         });
     }
 
@@ -442,8 +453,12 @@ async fn store_fragment_inline(
     let Some(guard) = guard else {
         // We waited on another task that finished without satisfying our
         // preconditions (e.g., they wrote durable but we want local).
-        // Preserve legacy behaviour by returning the current store state.
+        // Re-read the store rather than reporting the view we took before the wait: the winner
+        // has since written, and stale flags here would tell a fused caller the content is not
+        // remote when it is, costing it the key publish.
         drop(permit);
+        let query = query_match_full(&store, partition, address).await;
+        let (stored_local, stored_durable) = stored_flags(&query);
         return Ok(StoreResult {
             address,
             fragment: if query.match_made == StoreMatch::MatchFull {
@@ -454,10 +469,12 @@ async fn store_fragment_inline(
             deduplicated: true,
             stored_local,
             stored_remote: stored_durable,
+            // The winner's upload carried its own key, not ours.
+            published: false,
         });
     };
 
-    let (_, final_fragment) = leader_body(
+    let (_, final_fragment, published) = leader_body(
         store,
         partition,
         address,
@@ -478,6 +495,7 @@ async fn store_fragment_inline(
         deduplicated,
         stored_local: !stored_remote || cache_local,
         stored_remote,
+        published,
     })
 }
 
@@ -511,6 +529,7 @@ async fn store_fragment_dispatched(
                 // here would be a guess.
                 stored_local: false,
                 stored_remote: false,
+                published: false,
             });
         }
     };
@@ -534,6 +553,7 @@ async fn store_fragment_dispatched(
             deduplicated: true,
             stored_local,
             stored_remote: stored_durable,
+            published: false,
         });
     }
 
@@ -554,6 +574,7 @@ async fn store_fragment_dispatched(
             permit,
         )
         .await
+        .map(|(address, fragment, _published)| (address, fragment))
     });
     Ok(StoreResult {
         address,
@@ -563,6 +584,9 @@ async fn store_fragment_dispatched(
         // lower bound, never an optimistic claim.
         stored_local,
         stored_remote: stored_durable,
+        // The leader may fuse a publish, but it has not run yet. `RemoteWrite::PutResolved` with
+        // a tracker is unsupported for exactly this reason; see `write_resolved`.
+        published: false,
     })
 }
 
@@ -621,7 +645,7 @@ async fn leader_body(
     query: StoreQueryResult,
     guard: Option<StoreInFlightGuard>,
     permit: Option<OwnedSemaphorePermit>,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<(Address, Fragment, bool), StorageError> {
     let (mut stored_local, mut stored_durable) = stored_flags(&query);
 
     // For a partial match try loading the payload from local store instead of recompressing
@@ -674,15 +698,26 @@ async fn leader_body(
     // Remote upload if session provided and not already durable. The fused variant publishes the
     // mutable key in the same command, so the key lands exactly when the content does — and the
     // durable flag below is recorded on this path just as it is for a plain put.
+    //
+    // Note this is skipped entirely when the content is already durable, which skips the fused
+    // publish too; `published` reports that so the caller can write the key itself.
+    let mut published = false;
     if !stored_durable && let Some(session) = remote_session.clone() {
         stored_durable = match remote_write {
             RemoteWrite::Put => remote_put_retry(session, address, fragment, Some(buffer.clone()))
                 .await
                 .is_ok(),
             RemoteWrite::PutResolved { key } => {
-                remote_put_resolved_retry(session, key, address, fragment, Some(buffer.clone()))
-                    .await
-                    .is_ok()
+                published = remote_put_resolved_retry(
+                    session,
+                    key,
+                    address,
+                    fragment,
+                    Some(buffer.clone()),
+                )
+                .await
+                .is_ok();
+                published
             }
         };
     }
@@ -703,7 +738,7 @@ async fn leader_body(
 
     drop(permit);
     drop(guard);
-    Ok((address, fragment))
+    Ok((address, fragment, published))
 }
 
 /// Store a raw fragment locally (no remote, no event emission).
@@ -819,6 +854,7 @@ pub async fn write_resolved(
             // A removal stores no content; the flags describe where the mapping change landed.
             stored_local: true,
             stored_remote: remote_cleared,
+            published: remote_cleared,
         });
     }
 
@@ -853,15 +889,13 @@ pub async fn write_resolved(
     let stored_remote = written.stored_remote;
 
     if let Some(session) = remote_session {
-        if fuse_root_with_mapping {
-            // The upload published the key in the same command, so there is nothing more to do
-            // remotely — and `stored_remote` already reflects whether it succeeded.
-            if !stored_remote {
-                lore_base::lore_warn!(
-                    "Key {key} not published remotely: fused upload of {address} did not reach the remote"
-                );
-            }
+        if fuse_root_with_mapping && written.published {
+            // The upload carried the key, so there is nothing more to do remotely.
         } else if stored_remote {
+            // Either the write did not fuse, or it fused and the upload was skipped because the
+            // content was already durable — which skips the publish with it. The content is on
+            // the server either way, so write the key on its own. Without this a second key
+            // naming already-stored content is silently never published.
             session
                 .mutable_store(key, address.hash, KeyType::Resolve)
                 .await
@@ -890,6 +924,8 @@ pub async fn write_resolved(
         deduplicated: written.deduplicated,
         stored_local,
         stored_remote,
+        // The key is published by the time this returns, on whichever route got it there.
+        published: stored_remote,
     })
 }
 
@@ -994,6 +1030,8 @@ pub async fn write_content_with(
             deduplicated: false,
             stored_local,
             stored_remote,
+            // `write_fragmented` always uses `RemoteWrite::Put`; nothing fused a key.
+            published: false,
         })
     }
 }

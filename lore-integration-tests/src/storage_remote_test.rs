@@ -3928,4 +3928,128 @@ mod storage_remote_tests {
             })
             .await
     }
+
+    /// Two keys naming the same content. The second publish finds the content already durable, so
+    /// the upload — and with it the fused publish — is skipped; the key must still be written.
+    ///
+    /// This shipped broken: the second key was silently never published while the call reported
+    /// success and `stored_remote = 1`. Deduplicated content under several keys is the ordinary
+    /// case for a foreign-keyed cache, so this is the shape to keep pinned.
+    #[tokio::test]
+    async fn put_resolved_publishes_every_key_naming_the_same_content() -> TestResult {
+        use lore::storage::get_resolved;
+        use lore::storage::get_resolved::LoreStorageGetResolvedArgs;
+        use lore::storage::get_resolved::LoreStorageGetResolvedItem;
+        use lore::storage::put_resolved;
+        use lore::storage::put_resolved::LoreStoragePutResolvedArgs;
+        use lore::storage::put_resolved::LoreStoragePutResolvedItem;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::KeyType;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreBytes;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-shared-content".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = Partition::from([0xd6u8; 16]);
+                    let payload = b"one blob, many keys".to_vec();
+                    let expected = lore_storage::hash_slice(payload.as_slice());
+                    let keys = [
+                        Hash::hash_buffer(b"shared-a"),
+                        Hash::hash_buffer(b"shared-b"),
+                    ];
+                    let handle_id = open_remote_handle(&server).await;
+
+                    for (n, key) in keys.iter().enumerate() {
+                        let outs: Arc<Mutex<Vec<(LoreErrorCode, u8)>>> =
+                            Arc::new(Mutex::new(Vec::new()));
+                        let cb = outs.clone();
+                        let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+                            if let LoreEvent::StoragePutItemComplete(d) = e {
+                                cb.lock().unwrap().push((d.error_code, d.stored_remote));
+                            }
+                        }));
+                        put_resolved::put_resolved(
+                            LoreGlobalArgs::default(),
+                            LoreStoragePutResolvedArgs {
+                                handle: lore::storage::handle::LoreStore { handle_id },
+                                items: LoreArray::from_vec(vec![LoreStoragePutResolvedItem {
+                                    id: n as u64,
+                                    partition,
+                                    key: *key,
+                                    context: Context::default(),
+                                    data: LoreBytes {
+                                        ptr: payload.as_ptr().cast(),
+                                        len: payload.len(),
+                                    },
+                                    remote_write: 1,
+                                    local_cache: 0,
+                                    fixed_size_chunk: 0,
+                                }]),
+                            },
+                            callback,
+                        )
+                        .await;
+                        assert_eq!(
+                            outs.lock().unwrap().clone(),
+                            vec![(LoreErrorCode::None, 1)],
+                            "publish {n} must succeed and report remote placement"
+                        );
+
+                        // The claim `stored_remote = 1` makes is that other clients can see the
+                        // key, so check the server rather than trusting the flag.
+                        let mapped = server
+                            .backend_mutable
+                            .clone()
+                            .load(partition, *key, KeyType::Resolve)
+                            .await
+                            .unwrap_or_else(|e| {
+                                panic!("key {n} must be published on the server: {e:?}")
+                            });
+                        assert_eq!(mapped, expected, "key {n} must name the stored content");
+                    }
+
+                    // And a reader with an empty local store resolves the second key end to end.
+                    let reader = open_remote_handle(&server).await;
+                    let codes: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                    let cb = codes.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+                        if let LoreEvent::StorageGetItemComplete(d) = e {
+                            cb.lock().unwrap().push(d.error_code);
+                        }
+                    }));
+                    get_resolved::get_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStorageGetResolvedArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id: reader },
+                            items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                                id: 9,
+                                partition,
+                                key: keys[1],
+                                context: Context::default(),
+                                local_cache: 0,
+                                flags: 0,
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(
+                        codes.lock().unwrap().clone(),
+                        vec![LoreErrorCode::None],
+                        "the second key must resolve for a client that never published it"
+                    );
+
+                    close_handle(reader).await;
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
 }
