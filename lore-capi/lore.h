@@ -136,6 +136,21 @@ typedef enum lore_metadata_type_t {
   LORE_METADATA_TYPE_STRING = 2,
 } lore_metadata_type_t;
 
+// Whether a repository being created or cloned should be backed by a shared store.
+//
+// `Inherit` is zero so a zero-initialized C struct keeps following the machine's
+// `use_shared_store_automatically` setting, as callers have always relied on. `Disabled` exists
+// because that inherited setting is otherwise unconditional: without it, a caller on a machine
+// that opts in automatically has no way to ask for a repository backed by its own store.
+typedef enum lore_shared_store_mode_t {
+  // Follow the machine's `use_shared_store_automatically` global setting.
+  LORE_SHARED_STORE_MODE_INHERIT = 0,
+  // Always back the repository with a shared store.
+  LORE_SHARED_STORE_MODE_ENABLED = 1,
+  // Never back the repository with a shared store, whatever the global config says.
+  LORE_SHARED_STORE_MODE_DISABLED = 2,
+} lore_shared_store_mode_t;
+
 // Kind of value a stored key refers to.
 typedef enum lore_key_type_t {
   // Key has no specific type.
@@ -4224,8 +4239,9 @@ typedef struct lore_repository_clone_args_t {
   struct lore_string_t layer_metadata;
   // (Optional) File containing list of files to prefetch
   struct lore_string_t prefetch;
-  // Use the shared store instead of a local immutable store
-  uint8_t use_shared_store;
+  // Whether to use the shared store instead of a local immutable store. Zero-initialized
+  // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
+  enum lore_shared_store_mode_t use_shared_store;
   // [Optional] Path to use for the shared store, an empty string means to use the default
   struct lore_string_t shared_store_path;
   // Clone without local repository tracking (memory-only stores)
@@ -4264,8 +4280,9 @@ typedef struct lore_repository_create_args_t {
   struct lore_string_t description;
   // Optional repository ID, set to empty string to generate a new ID
   struct lore_string_t id;
-  // Use the shared store instead of a local immutable store
-  uint8_t use_shared_store;
+  // Whether to use the shared store instead of a local immutable store. Zero-initialized
+  // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
+  enum lore_shared_store_mode_t use_shared_store;
   // [Optional] Path to use for the shared store, an empty string means to use the default
   struct lore_string_t shared_store_path;
 } lore_repository_create_args_t;

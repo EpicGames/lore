@@ -35,6 +35,7 @@ mod open_tests {
     use lore_revision::interface::LoreEventCallback;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
+    use lore_revision::repository::LoreSharedStoreMode;
 
     /// Capture the events emitted by a call; mutex-guarded `Vec` so the
     /// callback (which must be `Fn + Send + Sync`) can push into it.
@@ -101,6 +102,14 @@ mod open_tests {
             .expect("create tempdir")
     }
 
+    /// Create a repository backed by its own store.
+    ///
+    /// `LoreSharedStoreMode::Disabled` is load-bearing, not decoration. `Inherit` follows the
+    /// developer's `use_shared_store_automatically` global setting, and on a machine that has it
+    /// set every repository here — each in its own tempdir — resolves to one process-wide
+    /// immutable store. Tests that assert anything about a store's identity or lifetime then
+    /// measure a store shared with every other test in the process. Shared-store behaviour is
+    /// covered deliberately in `shared_store_test` instead.
     async fn create_repo(path: &Path) {
         let mut repo_globals = globals();
         repo_globals.repository_path = path.into();
@@ -111,7 +120,7 @@ mod open_tests {
                 repository_url: "lore://localhost/test-storage-open".into(),
                 description: LoreString::default(),
                 id: LoreString::default(),
-                use_shared_store: 0,
+                use_shared_store: LoreSharedStoreMode::Disabled,
                 shared_store_path: LoreString::default(),
             },
             None,

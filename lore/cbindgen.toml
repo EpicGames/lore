@@ -412,6 +412,7 @@ include = [
 "LoreSharedStoreCreateArgs" = "lore_shared_store_create_args_t"
 "LoreSharedStoreCreateEventData" = "lore_shared_store_create_event_data_t"
 "LoreSharedStoreInfoArgs" = "lore_shared_store_info_args_t"
+"LoreSharedStoreMode" = "lore_shared_store_mode_t"
 "LoreSharedStoreInfoEventData" = "lore_shared_store_info_event_data_t"
 "LoreSharedStoreSetUseAutomaticallyArgs" = "lore_shared_store_set_use_automatically_args_t"
 "LoreServiceStartArgs" = "lore_service_start_args_t"
