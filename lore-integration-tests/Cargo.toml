@@ -32,9 +32,19 @@ lore-aws = { workspace = true }
 lore-revision = { workspace = true }
 lore-hashicorp = { workspace = true }
 lore-proto = { workspace = true }
-lore-server = { workspace = true, features = ["integration_tests"] }
 uuid = { workspace = true }
 
+# Only the `#[cfg(test)]` modules use this, so it belongs here rather than under
+# `[dependencies]`: resolver 2 then keeps it out of feature resolution for non-test builds.
+# It carries no `features` of its own — see `integration_tests` below.
+[dev-dependencies]
+lore-server = { workspace = true }
+
 [features]
-integration_tests = []
+# `lore_server::quic::tests` sits behind lore-server's matching feature, so pull it in from here
+# rather than from the dependency line. Requesting it on the dependency would enable it for every
+# build that resolves this crate's dev-dependencies — including a bare `cargo test` at the
+# workspace root, which is exactly the case this gate exists to exclude.
+integration_tests = ["lore-server/integration_tests"]
+# Uses only `lore_server::store::grpc_replica`, which is not feature-gated.
 grpc_integration_tests = ["dep:tokio-stream", "dep:tonic"]

@@ -6,6 +6,7 @@ mod replication_service_tests {
     use std::error::Error;
     use std::sync::Arc;
 
+    use lore_base::lore_spawn;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::Address;
     use lore_base::types::Context;
@@ -14,7 +15,6 @@ mod replication_service_tests {
     use lore_proto::ReplicationPutRequest;
     use lore_proto::rpc::replication_service_client::ReplicationServiceClient;
     use lore_revision::fragment::generate_random;
-    use lore_revision::lore_spawn;
     use lore_revision::util;
     use lore_server::store::grpc_replica::ReplicationClient;
     use lore_server::store::grpc_replica::ReplicationClientError;
