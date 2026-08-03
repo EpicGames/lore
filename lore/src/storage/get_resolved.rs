@@ -3,10 +3,16 @@
 //! `lore_storage_get_resolved` — `lore_storage_mutable_load` + `lore_storage_get` performed
 //! server-side, saving one round trip.
 //!
-//! Per-item event sequence, identical to `lore_storage_get`:
+//! Per-item event sequence in single-buffer mode (`streaming=0`), identical to
+//! `lore_storage_get`:
 //! - `GET_HEADER { id, address, size_content }`
 //! - `GET_DATA { id, address, offset: 0, bytes }`
 //! - `GET_ITEM_COMPLETE { id, address, error_code }`
+//!
+//! In streaming mode (`streaming=1`) the single `GET_DATA` is replaced by one event per leaf
+//! fragment with an advancing `offset`, so peak memory follows the fragment size rather than the
+//! content size. `GET_HEADER` still precedes the data, but it follows the resolve — unlike
+//! `lore_storage_get`, the address is not known until the key resolves.
 //!
 //! `address` is the resolved address (`{ resolved_hash, context }`), so callers may cache the
 //! key->hash mapping from the event stream.
@@ -40,6 +46,7 @@ use lore_revision::store::event::LoreStorageGetDataEventData;
 use lore_revision::store::event::LoreStorageGetHeaderEventData;
 use lore_revision::store::event::LoreStorageGetItemCompleteEventData;
 use lore_storage::read::read_resolved;
+use lore_storage::read::read_resolved_stream;
 use lore_transport::quic::storage_service::get_resolved_flags;
 use serde::Deserialize;
 use serde::Serialize;
@@ -69,6 +76,10 @@ pub struct LoreStorageGetResolvedItem {
     /// Cache fetched bytes back to the local store even without the producer's
     /// `PayloadLocalCachePriority` hint
     pub local_cache: u8,
+    /// Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer, as
+    /// `lore_storage_get` does. Peak memory then follows the fragment size rather than the
+    /// content size, which is what makes a key naming something large usable
+    pub streaming: u8,
     /// Reserved bitmask; 0 for default behaviour. No bits are defined yet, and unknown bits are
     /// rejected with `INVALID_ARGUMENTS` before the call reaches a backend — otherwise an unknown
     /// bit would be silently ignored on a local hit and refused only when the request reached the
@@ -81,6 +92,7 @@ impl core::fmt::Debug for LoreStorageGetResolvedItem {
         f.debug_struct("LoreStorageGetResolvedItem")
             .field("id", &self.id)
             .field("local_cache", &self.local_cache)
+            .field("streaming", &self.streaming)
             .field("flags", &self.flags)
             .finish()
     }
@@ -192,6 +204,10 @@ async fn get_resolved_item(
         read_options = read_options.with_cache();
     }
 
+    if item.streaming != 0 {
+        return get_resolved_item_streaming(store, item, read_options, remote_session).await;
+    }
+
     match read_resolved(
         store.immutable.clone(),
         store.mutable.clone(),
@@ -222,6 +238,54 @@ async fn get_resolved_item(
             code
         }
     }
+}
+
+/// Streaming counterpart of [`get_resolved_item`]: one `GET_DATA` per leaf instead of a single
+/// reassembled buffer, mirroring `get`'s streaming worker. The resolved address is not known
+/// until the key resolves, so `GET_HEADER` follows the resolve rather than preceding it.
+async fn get_resolved_item_streaming(
+    store: Arc<StoreInternal>,
+    item: LoreStorageGetResolvedItem,
+    read_options: lore_storage::options::ReadOptions,
+    remote_session: Option<Arc<lore_transport::StorageSession>>,
+) -> LoreErrorCode {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(256);
+    let stream_future = read_resolved_stream(
+        store.immutable.clone(),
+        store.mutable.clone(),
+        item.partition,
+        item.key,
+        item.context,
+        item.flags,
+        read_options,
+        tx,
+        remote_session,
+    );
+
+    let (resolved, size_content) = match stream_future.await {
+        Ok(result) => result,
+        Err(err) => {
+            let code = crate::storage::storage_error_to_code(&err);
+            emit_item_complete(&item, Address::default(), code);
+            return code;
+        }
+    };
+
+    let address = Address {
+        hash: resolved,
+        context: item.context,
+    };
+    emit_header(&item, address, size_content);
+
+    let mut offset: u64 = 0;
+    while let Some(chunk) = rx.recv().await {
+        let len = chunk.len() as u64;
+        emit_data(&item, address, chunk, offset);
+        offset += len;
+    }
+
+    emit_item_complete(&item, address, LoreErrorCode::None);
+    LoreErrorCode::None
 }
 
 fn emit_header(item: &LoreStorageGetResolvedItem, address: Address, size_content: u64) {

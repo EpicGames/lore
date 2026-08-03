@@ -4678,6 +4678,10 @@ typedef struct lore_storage_get_resolved_item_t {
   // Cache fetched bytes back to the local store even without the producer's
   // `PayloadLocalCachePriority` hint
   uint8_t local_cache;
+  // Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer, as
+  // `lore_storage_get` does. Peak memory then follows the fragment size rather than the
+  // content size, which is what makes a key naming something large usable
+  uint8_t streaming;
   // Reserved bitmask; 0 for default behaviour. No bits are defined yet, and unknown bits are
   // rejected with `INVALID_ARGUMENTS` before the call reaches a backend — otherwise an unknown
   // bit would be silently ignored on a local hit and refused only when the request reached the
@@ -10337,14 +10341,19 @@ void lore_storage_get_async(const struct lore_global_args_t *globals,
 //
 // The `address` in every event is the *resolved* address, so a caller can learn the key-to-hash
 // mapping from the event stream. A key with no mapping, or one naming absent content, reports
-// `error_code = ADDRESS_NOT_FOUND`.
+// `error_code = ADDRESS_NOT_FOUND`, and the terminal event then carries a zero address.
+//
+// Set `streaming` to receive one `LORE_EVENT_STORAGE_GET_DATA` per leaf fragment instead of a
+// single reassembled buffer, exactly as `lore_storage_get` does. Without it the whole content is
+// materialised in memory before the first byte reaches the callback, so a key naming something
+// large should set it.
 //
 // # Events
 //
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_STORAGE_GET_HEADER` | `lore_storage_get_header_event_data_t` | Size of the item's reassembled content, emitted before any DATA events |
-// | `LORE_EVENT_STORAGE_GET_DATA` | `lore_storage_get_data_event_data_t` | Payload bytes — valid only during the callback invocation |
+// | `LORE_EVENT_STORAGE_GET_DATA` | `lore_storage_get_data_event_data_t` | Payload bytes — valid only during the callback invocation. One event per item, or one per leaf fragment when `streaming` is set |
 // | `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE` | `lore_storage_get_item_complete_event_data_t` | Terminal per-item event |
 // | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 // | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |

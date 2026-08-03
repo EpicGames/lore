@@ -3329,6 +3329,7 @@ mod storage_remote_tests {
                         key: missing,
                         context: Context::default(),
                         local_cache: 0,
+                        streaming: 0,
                         flags: 0,
                     },
                     LoreStorageGetResolvedItem {
@@ -3337,6 +3338,7 @@ mod storage_remote_tests {
                         key: present,
                         context: Context::default(),
                         local_cache: 0,
+                        streaming: 0,
                         flags: 0,
                     },
                 ];
@@ -3400,6 +3402,7 @@ mod storage_remote_tests {
                             key: present,
                             context: Context::default(),
                             local_cache: 0,
+                            streaming: 0,
                             flags: 0,
                         }]),
                     },
@@ -3563,6 +3566,7 @@ mod storage_remote_tests {
                                 key,
                                 context: Context::default(),
                                 local_cache: 0,
+                                streaming: 0,
                                 flags: 0,
                             }]),
                         },
@@ -3673,6 +3677,7 @@ mod storage_remote_tests {
                                     key,
                                     context: Context::default(),
                                     local_cache: 0,
+                                    streaming: 0,
                                     flags: 0,
                                 }]),
                             },
@@ -3866,6 +3871,7 @@ mod storage_remote_tests {
                             key: cached_key,
                             context: Context::default(),
                             local_cache: 1,
+                            streaming: 0,
                             flags: 0,
                         },
                         LoreStorageGetResolvedItem {
@@ -3874,6 +3880,7 @@ mod storage_remote_tests {
                             key: uncached_key,
                             context: Context::default(),
                             local_cache: 0,
+                            streaming: 0,
                             flags: 0,
                         },
                     ];
@@ -4033,6 +4040,7 @@ mod storage_remote_tests {
                                 key: keys[1],
                                 context: Context::default(),
                                 local_cache: 0,
+                                streaming: 0,
                                 flags: 0,
                             }]),
                         },
@@ -4264,6 +4272,7 @@ mod storage_remote_tests {
                                 key,
                                 context: Context::default(),
                                 local_cache: 0,
+                                streaming: 0,
                                 flags: 0,
                             }]),
                         },
@@ -4277,6 +4286,144 @@ mod storage_remote_tests {
                         "the reassembled content must match what was published"
                     );
                     assert_eq!(got.lock().unwrap().clone(), payload);
+
+                    close_handle(reader).await;
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// `streaming` delivers the content one leaf at a time rather than as a single buffer, so a
+    /// key naming something large does not have to be materialised whole. The bytes and their
+    /// order must match what the buffered mode returns.
+    #[tokio::test]
+    async fn get_resolved_streams_content_one_fragment_at_a_time() -> TestResult {
+        use lore::storage::get_resolved;
+        use lore::storage::get_resolved::LoreStorageGetResolvedArgs;
+        use lore::storage::get_resolved::LoreStorageGetResolvedItem;
+        use lore::storage::put_resolved;
+        use lore::storage::put_resolved::LoreStoragePutResolvedArgs;
+        use lore::storage::put_resolved::LoreStoragePutResolvedItem;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreBytes;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-resolve-streaming".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = Partition::from([0xd9u8; 16]);
+                    let key = Hash::hash_buffer(b"streamed-key");
+                    let payload: Vec<u8> = (0..(512 * 1024u32)).map(|i| (i % 251) as u8).collect();
+                    let handle_id = open_remote_handle(&server).await;
+
+                    let put_codes: Arc<Mutex<Vec<LoreErrorCode>>> =
+                        Arc::new(Mutex::new(Vec::new()));
+                    let cb = put_codes.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+                        if let LoreEvent::StoragePutItemComplete(d) = e {
+                            cb.lock().unwrap().push(d.error_code);
+                        }
+                    }));
+                    put_resolved::put_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStoragePutResolvedArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id },
+                            items: LoreArray::from_vec(vec![LoreStoragePutResolvedItem {
+                                id: 1,
+                                partition,
+                                key,
+                                context: Context::default(),
+                                data: LoreBytes {
+                                    ptr: payload.as_ptr().cast(),
+                                    len: payload.len(),
+                                },
+                                remote_write: 1,
+                                local_cache: 0,
+                                fixed_size_chunk: 64 * 1024,
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(put_codes.lock().unwrap().clone(), vec![LoreErrorCode::None]);
+
+                    // Read it back streaming, on a handle whose local store is empty.
+                    let reader = open_remote_handle(&server).await;
+                    let chunks: Arc<Mutex<Vec<(u64, Vec<u8>)>>> = Arc::new(Mutex::new(Vec::new()));
+                    let chunks_cb = chunks.clone();
+                    let header: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+                    let header_cb = header.clone();
+                    let codes: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                    let codes_cb = codes.clone();
+                    let callback: LoreEventCallback =
+                        Some(Box::new(move |e: &LoreEvent| match e {
+                            LoreEvent::StorageGetHeader(d) => {
+                                header_cb.lock().unwrap().push(d.size_content);
+                            }
+                            LoreEvent::StorageGetData(d) => {
+                                let slice = unsafe {
+                                    std::slice::from_raw_parts(
+                                        d.bytes.ptr.cast::<u8>(),
+                                        d.bytes.len,
+                                    )
+                                };
+                                chunks_cb.lock().unwrap().push((d.offset, slice.to_vec()));
+                            }
+                            LoreEvent::StorageGetItemComplete(d) => {
+                                codes_cb.lock().unwrap().push(d.error_code);
+                            }
+                            _ => {}
+                        }));
+                    get_resolved::get_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStorageGetResolvedArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id: reader },
+                            items: LoreArray::from_vec(vec![LoreStorageGetResolvedItem {
+                                id: 2,
+                                partition,
+                                key,
+                                context: Context::default(),
+                                local_cache: 0,
+                                streaming: 1,
+                                flags: 0,
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+
+                    assert_eq!(codes.lock().unwrap().clone(), vec![LoreErrorCode::None]);
+                    assert_eq!(
+                        header.lock().unwrap().clone(),
+                        vec![payload.len() as u64],
+                        "the header must carry the whole content size before any data"
+                    );
+
+                    let chunks = chunks.lock().unwrap().clone();
+                    assert!(
+                        chunks.len() > 1,
+                        "streaming must deliver more than one event for fragmented content, got {}",
+                        chunks.len()
+                    );
+                    // Offsets must be contiguous and the concatenation must be the original.
+                    let mut expected_offset = 0u64;
+                    let mut assembled = Vec::with_capacity(payload.len());
+                    for (offset, bytes) in &chunks {
+                        assert_eq!(*offset, expected_offset, "leaf offsets must be contiguous");
+                        expected_offset += bytes.len() as u64;
+                        assembled.extend_from_slice(bytes);
+                    }
+                    assert_eq!(
+                        assembled, payload,
+                        "streamed bytes must match what was published"
+                    );
 
                     close_handle(reader).await;
                     close_handle(handle_id).await;

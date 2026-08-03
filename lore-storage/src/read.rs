@@ -526,9 +526,8 @@ async fn read_resolved_content(
     }
 }
 
-/// `mutable_load(key)` + [`read`] of the resulting address, resolved server-side so both share one
-/// round trip whenever the answer is not already local. Returns the resolved hash alongside the
-/// content.
+/// Resolve `key` to the root fragment it names, sharing one round trip with the read of that root
+/// whenever the answer is not already local.
 ///
 /// The key is always read as [`KeyType::Resolve`], locally and remotely alike.
 ///
@@ -543,17 +542,16 @@ async fn read_resolved_content(
 ///
 /// `flags` is a reserved bitmask forwarded to the server; 0 for default behaviour.
 #[allow(clippy::too_many_arguments)]
-pub async fn read_resolved(
+async fn resolve_root(
     store: Arc<dyn ImmutableStore>,
     mutable: Arc<dyn MutableStore>,
     partition: Partition,
     key: Hash,
     context: Context,
     flags: u32,
-    range: Option<Range<usize>>,
     options: ReadOptions,
     session: Option<Arc<StorageSession>>,
-) -> Result<(Hash, Bytes), StorageError> {
+) -> Result<ResolvedRoot, StorageError> {
     let options = options.with_decompress();
     let key_address = Address { hash: key, context };
 
@@ -568,15 +566,18 @@ pub async fn read_resolved(
         )
         .await
     {
-        let address = Address {
-            hash: resolved,
-            context,
-        };
-        let bytes = read_resolved_content(
-            store, partition, address, fragment, buffer, range, options, session,
-        )
-        .await?;
-        return Ok((resolved, bytes));
+        return Ok(ResolvedRoot {
+            resolved,
+            address: Address {
+                hash: resolved,
+                context,
+            },
+            fragment,
+            buffer,
+            // The local store answered for the *root*, but a fragment list's leaves may still
+            // only exist remotely, so the caller's session has to travel with it.
+            session,
+        });
     }
 
     if !options.remote {
@@ -662,18 +663,146 @@ pub async fn read_resolved(
         }
     };
 
-    let bytes = read_resolved_content(
-        store,
-        partition,
+    Ok(ResolvedRoot {
+        resolved,
         address,
         fragment,
         buffer,
-        range,
+        session: Some(session),
+    })
+}
+
+/// The root a key resolved to, plus the session the tail should use for anything the root refers
+/// to. Present whenever the caller supplied one, including on a local hit: the root can be cached
+/// locally while a fragment list's leaves are not.
+struct ResolvedRoot {
+    resolved: Hash,
+    address: Address,
+    fragment: Fragment,
+    buffer: Bytes,
+    session: Option<Arc<StorageSession>>,
+}
+
+/// `mutable_load(key)` + [`read`] of the resulting address, resolved in one round trip when the
+/// remote answers. Returns the resolved hash alongside the content.
+///
+/// See [`resolve_root`] for how the key is resolved; this reassembles the whole content into one
+/// buffer. [`read_resolved_stream`] delivers it fragment by fragment instead.
+#[allow(clippy::too_many_arguments)]
+pub async fn read_resolved(
+    store: Arc<dyn ImmutableStore>,
+    mutable: Arc<dyn MutableStore>,
+    partition: Partition,
+    key: Hash,
+    context: Context,
+    flags: u32,
+    range: Option<Range<usize>>,
+    options: ReadOptions,
+    session: Option<Arc<StorageSession>>,
+) -> Result<(Hash, Bytes), StorageError> {
+    let root = resolve_root(
+        store.clone(),
+        mutable,
+        partition,
+        key,
+        context,
+        flags,
         options,
-        Some(session),
+        session,
     )
     .await?;
-    Ok((resolved, bytes))
+
+    let bytes = read_resolved_content(
+        store,
+        partition,
+        root.address,
+        root.fragment,
+        root.buffer,
+        range,
+        options.with_decompress(),
+        root.session,
+    )
+    .await?;
+    Ok((root.resolved, bytes))
+}
+
+/// [`read_resolved`] delivering the content through `sender` one fragment at a time instead of
+/// reassembling it, mirroring what [`read_stream`] does for an address.
+///
+/// Returns the resolved hash and the content's total size; the bytes follow on the channel. Peak
+/// memory is bounded by the channel depth rather than by the content, which is what makes this
+/// usable for a key naming something large.
+#[allow(clippy::too_many_arguments)]
+pub async fn read_resolved_stream(
+    store: Arc<dyn ImmutableStore>,
+    mutable: Arc<dyn MutableStore>,
+    partition: Partition,
+    key: Hash,
+    context: Context,
+    flags: u32,
+    options: ReadOptions,
+    sender: tokio::sync::mpsc::Sender<Bytes>,
+    session: Option<Arc<StorageSession>>,
+) -> Result<(Hash, u64), StorageError> {
+    let options = options.with_decompress();
+    let root = resolve_root(
+        store.clone(),
+        mutable,
+        partition,
+        key,
+        context,
+        flags,
+        options,
+        session,
+    )
+    .await?;
+
+    if let Some(max) = options.max_content_size
+        && root.fragment.size_content > max
+    {
+        return Err(StorageError::from(crate::errors::Oversized {
+            context: format!(
+                "fragment size_content {} exceeds caller-supplied max {max}",
+                root.fragment.size_content
+            ),
+        }));
+    }
+
+    if (root.fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented
+    {
+        // The root is the fragment list, so its own bytes are not content; the leaves are.
+        let address = root.address;
+        let fragment = root.fragment;
+        let buffer = root.buffer;
+        let remote_session = root.session;
+        lore_base::lore_spawn!(async move {
+            let result = defragment_pipeline(
+                store,
+                partition,
+                address,
+                fragment,
+                buffer,
+                DefragmentSink::Stream { sender },
+                options,
+                remote_session,
+            )
+            .await;
+
+            if let Err(err) = result {
+                lore_base::lore_warn!(
+                    "error while defragmenting during read_resolved_stream: {0}",
+                    err
+                );
+            }
+        });
+    } else {
+        sender
+            .send(root.buffer)
+            .await
+            .map_err(|_err| StorageError::internal("stream send failed"))?;
+    }
+
+    Ok((root.resolved, root.fragment.size_content))
 }
 
 /// Load a single raw fragment from local store, optionally decompressing and verifying.

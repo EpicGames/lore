@@ -50,7 +50,7 @@ Both costs fall entirely on integrations that address content by foreign key. Ca
 
 6. **Both transports, one behaviour.** The operations are available over QUIC and gRPC with the same semantics, per the transport-parity property asserted in [`system-design.md` §18.1](../explanation/system-design.md).
 
-7. **Reachable from the C API.** The operations are exposed through `lore-capi` in the same shape as the storage operations they compose, since the integrations that need them are not written in Rust.
+7. **Reachable from the C API.** The operations are exposed through `lore-capi` in the same shape as the storage operations they compose, since the integrations that need them are not written in Rust. "Same shape" includes the reading options that matter at scale: a resolved read streams fragment by fragment on request, as an ordinary read does, so content size does not dictate memory.
 
 ### Non-Goals
 
@@ -76,7 +76,7 @@ This addresses Goals 1 and 2 in part: the key type is implied rather than transm
 
 `put_resolved` takes a key and a fragment, stores the fragment, and publishes the key naming it (Goal 2). Storing happens first, and the key is published only once storing succeeds. For content small enough to occupy a single fragment the store and the publish are one command, so the ordering is the server's to guarantee rather than the caller's. For content split across a fragment list, the leaves upload through the ordinary write path and the key is published afterwards, gated on the whole tree having reached the remote (Goal 3).
 
-Both operations are available on QUIC and gRPC (Goal 6) and through `lore_storage_get_resolved` and `lore_storage_put_resolved` in the C API (Goal 7).
+Both operations are available on QUIC and gRPC (Goal 6) and through `lore_storage_get_resolved` and `lore_storage_put_resolved` in the C API (Goal 7). A resolved read takes the same `streaming` option an ordinary read does: without it the content is reassembled into one buffer, with it the caller receives one event per leaf fragment and peak memory follows the fragment size instead of the content size.
 
 ### Reporting where content landed
 
@@ -108,7 +108,7 @@ Because the local store is a cache, a mapping cached locally can be stale, and a
 
 - **Concurrency** — Publishes to the same key are last-writer-wins, as `mutable_store` is today. Concurrent publishes of identical *content* coalesce on the existing in-flight guard, so N publishers of the same bytes produce one upload. Concurrent resolves of one key may observe different mappings if the key moves between them, which is inherent to reading a mutable value and not introduced here.
 
-- **Memory** — Writes are unchanged: a publish carries a single fragment, bounded by the existing fragment size threshold, and content larger than that fragments through the existing write path with its streaming and backpressure intact. Reads are not: unlike `lore_storage_get`, a resolved read has no streaming mode and reassembles the whole content into one buffer before delivering it, so peak memory scales with the content rather than the fragment size. Adding streaming later is a C ABI change, which is why it appears under Unresolved Questions rather than as a deferred detail.
+- **Memory** — Unchanged in both directions. A publish carries a single fragment, bounded by the existing fragment size threshold, and larger content fragments through the existing write path with its streaming and backpressure intact. A resolved read offers the same `streaming` mode as `lore_storage_get`: set it and the content arrives one leaf fragment at a time, so peak memory follows the fragment size rather than the content. Left unset it reassembles into a single buffer, which is the right default for the small values this API is aimed at but not for a key naming something large.
 
 - **Statelessness** — No new process- or library-level state. The operations reuse the existing per-session transport state and the existing local stores.
 
@@ -192,10 +192,8 @@ Git separates object storage from refs, and a client fetching a branch resolves 
 
 - Should a client fall back to the two-request sequence when a server does not implement these operations, and should that be automatic or a caller's choice? The fallback is simple and always correct; the argument against making it automatic is that it hides a version mismatch a deployment may want to see.
 
-- Should publishing support compare-and-swap, so that concurrent publishers to one key can detect a lost update? The argument for deciding now rather than later is that the argument struct is part of a C ABI, where adding a field after release is a breaking change.
+- Should publishing support compare-and-swap, so that concurrent publishers to one key can detect a lost update? Nothing here has shipped, so the argument struct is still free to change; the question is whether last-writer-wins is the right default to release, not whether the field can be added.
 
 - Should content published this way be reachable to the mutable store's reclamation, once such reclamation exists? Today nothing prunes mutable entries, and this proposal adds a class of them whose lifetime is governed by an external system's key space rather than Lore's own.
-
-- Should a resolved read support streaming, as `lore_storage_get` does? Without it a caller fetching multi-megabyte content by key buffers all of it. The argument for deciding now is the same one that applies to compare-and-swap: the item struct is part of a C ABI, and adding a field after release is a breaking change.
 
 - Should retraction distinguish "this key never existed" from "this key was retracted"? Today both resolve to not-found, which is sufficient for a cache and insufficient for a caller that wants to detect a deliberate removal.
