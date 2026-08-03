@@ -2659,7 +2659,6 @@ dependencies = [
  "lore-revision",
  "lore-server",
  "lore-storage",
- "lore-transport",
  "rand",
  "reqwest",
  "ring",

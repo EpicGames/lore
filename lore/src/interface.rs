@@ -6339,10 +6339,11 @@ pub type LoreStoragePutResolvedArgs = crate::storage::put_resolved::LoreStorageP
 
 /// Store one or more buffers and publish a mutable key naming each, in one round trip.
 ///
-/// `lore_storage_put` followed by `lore_storage_mutable_store`, performed by the server. The key
-/// is published under `LORE_KEY_TYPE_RESOLVE`, making it readable by
-/// `lore_storage_get_resolved`; the mapping is written only once the content is stored, so a key
-/// never resolves to content that is not there.
+/// `lore_storage_put` followed by `lore_storage_mutable_store`, fused into one request when the
+/// content fits a single fragment. The key is published under `LORE_KEY_TYPE_RESOLVE`, making it
+/// readable by `lore_storage_get_resolved`, and the mapping is written only once the content is
+/// stored — so a key published this way never resolves to content that is not there. Writing the
+/// same key type directly with `lore_storage_mutable_store` carries no such guarantee.
 ///
 /// The local store always receives both the content and the mapping. `remote_write = 1` also
 /// publishes them remotely, matching `lore_storage_put`; there is no local-then-remote fallback.

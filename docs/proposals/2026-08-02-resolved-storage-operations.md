@@ -54,7 +54,7 @@ Both costs fall entirely on integrations that address content by foreign key. Ca
 
 ### Non-Goals
 
-- **A query or secondary-index facility.** These operations resolve one key to one content address. Listing keys, prefix scans, and multi-key queries are out of scope; the existing `mutable_list` covers enumeration where it is needed.
+- **A query or secondary-index facility.** These operations resolve one key to one content address. Listing keys, prefix scans, and multi-key queries are out of scope. Note that the existing `mutable_list` does not fill that gap for these keys: it reads the local store only, and the local mapping store is a cache rather than an authority, so it cannot enumerate a repository's published keys.
 
 - **Optimistic concurrency control.** Publishing is last-writer-wins. Callers needing compare-and-swap semantics on a foreign key have `mutable_compare_and_swap` today, and extending it to these operations is deferred (see Unresolved Questions).
 
@@ -96,19 +96,19 @@ Because the local store is a cache, a mapping cached locally can be stale, and a
 
 ## Compatibility
 
-- **Wire format** — Additive. QUIC gains two opcodes on the existing `lore-storage/0.4` ALPN; gRPC gains two rpcs and two message types in `lore.storage.v1`, plus a shared per-item status message in `lore.model.v1`. A v(N-1) peer cannot decode the new commands and reports them as unimplemented; a v(N) peer decodes everything a v(N-1) peer sends unchanged. No existing message's layout changes.
+- **Wire format** — Additive. QUIC gains two opcodes on the existing `lore-storage/0.4` ALPN; gRPC gains two rpcs and four message types in `lore.storage.v1`, plus a shared per-item status message in `lore.model.v1`. A v(N-1) peer cannot decode the new commands: over gRPC it answers `Unimplemented`, while QUIC has no such status and reports the opcode as an invalid command. A v(N) peer decodes everything a v(N-1) peer sends unchanged. No existing message's layout changes.
 
-- **Client/server protocols** — A new client against an old server receives an unimplemented response for both operations, with no fallback to the two-request sequence — see Risks. An old client against a new server is unaffected, since it never sends the new commands. Authorization is unchanged: both operations run under the session authorization the existing storage commands use, and neither reads or writes anything a caller could not already reach through `get`, `put`, `mutable_load` and `mutable_store`.
+- **Client/server protocols** — A new client against an old server fails both operations — reported as unimplemented over gRPC, as an invalid command over QUIC — with no fallback to the two-request sequence; see Risks. An old client against a new server is unaffected, since it never sends the new commands. Authorization is unchanged: both operations run under the session authorization the existing storage commands use, and neither reads or writes anything a caller could not already reach through `get`, `put`, `mutable_load` and `mutable_store`.
 
 - **On-disk format** — Additive. `KeyType::Resolve` is a new discriminant, and the local mutable store encodes the key type into the stored key ([`lore-storage/src/local/mutable_store.rs`](../../lore-storage/src/local/mutable_store.rs)), so the new type extends the persisted key space without disturbing existing entries. An upgraded Lore reads existing repositories unchanged; a downgraded Lore reads everything except keys of the new type, which it does not recognise and does not need.
 
-- **CLI and public API** — Additive. Four new `extern "C"` entry points (`lore_storage_get_resolved`, `lore_storage_put_resolved`, and their `_async` variants) and their argument and item structs. The shared per-item completion event for writes gains two fields, appended after the existing ones so that a consumer reading only the original fields is unaffected — the same append pattern the header's own compile check already pins for `lore_complete_event_data_t`. No CLI subcommand changes.
+- **CLI and public API** — Additive. Four new `extern "C"` entry points (`lore_storage_get_resolved`, `lore_storage_put_resolved`, and their `_async` variants) and their argument and item structs. The shared per-item completion event for writes gains two fields, appended after the existing ones: at the C level they occupy the struct's existing tail padding, so its size and every prior field offset are unchanged, and they carry `#[serde(default)]` so that the same event crossing the service IPC boundary still deserializes from a peer that predates them — the pattern `lore_complete_event_data_t` established when error detail was appended to it. No CLI subcommand changes.
 
 ## Non-Functional Considerations
 
 - **Concurrency** — Publishes to the same key are last-writer-wins, as `mutable_store` is today. Concurrent publishes of identical *content* coalesce on the existing in-flight guard, so N publishers of the same bytes produce one upload. Concurrent resolves of one key may observe different mappings if the key moves between them, which is inherent to reading a mutable value and not introduced here.
 
-- **Memory** — Unchanged. Both operations carry a single fragment, bounded by the existing fragment size threshold; content larger than that fragments through the existing write path and reassembles through the existing read path, with the same streaming and backpressure behaviour.
+- **Memory** — Writes are unchanged: a publish carries a single fragment, bounded by the existing fragment size threshold, and content larger than that fragments through the existing write path with its streaming and backpressure intact. Reads are not: unlike `lore_storage_get`, a resolved read has no streaming mode and reassembles the whole content into one buffer before delivering it, so peak memory scales with the content rather than the fragment size. Adding streaming later is a C ABI change, which is why it appears under Unresolved Questions rather than as a deferred detail.
 
 - **Statelessness** — No new process- or library-level state. The operations reuse the existing per-session transport state and the existing local stores.
 
@@ -195,5 +195,7 @@ Git separates object storage from refs, and a client fetching a branch resolves 
 - Should publishing support compare-and-swap, so that concurrent publishers to one key can detect a lost update? The argument for deciding now rather than later is that the argument struct is part of a C ABI, where adding a field after release is a breaking change.
 
 - Should content published this way be reachable to the mutable store's reclamation, once such reclamation exists? Today nothing prunes mutable entries, and this proposal adds a class of them whose lifetime is governed by an external system's key space rather than Lore's own.
+
+- Should a resolved read support streaming, as `lore_storage_get` does? Without it a caller fetching multi-megabyte content by key buffers all of it. The argument for deciding now is the same one that applies to compare-and-swap: the item struct is part of a C ABI, and adding a field after release is a breaking change.
 
 - Should retraction distinguish "this key never existed" from "this key was retracted"? Today both resolve to not-found, which is sufficient for a cache and insufficient for a caller that wants to detect a deliberate removal.

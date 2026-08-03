@@ -2,8 +2,11 @@
 // SPDX-License-Identifier: MIT
 //! `lore_storage_put_resolved` — store a buffer and publish a mutable key naming it.
 //!
-//! The write side of `lore_storage_get_resolved`, and the only thing that makes a key resolvable:
-//! it stores the content, then maps `key` to the content's hash under `KeyType::Resolve`.
+//! The write side of `lore_storage_get_resolved`: it stores the content, then maps `key` to the
+//! content's hash under `KeyType::Resolve`. It is not the only writer of that mapping —
+//! `lore_storage_mutable_store` accepts the same key type, a publish large enough to fragment
+//! finishes with an ordinary mutable store write, and `get_resolved` caches the mapping it reads
+//! — but it is the only one that guarantees the content is stored before the key names it.
 //!
 //! Backend selection matches `lore_storage_put` rather than the read ops: the local store always
 //! receives both the content and the mapping, and `remote_write = 1` additionally publishes them

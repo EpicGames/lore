@@ -164,14 +164,14 @@ async fn put_file_item(
     item: LoreStoragePutFileItem,
     session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
-    let (address, error_code) = resolve_put_file_item(store, &item, session).await;
+    let (address, error_code, stored_local, stored_remote) =
+        resolve_put_file_item(store, &item, session).await;
     LoreEvent::StoragePutItemComplete(LoreStoragePutItemCompleteEventData {
         id: item.id,
         address,
         error_code,
-        // `put_file` does not surface placement yet; zero means "not reported" here.
-        stored_local: 0,
-        stored_remote: 0,
+        stored_local: u8::from(stored_local),
+        stored_remote: u8::from(stored_remote),
     })
     .send();
     error_code
@@ -181,32 +181,53 @@ async fn resolve_put_file_item(
     store: Arc<StoreInternal>,
     item: &LoreStoragePutFileItem,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
-) -> (Address, LoreErrorCode) {
+) -> (Address, LoreErrorCode, bool, bool) {
     if item.partition == Partition::default() {
-        return (Address::default(), LoreErrorCode::InvalidArguments);
+        return (
+            Address::default(),
+            LoreErrorCode::InvalidArguments,
+            false,
+            false,
+        );
     }
 
     let path_str = item.path.as_str();
     if path_str.is_empty() {
-        return (Address::default(), LoreErrorCode::InvalidArguments);
+        return (
+            Address::default(),
+            LoreErrorCode::InvalidArguments,
+            false,
+            false,
+        );
     }
     let path = PathBuf::from(path_str);
 
     match tokio::fs::metadata(&path).await {
         Ok(meta) => {
             if !meta.is_file() {
-                return (Address::default(), LoreErrorCode::InvalidArguments);
+                return (
+                    Address::default(),
+                    LoreErrorCode::InvalidArguments,
+                    false,
+                    false,
+                );
             }
             if meta.len() == 0 {
                 let address = Address {
                     hash: Hash::default(),
                     context: item.context,
                 };
-                return (address, LoreErrorCode::None);
+                // An empty file stores nothing anywhere.
+                return (address, LoreErrorCode::None, false, false);
             }
         }
         Err(_) => {
-            return (Address::default(), LoreErrorCode::InvalidArguments);
+            return (
+                Address::default(),
+                LoreErrorCode::InvalidArguments,
+                false,
+                false,
+            );
         }
     }
 
@@ -229,10 +250,17 @@ async fn resolve_put_file_item(
     )
     .await
     {
-        Ok((address, _fragment)) => (address, LoreErrorCode::None),
+        Ok(written) => (
+            written.address,
+            LoreErrorCode::None,
+            written.stored_local,
+            written.stored_remote,
+        ),
         Err(err) => (
             Address::default(),
             crate::storage::storage_error_to_code(&err),
+            false,
+            false,
         ),
     }
 }

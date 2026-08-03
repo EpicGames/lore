@@ -2405,7 +2405,8 @@ typedef struct lore_storage_put_item_complete_event_data_t {
   // The outcome for the item.
   enum lore_error_code_t error_code;
   // Non-zero when the local store holds the content. Appended after the original three
-  // fields, so a consumer reading only those is unaffected.
+  // fields, so a consumer reading only those is unaffected — `serde(default)` lets an older
+  // payload that lacks the field deserialize, as events cross the IPC boundary.
   uint8_t stored_local;
   // Non-zero when the content reached the remote, or was already durable there. A remote
   // write that fails still reports `error_code = NONE` if the local write succeeded — this is
@@ -10358,10 +10359,11 @@ void lore_storage_get_resolved_async(const struct lore_global_args_t *globals,
 
 // Store one or more buffers and publish a mutable key naming each, in one round trip.
 //
-// `lore_storage_put` followed by `lore_storage_mutable_store`, performed by the server. The key
-// is published under `LORE_KEY_TYPE_RESOLVE`, making it readable by
-// `lore_storage_get_resolved`; the mapping is written only once the content is stored, so a key
-// never resolves to content that is not there.
+// `lore_storage_put` followed by `lore_storage_mutable_store`, fused into one request when the
+// content fits a single fragment. The key is published under `LORE_KEY_TYPE_RESOLVE`, making it
+// readable by `lore_storage_get_resolved`, and the mapping is written only once the content is
+// stored — so a key published this way never resolves to content that is not there. Writing the
+// same key type directly with `lore_storage_mutable_store` carries no such guarantee.
 //
 // The local store always receives both the content and the mapping. `remote_write = 1` also
 // publishes them remotely, matching `lore_storage_put`; there is no local-then-remote fallback.

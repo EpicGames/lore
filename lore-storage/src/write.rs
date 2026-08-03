@@ -851,9 +851,11 @@ pub async fn write_resolved(
             address,
             fragment: Fragment::default(),
             deduplicated: false,
-            // A removal stores no content; the flags describe where the mapping change landed.
-            stored_local: true,
-            stored_remote: remote_cleared,
+            // A removal stores no content, so neither placement flag is set — the same answer
+            // `put` gives for an empty buffer. Whether the removal reached the remote is carried
+            // by the result: the remote clear propagates its error rather than being swallowed.
+            stored_local: false,
+            stored_remote: false,
             published: remote_cleared,
         });
     }
@@ -1048,7 +1050,7 @@ pub async fn write_from_file(
     flags: WriteOptions,
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<WriteTracker>>,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<StoreResult, StorageError> {
     let _count_permit = file_count_limit_acquire()
         .await
         .forward::<StorageError>("permit failed")?;
@@ -1095,15 +1097,20 @@ pub async fn write_from_file(
             )
             .await?;
 
-            Ok((written.address, written.fragment))
+            Ok(written)
         } else {
-            Ok((
-                Address {
+            // An empty file stores nothing anywhere, so neither placement flag is set.
+            Ok(StoreResult {
+                address: Address {
                     context,
                     hash: Hash::new_zeroed(),
                 },
-                Fragment::new_zeroed(),
-            ))
+                fragment: Fragment::new_zeroed(),
+                deduplicated: false,
+                stored_local: false,
+                stored_remote: false,
+                published: false,
+            })
         }
     }
 }

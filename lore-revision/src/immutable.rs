@@ -416,6 +416,7 @@ pub async fn write_from_file_with_tracker(
         tracker,
     )
     .await
+    .map(|written| (written.address, written.fragment))
     .forward("writing immutable content from file")
 }
 

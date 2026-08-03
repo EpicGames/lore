@@ -2021,8 +2021,9 @@ The protocol's command set is small and the same on both transports:
 - *GetResolved*, *PutResolved* - span both stores, using the `Resolve` key type. *GetResolved*
   resolves a mutable key and returns the immutable blob it names, so a key lookup and the read
   it feeds share one round trip instead of two. *PutResolved* is its write side: it stores a
-  fragment and publishes a key naming it in one round trip, and is the only way a key becomes
-  resolvable. The mapping is published only once the content behind it is stored.
+  fragment and publishes a key naming it in one round trip. The mapping is published only once
+  the content behind it is stored, which is what distinguishes it from writing the same key type
+  with *MutableStore* directly.
 
 QUIC and gRPC carry these commands with the same arguments and return the same answers.
 The QUIC transport (ALPN `lore-storage/0.4`) is binary and low-overhead, designed for

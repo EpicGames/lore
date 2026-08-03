@@ -23,7 +23,6 @@ impl ::prost::Name for Fragment {
         "/lore.model.v1.Fragment".into()
     }
 }
-/// Content-addressed handle for a stored object.
 /// Per-item outcome carried inside a streaming response, so one item's failure does not end the
 /// stream. Mirrors the QUIC CommandHeader's `error` bit + `size_or_status`: the transport reports
 /// each request's fate in-band, reserving a transport-level error for stream-fatal conditions.
