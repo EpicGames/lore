@@ -68,6 +68,48 @@ mod storage_remote_tests {
         }
     }
 
+    /// Pick a port number that is free on both TCP and UDP.
+    ///
+    /// A `lore://` server needs gRPC on TCP and QUIC on UDP at the same number, and neither
+    /// server API accepts a pre-bound socket — both bind from the address themselves. Choosing
+    /// the number by binding TCP alone therefore never checks the UDP side, so two servers can
+    /// settle on the same number and one of them loses its bind. Binding UDP first and then
+    /// requiring the same number on TCP proves both are free before either server starts.
+    ///
+    /// The window between dropping these probes and the servers binding is unavoidable while the
+    /// APIs bind for themselves; it is a few microseconds against the seconds-long lifetime of a
+    /// real conflict, and [`await_listening`] turns a loss into an immediate failure.
+    async fn reserve_port() -> SocketAddr {
+        for _ in 0..64 {
+            let Ok(udp) = tokio::net::UdpSocket::bind("127.0.0.1:0").await else {
+                continue;
+            };
+            let addr = udp.local_addr().expect("udp local addr");
+            let Ok(tcp) = tokio::net::TcpListener::bind(addr).await else {
+                continue;
+            };
+            drop(tcp);
+            drop(udp);
+            return addr;
+        }
+        panic!("no port free on both TCP and UDP after 64 attempts");
+    }
+
+    /// Block until `addr` accepts a TCP connection, panicking if it never does.
+    ///
+    /// The gRPC server binds inside a spawned task, so a failed bind cannot propagate to the
+    /// caller. Returning quietly on timeout leaves the test to meet it as a peer that never
+    /// answers — minutes of client retries reported as a hang instead of the bind error it is.
+    async fn await_listening(addr: SocketAddr) {
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("server at {addr} never started listening");
+    }
+
     async fn start_test_server() -> TestServer {
         let backend_immutable = lore_storage::local::immutable_store::create(
             None::<&str>,
@@ -93,9 +135,7 @@ mod storage_remote_tests {
         let backend_for_test = backend_immutable.clone();
         let backend_mutable_for_test: Arc<dyn lore_storage::MutableStore> = backend_mutable.clone();
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr: SocketAddr = listener.local_addr().unwrap();
-        drop(listener);
+        let addr = reserve_port().await;
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let signal = async {
@@ -135,12 +175,7 @@ mod storage_remote_tests {
                 .unwrap();
         });
 
-        for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            if tokio::net::TcpStream::connect(addr).await.is_ok() {
-                break;
-            }
-        }
+        await_listening(addr).await;
 
         TestServer {
             url: format!("grpc://127.0.0.1:{}", addr.port()),
@@ -181,11 +216,8 @@ mod storage_remote_tests {
         let backend_for_test = backend_immutable.clone();
         let backend_mutable_for_test: Arc<dyn lore_storage::MutableStore> = backend_mutable.clone();
 
-        // One port number serving both: claim it on TCP (which gRPC needs) and reuse the number
-        // for the QUIC UDP socket.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr: SocketAddr = listener.local_addr().unwrap();
-        drop(listener);
+        // One port number serving both: QUIC on UDP, gRPC on TCP.
+        let addr = reserve_port().await;
 
         let (cert_path, key_path, _ca) = server_certs().expect("test certs");
         let quic = QuinnServer::start(
@@ -237,12 +269,7 @@ mod storage_remote_tests {
                 .unwrap();
         });
 
-        for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            if tokio::net::TcpStream::connect(addr).await.is_ok() {
-                break;
-            }
-        }
+        await_listening(addr).await;
 
         TestServer {
             url: format!("lore://127.0.0.1:{}", addr.port()),
