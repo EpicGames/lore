@@ -34,6 +34,22 @@ use tracing::warn;
 use crate::aws_error::AwsError;
 use crate::observe_aws_operation_callback;
 
+/// HTTP status S3 returns when a conditional write's precondition is not met.
+const PRECONDITION_FAILED: u16 = 412;
+
+/// Whether an S3 error is the precondition failure a conditional write returns when the key is
+/// already present, rather than a genuine failure.
+///
+/// Used to tell "someone else's object is already there" apart from "the upload broke", which
+/// are handled very differently: the first is a race to recover from, the second is an error.
+pub fn is_precondition_failed<E>(error: &AwsError<SdkError<E>>) -> bool {
+    matches!(
+        error,
+        AwsError::AwsSdkError(SdkError::ServiceError(err))
+            if err.raw().status().as_u16() == PRECONDITION_FAILED
+    )
+}
+
 #[derive(Clone)]
 struct S3InstrumentProvider;
 
@@ -211,6 +227,82 @@ impl S3Impl {
                 self.instruments
                     .instrument_provider
                     .get_labels_for_operation_context("put_object"),
+                observe_aws_operation_callback(self.slow_operation_duration),
+            )
+            .await
+            .output
+            .map_err(AwsError::AwsSdkError)
+    }
+
+    /// Store an object only if the key is absent.
+    ///
+    /// Makes the object write-once, so exactly one writer can ever create the bytes under a key.
+    /// That writer is the only one whose put succeeds, which makes S3 itself the mutual exclusion
+    /// between competing writers — no external lock required. A successful put is therefore proof
+    /// the stored bytes are this writer's, and the only point at which it is safe to publish
+    /// metadata describing them.
+    ///
+    /// A key that already exists fails with HTTP 412; see [`is_precondition_failed`].
+    #[tracing::instrument(name = "S3Impl::put_object_if_absent", skip_all)]
+    pub async fn put_object_if_absent<T>(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: T,
+    ) -> Result<PutObjectOutput, AwsError<SdkError<PutObjectError>>>
+    where
+        T: Into<Vec<u8>> + 'static,
+    {
+        self.client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .if_none_match("*")
+            .body(ByteStream::from(Into::<Vec<u8>>::into(body)))
+            .send()
+            .observe(
+                self.instruments.operation_latency_histogram.clone(),
+                self.instruments
+                    .instrument_provider
+                    .get_labels_for_operation_context("put_object_if_absent"),
+                observe_aws_operation_callback(self.slow_operation_duration),
+            )
+            .await
+            .output
+            .map_err(AwsError::AwsSdkError)
+    }
+
+    /// Replace an object only if it is still exactly the one identified by `etag`.
+    ///
+    /// Used to reclaim an object abandoned by a writer that never published it. Conditioning on
+    /// the entity tag observed a moment earlier makes reclaiming single-winner: the first reclaim
+    /// changes the tag, so a second writer racing for the same object is rejected rather than
+    /// quietly replacing bytes the first one is about to publish metadata for.
+    ///
+    /// A tag that no longer matches fails with HTTP 412; see [`is_precondition_failed`].
+    #[tracing::instrument(name = "S3Impl::put_object_if_match", skip_all)]
+    pub async fn put_object_if_match<T>(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: T,
+        etag: &str,
+    ) -> Result<PutObjectOutput, AwsError<SdkError<PutObjectError>>>
+    where
+        T: Into<Vec<u8>> + 'static,
+    {
+        self.client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .if_match(etag)
+            .body(ByteStream::from(Into::<Vec<u8>>::into(body)))
+            .send()
+            .observe(
+                self.instruments.operation_latency_histogram.clone(),
+                self.instruments
+                    .instrument_provider
+                    .get_labels_for_operation_context("put_object_if_match"),
                 observe_aws_operation_callback(self.slow_operation_duration),
             )
             .await

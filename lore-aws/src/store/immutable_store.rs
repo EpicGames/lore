@@ -6,6 +6,9 @@ use std::fmt::Formatter;
 use std::string::ToString;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
 use aws_sdk_dynamodb::error::SdkError;
@@ -14,6 +17,7 @@ use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::types::Select;
 use aws_sdk_s3::operation::get_object::GetObjectError;
+use aws_smithy_types::DateTime;
 use bytes::Bytes;
 use bytes::BytesMut;
 use lore_base::error::AddressNotFound;
@@ -44,6 +48,7 @@ use lore_telemetry::timer::TimedResult;
 use lore_telemetry::tracing::fields::ADDRESS;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use opentelemetry::KeyValue;
+use opentelemetry::metrics::Counter;
 use opentelemetry::metrics::Histogram;
 use serde::Deserialize;
 use serde::Serialize;
@@ -102,6 +107,67 @@ impl FragmentsEntry {
             repository_context,
         }
     }
+}
+
+/// Lower bound on how long to wait for an in-flight upload to publish before treating the object
+/// it left behind as abandoned.
+const MIN_ABANDONED_GRACE_MILLIS: u64 = 100;
+
+/// Lower bound on the obliteration drain, regardless of how the `DynamoDB` timeout is configured.
+const MIN_OBLITERATION_DRAIN_MILLIS: u64 = 100;
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
+}
+
+/// Whether an object stored at `last_modified` has gone unpublished long enough that the writer
+/// which stored it must be gone rather than still finishing.
+///
+/// Deliberately one-sided: without a usable timestamp, or with one that looks like the future,
+/// the object is treated as live. Concluding too early is not a correctness problem — reclaiming
+/// is single-winner and only a reclaimer may overwrite metadata — but it does waste another
+/// writer's upload, so the doubt is resolved in their favour.
+///
+/// The age is measured against the local clock, so the threshold wants to stay comfortably above
+/// any skew between this host and S3.
+fn is_abandoned(last_modified: Option<&DateTime>, threshold_millis: u64) -> bool {
+    let Some(stored_at_millis) = last_modified.and_then(datetime_millis) else {
+        // An object that cannot be dated can never be judged abandoned, so it will never be
+        // reclaimed and every put for this hash backs off indefinitely. Real S3 always reports
+        // this; an implementation that does not turns a recoverable orphan into an unwritable
+        // hash, which is worth saying out loud rather than leaving to look like contention.
+        error!(
+            "Stored object reports no usable last-modified time, so it can never be reclaimed \
+             if its writer abandoned it"
+        );
+
+        return false;
+    };
+
+    let now = now_millis();
+
+    if stored_at_millis > now {
+        warn!(
+            ahead_millis = stored_at_millis - now,
+            "Stored object is dated in the future; check this host's clock against S3, as \
+             reclaiming abandoned uploads depends on the two agreeing"
+        );
+
+        return false;
+    }
+
+    now - stored_at_millis >= threshold_millis
+}
+
+/// Milliseconds since the epoch, or `None` for a time that predates it.
+///
+/// Keeps sub-second precision, so a threshold below a second means what it says.
+fn datetime_millis(time: &DateTime) -> Option<u64> {
+    let seconds = u64::try_from(time.secs()).ok()?;
+
+    Some(seconds.saturating_mul(1_000) + u64::from(time.subsec_nanos()) / 1_000_000)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -203,6 +269,15 @@ pub struct AwsImmutableStoreSettings {
     pub force_write: bool,
     #[serde(default = "default_submission_limit")]
     pub batch_exist_submission_limit: usize,
+    /// How long to keep waiting for another writer to publish an object it has already uploaded
+    /// before treating that object as abandoned and recovering it. Defaults to a multiple of the
+    /// S3 request timeout, so a merely slow writer is given time to finish rather than having its
+    /// upload adopted.
+    pub abandoned_upload_grace_millis: Option<u64>,
+    /// How long an obliteration waits, after marking a row, for puts that read it beforehand to
+    /// finish writing their association. Sized above the `DynamoDB` request timeout so such a write
+    /// has either landed or failed by the time the references are counted again.
+    pub obliteration_drain_millis: Option<u64>,
 }
 
 impl AwsImmutableStoreSettings {
@@ -216,12 +291,117 @@ impl AwsImmutableStoreSettings {
             dynamodb,
             force_write,
             batch_exist_submission_limit: default_submission_limit(),
+            abandoned_upload_grace_millis: None,
+            obliteration_drain_millis: None,
         }
+    }
+
+    /// Resolve how long a writer waits for someone else's upload to be published. Sized above the
+    /// S3 request timeout so a live writer has finished by the time its object is treated as
+    /// abandoned; recovery is correct either way, this only avoids doing it needlessly.
+    fn abandoned_grace_millis(&self) -> u64 {
+        self.abandoned_upload_grace_millis
+            .unwrap_or_else(|| self.s3.timeout_millis.saturating_mul(4))
+            // `max` raises anything below the floor up to it.
+            .max(MIN_ABANDONED_GRACE_MILLIS)
+    }
+
+    /// Resolve the obliteration drain. Obliteration is rare and not latency sensitive, so this is
+    /// sized generously: an association write that had already begun must have completed or timed
+    /// out before the references are counted again.
+    fn obliteration_drain_millis(&self) -> u64 {
+        self.obliteration_drain_millis
+            .unwrap_or_else(|| self.dynamodb.timeout_millis.saturating_mul(4))
+            // `max` raises anything below the floor up to it.
+            .max(MIN_OBLITERATION_DRAIN_MILLIS)
     }
 }
 
+/// Counts payloads whose metadata says they are stored but whose object is not in S3.
+///
+/// Should always be zero. A non-zero value means content has been lost underneath the store —
+/// see [`AwsImmutableStore`] for why nothing repairs it automatically.
+pub const METRICS_MISSING_PAYLOAD_METRIC_NAME: &str = "store.immutable.missing_payload";
+
 pub const FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE: &str = "hash";
 pub const FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE: &str = "repository_context";
+
+/// How many times `put` re-probes after losing a race. Each retry is one extra metadata read;
+/// the bound stops a contended hash from spinning here instead of returning to the caller, which
+/// can retry with its own backoff.
+const PUT_MAX_ATTEMPTS: usize = 3;
+
+/// What a `put` should do, given what its probe observed.
+#[derive(Debug, PartialEq)]
+enum PutAction {
+    /// The exact association already exists against durable content; nothing to write.
+    Done,
+    /// The payload is already durable, in this or another partition. Record the association and
+    /// skip the upload.
+    Deduplicate(Fragment),
+    /// Store the bytes and publish them, with the publish conditioned on this.
+    Upload(MetadataWriteCondition),
+    /// The caller did not supply the bytes and nothing here entitles it to skip them.
+    PayloadRequired,
+    /// The payload is marked for obliteration. The mark is transient, so this is a back-off
+    /// rather than a failure.
+    Obliterating,
+    /// Different content is already stored under this hash.
+    Collision,
+}
+
+/// Decide what a put should do from the probed association and metadata state.
+///
+/// Deduplication hinges on [`MetadataState::Committed`] meaning the payload is durable in S3:
+/// rows are only committed after their upload succeeded, so a committed row lets this writer
+/// record a reference instead of re-uploading bytes the server already holds. Crucially the
+/// *stored* fragment is what gets referenced, never the incoming one — the S3 object is whatever
+/// the original writer stored, so adopting an incoming fragment that described a different
+/// representation would leave the metadata contradicting the bytes.
+fn decide_put(
+    fragment: Fragment,
+    associated: bool,
+    stored: Option<Fragment>,
+    force_write: bool,
+    has_payload: bool,
+) -> PutAction {
+    match stored {
+        // Nothing stored, so this writer has to supply the bytes. Note this is also how a lost
+        // metadata row heals: the association may well exist already, but without metadata the
+        // payload is not readable, so it is stored and published again.
+        None => PutAction::Upload(MetadataWriteCondition::Absent),
+
+        Some(stored) => {
+            // Checked ahead of `force_write`, because an obliteration in progress holds a lock on
+            // this row. Overwriting it would release that lock underneath the obliteration and
+            // resurrect content that is being deleted.
+            if stored.flags & FragmentFlags::PayloadObliterating
+                == FragmentFlags::PayloadObliterating
+            {
+                PutAction::Obliterating
+            } else if force_write {
+                PutAction::Upload(MetadataWriteCondition::Unchanged(stored))
+            } else if stored.flags & FragmentFlags::PayloadObliterated
+                == FragmentFlags::PayloadObliterated
+            {
+                // A tombstone: the payload was deleted, so the bytes must be stored again.
+                PutAction::Upload(MetadataWriteCondition::Unchanged(stored))
+            } else if fragment.size_content != stored.size_content {
+                PutAction::Collision
+            } else if associated {
+                PutAction::Done
+            } else if has_payload {
+                // Attaching content the caller does not already reference means presenting the
+                // bytes for it. The upload is what deduplication skips, not that requirement:
+                // a hash on its own is not evidence the caller holds the content, and treating
+                // it as such would let one be attached to a partition that never had it.
+                PutAction::Deduplicate(stored)
+            } else {
+                PutAction::PayloadRequired
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum FragmentsQuery {
@@ -295,32 +475,80 @@ impl DynamoDbQuery for FragmentsQuery {
     }
 }
 
+/// Condition parts asserting that a metadata row still describes exactly `expected`.
+fn committed_metadata_condition_parts(expected: Fragment) -> ConditionParts {
+    ConditionParts {
+        condition_expression:
+            "#flags = :flags AND #size_payload = :size_payload AND #size_content = :size_content"
+                .to_string(),
+        expression_names: HashMap::from([
+            ("#flags".to_string(), "flags".to_string()),
+            ("#size_payload".to_string(), "size_payload".to_string()),
+            ("#size_content".to_string(), "size_content".to_string()),
+        ]),
+        expression_values: HashMap::from([
+            (
+                ":flags".to_string(),
+                AttributeValue::N(expected.flags.to_string()),
+            ),
+            (
+                ":size_payload".to_string(),
+                AttributeValue::N(expected.size_payload.to_string()),
+            ),
+            (
+                ":size_content".to_string(),
+                AttributeValue::N(expected.size_content.to_string()),
+            ),
+        ]),
+    }
+}
+
+/// Whether a conditional put failed its condition, as opposed to failing outright. Callers treat
+/// this as "another writer won the race", not as an error.
+fn is_conditional_check_failed(error: &AwsError<DynamoDbSdkError<PutItemError>>) -> bool {
+    let AwsError::AwsSdkError(sdk_error) = error else {
+        return false;
+    };
+
+    sdk_error
+        .as_service_error()
+        .is_some_and(PutItemError::is_conditional_check_failed_exception)
+}
+
 #[derive(Debug, PartialEq)]
 struct UpdateMetadataCondition(Fragment);
 
 impl DynamoDbPutCondition for UpdateMetadataCondition {
     fn into_parts(self) -> ConditionParts {
-        ConditionParts {
-            condition_expression: "#flags = :flags AND #size_payload = :size_payload AND #size_content = :size_content".to_string(),
-            expression_names: HashMap::from([
-                ("#flags".to_string(), "flags".to_string()),
-                ("#size_payload".to_string(), "size_payload".to_string()),
-                ("#size_content".to_string(), "size_content".to_string()),
-            ]),
-            expression_values: HashMap::from([
-                (
-                    ":flags".to_string(),
-                    AttributeValue::N(self.0.flags.to_string()),
-                ),
-                (
-                    ":size_payload".to_string(),
-                    AttributeValue::N(self.0.size_payload.to_string()),
-                ),
-                (
-                    ":size_content".to_string(),
-                    AttributeValue::N(self.0.size_content.to_string()),
-                ),
-            ]),
+        committed_metadata_condition_parts(self.0)
+    }
+}
+
+/// Guards publishing a payload's metadata.
+///
+/// Publishing is only ever done by the writer whose own conditional upload created the object,
+/// or by one that recovered the object's representation from the object itself. The condition
+/// stops that publish from overwriting a row that changed in the meantime — most importantly an
+/// obliteration lock, which must not be cleared by a concurrent write.
+#[derive(Debug, PartialEq)]
+enum MetadataWriteCondition {
+    /// No metadata row exists for this hash at all.
+    Absent,
+    /// The row still describes exactly this fragment.
+    Unchanged(Fragment),
+}
+
+impl DynamoDbPutCondition for MetadataWriteCondition {
+    fn into_parts(self) -> ConditionParts {
+        match self {
+            MetadataWriteCondition::Absent => ConditionParts {
+                condition_expression: "attribute_not_exists(#hash)".to_string(),
+                expression_names: HashMap::from([("#hash".to_string(), "hash".to_string())]),
+                expression_values: HashMap::new(),
+            },
+            MetadataWriteCondition::Unchanged(expected) => {
+                committed_metadata_condition_parts(expected)
+            }
         }
     }
 }
@@ -330,11 +558,105 @@ static STORE_ATTRIBUTES: LazyLock<[KeyValue; 1]> =
 
 type BatchTaskResult = Result<(usize, StoreMatch), (usize, StoreError)>;
 
+/// Result of an upload: whether this writer is the one that created the object.
+#[derive(Debug, PartialEq, Eq)]
+enum UploadOutcome {
+    /// This writer's bytes are now the object's contents.
+    Stored,
+    /// An object this writer did not create is already under the key.
+    AlreadyPresent,
+}
+
+/// What became of an object found under a key this writer does not own.
+#[derive(Debug, PartialEq, Eq)]
+enum UnpublishedObject {
+    /// A published row accounts for it, so it is durable and described.
+    Published,
+    /// An obliteration owns the hash, so this object should not exist at all. A tombstone is a
+    /// row, but it does not account for an object.
+    ObliteratedRemnant,
+    /// Stored too recently to conclude anything: its writer is most likely still finishing.
+    InFlight,
+    /// Stored long enough ago that its writer would have published by now. The tag identifies
+    /// the object as observed, so reclaiming it can be made single-winner.
+    Abandoned(Option<String>),
+}
+
+/// Whether this writer's bytes displaced someone else's.
+///
+/// A conditional upload cannot displace anything, so its bytes stay canonical until an
+/// obliteration or a reclaim removes them. An unconditional one replaces whatever was there,
+/// which is what decides who may overwrite whose metadata when a publish is rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteMode {
+    /// Written only because the key was free.
+    Exclusive,
+    /// Written over whatever was there.
+    Displacing,
+}
+
+/// How far a publish got before the row moved underneath it.
+#[derive(Debug, PartialEq, Eq)]
+enum PublishOutcome {
+    Published,
+    /// An obliteration took the row. It deletes the payload itself, so there is nothing to do.
+    Obliterating,
+    /// Another writer owns the hash now, and these bytes are no longer known to be the stored
+    /// ones, so publishing over it would be a guess.
+    Superseded,
+    /// The row kept changing; the publish never landed.
+    Contended,
+}
+
+/// How many times a publish re-reads and re-conditions before giving up. Only the metadata write
+/// is retried: the bytes are already stored, so re-uploading them buys nothing.
+const PUBLISH_MAX_ATTEMPTS: usize = 3;
+
+/// Classify a failed upload, keeping the underlying error attached so the cause survives into
+/// the error chain rather than only into the log line.
+fn upload_error<E>(key: &str, error: AwsError<E>) -> StoreError
+where
+    AwsError<E>: std::error::Error + Send + Sync + 'static,
+{
+    warn!(%key, ?error, "Failed to write payload");
+
+    if matches!(error, AwsError::AwsSdkError(_)) {
+        StoreError::from(SlowDown)
+    } else {
+        StoreError::internal_with_context(error, "S3 put object failed")
+    }
+}
+
 struct GetS3objectContentsOutput {
     read: usize,
     bytes: BytesMut,
 }
 
+/// Fragment storage backed by S3 for payloads and `DynamoDB` for the metadata describing them.
+///
+/// # Published metadata is authoritative
+///
+/// A published metadata row is taken as proof that the payload it describes is in S3. That is
+/// what lets a put deduplicate — recording a reference to content another partition already
+/// stored, without re-uploading it or consulting S3 at all — and it holds because metadata is
+/// only ever published after the upload that stored those bytes succeeded.
+///
+/// The assumption is not verified on the read or deduplication paths, deliberately: checking it
+/// would cost an S3 request per put and give back exactly what deduplication buys. So if an
+/// object is removed from S3 while its metadata row survives — a lifecycle rule, a direct
+/// deletion, or S3 and `DynamoDB` being restored to different points in time — the store cannot
+/// tell, and:
+///
+/// - reads of that hash fail from every partition referencing it, not only the one that wrote it;
+/// - further puts of the same content deduplicate onto it, spreading references to a payload that
+///   cannot be read;
+/// - nothing repairs it. Re-writing the content does not, because a published row makes the put
+///   deduplicate rather than upload.
+///
+/// This is an operational failure to be recovered by whatever restores the object, not a state
+/// the store resolves on its own. It is reported rather than hidden: see
+/// [`METRICS_MISSING_PAYLOAD_METRIC_NAME`], which counts reads that find published metadata with
+/// no object behind it and should never be non-zero.
 pub struct AwsImmutableStore {
     s3: S3,
     dynamodb: DynamoDb,
@@ -343,7 +665,11 @@ pub struct AwsImmutableStore {
     fragments_table_name: Arc<str>,
     metadata_table_name: Arc<str>,
     force_write: bool,
+    abandoned_grace_millis: u64,
+    obliteration_drain_millis: u64,
     latency_histogram: Histogram<f64>,
+    missing_payload_counter: Counter<u64>,
+    labels_missing_payload: LabelArray,
     labels_get: LabelArray,
     labels_put: LabelArray,
     labels_exist: LabelArray,
@@ -359,6 +685,8 @@ impl AwsImmutableStore {
 
         let latency_histogram =
             provider.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME);
+        let missing_payload_counter = provider.counter(METRICS_MISSING_PAYLOAD_METRIC_NAME);
+        let labels_missing_payload = provider.get_labels_for_operation_context("get");
         let labels_exist = provider.get_labels_for_operation_context("exist");
         let labels_get = provider.get_labels_for_operation_context("get");
         let labels_put = provider.get_labels_for_operation_context("put");
@@ -382,7 +710,11 @@ impl AwsImmutableStore {
             fragments_table_name: Arc::from(settings.dynamodb.fragments_table_name.clone()),
             metadata_table_name: Arc::from(settings.dynamodb.metadata_table_name.clone()),
             force_write: settings.force_write,
+            abandoned_grace_millis: settings.abandoned_grace_millis(),
+            obliteration_drain_millis: settings.obliteration_drain_millis(),
             latency_histogram,
+            missing_payload_counter,
+            labels_missing_payload,
             labels_get,
             labels_put,
             labels_exist,
@@ -742,30 +1074,6 @@ impl AwsImmutableStore {
         }
     }
 
-    async fn write_metadata(
-        &self,
-        repository: Context,
-        address: Address,
-        fragment: Fragment,
-    ) -> Result<(), StoreError> {
-        let metadata = FragmentMetadataEntry::new(address.hash).with_fragment(fragment);
-        let item = serde_dynamo::to_item(&metadata).map_err(|e| {
-            warn!("Failed to serialize metadata entry for repository: {repository:?} and address: {address:?} to dynamo av map: {e:?}");
-            StoreError::internal_with_context(e, "Failed to serialize metadata for DynamoDB write")
-        })?;
-
-        self.dynamodb.put_item(&self.metadata_table_name, item).await.map_err(|e| {
-            warn!("Failed to save metadata entry for repository: {repository:?} and address: {address:?}: {e:?}");
-            if matches!(&e, AwsError::AwsSdkError(_)) {
-                StoreError::from(SlowDown)
-            } else {
-                StoreError::internal_with_context(e, "DynamoDB metadata write failed")
-            }
-        })?;
-
-        Ok(())
-    }
-
     async fn update_metadata(
         &self,
         address: Address,
@@ -832,6 +1140,97 @@ impl AwsImmutableStore {
         }
     }
 
+    /// Publish the metadata describing a payload that is already in S3, making it visible.
+    ///
+    /// Only ever called by a writer whose own upload put the bytes under the key — a conditional
+    /// upload that created the object, a reclaim that replaced an abandoned one, or a
+    /// `force_write` that replaced it deliberately — so the fragment published here always
+    /// describes the bytes actually stored.
+    ///
+    /// `Ok(false)` means the condition rejected the write and the caller should re-probe.
+    async fn publish_metadata(
+        &self,
+        hash: Hash,
+        fragment: Fragment,
+        condition: MetadataWriteCondition,
+    ) -> Result<bool, StoreError> {
+        let item = serde_dynamo::to_item(FragmentMetadataEntry::new(hash).with_fragment(fragment))
+            .map_err(|e| {
+                warn!(%hash, ?e, "Failed to serialize metadata entry");
+                StoreError::internal_with_context(e, "Failed to serialize metadata for DynamoDB")
+            })?;
+
+        match self
+            .dynamodb
+            .put_item_conditional(&self.metadata_table_name, item, condition)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) if is_conditional_check_failed(&e) => {
+                debug!(%hash, "Metadata changed before this write could publish");
+                Ok(false)
+            }
+            Err(e) => {
+                warn!(%hash, ?e, "Failed to publish payload metadata");
+                if matches!(&e, AwsError::AwsSdkError(_)) {
+                    Err(StoreError::from(SlowDown))
+                } else {
+                    Err(StoreError::internal_with_context(
+                        e,
+                        "DynamoDB metadata publish failed",
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Publish, re-reading and re-conditioning if the row moves underneath us.
+    ///
+    /// A rejected publish means the row changed since it was probed, not that the bytes are
+    /// wrong, so the right response is to re-condition against what is there now rather than
+    /// unwind and store the payload again.
+    async fn publish_converging(
+        &self,
+        hash: Hash,
+        fragment: Fragment,
+        mut condition: MetadataWriteCondition,
+        mode: WriteMode,
+    ) -> Result<PublishOutcome, StoreError> {
+        for _ in 0..PUBLISH_MAX_ATTEMPTS {
+            if self.publish_metadata(hash, fragment, condition).await? {
+                return Ok(PublishOutcome::Published);
+            }
+
+            let current = self.metadata_lookup(hash).await?;
+
+            if matches!(current, Some(f) if f.flags & FragmentFlags::PayloadObliteration != 0) {
+                return Ok(PublishOutcome::Obliterating);
+            }
+
+            // Only a writer that displaced what was under the key may overwrite another writer's
+            // metadata, because only it knows the stored bytes are its own. A writer whose upload
+            // was conditional cannot know that: its bytes may since have been reclaimed, and
+            // publishing over the reclaimer would describe their object with this writer's
+            // fragment.
+            if mode == WriteMode::Exclusive {
+                return Ok(PublishOutcome::Superseded);
+            }
+
+            condition = match current {
+                Some(current) => MetadataWriteCondition::Unchanged(current),
+                None => MetadataWriteCondition::Absent,
+            };
+        }
+
+        Ok(PublishOutcome::Contended)
+    }
+
+    /// Record that `(repository, context)` references a payload, without guarding the metadata
+    /// row.
+    ///
+    /// Obliteration marks the metadata row before removing a payload and counts references again
+    /// afterwards, so a put that saw no mark is either counted by that second pass or has already
+    /// backed off. Nothing here needs to be conditional on the row.
     async fn associate_fragment(
         &self,
         repository: Context,
@@ -847,13 +1246,18 @@ impl AwsImmutableStore {
             )
         })?;
 
-        self.dynamodb.put_item(&self.fragments_table_name, item).await
+        self.dynamodb
+            .put_item(&self.fragments_table_name, item)
+            .await
             .map_err(|e| {
                 warn!({REPOSITORY_ID} = %repository, {ADDRESS} = %address, error = ?e, "Failed to put item while storing fragment association");
                 if matches!(&e, AwsError::AwsSdkError(_)) {
                     StoreError::from(SlowDown)
                 } else {
-                    StoreError::internal_with_context(e, "DynamoDB fragment association write failed")
+                    StoreError::internal_with_context(
+                        e,
+                        "DynamoDB fragment association write failed",
+                    )
                 }
             })?;
 
@@ -910,13 +1314,153 @@ impl AwsImmutableStore {
         Ok(())
     }
 
+    /// Store a fragment, deduplicating the payload against content the server already holds.
+    ///
+    /// The probe is two strongly consistent single-item reads on different tables, issued
+    /// together so they cost one round trip. The metadata table is keyed by hash alone, so
+    /// asking whether a payload is already durable is a point lookup whose cost does not grow
+    /// with how many partitions reference it — and S3 is never consulted to answer it.
+    ///
+    /// ```text
+    /// OK        returned success        RE-PROBE  loop back to the probe (max 3, then SLOWDOWN)
+    /// ERROR     returned failure        SLOWDOWN  returned to the caller to retry later
+    ///
+    /// PROBE  GetItem fragments  PK=hash SK=repo|ctx  ┐ concurrent
+    ///        GetItem metadata   PK=hash              ┘ no S3
+    ///   │
+    ///   ├─ no metadata row ...................................... UPLOAD  cond: absent
+    ///   ├─ flags: Obliterating .................................. SLOWDOWN
+    ///   ├─ force_write .......................................... UPLOAD  cond: unchanged
+    ///   ├─ flags: Obliterated ................................... UPLOAD  cond: unchanged
+    ///   ├─ size_content differs ................................. ERROR  hash collision
+    ///   ├─ association present .................................. OK  (no writes)
+    ///   ├─ payload supplied ..................................... DEDUPLICATE
+    ///   └─ no payload ........................................... ERROR  payload required
+    ///
+    /// DEDUPLICATE  PutItem fragments ............................ OK
+    ///   No S3 request: a published row already means the payload is durable. The stored
+    ///   fragment is referenced, never the incoming one.
+    ///
+    /// UPLOAD  PutObject S3   If-None-Match (or unconditional under force_write)
+    ///   ├─ stored ............................................... PUBLISH
+    ///   └─ 412, the key is taken ................................ RESOLVE
+    ///
+    /// RESOLVE  GetItem metadata
+    ///   ├─ published ............................................ RE-PROBE
+    ///   ├─ obliteration flags → discard the object .............. RE-PROBE
+    ///   └─ absent → HeadObject S3   ETag + Last-Modified
+    ///        ├─ younger than the threshold ...................... SLOWDOWN
+    ///        └─ older → PutObject S3  If-Match  (single winner)
+    ///             ├─ 412, lost the reclaim ...................... RE-PROBE
+    ///             └─ stored ..................................... PUBLISH
+    ///
+    /// PUBLISH  PutItem metadata  conditional
+    ///   ├─ accepted → PutItem fragments ......................... OK
+    ///   └─ rejected → GetItem metadata
+    ///        ├─ obliteration flags → discard the object ......... RE-PROBE
+    ///        ├─ Exclusive (our upload was conditional) .......... RE-PROBE
+    ///        └─ Displacing → re-condition and retry (max 3)
+    ///             ├─ accepted ................................... OK
+    ///             └─ exhausted .................................. ERROR  (logged loudly)
+    /// ```
+    ///
+    /// `SLOWDOWN` means nothing will change within this request — another writer owns the
+    /// outcome, so the caller has to come back. `RE-PROBE` means the state changed underneath
+    /// us and the correct action is now a different one, which re-reading resolves without
+    /// troubling the caller.
+    ///
+    /// The two `WriteMode` cases decide who may overwrite whose metadata after a rejected
+    /// publish. `Exclusive` means the upload was conditional, so these bytes may since have been
+    /// reclaimed and this writer cannot vouch for what is stored; it stands down. `Displacing`
+    /// means a reclaim or a `force_write` replaced whatever was there, so the stored bytes are
+    /// known to be this writer's.
+    async fn put_deduplicated(
+        &self,
+        repository: Context,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<(), StoreError> {
+        for _ in 0..PUT_MAX_ATTEMPTS {
+            // Both reads are single-item and hit different tables, so issuing them together costs
+            // one round trip rather than two. The metadata table is keyed by hash alone, which is
+            // what keeps the deduplication probe independent of how many partitions reference the
+            // content: no query, no scan, and S3 is never consulted.
+            let association = FragmentsEntry::new(repository, address);
+            let (associated, state) = tokio::join!(
+                self.exists_exact(&association),
+                self.metadata_lookup(address.hash),
+            );
+
+            match decide_put(
+                fragment,
+                associated?,
+                state?,
+                self.force_write,
+                payload.is_some(),
+            ) {
+                PutAction::Done => return Ok(()),
+
+                PutAction::PayloadRequired => {
+                    return Err(StoreError::internal("Payload buffer required"));
+                }
+
+                // Backing off is what keeps a new reference from appearing while the payload is
+                // being removed, which is what lets the obliteration count references without a
+                // transaction to serialise against.
+                PutAction::Obliterating => {
+                    debug!(%address, "Payload is marked for obliteration; backing off");
+                    return Err(StoreError::from(SlowDown));
+                }
+
+                PutAction::Collision => return Err(StoreError::internal("Hash collision")),
+
+                // The payload is already durable, so this only has to record the reference.
+                // Obliteration marks the row before removing a payload and counts references
+                // again afterwards, so a put that saw no mark is either counted or backed off.
+                PutAction::Deduplicate(_) => {
+                    self.associate_fragment(repository, address).await?;
+
+                    return Ok(());
+                }
+
+                PutAction::Upload(condition) => {
+                    let Some(payload) = payload.clone() else {
+                        return Err(StoreError::internal("Payload buffer required"));
+                    };
+
+                    if self
+                        .write_payload(repository, address, fragment, payload, condition)
+                        .await?
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        debug!(%address, "Gave up storing after repeatedly losing the race for the payload");
+        Err(StoreError::from(SlowDown))
+    }
+
+    /// Store a payload and publish the metadata describing it.
+    ///
+    /// The upload is conditional on the key being absent, so exactly one writer can ever create
+    /// the bytes for a hash. That is the whole of the mutual exclusion: no lock is needed,
+    /// because S3 itself arbitrates. Metadata is published only after *this* writer's own upload
+    /// created the object, so the published fragment always describes the bytes that are there —
+    /// which is what stops two writers holding the same content in different representations
+    /// (different compression, say) from leaving the pair disagreeing.
+    ///
+    /// `Ok(false)` means another writer got there first and the caller should re-probe.
     async fn write_payload(
         &self,
         repository: Context,
         address: Address,
         fragment: Fragment,
         payload: Bytes,
-    ) -> Result<(), StoreError> {
+        publish_with: MetadataWriteCondition,
+    ) -> Result<bool, StoreError> {
         if payload.len() != fragment.size_payload as usize {
             warn!(
                 "Failed to write fragment to immutable store for address: {address}, payload size invalid (expected {} bytes, but got {})",
@@ -930,31 +1474,237 @@ impl AwsImmutableStore {
         }
 
         let mut dst = [0u8; 64];
-        let hash = lore_revision::util::to_hex_str(address.hash.data(), &mut dst);
+        let key = lore_revision::util::to_hex_str(address.hash.data(), &mut dst);
 
-        self.s3
-            .put_object(self.bucket.as_str(), hash, payload.to_vec())
-            .await
-            .map(|_| ())
-            .map_err(|e| {
-                warn!("Failed to write payload for hash: {}: {e:?}", address.hash);
-                if matches!(&e, AwsError::AwsSdkError(_)) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(e, "S3 put object failed")
+        // `force_write` deliberately replaces whatever is stored, so it writes unconditionally;
+        // it is an operator override rather than part of the concurrent write protocol. Replacing
+        // in place keeps it from ever leaving the key empty, which deleting first would.
+        let (stored, mut mode) = if self.force_write {
+            (self.upload(key, &payload).await?, WriteMode::Displacing)
+        } else {
+            (
+                self.upload_if_absent(key, &payload).await?,
+                WriteMode::Exclusive,
+            )
+        };
+
+        let (published_fragment, condition) = match stored {
+            UploadOutcome::Stored => (fragment, publish_with),
+
+            // The key is taken by an object this writer did not create, so its bytes are not the
+            // ones `fragment` describes and publishing `fragment` would tear the pair.
+            UploadOutcome::AlreadyPresent => {
+                match self.resolve_unpublished_object(address.hash).await? {
+                    // Another writer published while we were uploading. Nothing to store.
+                    UnpublishedObject::Published => return Ok(false),
+
+                    // The object outlived the content it belongs to. Nothing references it and
+                    // nothing can adopt it, so removing it both unwedges the hash — the next
+                    // attempt's conditional upload can finally succeed — and stops obliterated
+                    // bytes from sitting in S3 indefinitely.
+                    UnpublishedObject::ObliteratedRemnant => {
+                        self.discard_orphaned_object(address.hash).await;
+                        return Ok(false);
+                    }
+
+                    // Another writer stored this recently and has not published yet. Its
+                    // representation is the one that will win, so this writer backs off and lets
+                    // the caller come back rather than holding the request or racing it.
+                    UnpublishedObject::InFlight => {
+                        debug!(%address, "Upload is not published yet; backing off");
+                        return Err(StoreError::from(SlowDown));
+                    }
+
+                    // Long enough unpublished that the writer that stored it is gone. Take the
+                    // key over with bytes this writer can vouch for, rather than trying to work
+                    // out what the abandoned ones were.
+                    UnpublishedObject::Abandoned(etag) => {
+                        if !self.reclaim_object(key, &payload, etag.as_deref()).await? {
+                            debug!(%address, "Lost the race to reclaim the abandoned object");
+                            return Ok(false);
+                        }
+
+                        info!(%address, "Reclaimed an abandoned object");
+                        mode = WriteMode::Displacing;
+
+                        (fragment, MetadataWriteCondition::Absent)
+                    }
                 }
+            }
+        };
+
+        match self
+            .publish_converging(address.hash, published_fragment, condition, mode)
+            .await?
+        {
+            PublishOutcome::Published => {}
+
+            // Every path that reaches here stored this writer's bytes: either the conditional
+            // upload created the object, or the reclaim replaced it. Anything else returned
+            // earlier. So the object is always this writer's to withdraw, and leaving it would
+            // put content an obliteration is deleting back into S3.
+            PublishOutcome::Obliterating => {
+                self.discard_orphaned_object(address.hash).await;
+
+                return Ok(false);
+            }
+
+            // An unconditional overwrite already replaced the stored bytes, so giving up here
+            // leaves them described by another writer's metadata and nothing will repair it.
+            // That has to surface as a failure an operator can see, not as a retry hint.
+            PublishOutcome::Contended if mode == WriteMode::Displacing => {
+                error!(
+                    "Storing {address} replaced the stored payload but could not publish its \
+                     metadata; the stored bytes and the published metadata may disagree"
+                );
+                return Err(StoreError::internal(format!(
+                    "Failed to publish metadata for replaced payload {address}"
+                )));
+            }
+
+            // Someone else owns the hash now, or the row would not settle. Either way the
+            // conditional upload left any existing object untouched, so there is nothing to
+            // repair and the caller can simply re-probe.
+            PublishOutcome::Superseded | PublishOutcome::Contended => return Ok(false),
+        }
+
+        self.associate_fragment(repository, address)
+            .await
+            .map(|()| true)
+    }
+
+    /// Remove an object this writer created but could not publish, when an obliteration owns the
+    /// hash.
+    ///
+    /// Obliteration marks the row before it deletes the payload, so a put that slips in between
+    /// that delete and the final tombstone would otherwise leave the content back in S3 —
+    /// unreferenced and unreadable, but present, which is not what "permanently delete" should
+    /// mean. Re-reading the row is what makes removing it safe: it only proceeds while an
+    /// obliteration holds the hash, which is exactly the case where nothing else can have adopted
+    /// these bytes.
+    async fn discard_orphaned_object(&self, hash: Hash) {
+        let obliterating = matches!(
+            self.metadata_lookup(hash).await,
+            Ok(Some(fragment)) if fragment.flags & FragmentFlags::PayloadObliteration != 0
+        );
+
+        if !obliterating {
+            return;
+        }
+
+        info!(%hash, "Discarding an orphaned object left behind by an obliteration");
+
+        if let Err(e) = self.delete_payload(hash).await {
+            warn!(%hash, ?e, "Failed to discard the unpublished object");
+        }
+    }
+
+    /// Decide what to do about an object that exists under a key this writer does not own.
+    ///
+    /// The overwhelmingly likely explanation is a writer that is merely slow, so an object is
+    /// only treated as abandoned once it has gone unpublished for longer than the threshold.
+    /// Concluding that too early is not a correctness problem — reclaiming is single-winner and
+    /// only a reclaimer may overwrite another writer's metadata — but it throws away a live
+    /// writer's upload, so the doubt is resolved in their favour.
+    async fn resolve_unpublished_object(
+        &self,
+        hash: Hash,
+    ) -> Result<UnpublishedObject, StoreError> {
+        match self.metadata_lookup(hash).await? {
+            // A published row accounts for these bytes.
+            Some(fragment) if fragment.flags & FragmentFlags::PayloadObliteration == 0 => {
+                return Ok(UnpublishedObject::Published);
+            }
+            // A tombstone is a row, but it does not account for an object: obliteration deletes
+            // the payload, so anything still under the key outlived its content.
+            Some(_) => return Ok(UnpublishedObject::ObliteratedRemnant),
+            None => {}
+        }
+
+        let mut dst = [0u8; 64];
+        let key = lore_revision::util::to_hex_str(hash.data(), &mut dst);
+
+        let object = self
+            .s3
+            .head_object(self.bucket.as_str(), key)
+            .await
+            .map_err(|e| {
+                warn!(%hash, ?e, "Failed to inspect the unpublished object");
+                StoreError::from(SlowDown)
             })?;
 
-        // Writing metadata is not tied to writing the payload to S3, which means that over time
-        // we'll likely wind up in a scenario where some fragments exist in S3, but their associated
-        // metadata does not exist in Dynamo. In this scenario, a later query and/or read for the
-        // fragment would treat it as not found, prompting clients to resend the fragment. This
-        // means that whenever we land in this scenario, we should be self-healing.
-        self.write_metadata(repository, address, fragment).await?;
+        // How long the object has been sitting unpublished is what separates a writer that has
+        // died from one that is still finishing, and S3 already knows it. Asking is what keeps
+        // this decision out of the request: waiting here would hold the caller for the whole
+        // threshold to learn something a timestamp answers immediately.
+        if !is_abandoned(object.last_modified(), self.abandoned_grace_millis) {
+            return Ok(UnpublishedObject::InFlight);
+        }
 
-        self.associate_fragment(repository, address).await?;
+        debug!(%hash, "Object has gone unpublished long enough to be abandoned");
 
-        Ok(())
+        Ok(UnpublishedObject::Abandoned(
+            object.e_tag().map(ToString::to_string),
+        ))
+    }
+
+    /// Take over an object whose writer never published it.
+    ///
+    /// Conditioned on the object still being the one just inspected, so exactly one writer can
+    /// reclaim a given object: a second one racing for it is rejected and re-probes instead of
+    /// replacing bytes the first is about to publish.
+    ///
+    /// `Ok(false)` means the reclaim was lost.
+    async fn reclaim_object(
+        &self,
+        key: &str,
+        payload: &Bytes,
+        etag: Option<&str>,
+    ) -> Result<bool, StoreError> {
+        let Some(etag) = etag else {
+            // Nothing to condition on. Only reachable if S3 returned no entity tag, and the
+            // exposure is the one `force_write` already accepts.
+            warn!(%key, "Reclaiming unconditionally: the stored object reported no entity tag");
+            self.upload(key, payload).await?;
+
+            return Ok(true);
+        };
+
+        match self
+            .s3
+            .put_object_if_match(self.bucket.as_str(), key, payload.to_vec(), etag)
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(e) if crate::s3::is_precondition_failed(&e) => Ok(false),
+            Err(e) => Err(upload_error(key, e)),
+        }
+    }
+
+    /// A single conditional upload.
+    async fn upload_if_absent(
+        &self,
+        key: &str,
+        payload: &Bytes,
+    ) -> Result<UploadOutcome, StoreError> {
+        match self
+            .s3
+            .put_object_if_absent(self.bucket.as_str(), key, payload.to_vec())
+            .await
+        {
+            Ok(_) => Ok(UploadOutcome::Stored),
+            Err(e) if crate::s3::is_precondition_failed(&e) => Ok(UploadOutcome::AlreadyPresent),
+            Err(e) => Err(upload_error(key, e)),
+        }
+    }
+
+    /// An unconditional upload, replacing whatever is stored under the key.
+    async fn upload(&self, key: &str, payload: &Bytes) -> Result<UploadOutcome, StoreError> {
+        self.s3
+            .put_object(self.bucket.as_str(), key, payload.to_vec())
+            .await
+            .map(|_| UploadOutcome::Stored)
+            .map_err(|e| upload_error(key, e))
     }
 
     /// Permanently delete a payload from S3 by removing *ALL* versions from the bucket.
@@ -1026,7 +1776,11 @@ impl AwsImmutableStore {
     async fn metadata_with_load_validation(&self, hash: Hash) -> Result<Fragment, StoreError> {
         let metadata = self.metadata_with_size_validation(hash).await?;
 
-        if (metadata.flags & FragmentFlags::PayloadObliteration) != 0 {
+        // Only a tombstone means the payload is gone. A row that is merely marked still has its
+        // payload — it is removed after the references are counted — so refusing reads there
+        // would hide content from every partition holding it, and would hide it permanently if
+        // the obliteration that set the mark never finished.
+        if (metadata.flags & FragmentFlags::PayloadObliterated) != 0 {
             return Err(StoreError::from(AddressNotFound::from(
                 Address::zero_context_hash(hash),
             )));
@@ -1035,8 +1789,13 @@ impl AwsImmutableStore {
         Ok(metadata)
     }
 
-    async fn load_metadata(&self, hash: Hash) -> Result<Fragment, StoreError> {
-        let item = serde_dynamo::to_item(FragmentMetadataEntry::new(hash)).map_err(|e| {
+    /// Read the raw metadata row for `hash`. A missing row is `Ok(None)` rather than an error, so
+    /// callers can distinguish "nothing stored" from "the read failed".
+    async fn metadata_entry(
+        &self,
+        hash: Hash,
+    ) -> Result<Option<FragmentMetadataEntry>, StoreError> {
+        let key = serde_dynamo::to_item(FragmentMetadataEntry::new(hash)).map_err(|e| {
             warn!("Failed to serialize fragment metadata entry for {hash}: {e:?}");
             StoreError::internal_with_context(
                 e,
@@ -1044,11 +1803,11 @@ impl AwsImmutableStore {
             )
         })?;
 
-        let metadata: FragmentMetadataEntry = if let Some(av_map) = self
+        let item = self
             .dynamodb
             .get_item(
                 &self.metadata_table_name,
-                item,
+                key,
                 true, /* consistent read */
             )
             .await
@@ -1062,21 +1821,41 @@ impl AwsImmutableStore {
                     StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
                 }
             })?
-            .item
-        {
-            serde_dynamo::from_item(av_map).map_err(|e| {
+            .item;
+
+        match item {
+            Some(av_map) => serde_dynamo::from_item(av_map).map(Some).map_err(|e| {
                 warn!("Failed to deserialize fragment metadata: {e:?}");
                 StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
-            })
-        } else {
-            warn!("Failed to get metadata for fragment, no item found");
-            Err(StoreError::from(AddressNotFound::from(
-                Address::zero_context_hash(hash),
-            )))
-        }?;
+            }),
+            None => Ok(None),
+        }
+    }
 
-        metadata.fragment.ok_or_else(|| {
-            warn!("No fragment found on metadata from store: {metadata:?}");
+    /// Read the metadata row for `hash` without treating absence as an error. This is the
+    /// deduplication probe: a published row proves the payload is durable in S3, because
+    /// metadata is only ever published after the upload that stored those bytes succeeded.
+    ///
+    /// One strongly consistent `GetItem` against a table keyed by hash alone, so the cost does
+    /// not grow with how many partitions reference the content, and S3 is never consulted.
+    async fn metadata_lookup(&self, hash: Hash) -> Result<Option<Fragment>, StoreError> {
+        Ok(self
+            .metadata_entry(hash)
+            .await?
+            .and_then(|entry| entry.fragment))
+    }
+
+    async fn load_metadata(&self, hash: Hash) -> Result<Fragment, StoreError> {
+        let Some(entry) = self.metadata_entry(hash).await? else {
+            warn!("Failed to get metadata for fragment, no item found");
+
+            return Err(StoreError::from(AddressNotFound::from(
+                Address::zero_context_hash(hash),
+            )));
+        };
+
+        entry.fragment.ok_or_else(|| {
+            warn!("No fragment found on metadata from store: {entry:?}");
             StoreError::internal("Fragment metadata entry missing fragment field")
         })
     }
@@ -1186,9 +1965,25 @@ impl AwsImmutableStore {
         let fragment = metadata_result?;
 
         let s3_contents = match s3_result {
-            Some(r) => r?,
-            None => s3_fut.await?,
+            Some(r) => r,
+            None => s3_fut.await,
         };
+
+        // Metadata resolved, so the store believes this payload is durable, but S3 does not have
+        // it. Reads of this hash will fail from every partition referencing it, and because a
+        // missing object is reported as a plain not-found, it is otherwise indistinguishable
+        // from content that was never stored. Say so explicitly and count it.
+        let s3_contents = s3_contents.inspect_err(|error| {
+            if error.is_address_not_found() {
+                self.missing_payload_counter
+                    .add(1, &self.labels_missing_payload);
+                error!(
+                    %hash,
+                    "Payload is published in metadata but absent from S3; content for this hash \
+                     has been lost and will not be repaired by writing it again"
+                );
+            }
+        })?;
 
         let payload = self.read_payload(s3_contents, hash, fragment)?;
         Ok((fragment, payload))
@@ -1323,75 +2118,11 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             lore_storage::validate_fragment_size(&fragment)?;
         }
         let repository: Context = partition.into();
-        timed!(
-            self.latency_histogram,
-            &self.labels_put,
-            {
-                let query = self.do_query(
-                    repository,
-                    address,
-                    StoreMatch::MatchFull,
-                    false, /* hide obliterates */
-                )
-                .await;
-
-                let match_made = if !self.force_write && query.is_ok() {
-                    let query = query?;
-
-                    if (query.fragment.flags & FragmentFlags::PayloadObliterating) == FragmentFlags::PayloadObliterating
-                    {
-                        info!("Received request to put fragment at {address} that is in the process of being obliterated");
-                        return Err(StoreError::internal(format!("Failed to obliterate immutable {address}")));
-                    }
-
-                    if query.match_made != StoreMatch::MatchNone
-                        && fragment.size_content != query.fragment.size_content
-                        && (query.fragment.flags & FragmentFlags::PayloadObliterated) != FragmentFlags::PayloadObliterated
-                    {
-                        return Err(StoreError::internal("Hash collision"));
-                    }
-
-                    query.match_made
-                } else {
-                    // If we're in this branch because the query failed, we should log the error.
-                    if let Err(e) = query {
-                        warn!("Query failed for address: {address:?} in repository: {repository}: {e:?}");
-                    }
-
-                    StoreMatch::MatchNone
-                };
-
-                match match_made {
-                    // If the fragment exists with the same context, there's nothing to do.
-                    StoreMatch::MatchFull => Ok(()),
-
-                    // If we matched on hash + repo, then we need to associate the fragment with the new
-                    // context. Does not need the payload as it already exist in repository.
-                    StoreMatch::MatchPartition => {
-                        self.associate_fragment(repository, address).await
-                    }
-
-                    // If we were only able to match on hash, the payload must have been provided.
-                    // If so, associate the fragment.
-                    StoreMatch::MatchHash if payload.is_some() => {
-                        self.associate_fragment(repository, address).await
-                    }
-
-                    // If no match, the payload must have been provided. Write it to S3 and store fragment.
-                    StoreMatch::MatchNone if payload.is_some() => {
-                        self.write_payload(repository, address, fragment, payload.unwrap())
-                            .await
-                    }
-
-                    // If we were only able to match on hash, or were not able to match at all, and no
-                    // payload was provided, that's an error.
-                    StoreMatch::MatchHash | StoreMatch::MatchNone => {
-                        Err(StoreError::internal("Payload buffer required"))
-                    }
-                }
-            }
-        )
-            .into()
+        timed!(self.latency_histogram, &self.labels_put, {
+            self.put_deduplicated(repository, address, fragment, payload)
+                .await
+        })
+        .into()
     }
 
     #[lore_macro::lore_instrument]
@@ -1408,36 +2139,84 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             // expect this to be invoked, the log output in this method is intentionally very verbose.
             let span = tracing::Span::current();
 
-            let original_metadata = self
-                .metadata_with_size_validation(address.hash)
-                .instrument(span.clone())
-                .await?;
+            let original_metadata = self.metadata_with_size_validation(address.hash).await?;
 
-            info!("Original metadata: {original_metadata:?}");
+            info!(?original_metadata, "Loaded metadata");
 
-            // Acquire the lock on the fragment.
-            let updated_metadata = if original_metadata.flags & FragmentFlags::PayloadObliteration == 0
-            {
-                let mut updated_metadata = original_metadata;
-                updated_metadata.flags |= FragmentFlags::PayloadObliterating;
-
-                self.update_metadata(address, updated_metadata, original_metadata)
-                    .instrument(span.clone())
-                    .await?;
-                info!("Acquired obliteration lock, updated metadata: {updated_metadata:?}");
-                updated_metadata
-            } else {
-                info!("Fragment metadata indicates fragment is already being (or has previously been) obliterated");
+            if original_metadata.flags & FragmentFlags::PayloadObliterated != 0 {
+                info!("Fragment has already been obliterated");
                 return Ok(());
+            }
+
+            // Another obliteration owns the mark. Removing this partition's reference is what
+            // this call has to do and is safe whoever owns the mark, since it is a single row
+            // keyed by this partition and context. The payload and the metadata are the mark
+            // owner's to decide: it counts the references after its own drain and will see this
+            // one gone, whereas racing it here could delete a payload it has decided to keep.
+            if original_metadata.flags & FragmentFlags::PayloadObliterating != 0 {
+                info!("Another obliteration holds the mark; removing this association only");
+
+                self.delete_association(repository, address).await?;
+                stats
+                    .num_fragments
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                return Ok(());
+            }
+
+            // Removing this partition's reference is the part that has to happen. Everything after
+            // it — deleting the shared payload, marking the metadata — is cleanup that only
+            // applies once nothing references the content any more.
+            // Mark before touching the association. A put that reads the mark backs off, which
+            // is what stops a reference appearing while this runs — including the reference this
+            // obliteration is about to delete being written straight back by the very partition
+            // it is being deleted for.
+            let considered_metadata = {
+                let mut considered = original_metadata;
+                considered.flags |= FragmentFlags::PayloadObliterating;
+
+                self.update_metadata(address, considered, original_metadata)
+                    .await?;
+                info!(?considered, "Marked for obliteration");
+                considered
             };
 
-            if updated_metadata.flags & FragmentFlags::PayloadFragmented != 0 {
+            self.delete_association(repository, address).await?;
+            stats
+                .num_fragments
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            // A put that read the row before the mark went on may still be about to write its
+            // association. Association reads are strongly consistent, so this is not waiting for
+            // consistency: it is waiting for those writes to land, so the count below sees them.
+            // Afterwards no further reference can appear, which is what lets a single count
+            // decide, and lets an association be written plainly rather than in a transaction.
+            tokio::time::sleep(Duration::from_millis(self.obliteration_drain_millis)).await;
+
+            info!("Association deleted, counting remaining associations...");
+            if self.has_associations(address.hash).await? {
+                info!("Fragment still associated, clearing the mark");
+                return self
+                    .update_metadata(address, original_metadata, considered_metadata)
+                    .await
+                    .inspect_err(|e| {
+                        warn!("Failed to reset metadata back to original state: {e:?}");
+                    });
+            }
+
+            // Only now is the content definitely going away, so its sub-fragments can go with it.
+            if considered_metadata.flags & FragmentFlags::PayloadFragmented != 0 {
                 info!("Fragment is fragmented");
-                // There's no reason we couldn't use the `updated_metadata` here, since `read_payload`
-                // only cares about the size fields (which haven't changed), but it feels wrong given it
-                // doesn't explicitly match the metadata for what's currently in S3.
+                // There's no reason we couldn't use the `considered_metadata` here, since
+                // `read_payload` only cares about the size fields (which haven't changed), but it
+                // feels wrong given it doesn't explicitly match the metadata for what's currently
+                // in S3.
                 let payload = self
-                    .read_payload(self.get_s3_object_contents(address.hash).await?, address.hash, original_metadata)?
+                    .read_payload(
+                        self.get_s3_object_contents(address.hash).await?,
+                        address.hash,
+                        original_metadata,
+                    )?
                     .to_aligned::<FragmentReference>();
 
                 let sub_fragments = payload.as_type_slice::<FragmentReference>();
@@ -1484,57 +2263,28 @@ impl ImmutableStoreTrait for AwsImmutableStore {
 
                 if failures {
                     warn!("Obliteration failed for at least one sub-fragment.");
-                    return Err(StoreError::internal(format!("Failed to obliterate immutable {address}")));
+                    return Err(StoreError::internal(format!(
+                        "Failed to obliterate immutable {address}"
+                    )));
                 }
 
                 info!("Done obliterating sub-fragments");
             }
 
-            self.delete_association(repository, address)
-                .instrument(span.clone())
-                .await?;
-            stats
-                .num_fragments
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-            // TODO(jcohen): Assuming we always lock the fragment regardless of the association count
-            //  then this process of re-checking the count after removing the association should
-            //  theoretically not be necessary since no one else should have been able to add a new
-            //  fragment association while we maintain the lock.
-            info!("Association deleted, re-checking for other association...");
-            let remain_associated = self
-                .has_associations(address.hash)
-                .instrument(span.clone())
-                .await?;
-
-            // If the association count is still >= 1 after we deleted, other references remain, so
-            // there's nothing left to do...
-            if remain_associated {
-                info!("Fragment still associated, nothing more to do");
-                return self
-                    .update_metadata(address, original_metadata, updated_metadata)
-                    .instrument(span.clone())
-                    .await
-                    .inspect_err(|e| {
-                        warn!("Failed to reset metadata back to original state: {e:?}");
-                    });
-            }
-
-            self.delete_payload(address.hash)
-                .instrument(span.clone())
-                .await?;
+            self.delete_payload(address.hash).await?;
 
             stats
                 .num_payloads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-            let mut obliterated_metadata = updated_metadata;
+            let mut obliterated_metadata = considered_metadata;
             obliterated_metadata.flags = FragmentFlags::PayloadObliterated.bits();
             obliterated_metadata.size_payload = 0;
             obliterated_metadata.size_content = 0;
 
-            // Final metadata update to clear out the sizes and set the flags to `Obliterated`.
-            self.update_metadata(address, obliterated_metadata, updated_metadata)
+            // Leave a tombstone rather than removing the row: it keeps a repeat obliteration
+            // idempotent, and is what a policy refusing re-upload would key on.
+            self.update_metadata(address, obliterated_metadata, considered_metadata)
                 .await
                 .inspect_err(|e| {
                     // At this point we've already deleted the underlying payload, so there's not any
@@ -1542,7 +2292,8 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                     // broken.
                     warn!("Failed to finalize obliterate for {address}: {e:?}");
                 })
-        }).into()
+        })
+        .into()
     }
 
     #[lore_macro::lore_instrument]
@@ -1642,6 +2393,7 @@ impl InstrumentProvider for AwsImmutableStoreInstrumentProvider {
 #[cfg(test)]
 mod test {
     use std::collections::HashMap;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
     use aws_sdk_dynamodb::operation::delete_item::DeleteItemError;
@@ -1658,16 +2410,21 @@ mod test {
     use aws_sdk_s3::error::ErrorMetadata;
     use aws_sdk_s3::operation::delete_object::DeleteObjectError;
     use aws_sdk_s3::operation::delete_object::DeleteObjectOutput;
+    use aws_sdk_s3::operation::get_object::GetObjectError;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
+    use aws_sdk_s3::operation::head_object::HeadObjectOutput;
     use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsError;
     use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput;
+    use aws_sdk_s3::operation::put_object::PutObjectError;
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_sdk_s3::primitives::SdkBody;
     use aws_sdk_s3::types::ObjectVersion;
+    use aws_sdk_s3::types::error::NoSuchKey;
     use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
     use aws_smithy_runtime_api::client::result::SdkError;
     use aws_smithy_runtime_api::client::result::ServiceError;
     use aws_smithy_runtime_api::client::result::TimeoutError;
+    use aws_smithy_types::DateTime;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::FragmentFlags;
     use lore_revision::fragment;
@@ -1687,6 +2444,7 @@ mod test {
     const BUCKET: &str = "test-bucket";
     const FRAGMENTS_TABLE_NAME: &str = "fragments";
     const METADATA_TABLE_NAME: &str = "metadata";
+    const ABANDONED_ETAG: &str = "\"abandoned-object\"";
 
     fn mock_lookup_fragments(
         dynamodb_mock: &mut MockDynamoDb,
@@ -1763,15 +2521,132 @@ mod test {
         }
     }
 
+    /// Mock an association write. Obliteration marks the metadata row before removing a payload
+    /// and counts references afterwards, so a put that saw no mark is either counted by that pass
+    /// or has already backed off, and nothing about this write is conditional.
     fn mock_associate_fragment(dynamodb_mock: &mut MockDynamoDb, entry: &FragmentsEntry) {
         let item: HashMap<String, AttributeValue> = serde_dynamo::to_item(entry).unwrap();
 
         dynamodb_mock
             .expect_put_item()
-            .with(eq(Arc::<str>::from(FRAGMENTS_TABLE_NAME)), eq(item.clone()))
-            .return_once(move |_, _| {
-                Ok(PutItemOutput::builder().set_attributes(Some(item)).build())
+            .withf(move |table, written| table.as_ref() == FRAGMENTS_TABLE_NAME && *written == item)
+            .returning(|_, _| Ok(PutItemOutput::builder().build()));
+    }
+
+    /// Mock the metadata probe `put` issues, resolving to the supplied row (or to nothing).
+    fn mock_metadata_probe(
+        dynamodb_mock: &mut MockDynamoDb,
+        hash: Hash,
+        entry: Option<FragmentMetadataEntry>,
+    ) {
+        let key: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(FragmentMetadataEntry::new(hash)).unwrap();
+        let item = entry.map(|e| serde_dynamo::to_item(e).unwrap());
+
+        dynamodb_mock
+            .expect_get_item()
+            .with(eq(Arc::<str>::from(METADATA_TABLE_NAME)), eq(key), eq(true))
+            .return_once(move |_, _, _| Ok(GetItemOutput::builder().set_item(item).build()));
+    }
+
+    /// Mock a fragments-table probe that answers every attempt with a miss. `put` re-probes on
+    /// each attempt, and a `return_once` expectation would be re-matched rather than fall
+    /// through.
+    fn mock_fragments_probe_repeated(dynamodb_mock: &mut MockDynamoDb, entry: &FragmentsEntry) {
+        let key: HashMap<String, AttributeValue> = serde_dynamo::to_item(entry).unwrap();
+
+        dynamodb_mock
+            .expect_get_item()
+            .with(
+                eq(Arc::<str>::from(FRAGMENTS_TABLE_NAME)),
+                eq(key),
+                eq(true),
+            )
+            .returning(|_, _, _| Ok(GetItemOutput::builder().set_item(None).build()));
+    }
+
+    /// Mock a metadata probe whose answer changes between reads, so a test can model the row
+    /// moving underneath a writer. The last answer is repeated once the sequence is exhausted.
+    fn mock_metadata_probe_sequence(
+        dynamodb_mock: &mut MockDynamoDb,
+        hash: Hash,
+        answers: Vec<Option<FragmentMetadataEntry>>,
+    ) {
+        let key: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(FragmentMetadataEntry::new(hash)).unwrap();
+        let items: Vec<Option<HashMap<String, AttributeValue>>> = answers
+            .into_iter()
+            .map(|entry| entry.map(|e| serde_dynamo::to_item(e).unwrap()))
+            .collect();
+        let reads = AtomicUsize::new(0);
+
+        dynamodb_mock
+            .expect_get_item()
+            .with(eq(Arc::<str>::from(METADATA_TABLE_NAME)), eq(key), eq(true))
+            .returning(move |_, _, _| {
+                let index = reads.fetch_add(1, Ordering::Relaxed).min(items.len() - 1);
+
+                Ok(GetItemOutput::builder()
+                    .set_item(items[index].clone())
+                    .build())
             });
+    }
+
+    /// Mock a metadata probe that answers every read, as the recovery poll issues several.
+    fn mock_metadata_probe_repeated(
+        dynamodb_mock: &mut MockDynamoDb,
+        hash: Hash,
+        entry: Option<FragmentMetadataEntry>,
+    ) {
+        let key: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(FragmentMetadataEntry::new(hash)).unwrap();
+        let item = entry.map(|e| serde_dynamo::to_item(e).unwrap());
+
+        dynamodb_mock
+            .expect_get_item()
+            .with(eq(Arc::<str>::from(METADATA_TABLE_NAME)), eq(key), eq(true))
+            .returning(move |_, _, _| Ok(GetItemOutput::builder().set_item(item.clone()).build()));
+    }
+
+    /// Mock the conditional publish that follows an upload, asserting it writes exactly
+    /// `fragment` and nothing more.
+    fn mock_publish_metadata(dynamodb_mock: &mut MockDynamoDb, hash: Hash, fragment: Fragment) {
+        let published: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(FragmentMetadataEntry::new(hash).with_fragment(fragment))
+                .unwrap();
+
+        dynamodb_mock
+            .expect_put_item_conditional::<MetadataWriteCondition>()
+            .times(1)
+            .withf(move |table, item, _| {
+                table.as_ref() == METADATA_TABLE_NAME && *item == published
+            })
+            .returning(|_, _, _| Ok(PutItemOutput::builder().build()));
+    }
+
+    async fn initialize_immutable_store_with_grace(
+        s3: S3,
+        dynamodb: DynamoDb,
+        grace_millis: u64,
+    ) -> AwsImmutableStore {
+        let settings = AwsImmutableStoreSettings {
+            s3: S3StoreSettings::new(BUCKET.to_string()),
+            dynamodb: DynamoDbImmutableStoreSettings::new(
+                FRAGMENTS_TABLE_NAME.to_string(),
+                METADATA_TABLE_NAME.to_string(),
+            ),
+            force_write: false,
+            batch_exist_submission_limit: 1000,
+            abandoned_upload_grace_millis: Some(grace_millis),
+            obliteration_drain_millis: Some(0),
+        };
+
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                AwsImmutableStore::new(s3, dynamodb, &settings)
+            })
+            .await
     }
 
     async fn initialize_immutable_store(s3: S3, dynamodb: DynamoDb) -> AwsImmutableStore {
@@ -1783,6 +2658,8 @@ mod test {
             ),
             force_write: false,
             batch_exist_submission_limit: 1000,
+            abandoned_upload_grace_millis: None,
+            obliteration_drain_millis: Some(0),
         };
 
         let execution = setup_execution("test".to_string());
@@ -2126,21 +3003,13 @@ mod test {
             StoreMatch::MatchNone,
         );
 
-        let item: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(FragmentMetadataEntry::new(address.hash).with_fragment(fragment))
-                .unwrap();
-
-        dynamodb_mock
-            .expect_put_item()
-            .with(eq(Arc::<str>::from(METADATA_TABLE_NAME)), eq(item.clone()))
-            .return_once(move |_, _| {
-                Ok(PutItemOutput::builder().set_attributes(Some(item)).build())
-            });
+        mock_metadata_probe(&mut dynamodb_mock, address.hash, None);
+        mock_publish_metadata(&mut dynamodb_mock, address.hash, fragment);
 
         mock_associate_fragment(&mut dynamodb_mock, &entry);
 
         s3mock
-            .expect_put_object()
+            .expect_put_object_if_absent()
             .with(
                 eq(BUCKET),
                 eq(address.hash.to_string()),
@@ -2253,8 +3122,8 @@ mod test {
             store
                 .put(repository.into(), address, fragment, Some(payload), false)
                 .await
-                .expect_err("expected put to fail")
-                .is_internal()
+                .expect_err("expected put to back off")
+                .is_slow_down()
         );
     }
 
@@ -2282,40 +3151,20 @@ mod test {
             size_content: 0,
         };
 
-        let metadata_entry = FragmentMetadataEntry::new(address.hash);
-        let av_map: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(metadata_entry.clone()).unwrap();
-        let full_entry = metadata_entry.with_fragment(obliterated_fragment);
-        let full_entry_av_map = serde_dynamo::to_item(full_entry.clone()).unwrap();
+        mock_metadata_probe(
+            &mut dynamodb_mock,
+            address.hash,
+            Some(FragmentMetadataEntry::new(address.hash).with_fragment(obliterated_fragment)),
+        );
 
-        dynamodb_mock
-            .expect_get_item()
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(av_map),
-                eq(true),
-            )
-            .return_once(move |_, _, _| {
-                Ok(GetItemOutput::builder()
-                    .set_item(Some(full_entry_av_map))
-                    .build())
-            });
-
-        let item: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(FragmentMetadataEntry::new(address.hash).with_fragment(fragment))
-                .unwrap();
-
-        dynamodb_mock
-            .expect_put_item()
-            .with(eq(Arc::<str>::from(METADATA_TABLE_NAME)), eq(item.clone()))
-            .return_once(move |_, _| {
-                Ok(PutItemOutput::builder().set_attributes(Some(item)).build())
-            });
+        // A tombstone is not a deduplication source: the payload was deleted, so the bytes have
+        // to be stored again and the row republished.
+        mock_publish_metadata(&mut dynamodb_mock, address.hash, fragment);
 
         mock_associate_fragment(&mut dynamodb_mock, &entry);
 
         s3mock
-            .expect_put_object()
+            .expect_put_object_if_absent()
             .with(
                 eq(BUCKET),
                 eq(address.hash.to_string()),
@@ -2404,24 +3253,9 @@ mod test {
             StoreMatch::MatchHash,
         );
 
-        let metadata_entry = FragmentMetadataEntry::new(address.hash);
-        let av_map: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(metadata_entry.clone()).unwrap();
-        let full_entry = metadata_entry.with_fragment(fragment);
-        let full_entry_av_map = serde_dynamo::to_item(full_entry.clone()).unwrap();
-
-        dynamodb_mock
-            .expect_get_item()
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(av_map),
-                eq(true),
-            )
-            .return_once(move |_, _, _| {
-                Ok(GetItemOutput::builder()
-                    .set_item(Some(full_entry_av_map))
-                    .build())
-            });
+        // Nothing is stored for this hash, so there is nothing to deduplicate against and the
+        // caller has to supply the bytes.
+        mock_metadata_probe(&mut dynamodb_mock, address.hash, None);
 
         let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
         let store = Arc::new(store);
@@ -2433,6 +3267,815 @@ mod test {
                 .expect_err("should have returned an error")
                 .is_internal()
         );
+    }
+
+    /// `force_write` is an operator override, but it must still not tear an obliteration's lock
+    /// off the row: doing so would resurrect content that is midway through being deleted.
+    #[tokio::test]
+    async fn test_put_immutable_force_write_respects_obliteration() {
+        let repository = random::<Context>();
+        let (fragment, address, payload) = fragment::generate_random();
+
+        // Bare mocks: any upload or metadata write here is a test failure.
+        let s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let entry = FragmentsEntry::new(repository, address);
+        let mut obliterating = fragment;
+        obliterating.flags |= FragmentFlags::PayloadObliterating;
+
+        mock_lookup_fragments(
+            &mut dynamodb_mock,
+            entry,
+            StoreMatch::MatchFull,
+            StoreMatch::MatchNone,
+        );
+        mock_metadata_probe(
+            &mut dynamodb_mock,
+            address.hash,
+            Some(FragmentMetadataEntry::new(address.hash).with_fragment(obliterating)),
+        );
+
+        let settings = AwsImmutableStoreSettings {
+            s3: S3StoreSettings::new(BUCKET.to_string()),
+            dynamodb: DynamoDbImmutableStoreSettings::new(
+                FRAGMENTS_TABLE_NAME.to_string(),
+                METADATA_TABLE_NAME.to_string(),
+            ),
+            force_write: true,
+            batch_exist_submission_limit: 1000,
+            abandoned_upload_grace_millis: None,
+            obliteration_drain_millis: Some(0),
+        };
+
+        let execution = setup_execution("test".to_string());
+        let store = LORE_CONTEXT
+            .scope(execution, async move {
+                AwsImmutableStore::new(s3mock, dynamodb_mock, &settings)
+            })
+            .await;
+
+        assert!(
+            Arc::new(store)
+                .put(repository.into(), address, fragment, Some(payload), false)
+                .await
+                .expect_err("force_write must not override an obliteration")
+                .is_slow_down()
+        );
+    }
+
+    /// Build a `force_write` store, the operator override that replaces whatever is stored.
+    async fn initialize_force_write_store(s3: S3, dynamodb: DynamoDb) -> AwsImmutableStore {
+        let settings = AwsImmutableStoreSettings {
+            s3: S3StoreSettings::new(BUCKET.to_string()),
+            dynamodb: DynamoDbImmutableStoreSettings::new(
+                FRAGMENTS_TABLE_NAME.to_string(),
+                METADATA_TABLE_NAME.to_string(),
+            ),
+            force_write: true,
+            batch_exist_submission_limit: 1000,
+            abandoned_upload_grace_millis: Some(100),
+            obliteration_drain_millis: Some(0),
+        };
+
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                AwsImmutableStore::new(s3, dynamodb, &settings)
+            })
+            .await
+    }
+
+    fn conditional_check_failed() -> AwsError<SdkError<PutItemError, HttpResponse>> {
+        aws_error(
+            PutItemError::ConditionalCheckFailedException(
+                ConditionalCheckFailedException::builder().build(),
+            ),
+            400u16,
+        )
+    }
+
+    fn precondition_failed() -> AwsError<SdkError<PutObjectError, HttpResponse>> {
+        aws_error(
+            PutObjectError::generic(ErrorMetadata::builder().code("PreconditionFailed").build()),
+            412u16,
+        )
+    }
+
+    /// A publish rejected because the row moved is not a reason to store the payload again: the
+    /// bytes are already there, so only the metadata write is retried, against what is now stored.
+    #[tokio::test]
+    async fn test_put_immutable_publish_reconditions_without_reuploading() {
+        let repository = random::<Context>();
+        let (fragment, address, payload) = fragment::generate_random();
+
+        let mut s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let entry = FragmentsEntry::new(repository, address);
+        let mut moved = fragment;
+        moved.flags |= FragmentFlags::PayloadStoredDurable;
+
+        mock_lookup_fragments(
+            &mut dynamodb_mock,
+            entry.clone(),
+            StoreMatch::MatchFull,
+            StoreMatch::MatchNone,
+        );
+        // Probed as `fragment`, but by publish time the row reads as `moved`.
+        mock_metadata_probe_sequence(
+            &mut dynamodb_mock,
+            address.hash,
+            vec![
+                Some(FragmentMetadataEntry::new(address.hash).with_fragment(fragment)),
+                Some(FragmentMetadataEntry::new(address.hash).with_fragment(moved)),
+            ],
+        );
+
+        // Exactly one upload, however many times the publish is retried.
+        s3mock
+            .expect_put_object::<Vec<u8>>()
+            .times(1)
+            .returning(|_, _, _| Ok(PutObjectOutput::builder().build()));
+
+        let mut seq = mockall::Sequence::default();
+        dynamodb_mock
+            .expect_put_item_conditional::<MetadataWriteCondition>()
+            .times(1)
+            .in_sequence(&mut seq)
+            .withf(move |_, _, condition| *condition == MetadataWriteCondition::Unchanged(fragment))
+            .returning(|_, _, _| Err(conditional_check_failed()));
+        dynamodb_mock
+            .expect_put_item_conditional::<MetadataWriteCondition>()
+            .times(1)
+            .in_sequence(&mut seq)
+            .withf(move |_, _, condition| *condition == MetadataWriteCondition::Unchanged(moved))
+            .returning(|_, _, _| Ok(PutItemOutput::builder().build()));
+
+        mock_associate_fragment(&mut dynamodb_mock, &entry);
+
+        let store = initialize_force_write_store(s3mock, dynamodb_mock).await;
+
+        Arc::new(store)
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect("the publish should have re-conditioned and succeeded");
+    }
+
+    /// A `force_write` that replaced the stored bytes but never managed to publish has left them
+    /// described by someone else's metadata, and nothing will repair that. It must surface as a
+    /// failure an operator can see, not as a retry hint.
+    #[tokio::test]
+    async fn test_put_immutable_force_write_publish_exhaustion_is_loud() {
+        let repository = random::<Context>();
+        let (fragment, address, payload) = fragment::generate_random();
+
+        let mut s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let entry = FragmentsEntry::new(repository, address);
+
+        mock_lookup_fragments(
+            &mut dynamodb_mock,
+            entry,
+            StoreMatch::MatchFull,
+            StoreMatch::MatchNone,
+        );
+        // The row never settles.
+        mock_metadata_probe_repeated(
+            &mut dynamodb_mock,
+            address.hash,
+            Some(FragmentMetadataEntry::new(address.hash).with_fragment(fragment)),
+        );
+
+        s3mock
+            .expect_put_object::<Vec<u8>>()
+            .times(1)
+            .returning(|_, _, _| Ok(PutObjectOutput::builder().build()));
+
+        dynamodb_mock
+            .expect_put_item_conditional::<MetadataWriteCondition>()
+            .times(PUBLISH_MAX_ATTEMPTS)
+            .returning(|_, _, _| Err(conditional_check_failed()));
+
+        let store = initialize_force_write_store(s3mock, dynamodb_mock).await;
+
+        let error = Arc::new(store)
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect_err("an unrepairable force_write must not look like a retry");
+
+        assert!(
+            error.is_internal() && !error.is_slow_down(),
+            "expected a visible failure, got {error:?}"
+        );
+    }
+
+    /// An object left under a key whose content has been obliterated outlived that content: a
+    /// tombstone is a row, but it does not account for an object. It must be discarded rather
+    /// than mistaken for a published payload, which would wedge the hash forever and leave
+    /// deleted bytes in S3.
+    #[tokio::test]
+    async fn test_put_immutable_discards_object_left_by_obliteration() {
+        let repository = random::<Context>();
+        let (fragment, address, payload) = fragment::generate_random();
+
+        let mut s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let entry = FragmentsEntry::new(repository, address);
+        let tombstone = Fragment {
+            flags: FragmentFlags::PayloadObliterated.bits(),
+            size_payload: 0,
+            size_content: 0,
+        };
+
+        // Two attempts: the first discards the remnant, the second stores the content.
+        mock_fragments_probe_repeated(&mut dynamodb_mock, &entry);
+        mock_metadata_probe_repeated(
+            &mut dynamodb_mock,
+            address.hash,
+            Some(FragmentMetadataEntry::new(address.hash).with_fragment(tombstone)),
+        );
+
+        let mut seq = mockall::Sequence::default();
+
+        // The remnant blocks the first upload...
+        s3mock
+            .expect_put_object_if_absent::<Vec<u8>>()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _, _| Err(precondition_failed()));
+
+        // ...so it is deleted...
+        s3mock
+            .expect_list_versions()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _| Ok(ListObjectVersionsOutput::builder().build()));
+        s3mock
+            .expect_delete_object()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _, _| Ok(DeleteObjectOutput::builder().build()));
+
+        // ...and the retry stores this writer's bytes in its place.
+        s3mock
+            .expect_put_object_if_absent::<Vec<u8>>()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _, _| Ok(PutObjectOutput::builder().build()));
+
+        dynamodb_mock
+            .expect_put_item_conditional::<MetadataWriteCondition>()
+            .times(1)
+            .withf(move |_, _, condition| {
+                *condition == MetadataWriteCondition::Unchanged(tombstone)
+            })
+            .returning(|_, _, _| Ok(PutItemOutput::builder().build()));
+
+        mock_associate_fragment(&mut dynamodb_mock, &entry);
+
+        let store = initialize_immutable_store_with_grace(s3mock, dynamodb_mock, 100).await;
+
+        Arc::new(store)
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect("should have discarded the remnant and stored the content");
+    }
+
+    /// Reclaiming stores this writer's bytes, so losing the publish to an obliteration must
+    /// withdraw them. Otherwise content an obliteration is deleting comes back into S3 through
+    /// the reclaim path — the same hole the tombstone handling closes on the upload path.
+    #[tokio::test]
+    async fn test_put_immutable_discards_reclaimed_bytes_when_obliteration_wins() {
+        let repository = random::<Context>();
+        let (fragment, address, payload) = fragment::generate_random();
+
+        let mut s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let entry = FragmentsEntry::new(repository, address);
+        let mut obliterating = fragment;
+        obliterating.flags |= FragmentFlags::PayloadObliterating;
+
+        mock_fragments_probe_repeated(&mut dynamodb_mock, &entry);
+        mock_metadata_probe_sequence(
+            &mut dynamodb_mock,
+            address.hash,
+            vec![
+                // Nothing stored when the put probes, nor when the object is resolved...
+                None,
+                None,
+                // ...but an obliteration owns the hash by the time it is published.
+                Some(FragmentMetadataEntry::new(address.hash).with_fragment(obliterating)),
+            ],
+        );
+
+        s3mock
+            .expect_put_object_if_absent::<Vec<u8>>()
+            .times(1)
+            .returning(|_, _, _| Err(precondition_failed()));
+        s3mock.expect_head_object().times(1).returning(|_, _| {
+            Ok(HeadObjectOutput::builder()
+                .e_tag(ABANDONED_ETAG)
+                .last_modified(DateTime::from_secs(1))
+                .build())
+        });
+        s3mock
+            .expect_put_object_if_match::<Vec<u8>>()
+            .times(1)
+            .returning(|_, _, _, _| Ok(PutObjectOutput::builder().build()));
+
+        dynamodb_mock
+            .expect_put_item_conditional::<MetadataWriteCondition>()
+            .times(1)
+            .returning(|_, _, _| Err(conditional_check_failed()));
+
+        // The reclaimed bytes must be withdrawn.
+        s3mock
+            .expect_list_versions()
+            .times(1)
+            .returning(|_, _| Ok(ListObjectVersionsOutput::builder().build()));
+        s3mock
+            .expect_delete_object()
+            .times(1)
+            .returning(|_, _, _| Ok(DeleteObjectOutput::builder().build()));
+
+        let store = initialize_immutable_store_with_grace(s3mock, dynamodb_mock, 100).await;
+
+        assert!(
+            Arc::new(store)
+                .put(repository.into(), address, fragment, Some(payload), false)
+                .await
+                .expect_err("an obliterated hash must not accept a put")
+                .is_slow_down()
+        );
+    }
+
+    /// `is_abandoned` is the only gate on reclaiming another writer's object, and the only
+    /// clock-dependent logic here, so its edges are worth pinning directly.
+    #[test]
+    fn abandonment_is_decided_conservatively() {
+        let now = now_millis();
+        let recent = DateTime::from_millis((now - 1_000) as i64);
+        let old = DateTime::from_millis((now - 60_000) as i64);
+        let future = DateTime::from_millis((now + 60_000) as i64);
+
+        assert!(
+            !is_abandoned(None, 10_000),
+            "an object that cannot be dated must never be reclaimed"
+        );
+        assert!(
+            !is_abandoned(Some(&future), 10_000),
+            "an object dated in the future means clock skew, not abandonment"
+        );
+        assert!(
+            !is_abandoned(Some(&recent), 10_000),
+            "an object younger than the threshold belongs to a writer still finishing"
+        );
+        assert!(
+            is_abandoned(Some(&old), 10_000),
+            "an object older than the threshold has been left behind"
+        );
+    }
+
+    /// Sub-second thresholds cannot mean what they say if the stored time is truncated to whole
+    /// seconds, and the truncation error is up to a second — larger than the smallest threshold
+    /// the settings allow.
+    #[test]
+    fn stored_time_keeps_sub_second_precision() {
+        assert_eq!(datetime_millis(&DateTime::from_millis(1_500)), Some(1_500));
+        assert_eq!(datetime_millis(&DateTime::from_millis(999)), Some(999));
+        assert_eq!(
+            datetime_millis(&DateTime::from_secs(-1)),
+            None,
+            "a time before the epoch is not a usable age"
+        );
+    }
+
+    /// A payload that is published but missing from S3 is otherwise indistinguishable from
+    /// content that was never stored, because a missing object surfaces as a plain not-found. It
+    /// has to be called out, since nothing repairs it and every partition referencing the hash is
+    /// affected.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_get_immutable_reports_published_metadata_with_no_object() {
+        let repository = random::<Context>();
+
+        let mut s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let (fragment, address) =
+            mock_load_fragment_metadata(&mut dynamodb_mock, None, false /* fail */);
+
+        let entry = FragmentsEntry::new(repository, address);
+        mock_lookup_fragments(
+            &mut dynamodb_mock,
+            entry,
+            StoreMatch::MatchFull,
+            StoreMatch::MatchFull,
+        );
+
+        s3mock
+            .expect_get_object()
+            .with(eq(BUCKET), eq(address.hash.to_string()), eq(None))
+            .return_once(move |_, _, _| {
+                Err(aws_error(
+                    GetObjectError::NoSuchKey(NoSuchKey::builder().build()),
+                    404u16,
+                ))
+            });
+
+        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
+
+        let error = Arc::new(store)
+            .get(repository.into(), address, StoreMatch::MatchFull)
+            .await
+            .expect_err("a published payload with no object cannot be read");
+
+        assert!(error.is_address_not_found());
+        assert!(
+            logs_contain("published in metadata but absent from S3"),
+            "losing a payload underneath the store must not look like an ordinary miss"
+        );
+
+        let _ = fragment;
+    }
+
+    /// The metadata table holds rows written long before any of this, and this design keeps its
+    /// shape untouched so no table change or backfill is needed. Guards against a future addition
+    /// quietly changing what a published row looks like.
+    #[test]
+    fn published_rows_keep_their_original_shape() {
+        let (fragment, address, _) = fragment::generate_random();
+
+        let published: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(FragmentMetadataEntry::new(address.hash).with_fragment(fragment))
+                .unwrap();
+
+        let mut attributes = published.keys().cloned().collect::<Vec<_>>();
+        attributes.sort();
+        assert_eq!(
+            attributes,
+            vec!["flags", "hash", "size_content", "size_payload"],
+            "a published row must carry exactly the attributes existing rows already have"
+        );
+
+        let parsed: FragmentMetadataEntry = serde_dynamo::from_item(published).unwrap();
+        assert_eq!(parsed.fragment, Some(fragment));
+    }
+
+    /// A row that is only marked for obliteration still has its payload — it is removed after the
+    /// references are counted, and the mark is cleared again if any remain. Refusing reads there
+    /// would hide content from every partition holding it, and hide it permanently if the
+    /// obliteration that set the mark never finished.
+    #[tokio::test]
+    async fn test_get_immutable_marked_for_obliteration_is_still_readable() {
+        let repository = random::<Context>();
+        let (mut fragment, address, payload) = fragment::generate_random();
+        fragment.flags |= FragmentFlags::PayloadObliterating;
+
+        let mut s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let entry = FragmentsEntry::new(repository, address);
+        mock_lookup_fragments(
+            &mut dynamodb_mock,
+            entry,
+            StoreMatch::MatchFull,
+            StoreMatch::MatchFull,
+        );
+
+        let key: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(FragmentMetadataEntry::new(address.hash)).unwrap();
+        let row =
+            serde_dynamo::to_item(FragmentMetadataEntry::new(address.hash).with_fragment(fragment))
+                .unwrap();
+        dynamodb_mock
+            .expect_get_item()
+            .with(eq(Arc::<str>::from(METADATA_TABLE_NAME)), eq(key), eq(true))
+            .return_once(move |_, _, _| Ok(GetItemOutput::builder().set_item(Some(row)).build()));
+
+        let stored = payload.to_vec();
+        s3mock
+            .expect_get_object()
+            .with(eq(BUCKET), eq(address.hash.to_string()), eq(None))
+            .return_once(move |_, _, _| {
+                Ok(GetObjectOutput::builder()
+                    .set_body(Some(stored.into()))
+                    .build())
+            });
+
+        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
+
+        let (read_fragment, read_payload) = Arc::new(store)
+            .get(repository.into(), address, StoreMatch::MatchFull)
+            .await
+            .expect("a marked payload is still stored and must still be readable");
+
+        assert_eq!(read_fragment, fragment);
+        assert_eq!(read_payload, payload);
+    }
+
+    /// Deduplication skips the upload, not the requirement to present the bytes. A caller that
+    /// does not already reference the content cannot attach it by naming its hash alone.
+    #[tokio::test]
+    async fn test_put_immutable_payload_required_to_deduplicate() {
+        let repository = random::<Context>();
+        let (fragment, address, _) = fragment::generate_random();
+
+        let s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let entry = FragmentsEntry::new(repository, address);
+
+        // This partition holds no reference to the content...
+        mock_lookup_fragments(
+            &mut dynamodb_mock,
+            entry,
+            StoreMatch::MatchFull,
+            StoreMatch::MatchNone,
+        );
+
+        // ...and although the payload is durable elsewhere, that alone does not entitle this
+        // caller to a reference to it. No association write is mocked: making one is a failure.
+        mock_metadata_probe(
+            &mut dynamodb_mock,
+            address.hash,
+            Some(FragmentMetadataEntry::new(address.hash).with_fragment(fragment)),
+        );
+
+        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
+
+        assert!(
+            Arc::new(store)
+                .put(repository.into(), address, fragment, None, false)
+                .await
+                .expect_err("a hash alone should not attach content to a partition")
+                .is_internal()
+        );
+    }
+
+    /// An object left behind by a writer that died before publishing must not wedge the hash.
+    /// After waiting out the grace period, the key is taken over with bytes this writer can
+    /// vouch for — rather than trying to work out what the abandoned ones were.
+    #[tokio::test]
+    async fn test_put_immutable_reclaims_abandoned_object() {
+        let repository = random::<Context>();
+        let (fragment, address, payload) = fragment::generate_random();
+
+        let mut s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let entry = FragmentsEntry::new(repository, address);
+
+        mock_fragments_probe_repeated(&mut dynamodb_mock, &entry);
+        // Nothing is ever published by the writer that left the object behind.
+        mock_metadata_probe_repeated(&mut dynamodb_mock, address.hash, None);
+
+        // The conditional upload refuses to replace the abandoned object.
+        s3mock
+            .expect_put_object_if_absent::<Vec<u8>>()
+            .times(1)
+            .returning(|_, _, _| Err(precondition_failed()));
+
+        // It is identified, then replaced only if it is still that same object.
+        s3mock.expect_head_object().times(1).returning(|_, _| {
+            Ok(HeadObjectOutput::builder()
+                .e_tag(ABANDONED_ETAG)
+                .last_modified(DateTime::from_secs(1))
+                .build())
+        });
+        s3mock
+            .expect_put_object_if_match::<Vec<u8>>()
+            .times(1)
+            .withf(|_, _, _, etag| etag == ABANDONED_ETAG)
+            .returning(|_, _, _, _| Ok(PutObjectOutput::builder().build()));
+
+        // This writer's own fragment is published, because these are now its own bytes.
+        mock_publish_metadata(&mut dynamodb_mock, address.hash, fragment);
+        mock_associate_fragment(&mut dynamodb_mock, &entry);
+
+        let store = initialize_immutable_store_with_grace(s3mock, dynamodb_mock, 100).await;
+
+        Arc::new(store)
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect("should have reclaimed the abandoned object");
+    }
+
+    /// An object stored moments ago belongs to a writer that is most likely still finishing.
+    /// Its representation is the one that will win, so this writer must leave it alone and hand
+    /// the wait back to the caller rather than reclaiming it or holding the request.
+    #[tokio::test]
+    async fn test_put_immutable_backs_off_from_an_unpublished_upload() {
+        let repository = random::<Context>();
+        let (fragment, address, payload) = fragment::generate_random();
+
+        let mut s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let entry = FragmentsEntry::new(repository, address);
+
+        mock_fragments_probe_repeated(&mut dynamodb_mock, &entry);
+        mock_metadata_probe_repeated(&mut dynamodb_mock, address.hash, None);
+
+        s3mock
+            .expect_put_object_if_absent::<Vec<u8>>()
+            .times(1)
+            .returning(|_, _, _| Err(precondition_failed()));
+
+        // Stored just now. No reclaim is mocked: taking it over would be a test failure.
+        let stored_at = DateTime::from_millis(now_millis() as i64);
+        s3mock.expect_head_object().times(1).returning(move |_, _| {
+            Ok(HeadObjectOutput::builder()
+                .e_tag(ABANDONED_ETAG)
+                .last_modified(stored_at)
+                .build())
+        });
+
+        let store = initialize_immutable_store_with_grace(s3mock, dynamodb_mock, 60_000).await;
+
+        let error = Arc::new(store)
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect_err("should have backed off rather than reclaiming a live upload");
+
+        assert!(error.is_slow_down(), "expected a back-off, got {error:?}");
+    }
+
+    /// Two writers can reach recovery for the same abandoned object. Conditioning the reclaim on
+    /// the object being unchanged makes it single-winner: the loser must publish nothing, or it
+    /// would describe the winner's bytes with its own fragment.
+    #[tokio::test]
+    async fn test_put_immutable_losing_the_reclaim_publishes_nothing() {
+        let repository = random::<Context>();
+        let (fragment, address, payload) = fragment::generate_random();
+
+        let mut s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let entry = FragmentsEntry::new(repository, address);
+
+        mock_fragments_probe_repeated(&mut dynamodb_mock, &entry);
+        mock_metadata_probe_repeated(&mut dynamodb_mock, address.hash, None);
+
+        // No publish is mocked: writing metadata after losing the reclaim would describe another
+        // writer's bytes, so any conditional put here is a test failure.
+        s3mock
+            .expect_put_object_if_absent::<Vec<u8>>()
+            .times(PUT_MAX_ATTEMPTS)
+            .returning(|_, _, _| Err(precondition_failed()));
+        s3mock
+            .expect_head_object()
+            .times(PUT_MAX_ATTEMPTS)
+            .returning(|_, _| {
+                Ok(HeadObjectOutput::builder()
+                    .e_tag(ABANDONED_ETAG)
+                    .last_modified(DateTime::from_secs(1))
+                    .build())
+            });
+
+        // Another writer reclaimed it first every time, so the entity tag never matches.
+        s3mock
+            .expect_put_object_if_match::<Vec<u8>>()
+            .times(PUT_MAX_ATTEMPTS)
+            .returning(|_, _, _, _| Err(precondition_failed()));
+
+        let store = initialize_immutable_store_with_grace(s3mock, dynamodb_mock, 100).await;
+
+        let error = Arc::new(store)
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect_err("losing every reclaim should not report success");
+
+        assert!(error.is_slow_down(), "expected a back-off, got {error:?}");
+    }
+
+    /// A writer whose upload was conditional cannot know its bytes are still the stored ones —
+    /// they may have been reclaimed while it was stalled. So a rejected publish must make it
+    /// stand down and re-probe, never overwrite the other writer's metadata with its own
+    /// fragment.
+    #[tokio::test]
+    async fn test_put_immutable_conditional_writer_does_not_publish_over_a_reclaimer() {
+        let repository = random::<Context>();
+        let (fragment, address, payload) = fragment::generate_random();
+
+        let mut s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let entry = FragmentsEntry::new(repository, address);
+        let reclaimer = Fragment {
+            flags: FragmentFlags::PayloadCompressedZstd.bits(),
+            size_payload: fragment.size_payload / 2,
+            size_content: fragment.size_content,
+        };
+
+        mock_fragments_probe_repeated(&mut dynamodb_mock, &entry);
+        // Nothing stored at probe time; by publish time a reclaimer owns the hash.
+        mock_metadata_probe_sequence(
+            &mut dynamodb_mock,
+            address.hash,
+            vec![
+                None,
+                Some(FragmentMetadataEntry::new(address.hash).with_fragment(reclaimer)),
+            ],
+        );
+
+        s3mock
+            .expect_put_object_if_absent::<Vec<u8>>()
+            .times(1)
+            .returning(|_, _, _| Ok(PutObjectOutput::builder().build()));
+
+        // Exactly one publish attempt. A second would be this writer overwriting the reclaimer's
+        // metadata with a fragment describing bytes that are no longer stored.
+        dynamodb_mock
+            .expect_put_item_conditional::<MetadataWriteCondition>()
+            .times(1)
+            .withf(|_, _, condition| *condition == MetadataWriteCondition::Absent)
+            .returning(|_, _, _| Err(conditional_check_failed()));
+
+        // Standing down leads to deduplicating against what the reclaimer published.
+        mock_associate_fragment(&mut dynamodb_mock, &entry);
+
+        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
+
+        Arc::new(store)
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect("should have stood down and deduplicated");
+    }
+
+    /// The payload is already durable under a different partition, so this put records a
+    /// reference to it instead of uploading anything. No S3 call and no metadata write: the
+    /// stored representation is adopted as-is.
+    #[tokio::test]
+    async fn test_put_immutable_deduplicates_across_partitions() {
+        let repository = random::<Context>();
+        let (fragment, address, payload) = fragment::generate_random();
+
+        // A bare S3 mock with no expectations: any upload here is a test failure.
+        let s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let entry = FragmentsEntry::new(repository, address);
+
+        // This partition has no association yet...
+        mock_lookup_fragments(
+            &mut dynamodb_mock,
+            entry.clone(),
+            StoreMatch::MatchFull,
+            StoreMatch::MatchNone,
+        );
+
+        // ...but the payload is already committed, so it is durable in S3.
+        mock_metadata_probe(
+            &mut dynamodb_mock,
+            address.hash,
+            Some(FragmentMetadataEntry::new(address.hash).with_fragment(fragment)),
+        );
+
+        mock_associate_fragment(&mut dynamodb_mock, &entry);
+
+        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
+
+        Arc::new(store)
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect("failed to deduplicate against durable content");
+    }
+
+    /// A put whose exact association already exists against committed content writes nothing at
+    /// all: no S3, no metadata, not even an association.
+    #[tokio::test]
+    async fn test_put_immutable_full_match_writes_nothing() {
+        let repository = random::<Context>();
+        let (fragment, address, payload) = fragment::generate_random();
+
+        let s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let entry = FragmentsEntry::new(repository, address);
+
+        mock_lookup_fragments(
+            &mut dynamodb_mock,
+            entry,
+            StoreMatch::MatchFull,
+            StoreMatch::MatchFull,
+        );
+        mock_metadata_probe(
+            &mut dynamodb_mock,
+            address.hash,
+            Some(FragmentMetadataEntry::new(address.hash).with_fragment(fragment)),
+        );
+
+        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
+
+        Arc::new(store)
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect("failed to put an already stored fragment");
     }
 
     #[tokio::test]
@@ -2453,16 +4096,8 @@ mod test {
             StoreMatch::MatchNone,
         );
 
-        let item: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(FragmentMetadataEntry::new(address.hash).with_fragment(fragment))
-                .unwrap();
-
-        dynamodb_mock
-            .expect_put_item()
-            .with(eq(Arc::<str>::from(METADATA_TABLE_NAME)), eq(item.clone()))
-            .return_once(move |_, _| {
-                Ok(PutItemOutput::builder().set_attributes(Some(item)).build())
-            });
+        mock_metadata_probe(&mut dynamodb_mock, address.hash, None);
+        mock_publish_metadata(&mut dynamodb_mock, address.hash, fragment);
 
         mock_associate_fragment(&mut dynamodb_mock, &entry);
 
@@ -2478,7 +4113,7 @@ mod test {
         // was sent.
         let expected = body[..real_len].to_vec();
         s3mock
-            .expect_put_object()
+            .expect_put_object_if_absent()
             .with(eq(BUCKET), eq(address.hash.to_string()), eq(expected))
             .return_once(move |_, _, _: Vec<u8>| Ok(PutObjectOutput::builder().build()));
 
@@ -2670,7 +4305,7 @@ mod test {
         let (_, address, payload) = fragment::generate_random();
         let repository = random::<Context>();
         let fragment = Fragment {
-            flags: FragmentFlags::PayloadObliterating.bits(),
+            flags: FragmentFlags::PayloadObliterated.bits(),
             size_payload: 0,
             size_content: 0,
         };
@@ -2889,13 +4524,30 @@ mod test {
             false, /* fail */
         );
 
+        // Another obliteration owns the mark, so the payload and the metadata are its to decide.
+        // Removing this partition's own reference is still this call's job, and neither S3 nor a
+        // metadata write is mocked: touching either here would be a test failure.
+        mock_remove_association(
+            &mut dynamodb_mock,
+            repository,
+            address,
+            false, /* fail */
+        );
+
         let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
 
-        let stats = Default::default();
+        let stats: Arc<StoreObliterateStats> = Default::default();
         Arc::new(store)
-            .obliterate(repository.into(), address, stats)
+            .obliterate(repository.into(), address, stats.clone())
             .await
             .expect("obliterate failed");
+
+        assert_eq!(
+            stats.num_fragments.load(Ordering::Relaxed),
+            1,
+            "the reference this call was asked to remove must still be removed"
+        );
+        assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -3150,6 +4802,65 @@ mod test {
                     Ok(DeleteObjectOutput::builder().build())
                 }
             });
+    }
+
+    /// The reference being obliterated must not be removable while a put could write it straight
+    /// back. Marking the row first is what prevents that: a put reading the mark backs off, so
+    /// the partition the content is being deleted for cannot restore its own reference and leave
+    /// the obliteration reporting success over content that is still referenced.
+    ///
+    /// Pins the ordering rather than the race, since the race is what the ordering rules out.
+    #[tokio::test]
+    async fn test_obliterate_marks_before_removing_the_association() {
+        let repository = random::<Context>();
+
+        let s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let (fragment, address) =
+            mock_load_fragment_metadata(&mut dynamodb_mock, None, false /* fail */);
+
+        let mut marked = fragment;
+        marked.flags |= FragmentFlags::PayloadObliterating;
+        let mut order = mockall::Sequence::default();
+
+        dynamodb_mock
+            .expect_put_item_conditional::<UpdateMetadataCondition>()
+            .times(1)
+            .in_sequence(&mut order)
+            .withf(move |table, _, condition| {
+                table.as_ref() == METADATA_TABLE_NAME
+                    && *condition == UpdateMetadataCondition(fragment)
+            })
+            .returning(|_, _, _| Ok(PutItemOutput::builder().build()));
+
+        dynamodb_mock
+            .expect_delete_item()
+            .times(1)
+            .in_sequence(&mut order)
+            .withf(move |table, _| table.as_ref() == FRAGMENTS_TABLE_NAME)
+            .returning(|_, _| Ok(DeleteItemOutput::builder().build()));
+
+        // A reference remains, so the mark is cleared and nothing else happens. Reaching this at
+        // all means the mark was already in place when the association was removed.
+        mock_count_associations(&mut dynamodb_mock, address.hash, 1, false /* fail */);
+
+        dynamodb_mock
+            .expect_put_item_conditional::<UpdateMetadataCondition>()
+            .times(1)
+            .in_sequence(&mut order)
+            .withf(move |_, _, condition| *condition == UpdateMetadataCondition(marked))
+            .returning(|_, _, _| Ok(PutItemOutput::builder().build()));
+
+        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
+
+        let stats: Arc<StoreObliterateStats> = Default::default();
+        Arc::new(store)
+            .obliterate(repository.into(), address, stats.clone())
+            .await
+            .expect("obliterate should leave a still-referenced payload alone");
+
+        assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -3864,6 +5575,16 @@ mod test {
                     .build())
             });
 
+        // The parent's own association is now removed before its sub-fragments are visited, so
+        // that they are only obliterated once the parent is known to be going away.
+        mock_remove_association(
+            &mut dynamodb_mock,
+            repository,
+            address,
+            false, /* fail */
+        );
+        mock_count_associations(&mut dynamodb_mock, address.hash, 0, false /* fail */);
+
         mock_acquire_obliterate_lock(
             &mut dynamodb_mock,
             fragment,
@@ -3889,8 +5610,8 @@ mod test {
         // mocks.
         assert_eq!(
             stats.num_fragments.load(Ordering::Relaxed),
-            // We deleted associations for both sub-fragments, but not the parent fragment
-            SUB_FRAGMENT_COUNT as usize
+            // Associations for both sub-fragments and the parent
+            (SUB_FRAGMENT_COUNT + 1) as usize
         );
         assert_eq!(
             stats.num_payloads.load(Ordering::Relaxed),
@@ -4028,5 +5749,738 @@ mod test {
             )
             .await
             .expect("copy should succeed");
+    }
+
+    /// Concurrency tests that drive the real store against an in-memory stand-in for `DynamoDB`
+    /// and S3.
+    ///
+    /// The fake implements the parts of the semantics the protocol actually leans on: per-object
+    /// and per-item atomicity, conditional puts, and write-once objects. That is what lets these
+    /// tests answer the question they exist for — whether concurrent writers holding the same
+    /// content in *different* representations can leave the stored blob and the metadata
+    /// describing it disagreeing, which would make every later read of that hash fail.
+    mod concurrency {
+        use std::collections::HashSet;
+        use std::sync::Mutex;
+
+        use super::*;
+
+        /// Number of writers racing for the same hash.
+        const WRITERS: u8 = 6;
+        /// Base compressed length; each writer's representation is a different length.
+        const BASE_PAYLOAD_LEN: usize = 64;
+        /// Uncompressed size, shared by every representation because it is the same content.
+        const CONTENT_SIZE: u64 = 4096;
+
+        /// The stored state for a single hash, which is all these races need.
+        ///
+        /// Guarded by one mutex, so each operation is atomic with respect to the others — the
+        /// property S3 gives per object and `DynamoDB` per item, and the only one these tests
+        /// need, since the corruption they cover comes from two separately atomic writes to two
+        /// independent stores rather than from a torn individual write.
+        #[derive(Default)]
+        struct FakeState {
+            metadata: Option<HashMap<String, AttributeValue>>,
+            object: Option<Vec<u8>>,
+            associations: HashSet<String>,
+            uploads: usize,
+            /// Bumped on every write, so the entity tag changes exactly when the object does.
+            generation: u64,
+            stored_at_millis: u64,
+            /// When set, the next metadata write fails, standing in for the throttling that
+            /// corrupts the store before this change.
+            fail_next_metadata_write: bool,
+            /// When set, conditional metadata writes always succeed and uploads overwrite freely,
+            /// modelling the unguarded write this store used before S3 arbitrated between
+            /// writers. Used by the negative control to show what the conditions actually buy.
+            unprotected: bool,
+        }
+
+        impl FakeState {
+            fn etag(&self) -> String {
+                format!("\"generation-{}\"", self.generation)
+            }
+
+            fn store(&mut self, body: Vec<u8>) {
+                self.object = Some(body);
+                self.generation += 1;
+                self.stored_at_millis = now_millis();
+                self.uploads += 1;
+            }
+
+            /// Evaluate a publish condition against the current row.
+            fn permits(&self, condition: &MetadataWriteCondition) -> bool {
+                if self.unprotected {
+                    return true;
+                }
+
+                match condition {
+                    MetadataWriteCondition::Absent => self.metadata.is_none(),
+                    MetadataWriteCondition::Unchanged(expected) => {
+                        self.metadata.as_ref().is_some_and(|row| {
+                            row.get("flags") == Some(&AttributeValue::N(expected.flags.to_string()))
+                                && row.get("size_payload")
+                                    == Some(&AttributeValue::N(expected.size_payload.to_string()))
+                                && row.get("size_content")
+                                    == Some(&AttributeValue::N(expected.size_content.to_string()))
+                        })
+                    }
+                }
+            }
+        }
+
+        /// Identity of an association, taken from the sort key of a fragments row.
+        fn association_key(item: &HashMap<String, AttributeValue>) -> String {
+            format!("{:?}", item.get(FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE))
+        }
+
+        /// Writer `index`'s representation of the shared content: a distinct codec, a distinct
+        /// compressed length, and bytes that identify which writer produced them.
+        fn representation(index: u8) -> (Fragment, Bytes) {
+            let len = BASE_PAYLOAD_LEN + usize::from(index);
+            let codec = match index % 3 {
+                0 => FragmentFlags::PayloadCompressedLZ4,
+                1 => FragmentFlags::PayloadCompressedZstd,
+                _ => FragmentFlags::PayloadCompressedOodle2,
+            };
+
+            let fragment = Fragment {
+                flags: codec.bits(),
+                size_payload: len as u32,
+                size_content: CONTENT_SIZE,
+            };
+
+            (fragment, Bytes::from(vec![index; len]))
+        }
+
+        /// Build a store whose `DynamoDB` and S3 calls are served by `state`.
+        async fn fake_store(state: Arc<Mutex<FakeState>>) -> Arc<AwsImmutableStore> {
+            let mut dynamodb = MockDynamoDb::default();
+            let mut s3 = MockS3Impl::default();
+
+            let get_state = state.clone();
+            dynamodb
+                .expect_get_item()
+                .returning(move |table, key, _consistent| {
+                    let state = get_state.lock().unwrap();
+                    let item = if table.as_ref() == METADATA_TABLE_NAME {
+                        state.metadata.clone()
+                    } else if state.associations.contains(&association_key(&key)) {
+                        Some(key)
+                    } else {
+                        None
+                    };
+
+                    Ok(GetItemOutput::builder().set_item(item).build())
+                });
+
+            let put_state = state.clone();
+            dynamodb.expect_put_item().returning(move |table, item| {
+                assert_eq!(
+                    table.as_ref(),
+                    FRAGMENTS_TABLE_NAME,
+                    "metadata must only ever be written conditionally"
+                );
+                put_state
+                    .lock()
+                    .unwrap()
+                    .associations
+                    .insert(association_key(&item));
+
+                Ok(PutItemOutput::builder().build())
+            });
+
+            let conditional_state = state.clone();
+            dynamodb
+                .expect_put_item_conditional::<MetadataWriteCondition>()
+                .returning(move |table, item, condition| {
+                    assert_eq!(table.as_ref(), METADATA_TABLE_NAME);
+                    let mut state = conditional_state.lock().unwrap();
+
+                    if state.fail_next_metadata_write {
+                        state.fail_next_metadata_write = false;
+
+                        return Err(aws_error(
+                            PutItemError::ProvisionedThroughputExceededException(
+                                ProvisionedThroughputExceededException::builder().build(),
+                            ),
+                            400u16,
+                        ));
+                    }
+
+                    if !state.permits(&condition) {
+                        return Err(aws_error(
+                            PutItemError::ConditionalCheckFailedException(
+                                ConditionalCheckFailedException::builder()
+                                    .set_item(state.metadata.clone())
+                                    .build(),
+                            ),
+                            400u16,
+                        ));
+                    }
+
+                    state.metadata = Some(item);
+
+                    Ok(PutItemOutput::builder().build())
+                });
+
+            let upload_state = state.clone();
+            s3.expect_put_object_if_absent::<Vec<u8>>()
+                .returning(move |_bucket, _key, body| {
+                    let mut state = upload_state.lock().unwrap();
+
+                    // Write-once, as S3 enforces for a conditional put: an existing object is
+                    // never silently replaced.
+                    if state.object.is_some() && !state.unprotected {
+                        return Err(aws_error(
+                            PutObjectError::generic(
+                                ErrorMetadata::builder().code("PreconditionFailed").build(),
+                            ),
+                            412u16,
+                        ));
+                    }
+
+                    state.store(body);
+
+                    Ok(PutObjectOutput::builder().build())
+                });
+
+            let read_state = state.clone();
+            s3.expect_get_object()
+                .returning(move |_bucket, _key, _range| {
+                    let object = read_state.lock().unwrap().object.clone();
+
+                    Ok(GetObjectOutput::builder()
+                        .set_body(object.map(Into::into))
+                        .build())
+                });
+
+            let head_state = state.clone();
+            s3.expect_head_object().returning(move |_bucket, _key| {
+                let state = head_state.lock().unwrap();
+
+                Ok(HeadObjectOutput::builder()
+                    .e_tag(state.etag())
+                    .last_modified(DateTime::from_millis(state.stored_at_millis as i64))
+                    .build())
+            });
+
+            // Reclaiming succeeds only while the object is still the one that was inspected,
+            // which is what makes it single-winner.
+            let reclaim_state = state.clone();
+            s3.expect_put_object_if_match::<Vec<u8>>().returning(
+                move |_bucket, _key, body, etag| {
+                    let mut state = reclaim_state.lock().unwrap();
+
+                    if state.etag() != etag {
+                        return Err(aws_error(
+                            PutObjectError::generic(
+                                ErrorMetadata::builder().code("PreconditionFailed").build(),
+                            ),
+                            412u16,
+                        ));
+                    }
+
+                    state.store(body);
+
+                    Ok(PutObjectOutput::builder().build())
+                },
+            );
+
+            let delete_state = state.clone();
+            s3.expect_delete_object()
+                .returning(move |_bucket, _key, _version| {
+                    delete_state.lock().unwrap().object = None;
+
+                    Ok(DeleteObjectOutput::builder().build())
+                });
+
+            Arc::new(initialize_immutable_store(s3, dynamodb).await)
+        }
+
+        /// Describe how the stored blob and the published metadata disagree, or `None` when they
+        /// are a matched pair.
+        ///
+        /// This is the invariant everything here exists to protect: whatever metadata is
+        /// published must describe exactly the bytes sitting in S3, because a reader fetches the
+        /// two independently and fails if they do not line up.
+        fn cohesion_violation(state: &FakeState) -> Option<String> {
+            let row = state.metadata.as_ref()?;
+            let entry: FragmentMetadataEntry = serde_dynamo::from_item(row.clone()).unwrap();
+
+            let published = entry.fragment?;
+
+            let Some(object) = state.object.as_ref() else {
+                return Some("metadata was published with no blob in S3".to_string());
+            };
+
+            if published.size_payload as usize != object.len() {
+                return Some(format!(
+                    "published size_payload {} does not match the stored blob length {}",
+                    published.size_payload,
+                    object.len()
+                ));
+            }
+
+            // Every writer fills its payload with its own index, so the blob names the writer
+            // whose bytes actually survived. The published metadata must be that writer's.
+            let writer = object[0];
+            if !object.iter().all(|byte| *byte == writer) {
+                return Some("the stored blob mixes bytes from more than one writer".to_string());
+            }
+
+            let (expected, _) = representation(writer);
+            if published.flags != expected.flags {
+                return Some(format!(
+                    "writer {writer}'s blob was published with flags {:#x} instead of {:#x}",
+                    published.flags, expected.flags
+                ));
+            }
+            if published.size_content != expected.size_content {
+                return Some("published size_content does not match the stored blob".to_string());
+            }
+
+            None
+        }
+
+        fn assert_blob_and_metadata_agree(state: &FakeState, context: &str) {
+            if let Some(violation) = cohesion_violation(state) {
+                panic!("{context}: {violation}");
+            }
+        }
+
+        /// Many writers race to store the same content in different representations. Whatever
+        /// ends up published has to describe the bytes that actually landed in S3.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn concurrent_writers_with_different_representations_stay_cohesive() {
+            for iteration in 0..64 {
+                let state = Arc::new(Mutex::new(FakeState::default()));
+                let store = fake_store(state.clone()).await;
+                let (_, shared, _) = fragment::generate_random();
+
+                let mut writers = JoinSet::new();
+                for index in 0..WRITERS {
+                    let store = store.clone();
+                    // Different partitions and contexts, same content: exactly the case
+                    // deduplication is meant to collapse.
+                    let partition = random::<Partition>();
+                    let address = address_with_random_context(shared);
+                    let (fragment, payload) = representation(index);
+
+                    lore_base::lore_spawn!(writers, async move {
+                        store
+                            .put(partition, address, fragment, Some(payload), false)
+                            .await
+                    });
+                }
+
+                let mut stored = 0;
+                while let Some(writer) = writers.join_next().await {
+                    match writer.expect("writer panicked") {
+                        Ok(()) => stored += 1,
+                        // Backing off is a legitimate outcome: another writer's upload is in
+                        // flight, and the caller retries rather than racing a second
+                        // representation into the same object.
+                        Err(error) => assert!(
+                            error.is_slow_down(),
+                            "iteration {iteration}: unexpected error {error:?}"
+                        ),
+                    }
+                }
+
+                let state = state.lock().unwrap();
+                assert_blob_and_metadata_agree(&state, &format!("iteration {iteration}"));
+                assert!(
+                    stored >= 1,
+                    "iteration {iteration}: every writer backed off, so none made progress"
+                );
+                assert_eq!(
+                    state.uploads, 1,
+                    "iteration {iteration}: the payload should be uploaded exactly once no \
+                     matter how many writers raced for it"
+                );
+            }
+        }
+
+        /// Negative control for the race test above: the same writers, against a store whose
+        /// metadata writes always succeed and whose objects can be overwritten — which is how
+        /// this store behaved before S3 arbitrated between writers.
+        ///
+        /// With nothing serialising them, writers that probed before anyone published all go on
+        /// to upload their own representation of the hash. That is precisely the precondition
+        /// for tearing: once more than one writer stores bytes, which representation wins S3 is
+        /// decided independently of which one wins the metadata table, so the two can disagree.
+        /// Tearing itself is a race and does not surface on every run, so the assertion here is
+        /// on the collision; [`legacy_write_order_tears_blob_and_metadata`] pins down the torn
+        /// outcome deterministically.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn without_metadata_conditions_writers_upload_over_each_other() {
+            let mut collisions = 0;
+            let mut tears = 0;
+
+            for _ in 0..64 {
+                let state = Arc::new(Mutex::new(FakeState {
+                    unprotected: true,
+                    ..Default::default()
+                }));
+                let store = fake_store(state.clone()).await;
+                let (_, shared, _) = fragment::generate_random();
+
+                let mut writers = JoinSet::new();
+                for index in 0..WRITERS {
+                    let store = store.clone();
+                    let partition = random::<Partition>();
+                    let address = address_with_random_context(shared);
+                    let (fragment, payload) = representation(index);
+
+                    lore_base::lore_spawn!(writers, async move {
+                        store
+                            .put(partition, address, fragment, Some(payload), false)
+                            .await
+                    });
+                }
+
+                while let Some(writer) = writers.join_next().await {
+                    let _ = writer.expect("writer panicked");
+                }
+
+                let state = state.lock().unwrap();
+                if state.uploads > 1 {
+                    collisions += 1;
+                }
+                if cohesion_violation(&state).is_some() {
+                    tears += 1;
+                }
+            }
+
+            assert!(
+                collisions > 0,
+                "without the metadata conditions nothing serialises the writers, so competing \
+                 uploads for a single hash were expected (collisions: {collisions}, torn: {tears})"
+            );
+        }
+
+        /// One partition stores the content; another later stores the *same* content in a
+        /// different representation. The second put must leave the stored blob and its metadata
+        /// completely alone, because overwriting the blob would strand the first partition's
+        /// content behind metadata that no longer describes it.
+        ///
+        /// This needs no concurrency at all — it is two sequential puts from different
+        /// partitions.
+        #[tokio::test]
+        async fn cross_partition_put_of_another_representation_leaves_the_blob_alone() {
+            let state = Arc::new(Mutex::new(FakeState::default()));
+            let store = fake_store(state.clone()).await;
+            let (_, shared, _) = fragment::generate_random();
+
+            // The first partition stores the content as one representation.
+            let (first, first_payload) = representation(0);
+            store
+                .clone()
+                .put(
+                    random::<Partition>(),
+                    address_with_random_context(shared),
+                    first,
+                    Some(first_payload.clone()),
+                    false,
+                )
+                .await
+                .expect("the first partition should store the content");
+
+            let (blob, metadata) = {
+                let state = state.lock().unwrap();
+                (state.object.clone(), state.metadata.clone())
+            };
+            assert_eq!(
+                blob.as_deref(),
+                Some(first_payload.as_ref()),
+                "the first partition's bytes should be the ones stored"
+            );
+
+            // A second partition stores the same content compressed differently.
+            let (second, second_payload) = representation(1);
+            assert_ne!(
+                first.size_payload, second.size_payload,
+                "the two partitions must hold genuinely different representations"
+            );
+
+            store
+                .put(
+                    random::<Partition>(),
+                    address_with_random_context(shared),
+                    second,
+                    Some(second_payload),
+                    false,
+                )
+                .await
+                .expect("the second partition should deduplicate against the stored content");
+
+            let state = state.lock().unwrap();
+            assert_eq!(
+                state.object, blob,
+                "the stored blob must be untouched by the second partition"
+            );
+            assert_eq!(
+                state.metadata, metadata,
+                "the published metadata must be untouched by the second partition"
+            );
+            assert_blob_and_metadata_agree(&state, "after a cross-partition put");
+            assert_eq!(
+                state.uploads, 1,
+                "the second partition must not upload its own representation over the first's"
+            );
+        }
+
+        /// The sequence that corrupts the store without this change, end to end.
+        ///
+        /// One partition stores content and reads it back. A second partition stores the same
+        /// content compressed differently, with the next metadata write armed to fail — the
+        /// throttling that previously left the first partition reading a blob its own metadata
+        /// no longer described.
+        ///
+        /// Nothing fails now, because nothing is written: the second partition records a
+        /// reference to content that is already stored, so there is no upload to replace the
+        /// blob and no metadata write to lose.
+        #[tokio::test]
+        async fn a_failed_cross_partition_write_cannot_corrupt_the_first_partition() {
+            let state = Arc::new(Mutex::new(FakeState::default()));
+            let store = fake_store(state.clone()).await;
+            let (_, shared, _) = fragment::generate_random();
+
+            let first_partition = random::<Partition>();
+            let first_address = address_with_random_context(shared);
+            let (first_fragment, first_payload) = representation(0);
+
+            store
+                .clone()
+                .put(
+                    first_partition,
+                    first_address,
+                    first_fragment,
+                    Some(first_payload.clone()),
+                    false,
+                )
+                .await
+                .expect("the first partition should store the content");
+
+            store
+                .clone()
+                .get(first_partition, first_address, StoreMatch::MatchFull)
+                .await
+                .expect("the first partition should be able to read what it stored");
+
+            // Arm the write that used to be lost, then have another partition store the same
+            // content in its own representation.
+            state.lock().unwrap().fail_next_metadata_write = true;
+
+            let (second_fragment, second_payload) = representation(1);
+            store
+                .clone()
+                .put(
+                    random::<Partition>(),
+                    address_with_random_context(shared),
+                    second_fragment,
+                    Some(second_payload),
+                    false,
+                )
+                .await
+                .expect("the second partition should deduplicate against the stored content");
+
+            {
+                let state = state.lock().unwrap();
+                assert!(
+                    state.fail_next_metadata_write,
+                    "the armed metadata write was consumed, so the second partition published \
+                     metadata it had no business publishing"
+                );
+                assert_eq!(
+                    state.uploads, 1,
+                    "the second partition uploaded content that was already stored"
+                );
+            }
+
+            store
+                .get(first_partition, first_address, StoreMatch::MatchFull)
+                .await
+                .expect("the first partition must still be able to read what it stored");
+        }
+
+        /// Negative control for the test above, modelling the write order this store used before
+        /// deduplication: a put with no exact match uploaded unconditionally, then published its
+        /// own metadata. A second partition storing the same content in a different
+        /// representation therefore replaced the blob while the first partition's metadata still
+        /// described it.
+        ///
+        /// The pair is inconsistent for the whole gap between those two writes — every read of
+        /// the hash fails, including reads from the partition that did not write — and stays that
+        /// way permanently if the writer dies before publishing.
+        #[tokio::test]
+        async fn legacy_cross_partition_overwrite_tears_blob_and_metadata() {
+            let state = Arc::new(Mutex::new(FakeState::default()));
+            let (first, first_payload) = representation(0);
+            let (second, second_payload) = representation(1);
+            let (_, shared, _) = fragment::generate_random();
+
+            // The first partition's consistent pair.
+            {
+                let mut state = state.lock().unwrap();
+                state.object = Some(first_payload.to_vec());
+                state.metadata = Some(
+                    serde_dynamo::to_item(
+                        FragmentMetadataEntry::new(shared.hash).with_fragment(first),
+                    )
+                    .unwrap(),
+                );
+            }
+            assert!(
+                cohesion_violation(&state.lock().unwrap()).is_none(),
+                "the first partition should start out consistent"
+            );
+
+            // The second partition uploads its representation over the top, as the old
+            // unconditional put did.
+            state.lock().unwrap().object = Some(second_payload.to_vec());
+
+            let torn = cohesion_violation(&state.lock().unwrap());
+            assert!(
+                torn.is_some(),
+                "overwriting the blob should have left it disagreeing with the published metadata"
+            );
+
+            // Publishing the second representation restores consistency — so the damage lasts
+            // only as long as the gap, unless the writer never gets here.
+            state.lock().unwrap().metadata = Some(
+                serde_dynamo::to_item(
+                    FragmentMetadataEntry::new(shared.hash).with_fragment(second),
+                )
+                .unwrap(),
+            );
+            assert!(
+                cohesion_violation(&state.lock().unwrap()).is_none(),
+                "publishing the second representation should have restored the pair"
+            );
+        }
+
+        /// Negative control for [`assert_blob_and_metadata_agree`].
+        ///
+        /// Replays the write order this store used before this change — upload, then publish
+        /// metadata unconditionally — with the interleaving that made it unsafe. Both
+        /// writers upload and both publish, and because S3 and the metadata table are updated
+        /// independently, the writer that wins one is not the writer that wins the other. The
+        /// result is a hash whose published metadata describes bytes that are no longer there,
+        /// which fails every subsequent read.
+        ///
+        /// Without this, a cohesion assertion that never fires would look like a passing test.
+        #[tokio::test]
+        async fn legacy_write_order_tears_blob_and_metadata() {
+            let state = Arc::new(Mutex::new(FakeState::default()));
+            let (_, shared, _) = fragment::generate_random();
+
+            let (fragment_a, payload_a) = representation(0);
+            let (fragment_b, payload_b) = representation(1);
+            assert_ne!(
+                fragment_a.size_payload, fragment_b.size_payload,
+                "the two writers must hold genuinely different representations"
+            );
+
+            {
+                let mut state = state.lock().unwrap();
+
+                // Both uploads land, B's last...
+                state.object = Some(payload_a.to_vec());
+                state.object = Some(payload_b.to_vec());
+
+                // ...but the unconditional metadata writes land in the opposite order, so the
+                // published fragment is A's while the stored bytes are B's.
+                for fragment in [fragment_b, fragment_a] {
+                    state.metadata = Some(
+                        serde_dynamo::to_item(
+                            FragmentMetadataEntry::new(shared.hash).with_fragment(fragment),
+                        )
+                        .unwrap(),
+                    );
+                }
+            }
+
+            let state = state.lock().unwrap();
+            let entry: FragmentMetadataEntry =
+                serde_dynamo::from_item(state.metadata.clone().unwrap()).unwrap();
+            let published = entry
+                .fragment
+                .expect("the legacy order publishes a row describing a fragment");
+            let object = state.object.as_ref().expect("a blob was uploaded");
+
+            // This is the exact condition `assert_blob_and_metadata_agree` checks first, so the
+            // cohesion assertion used by the tests above does detect this state.
+            assert_ne!(
+                published.size_payload as usize,
+                object.len(),
+                "the legacy write order should leave the published size describing another \
+                 writer's blob"
+            );
+        }
+
+        /// Once the content is durable, writers holding a *different* representation of it must
+        /// deduplicate against what is stored rather than republishing their own description of
+        /// it — otherwise the metadata would stop matching the blob.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn deduplicating_writers_adopt_the_stored_representation() {
+            let state = Arc::new(Mutex::new(FakeState::default()));
+            let store = fake_store(state.clone()).await;
+            let (_, shared, _) = fragment::generate_random();
+
+            // One writer stores the content.
+            let (fragment, payload) = representation(0);
+            store
+                .clone()
+                .put(
+                    random::<Partition>(),
+                    address_with_random_context(shared),
+                    fragment,
+                    Some(payload),
+                    false,
+                )
+                .await
+                .expect("initial write should succeed");
+
+            let published = state.lock().unwrap().metadata.clone();
+
+            // Now everyone else stores the same content in their own representation.
+            let mut writers = JoinSet::new();
+            for index in 1..WRITERS {
+                let store = store.clone();
+                let partition = random::<Partition>();
+                let address = address_with_random_context(shared);
+                let (fragment, payload) = representation(index);
+
+                lore_base::lore_spawn!(writers, async move {
+                    store
+                        .put(partition, address, fragment, Some(payload), false)
+                        .await
+                });
+            }
+
+            while let Some(writer) = writers.join_next().await {
+                writer
+                    .expect("writer panicked")
+                    .expect("deduplicating against durable content should succeed");
+            }
+
+            let state = state.lock().unwrap();
+            assert_eq!(
+                state.uploads, 1,
+                "deduplicating writers must not upload their own representation"
+            );
+            assert_eq!(
+                state.metadata, published,
+                "deduplicating writers must not republish the payload metadata"
+            );
+            assert_eq!(
+                state.associations.len(),
+                usize::from(WRITERS),
+                "every writer should have recorded its own association"
+            );
+            assert_blob_and_metadata_agree(&state, "after deduplication");
+        }
     }
 }
