@@ -29,7 +29,7 @@ Lore's design principle that all content is handled as opaque byte streams on th
 The 256-bit cryptographic hash function Lore uses as its content address function, chosen for cryptographic strength, throughput on commodity CPUs, and parallel hashing of large inputs.
 
 For more information, see:
-BLAKE3 <https://github.com/BLAKE3-team/BLAKE3-specs>
+[BLAKE3 specifications](https://github.com/BLAKE3-team/BLAKE3-specs)
 
 ### Branch
 
