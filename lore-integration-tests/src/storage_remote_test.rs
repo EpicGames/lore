@@ -3357,7 +3357,6 @@ mod storage_remote_tests {
                         context: Context::default(),
                         local_cache: 0,
                         streaming: 0,
-                        flags: 0,
                     },
                     LoreStorageGetResolvedItem {
                         id: 2,
@@ -3366,7 +3365,6 @@ mod storage_remote_tests {
                         context: Context::default(),
                         local_cache: 0,
                         streaming: 0,
-                        flags: 0,
                     },
                 ];
                 get_resolved::get_resolved(
@@ -3430,7 +3428,6 @@ mod storage_remote_tests {
                             context: Context::default(),
                             local_cache: 0,
                             streaming: 0,
-                            flags: 0,
                         }]),
                     },
                     callback,
@@ -3594,7 +3591,6 @@ mod storage_remote_tests {
                                 context: Context::default(),
                                 local_cache: 0,
                                 streaming: 0,
-                                flags: 0,
                             }]),
                         },
                         callback,
@@ -3705,7 +3701,6 @@ mod storage_remote_tests {
                                     context: Context::default(),
                                     local_cache: 0,
                                     streaming: 0,
-                                    flags: 0,
                                 }]),
                             },
                             callback,
@@ -3899,7 +3894,6 @@ mod storage_remote_tests {
                             context: Context::default(),
                             local_cache: 1,
                             streaming: 0,
-                            flags: 0,
                         },
                         LoreStorageGetResolvedItem {
                             id: 2,
@@ -3908,7 +3902,6 @@ mod storage_remote_tests {
                             context: Context::default(),
                             local_cache: 0,
                             streaming: 0,
-                            flags: 0,
                         },
                     ];
                     get_resolved::get_resolved(
@@ -4068,7 +4061,6 @@ mod storage_remote_tests {
                                 context: Context::default(),
                                 local_cache: 0,
                                 streaming: 0,
-                                flags: 0,
                             }]),
                         },
                         callback,
@@ -4300,7 +4292,6 @@ mod storage_remote_tests {
                                 context: Context::default(),
                                 local_cache: 0,
                                 streaming: 0,
-                                flags: 0,
                             }]),
                         },
                         callback,
@@ -4419,7 +4410,6 @@ mod storage_remote_tests {
                                 context: Context::default(),
                                 local_cache: 0,
                                 streaming: 1,
-                                flags: 0,
                             }]),
                         },
                         callback,

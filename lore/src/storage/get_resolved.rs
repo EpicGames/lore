@@ -20,7 +20,10 @@
 //! `address` is the resolved address (`{ resolved_hash, context }`), so callers may cache the
 //! key->hash mapping from the event stream.
 //!
-//! Keys are always resolved as `KeyType::Resolve`, so no key type is supplied.
+//! Keys are always resolved as `KeyType::Resolve`, so no key type is supplied. The QUIC request
+//! carries a `flags` word to keep its length a multiple of four, but no bit is defined and the
+//! value is not a caller's to choose, so it is not part of the item — the server rejects a
+//! non-zero value from any peer that sends one.
 //!
 //! Backend selection matches `lore_storage_get`: local first, remote on a miss, narrowed by the
 //! handle's bound and per-call `offline`/`local`/`remote` flags. A missing key, or one resolving
@@ -76,29 +79,23 @@ pub struct LoreStorageGetResolvedItem {
     /// Paired with the resolved hash to address the immutable read; the mutable store yields
     /// only a hash.
     pub context: Context,
-    /// Cache fetched bytes back to the local store even without the producer's
-    /// `PayloadLocalCachePriority` hint
-    pub local_cache: u8,
     /// Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer, as
     /// `lore_storage_get` does. Peak memory then follows the fragment size rather than the
     /// content size, which is what makes a key naming something large usable. A read that fails
     /// partway reports the failure on `GET_ITEM_COMPLETE` rather than ending short with a
     /// success code
     pub streaming: u8,
-    /// Reserved bitmask; 0 for default behaviour. No bits are defined yet, and unknown bits are
-    /// rejected with `INVALID_ARGUMENTS` before the call reaches a backend — otherwise an unknown
-    /// bit would be silently ignored on a local hit and refused only when the request reached the
-    /// server, making the outcome depend on what happens to be cached.
-    pub flags: u32,
+    /// Cache fetched bytes back to the local store even without the producer's
+    /// `PayloadLocalCachePriority` hint
+    pub local_cache: u8,
 }
 
 impl core::fmt::Debug for LoreStorageGetResolvedItem {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LoreStorageGetResolvedItem")
             .field("id", &self.id)
-            .field("local_cache", &self.local_cache)
             .field("streaming", &self.streaming)
-            .field("flags", &self.flags)
+            .field("local_cache", &self.local_cache)
             .finish()
     }
 }
@@ -197,13 +194,6 @@ async fn get_resolved_item(
         return LoreErrorCode::InvalidArguments;
     }
 
-    // Reject here rather than letting the server decide: a local hit never inspects `flags`, so
-    // deferring would make an unknown bit succeed or fail depending on cache state.
-    if item.flags & !get_resolved_flags::KNOWN != 0 {
-        emit_item_complete(&item, Address::default(), LoreErrorCode::InvalidArguments);
-        return LoreErrorCode::InvalidArguments;
-    }
-
     let mut read_options = effective.read_options(remote_session.is_some());
     if item.local_cache != 0 {
         read_options = read_options.with_cache();
@@ -219,7 +209,7 @@ async fn get_resolved_item(
         item.partition,
         item.key,
         item.context,
-        item.flags,
+        get_resolved_flags::NONE,
         None,
         read_options,
         remote_session,
@@ -262,7 +252,7 @@ async fn get_resolved_item_streaming(
         item.partition,
         item.key,
         item.context,
-        item.flags,
+        get_resolved_flags::NONE,
         read_options,
         tx,
         remote_session,

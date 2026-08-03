@@ -4694,20 +4694,15 @@ typedef struct lore_storage_get_resolved_item_t {
   // Paired with the resolved hash to address the immutable read; the mutable store yields
   // only a hash.
   struct lore_context_t context;
-  // Cache fetched bytes back to the local store even without the producer's
-  // `PayloadLocalCachePriority` hint
-  uint8_t local_cache;
   // Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer, as
   // `lore_storage_get` does. Peak memory then follows the fragment size rather than the
   // content size, which is what makes a key naming something large usable. A read that fails
   // partway reports the failure on `GET_ITEM_COMPLETE` rather than ending short with a
   // success code
   uint8_t streaming;
-  // Reserved bitmask; 0 for default behaviour. No bits are defined yet, and unknown bits are
-  // rejected with `INVALID_ARGUMENTS` before the call reaches a backend — otherwise an unknown
-  // bit would be silently ignored on a local hit and refused only when the request reached the
-  // server, making the outcome depend on what happens to be cached.
-  uint32_t flags;
+  // Cache fetched bytes back to the local store even without the producer's
+  // `PayloadLocalCachePriority` hint
+  uint8_t local_cache;
 } lore_storage_get_resolved_item_t;
 
 // A contiguous array of elements described by a pointer and a count.
