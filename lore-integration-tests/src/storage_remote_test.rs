@@ -344,7 +344,7 @@ mod storage_remote_tests {
         assert_eq!(close_status, 0, "close must succeed");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn open_with_remote_config_succeeds_against_real_server() -> TestResult {
         let execution = setup_execution("storage-remote-open".to_string());
         LORE_CONTEXT
@@ -381,7 +381,7 @@ mod storage_remote_tests {
             .await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn put_with_remote_write_uploads_payload_to_server() -> TestResult {
         use lore::storage::put;
         use lore::storage::put::LoreStoragePutArgs;
@@ -466,7 +466,7 @@ mod storage_remote_tests {
             .await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn put_without_remote_write_does_not_upload() -> TestResult {
         use lore::storage::put;
         use lore::storage::put::LoreStoragePutArgs;
@@ -548,7 +548,7 @@ mod storage_remote_tests {
             .await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn get_falls_back_to_remote_on_local_miss() -> TestResult {
         use bytes::Bytes;
         use lore::storage::get;
@@ -677,7 +677,7 @@ mod storage_remote_tests {
     /// (`PayloadLocalCachePriority` set on the seed fragment) opts the payload into local
     /// caching via `load_fragment`'s `should_store` gate. Verify the gate fires for that
     /// case so producers retain the ability to mark "this should always be cached".
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn get_caches_locally_when_payload_has_local_cache_priority_flag() -> TestResult {
         use bytes::Bytes;
         use lore::storage::get;
@@ -778,7 +778,7 @@ mod storage_remote_tests {
     /// fragment is not flagged with `PayloadLocalCachePriority`. The companion
     /// `get_falls_back_to_remote_on_local_miss` test asserts the opposite (no flag, no
     /// per-item opt-in → no cache); this one proves the per-item opt-in works.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn get_with_local_cache_flag_caches_remote_fetched_payload_locally() -> TestResult {
         use bytes::Bytes;
         use lore::storage::get;
@@ -868,7 +868,7 @@ mod storage_remote_tests {
     /// `PayloadLocalCachePriority`. A subsequent local query of the address shows the flag
     /// is preserved so future remote reads of this content cache regardless of the reader's
     /// caching choice.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn put_with_local_cache_flag_tags_fragment_with_priority() -> TestResult {
         use lore::storage::put;
         use lore::storage::put::LoreStoragePutArgs;
@@ -1110,7 +1110,7 @@ mod storage_remote_tests {
         events[0].1
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copy_tier1_server_side_when_source_on_both() -> TestResult {
         use lore_base::types::Partition;
         use lore_revision::event::LoreErrorCode;
@@ -1163,7 +1163,7 @@ mod storage_remote_tests {
             .await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copy_tier2_upload_fallback_when_local_source_only() -> TestResult {
         use lore_base::types::Partition;
         use lore_revision::event::LoreErrorCode;
@@ -1296,7 +1296,7 @@ mod storage_remote_tests {
     /// server is configured with no JWT verifier, so the admin obliterate path returns
     /// `Ok` — `remote_success=1` and `error_code=None` are the expected
     /// outcomes. `local_success=1` confirms the local side ran independently and succeeded.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn obliterate_runs_local_and_remote_in_parallel_with_independent_outcomes() -> TestResult
     {
         use lore_base::types::Partition;
@@ -1341,7 +1341,7 @@ mod storage_remote_tests {
 
     /// An absent local address still reports `local_success=1` (idempotent obliterate).
     /// The remote side fails for the same JWT reason, which is independent of presence.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn obliterate_absent_address_is_idempotent_on_local_side() -> TestResult {
         use lore_base::types::Address;
         use lore_base::types::Context;
@@ -1371,7 +1371,7 @@ mod storage_remote_tests {
             .await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn query_falls_back_to_remote_when_local_misses() -> TestResult {
         use bytes::Bytes;
         use lore_base::types::Address;
@@ -1527,7 +1527,7 @@ mod storage_remote_tests {
         (status, events)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn upload_local_only_payload_pushes_to_remote_and_marks_durable() -> TestResult {
         use lore_base::types::Partition;
         use lore_revision::event::LoreErrorCode;
@@ -1584,7 +1584,7 @@ mod storage_remote_tests {
             .await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn upload_unknown_address_returns_address_not_found() -> TestResult {
         use lore_base::types::Address;
         use lore_base::types::Context;
@@ -1615,7 +1615,7 @@ mod storage_remote_tests {
             .await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn upload_zero_hash_short_circuits_as_already_durable() -> TestResult {
         use lore_base::types::Address;
         use lore_base::types::Context;
@@ -1647,7 +1647,7 @@ mod storage_remote_tests {
             .await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn upload_handle_without_remote_fails_pre_dispatch() -> TestResult {
         use lore::storage::upload;
         use lore::storage::upload::LoreStorageUploadArgs;
@@ -1718,7 +1718,7 @@ mod storage_remote_tests {
     /// Copy idempotency: re-copying onto an already-populated target tuple succeeds with the
     /// same `error_code = None` and produces no observable change. Exercises the remote path
     /// (idempotent on both server-side `session.copy` and the local mirror).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copy_idempotent_when_target_already_present() -> TestResult {
         use lore_base::types::Partition;
         use lore_revision::event::LoreErrorCode;
@@ -1778,7 +1778,7 @@ mod storage_remote_tests {
             .await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn copy_tier3_no_local_no_server_returns_address_not_found() -> TestResult {
         use lore_base::types::Address;
         use lore_base::types::Context;
@@ -1819,7 +1819,7 @@ mod storage_remote_tests {
     /// `put_file` with `remote_write=1` against a remote-configured handle must upload to the
     /// server. Exercises the path that previously hardcoded `None` for the `remote_session` and
     /// silently dropped the upload.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn put_file_with_remote_write_uploads_file_to_server() -> TestResult {
         use lore::storage::put_file;
         use lore::storage::put_file::LoreStoragePutFileArgs;
@@ -1911,7 +1911,7 @@ mod storage_remote_tests {
     /// `get_file` against a remote-only address (not in local cache) must fetch from the
     /// remote and write the bytes to the target file. Exercises the path that previously
     /// hardcoded `no_remote()` and would have failed with `ADDRESS_NOT_FOUND`.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn get_file_falls_back_to_remote_on_local_miss() -> TestResult {
         use lore::storage::get_file;
         use lore::storage::get_file::LoreStorageGetFileArgs;
@@ -2040,7 +2040,7 @@ mod storage_remote_tests {
         take_opened(&events).expect("STORAGE_OPENED must fire on remote-configured open")
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bound_offline_suppresses_remote_upload_on_put() -> TestResult {
         use lore::storage::put;
         use lore::storage::put::LoreStoragePutArgs;
@@ -2129,7 +2129,7 @@ mod storage_remote_tests {
             .await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bound_local_suppresses_remote_fetch_on_get_miss() -> TestResult {
         use bytes::Bytes;
         use lore::storage::get;
@@ -2227,7 +2227,7 @@ mod storage_remote_tests {
             .await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn per_call_local_and_remote_combo_rejects_with_invalid_arguments() -> TestResult {
         use lore::storage::put;
         use lore::storage::put::LoreStoragePutArgs;
@@ -2323,7 +2323,7 @@ mod storage_remote_tests {
     /// rather than fetching. Mirrors the same shape of the `bound_local_*` test for
     /// completeness — `offline` and `local` produce equivalent storage-side behavior, so any
     /// future divergence between them surfaces here.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bound_offline_suppresses_remote_fetch_on_get_miss() -> TestResult {
         use lore::storage::get;
         use lore::storage::get::LoreStorageGetArgs;
@@ -2383,7 +2383,7 @@ mod storage_remote_tests {
 
     /// Suppression on `get_metadata`: bound `local=1` makes `get_metadata` against a server-only
     /// address miss without consulting the remote.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bound_local_suppresses_remote_fetch_on_get_metadata_miss() -> TestResult {
         use lore::storage::get_metadata;
         use lore::storage::get_metadata::LoreStorageGetMetadataArgs;
@@ -2441,7 +2441,7 @@ mod storage_remote_tests {
 
     /// Suppression-on-upload: bound `offline=1` rejects upload up front rather than letting
     /// the call slip through.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bound_offline_rejects_upload_pre_dispatch() -> TestResult {
         use lore::storage::upload;
         use lore::storage::upload::LoreStorageUploadArgs;
@@ -2491,7 +2491,7 @@ mod storage_remote_tests {
 
     /// Suppression-on-obliterate: bound `local=1` makes obliterate run only the local leg;
     /// the remote leg is reported as `remote_skipped=1` (not `remote_success`).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bound_local_suppresses_remote_obliterate() -> TestResult {
         use lore::storage::obliterate;
         use lore::storage::obliterate::LoreStorageObliterateArgs;
@@ -2561,7 +2561,7 @@ mod storage_remote_tests {
 
     /// Suppression-on-copy: bound `offline=1` degrades copy to local-only — the destination
     /// is not durably confirmed on the peer, but the call succeeds locally.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bound_offline_degrades_copy_to_local_only() -> TestResult {
         use lore::storage::copy;
         use lore::storage::copy::LoreStorageCopyArgs;
@@ -2658,7 +2658,7 @@ mod storage_remote_tests {
     /// Bound `remote=1`: read bypasses the local cache and reaches the remote even when the
     /// local side has the address. Seed both sides with the same address but different
     /// payloads so we can distinguish which side served the read.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bound_remote_bypasses_local_cache_on_get() -> TestResult {
         use bytes::Bytes;
         use lore::storage::get;
@@ -2755,7 +2755,7 @@ mod storage_remote_tests {
     /// Bound `remote=1`: copy items only attempt server-side. With a destination tuple that
     /// the server has NOT seen, tier-1 returns `NotFound` and the upload-fallback (tier 2)
     /// is suppressed — the result is `AddressNotFound` rather than a fallback success.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn bound_remote_skips_copy_upload_fallback() -> TestResult {
         use lore::storage::copy;
         use lore::storage::copy::LoreStorageCopyArgs;
@@ -2973,7 +2973,7 @@ mod storage_remote_tests {
         (status, events[0].0, events[0].1)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mutable_store_and_load_via_remote_round_trips() -> TestResult {
         let execution = setup_execution("storage-remote-mutable-roundtrip".to_string());
         LORE_CONTEXT
@@ -3019,7 +3019,7 @@ mod storage_remote_tests {
             .await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mutable_compare_and_swap_via_remote() -> TestResult {
         use lore::storage::mutable_compare_and_swap;
         use lore::storage::mutable_compare_and_swap::LoreStorageMutableCompareAndSwapArgs;
@@ -3099,7 +3099,7 @@ mod storage_remote_tests {
             .await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mutable_load_via_remote_missing_returns_not_found() -> TestResult {
         let execution = setup_execution("storage-remote-mutable-miss".to_string());
         LORE_CONTEXT
@@ -3123,7 +3123,7 @@ mod storage_remote_tests {
             .await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mutable_default_routing_is_local_not_remote() -> TestResult {
         let execution = setup_execution("storage-remote-mutable-localdefault".to_string());
         LORE_CONTEXT
@@ -3180,7 +3180,7 @@ mod storage_remote_tests {
             .await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mutable_list_via_remote_returns_error() -> TestResult {
         use lore::storage::mutable_list;
         use lore::storage::mutable_list::LoreStorageMutableListArgs;
@@ -3299,7 +3299,7 @@ mod storage_remote_tests {
     /// stream, so `present` would never be answered — silently, as an absent event rather than an
     /// error. A miss is the expected outcome for `get_resolved`, which is what makes this the
     /// regression worth pinning.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn get_resolved_miss_does_not_end_the_stream() -> TestResult {
         use lore::storage::get_resolved;
         use lore::storage::get_resolved::LoreStorageGetResolvedArgs;
@@ -3455,7 +3455,7 @@ mod storage_remote_tests {
     /// via the public API against a real server. Every other `get_resolved` test seeds the
     /// server's mutable store directly because until `put_resolved` existed there was no
     /// producer — a fresh server answered every resolve with `ADDRESS_NOT_FOUND`.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn put_resolved_then_get_resolved_round_trips_via_remote() -> TestResult {
         use lore::storage::get_resolved;
         use lore::storage::get_resolved::LoreStorageGetResolvedArgs;
@@ -3624,7 +3624,7 @@ mod storage_remote_tests {
 
     /// An empty buffer removes the mapping, so a key's whole lifecycle — publish, resolve,
     /// delete, resolve again — runs through `put_resolved` and `get_resolved` alone.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn put_resolved_with_empty_buffer_deletes_the_mapping() -> TestResult {
         use lore::storage::get_resolved;
         use lore::storage::get_resolved::LoreStorageGetResolvedArgs;
@@ -3758,7 +3758,7 @@ mod storage_remote_tests {
 
     /// A publish that never reached the remote must not be resolvable there. Pins that
     /// `remote_write` actually gates the remote half rather than everything going up regardless.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn put_resolved_without_remote_write_stays_local() -> TestResult {
         use lore::storage::put_resolved;
         use lore::storage::put_resolved::LoreStoragePutResolvedArgs;
@@ -3855,7 +3855,7 @@ mod storage_remote_tests {
 
     /// `local_cache=1` writes the key->hash mapping back to the local mutable store, so a later
     /// resolve can be served without the network. Default (`local_cache=0`) leaves no mapping.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn get_resolved_caches_mapping_only_when_local_cache_is_set() -> TestResult {
         use lore::storage::get_resolved;
         use lore::storage::get_resolved::LoreStorageGetResolvedArgs;
@@ -3969,7 +3969,7 @@ mod storage_remote_tests {
     /// This shipped broken: the second key was silently never published while the call reported
     /// success and `stored_remote = 1`. Deduplicated content under several keys is the ordinary
     /// case for a foreign-keyed cache, so this is the shape to keep pinned.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn put_resolved_publishes_every_key_naming_the_same_content() -> TestResult {
         use lore::storage::get_resolved;
         use lore::storage::get_resolved::LoreStorageGetResolvedArgs;
@@ -4095,7 +4095,7 @@ mod storage_remote_tests {
     /// creates a session, so the branch the whole placement mechanism exists for was unobserved.
     /// A `put_resolved` in this state must also refuse to publish the key, since publishing it
     /// would name content the server does not hold.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_upload_reports_local_only_and_withholds_the_key() -> TestResult {
         use lore::storage::put_resolved;
         use lore::storage::put_resolved::LoreStoragePutResolvedArgs;
@@ -4192,7 +4192,7 @@ mod storage_remote_tests {
     /// ordinary write path and the key follows as a separate mapping write, gated on every
     /// fragment having reached the remote. `fixed_size_chunk` forces many small leaves so the
     /// aggregate is over a real tree rather than a single fragment.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn put_resolved_publishes_fragmented_content() -> TestResult {
         use lore::storage::get_resolved;
         use lore::storage::get_resolved::LoreStorageGetResolvedArgs;
@@ -4325,7 +4325,7 @@ mod storage_remote_tests {
     /// `streaming` delivers the content one leaf at a time rather than as a single buffer, so a
     /// key naming something large does not have to be materialised whole. The bytes and their
     /// order must match what the buffered mode returns.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn get_resolved_streams_content_one_fragment_at_a_time() -> TestResult {
         use lore::storage::get_resolved;
         use lore::storage::get_resolved::LoreStorageGetResolvedArgs;
