@@ -39,6 +39,9 @@ uuid = { workspace = true }
 # It carries no `features` of its own — see `integration_tests` below.
 [dev-dependencies]
 lore-server = { workspace = true }
+# Generates the mTLS chain the replication tests need; they used to read a `certs/` directory
+# that no checked-in tooling ever produced.
+rcgen = { workspace = true }
 
 [features]
 # `lore_server::quic::tests` sits behind lore-server's matching feature, so pull it in from here
