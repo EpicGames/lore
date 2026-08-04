@@ -63,6 +63,7 @@ flush_delay_seconds = 10
 # immutable_store.s3_bucket = "lore-immutable-store-local"
 # immutable_store.s3_endpoint_url = "http://127.0.0.1:9000"
 # immutable_store.s3_slow_operation_threshold_millis = 2000
+# immutable_store.direct_downloads_enabled = false # force clients through the Lore server
 # immutable_store.dynamodb_endpoint_url = "http://127.0.0.1:9090"
 # immutable_store.dynamodb_fragments_table = "lore-fragments-local"
 # immutable_store.dynamodb_metadata_table = "lore-fragment-metadata-local"

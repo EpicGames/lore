@@ -20,6 +20,7 @@ use aws_sdk_s3::operation::get_object::GetObjectError;
 use bytes::Bytes;
 use bytes::BytesMut;
 use lore_base::error::AddressNotFound;
+use lore_base::error::NotSupported;
 use lore_base::error::SlowDown;
 use lore_base::types::Address;
 use lore_base::types::Context;
@@ -198,6 +199,10 @@ fn default_submission_limit() -> usize {
     150_000
 }
 
+fn default_direct_downloads_enabled() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(bound(deserialize = "'de: 'static"))]
 pub struct AwsImmutableStoreSettings {
@@ -207,6 +212,8 @@ pub struct AwsImmutableStoreSettings {
     pub force_write: bool,
     #[serde(default = "default_submission_limit")]
     pub batch_exist_submission_limit: usize,
+    #[serde(default = "default_direct_downloads_enabled")]
+    pub direct_downloads_enabled: bool,
 }
 
 impl AwsImmutableStoreSettings {
@@ -220,7 +227,13 @@ impl AwsImmutableStoreSettings {
             dynamodb,
             force_write,
             batch_exist_submission_limit: default_submission_limit(),
+            direct_downloads_enabled: default_direct_downloads_enabled(),
         }
+    }
+
+    pub fn with_direct_downloads_enabled(mut self, enabled: bool) -> Self {
+        self.direct_downloads_enabled = enabled;
+        self
     }
 }
 
@@ -347,6 +360,7 @@ pub struct AwsImmutableStore {
     fragments_table_name: Arc<str>,
     metadata_table_name: Arc<str>,
     force_write: bool,
+    direct_downloads_enabled: bool,
     latency_histogram: Histogram<f64>,
     labels_get: LabelArray,
     labels_put: LabelArray,
@@ -386,6 +400,7 @@ impl AwsImmutableStore {
             fragments_table_name: Arc::from(settings.dynamodb.fragments_table_name.clone()),
             metadata_table_name: Arc::from(settings.dynamodb.metadata_table_name.clone()),
             force_write: settings.force_write,
+            direct_downloads_enabled: settings.direct_downloads_enabled,
             latency_histogram,
             labels_get,
             labels_put,
@@ -1334,6 +1349,12 @@ impl ImmutableStoreTrait for AwsImmutableStore {
         match_required: StoreMatch,
         expires_in: Duration,
     ) -> Result<Vec<DirectDownload>, StoreError> {
+        if !self.direct_downloads_enabled {
+            return Err(StoreError::from(NotSupported {
+                operation: "immutable direct download".to_string(),
+            }));
+        }
+
         let repository: Context = partition.into();
         let matches = match match_required {
             StoreMatch::MatchFull => self.exist_batch_exact(repository, addresses).await?,
@@ -1856,7 +1877,11 @@ mod test {
             });
     }
 
-    async fn initialize_immutable_store(s3: S3, dynamodb: DynamoDb) -> AwsImmutableStore {
+    async fn initialize_immutable_store_with_direct_downloads(
+        s3: S3,
+        dynamodb: DynamoDb,
+        direct_downloads_enabled: bool,
+    ) -> AwsImmutableStore {
         let settings = AwsImmutableStoreSettings {
             s3: S3StoreSettings::new(BUCKET.to_string()),
             dynamodb: DynamoDbImmutableStoreSettings::new(
@@ -1865,6 +1890,7 @@ mod test {
             ),
             force_write: false,
             batch_exist_submission_limit: 1000,
+            direct_downloads_enabled,
         };
 
         let execution = setup_execution("test".to_string());
@@ -1873,6 +1899,10 @@ mod test {
                 AwsImmutableStore::new(s3, dynamodb, &settings)
             })
             .await
+    }
+
+    async fn initialize_immutable_store(s3: S3, dynamodb: DynamoDb) -> AwsImmutableStore {
+        initialize_immutable_store_with_direct_downloads(s3, dynamodb, true).await
     }
 
     #[tokio::test]
@@ -2024,6 +2054,28 @@ mod test {
             result[0].fragment.flags & FragmentFlags::PayloadStoredLocal.bits(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn test_presign_downloads_can_be_disabled() {
+        let store = initialize_immutable_store_with_direct_downloads(
+            MockS3Impl::default(),
+            MockDynamoDb::default(),
+            false,
+        )
+        .await;
+
+        let error = Arc::new(store)
+            .presign_downloads(
+                random::<Context>().into(),
+                &[random::<Address>()],
+                StoreMatch::MatchFull,
+                Duration::from_secs(60),
+            )
+            .await
+            .expect_err("disabled direct downloads should not be presigned");
+
+        assert!(matches!(error, StoreError::NotSupported(_)));
     }
 
     #[tokio::test]

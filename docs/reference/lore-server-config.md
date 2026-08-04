@@ -320,6 +320,13 @@ This repository ships two reference plugin implementations as source. Both requi
 - **`lore-aws`** backs the immutable store with Amazon S3 and DynamoDB, and the mutable and lock stores with DynamoDB. AWS credentials come from the SDK's default credential chain (environment, profile, instance role), not from the config file.
 - **`lore-hashicorp`** provides a Consul topology that discovers peers from a service catalog. It only *reads* the catalog — each server must be registered in Consul externally (by your orchestrator or a Consul agent) — returns only passing or healthy nodes, and re-polls on a fixed interval.
 
+The AWS immutable store supports `direct_downloads_enabled` under `[plugins.aws.immutable_store]`. It defaults to `true`, allowing clients to fetch fragment payloads directly from S3 with short-lived presigned URLs. Set it to `false` to make presigning report unsupported so current clients fall back to normal server-proxied reads:
+
+```toml
+[plugins.aws.immutable_store]
+direct_downloads_enabled = false
+```
+
 > [!NOTE]
 > Per-field configuration for these plugins depends on the binary that registers them and is out of scope for this page. A dedicated Server plugins guide — covering the plugin registry, the factory traits, and how to build a server binary with plugins compiled in — is planned.
 
