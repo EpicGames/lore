@@ -207,9 +207,6 @@ impl store::ImmutableStore for RemoteImmutableStore {
         }
     }
 
-    /// Answered by this store's own `query`, so it reports whether the payload is durable rather
-    /// than what representation is stored. Wiring the remote's metadata operation through is
-    /// outstanding.
     /// Asks the remote for the fragment alone. Unlike [`RemoteImmutableStore::query`], which
     /// obtains one by fetching the whole payload, this uses the wire operation that exists for it,
     /// so the representation comes back without the bytes.
