@@ -26,8 +26,8 @@ mod tests {
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreEventCallbackConfig;
     use lore_revision::interface::LoreGlobalArgs;
-    use lore_revision::repository::RepositoryError;
     use lore_revision::repository::LoreSharedStoreMode;
+    use lore_revision::repository::RepositoryError;
     use rand::Rng;
     use rand::distr::Alphanumeric;
     use serial_test::serial;

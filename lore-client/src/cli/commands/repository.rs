@@ -8,7 +8,6 @@ use std::sync::atomic::Ordering;
 use chrono::DateTime;
 use clap::Args;
 use clap::Subcommand;
-use lore_revision::repository::LoreSharedStoreMode;
 use lore::interface::LoreArray;
 use lore::interface::LoreEvent;
 use lore::interface::LoreFileAction;
@@ -32,6 +31,7 @@ use lore::interface::LoreString;
 use lore::repository;
 use lore::repository::LoreRepositoryDeleteArgs;
 use lore::runtime;
+use lore_revision::repository::LoreSharedStoreMode;
 use parking_lot::Mutex;
 
 use crate::cli::EventCallbackExt;

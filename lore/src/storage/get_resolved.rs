@@ -244,8 +244,7 @@ async fn get_resolved_item_streaming(
     read_options: lore_storage::options::ReadOptions,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
-    let (tx, mut rx) =
-        tokio::sync::mpsc::channel::<Result<Bytes, lore_storage::StorageError>>(256);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, lore_storage::StorageError>>(256);
     let stream_future = read_resolved_stream(
         store.immutable.clone(),
         store.mutable.clone(),

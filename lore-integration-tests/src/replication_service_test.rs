@@ -16,7 +16,10 @@
 mod replication_service_tests {
     use std::collections::HashSet;
     use std::error::Error;
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use lore_base::lore_spawn;
     use lore_base::runtime::LORE_CONTEXT;
@@ -28,16 +31,12 @@ mod replication_service_tests {
     use lore_proto::rpc::replication_service_client::ReplicationServiceClient;
     use lore_revision::fragment::generate_random;
     use lore_revision::util;
+    use lore_server::grpc::GrpcInternalServerBuilder;
     use lore_server::store::grpc_replica::ReplicationClient;
     use lore_server::store::grpc_replica::ReplicationClientError;
     use tokio::sync::mpsc;
     use tokio::task::JoinSet;
     use tokio_stream::wrappers::ReceiverStream;
-    use std::net::SocketAddr;
-    use std::path::PathBuf;
-    use std::time::Duration;
-
-    use lore_server::grpc::GrpcInternalServerBuilder;
     use tonic::transport::Certificate;
     use tonic::transport::Channel;
     use tonic::transport::ClientTlsConfig;
@@ -196,7 +195,6 @@ mod replication_service_tests {
             _shutdown: shutdown_tx,
         })
     }
-
 
     /// Connect to `server`, presenting `identity_from` as the client certificate.
     ///

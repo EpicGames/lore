@@ -135,9 +135,7 @@ mod shared_store_tests {
         assert_eq!(status, 0, "close failed");
     }
 
-    fn backend(
-        handle: lore::storage::handle::LoreStore,
-    ) -> Arc<dyn lore_storage::ImmutableStore> {
+    fn backend(handle: lore::storage::handle::LoreStore) -> Arc<dyn lore_storage::ImmutableStore> {
         lore::storage::handle::immutable_for_test(handle).expect("backend for open handle")
     }
 
@@ -152,8 +150,18 @@ mod shared_store_tests {
 
         let repo_a = tempdir("enabled-a");
         let repo_b = tempdir("enabled-b");
-        create_repo(repo_a.path(), LoreSharedStoreMode::Enabled, shared_dir.path()).await;
-        create_repo(repo_b.path(), LoreSharedStoreMode::Enabled, shared_dir.path()).await;
+        create_repo(
+            repo_a.path(),
+            LoreSharedStoreMode::Enabled,
+            shared_dir.path(),
+        )
+        .await;
+        create_repo(
+            repo_b.path(),
+            LoreSharedStoreMode::Enabled,
+            shared_dir.path(),
+        )
+        .await;
 
         let handle_a = open_repo(repo_a.path()).await;
         let handle_b = open_repo(repo_b.path()).await;
@@ -180,8 +188,18 @@ mod shared_store_tests {
 
         let repo_a = tempdir("disabled-a");
         let repo_b = tempdir("disabled-b");
-        create_repo(repo_a.path(), LoreSharedStoreMode::Disabled, shared_dir.path()).await;
-        create_repo(repo_b.path(), LoreSharedStoreMode::Disabled, shared_dir.path()).await;
+        create_repo(
+            repo_a.path(),
+            LoreSharedStoreMode::Disabled,
+            shared_dir.path(),
+        )
+        .await;
+        create_repo(
+            repo_b.path(),
+            LoreSharedStoreMode::Disabled,
+            shared_dir.path(),
+        )
+        .await;
 
         let handle_a = open_repo(repo_a.path()).await;
         let handle_b = open_repo(repo_b.path()).await;
@@ -206,8 +224,18 @@ mod shared_store_tests {
 
         let repo_a = tempdir("cross-a");
         let repo_b = tempdir("cross-b");
-        create_repo(repo_a.path(), LoreSharedStoreMode::Enabled, shared_dir.path()).await;
-        create_repo(repo_b.path(), LoreSharedStoreMode::Enabled, shared_dir.path()).await;
+        create_repo(
+            repo_a.path(),
+            LoreSharedStoreMode::Enabled,
+            shared_dir.path(),
+        )
+        .await;
+        create_repo(
+            repo_b.path(),
+            LoreSharedStoreMode::Enabled,
+            shared_dir.path(),
+        )
+        .await;
 
         let handle_a = open_repo(repo_a.path()).await;
         let handle_b = open_repo(repo_b.path()).await;
