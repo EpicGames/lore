@@ -114,6 +114,8 @@ pub async fn dirty(
 /// callers that already work with `RelativePath` (e.g. `commit_impl`
 /// replaying tracked paths against a freshly committed revision) can hand
 /// them in directly.
+///
+/// Wraps [`dirty_relative_paths_in`] with the instance anchor I/O.
 pub(crate) async fn dirty_relative_paths(
     repository: Arc<RepositoryContext>,
     paths: Vec<RelativePath>,
@@ -123,7 +125,34 @@ pub(crate) async fn dirty_relative_paths(
             .await
             .forward::<DirtyError>("Failed to deserialize revision state")?;
     let current_revision = state_current.revision();
-    let state = state_staged.unwrap_or_else(|| state_current.clone());
+    let state_staged = state_staged.unwrap_or_else(|| state_current.clone());
+    let staged_revision = state_staged.revision();
+
+    let signature =
+        dirty_relative_paths_in(repository.clone(), state_current, state_staged, paths).await?;
+
+    // Current is never anchored as staged, and matching either input state
+    // means nothing was dirtied.
+    if signature != current_revision && signature != staged_revision {
+        crate::instance::store_staged_anchor(&repository, signature)
+            .await
+            .forward::<DirtyError>("Failed to serialize staged anchor")?;
+    }
+
+    Ok(signature)
+}
+
+/// Apply dirty markers against explicit states, reading and writing no
+/// anchors. Pass a clone of `state_current` as `state_staged` when nothing is
+/// staged yet. Returns `state_staged`'s own revision when no path produced a
+/// marker.
+pub(crate) async fn dirty_relative_paths_in(
+    repository: Arc<RepositoryContext>,
+    state_current: Arc<State>,
+    state_staged: Arc<State>,
+    paths: Vec<RelativePath>,
+) -> Result<Hash, DirtyError> {
+    let current_revision = state_current.revision();
 
     let stats = Arc::new(DirtyStats::default());
     let force = execution_context().globals().force();
@@ -141,7 +170,7 @@ pub(crate) async fn dirty_relative_paths(
         dirty_path(
             repository.clone(),
             state_current.clone(),
-            state.clone(),
+            state_staged.clone(),
             relative_path,
             stats.clone(),
         )
@@ -156,32 +185,26 @@ pub(crate) async fn dirty_relative_paths(
     lore_debug!("Dirtied {total} paths: {modify} modified, {add} added, {delete} deleted");
 
     if total == 0 {
-        return Ok(state.revision());
+        return Ok(state_staged.revision());
     }
 
     // Staged states should have no revision number
-    state.set_revision_number(0);
-    state.set_parent_self(current_revision);
+    state_staged.set_revision_number(0);
+    state_staged.set_parent_self(current_revision);
 
     // If this is the first modification of the state (cloned from current), reset other parent
-    if state.revision() == current_revision {
-        state.set_parent_other(Hash::default());
-        state.set_metadata_hash(Hash::default());
+    if state_staged.revision() == current_revision {
+        state_staged.set_parent_other(Hash::default());
+        state_staged.set_metadata_hash(Hash::default());
     }
 
     let token = repository
         .try_write_token()
         .expect("dirty requires write access");
-    let signature = state
+    let signature = state_staged
         .serialize(repository.clone(), token)
         .await
         .forward::<DirtyError>("Failed to serialize staged revision state")?;
-
-    if signature != current_revision {
-        crate::instance::store_staged_anchor(&repository, signature)
-            .await
-            .forward::<DirtyError>("Failed to serialize staged anchor")?;
-    }
 
     Ok(signature)
 }

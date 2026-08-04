@@ -7,6 +7,7 @@ use lore_base::types::Address;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_revision::file;
+pub use lore_revision::file::diff::DEFAULT_CONTEXT_LINES;
 use lore_revision::file::dump::DumpError;
 use lore_revision::file::hash::HashError;
 use lore_revision::file::history::HistoryOptions;

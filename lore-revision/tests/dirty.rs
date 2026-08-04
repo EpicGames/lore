@@ -2760,4 +2760,247 @@ mod tests {
             .await
             .expect("Test task failed");
     }
+
+    #[tokio::test]
+    async fn rebase_staged_state_carries_dirty_paths_without_touching_anchor() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
+                let default_branch_id = Context::from(uuid::Uuid::now_v7());
+                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
+                let created_repo = repository::create_local(
+                    path.as_path(),
+                    &write_token,
+                    repository_id,
+                    default_branch_id,
+                    branch::DEFAULT_DEFAULT_NAME.to_string(),
+                    repository::RepositoryConfig::default(),
+                    false,
+                )
+                .await
+                .expect("Failed to initialize repository");
+
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        Some(path.clone()),
+                        immutable_store.clone(),
+                        mutable_store.clone(),
+                        repository_id,
+                        created_repo.instance_id,
+                        Err(ProtocolError::from(NoRemote)),
+                        Arc::default(),
+                        RepositoryFormat::Lore,
+                    )
+                    .with_write_token(write_token.share()),
+                );
+
+                lore_revision::instance::store_current_anchor_branch(
+                    &repository,
+                    default_branch_id,
+                )
+                .await
+                .expect("Failed to store anchor branch");
+
+                // Create a file, stage, commit
+                {
+                    let mut f =
+                        std::fs::File::create(path.join("carried.txt")).expect("Create failed");
+                    f.write_all(b"original").expect("Write failed");
+                }
+                file::stage::stage(
+                    repository.clone(),
+                    &write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&path)]),
+                    StageOptions {
+                        case_change: stage::StageCaseChange::Error,
+                        node_flags: NodeFlags::NoFlags,
+                        file_id: None,
+                        no_children: false,
+                        scan: true,
+                    },
+                )
+                .await
+                .expect("Stage failed");
+                Box::pin(commit::commit(
+                    repository.clone(),
+                    &write_token,
+                    CommitOptions::new("Initial".to_string()),
+                ))
+                .await
+                .expect("Commit failed");
+
+                let (current_revision, _) =
+                    lore_revision::instance::load_current_anchor(&repository)
+                        .await
+                        .expect("Load current anchor failed");
+
+                // Modify and dirty the file so an anchored staged state exists
+                {
+                    let mut f =
+                        std::fs::File::create(path.join("carried.txt")).expect("Create failed");
+                    f.write_all(b"modified longer").expect("Write failed");
+                }
+                file::dirty::dirty(
+                    repository.clone(),
+                    LoreArray::from_vec(vec![LoreString::from(
+                        path.join("carried.txt").to_string_lossy().as_ref(),
+                    )]),
+                )
+                .await
+                .expect("Dirty failed");
+
+                let staged_revision = lore_revision::instance::load_staged_revision(&repository)
+                    .await
+                    .expect("Load staged anchor failed")
+                    .expect("Dirty should have anchored a staged state");
+                assert_ne!(
+                    staged_revision, current_revision,
+                    "Dirty should anchor a state distinct from current"
+                );
+
+                let rebased_revision = lore_revision::state::rebase_staged_state(
+                    repository.clone(),
+                    staged_revision,
+                    current_revision,
+                )
+                .await
+                .expect("Rebase failed")
+                .expect("Dirty paths should produce a rebased state");
+                assert_ne!(
+                    rebased_revision, current_revision,
+                    "Rebased state should carry the dirty path"
+                );
+
+                let anchored_revision = lore_revision::instance::load_staged_revision(&repository)
+                    .await
+                    .expect("Load staged anchor failed");
+                assert_eq!(
+                    anchored_revision,
+                    Some(staged_revision),
+                    "Rebase should not touch the staged anchor"
+                );
+
+                let rebased_state = State::deserialize(repository.clone(), rebased_revision)
+                    .await
+                    .expect("Deserialize rebased state failed");
+                let link = rebased_state
+                    .find_node_link(repository.clone(), "carried.txt")
+                    .await
+                    .expect("Find carried.txt");
+                let node = rebased_state
+                    .node(repository.clone(), link.node)
+                    .await
+                    .expect("Get node");
+                assert!(
+                    node.is_dirty_modify(),
+                    "carried.txt should be dirty in the rebased state"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    #[tokio::test]
+    async fn rebase_staged_state_returns_none_without_dirty_paths() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
+                let default_branch_id = Context::from(uuid::Uuid::now_v7());
+                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
+                let created_repo = repository::create_local(
+                    path.as_path(),
+                    &write_token,
+                    repository_id,
+                    default_branch_id,
+                    branch::DEFAULT_DEFAULT_NAME.to_string(),
+                    repository::RepositoryConfig::default(),
+                    false,
+                )
+                .await
+                .expect("Failed to initialize repository");
+
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        Some(path.clone()),
+                        immutable_store.clone(),
+                        mutable_store.clone(),
+                        repository_id,
+                        created_repo.instance_id,
+                        Err(ProtocolError::from(NoRemote)),
+                        Arc::default(),
+                        RepositoryFormat::Lore,
+                    )
+                    .with_write_token(write_token.share()),
+                );
+
+                lore_revision::instance::store_current_anchor_branch(
+                    &repository,
+                    default_branch_id,
+                )
+                .await
+                .expect("Failed to store anchor branch");
+
+                // Create a file, stage, commit
+                {
+                    let mut f =
+                        std::fs::File::create(path.join("clean.txt")).expect("Create failed");
+                    f.write_all(b"original").expect("Write failed");
+                }
+                file::stage::stage(
+                    repository.clone(),
+                    &write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&path)]),
+                    StageOptions {
+                        case_change: stage::StageCaseChange::Error,
+                        node_flags: NodeFlags::NoFlags,
+                        file_id: None,
+                        no_children: false,
+                        scan: true,
+                    },
+                )
+                .await
+                .expect("Stage failed");
+                Box::pin(commit::commit(
+                    repository.clone(),
+                    &write_token,
+                    CommitOptions::new("Initial".to_string()),
+                ))
+                .await
+                .expect("Commit failed");
+
+                let (current_revision, _) =
+                    lore_revision::instance::load_current_anchor(&repository)
+                        .await
+                        .expect("Load current anchor failed");
+
+                // The committed revision carries no dirty nodes
+                let rebased_revision = lore_revision::state::rebase_staged_state(
+                    repository.clone(),
+                    current_revision,
+                    current_revision,
+                )
+                .await
+                .expect("Rebase failed");
+                assert!(
+                    rebased_revision.is_none(),
+                    "A state without dirty paths has nothing to rebase"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
 }

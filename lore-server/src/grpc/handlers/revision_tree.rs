@@ -75,6 +75,7 @@ pub async fn handler(
                                     .unwrap_or_default(),
                                 path: tree_path.path.to_string(),
                                 r#type: super::path_diff::node_flags_to_type(tree_path.flags),
+                                tracking: tree_path.tracking,
                             })
                             .collect(),
                     })
@@ -95,9 +96,13 @@ pub async fn handler(
 
 #[cfg(test)]
 mod tests {
+    use lore_base::types::Address;
     use lore_base::types::Context;
     use lore_base::types::Hash;
+    use lore_proto::PathType;
     use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
+    use lore_revision::link::LinkFlags;
+    use lore_revision::lore::BranchId;
     use lore_revision::node::Node;
     use lore_revision::node::NodeFlags;
     use lore_revision::node::ROOT_NODE;
@@ -369,6 +374,155 @@ mod tests {
                 assert_eq!(
                     address.context, target_repo,
                     "link.address.context should be the target repository id",
+                );
+            })
+            .await;
+    }
+
+    /// Push a tree with a single link recording `link_branch` and return the
+    /// emitted `Path`.
+    async fn link_tree_path(
+        immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+        mutable_store: Arc<dyn lore_storage::MutableStore>,
+        repository_id: Context,
+        link_branch: BranchId,
+    ) -> Path {
+        let target_repo = random::<Context>();
+        let target_revision = Hash::from(random::<[u8; 32]>());
+        let write_token = get_write_token();
+        let repository = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository_id.into(),
+        ));
+
+        let main = lore_revision::branch::create(
+            repository.clone(),
+            &write_token,
+            Context::from(uuid::Uuid::now_v7()),
+            lore_revision::branch::DEFAULT_DEFAULT_NAME,
+            lore_revision::branch::default_category(),
+            "TestCreator",
+            12345,
+            vec![],
+            false,
+            false,
+        )
+        .await
+        .expect("Could not create main branch");
+
+        let state = state::State::new();
+        state.set_parent_self(Hash::default());
+        state.set_revision_number(1);
+
+        let link_node = Node {
+            flags: NodeFlags::Link.bits(),
+            child: ROOT_NODE,
+            address: Address {
+                hash: target_revision,
+                context: target_repo,
+            },
+            name_hash: hash_string("linked"),
+            ..Default::default()
+        };
+        let link_node_id = state
+            .node_add(repository.clone(), ROOT_NODE, link_node, "linked")
+            .await
+            .expect("Failed to add link node");
+
+        state
+            .link_add(
+                repository.clone(),
+                target_repo.into(),
+                link_branch,
+                target_revision,
+                link_node_id,
+                LinkFlags::NoFlags,
+            )
+            .await
+            .expect("Failed to register link reference");
+
+        let revision_hash = state
+            .serialize(repository.clone(), &write_token)
+            .await
+            .expect("Failed to serialize state");
+
+        branch_push::push(
+            repository.clone(),
+            main,
+            revision_hash,
+            true,
+            true,
+            false,
+            DEFAULT_HISTORY_STEP_SIZE,
+            crate::grpc::server::RevisionListAcceleration::default(),
+        )
+        .await
+        .expect("Failed to push revision");
+
+        let mut request = Request::new(RevisionTreeRequest {
+            revision: revision_hash.into(),
+            path: String::new(),
+            max_depth: 10,
+        });
+        request.metadata_mut().insert_bin(
+            REPOSITORY_ID_KEY,
+            tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
+        );
+        let response = handler(request, immutable_store, mutable_store)
+            .await
+            .expect("handler ok");
+        let mut paths = response.into_inner().paths;
+        assert_eq!(paths.len(), 1, "expected exactly the link entry");
+        let link_path = paths.pop().expect("one path");
+        assert_eq!(link_path.path, "linked");
+        assert_eq!(link_path.r#type, PathType::Link as i32);
+        link_path
+    }
+
+    /// A zero-branch link reports `tracking = true`.
+    #[tokio::test]
+    async fn tree_marks_zero_branch_link_as_tracking() {
+        let repository_id = random::<Context>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        #[allow(clippy::large_futures)]
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let link_path = link_tree_path(
+                    immutable_store,
+                    mutable_store,
+                    repository_id,
+                    BranchId::default(),
+                )
+                .await;
+                assert!(
+                    link_path.tracking,
+                    "a zero-branch link must be reported as tracking",
+                );
+            })
+            .await;
+    }
+
+    /// A link pinned to an explicit branch reports `tracking = false`.
+    #[tokio::test]
+    async fn tree_marks_pinned_link_as_not_tracking() {
+        let repository_id = random::<Context>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        #[allow(clippy::large_futures)]
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let link_path = link_tree_path(
+                    immutable_store,
+                    mutable_store,
+                    repository_id,
+                    BranchId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                assert!(
+                    !link_path.tracking,
+                    "a pinned (non-zero branch) link must not be reported as tracking",
                 );
             })
             .await;

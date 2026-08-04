@@ -452,6 +452,12 @@ impl LinkReference {
             self.branch
         }
     }
+
+    /// Whether the link tracks its parent's branch (zero branch) rather than
+    /// being pinned to an explicit one.
+    pub fn is_tracking(&self) -> bool {
+        self.branch.is_zero()
+    }
 }
 
 /// Tracks a single link's merge state for rollback.
@@ -3341,6 +3347,8 @@ impl State {
 /// - Anchor's tree has dirty descendants: drop the anchor, then re-apply
 ///   each dirty path against the new current via [`crate::file::dirty::dirty`].
 ///   Only dirty nodes carry over; the prior staged merkle tree is discarded.
+///
+/// Wraps [`rebase_staged_state`] with the instance anchor I/O.
 pub async fn rebase_staged_anchor(
     repository: Arc<RepositoryContext>,
     new_current_signature: Hash,
@@ -3357,15 +3365,41 @@ pub async fn rebase_staged_anchor(
         return Ok(());
     }
 
+    let _ = crate::instance::delete_staged_anchor(&repository).await;
+
+    let Some(rebased_signature) = rebase_staged_state(
+        repository.clone(),
+        old_staged_signature,
+        new_current_signature,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    crate::instance::store_staged_anchor(&repository, rebased_signature)
+        .await
+        .forward::<StateError>("Failed to serialize staged anchor")?;
+
+    Ok(())
+}
+
+/// Rebase a staged state onto a new current revision, touching no anchors.
+///
+/// Returns the signature of the rebased state, leaving persistence to the
+/// caller, or `None` when nothing needs staging on top of the new current.
+pub async fn rebase_staged_state(
+    repository: Arc<RepositoryContext>,
+    old_staged_signature: Hash,
+    new_current_signature: Hash,
+) -> Result<Option<Hash>, StateError> {
     let old_staged_state = State::deserialize(repository.clone(), old_staged_signature).await?;
     let has_dirty = old_staged_state
         .node_has_dirty_children(repository.clone(), crate::node::ROOT_NODE)
         .await?;
 
-    let _ = crate::instance::delete_staged_anchor(&repository).await;
-
     if !has_dirty {
-        return Ok(());
+        return Ok(None);
     }
 
     let mut dirty_paths: Vec<RelativePath> = Vec::new();
@@ -3379,14 +3413,20 @@ pub async fn rebase_staged_anchor(
     .await?;
 
     if dirty_paths.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
-    crate::file::dirty::dirty_relative_paths(repository, dirty_paths)
-        .await
-        .forward::<StateError>("Failed to apply dirty paths during staged rebase")?;
+    let state_current = State::deserialize(repository.clone(), new_current_signature).await?;
+    let signature = crate::file::dirty::dirty_relative_paths_in(
+        repository,
+        state_current.clone(),
+        state_current,
+        dirty_paths,
+    )
+    .await
+    .forward::<StateError>("Failed to apply dirty paths during staged rebase")?;
 
-    Ok(())
+    Ok((signature != new_current_signature).then_some(signature))
 }
 
 /// Walk a staged state and collect paths of nodes carrying an explicit dirty
@@ -3495,6 +3535,9 @@ pub struct TreePath {
     pub path: RelativePath,
     pub address: Option<Address>,
     pub flags: NodeFlags,
+    /// True when a link node tracks its parent's branch; false for pinned
+    /// links and all non-link nodes.
+    pub tracking: bool,
 }
 
 pub type CanReadRepository = Arc<dyn Fn(RepositoryId) -> bool + Send + Sync>;
@@ -3654,10 +3697,21 @@ async fn gather_tree_paths_node(
     } else {
         NodeFlags::NoFlags
     };
+    // An unresolvable link reference falls back to pinned.
+    let tracking = if node.is_link() {
+        let link = node.linked_node();
+        state
+            .link_find(repository.clone(), link.repository, node_id)
+            .await
+            .is_ok_and(|link_ref| link_ref.is_tracking())
+    } else {
+        false
+    };
     result.push(TreePath {
         path: node_path.clone(),
         address,
         flags,
+        tracking,
     });
 
     let depth_remaining = max_depth == 0 || depth + 1 < max_depth;

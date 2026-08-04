@@ -2258,6 +2258,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9080b15e63775b9a2ac7dca720f7050a8b955e092ea0f6020a4a80f69998cdc0"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2568,9 +2579,6 @@ dependencies = [
  "clap_complete",
  "libc",
  "lore",
- "lore-base",
- "lore-error-set",
- "lore-revision",
  "parking_lot",
  "serde",
  "serde_json",
@@ -2673,6 +2681,20 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "zerocopy",
+]
+
+[[package]]
+name = "lore-io"
+version = "0.8.7-nightly"
+dependencies = [
+ "bytes",
+ "futures",
+ "io-uring",
+ "libc",
+ "lore-base",
+ "parking_lot",
+ "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
