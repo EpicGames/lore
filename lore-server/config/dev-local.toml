@@ -29,14 +29,14 @@ mode = "aws"
 # TLS — use certs baked into the Docker image
 # =============================================================================
 
-[server.quic.certificate]
-cert_file = "/etc/lore/certs/server.crt"
-pkey_file = "/etc/lore/certs/server.key"
+# [server.quic.certificate]
+# cert_file = "/etc/lore/certs/server.crt"
+# pkey_file = "/etc/lore/certs/server.key"
 
-[server.quic_internal.certificate]
-cert_file = "/etc/lore/certs/server.crt"
-pkey_file = "/etc/lore/certs/server.key"
-cert_chain = "/etc/lore/certs/ca.crt"
+# [server.quic_internal.certificate]
+# cert_file = "/etc/lore/certs/server.crt"
+# pkey_file = "/etc/lore/certs/server.key"
+# cert_chain = "/etc/lore/certs/ca.crt"
 
 # Increase handler timeouts for slow emulated storage
 [server.quic]
@@ -58,25 +58,25 @@ presigned_url_hmac_key = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbe
 # =============================================================================
 
 [plugins.aws.immutable_store]
-s3_bucket = "lore-immutable-store-dev"
-s3_endpoint_url = "http://minio:9000"
+s3_bucket = "lore-dev"
+s3_endpoint_url = "http://127.0.0.1:9000"
 s3_region = "us-east-1"
 s3_force_path_style = true
 dynamodb_fragments_table = "lore-fragments-dev"
 dynamodb_metadata_table = "lore-fragment-metadata-dev"
-dynamodb_endpoint_url = "http://dynamodb:9090"
+dynamodb_endpoint_url = "https://127.0.0.1:8000"
 dynamodb_region = "us-east-1"
 timeout_millis = 120000
 
 [plugins.aws.mutable_store]
 dynamodb_table = "lore-mutable-store-dev"
-dynamodb_endpoint_url = "http://dynamodb:9090"
+dynamodb_endpoint_url = "https://127.0.0.1:8000"
 dynamodb_region = "us-east-1"
 timeout_millis = 120000
 
 [plugins.aws.lock_store]
 dynamodb_table = "lore-locks-dev"
-dynamodb_endpoint_url = "http://dynamodb:9090"
+dynamodb_endpoint_url = "https://127.0.0.1:8000"
 dynamodb_region = "us-east-1"
 timeout_millis = 120000
 
@@ -87,17 +87,17 @@ timeout_millis = 120000
 [telemetry]
 additional_labels = { region = "local" }
 
-[telemetry.exporter]
-endpoint = "http://grafana:4317"
-queue_size = 8192
-timeout = 5000
+# [telemetry.exporter]
+# endpoint = "http://grafana:4317"
+# queue_size = 8192
+# timeout = 5000
 
 [telemetry.logger]
 enable_otlp = false
 format = "json"
 
 [telemetry.logger.output]
-file = "/var/log/lore/server.log"
+file = "./server.log"
 
 [telemetry.traces]
 sample_rate = 1.0

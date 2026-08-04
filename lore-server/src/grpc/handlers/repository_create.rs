@@ -147,6 +147,21 @@ fn validate_create_input(
     Ok(())
 }
 
+pub(crate) fn ensure_default_branch_name_matches(
+    repository_id: RepositoryId,
+    existing_default_branch_name: &str,
+    requested_default_branch_name: &str,
+) -> Result<(), Status> {
+    if existing_default_branch_name == requested_default_branch_name {
+        return Ok(());
+    }
+
+    Err(Status::already_exists(format!(
+        "Repository {repository_id} already exist with default branch \
+         {existing_default_branch_name} which does not match {requested_default_branch_name}"
+    )))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn repository_create(
     repository: Arc<RepositoryContext>,
@@ -184,6 +199,12 @@ async fn repository_create(
     .await
     {
         return if data.name == name {
+            ensure_default_branch_name_matches(
+                data.id,
+                data.default_branch_name.as_str(),
+                default_branch_name,
+            )?;
+
             info!(
                 "Repository {} already exist with name {}, early out create successful",
                 repository.id, data.name
@@ -225,6 +246,12 @@ async fn repository_create(
     .await
     {
         return if data.id == repository.id {
+            ensure_default_branch_name_matches(
+                data.id,
+                data.default_branch_name.as_str(),
+                default_branch_name,
+            )?;
+
             info!(
                 "Repository {} already exist with id {}, early out create successful",
                 name, data.id
@@ -314,6 +341,7 @@ async fn repository_create(
     Ok(RepositoryData {
         id: repository.id,
         name: name.to_string(),
+        default_branch_name: default_branch_name.to_string(),
         metadata,
     })
 }
@@ -442,6 +470,26 @@ mod tests {
                 .expect_err("should reject oversized creator");
             assert_eq!(err.code(), Code::InvalidArgument);
             assert!(err.message().contains("Creator exceeds maximum length"));
+        }
+    }
+
+    mod retry_idempotency {
+        use super::*;
+
+        #[test]
+        fn accepts_matching_default_branch_name() {
+            ensure_default_branch_name_matches(RepositoryId::default(), "main", "main")
+                .expect("matching branch names should pass");
+        }
+
+        #[test]
+        fn rejects_mismatched_default_branch_name() {
+            let err = ensure_default_branch_name_matches(RepositoryId::default(), "main", "trunk")
+                .expect_err("mismatched branch names should reject retry");
+
+            assert_eq!(err.code(), Code::AlreadyExists);
+            assert!(err.message().contains("default branch main"));
+            assert!(err.message().contains("does not match trunk"));
         }
     }
 

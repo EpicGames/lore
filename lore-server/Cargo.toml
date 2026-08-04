@@ -18,6 +18,7 @@ bytes = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 config = { workspace = true }
 dashmap = { workspace = true }
+diffy = { workspace = true }
 enum_dispatch = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
@@ -27,6 +28,8 @@ opentelemetry = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
 parking_lot = { workspace = true }
 pin-project = { workspace = true }
+postgres = { workspace = true }
+prost = { workspace = true }
 prost-types = { workspace = true }
 quinn = { workspace = true }
 rand = { workspace = true }
@@ -43,7 +46,7 @@ sysinfo = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-metrics = { workspace = true }
-tokio-util = { workspace = true }
+tokio-util = { workspace = true, features = ["io"] }
 tokio-stream = { workspace = true }
 toml = { workspace = true }
 tonic = { workspace = true }

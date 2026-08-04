@@ -20,6 +20,7 @@ use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsError;
 use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput;
 use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::operation::put_object::PutObjectOutput;
+use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
@@ -188,6 +189,26 @@ impl S3Impl {
             .await
             .output
             .map_err(AwsError::AwsSdkError)
+    }
+
+    #[tracing::instrument(name = "S3Impl::presign_get_object", skip_all)]
+    pub async fn presign_get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        expires_in: Duration,
+    ) -> Result<String, String> {
+        let presigning_config = PresigningConfig::expires_in(expires_in)
+            .map_err(|err| format!("failed to build S3 presigning config: {err}"))?;
+
+        self.client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .presigned(presigning_config)
+            .await
+            .map(|request| request.uri().to_string())
+            .map_err(|err| format!("failed to presign S3 get object: {err:?}"))
     }
 
     #[tracing::instrument(name = "S3Impl::put_object", skip_all)]

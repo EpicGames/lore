@@ -117,6 +117,7 @@ async fn resolve_path_impl(
         },
         async move |internal, args: LoreRevisionTreeResolvePathArgs| {
             let id = args.id;
+            let state = internal.state();
             let path = args.path.as_str();
 
             if path.is_empty() {
@@ -124,14 +125,13 @@ async fn resolve_path_impl(
                     id,
                     ROOT_NODE,
                     internal.repository,
-                    internal.state.revision(),
+                    state.revision(),
                     LoreErrorCode::None,
                 );
                 return Ok(());
             }
 
-            match internal
-                .state
+            match state
                 .find_node_link(internal.repository_context.clone(), path)
                 .await
             {
@@ -272,7 +272,7 @@ mod tests {
         let entry = rt_handle::REGISTRY
             .get(&handle.handle_id)
             .expect("handle registered");
-        (entry.state.clone(), entry.repository_context.clone())
+        (entry.state(), entry.repository_context.clone())
     }
 
     /// Add a link node under root targeting `(repository, revision, target_node)`.

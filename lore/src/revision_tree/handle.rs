@@ -17,11 +17,6 @@
 //! wrapper enforces the in-flight counter protocol the same way
 //! [`crate::storage::store::OpGuard`] does.
 
-// Several items here are unread until their owning verbs land. A file-level
-// `expect` keeps the lint quiet now and fires once every item is wired up —
-// at which point this attribute should be removed.
-#![expect(dead_code)]
-
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::AtomicBool;
@@ -34,8 +29,10 @@ use lore_base::types::Partition;
 use lore_revision::filter::Filter;
 use lore_revision::instance::InstanceId;
 use lore_revision::metadata::Metadata;
+use lore_revision::node::NodeDelta;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryFormat;
+use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::state::State;
 use lore_transport::ProtocolError;
 use serde::Deserialize;
@@ -75,7 +72,9 @@ pub(crate) struct RevisionTreeInternal {
     /// Registry key of the parent storage handle this revision tree was
     /// loaded against. Used by the storage-close warning path and the IPC
     /// connection-teardown cascade to match revision tree handles to
-    /// their parent storage handle.
+    /// their parent storage handle. Only the load tests read it until those
+    /// consumers land; the `expect` fires once the first one does.
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) parent_storage_handle_id: u64,
     /// Repository identity (a `Partition`) the loaded revision targets.
     pub(crate) repository: Partition,
@@ -84,12 +83,21 @@ pub(crate) struct RevisionTreeInternal {
     /// at load time and reused across every verb on this handle.
     pub(crate) repository_context: Arc<RepositoryContext>,
     /// Loaded revision's in-memory `State`. Internally mutable via the
-    /// `parking_lot` locks `State` holds; no outer lock is required.
-    pub(crate) state: Arc<State>,
+    /// `parking_lot` locks `State` holds; the outer lock exists only so a
+    /// successful commit can swap in a state freshly deserialized from the
+    /// newly-published revision ("the handle behaves as if freshly
+    /// loaded"). Verbs snapshot via [`Self::state`] once at entry.
+    pub(crate) state: parking_lot::RwLock<Arc<State>>,
     /// Accumulator for `metadata_set` edits. Commit clones the buffer,
     /// serializes the clone, and on success replaces this with a fresh
     /// default.
     pub(crate) pending_metadata: parking_lot::RwLock<Metadata>,
+    /// Delta entries recorded by `delete` for nodes no longer present in
+    /// the tree at commit time (the discard drops them from the child
+    /// chains, so the commit's freeze walk cannot observe them). Commit
+    /// seeds the new revision's delta block from this buffer and on
+    /// success replaces it with a fresh default.
+    pub(crate) pending_delta: parking_lot::RwLock<Vec<NodeDelta>>,
     /// In-flight op counter; paired increment/decrement via
     /// [`RevisionTreeGuard`].
     pub(crate) in_flight: AtomicU64,
@@ -101,6 +109,13 @@ pub(crate) struct RevisionTreeInternal {
 }
 
 impl RevisionTreeInternal {
+    /// Snapshot the handle's current `State`. A verb takes one snapshot at
+    /// entry and works against it throughout — a concurrent commit swapping
+    /// the handle's state does not shear an in-flight op.
+    pub(crate) fn state(&self) -> Arc<State> {
+        self.state.read().clone()
+    }
+
     /// Close sequence: mark the handle invalid so no new ops enter, then
     /// block until every in-flight op has paired its decrement. Ops that
     /// race in between increment-and-check self-abort because they see
@@ -180,11 +195,31 @@ pub(crate) async fn synth_repository_context(
     store: &StoreInternal,
     repository: Partition,
 ) -> Arc<RepositoryContext> {
+    Arc::new(synth_context(store, repository).await)
+}
+
+/// [`synth_repository_context`] carrying a write token — minted per commit,
+/// the only verb that writes through the mutable-store branch path. The
+/// handle's own context stays read-only so holding a handle open never
+/// holds the per-repository write mutex.
+pub(crate) async fn synth_repository_write_context(
+    store: &StoreInternal,
+    repository: Partition,
+    token: &RepositoryWriteToken,
+) -> Arc<RepositoryContext> {
+    Arc::new(
+        synth_context(store, repository)
+            .await
+            .with_write_token(token.share()),
+    )
+}
+
+async fn synth_context(store: &StoreInternal, repository: Partition) -> RepositoryContext {
     let remote_result = match store.remote.as_ref() {
         Some(endpoint) => endpoint.session_connection(repository).await,
         None => Err(ProtocolError::from(NoRemote)),
     };
-    Arc::new(RepositoryContext::new(
+    RepositoryContext::new(
         None,
         store.immutable.clone(),
         store.mutable.clone(),
@@ -193,7 +228,7 @@ pub(crate) async fn synth_repository_context(
         remote_result,
         Arc::new(Filter::default()),
         RepositoryFormat::Lore,
-    ))
+    )
 }
 
 /// RAII guard protecting an in-flight op. Obtained via
@@ -298,8 +333,9 @@ pub(crate) mod test_support {
             parent_storage_handle_id: 0,
             repository,
             repository_context,
-            state,
+            state: parking_lot::RwLock::new(state),
             pending_metadata: parking_lot::RwLock::new(Metadata::default()),
+            pending_delta: parking_lot::RwLock::new(Vec::new()),
             in_flight: AtomicU64::new(0),
             invalid: AtomicBool::new(false),
             drained: Notify::new(),

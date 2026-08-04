@@ -45,8 +45,12 @@ pub enum DefragmentSink {
         file: Arc<std::fs::File>,
         size: usize,
     },
-    /// Stream buffers in content order to a caller-provided channel.
-    Stream { sender: Sender<Bytes> },
+    /// Stream buffers in content order to a caller-provided channel. The
+    /// range is expressed in global logical-content offsets.
+    Stream {
+        sender: Sender<Result<Bytes, StorageError>>,
+        range: Range<u64>,
+    },
 }
 
 /// A fetched payload on its way to the write sink: target offset, bytes, and the
@@ -63,6 +67,8 @@ struct LeafReference {
     offset_content: u64,
     expected_size: u64,
     context: Context,
+    /// Portion of the decompressed leaf to emit for a ranged stream.
+    emit_range: Range<usize>,
 }
 
 /// Channel capacity for leaf references from walker to fetch pool.
@@ -94,6 +100,7 @@ async fn walk_fragment_tree(
     leaf_tx: Sender<LeafReference>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
+    stream_range: Range<u64>,
 ) -> Result<(), StorageError> {
     debug_assert!(
         (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented
@@ -118,6 +125,7 @@ async fn walk_fragment_tree(
         options,
         remote_session,
         0,
+        &stream_range,
     )
     .await
 }
@@ -141,6 +149,7 @@ async fn walk_fragment_level(
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
     depth: usize,
+    stream_range: &Range<u64>,
 ) -> Result<(), StorageError> {
     if depth > MAX_FRAGMENT_TREE_DEPTH {
         return Err(StorageError::internal(format!(
@@ -153,6 +162,26 @@ async fn walk_fragment_level(
             "fragment list is empty, claiming {total_content_size} bytes of content"
         )));
     }
+    let content_start = fragment_list[0].offset_content;
+    let content_end = content_start
+        .checked_add(total_content_size as u64)
+        .ok_or_else(|| StorageError::internal("fragment content window overflows u64"))?;
+    let (window, selected_content_size) =
+        if stream_range.start <= content_start && stream_range.end >= content_end {
+            // Preserve the full-read validation path: the intermediate walker
+            // diagnoses malformed child lists before parent offset ordering.
+            (0..fragment_list.len(), total_content_size)
+        } else {
+            let Some(selected) =
+                overlapping_fragment_window(fragment_list, total_content_size, stream_range)?
+            else {
+                return Ok(());
+            };
+            selected
+        };
+    let fragment_list = &fragment_list[window];
+    let total_content_size = selected_content_size;
+
     let base_offset = fragment_list[0].offset_content;
 
     // Peek at the first entry to determine if this level is intermediate or leaf
@@ -182,6 +211,7 @@ async fn walk_fragment_level(
             options,
             remote_session,
             depth,
+            stream_range,
         )
         .await
     } else {
@@ -192,9 +222,67 @@ async fn walk_fragment_level(
             base_offset,
             context,
             leaf_tx,
+            stream_range,
         )
         .await
     }
+}
+
+/// Select the consecutive fragment references whose content spans overlap a
+/// requested global logical range. The returned size is relative to the first
+/// selected reference, matching `Fragment::size_content` semantics expected by
+/// the lower-level walker.
+fn overlapping_fragment_window(
+    fragment_list: &[FragmentReference],
+    total_content_size: usize,
+    requested: &Range<u64>,
+) -> Result<Option<(Range<usize>, usize)>, StorageError> {
+    if fragment_list.is_empty() || requested.is_empty() {
+        return Ok(None);
+    }
+    let base = fragment_list[0].offset_content;
+    let content_end = base
+        .checked_add(total_content_size as u64)
+        .ok_or_else(|| StorageError::internal("fragment content window overflows u64"))?;
+
+    let mut first = None;
+    let mut last = 0;
+    let mut previous = None;
+    for (index, reference) in fragment_list.iter().enumerate() {
+        if let Some(previous) = previous
+            && reference.offset_content <= previous
+        {
+            return Err(StorageError::internal(
+                "fragment list offsets are not strictly increasing",
+            ));
+        }
+        previous = Some(reference.offset_content);
+        let end = fragment_list
+            .get(index + 1)
+            .map_or(content_end, |next| next.offset_content);
+        if reference.offset_content >= content_end || end > content_end {
+            return Err(StorageError::internal(
+                "fragment list offset is outside its content window",
+            ));
+        }
+        if reference.offset_content < requested.end && end > requested.start {
+            first.get_or_insert(index);
+            last = index + 1;
+        }
+    }
+
+    let Some(first) = first else {
+        return Ok(None);
+    };
+    let selected_start = fragment_list[first].offset_content;
+    let selected_end = fragment_list
+        .get(last)
+        .map_or(content_end, |next| next.offset_content);
+    let selected_size = selected_end
+        .checked_sub(selected_start)
+        .and_then(|size| usize::try_from(size).ok())
+        .ok_or_else(|| StorageError::internal("selected fragment window is too large"))?;
+    Ok(Some((first..last, selected_size)))
 }
 
 /// Yields all entries in a leaf-level fragment list as `LeafReference`.
@@ -210,6 +298,7 @@ async fn walk_leaf_level(
     base_offset: u64,
     context: Context,
     leaf_tx: &Sender<LeafReference>,
+    stream_range: &Range<u64>,
 ) -> Result<(), StorageError> {
     let content_end = base_offset
         .checked_add(total_content_size as u64)
@@ -246,11 +335,21 @@ async fn walk_leaf_level(
             )));
         }
 
+        let overlap_start = frag_ref.offset_content.max(stream_range.start);
+        let overlap_end = next_offset.min(stream_range.end);
+        if overlap_start >= overlap_end {
+            continue;
+        }
+        let emit_start = usize::try_from(overlap_start - frag_ref.offset_content)
+            .map_err(|_| StorageError::internal("leaf stream range start is too large"))?;
+        let emit_end = usize::try_from(overlap_end - frag_ref.offset_content)
+            .map_err(|_| StorageError::internal("leaf stream range end is too large"))?;
         let leaf = LeafReference {
             hash: frag_ref.hash,
             offset_content: frag_ref.offset_content,
             expected_size: expected_content_size,
             context,
+            emit_range: emit_start..emit_end,
         };
         if leaf_tx.send(leaf).await.is_err() {
             break;
@@ -348,6 +447,7 @@ async fn walk_intermediate_level(
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
     depth: usize,
+    stream_range: &Range<u64>,
 ) -> Result<(), StorageError> {
     // Parse the already-loaded first entry
     let first_content_size = first_frag.size_content as usize;
@@ -398,6 +498,7 @@ async fn walk_intermediate_level(
             first_base_offset,
             context,
             leaf_tx,
+            stream_range,
         )
         .await
     } else {
@@ -411,6 +512,7 @@ async fn walk_intermediate_level(
             options,
             remote_session.clone(),
             depth + 1,
+            stream_range,
         ))
         .await
     };
@@ -499,6 +601,7 @@ async fn walk_intermediate_level(
                 sub_list[0].offset_content,
                 context,
                 leaf_tx,
+                stream_range,
             )
             .await
         } else {
@@ -512,6 +615,7 @@ async fn walk_intermediate_level(
                 options,
                 remote_session.clone(),
                 depth + 1,
+                stream_range,
             ))
             .await
         };
@@ -630,7 +734,7 @@ async fn fetch_ordered_and_stream(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     leaf_rx: Receiver<LeafReference>,
-    sender: Sender<Bytes>,
+    sender: Sender<Result<Bytes, StorageError>>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
 ) -> Result<(), StorageError> {
@@ -651,7 +755,7 @@ async fn fetch_ordered_and_stream_from(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     mut leaf_rx: Receiver<LeafReference>,
-    sender: Sender<Bytes>,
+    sender: Sender<Result<Bytes, StorageError>>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
 ) -> Result<(), StorageError> {
@@ -660,7 +764,7 @@ async fn fetch_ordered_and_stream_from(
 
     // Sized so it never binds before the budget does; every payload in it holds a permit.
     let max_tasks = FRAGMENT_BUDGET_KIB / FRAGMENT_MINIMUM_COST_KIB as usize;
-    type FetchResult = Result<(Bytes, SemaphorePermit<'static>), StorageError>;
+    type FetchResult = Result<(Bytes, Range<usize>, SemaphorePermit<'static>), StorageError>;
     let (fetch_queue_tx, mut fetch_queue_rx) = channel::<JoinHandle<FetchResult>>(max_tasks);
 
     // Launcher: read leaf refs from walker, spawn fetch tasks, push handles
@@ -682,6 +786,7 @@ async fn fetch_ordered_and_stream_from(
                 let store = store.clone();
                 let remote_session = remote_session.clone();
                 let expected_size = leaf.expected_size;
+                let emit_range = leaf.emit_range;
 
                 let handle: JoinHandle<FetchResult> = lore_base::lore_spawn!(async move {
                     let (loaded_fragment, buffer) =
@@ -698,7 +803,14 @@ async fn fetch_ordered_and_stream_from(
                             buffer.len()
                         )));
                     }
-                    Ok((buffer, permit))
+                    if emit_range.end > buffer.len() {
+                        return Err(StorageError::internal(format!(
+                            "leaf emit range {:?} exceeds content size {}",
+                            emit_range,
+                            buffer.len()
+                        )));
+                    }
+                    Ok((buffer, emit_range, permit))
                 });
 
                 if fetch_queue_tx.send(handle).await.is_err() {
@@ -717,10 +829,11 @@ async fn fetch_ordered_and_stream_from(
             .map_err(|e| StorageError::internal_with_context(e, "load task join"))
             .and_then(|r| r)
         {
-            Ok((buffer, permit)) => {
+            Ok((buffer, emit_range, permit)) => {
                 if result.is_ok() {
+                    let buffer = buffer.slice(emit_range);
                     result = sender
-                        .send(buffer)
+                        .send(Ok(buffer))
                         .await
                         .map_err(|_err| StorageError::internal("stream send failed"));
                 }
@@ -910,6 +1023,10 @@ pub async fn defragment_pipeline(
     remote_session: Option<Arc<StorageSession>>,
 ) -> Result<(), StorageError> {
     let (leaf_tx, leaf_rx) = channel::<LeafReference>(PIPELINE_LEAF_CHANNEL_SIZE);
+    let stream_range = match &sink {
+        DefragmentSink::Stream { range, .. } => range.clone(),
+        DefragmentSink::File { .. } => 0..fragment.size_content,
+    };
 
     // Stage 1: Tree walker
     let store_walker = store.clone();
@@ -923,9 +1040,10 @@ pub async fn defragment_pipeline(
         leaf_tx,
         options,
         session_walker,
+        stream_range,
     ));
 
-    if let DefragmentSink::Stream { sender } = sink {
+    if let DefragmentSink::Stream { sender, .. } = sink {
         // Ordered fetch -> stream directly to caller's channel
         let store_fetch = store.clone();
         let session_fetch = remote_session.clone();
@@ -1225,8 +1343,19 @@ mod tests {
         ) -> Result<Vec<LeafReference>, StorageError> {
             let (tx, mut rx) = channel::<LeafReference>(32);
             let context = Context::default();
-            let walk_result =
-                walk_leaf_level(fragment_list, total_content_size, base_offset, context, &tx).await;
+            let stream_end = base_offset
+                .checked_add(total_content_size as u64)
+                .unwrap_or(u64::MAX);
+            let stream_range = base_offset..stream_end;
+            let walk_result = walk_leaf_level(
+                fragment_list,
+                total_content_size,
+                base_offset,
+                context,
+                &tx,
+                &stream_range,
+            )
+            .await;
             drop(tx);
             let mut leaves = Vec::new();
             while let Some(leaf) = rx.recv().await {
@@ -2274,6 +2403,7 @@ mod tests {
                         offset_content: (index * PAYLOAD) as u64,
                         expected_size: PAYLOAD as u64,
                         context,
+                        emit_range: 0..PAYLOAD,
                     })
                     .await
                     .expect("queue leaf");
@@ -2281,7 +2411,7 @@ mod tests {
             drop(leaf_tx);
 
             // One slot, so only the first payload leaves the pipeline's accounting.
-            let (data_tx, mut data_rx) = channel::<Bytes>(1);
+            let (data_tx, mut data_rx) = channel::<Result<Bytes, StorageError>>(1);
             let pipeline = lore_base::lore_spawn!(fetch_ordered_and_stream_from(
                 budget,
                 store.clone(),
@@ -2315,7 +2445,11 @@ mod tests {
 
             // Draining releases them in order, and the walk completes.
             for index in 0..LEAVES {
-                let payload = data_rx.recv().await.expect("payload");
+                let payload = data_rx
+                    .recv()
+                    .await
+                    .expect("payload")
+                    .expect("payload result");
                 assert_eq!(payload.len(), PAYLOAD);
                 assert!(
                     payload.iter().all(|&byte| byte == index as u8),

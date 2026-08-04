@@ -11,6 +11,7 @@ use lore_error_set::prelude::*;
 
 use crate::Address;
 use crate::Context;
+use crate::DirectDownload;
 use crate::Fragment;
 use crate::FragmentFlags;
 use crate::FragmentReference;
@@ -329,6 +330,22 @@ pub trait ImmutableStore: Any + Send + Sync {
         address: Address,
         match_required: StoreMatch,
     ) -> Result<(Fragment, Bytes), StoreError>;
+
+    /// Return presigned direct-download URLs for immutable payloads.
+    ///
+    /// Implementations must preserve `get` authorization semantics: a returned URL must only be
+    /// issued when `match_required` is satisfied for the given `(partition, address)`.
+    async fn presign_downloads(
+        self: Arc<Self>,
+        _partition: Partition,
+        _addresses: &[Address],
+        _match_required: StoreMatch,
+        _expires_in: Duration,
+    ) -> Result<Vec<DirectDownload>, StoreError> {
+        Err(StoreError::from(NotSupported {
+            operation: "immutable direct download".to_string(),
+        }))
+    }
 
     /// Put the immutable data for the given address within the partition.
     /// If the payload buffer is not given and the store has no previous instance of the data,

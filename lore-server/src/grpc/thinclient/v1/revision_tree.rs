@@ -161,6 +161,10 @@ async fn stream_tree(
                 hash: address.hash.into(),
                 context: address.context.into(),
             }),
+            last_changed_revision_signature: tree_path
+                .last_changed_revision
+                .map(Into::into)
+                .unwrap_or_default(),
         };
         if tx
             .send(Ok(RevisionTreeResponse {
@@ -549,6 +553,9 @@ mod test {
                     .iter()
                     .all(|n| n.node_type == thin_client_v1::NodeType::File as i32)
             );
+            assert!(nodes.iter().all(|node| {
+                Hash::from(node.last_changed_revision_signature.as_ref()) == signature
+            }));
         }))
         .await;
     }
@@ -1064,6 +1071,15 @@ mod test {
             let child = &nodes[1];
             assert_eq!(child.path, "linked/inner.txt");
             assert_eq!(child.node_type, thin_client_v1::NodeType::File as i32);
+            assert_eq!(
+                Hash::from(link.last_changed_revision_signature.as_ref()),
+                signature,
+            );
+            assert_eq!(
+                Hash::from(child.last_changed_revision_signature.as_ref()),
+                signature,
+                "linked descendants inherit the revision that changed the link pin",
+            );
         }))
         .await;
     }

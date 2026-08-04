@@ -9,6 +9,7 @@ use lore_base::types::Hash;
 use lore_proto::lore::model::v1 as model_v1;
 use lore_proto::lore::thin_client::v1 as thin_client_v1;
 use lore_proto::lore::thin_client::v1::revision_diff_request;
+use lore_proto::lore::thin_client::v1::revision_file_download_request;
 use lore_proto::lore::thin_client::v1::revision_info_request;
 use lore_proto::lore::thin_client::v1::revision_tree_request;
 use lore_revision::branch;
@@ -54,6 +55,15 @@ impl From<revision_tree_request::Query> for RevisionSpec {
         match query {
             revision_tree_request::Query::Signature(sig) => Self::Signature(sig),
             revision_tree_request::Query::Identifier(id) => Self::Identifier(id),
+        }
+    }
+}
+
+impl From<revision_file_download_request::Query> for RevisionSpec {
+    fn from(query: revision_file_download_request::Query) -> Self {
+        match query {
+            revision_file_download_request::Query::Signature(sig) => Self::Signature(sig),
+            revision_file_download_request::Query::Identifier(id) => Self::Identifier(id),
         }
     }
 }
@@ -240,7 +250,7 @@ fn file_action_to_v1_action(action: FileAction) -> thin_client_v1::Action {
 /// Convert an internal `NodeChange` into a v1 `DiffChange`. The
 /// `to.flags` drive `node_type` for non-delete actions; for deletes
 /// `from.flags` is the surviving record of what the path used to be.
-/// `content_from` / `content_to` carry the from / to side's CAS hash,
+/// `content_from` / `content_to` carry the from / to side's full `Address`,
 /// or empty bytes for ADD (no from) and DELETE (no to).
 ///
 /// `link_repository_index` is passed through verbatim; the handler
@@ -262,12 +272,12 @@ pub(super) fn node_change_to_diff_change(
     let content_from = if action == thin_client_v1::Action::Add {
         Bytes::new()
     } else {
-        change.from.address.hash.into()
+        change.from.address.into()
     };
     let content_to = if action == thin_client_v1::Action::Delete {
         Bytes::new()
     } else {
-        change.to.address.hash.into()
+        change.to.address.into()
     };
     thin_client_v1::DiffChange {
         path: change.path.to_string(),
@@ -288,6 +298,7 @@ pub(super) fn node_change_to_diff_change(
 /// take separate indices: they can land in different partitions.
 pub(super) fn diff_conflict_from_pair(
     pair: &(NodeChange, NodeChange),
+    conflict_id: lore_base::types::Hash,
     link_repository_index_from: u32,
     link_repository_index_to: u32,
 ) -> thin_client_v1::DiffConflict {
@@ -300,6 +311,7 @@ pub(super) fn diff_conflict_from_pair(
             &pair.1,
             link_repository_index_to,
         )),
+        conflict_id: conflict_id.into(),
     }
 }
 
@@ -394,6 +406,15 @@ mod tests {
         assert_eq!(mapped.link_repository_index, 0);
         assert_eq!(mapped.path, "dir/file.txt");
         assert_eq!(mapped.action, thin_client_v1::Action::Add as i32);
+        assert!(
+            mapped.content_from.is_empty(),
+            "ADD has no from-side content"
+        );
+        assert_eq!(
+            Address::from(&mapped.content_to),
+            change.to.address,
+            "to-side content carries the full address"
+        );
 
         let mapped = node_change_to_diff_change(&change, 7);
         assert_eq!(mapped.link_repository_index, 7);
@@ -410,6 +431,15 @@ mod tests {
 
         let mapped = node_change_to_diff_change(&change, 0);
         assert_eq!(mapped.node_type, thin_client_v1::NodeType::Link as i32);
+        assert_eq!(
+            Address::from(&mapped.content_from),
+            change.from.address,
+            "delete keeps the full from-side address"
+        );
+        assert!(
+            mapped.content_to.is_empty(),
+            "DELETE has no to-side content"
+        );
     }
 
     #[tokio::test]
@@ -417,7 +447,7 @@ mod tests {
         let from = make_change(lore_revision::change::FileAction::Keep);
         let to = make_change(lore_revision::change::FileAction::Keep);
 
-        let mapped = diff_conflict_from_pair(&(from, to), 0, 3);
+        let mapped = diff_conflict_from_pair(&(from, to), Hash::from_u64(7), 0, 3);
         assert_eq!(
             mapped.change_from.as_ref().unwrap().link_repository_index,
             0,
@@ -428,5 +458,6 @@ mod tests {
             3,
             "to-half carries its own index, distinct from from-half",
         );
+        assert_eq!(Hash::from(&mapped.conflict_id), Hash::from_u64(7));
     }
 }

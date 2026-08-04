@@ -97,6 +97,7 @@ impl From<StoreError> for MessageHandleError {
         match value {
             StoreError::SlowDown(_) => MessageHandleError::SlowDown,
             StoreError::Oversized(_) => MessageHandleError::Oversized,
+            StoreError::NotSupported(_) => MessageHandleError::NotImplemented,
             _ => MessageHandleError::StoreFailure,
         }
     }
@@ -144,6 +145,7 @@ pub enum LoreResponse {
     Put(responses::PutResponse),
     Query(responses::QueryResponse),
     Ping(responses::PingResponse),
+    PresignDownload(responses::PresignDownloadResponse),
     Correlate(responses::CorrelateResponse),
     Verify(responses::VerifyResponse),
     MutableLoad(responses::MutableLoadResponse),

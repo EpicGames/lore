@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 use std::sync::Weak;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use lore_base::error::NotSupported;
 use lore_base::types::*;
 
 use crate::connection::Connection;
@@ -118,6 +120,19 @@ pub trait Storage: Send + Sync {
     ) -> Result<Fragment, ProtocolError> {
         let (fragment, _payload) = self.get(session_id, address).await?;
         Ok(fragment)
+    }
+
+    /// Return short-lived direct-download URLs for a batch of immutable payloads.
+    async fn presign_downloads(
+        &self,
+        session_id: u32,
+        addresses: &[Address],
+        expires_in: Duration,
+    ) -> Result<Vec<DirectDownload>, ProtocolError> {
+        let _ = (session_id, addresses, expires_in);
+        Err(ProtocolError::from(NotSupported {
+            operation: "direct download".to_string(),
+        }))
     }
 
     /// Put the immutable fragment and optional payload for address

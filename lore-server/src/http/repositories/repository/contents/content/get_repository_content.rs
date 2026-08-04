@@ -15,7 +15,6 @@ use axum::http::header::CONTENT_ENCODING;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::header::InvalidHeaderValue;
 use axum::response::IntoResponse;
-use bytes::Bytes;
 use hex::FromHexError;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
@@ -157,7 +156,8 @@ pub async fn handler(
                 .await
                 .map_err(GetContentError::ReadStream)?;
 
-            let stream = ReceiverStream::new(rx).map(Ok::<Bytes, GetContentError>);
+            let stream =
+                ReceiverStream::new(rx).map(|item| item.map_err(GetContentError::ReadStream));
 
             let headers = create_stream_response_headers(query, content_length)
                 .map_err(GetContentError::HeaderGeneration)?;

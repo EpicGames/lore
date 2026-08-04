@@ -25,6 +25,7 @@ parking_lot = { workspace = true }
 quinn = { workspace = true }
 quinn-proto = { workspace = true }
 rcgen = { workspace = true }
+reqwest = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 serde = { workspace = true }

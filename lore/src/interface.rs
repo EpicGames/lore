@@ -1356,6 +1356,8 @@ pub extern "C" fn lore_branch_merge_restart_async(
 }
 
 pub type LoreBranchMergeStartArgs = crate::branch::LoreBranchMergeStartArgs;
+pub type LorePathMergeRule = crate::branch::LorePathMergeRule;
+pub type LorePathMergeStrategy = crate::branch::LorePathMergeStrategy;
 
 /// Start a merge from another branch into the current branch.
 ///
@@ -7480,4 +7482,238 @@ pub extern "C" fn lore_revision_tree_add_async(
     callback: LoreEventCallbackConfig,
 ) {
     run_asynchronously(globals, args, callback, crate::revision_tree::add::add);
+}
+
+pub type LoreRevisionTreeDeleteArgs = crate::revision_tree::delete::LoreRevisionTreeDeleteArgs;
+
+/// Mark a node and its transitive children as deleted in a loaded revision
+/// tree. Subsequent reads on the same handle do not observe the deleted
+/// subtree.
+///
+/// | Terminal event                             | Payload                                           | Notes                                     |
+/// |--------------------------------------------|---------------------------------------------------|-------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_DELETE_COMPLETE` | `lore_revision_tree_delete_complete_event_data_t` | Carries the per-call outcome              |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_delete(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeDeleteArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::delete::delete,
+    )
+}
+
+/// Mark a node and its transitive children as deleted (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_delete_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeDeleteArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::delete::delete,
+    );
+}
+
+pub type LoreRevisionTreeModifyArgs = crate::revision_tree::modify::LoreRevisionTreeModifyArgs;
+
+/// Update a leaf node's mode, size, and content address in a loaded revision
+/// tree, preserving its file id.
+///
+/// | Terminal event                             | Payload                                           | Notes                                     |
+/// |--------------------------------------------|---------------------------------------------------|-------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_MODIFY_COMPLETE` | `lore_revision_tree_modify_complete_event_data_t` | Echoes the modified node id on success    |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_modify(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeModifyArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::modify::modify,
+    )
+}
+
+/// Update a leaf node's mode, size, and content address (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_modify_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeModifyArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::modify::modify,
+    );
+}
+
+pub type LoreRevisionTreeMoveArgs = crate::revision_tree::move_node::LoreRevisionTreeMoveArgs;
+
+/// Move a node between parents with optional rename (or rename within one)
+/// in a loaded revision tree, preserving its file id so the revision graph
+/// records a true move.
+///
+/// | Terminal event                           | Payload                                         | Notes                                     |
+/// |------------------------------------------|-------------------------------------------------|-------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_MOVE_COMPLETE` | `lore_revision_tree_move_complete_event_data_t` | Echoes the moved node id on success       |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_move(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMoveArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::move_node::move_node,
+    )
+}
+
+/// Move a node between parents with optional rename (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_move_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMoveArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::move_node::move_node,
+    );
+}
+
+pub type LoreRevisionTreeMetadataSetArgs =
+    crate::revision_tree::metadata_set::LoreRevisionTreeMetadataSetArgs;
+
+/// Record a `(key, value, format)` triple on the in-progress revision's
+/// metadata. The value lives on the handle until `lore_revision_tree_commit`
+/// serializes it into the new revision's metadata fragment.
+///
+/// | Terminal event                                   | Payload                                                 | Notes                        |
+/// |--------------------------------------------------|---------------------------------------------------------|------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_METADATA_SET_COMPLETE` | `lore_revision_tree_metadata_set_complete_event_data_t` | Carries the per-call outcome |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_metadata_set(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMetadataSetArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::metadata_set::metadata_set,
+    )
+}
+
+/// Record a metadata triple on the in-progress revision (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_metadata_set_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMetadataSetArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::metadata_set::metadata_set,
+    );
+}
+
+pub type LoreRevisionTreeMetadataGetArgs =
+    crate::revision_tree::metadata_get::LoreRevisionTreeMetadataGetArgs;
+
+/// Read a metadata value by key from a loaded revision tree. Pending
+/// `lore_revision_tree_metadata_set` edits take precedence over the loaded
+/// revision's frozen metadata; a missing key emits no value event and
+/// completes with status 0.
+///
+/// | Terminal event                                   | Payload                                                 | Notes                                  |
+/// |--------------------------------------------------|---------------------------------------------------------|----------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_METADATA_GET_COMPLETE` | `lore_revision_tree_metadata_get_complete_event_data_t` | Carries the typed value on a hit       |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_metadata_get(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMetadataGetArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::metadata_get::metadata_get,
+    )
+}
+
+/// Read a metadata value by key (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_metadata_get_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMetadataGetArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::metadata_get::metadata_get,
+    );
+}
+
+pub type LoreRevisionTreeCommitOptions =
+    crate::revision_tree::commit::LoreRevisionTreeCommitOptions;
+pub type LoreRevisionTreeCommitArgs = crate::revision_tree::commit::LoreRevisionTreeCommitArgs;
+
+/// Freeze the handle's tree and commit it as a new revision, atomically
+/// advancing the target branch tip. Honors the same tip-collision, branch
+/// protection, and remote-write contract as the file-system-based commit.
+/// On success the handle behaves as if freshly loaded from the new revision;
+/// any commit failure invalidates the handle.
+///
+/// | Terminal event                             | Payload                                           | Notes                                                                  |
+/// |--------------------------------------------|---------------------------------------------------|------------------------------------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_COMMIT_COMPLETE` | `lore_revision_tree_commit_complete_event_data_t` | Carries the new revision hash; the observed tip on `BRANCH_ADVANCED`  |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_commit(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeCommitArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::commit::commit,
+    )
+}
+
+/// Freeze the handle's tree and commit it as a new revision (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_commit_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeCommitArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::commit::commit,
+    );
 }

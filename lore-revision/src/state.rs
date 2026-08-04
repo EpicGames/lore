@@ -5,6 +5,7 @@ pub mod dump;
 mod sink;
 
 use core::str;
+use std::collections::HashSet;
 use std::future::Future;
 use std::io::Write;
 use std::mem::size_of;
@@ -844,8 +845,8 @@ impl State {
                     // TODO(mjansson): Figure out a way to write the node block without having to copy
                     // it out of the lock first. Writing from the locked ref will not work as the immutable
                     // write makes the lock held of an await point
-                    let mut node_block = { *block.read().node_block() };
-                    node_block.flags &= !NodeBlockFlags::Dirty;
+                    let mut node_block = { block.read().node_block().clone_on_heap() };
+                    node_block.flags &= !NodeFileMetadataBlockFlags::Dirty;
                     let (address, _) = node_block
                         .write_to_immutable(
                             repository.clone(),
@@ -3497,6 +3498,7 @@ pub struct TreePath {
     pub path: RelativePath,
     pub address: Option<Address>,
     pub flags: NodeFlags,
+    pub last_changed_revision: Option<Hash>,
 }
 
 pub type CanReadRepository = Arc<dyn Fn(RepositoryId) -> bool + Send + Sync>;
@@ -3550,6 +3552,7 @@ pub async fn gather_tree_paths(
         0,
         max_depth,
         0,
+        None,
         can_read,
         &mut paths,
     )
@@ -3566,6 +3569,7 @@ async fn enumerate_children(
     depth: usize,
     max_depth: usize,
     link_depth: usize,
+    inherited_last_changed_revision: Option<Hash>,
     can_read: CanReadRepository,
     result: &mut Vec<TreePath>,
 ) -> Result<(), StateError> {
@@ -3579,6 +3583,21 @@ async fn enumerate_children(
         }
         .into());
     }
+    let changed_nodes = if inherited_last_changed_revision.is_some() {
+        Arc::new(HashSet::new())
+    } else {
+        let delta = state
+            .delta_block(repository.clone())
+            .await?
+            .to_aligned::<NodeDelta>();
+        Arc::new(
+            delta
+                .as_type_slice::<NodeDelta>()
+                .iter()
+                .map(|entry| entry.node)
+                .collect(),
+        )
+    };
     let mut cycle = SiblingCycleGuard::new(parent_node_id);
     gather_tree_paths_node_recurse(
         state,
@@ -3589,6 +3608,8 @@ async fn enumerate_children(
         depth,
         max_depth,
         link_depth,
+        changed_nodes,
+        inherited_last_changed_revision,
         can_read,
         result,
         &mut cycle,
@@ -3626,6 +3647,8 @@ async fn gather_tree_paths_node(
     depth: usize,
     max_depth: usize,
     link_depth: usize,
+    changed_nodes: Arc<HashSet<NodeID>>,
+    inherited_last_changed_revision: Option<Hash>,
     can_read: CanReadRepository,
     result: &mut Vec<TreePath>,
     cycle: &mut SiblingCycleGuard,
@@ -3656,10 +3679,35 @@ async fn gather_tree_paths_node(
     } else {
         NodeFlags::NoFlags
     };
+    let last_changed_revision = if node.is_directory() {
+        None
+    } else if let Some(revision) = inherited_last_changed_revision {
+        Some(revision)
+    } else if changed_nodes.contains(&node_id) {
+        Some(state.revision())
+    } else {
+        let metadata_node = node::node_to_file_metadata(node_id);
+        let metadata_block = state
+            .block_file_metadata(
+                repository.clone(),
+                NodeFileMetadataBlock::index(metadata_node),
+            )
+            .await?;
+        let revision = metadata_block
+            .read()
+            .node(NodeFileMetadata::index(metadata_node))
+            .revision[0];
+        Some(if revision.is_zero() {
+            state.revision()
+        } else {
+            revision
+        })
+    };
     result.push(TreePath {
         path: node_path.clone(),
         address,
         flags,
+        last_changed_revision,
     });
 
     let depth_remaining = max_depth == 0 || depth + 1 < max_depth;
@@ -3674,6 +3722,8 @@ async fn gather_tree_paths_node(
             depth + 1,
             max_depth,
             link_depth,
+            changed_nodes.clone(),
+            inherited_last_changed_revision,
             can_read,
             result,
             &mut child_cycle,
@@ -3698,6 +3748,7 @@ async fn gather_tree_paths_node(
                         depth + 1,
                         max_depth,
                         link_depth + 1,
+                        last_changed_revision,
                         can_read,
                         result,
                     )
@@ -3736,6 +3787,8 @@ fn gather_tree_paths_node_recurse<'a>(
     depth: usize,
     max_depth: usize,
     link_depth: usize,
+    changed_nodes: Arc<HashSet<NodeID>>,
+    inherited_last_changed_revision: Option<Hash>,
     can_read: CanReadRepository,
     result: &'a mut Vec<TreePath>,
     cycle: &'a mut SiblingCycleGuard,
@@ -3752,6 +3805,8 @@ fn gather_tree_paths_node_recurse<'a>(
                 depth,
                 max_depth,
                 link_depth,
+                changed_nodes.clone(),
+                inherited_last_changed_revision,
                 can_read.clone(),
                 result,
                 cycle,
@@ -4540,6 +4595,10 @@ pub async fn diff(
             .find_node_link(repository_to.clone(), path.as_str())
             .await
             .unwrap_or(NodeLink::invalid());
+
+        if !from_link.is_valid_or_root() && !to_link.is_valid_or_root() {
+            return Ok(());
+        }
 
         let mut repository_from = repository_from;
         let state_from = if !from_link.repository.is_zero()
@@ -6701,7 +6760,7 @@ pub async fn is_file_content_equal(
     } else {
         // Large file: stream stored content and compare chunk-by-chunk against
         // the file read in matching chunks
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
         let repo_clone = repository.clone();
         let stream_handle = lore_spawn!(async move {
             immutable::read_stream(repo_clone, address, options, sender).await
@@ -6716,6 +6775,10 @@ pub async fn is_file_content_equal(
         let mut bytes_compared: u64 = 0;
 
         while let Some(chunk) = receiver.recv().await {
+            let Ok(chunk) = chunk else {
+                equal = false;
+                break;
+            };
             use tokio::io::AsyncReadExt;
             let mut local_buf = vec![0u8; chunk.len()];
             if reader.read_exact(&mut local_buf).await.is_ok() {
@@ -7846,7 +7909,31 @@ pub async fn apply_tree_changes(
     target_state: Arc<State>,
     changes: &[NodeChange],
 ) -> Result<(), StateError> {
+    apply_tree_changes_inner(repository, target_state, changes, false)
+        .await
+        .map(|_| ())
+}
+
+/// Commit-ready variant of [`apply_tree_changes`]. Deleted and moved-away
+/// nodes are discarded from the target tree and returned as delta entries,
+/// allowing [`crate::commit::construct_merge_revision`] to freeze and rehash
+/// the resulting tree into a normal immutable revision.
+pub async fn apply_tree_changes_for_commit(
+    repository: Arc<RepositoryContext>,
+    target_state: Arc<State>,
+    changes: &[NodeChange],
+) -> Result<Vec<NodeDelta>, StateError> {
+    apply_tree_changes_inner(repository, target_state, changes, true).await
+}
+
+async fn apply_tree_changes_inner(
+    repository: Arc<RepositoryContext>,
+    target_state: Arc<State>,
+    changes: &[NodeChange],
+    discard_deletes: bool,
+) -> Result<Vec<NodeDelta>, StateError> {
     let stats = Arc::new(crate::stage::StageStats::default());
+    let mut deleted = Vec::new();
 
     // Process deletes first, in reverse path order (deepest paths first) so that
     // children are deleted before parent directories
@@ -7866,7 +7953,19 @@ pub async fn apply_tree_changes(
             Err(err) => return Err(err),
         };
 
-        if node_link.is_valid() {
+        if node_link.is_valid() && discard_deletes {
+            deleted.extend(
+                crate::revision_tree::delete_node(
+                    target_state.clone(),
+                    repository.clone(),
+                    node_link.node,
+                )
+                .await
+                .map_err(|error| {
+                    StateError::internal_with_context(error, "discarding merge deletion")
+                })?,
+            );
+        } else if node_link.is_valid() {
             crate::stage::stage_delete(
                 repository.clone(),
                 target_state.clone(),
@@ -7899,7 +7998,19 @@ pub async fn apply_tree_changes(
                 Err(err) => return Err(err),
             };
 
-            if node_link.is_valid() {
+            if node_link.is_valid() && discard_deletes {
+                deleted.extend(
+                    crate::revision_tree::delete_node(
+                        target_state.clone(),
+                        repository.clone(),
+                        node_link.node,
+                    )
+                    .await
+                    .map_err(|error| {
+                        StateError::internal_with_context(error, "discarding merge move source")
+                    })?,
+                );
+            } else if node_link.is_valid() {
                 crate::stage::stage_delete(
                     repository.clone(),
                     target_state.clone(),
@@ -7938,7 +8049,7 @@ pub async fn apply_tree_changes(
         .internal("Node not found")?;
     }
 
-    Ok(())
+    Ok(deleted)
 }
 
 #[cfg(test)]

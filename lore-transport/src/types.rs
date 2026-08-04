@@ -179,6 +179,7 @@ impl From<Hash> for RevisionListStart {
 pub struct RepositoryData {
     pub id: RepositoryId,
     pub name: String,
+    pub default_branch_name: String,
     pub metadata: Hash,
 }
 

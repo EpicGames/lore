@@ -6,6 +6,7 @@
 pub(crate) use lore_base::types::Address;
 pub(crate) use lore_base::types::CloneHeapAlloc;
 pub(crate) use lore_base::types::Context;
+pub(crate) use lore_base::types::DirectDownload;
 pub(crate) use lore_base::types::Fragment;
 pub(crate) use lore_base::types::FragmentReference;
 pub(crate) use lore_base::types::HASH_STRING_LENGTH;

@@ -189,7 +189,10 @@ pub(crate) fn aggregate_error_code(
 ) -> Option<LoreErrorCode> {
     fn severity(code: LoreErrorCode) -> u8 {
         match code {
-            LoreErrorCode::InvalidArguments => 4,
+            // Only revision-tree commits report BranchAdvanced; it never
+            // appears on a storage item, but rank it like a caller-actionable
+            // failure for completeness.
+            LoreErrorCode::InvalidArguments | LoreErrorCode::BranchAdvanced => 4,
             LoreErrorCode::Internal => 3,
             LoreErrorCode::SlowDown => 2,
             LoreErrorCode::AddressNotFound => 1,

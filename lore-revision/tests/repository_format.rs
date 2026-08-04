@@ -51,7 +51,7 @@ mod tests {
     fn detect_lore_directory() {
         let dir = std::env::temp_dir().join("lore-test-detect-lore");
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".lore")).expect("create .lore dir");
+        std::fs::create_dir_all(dir.join(".spacesync")).expect("create .lore dir");
 
         let format = RepositoryFormat::detect(&dir);
         assert!(matches!(format, RepositoryFormat::Lore));
@@ -76,7 +76,7 @@ mod tests {
         let dir = std::env::temp_dir().join("lore-test-detect-both");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".urc")).expect("create .urc dir");
-        std::fs::create_dir_all(dir.join(".lore")).expect("create .lore dir");
+        std::fs::create_dir_all(dir.join(".spacesync")).expect("create .lore dir");
 
         let format = RepositoryFormat::detect(&dir);
         assert!(matches!(format, RepositoryFormat::Urc));
@@ -103,12 +103,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         let nested = base.join("a").join("b");
         std::fs::create_dir_all(&nested).expect("create nested dirs");
-        std::fs::create_dir_all(base.join(".lore")).expect("create .lore dir");
+        std::fs::create_dir_all(base.join(".spacesync")).expect("create .lore dir");
 
         // Walk up from nested, looking for .lore or .urc
         let mut current = nested.as_path();
         let found = loop {
-            if current.join(".urc").is_dir() || current.join(".lore").is_dir() {
+            if current.join(".urc").is_dir() || current.join(".spacesync").is_dir() {
                 break Some(current.to_path_buf());
             }
             match current.parent() {
@@ -131,7 +131,7 @@ mod tests {
 
         let mut current = nested.as_path();
         let found = loop {
-            if current.join(".urc").is_dir() || current.join(".lore").is_dir() {
+            if current.join(".urc").is_dir() || current.join(".spacesync").is_dir() {
                 break Some(current.to_path_buf());
             }
             match current.parent() {
@@ -150,7 +150,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join("lore-test-ignore-fallback");
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".lore")).expect("create .lore dir");
+        std::fs::create_dir_all(dir.join(".spacesync")).expect("create .lore dir");
 
         // Write a .urcignore with a pattern (no .loreignore present)
         std::fs::write(dir.join(".urcignore"), "secret.txt\n").expect("write .urcignore");
@@ -170,7 +170,7 @@ mod tests {
 
         let dir = std::env::temp_dir().join("lore-test-ignore-prefer");
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".lore")).expect("create .lore dir");
+        std::fs::create_dir_all(dir.join(".spacesync")).expect("create .lore dir");
 
         // Both files present — .loreignore should win
         std::fs::write(dir.join(".loreignore"), "a.txt\nb.txt\n").expect("write .loreignore");

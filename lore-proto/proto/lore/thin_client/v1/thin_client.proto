@@ -5,8 +5,8 @@ package lore.thin_client.v1;
 import "lore/model/v1/model.proto";
 import "lore/thin_client/v1/model.proto";
 
-// Thin-client presentation helpers — describe / tree / diff RPCs that are
-// convenience helpers for clients that lack local cache or compute ( web UIs).
+// Thin-client presentation helpers — describe / tree / diff / download RPCs
+// for clients that lack local cache or compute (web UIs).
 // Sits alongside the baseline lore.revision.v1.RevisionService and shares the
 // same backing revision-graph state.
 service ThinClientService {
@@ -21,6 +21,10 @@ service ThinClientService {
   // Stream the file/directory tree at a revision as header + TreeNode
   // items.
   rpc RevisionTree(RevisionTreeRequest) returns (stream RevisionTreeResponse);
+  // Resolve one file at an immutable revision and create a short-lived URL
+  // that streams the reconstructed logical bytes through the Lore HTTP
+  // server. The returned URL never exposes storage fragment URLs.
+  rpc RevisionFileDownload(RevisionFileDownloadRequest) returns (RevisionFileDownloadResponse);
 }
 
 // Request to describe a single revision by identifier or signature.
@@ -42,8 +46,20 @@ message RevisionInfoResponse {
   Revision revision = 1;
 }
 
-// Request to diff two revisions. Server picks the diff mode (2-way vs
-// 3-way) from revision metadata; callers do not declare it.
+// Controls whether RevisionDiff compares two snapshots directly or computes
+// their merge-relative changes through a common ancestor.
+enum RevisionDiffMode {
+  // Preserve the server's historical mode selection: pairwise for revisions
+  // on the same branch (or at a branch point), merge otherwise.
+  REVISION_DIFF_MODE_AUTO = 0;
+  // Always compare the "from" snapshot directly with the "to" snapshot.
+  REVISION_DIFF_MODE_PAIRWISE = 1;
+  // Always resolve a common ancestor and compute a three-way merge diff.
+  REVISION_DIFF_MODE_MERGE = 2;
+}
+
+// Request to diff two revisions. Callers may explicitly select pairwise or
+// merge semantics; AUTO preserves the server's metadata-driven behavior.
 message RevisionDiffRequest {
   // "From" side specifier.
   oneof query_from {
@@ -59,16 +75,18 @@ message RevisionDiffRequest {
     // Signature-based "to".
     bytes signature_to = 4;
   }
-  // When true and the server picks 3-way mode, auto-resolved
-  // DiffChange entries are flagged via `automerged = true`. Silently
-  // ignored in 2-way mode.
+  // When true and the effective mode is MERGE, auto-resolved DiffChange
+  // entries are flagged via `automerged = true`. Silently ignored in
+  // PAIRWISE mode.
   bool autoresolve = 5;
+  // Requested comparison semantics. AUTO preserves the legacy behavior.
+  RevisionDiffMode mode = 6;
 }
 
 // Header for a RevisionDiff stream. Echoes the resolved revisions so
 // callers querying by signature learn the (branch, number) and vice
-// versa. Optional `_base` fields are populated only when the server
-// selected a 3-way diff.
+// versa. `mode` reports the effective mode after AUTO resolution. Optional
+// `_base` fields are populated for non-identical MERGE comparisons.
 message RevisionDiffHeader {
   // Resolved (branch, number) of the "from" side.
   lore.model.v1.RevisionIdentifier identifier_from = 1;
@@ -84,6 +102,8 @@ message RevisionDiffHeader {
   // Resolved signature of the common ancestor base. Set only in
   // 3-way mode.
   optional bytes signature_base = 6;
+  // Effective comparison mode after resolving AUTO.
+  RevisionDiffMode mode = 7;
 }
 
 // Server-streamed response for RevisionDiff. First message carries
@@ -146,4 +166,49 @@ message RevisionTreeResponse {
     // A tree entry (directory, file, or link).
     TreeNode node = 2;
   }
+}
+
+// Request a browser-ready download URL for one exact file path.
+message RevisionFileDownloadRequest {
+  // Revision specifier.
+  oneof query {
+    // Identifier-based lookup; `number == 0` resolves to the tip of
+    // the branch and the response pins the concrete signature.
+    lore.model.v1.RevisionIdentifier identifier = 1;
+    // Signature-based lookup.
+    bytes signature = 2;
+  }
+  // Repository-relative path to a file. Directories and links are rejected.
+  string path = 3;
+  // Requested URL lifetime. Zero selects the server default; non-zero values
+  // are clamped to the configured minimum and maximum.
+  uint64 ttl_seconds = 4;
+  // Response Content-Type. Empty defaults to application/octet-stream.
+  string content_type = 5;
+  // When true, Content-Disposition is `inline`; otherwise it is `attachment`.
+  // In both cases Lore derives and safely encodes the filename from `path`.
+  bool inline = 6;
+}
+
+// A pinned logical-file download. `url_suffix` is relative to the externally
+// configured Lore HTTP origin because the gRPC server does not know ingress
+// or reverse-proxy host names.
+message RevisionFileDownloadResponse {
+  // Concrete revision selected by the request.
+  RevisionTreeHeader revision = 1;
+  // Repository that owns the resolved file. This can differ from the request
+  // repository when the path crosses an authorized repository link.
+  bytes repository_resolved = 2;
+  // Immutable logical-content address stored on the file node.
+  lore.model.v1.Address address = 3;
+  // Logical file length after defragmentation and decompression.
+  uint64 size = 4;
+  // Short-lived Lore HTTP path, including its signed query token.
+  string url_suffix = 5;
+  // Unix epoch seconds at which the URL expires.
+  uint64 expires_at_epoch_seconds = 6;
+  // Final path component used for Content-Disposition.
+  string file_name = 7;
+  // File mode stored on the revision node.
+  uint32 mode = 8;
 }

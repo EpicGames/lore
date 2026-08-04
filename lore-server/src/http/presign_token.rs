@@ -21,6 +21,10 @@ pub struct PresignTokenPayload {
     pub content_encoding: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_disposition: Option<String>,
+    /// Logical byte length after Lore defragmentation/decompression. Optional
+    /// so URLs issued before this field existed remain redeemable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_length: Option<u64>,
 }
 
 #[derive(Debug, Error, PartialEq)]
@@ -110,6 +114,7 @@ mod tests {
             content_type: None,
             content_encoding: None,
             content_disposition: None,
+            content_length: None,
         }
     }
 
@@ -184,10 +189,12 @@ mod tests {
         payload.content_type = Some("image/png".to_string());
         payload.content_encoding = Some("gzip".to_string());
         payload.content_disposition = Some("inline".to_string());
+        payload.content_length = Some(42);
         let token = sign(&payload, &key);
         let result = verify(&token, &key, "test_key_id", 0 /* now_unix */).unwrap();
         assert_eq!(result.content_type.as_deref(), Some("image/png"));
         assert_eq!(result.content_encoding.as_deref(), Some("gzip"));
         assert_eq!(result.content_disposition.as_deref(), Some("inline"));
+        assert_eq!(result.content_length, Some(42));
     }
 }

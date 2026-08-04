@@ -273,6 +273,19 @@ pub struct Fragment {
     pub size_content: u64,
 }
 
+/// A short-lived direct-download URL for an immutable fragment payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectDownload {
+    /// Address the URL was authorized for.
+    pub address: Address,
+    /// Fragment metadata that describes and validates the payload.
+    pub fragment: Fragment,
+    /// Presigned HTTP GET URL for the backing object.
+    pub url: String,
+    /// Unix epoch seconds when the URL expires, for client-side diagnostics.
+    pub expires_at_epoch_seconds: u64,
+}
+
 /// Reference to one fragment within larger reassembled content.
 ///
 /// Names the fragment by its payload hash and records where its bytes sit in

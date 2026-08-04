@@ -124,6 +124,11 @@ async fn resolve_listing_target(
         let Ok(node) = state.node(repository.clone(), node_id).await else {
             return Ok(None);
         };
+        // A discarded slot reads back as a directory shape (no file or link
+        // bits); the node itself is gone (e.g. deleted through this handle).
+        if node.is_discarded() {
+            return Ok(None);
+        }
         if node.is_directory() {
             return Ok(Some((state, repository, node_id)));
         }
@@ -213,7 +218,7 @@ async fn list_children_impl(
             }
 
             let (list_state, list_repository, list_node) = match resolve_listing_target(
-                internal.state.clone(),
+                internal.state(),
                 internal.repository_context.clone(),
                 parent_id,
             )
@@ -430,7 +435,7 @@ mod tests {
             let entry = rt_handle::REGISTRY
                 .get(&handle.handle_id)
                 .expect("handle registered");
-            (entry.state.clone(), entry.repository_context.clone())
+            (entry.state(), entry.repository_context.clone())
         };
         let flags = if is_file { NodeFlags::File.bits() } else { 0 };
         let node = Node {
@@ -456,7 +461,7 @@ mod tests {
             let entry = rt_handle::REGISTRY
                 .get(&handle.handle_id)
                 .expect("handle registered");
-            (entry.state.clone(), entry.repository_context.clone())
+            (entry.state(), entry.repository_context.clone())
         };
         let node = Node {
             flags: NodeFlags::File.bits(),
@@ -475,7 +480,7 @@ mod tests {
         let entry = rt_handle::REGISTRY
             .get(&handle.handle_id)
             .expect("handle registered");
-        (entry.state.clone(), entry.repository_context.clone())
+        (entry.state(), entry.repository_context.clone())
     }
 
     /// Add a link node under root targeting `(repository, revision, target_node)`.

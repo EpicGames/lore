@@ -1053,6 +1053,18 @@ impl Storage for GRPCStorage {
         self.client.get_metadata(session_id, &ctx, address).await
     }
 
+    async fn presign_downloads(
+        &self,
+        session_id: u32,
+        addresses: &[Address],
+        expires_in: Duration,
+    ) -> Result<Vec<DirectDownload>, ProtocolError> {
+        let ctx = self.session_context(session_id)?;
+        self.client
+            .presign_downloads(&ctx, addresses, expires_in)
+            .await
+    }
+
     async fn put(
         &self,
         session_id: u32,

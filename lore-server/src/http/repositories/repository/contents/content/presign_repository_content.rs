@@ -175,17 +175,19 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            // Verify the address exists before issuing a URL for it.
-            let match_result = immutable_store
+            // Verify the exact repository/context association and retain the
+            // logical length so redemption can serve byte ranges without a
+            // separate metadata round trip.
+            let query_result = immutable_store
                 .clone()
-                .exist(repository, parsed_address, StoreMatch::MatchFull)
+                .query(repository, parsed_address, StoreMatch::MatchFull)
                 .await
                 .map_err(|e| {
                     warn!(%e, "Presign exist check failed");
                     PresignError::StoreError
                 })?;
 
-            if match_result == StoreMatch::MatchNone {
+            if query_result.match_made != StoreMatch::MatchFull {
                 return Err(PresignError::NotFound);
             }
 
@@ -213,6 +215,7 @@ pub async fn handler(
                 content_type: body.content_type,
                 content_encoding: body.content_encoding,
                 content_disposition: body.content_disposition,
+                content_length: Some(query_result.fragment.size_content),
             };
 
             let token_str = sign(&payload, &presign_config.hmac_key);

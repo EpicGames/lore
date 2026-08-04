@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -13,12 +14,15 @@ use bytes::BytesMut;
 use lore_base::error::Disconnected;
 use lore_base::error::NotAuthorized;
 use lore_base::error::NotFound;
+use lore_base::error::NotSupported;
 use lore_base::error::Oversized;
 use lore_base::error::SlowDown;
 use lore_base::lore_debug;
 use lore_base::lore_trace;
+use lore_base::lore_warn;
 use lore_base::types::Address;
 use lore_base::types::Context;
+use lore_base::types::DirectDownload;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_base::types::HealResult;
@@ -48,6 +52,7 @@ use super::super::storage_service::Command;
 use super::super::storage_service::MAX_CHUNK_SIZE;
 use super::super::storage_service::auth::StorageClientAuth;
 use crate::connection::Connection;
+use crate::direct_download::DirectDownloadBatcher;
 use crate::error::ProtocolError;
 use crate::quic::client::CongestionAlgorithm;
 use crate::traits::Storage;
@@ -70,6 +75,7 @@ pub struct StorageClient {
     quic: Arc<QuicConnection>,
     connection_establish: Semaphore,
     command_limit: Semaphore,
+    direct_downloads: DirectDownloadBatcher,
     sent: AtomicUsize,
 }
 
@@ -113,6 +119,7 @@ impl StorageClient {
             counter: AtomicUsize::new(0),
             sent: AtomicUsize::new(0),
             command_limit: Semaphore::new(INFLIGHT_COMMAND_LIMIT),
+            direct_downloads: DirectDownloadBatcher::new(),
         }
     }
 
@@ -242,6 +249,9 @@ impl ServiceClient for StorageClient {
                         storage_service::command_name(&failed_request)
                     ),
                 }),
+                QuicClientError::NotSupported => ProtocolError::from(NotSupported {
+                    operation: storage_service::command_name(&failed_request).to_string(),
+                }),
                 _ => {
                     let name = storage_service::command_name(&failed_request);
                     ProtocolError::internal(format!(
@@ -336,6 +346,32 @@ impl Storage for StorageClient {
         session_id: u32,
         address: &Address,
     ) -> Result<(Fragment, Bytes), ProtocolError> {
+        match self
+            .direct_downloads
+            .presign(*address, |addresses, expires_in| async move {
+                self.presign_downloads(session_id, &addresses, expires_in)
+                    .await
+            })
+            .await
+        {
+            Ok(download) => match self.direct_downloads.download(download).await {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    lore_warn!(
+                        "Direct QUIC download failed for {}, falling back to server get: {err}",
+                        address
+                    );
+                }
+            },
+            Err(ProtocolError::NotSupported(_)) => {}
+            Err(err) => {
+                lore_debug!(
+                    "Direct QUIC presign failed for {}, falling back to server get: {err}",
+                    address
+                );
+            }
+        }
+
         let mut payload = send_normal_with_reconnect(self, Command::Get, session_id, || {
             [Bytes::default(), Bytes::from_owner(*address)]
         })
@@ -361,6 +397,91 @@ impl Storage for StorageClient {
         }
 
         Ok((fragment, payload))
+    }
+
+    async fn presign_downloads(
+        &self,
+        session_id: u32,
+        addresses: &[Address],
+        expires_in: Duration,
+    ) -> Result<Vec<DirectDownload>, ProtocolError> {
+        const MAX_BATCH: usize = lore_base::types::FRAGMENT_SIZE_EXPECTED / size_of::<Address>();
+        if addresses.len() > MAX_BATCH {
+            return Err(ProtocolError::internal(format!(
+                "presign_download: invalid address batch count: {}",
+                addresses.len()
+            )));
+        }
+        if addresses.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut request =
+            BytesMut::with_capacity(size_of::<u64>() + std::mem::size_of_val(addresses));
+        request.put_u64_le(expires_in.as_secs());
+        request.extend_from_slice(addresses.as_bytes());
+        let request = request.freeze();
+
+        let mut payload =
+            send_normal_with_reconnect(self, Command::PresignDownload, session_id, || {
+                [Bytes::default(), request.clone()]
+            })
+            .await?;
+
+        if payload.len() < size_of::<u32>() {
+            return Err(ProtocolError::internal(
+                "presign_download: invalid server response",
+            ));
+        }
+        let count =
+            u32::from_le_bytes(payload.split_to(size_of::<u32>())[..].try_into().unwrap()) as usize;
+
+        let mut downloads = Vec::with_capacity(count);
+        for _ in 0..count {
+            let fixed_len =
+                size_of::<Address>() + size_of::<Fragment>() + size_of::<u64>() + size_of::<u32>();
+            if payload.len() < fixed_len {
+                return Err(ProtocolError::internal(
+                    "presign_download: truncated response record",
+                ));
+            }
+
+            let address = Address::from(&payload.split_to(size_of::<Address>()));
+            let fragment_bytes = payload.split_to(size_of::<Fragment>());
+            let fragment = unsafe { fragment_bytes.as_ptr().cast::<Fragment>().read_unaligned() };
+            if let Err(reason) = lore_base::types::validate_fragment_response(&fragment) {
+                return Err(ProtocolError::internal(format!(
+                    "presign_download: invalid fragment {fragment:?}: {reason}"
+                )));
+            }
+            let expires_at_epoch_seconds =
+                u64::from_le_bytes(payload.split_to(size_of::<u64>())[..].try_into().unwrap());
+            let url_len =
+                u32::from_le_bytes(payload.split_to(size_of::<u32>())[..].try_into().unwrap())
+                    as usize;
+            if payload.len() < url_len {
+                return Err(ProtocolError::internal(
+                    "presign_download: truncated URL in response record",
+                ));
+            }
+            let url = String::from_utf8(payload.split_to(url_len).to_vec())
+                .map_err(|err| ProtocolError::internal_with_context(err, "presign_download url"))?;
+
+            downloads.push(DirectDownload {
+                address,
+                fragment,
+                url,
+                expires_at_epoch_seconds,
+            });
+        }
+
+        if !payload.is_empty() {
+            return Err(ProtocolError::internal(
+                "presign_download: trailing response bytes",
+            ));
+        }
+
+        Ok(downloads)
     }
 
     async fn get_metadata(
@@ -390,6 +511,32 @@ impl Storage for StorageClient {
         session_id: u32,
         address: &Address,
     ) -> Result<(Fragment, Bytes), ProtocolError> {
+        match self
+            .direct_downloads
+            .presign(*address, |addresses, expires_in| async move {
+                self.presign_downloads(session_id, &addresses, expires_in)
+                    .await
+            })
+            .await
+        {
+            Ok(download) => match self.direct_downloads.download(download).await {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    lore_warn!(
+                        "Direct QUIC priority download failed for {}, falling back to server get: {err}",
+                        address
+                    );
+                }
+            },
+            Err(ProtocolError::NotSupported(_)) => {}
+            Err(err) => {
+                lore_debug!(
+                    "Direct QUIC priority presign failed for {}, falling back to server get: {err}",
+                    address
+                );
+            }
+        }
+
         let mut payload = send_high_priority_with_reconnect(self, Command::Get, session_id, || {
             [Bytes::default(), Bytes::from_owner(*address)]
         })

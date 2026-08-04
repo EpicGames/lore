@@ -577,9 +577,35 @@ pub async fn read_stream(
     partition: Partition,
     address: Address,
     options: ReadOptions,
-    sender: tokio::sync::mpsc::Sender<Bytes>,
+    sender: tokio::sync::mpsc::Sender<Result<Bytes, StorageError>>,
     remote_session: Option<Arc<StorageSession>>,
 ) -> Result<u64, StorageError> {
+    let (content_size, _) = read_stream_range(
+        store,
+        partition,
+        address,
+        None,
+        options,
+        sender,
+        remote_session,
+    )
+    .await?;
+    Ok(content_size)
+}
+
+/// Read a logical byte range into a streaming channel. The root fragment and
+/// intermediate fragment lists are resolved by Lore, while only overlapping
+/// leaf payloads are fetched and the first/last leaves are sliced before
+/// emission. Returns `(full_content_size, normalized_range)`.
+pub async fn read_stream_range(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    range: Option<Range<u64>>,
+    options: ReadOptions,
+    sender: tokio::sync::mpsc::Sender<Result<Bytes, StorageError>>,
+    remote_session: Option<Arc<StorageSession>>,
+) -> Result<(u64, Range<u64>), StorageError> {
     let options = options.with_decompress();
     let (fragment, buffer) = load_fragment(
         store.clone(),
@@ -590,8 +616,28 @@ pub async fn read_stream(
     )
     .await?;
 
+    if let Some(max) = options.max_content_size
+        && fragment.size_content > max
+    {
+        return Err(StorageError::from(crate::errors::Oversized {
+            context: format!(
+                "fragment size_content {} exceeds caller-supplied max {max}",
+                fragment.size_content
+            ),
+        }));
+    }
+
+    let range = range.map_or(0..fragment.size_content, |range| {
+        range.start.min(fragment.size_content)..range.end.min(fragment.size_content)
+    });
+    if range.is_empty() {
+        return Ok((fragment.size_content, range));
+    }
+
     if (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented {
         let store = store.clone();
+        let error_sender = sender.clone();
+        let pipeline_range = range.clone();
         lore_base::lore_spawn!(async move {
             let result = defragment_pipeline(
                 store,
@@ -599,24 +645,31 @@ pub async fn read_stream(
                 address,
                 fragment,
                 buffer,
-                DefragmentSink::Stream { sender },
+                DefragmentSink::Stream {
+                    sender,
+                    range: pipeline_range,
+                },
                 options,
                 remote_session,
             )
             .await;
 
             if let Err(err) = result {
-                lore_base::lore_warn!("error while defragmenting during read_stream: {0}", err);
+                let _ = error_sender.send(Err(err)).await;
             }
         });
 
-        Ok(fragment.size_content)
+        Ok((fragment.size_content, range))
     } else {
+        let start = usize::try_from(range.start)
+            .map_err(|_| StorageError::internal("stream range start is too large"))?;
+        let end = usize::try_from(range.end)
+            .map_err(|_| StorageError::internal("stream range end is too large"))?;
         sender
-            .send(buffer)
+            .send(Ok(buffer.slice(start..end)))
             .await
             .map_err(|_err| StorageError::internal("stream send failed"))?;
-        Ok(fragment.size_content)
+        Ok((fragment.size_content, range))
     }
 }
 

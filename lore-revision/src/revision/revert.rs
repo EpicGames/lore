@@ -209,6 +209,7 @@ pub async fn revert(
         diff,
         state_current.clone(),
         MergeType::Revert,
+        &[],
         false,
         current_branch,
     )

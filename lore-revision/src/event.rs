@@ -361,6 +361,8 @@ pub enum LoreErrorCode {
     Internal = 3,
     /// The backing store is overloaded; the caller should retry later.
     SlowDown = 4,
+    /// The target branch tip advanced past the caller's parent revision.
+    BranchAdvanced = 5,
 }
 
 /// Data for an error event.

@@ -31,6 +31,8 @@ pub enum Command {
     /// `Fragment` only — no payload bytes. Used by callers that need fragment metadata for
     /// existence/size lookups without paying for the payload transfer.
     GetMetadata = 11,
+    /// Batch request for short-lived direct-download URLs for immutable payloads.
+    PresignDownload = 12,
 }
 
 impl From<Command> for QuicOpCode {
@@ -54,6 +56,7 @@ impl TryFrom<QuicOpCode> for Command {
             v if v == Command::MutableStore as u8 => Ok(Command::MutableStore),
             v if v == Command::MutableCas as u8 => Ok(Command::MutableCas),
             v if v == Command::GetMetadata as u8 => Ok(Command::GetMetadata),
+            v if v == Command::PresignDownload as u8 => Ok(Command::PresignDownload),
             _ => Err(UnknownCommand(value)),
         }
     }
@@ -77,6 +80,7 @@ pub fn command_name(command: &Command) -> &'static str {
         Command::MutableStore => "mutable_store",
         Command::MutableCas => "mutable_cas",
         Command::GetMetadata => "get_metadata",
+        Command::PresignDownload => "presign_download",
     }
 }
 

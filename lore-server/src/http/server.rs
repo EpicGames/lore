@@ -159,7 +159,7 @@ pub fn create_router(
         .layer(CoreHopLayer)
 }
 
-fn build_presign_config(settings: &PresignSettings) -> Result<Option<PresignConfig>> {
+pub(crate) fn build_presign_config(settings: &PresignSettings) -> Result<Option<PresignConfig>> {
     let Some(key_hex) = settings.hmac_key.as_deref() else {
         return Ok(None);
     };

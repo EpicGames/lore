@@ -8,6 +8,8 @@ use lore_proto::lore::thin_client::v1::ContentDiffRequest;
 use lore_proto::lore::thin_client::v1::ContentDiffResponse;
 use lore_proto::lore::thin_client::v1::RevisionDiffRequest;
 use lore_proto::lore::thin_client::v1::RevisionDiffResponse;
+use lore_proto::lore::thin_client::v1::RevisionFileDownloadRequest;
+use lore_proto::lore::thin_client::v1::RevisionFileDownloadResponse;
 use lore_proto::lore::thin_client::v1::RevisionInfoRequest;
 use lore_proto::lore::thin_client::v1::RevisionInfoResponse;
 use lore_proto::lore::thin_client::v1::RevisionTreeRequest;
@@ -19,10 +21,13 @@ use tonic::Response;
 use tonic::Status;
 use tonic::codegen::tokio_stream::Stream;
 
+use super::content_diff;
 use super::revision_diff;
+use super::revision_file_download;
 use super::revision_info;
 use super::revision_tree;
 use crate::grpc::timeout_grpc;
+use crate::http::server::PresignConfig;
 
 type ContentDiffStream =
     Pin<Box<dyn Stream<Item = Result<ContentDiffResponse, Status>> + Send + 'static>>;
@@ -53,6 +58,7 @@ pub struct LoreThinClientV1Service {
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     rpc_timeout: Duration,
     revision_diff_config: revision_diff::RevisionDiffConfig,
+    presign_config: Option<PresignConfig>,
     #[allow(dead_code)]
     instrument_provider: ThinClientServiceInstrumentProvider,
 }
@@ -63,12 +69,14 @@ impl LoreThinClientV1Service {
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         rpc_timeout: Duration,
         revision_diff_config: revision_diff::RevisionDiffConfig,
+        presign_config: Option<PresignConfig>,
     ) -> Self {
         Self {
             immutable_store,
             mutable_store,
             rpc_timeout,
             revision_diff_config,
+            presign_config,
             instrument_provider: ThinClientServiceInstrumentProvider,
         }
     }
@@ -88,11 +96,14 @@ impl ThinClientService for LoreThinClientV1Service {
 
     async fn content_diff(
         &self,
-        _request: Request<ContentDiffRequest>,
+        request: Request<ContentDiffRequest>,
     ) -> Result<Response<Self::ContentDiffStream>, Status> {
-        Err(Status::unimplemented(
-            "lore.thin_client.v1.ThinClientService.ContentDiff not yet implemented",
-        ))
+        content_diff::handler(
+            request,
+            self.immutable_store.clone(),
+            self.mutable_store.clone(),
+        )
+        .await
     }
 
     async fn revision_info(
@@ -135,6 +146,22 @@ impl ThinClientService for LoreThinClientV1Service {
             request,
             self.immutable_store.clone(),
             self.mutable_store.clone(),
+        )
+        .await
+    }
+
+    async fn revision_file_download(
+        &self,
+        request: Request<RevisionFileDownloadRequest>,
+    ) -> Result<Response<RevisionFileDownloadResponse>, Status> {
+        timeout_grpc(
+            self.rpc_timeout,
+            revision_file_download::handler(
+                request,
+                self.immutable_store.clone(),
+                self.mutable_store.clone(),
+                self.presign_config.clone(),
+            ),
         )
         .await
     }

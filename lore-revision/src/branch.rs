@@ -72,6 +72,7 @@ use crate::node::Node;
 use crate::node::NodeBlock;
 use crate::node::NodeFlags;
 use crate::node::NodeIDExt;
+use crate::path_merge::PathMergeRule;
 use crate::repository;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
@@ -2502,36 +2503,62 @@ pub async fn diff3(
     graft_view: Option<Arc<crate::filter::Filter>>,
     tx: mpsc::Sender<Result<DiffItem, BranchError>>,
 ) -> Result<Diff3Summary, BranchError> {
-    Box::pin(diff3_with_source_cap(
+    Box::pin(diff3_with_options(
         repository,
         source_branch,
         source_revision,
         target_branch,
         target_revision,
-        path,
-        include_same,
-        auto_resolve,
-        None,
-        None,
-        graft_view,
+        Diff3Options {
+            path,
+            include_same,
+            auto_resolve,
+            graft_view,
+            ..Default::default()
+        },
         tx,
     ))
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn diff3_with_source_cap(
+/// Optional behavior for streaming branch 3-way diffs.
+#[derive(Clone, Debug)]
+pub struct Diff3Options<'a> {
+    pub path: Option<RelativePath>,
+    pub include_same: bool,
+    pub auto_resolve: bool,
+    /// Abort when source's diff produces more than this many items.
+    pub source_cap: Option<usize>,
+    /// Permit count for parallel history-walk conflict checks.
+    pub history_walk_concurrency: Option<usize>,
+    /// Ordered per-path merge rules used to suppress matching merge inputs.
+    pub path_merge_rules: &'a [PathMergeRule],
+    /// View used to identify untouched out-of-view subtrees that can be grafted.
+    /// `None` disables graft adoption.
+    pub graft_view: Option<Arc<crate::filter::Filter>>,
+}
+
+impl Default for Diff3Options<'_> {
+    fn default() -> Self {
+        Self {
+            path: None,
+            include_same: false,
+            auto_resolve: false,
+            source_cap: None,
+            history_walk_concurrency: None,
+            path_merge_rules: &[],
+            graft_view: None,
+        }
+    }
+}
+
+pub async fn diff3_with_options(
     repository: Arc<RepositoryContext>,
     source_branch: BranchId,
     source_revision: Hash,
     target_branch: BranchId,
     target_revision: Hash,
-    path: Option<RelativePath>,
-    include_same: bool,
-    auto_resolve: bool,
-    source_cap: Option<usize>,
-    history_walk_concurrency: Option<usize>,
-    graft_view: Option<Arc<crate::filter::Filter>>,
+    options: Diff3Options<'_>,
     tx: mpsc::Sender<Result<DiffItem, BranchError>>,
 ) -> Result<Diff3Summary, BranchError> {
     lore_info!(
@@ -2558,16 +2585,20 @@ pub async fn diff3_with_source_cap(
     };
 
     let (inner_tx, mut inner_rx) = mpsc::channel::<Result<DiffItem, StateError>>(256);
-    let mut driver = std::pin::pin!(revision::diff3_with_source_cap(
+    let auto_resolve = options.auto_resolve;
+    let mut driver = std::pin::pin!(revision::diff3_with_options(
         repository.clone(),
         base_revision,
         source_revision,
         target_revision,
-        path,
-        include_same,
-        source_cap,
-        history_walk_concurrency,
-        graft_view,
+        revision::Diff3Options {
+            path: options.path,
+            include_same: options.include_same,
+            source_cap: options.source_cap,
+            history_walk_concurrency: options.history_walk_concurrency,
+            path_merge_rules: options.path_merge_rules,
+            graft_view: options.graft_view,
+        },
         inner_tx,
     ));
     loop {
@@ -3054,16 +3085,18 @@ pub async fn diff3_collect(
     include_same: bool,
     auto_resolve: bool,
 ) -> Result<DiffResult, BranchError> {
-    diff3_collect_with_graft(
+    diff3_collect_with_options(
         repository,
         source_branch,
         source_revision,
         target_branch,
         target_revision,
-        path,
-        include_same,
-        auto_resolve,
-        None,
+        Diff3Options {
+            path,
+            include_same,
+            auto_resolve,
+            ..Default::default()
+        },
     )
     .await
 }
@@ -3084,17 +3117,39 @@ pub async fn diff3_collect_with_graft(
     auto_resolve: bool,
     graft_view: Option<Arc<crate::filter::Filter>>,
 ) -> Result<DiffResult, BranchError> {
+    diff3_collect_with_options(
+        repository,
+        source_branch,
+        source_revision,
+        target_branch,
+        target_revision,
+        Diff3Options {
+            path,
+            include_same,
+            auto_resolve,
+            graft_view,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+pub async fn diff3_collect_with_options(
+    repository: Arc<RepositoryContext>,
+    source_branch: BranchId,
+    source_revision: Hash,
+    target_branch: BranchId,
+    target_revision: Hash,
+    options: Diff3Options<'_>,
+) -> Result<DiffResult, BranchError> {
     let (summary, items) = crate::util::collect_stream::collect_stream_with_summary(|tx| {
-        diff3(
+        diff3_with_options(
             repository,
             source_branch,
             source_revision,
             target_branch,
             target_revision,
-            path,
-            include_same,
-            auto_resolve,
-            graft_view,
+            options,
             tx,
         )
     })

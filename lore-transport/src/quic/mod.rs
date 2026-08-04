@@ -42,6 +42,7 @@ pub enum QuicServiceError {
     Failed = 3,
     NotFound = 4,
     Oversized = 5,
+    NotSupported = 6,
     SlowDown = 100,
     // service specific implementations can use 200-299
     ImplementationReserved = RESERVED_ERROR_CODE_START,
@@ -82,6 +83,8 @@ pub enum QuicClientError {
     NotFound,
     #[error("Oversized fragment rejected by server")]
     Oversized,
+    #[error("Operation not supported")]
+    NotSupported,
 }
 
 #[derive(Debug)]

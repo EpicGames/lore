@@ -24,6 +24,7 @@ pub mod options;
 pub mod packstore;
 pub mod read;
 pub mod store_types;
+pub mod stream_write;
 #[cfg(test)]
 pub(crate) mod test_util;
 pub(crate) mod typed_bytes;
@@ -98,6 +99,7 @@ pub use local::mutable_store::LocalMutableStoreError;
 pub use local::mutable_store::MutableStoreSettings;
 use lore_base::lore_info;
 use lore_base::lore_warn;
+pub use lore_base::types::DirectDownload;
 // Re-export maintenance functions
 pub use maintenance::compactor;
 pub use maintenance::evictor;
@@ -119,6 +121,7 @@ pub use read::read_into;
 pub use read::read_into_file;
 pub use read::read_raw;
 pub use read::read_stream;
+pub use read::read_stream_range;
 pub use read::remote_fetch_inflight;
 pub use read::write_all_to_file;
 // Re-export store types
@@ -127,6 +130,8 @@ pub use store_types::KeyValueStream;
 pub use store_types::StoreMatch;
 pub use store_types::StoreObliterateStats;
 pub use store_types::StoreQueryResult;
+pub use stream_write::ContentStreamError;
+pub use stream_write::write_content_stream;
 pub use typed_bytes::TypedBytes;
 pub use typed_bytes::TypedBytesMut;
 pub use types::Address;

@@ -37,6 +37,7 @@ use crate::errors::SlowDown;
 use crate::fragment::FragmentFlags;
 use crate::lore::Address;
 use crate::lore::Context;
+use crate::lore::DirectDownload;
 use crate::lore::Fragment;
 use crate::lore::Partition;
 use crate::lore_debug;
@@ -1052,6 +1053,19 @@ impl ImmutableStore for CompositeStore {
                 })
             }
         }
+    }
+
+    async fn presign_downloads(
+        self: Arc<Self>,
+        repository: Partition,
+        addresses: &[Address],
+        match_required: StoreMatch,
+        expires_in: Duration,
+    ) -> Result<Vec<DirectDownload>, StoreError> {
+        self.durable
+            .store()
+            .presign_downloads(repository, addresses, match_required, expires_in)
+            .await
     }
 
     async fn put(

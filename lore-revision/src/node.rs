@@ -1863,6 +1863,7 @@ pub struct NodeFileMetadataBlockData {
 
 impl ReadBoxFromImmutable for NodeFileMetadataBlockData {}
 impl ZeroHeapAlloc for NodeFileMetadataBlockData {}
+impl CloneHeapAlloc for NodeFileMetadataBlockData {}
 
 /// Legacy block of file metadata with 511 elements (old format before extension to 512)
 #[repr(C)]
@@ -1876,6 +1877,7 @@ struct NodeFileMetadataBlockDataV0 {
 
 impl ReadBoxFromImmutable for NodeFileMetadataBlockDataV0 {}
 impl ZeroHeapAlloc for NodeFileMetadataBlockDataV0 {}
+impl CloneHeapAlloc for NodeFileMetadataBlockDataV0 {}
 
 impl NodeFileMetadataBlockDataV0 {
     /// Convert the old 511-element block into the current 512-element format.

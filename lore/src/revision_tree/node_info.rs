@@ -121,6 +121,7 @@ async fn node_info_impl(
         },
         async move |internal, args: LoreRevisionTreeNodeInfoArgs| {
             let id = args.id;
+            let state = internal.state();
             let node_id = args.node_id;
 
             if !node_id.is_valid_or_root_node_id() {
@@ -128,8 +129,7 @@ async fn node_info_impl(
                 return Err(invalid("node id is invalid"));
             }
 
-            let Ok(node) = internal
-                .state
+            let Ok(node) = state
                 .node(internal.repository_context.clone(), node_id)
                 .await
             else {
@@ -137,11 +137,17 @@ async fn node_info_impl(
                 return Err(invalid("node id is unknown"));
             };
 
+            // A discarded slot keeps its name for history weaving; the node
+            // itself is gone (e.g. deleted through this handle).
+            if node.is_discarded() {
+                emit_node_info_error(id, LoreErrorCode::InvalidArguments);
+                return Err(invalid("node id resolves to a deleted node"));
+            }
+
             let name = if node_id == ROOT_NODE {
                 String::new()
             } else {
-                match internal
-                    .state
+                match state
                     .node_name_clone(internal.repository_context.clone(), node_id)
                     .await
                 {
@@ -175,7 +181,7 @@ async fn node_info_impl(
                 id,
                 node_id,
                 repository: internal.repository,
-                revision: internal.state.revision(),
+                revision: state.revision(),
                 name: LoreString::from(name.as_str()),
                 parent_id: node.parent,
                 kind,
@@ -281,7 +287,7 @@ mod tests {
         let entry = rt_handle::REGISTRY
             .get(&handle.handle_id)
             .expect("handle registered");
-        (entry.state.clone(), entry.repository_context.clone())
+        (entry.state(), entry.repository_context.clone())
     }
 
     /// Add a file under root with explicit metadata so the record fields can be

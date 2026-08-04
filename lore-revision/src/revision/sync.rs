@@ -529,6 +529,7 @@ pub async fn sync(
                 message: String::new(),
                 no_commit: false,
                 scope: merge::MergeScope::MainOnly,
+                path_merge_rules: Vec::new(),
             };
             let revision_staged = Box::pin(merge::merge_start(
                 repository.clone(),

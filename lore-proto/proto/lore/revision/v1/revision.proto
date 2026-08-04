@@ -21,6 +21,10 @@ service RevisionService {
   // Set the tip of a branch to a specific revision. Supports force and
   // fast-forward-merge semantics.
   rpc BranchPush       (BranchPushRequest)        returns (BranchPushResponse);
+  // Authoritatively merge a pinned source branch tip into a pinned target
+  // branch tip, optionally resolving each conflict to the target or source
+  // side. The target moves only after the entire merge succeeds.
+  rpc BranchMerge      (BranchMergeRequest)       returns (BranchMergeResponse);
   // Cheap hash-only read of a branch's current metadata pointer.
   rpc BranchMetadataGet(BranchMetadataGetRequest) returns (BranchMetadataGetResponse);
   // Compare-and-swap update of a branch's metadata pointer. CAS miss is
@@ -28,6 +32,10 @@ service RevisionService {
   rpc BranchMetadataSet(BranchMetadataSetRequest) returns (BranchMetadataSetResponse);
   // Page through a branch's revision history. Server picks page size.
   rpc RevisionList     (RevisionListRequest)      returns (RevisionListResponse);
+  // Atomically apply an address-backed path changeset to an observed branch
+  // tip. Immutable construction happens first; the same protected BranchPush
+  // CAS path used by BranchPush is the visibility point.
+  rpc RevisionCreate   (RevisionCreateRequest)    returns (RevisionCreateResponse);
 }
 
 // Request to create a new branch. The caller must supply a fully-resolved
@@ -148,6 +156,86 @@ message BranchPushResponse {
   optional string message = 4;
 }
 
+// Which complete side of a merge conflict should be retained. Values are
+// intentionally prefixed because protobuf enum values share package scope.
+enum BranchMergeSide {
+  BRANCH_MERGE_SIDE_UNSPECIFIED = 0;
+  // Keep the target branch's version of the conflicted path.
+  BRANCH_MERGE_SIDE_TARGET = 1;
+  // Apply the source branch's version of the conflicted path.
+  BRANCH_MERGE_SIDE_SOURCE = 2;
+}
+
+// Terminal result of a BranchMerge attempt.
+enum BranchMergeOutcome {
+  BRANCH_MERGE_OUTCOME_UNSPECIFIED = 0;
+  // A two-parent revision was published to the target branch.
+  BRANCH_MERGE_OUTCOME_MERGED = 1;
+  // The source introduced no changes relative to the resolved base.
+  BRANCH_MERGE_OUTCOME_ALREADY_UP_TO_DATE = 2;
+  // One or more conflicts still need an explicit resolution.
+  BRANCH_MERGE_OUTCOME_CONFLICTED = 3;
+}
+
+// Request for an atomic, server-authored branch merge. Both tips are required
+// optimistic-concurrency guards; stale tips fail with FAILED_PRECONDITION.
+message BranchMergeRequest {
+  // Required caller-generated UUIDv7. A successfully published request is
+  // idempotent; reusing its id with different content is rejected.
+  bytes request_id = 1;
+  // Branch that will move when the merge succeeds.
+  bytes branch_id_target = 2;
+  // Exact target tip observed by the caller.
+  bytes revision_signature_target = 3;
+  // Branch whose changes will be merged into the target.
+  bytes branch_id_source = 4;
+  // Exact source tip observed by the caller.
+  bytes revision_signature_source = 5;
+  // Commit message for the server-authored merge revision.
+  string commit_message = 6;
+  // Per-conflict decisions keyed by RevisionDiff conflict_id. Missing
+  // decisions are returned in-band and cause no branch mutation.
+  repeated BranchMergeResolution resolutions = 7;
+}
+
+// Resolution for one conflict. The oneof is an extension point for a future
+// custom/uploaded-content resolution without changing existing clients.
+message BranchMergeResolution {
+  // Stable conflict id emitted by RevisionDiff for the same pinned tips.
+  bytes conflict_id = 1;
+  // Requested resolution strategy.
+  oneof resolution {
+    // Keep the complete target or source side.
+    BranchMergeSide side = 2;
+  }
+}
+
+// Minimal conflict identity returned by BranchMerge. Clients can obtain full
+// content addresses and presentation diffs from RevisionDiff.
+message BranchMergeConflict {
+  // Stable id accepted by BranchMergeResolution.
+  bytes conflict_id = 1;
+  // Path changed on the source side.
+  string path_source = 2;
+  // Path changed on the target side.
+  string path_target = 3;
+}
+
+// Result of an authoritative merge attempt. CONFLICTED and
+// ALREADY_UP_TO_DATE are successful, non-mutating outcomes.
+message BranchMergeResponse {
+  // Machine-readable outcome.
+  BranchMergeOutcome outcome = 1;
+  // Published target tip for MERGED, otherwise the pinned target tip.
+  bytes revision_signature = 2;
+  // Revision number corresponding to revision_signature.
+  uint64 revision_number = 3;
+  // Common ancestor selected by the server.
+  bytes revision_signature_base = 4;
+  // Conflicts lacking a supplied decision. Empty for terminal outcomes.
+  repeated BranchMergeConflict unresolved_conflicts = 5;
+}
+
 // Request for a cheap hash-only read of a branch's metadata pointer.
 message BranchMetadataGetRequest {
   // Branch id.
@@ -216,6 +304,69 @@ message RevisionListResponse {
   // the page of revisions older than this one. Unset when no further
   // older revisions exist.
   optional bytes signature_backward = 3;
+}
+
+// Request to atomically apply a path changeset to a pinned branch tip.
+message RevisionCreateRequest {
+  // Required caller-generated UUIDv7. Reusing it with identical request bytes
+  // returns the original result; reuse with different bytes is rejected.
+  bytes request_id = 1;
+  bytes branch_id = 2;
+  // Exact branch tip observed by the caller. Zero is valid only for an
+  // initial/root revision. Stale bases fail with FAILED_PRECONDITION.
+  bytes revision_signature_base = 3;
+  string commit_message = 4;
+  repeated RevisionCreateMetadataEntry metadata = 5;
+  repeated RevisionCreateOperation operations = 6;
+}
+
+// Caller-supplied metadata entry for a new revision.
+message RevisionCreateMetadataEntry {
+  string key = 1;
+  bytes value = 2;
+  // lore metadata type encoding (Address=1, Boolean=2, Context=3, Hash=4,
+  // Numeric=5, String=6, Binary=255).
+  uint32 format = 3;
+}
+
+// One path-level edit in a RevisionCreate changeset.
+message RevisionCreateOperation {
+  oneof op {
+    RevisionCreatePutFile put_file = 1;
+    RevisionCreateDirectory create_directory = 2;
+    RevisionCreateDeletePath delete_path = 3;
+    RevisionCreateMovePath move_path = 4;
+  }
+}
+
+// Add or replace a file with content previously uploaded to Lore.
+message RevisionCreatePutFile {
+  string path = 1;
+  uint32 mode = 2;
+  // UploadContent result. The server verifies the exact repository/context
+  // association and derives logical size from immutable fragment metadata.
+  lore.model.v1.Address address = 3;
+}
+
+// Create an empty directory at a path.
+message RevisionCreateDirectory {
+  string path = 1;
+  uint32 mode = 2;
+}
+
+// Delete a file or directory tree at a path.
+message RevisionCreateDeletePath { string path = 1; }
+
+// Move or rename a path while preserving its file identity.
+message RevisionCreateMovePath {
+  string source = 1;
+  string destination = 2;
+}
+
+// Published revision identity returned by RevisionCreate.
+message RevisionCreateResponse {
+  bytes revision_signature = 1;
+  uint64 revision_number = 2;
 }
 
 // A service to receive requests forwarded on from another Lore Sever,

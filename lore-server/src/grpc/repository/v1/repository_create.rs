@@ -30,6 +30,7 @@ use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
+use crate::grpc::handlers::repository_create::ensure_default_branch_name_matches;
 use crate::grpc::handlers::repository_create::repository_create_auth_resource;
 use crate::grpc::hook_error_to_status;
 use crate::grpc::warn_error_to_status;
@@ -250,6 +251,12 @@ async fn repository_create_inner(
         repository_load_id(repository.clone(), repository.id, None, None).await
     {
         return if metadata.name == name {
+            ensure_default_branch_name_matches(
+                repository.id,
+                metadata.default_branch_name.as_str(),
+                default_branch_name,
+            )?;
+
             info!(
                 "Repository {} already exist with name {}, early out create successful",
                 repository.id, metadata.name
@@ -280,6 +287,12 @@ async fn repository_create_inner(
         repository_load_name(repository.clone(), name, None, None).await
     {
         return if id == repository.id {
+            ensure_default_branch_name_matches(
+                id,
+                metadata.default_branch_name.as_str(),
+                default_branch_name,
+            )?;
+
             info!(
                 "Repository {} already exist with id {}, early out create successful",
                 name, id

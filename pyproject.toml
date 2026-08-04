@@ -17,11 +17,8 @@ dev = ["ruff>=0.9.6", "pyright>=1.1.396"]
 
 [tool.ruff]
 target-version = "py313"
-extend-exclude = [".urc", ".lore"]
+extend-exclude = [".urc", ".spacesync"]
 
 [tool.pytest.ini_options]
 addopts = "--dist loadgroup --tb=short -rsxX"
-markers = [
-    "smoke: marks as smoke test",
-    "slow: marks as a slow running test",
-]
+markers = ["smoke: marks as smoke test", "slow: marks as a slow running test"]

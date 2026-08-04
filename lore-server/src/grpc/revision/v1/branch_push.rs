@@ -102,116 +102,154 @@ pub async fn handler(
         mutable_store,
         repository_id,
     ));
-    let repository_id: RepositoryId = repository.id;
     let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
 
     LORE_CONTEXT
-        .scope(execution, async move {
-            let mut ctx_builder = HookContext::builder()
-                .correlation_id(correlation_id.clone())
-                .hook_point(HookPoint::BranchPush)
-                .repository(repository_id)
-                .user(user_id.clone())
-                .branch(branch_id)
-                .revision(revision);
-
-            if let Some(ip) = client_ip {
-                ctx_builder = ctx_builder.metadata("client_ip", ip);
-            }
-
-            let mut hook_ctx = ctx_builder.build();
-
-            hook_dispatcher
-                .dispatch_pre(HookPoint::BranchPush, &hook_ctx)
-                .map_err(hook_error_to_status)?;
-
-            ensure_branch_pushable(repository.clone(), branch_id).await?;
-
-            let PushResult {
-                success,
-                fast_forward_merged,
-                revision: resulting_revision,
-                revision_number,
-            } = push(
-                repository.clone(),
+        .scope(
+            execution,
+            publish_revision(
+                repository,
                 branch_id,
                 revision,
                 bypass_protection,
                 force,
                 fast_forward_merge,
+                client_ip,
+                correlation_id,
+                user_id,
+                notification,
+                hook_dispatcher,
                 history_step_size,
                 acceleration,
-            )
-            .await?;
-
-            instrument_provider
-                .counter("num_branches_pushed")
-                .add(1, &[]);
-
-            if !success {
-                let detail = if fast_forward_merge {
-                    format!("Fast-forward merge has conflicts; branch latest: {resulting_revision}")
-                } else {
-                    format!(
-                        "Branch push is not a fast-forward; branch latest: {resulting_revision}"
-                    )
-                };
-                debug!(
-                    {BRANCH_ID} = %branch_id,
-                    branch_latest = %resulting_revision,
-                    fast_forward_merge,
-                    "Branch push rejected",
-                );
-                return Err(Status::failed_precondition(detail));
-            }
-
-            lore_spawn!({
-                let user_id = user_id.clone();
-                async move {
-                    notification
-                        .branch_pushed(
-                            repository_id,
-                            branch_id,
-                            &user_id,
-                            resulting_revision,
-                            revision_number,
-                        )
-                        .instrument(span!(Level::DEBUG, "publish_notification"))
-                        .await;
-                }
-                .in_current_span()
-            });
-
-            hook_ctx.set_revision_number(revision_number);
-            hook_dispatcher.spawn_post(HookPoint::BranchPush, hook_ctx);
-
-            let message = dispatch_response_message(
-                hook_dispatcher,
-                &correlation_id,
-                &user_id,
-                repository_id,
-                branch_id,
-                resulting_revision,
-                repository.clone(),
-            )
-            .await;
-
-            debug!(
-                {BRANCH_ID} = %branch_id,
-                {REVISION} = %resulting_revision,
-                revision_number,
-                fast_forward_merged,
-                "Branch push response",
-            );
-
-            Ok(Response::new(BranchPushResponse {
-                revision_signature: resulting_revision.into(),
-                revision_number,
-                fast_forward_merged,
-                message,
-            }))
-        })
+                instrument_provider,
+            ),
+        )
         .await
+}
+
+/// Shared authoritative publication orchestration for BranchPush and
+/// server-constructed revisions. The low-level CAS helper is intentionally
+/// kept behind this function so callers cannot skip protection, hooks,
+/// fragment verification, notifications, or response hooks.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn publish_revision(
+    repository: Arc<RepositoryContext>,
+    branch_id: BranchId,
+    revision: Hash,
+    bypass_protection: bool,
+    force: bool,
+    fast_forward_merge: bool,
+    client_ip: Option<String>,
+    correlation_id: String,
+    user_id: String,
+    notification: Arc<dyn NotificationSender>,
+    hook_dispatcher: &HookDispatcher,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
+    instrument_provider: &impl InstrumentProvider,
+) -> Result<Response<BranchPushResponse>, Status> {
+    let repository_id: RepositoryId = repository.id;
+    let mut ctx_builder = HookContext::builder()
+        .correlation_id(correlation_id.clone())
+        .hook_point(HookPoint::BranchPush)
+        .repository(repository_id)
+        .user(user_id.clone())
+        .branch(branch_id)
+        .revision(revision);
+
+    if let Some(ip) = client_ip {
+        ctx_builder = ctx_builder.metadata("client_ip", ip);
+    }
+
+    let mut hook_ctx = ctx_builder.build();
+
+    hook_dispatcher
+        .dispatch_pre(HookPoint::BranchPush, &hook_ctx)
+        .map_err(hook_error_to_status)?;
+
+    ensure_branch_pushable(repository.clone(), branch_id).await?;
+
+    let PushResult {
+        success,
+        fast_forward_merged,
+        revision: resulting_revision,
+        revision_number,
+    } = push(
+        repository.clone(),
+        branch_id,
+        revision,
+        bypass_protection,
+        force,
+        fast_forward_merge,
+        history_step_size,
+        acceleration,
+    )
+    .await?;
+
+    instrument_provider
+        .counter("num_branches_pushed")
+        .add(1, &[]);
+
+    if !success {
+        let detail = if fast_forward_merge {
+            format!("Fast-forward merge has conflicts; branch latest: {resulting_revision}")
+        } else {
+            format!("Branch push is not a fast-forward; branch latest: {resulting_revision}")
+        };
+        debug!(
+            {BRANCH_ID} = %branch_id,
+            branch_latest = %resulting_revision,
+            fast_forward_merge,
+            "Branch push rejected",
+        );
+        return Err(Status::failed_precondition(detail));
+    }
+
+    lore_spawn!({
+        let user_id = user_id.clone();
+        async move {
+            notification
+                .branch_pushed(
+                    repository_id,
+                    branch_id,
+                    &user_id,
+                    resulting_revision,
+                    revision_number,
+                )
+                .instrument(span!(Level::DEBUG, "publish_notification"))
+                .await;
+        }
+        .in_current_span()
+    });
+
+    hook_ctx.set_revision_number(revision_number);
+    hook_dispatcher.spawn_post(HookPoint::BranchPush, hook_ctx);
+
+    let message = dispatch_response_message(
+        hook_dispatcher,
+        &correlation_id,
+        &user_id,
+        repository_id,
+        branch_id,
+        resulting_revision,
+        repository.clone(),
+    )
+    .await;
+
+    debug!(
+        {BRANCH_ID} = %branch_id,
+        {REVISION} = %resulting_revision,
+        revision_number,
+        fast_forward_merged,
+        "Branch push response",
+    );
+
+    Ok(Response::new(BranchPushResponse {
+        revision_signature: resulting_revision.into(),
+        revision_number,
+        fast_forward_merged,
+        message,
+    }))
 }
 
 /// Returns `NotFound` for branch ids without metadata, and reinstates

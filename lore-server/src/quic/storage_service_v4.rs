@@ -30,6 +30,7 @@ use crate::protocol::storage::messages::Response;
 use crate::protocol::storage::mutable_cas::handle_mutable_cas;
 use crate::protocol::storage::mutable_load::handle_mutable_load;
 use crate::protocol::storage::mutable_store_handler::handle_mutable_store;
+use crate::protocol::storage::presign_download::handle_presign_download;
 use crate::protocol::storage::put::handle_put;
 use crate::protocol::storage::query::handle_query;
 use crate::protocol::storage::session::SessionError;
@@ -80,6 +81,7 @@ fn quic_error_v4(error: &MessageHandleError) -> QuicServiceError {
             QuicServiceError::SlowDown
         }
         MessageHandleError::Oversized => QuicServiceError::Oversized,
+        MessageHandleError::NotImplemented => QuicServiceError::NotSupported,
         _ => QuicServiceError::Failed,
     }
 }
@@ -261,6 +263,17 @@ impl QuicService for StorageServiceV4 {
                             repository,
                             correlation_id,
                             user_id,
+                            self.immutable_store.clone(),
+                        )
+                        .await
+                    }
+                    crate::quic::storage_service::ParsedStorageRequest::PresignDownload(
+                        presign,
+                    ) => {
+                        handle_presign_download(
+                            &presign.address,
+                            presign.expires_in,
+                            repository,
                             self.immutable_store.clone(),
                         )
                         .await

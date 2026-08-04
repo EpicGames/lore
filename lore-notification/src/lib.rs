@@ -7,6 +7,8 @@ mod client;
 pub fn initialize() {
     let service = Arc::new(client::NotificationService);
     lore_revision::notification::register_notification_service("https", service.clone());
+    lore_revision::notification::register_notification_service("spacesync", service.clone());
+    lore_revision::notification::register_notification_service("spacesyncs", service.clone());
     lore_revision::notification::register_notification_service("lore", service.clone());
     lore_revision::notification::register_notification_service("lores", service.clone());
     // Legacy protocol schemes for backwards compatibility

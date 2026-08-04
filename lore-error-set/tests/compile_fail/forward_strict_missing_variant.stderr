@@ -12,14 +12,14 @@ help: the trait `Has<Timeout>` is not implemented for `NarrowTarget`
 49 | #[error_set]
    | ^^^^^^^^^^^^
    = note: strict .forward requires the target to declare every variant of the source; see the `Has<…>` requirement below for the specific missing variant. Add the variant to `NarrowTarget` to preserve it.
-help: `NarrowTarget` implements trait `Has<V>`
+help: the following other types implement trait `Has<V>`
   --> tests/compile_fail/forward_strict_missing_variant.rs:49:1
    |
 49 | #[error_set]
    | ^^^^^^^^^^^^
    | |
-   | `Has<Internal>`
-   | `Has<NotFound>`
+   | `NarrowTarget` implements `Has<Internal>`
+   | `NarrowTarget` implements `Has<NotFound>`
    = note: required for `NarrowTarget` to implement `HasAll<Cons<Timeout, Nil>>`
    = note: 1 redundant requirement hidden
    = note: required for `NarrowTarget` to implement `HasAll<Cons<NotFound, Cons<Timeout, Nil>>>`

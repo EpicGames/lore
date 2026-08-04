@@ -1155,7 +1155,7 @@ pub enum RepositoryAccess {
 }
 
 pub const DOT_URC: &str = ".urc";
-pub const DOT_LORE: &str = ".lore";
+pub const DOT_LORE: &str = ".spacesync";
 pub const ID: &str = "id";
 pub const INSTANCE: &str = "instance";
 pub const CONFIG: &str = "config.toml";

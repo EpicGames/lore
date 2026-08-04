@@ -113,6 +113,8 @@ pub struct CreateOptions {
     pub id: Option<RepositoryId>,
     // Repository description
     pub description: Option<String>,
+    // Name of the default branch
+    pub default_branch_name: Option<String>,
     // Whether to use the shared store and options configuring it if desired
     pub shared_store_options: Option<SharedStoreToUseConfig>,
 }
@@ -171,8 +173,16 @@ pub async fn create_with_metadata(
 
     let id = options.id.unwrap_or_else(|| uuid::Uuid::now_v7().into());
 
-    // TODO(mjansson): Make this configurable in arguments and command line
-    let branch_name = branch::DEFAULT_DEFAULT_NAME;
+    let branch_name = options
+        .default_branch_name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(branch::DEFAULT_DEFAULT_NAME);
+    if !branch::is_valid_name(branch_name) {
+        return Err(CreateError::from(InvalidArguments {
+            reason: format!("invalid default branch name: {branch_name}"),
+        }));
+    }
     // Use the hash of the default name for the main branch ID to make it
     // easily distinguishable in logs even in the ID form.
     let branch = if branch_name == branch::DEFAULT_DEFAULT_NAME {

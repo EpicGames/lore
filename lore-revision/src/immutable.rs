@@ -222,14 +222,45 @@ pub async fn read_stream(
     repository: Arc<RepositoryContext>,
     address: Address,
     options: ReadOptions,
-    sender: Sender<Bytes>,
+    sender: Sender<Result<Bytes, ImmutableError>>,
 ) -> Result<u64, ImmutableError> {
+    let (content_size, _) = read_stream_range(repository, address, None, options, sender).await?;
+    Ok(content_size)
+}
+
+pub async fn read_stream_range(
+    repository: Arc<RepositoryContext>,
+    address: Address,
+    range: Option<Range<u64>>,
+    options: ReadOptions,
+    sender: Sender<Result<Bytes, ImmutableError>>,
+) -> Result<(u64, Range<u64>), ImmutableError> {
     let store = repository.immutable_store();
     let partition = repository.id;
     let session = Some(resolve_session(&repository));
-    lore_storage::read_stream(store, partition, address, options, sender, session)
-        .await
-        .forward("reading immutable data")
+    let (storage_sender, mut storage_receiver) = tokio::sync::mpsc::channel(sender.max_capacity());
+    let result = lore_storage::read_stream_range(
+        store,
+        partition,
+        address,
+        range,
+        options,
+        storage_sender,
+        session,
+    )
+    .await
+    .forward::<ImmutableError>("reading immutable data")?;
+    lore_spawn!(async move {
+        while let Some(item) = storage_receiver.recv().await {
+            let item = item.map_err(|error| {
+                ImmutableError::internal_with_context(error, "reading immutable stream")
+            });
+            if sender.send(item).await.is_err() {
+                break;
+            }
+        }
+    });
+    Ok(result)
 }
 
 /// Read the given data range from a fragment which can be a large data set

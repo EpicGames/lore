@@ -73,6 +73,7 @@ pub struct LoreStorageService {
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     local_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    upload_content_max_bytes: Option<u64>,
 }
 
 impl LoreStorageService {
@@ -85,7 +86,17 @@ impl LoreStorageService {
             immutable_store,
             local_store,
             mutable_store,
+            upload_content_max_bytes: None,
         }
+    }
+
+    pub fn with_upload_content_max_bytes(mut self, max_bytes: Option<u64>) -> Self {
+        self.upload_content_max_bytes = max_bytes;
+        self
+    }
+
+    pub fn upload_content_max_bytes(&self) -> Option<u64> {
+        self.upload_content_max_bytes
     }
 
     pub fn local_immutable_store(&self) -> &Arc<dyn lore_storage::ImmutableStore> {

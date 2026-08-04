@@ -548,8 +548,18 @@ async fn apply_wave(
                         .await
                     {
                         Ok(node_id) => {
-                            emit_add_complete(item.id, node_id, LoreErrorCode::None);
-                            landed.push((index, node_id));
+                            // Preserve the existing low-level revision-tree edit contract:
+                            // the new node is StagedAdd and ancestor directories are staged.
+                            match state
+                                .node_mark(context.clone(), node_id, NodeFlags::StagedAdd, true)
+                                .await
+                            {
+                                Ok(()) => {
+                                    emit_add_complete(item.id, node_id, LoreErrorCode::None);
+                                    landed.push((index, node_id));
+                                }
+                                Err(_) => emit_add_error(item.id, LoreErrorCode::Internal),
+                            }
                         }
                         Err(_) => emit_add_error(item.id, LoreErrorCode::Internal),
                     }
@@ -690,8 +700,9 @@ async fn add_batch(
         return Ok(());
     }
     let context = internal.repository_context.clone();
-    let planned = plan_entries(&internal.state, &context, args.entries.as_slice()).await?;
-    apply_plan(args.clone(), internal.state.clone(), context, planned).await
+    let state = internal.state();
+    let planned = plan_entries(&state, &context, args.entries.as_slice()).await?;
+    apply_plan(args.clone(), state, context, planned).await
 }
 
 async fn add_impl(
@@ -980,6 +991,17 @@ mod tests {
             data.address, address,
             "a supplied address must cross unchanged, got {info_events:?}"
         );
+
+        {
+            let guard = rt_handle::RevisionTreeGuard::enter(handle).expect("handle must resolve");
+            let internal = guard.internal_clone();
+            let state = internal.state();
+            let node = state
+                .node(internal.repository_context.clone(), node_id)
+                .await
+                .expect("added node must be readable");
+            assert!(node.is_staged_add(), "added node must be marked StagedAdd");
+        }
 
         release(handle, store_handle_id);
     }
@@ -1355,9 +1377,9 @@ mod tests {
         {
             let guard = rt_handle::RevisionTreeGuard::enter(handle).expect("handle must resolve");
             let internal = guard.internal_clone();
+            let state = internal.state();
             let block_index = NodeBlock::index(doomed);
-            let block = internal
-                .state
+            let block = state
                 .block(internal.repository_context.clone(), block_index)
                 .await
                 .expect("the parent block must be readable");

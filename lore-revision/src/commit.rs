@@ -1189,6 +1189,372 @@ pub async fn store_branch_latest_and_make_current(
     Ok(())
 }
 
+/// Commit an in-memory revision tree state as a new revision on `branch`,
+/// atomically advancing the branch's local tip.
+///
+/// The memory-based counterpart of [`commit`], serving the
+/// `lore_revision_tree_*` surface: same tip-collision check, delta block,
+/// history weave, state serialization, and branch-advance path as the
+/// file-system-based commit — with the working-tree walk replaced by a
+/// freeze pass over the staged nodes. Node content addresses were supplied
+/// by the caller through the revision tree write verbs and are recorded
+/// as-is; no bytes move here.
+///
+/// `pending_metadata` carries the caller's accumulated `metadata_set` edits
+/// (a caller-set commit message travels on the `message` key and is
+/// preserved). `deleted` carries the delta entries recorded when deleted
+/// subtrees were discarded from the child chains at verb time — the freeze
+/// pass can no longer observe those nodes. The new revision derives from
+/// the state's loaded revision; when the branch tip has advanced past it
+/// the commit fails with `BranchAdvanced` before any state is touched.
+///
+/// On success the state's signature is the newly-committed revision, so the
+/// caller's handle behaves as if freshly loaded from it.
+pub async fn commit_tree(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    state: Arc<State>,
+    pending_metadata: Metadata,
+    branch: BranchId,
+    deleted: Vec<NodeDelta>,
+) -> Result<Hash, CommitError> {
+    let context = execution_context();
+    let globals = context.globals();
+    let parent_revision = state.revision();
+
+    // Same early tip-collision check as the file-system-based commit; the
+    // mutable store lock keeps the advance itself atomic regardless of
+    // check placement.
+    let branch_latest = branch::load_latest(repository.clone(), branch)
+        .await
+        .unwrap_or_default();
+    if !globals.force() && !branch_latest.is_zero() && branch_latest != parent_revision {
+        return Err(BranchAdvanced.into());
+    }
+
+    let signature = construct_tree_revision(
+        repository.clone(),
+        token,
+        state.clone(),
+        pending_metadata,
+        branch,
+        deleted,
+    )
+    .await?;
+
+    if !globals.dry_run() {
+        branch::store_latest(
+            repository.clone(),
+            branch,
+            signature,
+            BranchLatestStatus::Divergent,
+        )
+        .await
+        .forward::<CommitError>("Failed to store current branch latest")?;
+    }
+
+    event::LoreEvent::RevisionCommitRevision(LoreRevisionCommitRevisionEventData {
+        repository: repository.id,
+        branch,
+        revision: signature,
+        revision_number: state.revision_number(),
+        parent: state.parent_self(),
+        parent_other: state.parent_other(),
+    })
+    .send();
+
+    Ok(signature)
+}
+
+/// Construct and serialize an immutable revision from an in-memory tree.
+///
+/// This performs the freeze, directory rehash, delta/history weave, metadata,
+/// and immutable state serialization portions of [`commit_tree`]. It never
+/// reads or updates branch latest. Server-side callers use this boundary to
+/// construct content-addressed state before the authoritative BranchPush
+/// protection, verification, hook, and compare-and-swap path publishes it.
+/// Unpublished revisions may remain unreachable when publication loses a
+/// race; that is safe content-addressed-storage behavior.
+pub async fn construct_tree_revision(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    state: Arc<State>,
+    pending_metadata: Metadata,
+    branch: BranchId,
+    deleted: Vec<NodeDelta>,
+) -> Result<Hash, CommitError> {
+    construct_tree_revision_with_parent(
+        repository,
+        token,
+        state,
+        pending_metadata,
+        branch,
+        Hash::default(),
+        deleted,
+        false,
+    )
+    .await
+}
+
+/// Construct a normal two-parent merge revision from an in-memory target
+/// tree. Unlike [`construct_tree_revision`], an unchanged tree is valid: the
+/// second parent records that the source lineage was considered and merged.
+#[allow(clippy::too_many_arguments)]
+pub async fn construct_merge_revision(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    state: Arc<State>,
+    pending_metadata: Metadata,
+    branch: BranchId,
+    source_revision: Hash,
+    deleted: Vec<NodeDelta>,
+) -> Result<Hash, CommitError> {
+    if source_revision.is_zero() {
+        return Err(CommitError::internal(
+            "merge source revision must be non-zero",
+        ));
+    }
+    construct_tree_revision_with_parent(
+        repository,
+        token,
+        state,
+        pending_metadata,
+        branch,
+        source_revision,
+        deleted,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn construct_tree_revision_with_parent(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    state: Arc<State>,
+    pending_metadata: Metadata,
+    branch: BranchId,
+    parent_other: Hash,
+    deleted: Vec<NodeDelta>,
+    allow_unchanged_tree: bool,
+) -> Result<Hash, CommitError> {
+    let context = execution_context();
+    let globals = context.globals();
+    let parent_revision = state.revision();
+
+    // An untouched handle has nothing to freeze: edits dirty the state and
+    // deletes leave recorded entries, so a clean state with no carried
+    // deletes is a no-op commit.
+    if !allow_unchanged_tree && !globals.force() && deleted.is_empty() && !state.is_dirty() {
+        return Err(NothingStaged.into());
+    }
+
+    // The pending metadata may carry a caller-set message; hoist it so
+    // prepare_commit_metadata records branch, timestamp, and authorship
+    // around it instead of overwriting it with an empty string.
+    let message = pending_metadata
+        .get_string(metadata::MESSAGE)
+        .unwrap_or_default()
+        .to_string();
+    let metadata = prepare_commit_metadata(
+        repository.clone(),
+        pending_metadata,
+        branch,
+        message,
+        None,
+        None,
+        None,
+    )
+    .await?;
+
+    // Freeze pass: fold the deleted subtrees' recorded entries and every
+    // staged node into the delta, clearing leaf change flags as it goes
+    // (directories are cleared by the rehash).
+    let delta = Arc::new(parking_lot::RwLock::new(BytesMut::new()));
+    {
+        let mut writer = delta.write();
+        for entry in deleted.iter() {
+            writer.extend_from_slice(entry.as_bytes());
+        }
+    }
+    commit_tree_freeze(repository.clone(), state.clone(), ROOT_NODE, delta.clone()).await?;
+
+    if !allow_unchanged_tree && !globals.force() {
+        let read = delta.read();
+        if read.count::<NodeDelta>() == 0 {
+            return Err(NothingStaged.into());
+        }
+    }
+
+    // Derive the new revision from the loaded parent. The weave assigns the
+    // revision number; the metadata hash lands after it serializes below.
+    state.set_parent_self(parent_revision);
+    state.set_parent_other(parent_other);
+
+    // Same graceful-drain pattern as commit_staged_revision: run all
+    // write-producing work under the tracker, then ALWAYS drain so no
+    // background leader outlives this function.
+    let tracker = immutable::commit_write_tracker(false);
+    let work_tracker = tracker.clone();
+    let work_repository = repository.clone();
+    let work_state = state.clone();
+    let work_result: Result<Hash, CommitError> = async move {
+        let repository = work_repository;
+        let state = work_state;
+
+        rehash_directory(repository.clone(), state.clone(), ROOT_NODE).await?;
+
+        state
+            .update_tree_root_hash(repository.clone())
+            .await
+            .forward::<CommitError>("Failed to update tree root hash")?;
+
+        // Same identical-tree guard as the file-system-based commit: edits
+        // that reproduce the parent's tree byte for byte are a no-op.
+        if !allow_unchanged_tree
+            && !execution_context().globals().force()
+            && !parent_revision.is_zero()
+        {
+            let state_parent = State::deserialize(repository.clone(), parent_revision)
+                .await
+                .forward_with::<CommitError, _>(|| {
+                    format!("Failed to deserialize revision state {parent_revision}")
+                })?;
+            let tree_staged = state
+                .tree(repository.clone())
+                .await
+                .forward::<CommitError>("Failed to read revision tree data")?;
+            let tree_parent = state_parent
+                .tree(repository.clone())
+                .await
+                .forward::<CommitError>("Failed to read revision tree data")?;
+            if tree_staged.hash_root == tree_parent.hash_root {
+                lore_debug!(
+                    "Tree {} in memory-based commit is identical to tree {} in parent revision {}",
+                    tree_staged.hash_root,
+                    tree_parent.hash_root,
+                    parent_revision,
+                );
+                return Err(NothingStaged.into());
+            }
+        }
+
+        generate_delta_block(
+            repository.clone(),
+            state.clone(),
+            delta,
+            work_tracker.clone(),
+        )
+        .await?;
+
+        let metadata_hash = metadata
+            .serialize_with_tracker(repository.clone(), Some(work_tracker))
+            .await
+            .forward::<CommitError>("Failed to write commit metadata")?;
+        state.set_metadata_hash(metadata_hash);
+
+        weave_history(repository.clone(), state.clone()).await?;
+
+        state.reset_merge_conflict_flags();
+        state.clear_link_merge_state();
+
+        let signature = state
+            .serialize(repository.clone(), token)
+            .await
+            .forward::<CommitError>("Failed to serialize revision state")?;
+
+        Ok(signature)
+    }
+    .await;
+
+    // ALWAYS drain, regardless of the work outcome — dropping the tracker
+    // with live leaders would abort them mid-write.
+    let drain_result = tracker.await_all().await;
+    let signature = match work_result {
+        Ok(signature) => {
+            drain_result
+                .forward::<CommitError>("Background fragment upload task failed during commit")?;
+            signature
+        }
+        Err(work_err) => return Err(work_err),
+    };
+
+    Ok(signature)
+}
+
+/// Freeze one directory of the memory-based revision tree: record a delta
+/// entry for every staged node and clear the change flags on staged leaves
+/// (files and links) so the rehash observes a settled tree. Directories
+/// keep their staged bits — [`rehash_directory`] consumes and clears those.
+/// Only staged directories are descended into: marking a node propagates
+/// the base staged bit to every ancestor, so a clean directory cannot hold
+/// staged descendants. Deleted subtrees were already discarded at verb
+/// time; a staged-delete node surviving to commit is a broken invariant,
+/// not input.
+fn commit_tree_freeze(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    node_id: NodeID,
+    delta: Arc<parking_lot::RwLock<BytesMut>>,
+) -> Pin<Box<dyn Future<Output = Result<(), CommitError>> + Send>> {
+    Box::pin(async move {
+        let node = state
+            .node(repository.clone(), node_id)
+            .await
+            .forward::<CommitError>("Failed deserializing state block")?;
+        debug_assert!(node.is_directory());
+
+        if node.is_staged() {
+            delta_add(delta.clone(), node_id, node.flags);
+        }
+
+        let mut children =
+            StateNodeChildrenIterator::new(state.clone(), repository.clone(), node_id)
+                .await
+                .forward::<CommitError>("Failed deserializing state block")?;
+        while let Some((child_node_id, child_node)) = children
+            .next()
+            .await
+            .forward::<CommitError>("Failed deserializing state block")?
+        {
+            if child_node.is_staged_delete() {
+                return Err(CommitError::internal(
+                    "Deleted node remains in the memory-based revision tree",
+                ));
+            }
+            if child_node.is_directory() {
+                if child_node.is_staged() {
+                    commit_tree_freeze(
+                        repository.clone(),
+                        state.clone(),
+                        child_node_id,
+                        delta.clone(),
+                    )
+                    .await?;
+                }
+            } else if child_node.is_staged() {
+                delta_add(delta.clone(), child_node_id, child_node.flags);
+                let block_index = NodeBlock::index(child_node_id);
+                let block = state
+                    .block(repository.clone(), block_index)
+                    .await
+                    .forward::<CommitError>("Failed deserializing state block")?;
+                let dirtied = {
+                    let mut block_writer = block.write();
+                    let node = block_writer.node(Node::index(child_node_id));
+                    node.clear_all_change_flags();
+                    block_writer.mark_dirty()
+                };
+                if dirtied {
+                    state.block_modified(block, block_index);
+                    state.mark_dirty();
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_files_and_rehash(
     repository: Arc<RepositoryContext>,

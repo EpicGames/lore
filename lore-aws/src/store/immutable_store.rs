@@ -6,6 +6,9 @@ use std::fmt::Formatter;
 use std::string::ToString;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
 use aws_sdk_dynamodb::error::SdkError;
@@ -20,6 +23,7 @@ use lore_base::error::AddressNotFound;
 use lore_base::error::SlowDown;
 use lore_base::types::Address;
 use lore_base::types::Context;
+use lore_base::types::DirectDownload;
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 use lore_base::types::Fragment;
 use lore_base::types::FragmentFlags;
@@ -1193,6 +1197,22 @@ impl AwsImmutableStore {
         let payload = self.read_payload(s3_contents, hash, fragment)?;
         Ok((fragment, payload))
     }
+
+    async fn presign_payload(
+        &self,
+        hash: Hash,
+        expires_in: Duration,
+    ) -> Result<String, StoreError> {
+        let mut dst = [0u8; 64];
+        let key = lore_revision::util::to_hex_str(hash.data(), &mut dst);
+        self.s3
+            .presign_get_object(self.bucket.as_str(), key, expires_in)
+            .await
+            .map_err(|err| {
+                warn!("Failed to presign payload for hash {hash}: {err}");
+                StoreError::internal(err)
+            })
+    }
 }
 
 #[async_trait]
@@ -1303,6 +1323,68 @@ impl ImmutableStoreTrait for AwsImmutableStore {
         let (fragment, payload) = result?;
         lore_storage::validate_fragment_payload(&fragment, payload.len())?;
         Ok((fragment, payload))
+    }
+
+    #[lore_macro::lore_instrument]
+    #[tracing::instrument(name= "AwsImmutableStore::presign_downloads" skip(self, addresses))]
+    async fn presign_downloads(
+        self: Arc<Self>,
+        partition: Partition,
+        addresses: &[Address],
+        match_required: StoreMatch,
+        expires_in: Duration,
+    ) -> Result<Vec<DirectDownload>, StoreError> {
+        let repository: Context = partition.into();
+        let matches = match match_required {
+            StoreMatch::MatchFull => self.exist_batch_exact(repository, addresses).await?,
+            other => {
+                return Err(StoreError::internal(format!(
+                    "direct downloads require MatchFull, got {other:?}"
+                )));
+            }
+        };
+
+        let expires_at_epoch_seconds = SystemTime::now()
+            .checked_add(expires_in)
+            .and_then(|expires_at| expires_at.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+
+        let mut join_set = JoinSet::new();
+        for (pos, address) in addresses.iter().copied().enumerate() {
+            if matches.get(pos) != Some(&StoreMatch::MatchFull) {
+                continue;
+            }
+
+            let store = self.clone();
+            join_set.spawn(async move {
+                let mut fragment = store.metadata_with_load_validation(address.hash).await?;
+                fragment.flags &= !FragmentFlags::PayloadStored;
+                fragment.flags |= FragmentFlags::PayloadStoredDurable;
+                let url = store.presign_payload(address.hash, expires_in).await?;
+                Ok::<_, StoreError>((
+                    pos,
+                    DirectDownload {
+                        address,
+                        fragment,
+                        url,
+                        expires_at_epoch_seconds,
+                    },
+                ))
+            });
+        }
+
+        let mut downloads = Vec::new();
+        while let Some(result) = join_set.join_next().await {
+            let (pos, download) = result
+                .map_err(|err| StoreError::internal_with_context(err, "joining presign task"))??;
+            downloads.push((pos, download));
+        }
+        downloads.sort_by_key(|(pos, _)| *pos);
+        Ok(downloads
+            .into_iter()
+            .map(|(_, download)| download)
+            .collect())
     }
 
     #[lore_macro::lore_instrument]
@@ -1860,6 +1942,88 @@ mod test {
             .expect("exist batch failed");
 
         assert_eq!(matches, result);
+    }
+
+    #[tokio::test]
+    async fn test_presign_downloads_returns_matching_fragments() {
+        let repository = random::<Context>();
+        let (fragment, matched_address, _) = fragment::generate_random();
+        let (_, missed_address, _) = fragment::generate_random();
+
+        let matched_entry = FragmentsEntry::new(repository, matched_address);
+        let missed_entry = FragmentsEntry::new(repository, missed_address);
+        let matched_item: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(matched_entry.clone()).unwrap();
+        let missed_item: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(missed_entry).unwrap();
+        let items = vec![matched_item.clone(), missed_item];
+        let response_items = vec![matched_item];
+
+        let metadata_entry = FragmentMetadataEntry::new(matched_address.hash);
+        let metadata_lookup: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(metadata_entry.clone()).unwrap();
+        let metadata_item = serde_dynamo::to_item(metadata_entry.with_fragment(fragment)).unwrap();
+
+        let mut s3mock = MockS3Impl::default();
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        dynamodb_mock
+            .expect_batch_get_item()
+            .with(
+                eq(Arc::<str>::from(FRAGMENTS_TABLE_NAME)),
+                eq(items),
+                eq(true),
+            )
+            .return_once(move |_, _, _| Ok(response_items));
+
+        dynamodb_mock
+            .expect_get_item()
+            .with(
+                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
+                eq(metadata_lookup),
+                eq(true),
+            )
+            .return_once(move |_, _, _| {
+                Ok(GetItemOutput::builder()
+                    .set_item(Some(metadata_item))
+                    .build())
+            });
+
+        s3mock
+            .expect_presign_get_object()
+            .with(
+                eq(BUCKET),
+                eq(matched_address.hash.to_string()),
+                eq(Duration::from_secs(60)),
+            )
+            .return_once(|_, _, _| Ok("http://127.0.0.1/presigned".to_string()));
+
+        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
+        let store = Arc::new(store);
+
+        let result = store
+            .presign_downloads(
+                repository.into(),
+                &[matched_address, missed_address],
+                StoreMatch::MatchFull,
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("presign downloads failed");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].address, matched_address);
+        assert_eq!(result[0].url, "http://127.0.0.1/presigned");
+        assert_eq!(result[0].fragment.size_payload, fragment.size_payload);
+        assert_eq!(result[0].fragment.size_content, fragment.size_content);
+        assert_eq!(
+            result[0].fragment.flags & FragmentFlags::PayloadStoredDurable.bits(),
+            FragmentFlags::PayloadStoredDurable.bits()
+        );
+        assert_eq!(
+            result[0].fragment.flags & FragmentFlags::PayloadStoredLocal.bits(),
+            0
+        );
     }
 
     #[tokio::test]
