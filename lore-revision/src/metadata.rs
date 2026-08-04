@@ -293,7 +293,7 @@ impl Metadata {
         }
 
         let buffer = self.buffer.clone();
-        let (address, _) = immutable::write_with_tracker(
+        let address = immutable::write_with_tracker(
             repository.clone(),
             Context::default(),
             buffer.freeze(),
@@ -327,7 +327,7 @@ impl Metadata {
         }
 
         let buffer = self.buffer.clone();
-        let (address, _) = immutable::write(
+        let address = immutable::write(
             repository.clone(),
             Context::default(),
             buffer.freeze(),

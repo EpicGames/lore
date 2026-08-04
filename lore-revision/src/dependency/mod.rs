@@ -687,7 +687,7 @@ pub async fn store_dependency_data(
                     .set_binary(key, &blob)
                     .internal("setting inline dependency blob")?;
             } else {
-                let (address, _) = immutable::write(
+                let address = immutable::write(
                     repository.clone(),
                     Context::default(),
                     blob,

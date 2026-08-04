@@ -754,6 +754,14 @@ mod tests {
 
     #[async_trait]
     impl ImmutableStore for MockImmutableStore {
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreQueryResult, StoreError> {
+            self.query(partition, address, StoreMatch::MatchFull).await
+        }
+
         async fn exist(
             self: Arc<Self>,
             _partition: Partition,

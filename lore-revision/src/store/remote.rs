@@ -207,6 +207,32 @@ impl store::ImmutableStore for RemoteImmutableStore {
         }
     }
 
+    /// Answered by this store's own `query`, so it reports whether the payload is durable rather
+    /// than what representation is stored. Wiring the remote's metadata operation through is
+    /// outstanding.
+    /// Asks the remote for the fragment alone. Unlike [`RemoteImmutableStore::query`], which
+    /// obtains one by fetching the whole payload, this uses the wire operation that exists for it,
+    /// so the representation comes back without the bytes.
+    async fn get_metadata(
+        self: Arc<Self>,
+        repository: Partition,
+        address: Address,
+    ) -> Result<StoreQueryResult, StoreError> {
+        let session = self.session(repository).await?;
+
+        match session.get_metadata(&address).await {
+            Ok(fragment) => Ok(StoreQueryResult {
+                fragment,
+                match_made: StoreMatch::MatchFull,
+            }),
+            Err(ProtocolError::NotFound(_)) => Ok(StoreQueryResult {
+                fragment: Fragment::default(),
+                match_made: StoreMatch::MatchNone,
+            }),
+            Err(error) => Err(error).forward::<StoreError>("Remote store metadata query failed"),
+        }
+    }
+
     async fn get(
         self: Arc<Self>,
         repository: Partition,

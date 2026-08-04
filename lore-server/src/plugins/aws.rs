@@ -69,8 +69,27 @@ pub struct AwsImmutableStorePluginConfig {
     /// `DynamoDB` table name for storing fragment associations.
     pub dynamodb_fragments_table: String,
 
-    /// `DynamoDB` table name for storing fragment metadata.
-    pub dynamodb_metadata_table: String,
+    /// `DynamoDB` table name for storing fragment state, where a row's presence means the hash
+    /// exists.
+    ///
+    /// Required, and deliberately without an alias: this table is its own, distinct from the one
+    /// that held fragment metadata, and which table serves it is a decision rather than something
+    /// to inherit.
+    pub dynamodb_fragment_state_table: String,
+
+    /// Optional `DynamoDB` table to read fragments from for objects written before they moved onto
+    /// the S3 object.
+    ///
+    /// Accepts the older `dynamodb_metadata_table` spelling, which is what a configuration written
+    /// before that change already points at — that table holds fragment metadata, and reading it is
+    /// exactly what it is still needed for.
+    ///
+    /// Leaving it unset declares that no object predating the change exists, so an object carrying
+    /// no metadata of its own is reported as damaged rather than described from a row that cannot
+    /// be about it. Set it only where such objects may still exist; once a backfill has given them
+    /// all their own metadata, removing it retires the fallback read.
+    #[serde(default, alias = "dynamodb_metadata_table")]
+    pub dynamodb_fragment_metadata_table: Option<String>,
 
     /// Optional `DynamoDB` endpoint URL (for `LocalStack` or other `DynamoDB`-compatible services).
     #[serde(default)]
@@ -222,7 +241,7 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
             plugin_name = plugin_name,
             s3_bucket = %plugin_config.s3_bucket,
             fragments_table = %plugin_config.dynamodb_fragments_table,
-            metadata_table = %plugin_config.dynamodb_metadata_table,
+            fragment_state_table = %plugin_config.dynamodb_fragment_state_table,
             "Creating AWS immutable store: {plugin_config:?}"
         );
 
@@ -277,7 +296,7 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
                 )
                 .dynamodb()
                 .ensure_table(&plugin_config.dynamodb_fragments_table)
-                .ensure_table(&plugin_config.dynamodb_metadata_table);
+                .ensure_table(&plugin_config.dynamodb_fragment_state_table);
 
                 let dynamodb_client =
                     Box::pin(dynamodb_client_builder.build())
@@ -304,7 +323,8 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
 
         let dynamodb_settings = DynamoDbImmutableStoreSettings {
             fragments_table_name: plugin_config.dynamodb_fragments_table,
-            metadata_table_name: plugin_config.dynamodb_metadata_table,
+            fragment_state_table_name: plugin_config.dynamodb_fragment_state_table,
+            fragment_metadata_table_name: plugin_config.dynamodb_fragment_metadata_table,
             endpoint_url: plugin_config.dynamodb_endpoint_url,
             region: plugin_config.dynamodb_region,
             slow_operation_threshold_millis: plugin_config.dynamodb_slow_operation_threshold_millis,
@@ -635,7 +655,7 @@ mod tests {
             s3_endpoint_url = "http://localhost:4566"
             s3_region = "us-east-1"
             dynamodb_fragments_table = "fragments"
-            dynamodb_metadata_table = "metadata"
+            dynamodb_fragment_state_table = "fragment-state"
             dynamodb_endpoint_url = "http://localhost:4566"
             dynamodb_region = "us-east-1"
             s3_slow_operation_threshold_millis = 1000
@@ -654,7 +674,10 @@ mod tests {
         );
         assert_eq!(plugin_config.s3_region, Some("us-east-1".to_string()));
         assert_eq!(plugin_config.dynamodb_fragments_table, "fragments");
-        assert_eq!(plugin_config.dynamodb_metadata_table, "metadata");
+        assert_eq!(
+            plugin_config.dynamodb_fragment_state_table,
+            "fragment-state"
+        );
         assert_eq!(
             plugin_config.dynamodb_endpoint_url,
             Some("http://localhost:4566".to_string())
@@ -666,12 +689,50 @@ mod tests {
         assert!(plugin_config.force_write);
     }
 
+    /// A configuration written before this change points at the table holding fragment metadata,
+    /// which is what that table is still read for. It carries over under its new name.
+    #[tokio::test]
+    async fn test_config_reads_the_former_metadata_table_key_as_the_fragment_metadata_table() {
+        let config_str = r#"
+            s3_bucket = "test-bucket"
+            dynamodb_fragments_table = "fragments"
+            dynamodb_fragment_state_table = "state"
+            dynamodb_metadata_table = "metadata"
+        "#;
+
+        let config: toml::Value = toml::from_str(config_str).unwrap();
+        let plugin_config: AwsImmutableStorePluginConfig = config.try_into().unwrap();
+
+        assert_eq!(plugin_config.dynamodb_fragment_state_table, "state");
+        assert_eq!(
+            plugin_config.dynamodb_fragment_metadata_table,
+            Some("metadata".to_string())
+        );
+    }
+
+    /// The state table has no alias on purpose. A configuration that never named one must fail
+    /// rather than silently reuse whichever table used to hold fragment metadata.
+    #[tokio::test]
+    async fn test_config_requires_the_fragment_state_table() {
+        let config_str = r#"
+            s3_bucket = "test-bucket"
+            dynamodb_fragments_table = "fragments"
+            dynamodb_metadata_table = "metadata"
+        "#;
+
+        let config: toml::Value = toml::from_str(config_str).unwrap();
+
+        config
+            .try_into::<AwsImmutableStorePluginConfig>()
+            .expect_err("the fragment state table must be configured explicitly");
+    }
+
     #[tokio::test]
     async fn test_config_deserialization_with_defaults() {
         let config_str = r#"
             s3_bucket = "test-bucket"
             dynamodb_fragments_table = "fragments"
-            dynamodb_metadata_table = "metadata"
+            dynamodb_fragment_state_table = "fragment-state"
         "#;
 
         let config: toml::Value = toml::from_str(config_str).unwrap();
@@ -681,7 +742,10 @@ mod tests {
         assert!(plugin_config.s3_endpoint_url.is_none());
         assert!(plugin_config.s3_region.is_none());
         assert_eq!(plugin_config.dynamodb_fragments_table, "fragments");
-        assert_eq!(plugin_config.dynamodb_metadata_table, "metadata");
+        assert_eq!(
+            plugin_config.dynamodb_fragment_state_table,
+            "fragment-state"
+        );
         assert!(plugin_config.dynamodb_endpoint_url.is_none());
         assert!(plugin_config.dynamodb_region.is_none());
         assert_eq!(plugin_config.s3_slow_operation_threshold_millis, u64::MAX);

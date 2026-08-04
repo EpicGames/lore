@@ -3171,6 +3171,16 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         })
     }
 
+    /// This store's `query` reads the fragment it stored, so it already reports the representation
+    /// and there is nothing further to fetch.
+    async fn get_metadata(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+    ) -> Result<StoreQueryResult, StoreError> {
+        self.query(partition, address, StoreMatch::MatchFull).await
+    }
+
     async fn get(
         self: Arc<Self>,
         partition: Partition,
@@ -4573,7 +4583,7 @@ mod tests {
             .await
             .unwrap();
 
-            let (address, _) = write_content(
+            let address = write_content(
                 store.clone(),
                 partition,
                 context,
@@ -4638,7 +4648,7 @@ mod tests {
             "originally stored content must be reported missing after recovery"
         );
 
-        let (new_address, _) = write_content(
+        let new_address = write_content(
             store.clone(),
             partition,
             context,
@@ -4821,7 +4831,7 @@ mod tests {
         // Prime target (uncompressed).
         let prev_mode =
             COMPRESSION_MODE.swap(CompressionMode::NoCompression as u32, Ordering::AcqRel);
-        let (target_address, _target_fragment) = write_content(
+        let target_address = write_content(
             store.clone(),
             target_partition,
             context,
@@ -4836,7 +4846,7 @@ mod tests {
 
         // Prime source (compressed).
         COMPRESSION_MODE.store(CompressionMode::Zstd as u32, Ordering::Release);
-        let (source_address, _source_fragment) = write_content(
+        let source_address = write_content(
             store.clone(),
             source_partition,
             context,
@@ -4911,7 +4921,7 @@ mod tests {
         let payload: Vec<u8> = b"in-partition new-context dedup payload".to_vec();
 
         // Seed the source tuple `(partition, hash, source_context)`.
-        let (source_address, _) = write_content(
+        let source_address = write_content(
             store.clone(),
             partition,
             source_context,

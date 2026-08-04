@@ -777,7 +777,7 @@ mod test {
         state.set_metadata_hash(metadata_hash);
         for (name, bytes) in files {
             let buffer = bytes::Bytes::copy_from_slice(bytes);
-            let (address, _) = lore_revision::immutable::write(
+            let address = lore_revision::immutable::write(
                 repository.clone(),
                 lore_storage::Context::default(),
                 buffer,

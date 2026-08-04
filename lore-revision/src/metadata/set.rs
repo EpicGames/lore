@@ -136,7 +136,7 @@ pub async fn set_revision(
             // When storing binary data, put it in the immutable store
             // Use a zero context to avoid creating extra entries if multiple
             // revisions use the same metadata blob
-            let (address, _) = {
+            let address = {
                 immutable::write(
                     repository.clone(),
                     Context::default(),
@@ -265,7 +265,7 @@ async fn set_file_task(
                 // When storing binary data, put it in the immutable store
                 // Use a zero context to avoid creating extra entries if multiple
                 // files use the same metadata blob
-                let (address, _) = {
+                let address = {
                     immutable::write(
                         repository.clone(),
                         Context::default(),

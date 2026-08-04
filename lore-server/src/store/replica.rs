@@ -323,6 +323,17 @@ where
         })
     }
 
+    /// Answered by this store's own `query`, so it reports whether the payload is durable rather
+    /// than what representation is stored. Wiring the remote's metadata operation through is
+    /// outstanding; until then a caller wanting a representation must ask the store holding it.
+    async fn get_metadata(
+        self: Arc<Self>,
+        repository: Partition,
+        address: Address,
+    ) -> Result<StoreQueryResult, StoreError> {
+        self.query(repository, address, StoreMatch::MatchFull).await
+    }
+
     #[lore_macro::lore_instrument]
     #[instrument(name = "QuicReplica::Get", skip_all)]
     async fn get(

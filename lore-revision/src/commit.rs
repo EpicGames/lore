@@ -43,7 +43,6 @@ use crate::link;
 use crate::lore::Address;
 use crate::lore::BranchId;
 use crate::lore::Context;
-use crate::lore::Fragment;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
 use crate::lore::TypedBytes;
@@ -1993,7 +1992,7 @@ async fn commit_file(
                 );
             }
 
-            let (address, fragment) = immutable::write_from_file_with_tracker(
+            let (address, size_content) = immutable::write_from_file_with_tracker(
                 repository.clone(),
                 absolute_path.as_path(),
                 node.address.context,
@@ -2011,7 +2010,7 @@ async fn commit_file(
             stats
                 .complete
                 .bytes_transferred
-                .fetch_add(fragment.size_content, Ordering::Relaxed);
+                .fetch_add(size_content, Ordering::Relaxed);
 
             let Ok(metadata) = tokio::fs::metadata(absolute_path.as_path()).await else {
                 return Err(CommitError::internal(format!(
@@ -2022,7 +2021,7 @@ async fn commit_file(
 
             (
                 address,
-                fragment.size_content,
+                size_content,
                 util::fs::metadata_to_mode(&metadata, node.mode),
             )
         };
@@ -2686,7 +2685,7 @@ async fn generate_delta_block(
     };
     let delta_count = delta.count::<NodeDelta>();
 
-    let (address, _fragment) = if !delta.is_empty() {
+    let address = if !delta.is_empty() {
         immutable::write_with_tracker(
             repository.clone(),
             Context::default(),
@@ -2699,7 +2698,7 @@ async fn generate_delta_block(
         .await
         .forward::<CommitError>("Failed writing delta block to immutable store")?
     } else {
-        (Address::default(), Fragment::default())
+        Address::default()
     };
 
     state

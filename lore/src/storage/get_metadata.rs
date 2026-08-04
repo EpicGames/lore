@@ -205,7 +205,7 @@ async fn resolve_local(
     match store
         .immutable
         .clone()
-        .query(item.partition, item.address, StoreMatch::MatchFull)
+        .get_metadata(item.partition, item.address)
         .await
     {
         Ok(result) if result.match_made == StoreMatch::MatchFull => {

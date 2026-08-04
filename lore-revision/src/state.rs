@@ -727,7 +727,7 @@ impl State {
                         if block.is_nametable_deserialized() {
                             lore_trace!("Serializing dirty node block {} name table", block_index);
                             let name_table = block.read().clone_name_table();
-                            let (name_table, _) = if !name_table.is_empty() {
+                            let name_table = if !name_table.is_empty() {
                                 immutable::write(
                                     repository.clone(),
                                     Context::default(),
@@ -739,7 +739,7 @@ impl State {
                                 .await
                                 .internal("Failed to serialize node block")?
                             } else {
-                                (Address::default(), Fragment::default())
+                                Address::default()
                             };
                             {
                                 let mut writer = block.write();
@@ -751,7 +751,7 @@ impl State {
                     node_block.flags &= !NodeBlockFlags::Dirty;
                     node_block.flags &= !NodeBlockFlags::UpgradeGeneratedNametable;
                     node_block.flags &= !NodeBlockFlags::FirstUnusedNode;
-                    let (address, _) = node_block
+                    let address = node_block
                         .write_to_immutable(
                             repository.clone(),
                             Context::default(),
@@ -796,7 +796,7 @@ impl State {
 
             // Write out the block address list
             let block_hash_bytes = block_hash_bytes.freeze();
-            let (list_address, _) = immutable::write(
+            let list_address = immutable::write(
                 repository.clone(),
                 Context::default(),
                 block_hash_bytes.clone(),
@@ -846,7 +846,7 @@ impl State {
                     // write makes the lock held of an await point
                     let mut node_block = { *block.read().node_block() };
                     node_block.flags &= !NodeBlockFlags::Dirty;
-                    let (address, _) = node_block
+                    let address = node_block
                         .write_to_immutable(
                             repository.clone(),
                             Context::default(),
@@ -891,7 +891,7 @@ impl State {
 
             // Write out the block address list
             let block_hash_bytes = block_hash_bytes.freeze();
-            let (list_address, _) = immutable::write(
+            let list_address = immutable::write(
                 repository.clone(),
                 Context::default(),
                 block_hash_bytes.clone(),
@@ -928,7 +928,7 @@ impl State {
                     Hash::default()
                 } else {
                     let bytes = Bytes::copy_from_slice(link_list.as_bytes());
-                    let (address, _fragment) = immutable::write(
+                    let address = immutable::write(
                         repository.clone(),
                         Context::default(),
                         bytes,
@@ -953,7 +953,7 @@ impl State {
         let tree = { self.runtime.read().tree.unwrap_or_default() };
         if tree.flags & TreeFlags::Dirty != 0 {
             lore_trace!("Serializing dirty tree");
-            let (address, _fragment) = tree
+            let address = tree
                 .write_to_immutable(
                     repository.clone(),
                     Context::default(),
@@ -974,7 +974,7 @@ impl State {
         }
 
         // Serialize the state
-        let (address, fragment) = {
+        let address = {
             let buffer = {
                 let mut data = self.data.write();
                 data.flags &= !StateFlags::Dirty;
@@ -1003,11 +1003,9 @@ impl State {
         }
 
         lore_trace!(
-            "Serialized state to {} in repository {}, {} -> {} bytes",
+            "Serialized state to {} in repository {}",
             address.hash,
-            repository.id,
-            fragment.size_content,
-            fragment.size_payload
+            repository.id
         );
 
         Ok(address.hash)
@@ -3025,7 +3023,7 @@ impl State {
             bytes.extend_from_slice(entry.as_bytes());
         }
 
-        let (address, _fragment) = immutable::write(
+        let address = immutable::write(
             repository.clone(),
             Context::default(),
             Bytes::from(bytes),

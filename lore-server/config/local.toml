@@ -65,7 +65,9 @@ flush_delay_seconds = 10
 # immutable_store.s3_slow_operation_threshold_millis = 2000
 # immutable_store.dynamodb_endpoint_url = "http://127.0.0.1:9090"
 # immutable_store.dynamodb_fragments_table = "lore-fragments-local"
-# immutable_store.dynamodb_metadata_table = "lore-fragment-metadata-local"
+# immutable_store.dynamodb_fragment_state_table = "lore-fragment-state-local"
+# # Only where objects predating the move of the fragment onto the S3 object may exist:
+# immutable_store.dynamodb_fragment_metadata_table = "lore-fragment-metadata-local"
 # immutable_store.dynamodb_slow_operation_threshold_millis = 500
 #
 # # Mutable store (DynamoDB)

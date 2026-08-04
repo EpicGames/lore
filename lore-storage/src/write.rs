@@ -169,9 +169,24 @@ pub async fn wait_if_in_flight(partition: Partition, address: Address) {
 }
 
 /// Result of a [`store_fragment`] operation.
+///
+/// The stored representation is deliberately not reported. A dispatched write returns before its
+/// leader has compressed anything, so the only representation available at that point is the one
+/// the caller passed in, and handing that back says nothing the caller did not already know. What
+/// the caller cannot know is where the payload ended up, which is what this carries instead.
+///
+/// The two storage flags describe the state as of this call returning, so a dispatched write
+/// reports both as `false`: its leader has not run yet.
 pub struct StoreResult {
     pub address: Address,
-    pub fragment: Fragment,
+    /// Size of the uncompressed and reassembled content the address stands for. Invariant across
+    /// compression, chunking and deduplication, so it is the one size worth reporting.
+    pub size_content: u64,
+    /// Whether the local store holds the payload.
+    pub stored_local: bool,
+    /// Whether the payload reached durable storage.
+    pub stored_durable: bool,
+    /// Whether the content was already stored, so no upload was needed.
     pub deduplicated: bool,
 }
 
@@ -286,9 +301,26 @@ pub async fn store_fragment(
     };
 
     if let (Some(tracker), Ok(result)) = (observer, &result) {
-        tracker.notify_fragment(&result.fragment, result.deduplicated);
+        tracker.notify_fragment(&observed_fragment(fragment, result), result.deduplicated);
     }
     result
+}
+
+/// The fragment to hand a write observer: the caller's representation, marked with where the
+/// payload ended up.
+///
+/// The representation has to come from the caller. An observer is only installed on a tracker, a
+/// tracker always dispatches, and a dispatched write reports before its leader compresses, so
+/// there is no stored representation to report yet.
+fn observed_fragment(fragment: Fragment, result: &StoreResult) -> Fragment {
+    let mut flags = fragment.flags;
+    if result.stored_local {
+        flags |= FragmentFlags::PayloadStoredLocal;
+    }
+    if result.stored_durable {
+        flags |= FragmentFlags::PayloadStoredDurable;
+    }
+    Fragment { flags, ..fragment }
 }
 
 /// Backward-compatible synchronous fragment store. Acquires the in-flight
@@ -324,7 +356,9 @@ async fn store_fragment_inline(
     ) {
         return Ok(StoreResult {
             address,
-            fragment: query.fragment,
+            size_content: fragment.size_content,
+            stored_local,
+            stored_durable,
             deduplicated: true,
         });
     }
@@ -332,7 +366,7 @@ async fn store_fragment_inline(
     // Local-only fast path: skip STORE_IN_FLIGHT entirely. No follower notification needed,
     // no leader-token rendezvous — just compress+write inline.
     if remote_session.is_none() {
-        let (_, final_fragment) = leader_body(
+        let (stored_local, stored_durable) = leader_body(
             store,
             partition,
             address,
@@ -347,7 +381,9 @@ async fn store_fragment_inline(
         .await?;
         return Ok(StoreResult {
             address,
-            fragment: final_fragment,
+            size_content: fragment.size_content,
+            stored_local,
+            stored_durable,
             deduplicated,
         });
     }
@@ -362,16 +398,14 @@ async fn store_fragment_inline(
         drop(permit);
         return Ok(StoreResult {
             address,
-            fragment: if query.match_made == StoreMatch::MatchFull {
-                query.fragment
-            } else {
-                fragment
-            },
+            size_content: fragment.size_content,
+            stored_local,
+            stored_durable,
             deduplicated: true,
         });
     };
 
-    let (_, final_fragment) = leader_body(
+    let (stored_local, stored_durable) = leader_body(
         store,
         partition,
         address,
@@ -386,7 +420,9 @@ async fn store_fragment_inline(
     .await?;
     Ok(StoreResult {
         address,
-        fragment: final_fragment,
+        size_content: fragment.size_content,
+        stored_local,
+        stored_durable,
         deduplicated,
     })
 }
@@ -414,7 +450,9 @@ async fn store_fragment_dispatched(
             tracker.register_follower(follower_future(store.clone(), partition, address, token));
             return Ok(StoreResult {
                 address,
-                fragment,
+                size_content: fragment.size_content,
+                stored_local: false,
+                stored_durable: false,
                 deduplicated: true,
             });
         }
@@ -435,7 +473,9 @@ async fn store_fragment_dispatched(
         drop(permit);
         return Ok(StoreResult {
             address,
-            fragment: query.fragment,
+            size_content: fragment.size_content,
+            stored_local,
+            stored_durable,
             deduplicated: true,
         });
     }
@@ -456,10 +496,13 @@ async fn store_fragment_dispatched(
             permit,
         )
         .await
+        .map(|_stored| ())
     });
     Ok(StoreResult {
         address,
-        fragment,
+        size_content: fragment.size_content,
+        stored_local: false,
+        stored_durable: false,
         deduplicated,
     })
 }
@@ -502,11 +545,13 @@ fn is_fully_satisfied(
 /// The "work" portion of [`store_fragment`]: optionally load existing local
 /// payload, compress, attempt remote upload, and write the terminal entry.
 ///
+/// Returns where the payload ended up, as `(stored_local, stored_durable)`.
+///
 /// `guard` is the in-flight token the caller acquired before invoking this function. When
 /// `None`, no in-flight machinery is in play (the local-only fast path that bypasses the
 /// dedup token entirely — see [`store_fragment_inline`]). When `Some`, dropping the guard at
 /// the end cancels the token and wakes any followers subscribed to this write.
-#[allow(clippy::too_many_arguments, unused_assignments)]
+#[allow(clippy::too_many_arguments)]
 async fn leader_body(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
@@ -518,7 +563,7 @@ async fn leader_body(
     query: StoreQueryResult,
     guard: Option<StoreInFlightGuard>,
     permit: Option<OwnedSemaphorePermit>,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<(bool, bool), StorageError> {
     let (mut stored_local, mut stored_durable) = stored_flags(&query);
 
     // For a partial match try loading the payload from local store instead of recompressing
@@ -589,12 +634,13 @@ async fn leader_body(
         drop(permit);
         (None, None)
     };
+    stored_local |= payload.is_some();
 
     write_raw(store, partition, address, fragment, payload).await?;
 
     drop(permit);
     drop(guard);
-    Ok((address, fragment))
+    Ok((stored_local, stored_durable))
 }
 
 /// Store a raw fragment locally (no remote, no event emission).
@@ -606,7 +652,7 @@ pub async fn store_raw_local(
     fragment: Fragment,
     buffer: Bytes,
     cache_local: bool,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<Address, StorageError> {
     let result = store_fragment(
         store,
         partition,
@@ -619,7 +665,7 @@ pub async fn store_raw_local(
         None,
     )
     .await?;
-    Ok((result.address, result.fragment))
+    Ok(result.address)
 }
 
 /// Content writes running now, and the most that have run at once since the peak was reset.
@@ -677,7 +723,7 @@ pub async fn write_content(
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<WriteTracker>>,
     permit: Option<OwnedSemaphorePermit>,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<Address, StorageError> {
     let _in_flight = ContentWriteGuard::new();
     // Check if data should be a single fragment
     if buffer.len() <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
@@ -707,7 +753,7 @@ pub async fn write_content(
             permit,
         )
         .await?;
-        Ok((result.address, result.fragment))
+        Ok(result.address)
     } else {
         write_fragmented(
             store,
@@ -727,6 +773,11 @@ pub async fn write_content(
 /// Write content from a file.
 ///
 /// Takes a store, partition, and optional remote session directly.
+///
+/// Returns the address and the size of the content behind it. The size is reported because a
+/// caller that hands over a path has no other way to learn what was actually written: stating the
+/// file again afterwards answers for the file as it is then, not for the bytes this address
+/// stands for.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_from_file(
     store: Arc<dyn ImmutableStore>,
@@ -736,7 +787,7 @@ pub async fn write_from_file(
     flags: WriteOptions,
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<WriteTracker>>,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<(Address, u64), StorageError> {
     let _in_flight = ContentWriteGuard::new();
     let _count_permit = file_count_limit_acquire()
         .await
@@ -767,7 +818,7 @@ pub async fn write_from_file(
                 context,
                 hash: Hash::new_zeroed(),
             },
-            Fragment::new_zeroed(),
+            0,
         ));
     }
 
@@ -780,7 +831,7 @@ pub async fn write_from_file(
             .map_err(|e| {
                 StorageError::internal_with_context(e, &format!("read file: {}", path.display()))
             })?;
-        return write_content(
+        let address = write_content(
             store,
             partition,
             context,
@@ -790,10 +841,11 @@ pub async fn write_from_file(
             tracker,
             read_permit,
         )
-        .await;
+        .await?;
+        return Ok((address, size as u64));
     }
 
-    crate::fragment_engine::write_fragmented_from_file(
+    let address = crate::fragment_engine::write_fragmented_from_file(
         store,
         partition,
         context,
@@ -804,7 +856,8 @@ pub async fn write_from_file(
         remote_session,
         tracker,
     )
-    .await
+    .await?;
+    Ok((address, size as u64))
 }
 
 /// Hash a file's content, using previous fragmentation hints when available.
@@ -917,7 +970,7 @@ pub async fn hash_file(
         }
     }
 
-    let (address, _) = crate::fragment_engine::write_fragmented_from_file(
+    let address = crate::fragment_engine::write_fragmented_from_file(
         store,
         partition,
         previous.context,
@@ -1178,7 +1231,7 @@ async fn previous_chunks_still_match(
 /// Follower future: waits for the leader token to fire, then observes the
 /// terminal store state for `address`.
 ///
-/// Returns `Ok((address, fragment))` if the store now holds a full-match entry
+/// Returns `Ok(())` if the store now holds a full-match entry
 /// with either [`PayloadStoredDurable`](FragmentFlags::PayloadStoredDurable) or
 /// [`PayloadStoredLocal`](FragmentFlags::PayloadStoredLocal) set. Returns an
 /// internal error if no terminal entry exists — that means the leader errored
@@ -1191,7 +1244,7 @@ pub async fn follower_future(
     partition: Partition,
     address: Address,
     token: CancellationToken,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<(), StorageError> {
     token.cancelled().await;
     match store.query(partition, address, StoreMatch::MatchFull).await {
         Ok(result)
@@ -1201,7 +1254,7 @@ pub async fn follower_future(
                         | FragmentFlags::PayloadStoredLocal.bits()))
                     != 0 =>
         {
-            Ok((address, result.fragment))
+            Ok(())
         }
         _ => Err(StorageError::internal(format!(
             "leader upload failed for {address}"
@@ -1280,14 +1333,9 @@ mod tests {
 
         let token = CancellationToken::new();
         token.cancel();
-        let result = follower_future(store, partition, address, token).await;
-        let (addr, frag) = result.expect("follower should observe terminal entry");
-        assert_eq!(addr, address);
-        assert_ne!(
-            frag.flags & FragmentFlags::PayloadStoredLocal.bits(),
-            0,
-            "expected PayloadStoredLocal flag"
-        );
+        follower_future(store, partition, address, token)
+            .await
+            .expect("follower should observe terminal entry stored locally");
     }
 
     #[tokio::test]
@@ -1340,16 +1388,10 @@ mod tests {
             .expect("put terminal entry");
         token.cancel();
 
-        let (addr, frag) = follower
+        follower
             .await
             .expect("join follower")
-            .expect("follower observed terminal entry");
-        assert_eq!(addr, address);
-        assert_ne!(
-            frag.flags & FragmentFlags::PayloadStoredDurable.bits(),
-            0,
-            "expected PayloadStoredDurable flag"
-        );
+            .expect("follower observed terminal entry stored durably");
     }
 
     fn make_input(seed: u8) -> (Partition, Address, Fragment, Bytes) {
@@ -1436,10 +1478,9 @@ mod tests {
         .expect("store_fragment against already-durable entry");
 
         assert!(result.deduplicated, "should dedup on already-durable");
-        assert_ne!(
-            result.fragment.flags & FragmentFlags::PayloadStoredDurable.bits(),
-            0,
-            "returned fragment should carry PayloadStoredDurable"
+        assert!(
+            result.stored_durable,
+            "result should report the entry as durable"
         );
         // Tracker should have no outstanding work.
         assert!(tracker.await_all().await.is_ok());
@@ -1530,6 +1571,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ImmutableStore for FailingPutStore {
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreQueryResult, StoreError> {
+            self.query(partition, address, StoreMatch::MatchFull).await
+        }
+
         fn is_local(&self) -> bool {
             self.inner.clone().is_local()
         }
@@ -1824,6 +1873,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ImmutableStore for DelayingPutStore {
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreQueryResult, StoreError> {
+            self.query(partition, address, StoreMatch::MatchFull).await
+        }
+
         fn is_local(&self) -> bool {
             self.inner.clone().is_local()
         }
@@ -2071,6 +2128,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ImmutableStore for CountingPutStore {
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreQueryResult, StoreError> {
+            self.query(partition, address, StoreMatch::MatchFull).await
+        }
+
         fn is_local(&self) -> bool {
             self.inner.clone().is_local()
         }

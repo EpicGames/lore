@@ -315,7 +315,7 @@ pub async fn set(
                     .internal("reading binary metadata file")?
             };
 
-            let (address, _) = immutable::write(
+            let address = immutable::write(
                 repo.clone(),
                 Context::default(),
                 Bytes::from_owner(payload),

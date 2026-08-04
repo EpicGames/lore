@@ -904,7 +904,7 @@ pub async fn store_latest_history(
         previous: old_history_latest,
     };
 
-    let (address, _) = entry
+    let address = entry
         .write_to_immutable(
             repository.clone(),
             Context::default(),

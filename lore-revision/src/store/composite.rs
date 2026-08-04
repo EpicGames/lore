@@ -1014,6 +1014,26 @@ impl ImmutableStore for CompositeStore {
         best_result.into_counted_result(&self.instruments.counter_query)
     }
 
+    /// Local first, then durable. Unlike `query` this does not fan out to read replicas: a
+    /// representation is the same wherever it is read from, so the first store that has it answers.
+    async fn get_metadata(
+        self: Arc<Self>,
+        repository: Partition,
+        address: Address,
+    ) -> Result<StoreQueryResult, StoreError> {
+        if let Ok(result) = self.local.store().get_metadata(repository, address).await
+            && result.match_made == StoreMatch::MatchFull
+        {
+            return Ok(result);
+        }
+
+        self.durable
+            .target
+            .clone()
+            .get_metadata(repository, address)
+            .await
+    }
+
     async fn get(
         self: Arc<Self>,
         repository: Partition,

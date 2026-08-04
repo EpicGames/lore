@@ -556,6 +556,14 @@ impl ImmutableStore for GrpcReplica {
         Err(StoreError::internal("Store does not support operation"))
     }
 
+    async fn get_metadata(
+        self: Arc<Self>,
+        _repository: Partition,
+        _address: Address,
+    ) -> Result<StoreQueryResult, StoreError> {
+        Err(StoreError::internal("Store does not support operation"))
+    }
+
     async fn get(
         self: Arc<Self>,
         _repository: Partition,

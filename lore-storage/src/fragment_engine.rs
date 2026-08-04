@@ -59,7 +59,7 @@ fn chunk_boundaries(
 /// Uses `FastCDC` (content-defined chunking) when `flags.fixed_size_chunk` is 0,
 /// or fixed-size chunking when it is >0. Each chunk is hashed, stored as a
 /// content-addressed fragment in the immutable `store`, and assembled into a
-/// fragment list (Merklized). Returns the root address and fragment.
+/// fragment list. Returns the root address.
 ///
 /// When the entire buffer fits in a single chunk, the single-fragment fast path
 /// is used and no fragment list is created. In `hash_only` mode, fragments are
@@ -75,7 +75,7 @@ pub async fn write_fragmented(
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<Address, StorageError> {
     let size = buffer.len();
     let mut read_permit = permit;
     let mut tasks = JoinSet::<Result<StoredChunk, StorageError>>::new();
@@ -120,7 +120,7 @@ pub async fn write_fragmented(
                 chunk_permit,
             )
             .await?;
-            return Ok((result.address, result.fragment));
+            return Ok(result.address);
         }
 
         let store = store.clone();
@@ -206,7 +206,7 @@ pub async fn write_fragmented_from_file(
     hash_only: bool,
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<Address, StorageError> {
     let mut tasks = JoinSet::<Result<StoredChunk, StorageError>>::new();
 
     lore_base::lore_trace!(
@@ -354,7 +354,7 @@ async fn write_chunk_list(
     hash_only: bool,
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<Address, StorageError> {
     results.drain(&mut tasks).await;
 
     if let Some(err) = results.failure {
@@ -419,7 +419,7 @@ async fn write_fragmentlist_impl(
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<Address, StorageError> {
     let size = buffer.len();
 
     if size <= FRAGMENT_SIZE_THRESHOLD {
@@ -430,7 +430,7 @@ async fn write_fragmentlist_impl(
             size_content: content_size as u64,
         };
         if hash_only {
-            Ok((Address { context, hash }, fragment))
+            Ok(Address { context, hash })
         } else {
             let permit = match permit {
                 Some(permit) => Some(permit),
@@ -448,7 +448,7 @@ async fn write_fragmentlist_impl(
                 permit,
             )
             .await?;
-            Ok((result.address, result.fragment))
+            Ok(result.address)
         }
     } else {
         // Fixed size chunking for fragment list
@@ -595,9 +595,7 @@ pub fn write_fragmentlist(
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<(Address, Fragment), StorageError>> + Send>,
-> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Address, StorageError>> + Send>> {
     Box::pin(write_fragmentlist_impl(
         store,
         partition,

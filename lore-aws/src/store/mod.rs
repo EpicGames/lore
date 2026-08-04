@@ -3,6 +3,7 @@
 pub mod immutable_store;
 pub mod lock_store;
 pub mod mutable_store;
+pub mod object_metadata;
 
 #[cfg(test)]
 pub fn address_with_random_context(address: lore_storage::Address) -> lore_storage::Address {

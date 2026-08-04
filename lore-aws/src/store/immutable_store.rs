@@ -6,14 +6,16 @@ use std::fmt::Formatter;
 use std::string::ToString;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use aws_sdk_dynamodb::error::SdkError;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_dynamodb::types::Select;
 use aws_sdk_s3::operation::get_object::GetObjectError;
+use aws_sdk_s3::operation::head_object::HeadObjectError;
+use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use bytes::Bytes;
 use bytes::BytesMut;
 use lore_base::error::AddressNotFound;
@@ -44,6 +46,7 @@ use lore_telemetry::timer::TimedResult;
 use lore_telemetry::tracing::fields::ADDRESS;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use opentelemetry::KeyValue;
+use opentelemetry::metrics::Counter;
 use opentelemetry::metrics::Histogram;
 use serde::Deserialize;
 use serde::Serialize;
@@ -65,6 +68,9 @@ use crate::dynamodb::DynamoDbPutCondition;
 use crate::dynamodb::DynamoDbQuery;
 use crate::dynamodb::error::SdkError as DynamoDbSdkError;
 use crate::s3::S3;
+use crate::store::object_metadata::ObjectMetadataError;
+use crate::store::object_metadata::from_object_metadata;
+use crate::store::object_metadata::to_object_metadata;
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct FragmentsEntry {
@@ -104,26 +110,86 @@ impl FragmentsEntry {
     }
 }
 
+/// Where a payload is in its lifecycle.
+///
+/// This is the whole of what `DynamoDB` records about a payload. What the payload *is* — its
+/// compression, its sizes — lives on the S3 object itself and is never duplicated here, so the two
+/// cannot disagree. What `DynamoDB` adds is the ability to answer "does this hash exist, and may it
+/// be read" without an S3 request, which is the only reason the row exists at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FragmentState {
+    /// The payload is stored and readable.
+    Stored,
+    /// An obliteration holds this hash. Transient: it is either cleared or advanced to
+    /// [`FragmentState::Obliterated`].
+    Obliterating,
+    /// The payload has been obliterated and its object deleted. A tombstone, kept so the
+    /// difference between "never stored" and "deliberately destroyed" survives.
+    Obliterated,
+}
+
+impl FragmentState {
+    fn from_bits(bits: u32) -> Self {
+        if bits & FragmentFlags::PayloadObliterated == FragmentFlags::PayloadObliterated {
+            Self::Obliterated
+        } else if bits & FragmentFlags::PayloadObliterating == FragmentFlags::PayloadObliterating {
+            Self::Obliterating
+        } else {
+            Self::Stored
+        }
+    }
+
+    fn bits(self) -> u32 {
+        match self {
+            Self::Stored => 0,
+            Self::Obliterating => FragmentFlags::PayloadObliterating.bits(),
+            Self::Obliterated => FragmentFlags::PayloadObliterated.bits(),
+        }
+    }
+
+    fn is_obliteration(self) -> bool {
+        self != Self::Stored
+    }
+}
+
+/// A row in the fragment state table. Presence of the row means the hash exists in some state.
+///
+/// The `state` field is what distinguishes a row written under this model from one written when
+/// fragments were stored in `DynamoDB`: those carry flattened `flags`/`size_payload`/`size_content`
+/// instead. A migration can tell the two apart by shape alone.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct FragmentMetadataEntry {
+struct FragmentStateEntry {
     hash: Hash,
     #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<u32>,
+}
+
+/// A row in the shape written before fragments moved onto the S3 object: the whole fragment,
+/// flattened alongside the hash.
+///
+/// Deserialization only. Nothing writes this shape any more.
+#[derive(Clone, Debug, Deserialize)]
+struct FragmentMetadataEntry {
+    #[allow(dead_code)]
+    hash: Hash,
     #[serde(flatten)]
     fragment: Option<Fragment>,
 }
 
-impl FragmentMetadataEntry {
-    fn new(hash: Hash) -> Self {
+impl FragmentStateEntry {
+    fn key(hash: Hash) -> Self {
+        Self { hash, state: None }
+    }
+
+    fn new(hash: Hash, state: FragmentState) -> Self {
         Self {
             hash,
-            fragment: None,
+            state: Some(state.bits()),
         }
     }
 
-    fn with_fragment(mut self, fragment: Fragment) -> Self {
-        self.fragment = Some(fragment);
-
-        self
+    fn state(&self) -> FragmentState {
+        FragmentState::from_bits(self.state.unwrap_or_default())
     }
 }
 
@@ -162,7 +228,16 @@ impl S3StoreSettings {
 #[derive(Clone, Debug, Deserialize)]
 pub struct DynamoDbImmutableStoreSettings {
     pub fragments_table_name: String,
-    pub metadata_table_name: String,
+    pub fragment_state_table_name: String,
+    /// Table holding fragments written before they moved onto the S3 object, read only when an
+    /// object turns out to carry no metadata of its own.
+    ///
+    /// Set this on a deployment that has stored objects the old way — normally to the same table as
+    /// `fragment_state_table_name`, since both row shapes share it and are told apart by shape. Leaving it
+    /// unset declares that no such object exists, which makes an object carrying no metadata what it
+    /// then is: damaged, rather than merely old.
+    #[serde(default)]
+    pub fragment_metadata_table_name: Option<String>,
     pub endpoint_url: Option<String>,
     pub region: Option<String>,
     pub slow_operation_threshold_millis: u64,
@@ -171,10 +246,11 @@ pub struct DynamoDbImmutableStoreSettings {
 }
 
 impl DynamoDbImmutableStoreSettings {
-    pub fn new(fragments_table_name: String, metadata_table_name: String) -> Self {
+    pub fn new(fragments_table_name: String, fragment_state_table_name: String) -> Self {
         Self {
             fragments_table_name,
-            metadata_table_name,
+            fragment_state_table_name,
+            fragment_metadata_table_name: None,
             endpoint_url: None,
             region: None,
             slow_operation_threshold_millis: u64::MAX,
@@ -184,6 +260,12 @@ impl DynamoDbImmutableStoreSettings {
 
     pub fn with_endpoint(mut self, endpoint_url: String) -> Self {
         self.endpoint_url = Some(endpoint_url);
+        self
+    }
+
+    /// Read fragments for objects predating the move onto the S3 object from `table_name`.
+    pub fn with_fragment_metadata_table(mut self, table_name: String) -> Self {
+        self.fragment_metadata_table_name = Some(table_name);
         self
     }
 }
@@ -295,34 +377,101 @@ impl DynamoDbQuery for FragmentsQuery {
     }
 }
 
+/// Write only if no row exists for this hash yet.
+///
+/// Publishing a payload uses this so that a concurrent obliteration's mark cannot be erased by a
+/// racing writer: the writer's create loses, it re-reads the row, and it sees the mark.
 #[derive(Debug, PartialEq)]
-struct UpdateMetadataCondition(Fragment);
+struct RowAbsent;
 
-impl DynamoDbPutCondition for UpdateMetadataCondition {
+impl DynamoDbPutCondition for RowAbsent {
     fn into_parts(self) -> ConditionParts {
         ConditionParts {
-            condition_expression: "#flags = :flags AND #size_payload = :size_payload AND #size_content = :size_content".to_string(),
-            expression_names: HashMap::from([
-                ("#flags".to_string(), "flags".to_string()),
-                ("#size_payload".to_string(), "size_payload".to_string()),
-                ("#size_content".to_string(), "size_content".to_string()),
-            ]),
-            expression_values: HashMap::from([
-                (
-                    ":flags".to_string(),
-                    AttributeValue::N(self.0.flags.to_string()),
-                ),
-                (
-                    ":size_payload".to_string(),
-                    AttributeValue::N(self.0.size_payload.to_string()),
-                ),
-                (
-                    ":size_content".to_string(),
-                    AttributeValue::N(self.0.size_content.to_string()),
-                ),
-            ]),
+            condition_expression: "attribute_not_exists(#hash)".to_string(),
+            expression_names: HashMap::from([("#hash".to_string(), "hash".to_string())]),
+            expression_values: HashMap::new(),
         }
     }
+}
+
+/// Write only if the row is still in the state the caller last observed.
+///
+/// Obliteration advances the row through its states with this, so two obliterations racing for the
+/// same hash cannot both believe they hold the mark.
+#[derive(Debug, PartialEq)]
+struct StateUnchanged(FragmentState);
+
+impl DynamoDbPutCondition for StateUnchanged {
+    fn into_parts(self) -> ConditionParts {
+        ConditionParts {
+            condition_expression: "#state = :state".to_string(),
+            expression_names: HashMap::from([("#state".to_string(), "state".to_string())]),
+            expression_values: HashMap::from([(
+                ":state".to_string(),
+                AttributeValue::N(self.0.bits().to_string()),
+            )]),
+        }
+    }
+}
+
+/// Counts reads that found a partition still referencing a hash whose payload S3 no longer has.
+///
+/// Non-zero means content has been lost. The read itself is reported as a plain not-found, which is
+/// indistinguishable from content that was never stored, so without this the loss is silent.
+const METRICS_MISSING_PAYLOAD_METRIC_NAME: &str = "store.immutable.missing_payload";
+
+/// Lower bound on the obliteration drain, regardless of how the `DynamoDB` timeout is configured.
+const MIN_OBLITERATION_DRAIN_MILLIS: u64 = 100;
+
+/// Whether a `DynamoDB` failure means "ask again" rather than "here is your answer".
+///
+/// The SDK signals overload in several shapes — a client-side timeout, a dispatch failure before the
+/// request reached the service, an HTTP 429 or 5xx, or a service error whose code names throttling —
+/// and they all mean the same thing to a caller: no answer was obtained. Everything else is a real
+/// failure and is reported as one.
+///
+/// Getting this wrong is not cosmetic. Reporting a failed read as not-found tells a caller the
+/// content is absent when we merely failed to look, and a not-found on a referenced hash is what
+/// [`AwsImmutableStore::report_missing_payload`] treats as lost data — so a throttle could be
+/// recorded as data loss and clear a state row.
+fn is_dynamodb_overloaded<E>(error: &AwsError<DynamoDbSdkError<E>>) -> bool
+where
+    E: ProvideErrorMetadata,
+{
+    let AwsError::AwsSdkError(sdk_error) = error else {
+        return false;
+    };
+
+    match sdk_error {
+        DynamoDbSdkError::TimeoutError(_) | DynamoDbSdkError::DispatchFailure(_) => true,
+        DynamoDbSdkError::ServiceError(err) => {
+            let status = err.raw().status().as_u16();
+
+            status == 429
+                || status >= 500
+                || matches!(
+                    err.err().code(),
+                    Some(
+                        "ThrottlingException"
+                            | "ProvisionedThroughputExceededException"
+                            | "RequestLimitExceeded"
+                            | "InternalServerError"
+                            | "ServiceUnavailable"
+                    )
+                )
+        }
+        _ => false,
+    }
+}
+
+/// Mark a fragment as durably stored.
+///
+/// Durability is a fact about this store, not about the payload, so it is derived on read rather
+/// than written down: an object present in the bucket is durable by definition. Persisting it would
+/// mean serving one store's answer for another, and would let the claim outlive the object.
+fn stored_durable(mut fragment: Fragment) -> Fragment {
+    fragment.flags |= FragmentFlags::PayloadStoredDurable.bits();
+    fragment
 }
 
 static STORE_ATTRIBUTES: LazyLock<[KeyValue; 1]> =
@@ -333,6 +482,9 @@ type BatchTaskResult = Result<(usize, StoreMatch), (usize, StoreError)>;
 struct GetS3objectContentsOutput {
     read: usize,
     bytes: BytesMut,
+    /// The fragment carried on the object, recovered from its object metadata. Arrives on the same
+    /// response as the bytes it describes, so the two are necessarily from the same object version.
+    fragment: Result<Fragment, ObjectMetadataError>,
 }
 
 pub struct AwsImmutableStore {
@@ -341,8 +493,16 @@ pub struct AwsImmutableStore {
     task_queue: TaskQueue<BatchTaskResult>,
     bucket: String,
     fragments_table_name: Arc<str>,
-    metadata_table_name: Arc<str>,
+    /// Table of [`FragmentStateEntry`] rows. Named "metadata" for historical reasons; it holds
+    /// lifecycle state only, never a fragment.
+    fragment_state_table_name: Arc<str>,
+    /// Set only where objects predating the move onto the S3 object may still exist. `None` is a
+    /// deployment that has never written one, and reads accordingly refuse to guess.
+    fragment_metadata_table_name: Option<Arc<str>>,
     force_write: bool,
+    /// How long to wait between removing an association and counting what remains, so a put that
+    /// had already passed its state probe has time to land its own association and be counted.
+    obliteration_drain: Duration,
     latency_histogram: Histogram<f64>,
     labels_get: LabelArray,
     labels_put: LabelArray,
@@ -351,6 +511,9 @@ pub struct AwsImmutableStore {
     labels_obliterate: LabelArray,
     labels_query: LabelArray,
     labels_copy: LabelArray,
+    labels_get_metadata: LabelArray,
+    missing_payload_counter: Counter<u64>,
+    labels_missing_payload: LabelArray,
 }
 
 impl AwsImmutableStore {
@@ -366,6 +529,9 @@ impl AwsImmutableStore {
         let labels_obliterate = provider.get_labels_for_operation_context("obliterate");
         let labels_query = provider.get_labels_for_operation_context("query");
         let labels_copy = provider.get_labels_for_operation_context("copy");
+        let labels_get_metadata = provider.get_labels_for_operation_context("get_metadata");
+        let missing_payload_counter = provider.counter(METRICS_MISSING_PAYLOAD_METRIC_NAME);
+        let labels_missing_payload = provider.get_labels_for_operation_context("missing_payload");
         Self {
             s3,
             dynamodb,
@@ -380,8 +546,21 @@ impl AwsImmutableStore {
             ),
             bucket: settings.s3.bucket.clone(),
             fragments_table_name: Arc::from(settings.dynamodb.fragments_table_name.clone()),
-            metadata_table_name: Arc::from(settings.dynamodb.metadata_table_name.clone()),
+            fragment_state_table_name: Arc::from(
+                settings.dynamodb.fragment_state_table_name.clone(),
+            ),
+            fragment_metadata_table_name: settings
+                .dynamodb
+                .fragment_metadata_table_name
+                .as_ref()
+                .map(|name| Arc::from(name.clone())),
             force_write: settings.force_write,
+            obliteration_drain: Duration::from_millis(
+                settings
+                    .dynamodb
+                    .timeout_millis
+                    .max(MIN_OBLITERATION_DRAIN_MILLIS),
+            ),
             latency_histogram,
             labels_get,
             labels_put,
@@ -390,6 +569,9 @@ impl AwsImmutableStore {
             labels_obliterate,
             labels_query,
             labels_copy,
+            labels_get_metadata,
+            missing_payload_counter,
+            labels_missing_payload,
         }
     }
 
@@ -705,128 +887,233 @@ impl AwsImmutableStore {
         })
     }
 
+    /// Resolve an address to the fragment stored for it, without transferring the payload.
+    ///
+    /// An obliterated hash needs no special case: obliteration deletes the object, so the head
+    /// returns not-found and the query reports a miss. Between an obliteration taking its mark and
+    /// deleting the association there is a window where a partition that still holds a reference
+    /// sees the fragment — which is accurate, since the payload survives for as long as any
+    /// reference to it does.
     async fn do_query(
         &self,
         repository: Context,
         address: Address,
         match_requested: StoreMatch,
-        hide_obliterates: bool,
     ) -> Result<StoreQueryResult, StoreError> {
-        let match_made = self.lookup(repository, address, match_requested).await?;
+        let (match_made, state) = tokio::join!(
+            self.lookup(repository, address, match_requested),
+            self.load_state(address.hash)
+        );
+
+        let match_made = match_made?;
+        let miss = Ok(StoreQueryResult {
+            fragment: Fragment::default(),
+            match_made: StoreMatch::MatchNone,
+        });
 
         if match_made == StoreMatch::MatchNone {
-            return Ok(StoreQueryResult {
-                fragment: Fragment::default(),
-                match_made,
-            });
+            return miss;
         }
 
-        let fragment = self.load_metadata(address.hash).await.map_err(|e| {
-            warn!(
-                "Load metadata failed for address: {address:?} in repository: {repository:?}: {e:?}"
-            );
-            StoreError::internal_with_context(e, "Failed to load metadata after fragment lookup")
-        })?;
-
-        if (fragment.flags & FragmentFlags::PayloadObliteration) != 0 && hide_obliterates {
-            debug!("Query found obliterated fragment at address {address}");
-            Ok(StoreQueryResult {
-                fragment: Fragment::default(),
-                match_made: StoreMatch::MatchNone,
-            })
-        } else {
-            Ok(StoreQueryResult {
-                fragment,
+        match state? {
+            Some(FragmentState::Stored) => Ok(StoreQueryResult {
+                fragment: stored_durable(Fragment::default()),
                 match_made,
-            })
+            }),
+            Some(FragmentState::Obliterating | FragmentState::Obliterated) => {
+                debug!("Query found obliterated fragment at address {address}");
+                miss
+            }
+            None => {
+                debug!("Query found an association at {address} with no stored payload");
+                miss
+            }
         }
     }
 
-    async fn write_metadata(
-        &self,
-        repository: Context,
-        address: Address,
-        fragment: Fragment,
-    ) -> Result<(), StoreError> {
-        let metadata = FragmentMetadataEntry::new(address.hash).with_fragment(fragment);
-        let item = serde_dynamo::to_item(&metadata).map_err(|e| {
-            warn!("Failed to serialize metadata entry for repository: {repository:?} and address: {address:?} to dynamo av map: {e:?}");
-            StoreError::internal_with_context(e, "Failed to serialize metadata for DynamoDB write")
+    /// Record that a payload exists, without disturbing an obliteration that may hold the hash.
+    ///
+    /// The create is conditional, so it can never overwrite a mark. Losing that condition is the
+    /// ordinary outcome for content that is already stored — the row carries no representation, so
+    /// there is nothing to reconcile and the existing row is already correct. The state it carries
+    /// is returned so the caller can tell "already published" from "an obliteration holds this".
+    async fn publish_state(&self, hash: Hash) -> Result<FragmentState, StoreError> {
+        let entry = FragmentStateEntry::new(hash, FragmentState::Stored);
+        let item = serde_dynamo::to_item(&entry).map_err(|e| {
+            warn!("Failed to serialize fragment state entry for {hash}: {e:?}");
+            StoreError::internal_with_context(e, "Failed to serialize fragment state for DynamoDB")
         })?;
 
-        self.dynamodb.put_item(&self.metadata_table_name, item).await.map_err(|e| {
-            warn!("Failed to save metadata entry for repository: {repository:?} and address: {address:?}: {e:?}");
-            if matches!(&e, AwsError::AwsSdkError(_)) {
-                StoreError::from(SlowDown)
-            } else {
-                StoreError::internal_with_context(e, "DynamoDB metadata write failed")
+        match self
+            .dynamodb
+            .put_item_conditional(&self.fragment_state_table_name, item, RowAbsent)
+            .await
+        {
+            Ok(_) => Ok(FragmentState::Stored),
+            Err(AwsError::AwsSdkError(DynamoDbSdkError::ServiceError(err)))
+                if err.err().is_conditional_check_failed_exception() =>
+            {
+                let PutItemError::ConditionalCheckFailedException(failure) = err.err() else {
+                    unreachable!()
+                };
+
+                Ok(failure
+                    .item()
+                    .and_then(|item| {
+                        serde_dynamo::from_item::<_, FragmentStateEntry>(item.to_owned())
+                            .inspect_err(|e| {
+                                warn!("Failed to parse fragment state from item {item:?}: {e}");
+                            })
+                            .ok()
+                    })
+                    .map_or(FragmentState::Stored, |entry| entry.state()))
             }
+            Err(e) => {
+                warn!("Failed to publish fragment state for {hash}: {e:?}");
+                if matches!(&e, AwsError::AwsSdkError(_)) {
+                    Err(StoreError::from(SlowDown))
+                } else {
+                    Err(StoreError::internal_with_context(
+                        e,
+                        "DynamoDB fragment state write failed",
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Record, and make repairable, a hash that is still referenced but whose payload is gone.
+    ///
+    /// Reaching here means the access check found an association while S3 reported no object, so
+    /// the content was published once and has since been lost. The read is on its way back to the
+    /// caller as an ordinary not-found, which is indistinguishable from content that was never
+    /// stored, so this is the only point at which the difference is still known.
+    ///
+    /// Clearing the state row is what makes it repairable: with no row, the next put stops taking
+    /// the "already durable" branch and uploads instead. That is safe only because the row holds no
+    /// representation — there is nothing in it the next write does not re-derive.
+    ///
+    /// Both steps are best effort. Failing to clear the row leaves the hash exactly as it already
+    /// was, and the alarm has been raised regardless.
+    async fn report_missing_payload(&self, address: Address) {
+        self.missing_payload_counter
+            .add(1, &self.labels_missing_payload);
+        error!(
+            %address,
+            "Fragment is referenced by a partition but absent from S3; content for this hash has \
+             been lost. Clearing its state so the content can be stored again."
+        );
+
+        match self.load_state(address.hash).await {
+            Ok(Some(FragmentState::Stored)) => {
+                if let Err(error) = self.clear_state(address.hash).await {
+                    warn!(%address, ?error, "Failed to clear state for a lost payload");
+                }
+            }
+            Ok(state) => {
+                debug!(%address, ?state, "Leaving state alone for a lost payload");
+            }
+            Err(error) => {
+                warn!(%address, ?error, "Failed to read state for a lost payload");
+            }
+        }
+    }
+
+    /// Delete the state row for a hash, so the next put treats it as new content.
+    ///
+    /// Only called for a payload S3 has lost. An obliteration holding the mark is left alone by the
+    /// caller, since removing a mark mid-obliteration would let a put republish underneath it.
+    async fn clear_state(&self, hash: Hash) -> Result<(), StoreError> {
+        let item = serde_dynamo::to_item(FragmentStateEntry::key(hash)).map_err(|e| {
+            warn!("Failed to serialize fragment state key for {hash}: {e:?}");
+            StoreError::internal_with_context(e, "Failed to serialize fragment state for delete")
         })?;
+
+        self.dynamodb
+            .delete_item(&self.fragment_state_table_name, item)
+            .await
+            .map_err(|e| {
+                if matches!(&e, AwsError::AwsSdkError(_)) {
+                    StoreError::from(SlowDown)
+                } else {
+                    StoreError::internal_with_context(e, "DynamoDB fragment state delete failed")
+                }
+            })?;
 
         Ok(())
     }
 
-    async fn update_metadata(
+    /// Move a tombstoned hash back to stored, now that its payload has been uploaded again.
+    ///
+    /// Losing this race is not a failure. Another writer reviving the same tombstone produced
+    /// exactly the state this one wanted, and this one's bytes are already uploaded, so there is
+    /// nothing left to disagree about. Only finding the hash back under an obliteration is a reason
+    /// to stop, and that is a back-off rather than an error because the mark is transient.
+    ///
+    /// This tolerance belongs here rather than in [`AwsImmutableStore::advance_state`], which is
+    /// also how an obliteration takes its mark — treating "already in the target state" as success
+    /// there would let two obliterations both believe they hold it.
+    async fn revive_state(&self, hash: Hash) -> Result<(), StoreError> {
+        if self
+            .advance_state(hash, FragmentState::Obliterated, FragmentState::Stored)
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+
+        match self.load_state(hash).await? {
+            Some(FragmentState::Stored) => {
+                debug!(%hash, "Another writer revived this hash first");
+                Ok(())
+            }
+            state => {
+                info!(%hash, ?state, "Hash is no longer revivable, asking the caller to retry");
+                Err(StoreError::from(SlowDown))
+            }
+        }
+    }
+
+    /// Move the state row from one state to another, failing if it has moved underneath us.
+    ///
+    /// Obliteration uses this to take and release the mark. Because the row holds nothing but the
+    /// state, this compare-and-set is over a single attribute and two writers racing for the mark
+    /// cannot both win.
+    async fn advance_state(
         &self,
-        address: Address,
-        updated: Fragment,
-        expected: Fragment,
+        hash: Hash,
+        expected: FragmentState,
+        updated: FragmentState,
     ) -> Result<(), StoreError> {
-        let metadata = FragmentMetadataEntry::new(address.hash).with_fragment(updated);
-        let item = serde_dynamo::to_item(&metadata).map_err(|e| {
-            warn!("Failed to serialize metadata entry for fragment with address: {address}: {e:?}");
-            StoreError::internal_with_context(e, "Failed to serialize metadata for DynamoDB update")
+        let entry = FragmentStateEntry::new(hash, updated);
+        let item = serde_dynamo::to_item(&entry).map_err(|e| {
+            warn!("Failed to serialize fragment state entry for {hash}: {e:?}");
+            StoreError::internal_with_context(e, "Failed to serialize fragment state for DynamoDB")
         })?;
 
-        let result = self
+        match self
             .dynamodb
             .put_item_conditional(
-                &self.metadata_table_name,
+                &self.fragment_state_table_name,
                 item,
-                UpdateMetadataCondition(expected),
+                StateUnchanged(expected),
             )
-            .await;
-
-        match result {
+            .await
+        {
             Ok(_) => Ok(()),
             Err(AwsError::AwsSdkError(DynamoDbSdkError::ServiceError(err)))
                 if err.err().is_conditional_check_failed_exception() =>
             {
-                if let PutItemError::ConditionalCheckFailedException(e) = err.err() {
-                    match e.item() {
-                        Some(item) => {
-                            let entry: Option<FragmentMetadataEntry> =
-                                serde_dynamo::from_item(item.to_owned())
-                                    .inspect_err(|e| {
-                                        warn!("Failed to parse fragment from item: {item:?}: {e}");
-                                    })
-                                    .ok();
-
-                            warn!(
-                                "Failed to update metadata, expected metadata: {expected:?} did not match actual: {:?}",
-                                entry
-                            );
-                        }
-                        None => {
-                            warn!(
-                                "Failed to update metadata, no existing metadata found for {address}"
-                            );
-                        }
-                    }
-                    Err(StoreError::internal(
-                        "Failed to update metadata due to conflict",
-                    ))
-                } else {
-                    unreachable!()
-                }
+                warn!("Fragment state for {hash} was not {expected:?} when moving to {updated:?}");
+                Err(StoreError::internal(
+                    "Failed to update fragment state due to conflict",
+                ))
             }
             Err(e) => {
-                warn!(
-                    "DynamoDB conditional put failed while updating metadata for {address}: {e:?}"
-                );
+                warn!("DynamoDB conditional put failed while updating state for {hash}: {e:?}");
                 Err(StoreError::internal_with_context(
                     e,
-                    "DynamoDB conditional metadata update failed",
+                    "DynamoDB conditional fragment state update failed",
                 ))
             }
         }
@@ -933,7 +1220,12 @@ impl AwsImmutableStore {
         let hash = lore_revision::util::to_hex_str(address.hash.data(), &mut dst);
 
         self.s3
-            .put_object(self.bucket.as_str(), hash, payload.to_vec())
+            .put_object(
+                self.bucket.as_str(),
+                hash,
+                payload.to_vec(),
+                Some(to_object_metadata(&fragment)),
+            )
             .await
             .map(|_| ())
             .map_err(|e| {
@@ -945,12 +1237,20 @@ impl AwsImmutableStore {
                 }
             })?;
 
-        // Writing metadata is not tied to writing the payload to S3, which means that over time
-        // we'll likely wind up in a scenario where some fragments exist in S3, but their associated
-        // metadata does not exist in Dynamo. In this scenario, a later query and/or read for the
-        // fragment would treat it as not found, prompting clients to resend the fragment. This
-        // means that whenever we land in this scenario, we should be self-healing.
-        self.write_metadata(repository, address, fragment).await?;
+        match self.publish_state(address.hash).await? {
+            FragmentState::Stored => {}
+            FragmentState::Obliterating => {
+                info!(
+                    "Payload for {address} was uploaded while an obliteration holds the hash; \
+                     leaving it unassociated and asking the caller to retry"
+                );
+                return Err(StoreError::from(SlowDown));
+            }
+            FragmentState::Obliterated => {
+                info!("Payload for {address} revives a tombstoned hash");
+                self.revive_state(address.hash).await?;
+            }
+        }
 
         self.associate_fragment(repository, address).await?;
 
@@ -1011,73 +1311,149 @@ impl AwsImmutableStore {
         Ok(())
     }
 
-    /// Loads fragment metadata, with just size validation
-    async fn metadata_with_size_validation(&self, hash: Hash) -> Result<Fragment, StoreError> {
-        let metadata = self.load_metadata(hash).await?;
-        // Reject upfront before issuing the S3 GET: a corrupt metadata entry
-        // could declare a payload larger than the protocol threshold, which
-        // would then be happily extended into the in-memory buffer below.
-        lore_storage::validate_fragment_size(&metadata)?;
-        Ok(metadata)
-    }
+    /// Read a fragment without its payload, from the object's object metadata.
+    ///
+    /// This is the one path that spends an S3 request purely on metadata, and it spends the
+    /// cheapest one: `HeadObject` transfers no body. Reads that want the payload get the fragment
+    /// for free on the `GetObject` response instead.
+    async fn head_fragment(&self, hash: Hash) -> Result<Fragment, StoreError> {
+        let mut dst = [0u8; 64];
+        let output = self
+            .s3
+            .head_object(
+                self.bucket.as_str(),
+                lore_revision::util::to_hex_str(hash.data(), &mut dst),
+            )
+            .await
+            .map_err(|e| {
+                if let AwsError::AwsSdkError(sdk_error) = e {
+                    debug!(%hash, error = ?sdk_error, "head_fragment SDK error heading object");
+                    match sdk_error.into_service_error() {
+                        HeadObjectError::NotFound(_) => StoreError::from(AddressNotFound::from(
+                            Address::zero_context_hash(hash),
+                        )),
+                        _ => StoreError::from(SlowDown),
+                    }
+                } else {
+                    debug!(%hash, error = ?e, "head_fragment failed to head object");
+                    StoreError::internal_with_context(e, "S3 head object failed")
+                }
+            })?;
 
-    /// Loads fragment metadata, applying all validation
-    /// to ensure it is a valid fragment to load
-    async fn metadata_with_load_validation(&self, hash: Hash) -> Result<Fragment, StoreError> {
-        let metadata = self.metadata_with_size_validation(hash).await?;
-
-        if (metadata.flags & FragmentFlags::PayloadObliteration) != 0 {
-            return Err(StoreError::from(AddressNotFound::from(
-                Address::zero_context_hash(hash),
-            )));
+        let fragment = match from_object_metadata(output.metadata()) {
+            Ok(fragment) => fragment,
+            Err(ObjectMetadataError::Absent) => self.fragment_from_metadata_table(hash).await?,
+            Err(e) => {
+                warn!(%hash, "Stored object carries unusable fragment metadata: {e}");
+                return Err(StoreError::internal_with_context(
+                    e,
+                    "S3 object fragment metadata unusable",
+                ));
+            }
         };
 
-        Ok(metadata)
+        Ok(stored_durable(fragment))
     }
 
-    async fn load_metadata(&self, hash: Hash) -> Result<Fragment, StoreError> {
-        let item = serde_dynamo::to_item(FragmentMetadataEntry::new(hash)).map_err(|e| {
-            warn!("Failed to serialize fragment metadata entry for {hash}: {e:?}");
+    /// Read the lifecycle state of a hash. `None` means no row exists, so the hash is unknown.
+    ///
+    /// This is the cheap existence probe the whole design turns on: one strongly consistent
+    /// `GetItem` answers "is this payload durable" for every partition at once, with no S3 request
+    /// and no dependence on how many partitions reference it.
+    async fn load_state(&self, hash: Hash) -> Result<Option<FragmentState>, StoreError> {
+        let item = serde_dynamo::to_item(FragmentStateEntry::key(hash)).map_err(|e| {
+            warn!("Failed to serialize fragment state entry for {hash}: {e:?}");
             StoreError::internal_with_context(
                 e,
-                "Failed to serialize fragment entry for DynamoDB metadata load",
+                "Failed to serialize fragment entry for DynamoDB state load",
             )
         })?;
 
-        let metadata: FragmentMetadataEntry = if let Some(av_map) = self
+        let Some(av_map) = self
             .dynamodb
             .get_item(
-                &self.metadata_table_name,
+                &self.fragment_state_table_name,
                 item,
                 true, /* consistent read */
             )
             .await
             .map_err(|e| {
-                warn!(%hash, ?e, "Failed to get fragment metadata for hash");
-                if let AwsError::AwsSdkError(sdk_error) = e
-                    && let SdkError::TimeoutError(_) = sdk_error
-                {
+                warn!(%hash, ?e, "Failed to get fragment state for hash");
+                if is_dynamodb_overloaded(&e) {
                     StoreError::from(SlowDown)
                 } else {
-                    StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
+                    StoreError::internal_with_context(e, "DynamoDB fragment state read failed")
                 }
             })?
             .item
-        {
-            serde_dynamo::from_item(av_map).map_err(|e| {
-                warn!("Failed to deserialize fragment metadata: {e:?}");
-                StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
-            })
-        } else {
-            warn!("Failed to get metadata for fragment, no item found");
-            Err(StoreError::from(AddressNotFound::from(
-                Address::zero_context_hash(hash),
-            )))
-        }?;
+        else {
+            return Ok(None);
+        };
 
-        metadata.fragment.ok_or_else(|| {
-            warn!("No fragment found on metadata from store: {metadata:?}");
-            StoreError::internal("Fragment metadata entry missing fragment field")
+        let entry: FragmentStateEntry = serde_dynamo::from_item(av_map).map_err(|e| {
+            warn!("Failed to deserialize fragment state: {e:?}");
+            StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
+        })?;
+
+        Ok(Some(entry.state()))
+    }
+
+    /// Resolve the fragment for an object that carries none of its own.
+    ///
+    /// Reached only on [`ObjectMetadataError::Absent`] — an intact object with no lore metadata,
+    /// which is exactly what an object written before the fragment moved onto it looks like. A
+    /// `Malformed` object never arrives here: metadata that is present but unreadable means damage,
+    /// and describing damaged bytes from a separate record is the mismatch this design exists to
+    /// remove.
+    ///
+    /// With no legacy table configured there is nothing to fall back to, and nothing that should
+    /// be: the deployment has declared it never wrote such an object.
+    async fn fragment_from_metadata_table(&self, hash: Hash) -> Result<Fragment, StoreError> {
+        let Some(table_name) = self.fragment_metadata_table_name.as_ref() else {
+            warn!(
+                %hash,
+                "Stored object carries no fragment metadata and no fragment metadata table is \
+                 configured; treating it as damaged"
+            );
+            return Err(StoreError::internal(
+                "S3 object carries no fragment metadata",
+            ));
+        };
+
+        let item = serde_dynamo::to_item(FragmentStateEntry::key(hash)).map_err(|e| {
+            warn!("Failed to serialize legacy fragment key for {hash}: {e:?}");
+            StoreError::internal_with_context(
+                e,
+                "Failed to serialize fragment entry for legacy metadata load",
+            )
+        })?;
+
+        let entry = self
+            .dynamodb
+            .get_item(table_name, item, true /* consistent read */)
+            .await
+            .map_err(|e| {
+                warn!(%hash, ?e, "Failed to read fragment metadata table");
+                if is_dynamodb_overloaded(&e) {
+                    StoreError::from(SlowDown)
+                } else {
+                    StoreError::internal_with_context(e, "DynamoDB fragment metadata read failed")
+                }
+            })?
+            .item
+            .map(serde_dynamo::from_item::<_, FragmentMetadataEntry>)
+            .transpose()
+            .map_err(|e| {
+                warn!(%hash, "Failed to deserialize fragment metadata row: {e:?}");
+                StoreError::internal_with_context(e, "Fragment metadata row is unreadable")
+            })?;
+
+        entry.and_then(|entry| entry.fragment).ok_or_else(|| {
+            warn!(
+                %hash,
+                "Stored object carries no fragment metadata and no legacy row describes it"
+            );
+            StoreError::internal("S3 object carries no fragment metadata")
         })
     }
 
@@ -1109,6 +1485,8 @@ impl AwsImmutableStore {
                 }
             })?;
 
+        let fragment = from_object_metadata(output.metadata());
+
         let mut buffer = BytesMut::with_capacity(FRAGMENT_SIZE_THRESHOLD);
         let mut read = 0_usize;
         while let Some(bytes) = output.body.next().await {
@@ -1126,34 +1504,25 @@ impl AwsImmutableStore {
         Ok(GetS3objectContentsOutput {
             bytes: buffer,
             read,
+            fragment,
         })
     }
 
+    /// Check the object's own bytes against the fragment the same object declares.
+    ///
+    /// Both sides of this comparison come from one S3 response, so it is a self-consistency check
+    /// on a single object rather than a comparison between two stores. It cannot fail because two
+    /// records drifted apart; only because the object itself is damaged.
     fn read_payload(
-        &self,
-        mut s3_contents: GetS3objectContentsOutput,
+        s3_contents: GetS3objectContentsOutput,
         hash: Hash,
         fragment: Fragment,
     ) -> Result<Bytes, StoreError> {
         let payload_size = fragment.size_payload as usize;
         let buffer_size = s3_contents.bytes.len();
 
-        // This exists to work around an inconsistency that can occur as we switch from storing
-        // metadata prefixed to objects in S3 to storing metadata separately in Dynamo. If the
-        // amount of data we read does not match the expected size, we should fail the request.
-        // However, if it's off by exactly the size of fragment metadata, and we're in force-write
-        // mode, assume it's ok.
-        let buffer = if buffer_size > payload_size
-            && (buffer_size - payload_size) == size_of::<Fragment>()
-            && self.force_write
-        {
-            s3_contents.bytes.split_off(size_of::<Fragment>()).freeze()
-        } else {
-            s3_contents.bytes.freeze()
-        };
-
         if buffer_size == payload_size {
-            Ok(buffer)
+            Ok(s3_contents.bytes.freeze())
         } else {
             warn!(
                 "Wrong number of bytes read from payload, expected {payload_size} but got {buffer_size}, from a total of {} bytes read",
@@ -1165,33 +1534,110 @@ impl AwsImmutableStore {
         }
     }
 
+    /// Load a payload and the fragment describing it, in a single S3 request.
+    ///
+    /// There is no `DynamoDB` read here at all. The fragment arrives as object metadata on the very
+    /// response carrying the bytes, so it describes those bytes by construction — no second record
+    /// to consult, and nothing that can be stale with respect to what was read.
     async fn load(&self, hash: Hash) -> Result<(Fragment, Bytes), StoreError> {
-        // Run both futures concurrently. The select! loop breaks as soon as metadata resolves.
-        // If S3 finishes first its result is stashed, and we keep waiting for metadata.
-        let metadata_fut = self.metadata_with_load_validation(hash);
-        let s3_fut = self.get_s3_object_contents(hash);
-        tokio::pin!(metadata_fut, s3_fut);
-        let mut s3_result = None;
-        let metadata_result = loop {
-            tokio::select! {
-                result = &mut metadata_fut => break result,
-                result = &mut s3_fut, if s3_result.is_none() => {
-                    s3_result = Some(result);
-                }
+        let s3_contents = self.get_s3_object_contents(hash).await?;
+
+        let fragment = match s3_contents.fragment {
+            Ok(fragment) => fragment,
+            Err(ObjectMetadataError::Absent) => self.fragment_from_metadata_table(hash).await?,
+            Err(e) => {
+                warn!(%hash, "Stored object carries unusable fragment metadata: {e}");
+                return Err(StoreError::internal_with_context(
+                    e,
+                    "S3 object fragment metadata unusable",
+                ));
             }
         };
 
-        // If metadata failed, its error is returned here; s3_fut is dropped (canceled) on the
-        // early return. Metadata error takes priority over any S3 error.
-        let fragment = metadata_result?;
+        let fragment = stored_durable(fragment);
+        lore_storage::validate_fragment_size(&fragment)?;
 
-        let s3_contents = match s3_result {
-            Some(r) => r?,
-            None => s3_fut.await?,
+        let payload = Self::read_payload(s3_contents, hash, fragment)?;
+        Ok((fragment, payload))
+    }
+
+    /// Obliterate the fragments a fragmented payload points at, if it is one.
+    ///
+    /// Called once the mark is held and no association remains, so the parent payload is still
+    /// present to be read and nothing can be adding references beneath it.
+    async fn obliterate_sub_fragments(
+        self: Arc<Self>,
+        repository: Context,
+        address: Address,
+        stats: Arc<StoreObliterateStats>,
+    ) -> Result<(), StoreError> {
+        let (fragment, payload) = match self.load(address.hash).await {
+            Ok(loaded) => loaded,
+            Err(e) if e.is_address_not_found() => {
+                info!("Payload for {address} is already gone, no sub-fragments to obliterate");
+                return Ok(());
+            }
+            Err(e) => return Err(e),
         };
 
-        let payload = self.read_payload(s3_contents, hash, fragment)?;
-        Ok((fragment, payload))
+        if fragment.flags & FragmentFlags::PayloadFragmented == 0 {
+            return Ok(());
+        }
+
+        let payload = payload.to_aligned::<FragmentReference>();
+        let sub_fragments = payload.as_type_slice::<FragmentReference>();
+        info!(
+            "Fragment {address} has {} sub-fragments",
+            sub_fragments.len()
+        );
+
+        let span = tracing::Span::current();
+        let mut join_set = JoinSet::new();
+        for reference in sub_fragments.iter() {
+            let self_clone = self.clone();
+            let stats = stats.clone();
+            let sub_address = Address {
+                hash: reference.hash,
+                context: address.context,
+            };
+
+            info!("Spawning task to obliterate {sub_address}");
+            lore_base::lore_spawn!(
+                join_set,
+                async move {
+                    self_clone
+                        .obliterate(repository.into(), sub_address, stats)
+                        .await
+                        .map_err(|e| (sub_address, e))
+                }
+                .instrument(span.clone())
+            );
+        }
+
+        let mut failures = false;
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Err(e) => {
+                    failures = true;
+                    warn!("Failed to join task for fragment reference obliterate: {e:?}");
+                }
+                Ok(Err((sub_address, e))) => {
+                    failures = true;
+                    warn!("Obliteration failed for sub-fragment {sub_address}: {e:?}");
+                }
+                Ok(Ok(())) => {}
+            }
+        }
+
+        if failures {
+            warn!("Obliteration failed for at least one sub-fragment.");
+            return Err(StoreError::internal(format!(
+                "Failed to obliterate immutable {address}"
+            )));
+        }
+
+        info!("Done obliterating sub-fragments");
+        Ok(())
     }
 }
 
@@ -1251,13 +1697,47 @@ impl ImmutableStoreTrait for AwsImmutableStore {
     ) -> Result<StoreQueryResult, StoreError> {
         let repository: Context = partition.into();
         timed!(self.latency_histogram, &self.labels_query, {
-            self.do_query(
-                repository,
-                address,
-                match_requested,
-                true, /* hide obliterates */
-            )
-            .await
+            Box::pin(self.do_query(repository, address, match_requested)).await
+        })
+        .into()
+    }
+
+    /// Unlike [`AwsImmutableStore::query`], this reads the object to report the representation
+    /// actually stored, which costs a `HeadObject`. It transfers no body, and it is the only path
+    /// in this store that spends an S3 request purely on metadata.
+    #[lore_macro::lore_instrument]
+    #[tracing::instrument(name = "AwsImmutableStore::get_metadata" skip(self))]
+    async fn get_metadata(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+    ) -> Result<StoreQueryResult, StoreError> {
+        let repository: Context = partition.into();
+        timed!(self.latency_histogram, &self.labels_get_metadata, {
+            let miss = StoreQueryResult {
+                fragment: Fragment::default(),
+                match_made: StoreMatch::MatchNone,
+            };
+
+            let match_made = Box::pin(self.do_query(repository, address, StoreMatch::MatchFull))
+                .await?
+                .match_made;
+
+            if match_made == StoreMatch::MatchNone {
+                return Ok(miss);
+            }
+
+            match self.head_fragment(address.hash).await {
+                Ok(fragment) => Ok(StoreQueryResult {
+                    fragment,
+                    match_made,
+                }),
+                Err(e) if e.is_address_not_found() => {
+                    self.report_missing_payload(address).await;
+                    Ok(miss)
+                }
+                Err(e) => Err(e),
+            }
         })
         .into()
     }
@@ -1293,11 +1773,19 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 exists_result?;
 
                 let load_output = match load_result {
-                    Some(r) => r?,
-                    None => load_fut.await?,
+                    Some(r) => r,
+                    None => load_fut.await,
                 };
 
-                Ok(load_output)
+                if load_output
+                    .as_ref()
+                    .err()
+                    .is_some_and(StoreError::is_address_not_found)
+                {
+                    self.report_missing_payload(address).await;
+                }
+
+                load_output
             })
             .into();
         let (fragment, payload) = result?;
@@ -1323,75 +1811,45 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             lore_storage::validate_fragment_size(&fragment)?;
         }
         let repository: Context = partition.into();
-        timed!(
-            self.latency_histogram,
-            &self.labels_put,
-            {
-                let query = self.do_query(
-                    repository,
-                    address,
-                    StoreMatch::MatchFull,
-                    false, /* hide obliterates */
-                )
-                .await;
+        timed!(self.latency_histogram, &self.labels_put, {
+            let probe = if self.force_write {
+                (None, false)
+            } else {
+                let entry = FragmentsEntry::new(repository, address);
+                let (associated, state) =
+                    tokio::join!(self.exists_exact(&entry), self.load_state(address.hash));
+                (state?, associated?)
+            };
 
-                let match_made = if !self.force_write && query.is_ok() {
-                    let query = query?;
+            match probe {
+                (Some(FragmentState::Obliterating), _) => {
+                    info!(
+                        "Received request to put fragment at {address} that is in the process of \
+                         being obliterated"
+                    );
+                    Err(StoreError::from(SlowDown))
+                }
 
-                    if (query.fragment.flags & FragmentFlags::PayloadObliterating) == FragmentFlags::PayloadObliterating
-                    {
-                        info!("Received request to put fragment at {address} that is in the process of being obliterated");
-                        return Err(StoreError::internal(format!("Failed to obliterate immutable {address}")));
-                    }
+                (Some(FragmentState::Stored), true) => Ok(()),
 
-                    if query.match_made != StoreMatch::MatchNone
-                        && fragment.size_content != query.fragment.size_content
-                        && (query.fragment.flags & FragmentFlags::PayloadObliterated) != FragmentFlags::PayloadObliterated
-                    {
-                        return Err(StoreError::internal("Hash collision"));
-                    }
+                (Some(FragmentState::Stored), false) if payload.is_some() => {
+                    self.associate_fragment(repository, address).await
+                }
 
-                    query.match_made
-                } else {
-                    // If we're in this branch because the query failed, we should log the error.
-                    if let Err(e) = query {
-                        warn!("Query failed for address: {address:?} in repository: {repository}: {e:?}");
-                    }
+                (Some(FragmentState::Stored), false) => {
+                    Err(StoreError::internal("Payload buffer required"))
+                }
 
-                    StoreMatch::MatchNone
-                };
-
-                match match_made {
-                    // If the fragment exists with the same context, there's nothing to do.
-                    StoreMatch::MatchFull => Ok(()),
-
-                    // If we matched on hash + repo, then we need to associate the fragment with the new
-                    // context. Does not need the payload as it already exist in repository.
-                    StoreMatch::MatchPartition => {
-                        self.associate_fragment(repository, address).await
-                    }
-
-                    // If we were only able to match on hash, the payload must have been provided.
-                    // If so, associate the fragment.
-                    StoreMatch::MatchHash if payload.is_some() => {
-                        self.associate_fragment(repository, address).await
-                    }
-
-                    // If no match, the payload must have been provided. Write it to S3 and store fragment.
-                    StoreMatch::MatchNone if payload.is_some() => {
-                        self.write_payload(repository, address, fragment, payload.unwrap())
+                _ => match payload {
+                    Some(payload) => {
+                        self.write_payload(repository, address, fragment, payload)
                             .await
                     }
-
-                    // If we were only able to match on hash, or were not able to match at all, and no
-                    // payload was provided, that's an error.
-                    StoreMatch::MatchHash | StoreMatch::MatchNone => {
-                        Err(StoreError::internal("Payload buffer required"))
-                    }
-                }
+                    None => Err(StoreError::internal("Payload buffer required")),
+                },
             }
-        )
-            .into()
+        })
+        .into()
     }
 
     #[lore_macro::lore_instrument]
@@ -1408,87 +1866,28 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             // expect this to be invoked, the log output in this method is intentionally very verbose.
             let span = tracing::Span::current();
 
-            let original_metadata = self
-                .metadata_with_size_validation(address.hash)
+            let Some(state) = self
+                .load_state(address.hash)
                 .instrument(span.clone())
-                .await?;
-
-            info!("Original metadata: {original_metadata:?}");
-
-            // Acquire the lock on the fragment.
-            let updated_metadata = if original_metadata.flags & FragmentFlags::PayloadObliteration == 0
-            {
-                let mut updated_metadata = original_metadata;
-                updated_metadata.flags |= FragmentFlags::PayloadObliterating;
-
-                self.update_metadata(address, updated_metadata, original_metadata)
-                    .instrument(span.clone())
-                    .await?;
-                info!("Acquired obliteration lock, updated metadata: {updated_metadata:?}");
-                updated_metadata
-            } else {
-                info!("Fragment metadata indicates fragment is already being (or has previously been) obliterated");
+                .await?
+            else {
+                info!("No fragment state for {address}, nothing to obliterate");
                 return Ok(());
             };
 
-            if updated_metadata.flags & FragmentFlags::PayloadFragmented != 0 {
-                info!("Fragment is fragmented");
-                // There's no reason we couldn't use the `updated_metadata` here, since `read_payload`
-                // only cares about the size fields (which haven't changed), but it feels wrong given it
-                // doesn't explicitly match the metadata for what's currently in S3.
-                let payload = self
-                    .read_payload(self.get_s3_object_contents(address.hash).await?, address.hash, original_metadata)?
-                    .to_aligned::<FragmentReference>();
-
-                let sub_fragments = payload.as_type_slice::<FragmentReference>();
-                info!("Fragment has {} sub-fragments", sub_fragments.len());
-
-                let mut join_set = JoinSet::new();
-                for reference in sub_fragments.iter() {
-                    let self_clone = self.clone();
-                    let stats = stats.clone();
-                    let address = Address {
-                        hash: reference.hash,
-                        context: address.context,
-                    };
-
-                    info!("Spawning task to obliterate {address}");
-                    lore_base::lore_spawn!(
-                        join_set,
-                        async move {
-                            self_clone
-                                .obliterate(repository.into(), address, stats)
-                                .await
-                                .map_err(|e| (address, e))
-                        }
-                        .instrument(span.clone())
-                    );
-                }
-
-                let mut failures = false;
-                while let Some(result) = join_set.join_next().await {
-                    if let Err(e) = result {
-                        failures = true;
-                        warn!("Failed to join task for fragment reference obliterate: {e:?}");
-                        continue;
-                    }
-
-                    // We wouldn't reach this if the result is an `Err`, so this unwrap is guaranteed
-                    // not to panic.
-                    let result = result.unwrap();
-                    if let Err(e) = result {
-                        failures = true;
-                        warn!("Obliteration failed for sub-fragment {address}: {e:?}");
-                    }
-                }
-
-                if failures {
-                    warn!("Obliteration failed for at least one sub-fragment.");
-                    return Err(StoreError::internal(format!("Failed to obliterate immutable {address}")));
-                }
-
-                info!("Done obliterating sub-fragments");
+            if state.is_obliteration() {
+                info!("Fragment {address} is already being, or has already been, obliterated");
+                return Ok(());
             }
+
+            self.advance_state(
+                address.hash,
+                FragmentState::Stored,
+                FragmentState::Obliterating,
+            )
+            .instrument(span.clone())
+            .await?;
+            info!("Acquired obliteration mark for {address}");
 
             self.delete_association(repository, address)
                 .instrument(span.clone())
@@ -1497,28 +1896,32 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 .num_fragments
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-            // TODO(jcohen): Assuming we always lock the fragment regardless of the association count
-            //  then this process of re-checking the count after removing the association should
-            //  theoretically not be necessary since no one else should have been able to add a new
-            //  fragment association while we maintain the lock.
-            info!("Association deleted, re-checking for other association...");
-            let remain_associated = self
+            tokio::time::sleep(self.obliteration_drain).await;
+
+            info!("Association deleted, re-checking for other associations...");
+            if self
                 .has_associations(address.hash)
                 .instrument(span.clone())
-                .await?;
-
-            // If the association count is still >= 1 after we deleted, other references remain, so
-            // there's nothing left to do...
-            if remain_associated {
-                info!("Fragment still associated, nothing more to do");
+                .await?
+            {
+                info!("Fragment still associated, releasing the obliteration mark");
                 return self
-                    .update_metadata(address, original_metadata, updated_metadata)
+                    .advance_state(
+                        address.hash,
+                        FragmentState::Obliterating,
+                        FragmentState::Stored,
+                    )
                     .instrument(span.clone())
                     .await
                     .inspect_err(|e| {
-                        warn!("Failed to reset metadata back to original state: {e:?}");
+                        warn!("Failed to release the obliteration mark: {e:?}");
                     });
             }
+
+            self.clone()
+                .obliterate_sub_fragments(repository, address, stats.clone())
+                .instrument(span.clone())
+                .await?;
 
             self.delete_payload(address.hash)
                 .instrument(span.clone())
@@ -1528,21 +1931,17 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 .num_payloads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-            let mut obliterated_metadata = updated_metadata;
-            obliterated_metadata.flags = FragmentFlags::PayloadObliterated.bits();
-            obliterated_metadata.size_payload = 0;
-            obliterated_metadata.size_content = 0;
-
-            // Final metadata update to clear out the sizes and set the flags to `Obliterated`.
-            self.update_metadata(address, obliterated_metadata, updated_metadata)
-                .await
-                .inspect_err(|e| {
-                    // At this point we've already deleted the underlying payload, so there's not any
-                    // point in trying to revert the metadata, that fragment is just well and truly
-                    // broken.
-                    warn!("Failed to finalize obliterate for {address}: {e:?}");
-                })
-        }).into()
+            self.advance_state(
+                address.hash,
+                FragmentState::Obliterating,
+                FragmentState::Obliterated,
+            )
+            .await
+            .inspect_err(|e| {
+                warn!("Failed to finalize obliterate for {address}: {e:?}");
+            })
+        })
+        .into()
     }
 
     #[lore_macro::lore_instrument]
@@ -1566,16 +1965,11 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             context: destination_context,
         };
         timed!(self.latency_histogram, &self.labels_copy, {
-            let query = self
-                .do_query(
-                    source_repository,
-                    source_address,
-                    StoreMatch::MatchFull,
-                    false,
-                )
+            let match_made = self
+                .lookup(source_repository, source_address, StoreMatch::MatchFull)
                 .await?;
 
-            if query.match_made != StoreMatch::MatchFull {
+            if match_made != StoreMatch::MatchFull {
                 return Err(StoreError::from(AddressNotFound::from(source_address)));
             }
 
@@ -1642,6 +2036,8 @@ impl InstrumentProvider for AwsImmutableStoreInstrumentProvider {
 #[cfg(test)]
 mod test {
     use std::collections::HashMap;
+    use std::collections::HashSet;
+    use std::sync::Mutex;
     use std::sync::atomic::Ordering;
 
     use aws_sdk_dynamodb::operation::delete_item::DeleteItemError;
@@ -1659,1275 +2055,31 @@ mod test {
     use aws_sdk_s3::operation::delete_object::DeleteObjectError;
     use aws_sdk_s3::operation::delete_object::DeleteObjectOutput;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
+    use aws_sdk_s3::operation::head_object::HeadObjectOutput;
     use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsError;
     use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput;
     use aws_sdk_s3::operation::put_object::PutObjectOutput;
     use aws_sdk_s3::primitives::SdkBody;
-    use aws_sdk_s3::types::ObjectVersion;
+    use aws_sdk_s3::types::error::NoSuchKey;
+    use aws_sdk_s3::types::error::NotFound;
     use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
     use aws_smithy_runtime_api::client::result::SdkError;
     use aws_smithy_runtime_api::client::result::ServiceError;
-    use aws_smithy_runtime_api::client::result::TimeoutError;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::FragmentFlags;
-    use lore_revision::fragment;
     use lore_storage::ImmutableStore;
-    use mockall::predicate::eq;
-    use rand::Rng;
     use rand::random;
-    use tracing_test::traced_test;
     use zerocopy::IntoBytes;
 
     use super::*;
     use crate::dynamodb::MockDynamoDb;
     use crate::s3::MockS3Impl;
-    use crate::store::address_with_random_context;
+    use crate::store::object_metadata::PAYLOAD_FLAGS;
     use crate::store::setup_execution;
 
     const BUCKET: &str = "test-bucket";
     const FRAGMENTS_TABLE_NAME: &str = "fragments";
-    const METADATA_TABLE_NAME: &str = "metadata";
-
-    fn mock_lookup_fragments(
-        dynamodb_mock: &mut MockDynamoDb,
-        fragment_entry: FragmentsEntry,
-        starting_match: StoreMatch,
-        expected_match: StoreMatch,
-    ) {
-        let mut store_match = Some(starting_match);
-
-        while store_match.is_some() {
-            let m = store_match.unwrap();
-            if m == StoreMatch::MatchNone {
-                return;
-            }
-
-            let matched = m == expected_match;
-
-            match m {
-                StoreMatch::MatchFull => {
-                    let av_map: HashMap<String, AttributeValue> =
-                        serde_dynamo::to_item(fragment_entry.clone()).unwrap();
-                    let item = if matched { Some(av_map.clone()) } else { None };
-
-                    dynamodb_mock
-                        .expect_get_item()
-                        .with(
-                            eq(Arc::<str>::from(FRAGMENTS_TABLE_NAME)),
-                            eq(av_map),
-                            eq(true),
-                        )
-                        .return_once(move |_, _, _| {
-                            Ok(GetItemOutput::builder().set_item(item).build())
-                        });
-                }
-                StoreMatch::MatchPartition => {
-                    dynamodb_mock
-                        .expect_query_single()
-                        .with(
-                            eq(Arc::<str>::from(FRAGMENTS_TABLE_NAME)),
-                            eq(FragmentsQuery::Repository(
-                                fragment_entry.hash,
-                                Context::from(
-                                    &fragment_entry.repository_context[..size_of::<Context>()],
-                                ),
-                            )),
-                        )
-                        .return_once(move |_, _| {
-                            Ok(QueryOutput::builder()
-                                .count(if matched { 1 } else { 0 })
-                                .build())
-                        });
-                }
-                StoreMatch::MatchHash => {
-                    dynamodb_mock
-                        .expect_query_single()
-                        .with(
-                            eq(Arc::<str>::from(FRAGMENTS_TABLE_NAME)),
-                            eq(FragmentsQuery::Hash(fragment_entry.hash)),
-                        )
-                        .return_once(move |_, _| {
-                            Ok(QueryOutput::builder()
-                                .count(if matched { 1 } else { 0 })
-                                .build())
-                        });
-                }
-                StoreMatch::MatchNone => unreachable!(),
-            }
-
-            if matched {
-                break;
-            } else {
-                store_match = store_match.unwrap().prev();
-            }
-        }
-    }
-
-    fn mock_associate_fragment(dynamodb_mock: &mut MockDynamoDb, entry: &FragmentsEntry) {
-        let item: HashMap<String, AttributeValue> = serde_dynamo::to_item(entry).unwrap();
-
-        dynamodb_mock
-            .expect_put_item()
-            .with(eq(Arc::<str>::from(FRAGMENTS_TABLE_NAME)), eq(item.clone()))
-            .return_once(move |_, _| {
-                Ok(PutItemOutput::builder().set_attributes(Some(item)).build())
-            });
-    }
-
-    async fn initialize_immutable_store(s3: S3, dynamodb: DynamoDb) -> AwsImmutableStore {
-        let settings = AwsImmutableStoreSettings {
-            s3: S3StoreSettings::new(BUCKET.to_string()),
-            dynamodb: DynamoDbImmutableStoreSettings::new(
-                FRAGMENTS_TABLE_NAME.to_string(),
-                METADATA_TABLE_NAME.to_string(),
-            ),
-            force_write: false,
-            batch_exist_submission_limit: 1000,
-        };
-
-        let execution = setup_execution("test".to_string());
-        LORE_CONTEXT
-            .scope(execution.clone(), async move {
-                AwsImmutableStore::new(s3, dynamodb, &settings)
-            })
-            .await
-    }
-
-    #[tokio::test]
-    async fn test_exists_batch_full_match() {
-        let repository = random::<Context>();
-
-        let mut rng = rand::rng();
-
-        #[allow(clippy::type_complexity)]
-        let fragments: Vec<(
-            FragmentsEntry,
-            HashMap<String, AttributeValue>,
-            StoreMatch,
-            Option<HashMap<String, AttributeValue>>,
-        )> = (1..=20)
-            .map(|_| {
-                let address = random::<Address>();
-                let found: bool = rng.random();
-
-                let entry = FragmentsEntry::new(repository, address);
-                let av_map: HashMap<String, AttributeValue> =
-                    serde_dynamo::to_item(entry.clone()).unwrap();
-
-                let (mock_match, mock_item) = if found {
-                    (StoreMatch::MatchFull, Some(av_map.clone()))
-                } else {
-                    (StoreMatch::MatchNone, None)
-                };
-
-                (entry, av_map, mock_match, mock_item)
-            })
-            .collect();
-
-        let addresses: Vec<Address> = fragments
-            .iter()
-            .map(|f| Into::<Address>::into(&f.0))
-            .collect();
-        let items: Vec<HashMap<String, AttributeValue>> =
-            fragments.iter().map(|f| f.1.clone()).collect();
-        let matches: Vec<StoreMatch> = fragments.iter().map(|f| f.2).collect();
-        let response_items: Vec<HashMap<String, AttributeValue>> =
-            fragments.iter().filter_map(|f| f.3.clone()).collect();
-
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        dynamodb_mock
-            .expect_batch_get_item()
-            .with(
-                eq(Arc::<str>::from(FRAGMENTS_TABLE_NAME)),
-                eq(items),
-                eq(true),
-            )
-            .return_once(move |_, _, _| Ok(response_items));
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
-
-        let result = store
-            .clone()
-            .exist_batch(
-                repository.into(),
-                addresses.as_slice(),
-                StoreMatch::MatchFull,
-            )
-            .await
-            .expect("exist batch failed");
-
-        assert_eq!(matches, result);
-    }
-
-    #[tokio::test]
-    async fn test_query_immutable_not_found() {
-        let repository = random::<Context>();
-        let address = random::<Address>();
-
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            FragmentsEntry::new(repository, address),
-            StoreMatch::MatchFull,
-            StoreMatch::MatchNone,
-        );
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
-
-        let result = store
-            .clone()
-            .query(repository.into(), address, StoreMatch::MatchFull)
-            .await
-            .expect("query immutable failed");
-
-        assert_eq!(
-            StoreQueryResult {
-                fragment: Fragment::default(),
-                match_made: StoreMatch::MatchNone
-            },
-            result
-        );
-    }
-
-    #[tokio::test]
-    async fn test_query_immutable_found() {
-        let repository = random::<Context>();
-        let (fragment, address, _) = fragment::generate_random();
-
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            FragmentsEntry::new(repository, address),
-            StoreMatch::MatchFull,
-            StoreMatch::MatchFull,
-        );
-
-        let metadata_entry = FragmentMetadataEntry::new(address.hash);
-        let av_map: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(metadata_entry.clone()).unwrap();
-        let full_entry = metadata_entry.with_fragment(fragment);
-        let full_entry_av_map = serde_dynamo::to_item(full_entry.clone()).unwrap();
-
-        dynamodb_mock
-            .expect_get_item()
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(av_map),
-                eq(true),
-            )
-            .return_once(move |_, _, _| {
-                Ok(GetItemOutput::builder()
-                    .set_item(Some(full_entry_av_map))
-                    .build())
-            });
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
-
-        let result = store
-            .clone()
-            .query(repository.into(), address, StoreMatch::MatchFull)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            StoreQueryResult {
-                fragment,
-                match_made: StoreMatch::MatchFull
-            },
-            result
-        );
-    }
-
-    #[tokio::test]
-    async fn test_query_immutable_obliterating() {
-        let repository = random::<Context>();
-        let (mut fragment, address, _) = fragment::generate_random();
-        fragment.flags |= FragmentFlags::PayloadStoredDurable | FragmentFlags::PayloadObliterating;
-
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            FragmentsEntry::new(repository, address),
-            StoreMatch::MatchFull,
-            StoreMatch::MatchFull,
-        );
-
-        let metadata_entry = FragmentMetadataEntry::new(address.hash);
-        let av_map: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(metadata_entry.clone()).unwrap();
-        let full_entry = metadata_entry.with_fragment(fragment);
-        let full_entry_av_map = serde_dynamo::to_item(full_entry.clone()).unwrap();
-
-        dynamodb_mock
-            .expect_get_item()
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(av_map),
-                eq(true),
-            )
-            .return_once(move |_, _, _| {
-                Ok(GetItemOutput::builder()
-                    .set_item(Some(full_entry_av_map))
-                    .build())
-            });
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
-
-        let result = store
-            .clone()
-            .query(repository.into(), address, StoreMatch::MatchFull)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            StoreQueryResult {
-                fragment: Fragment::default(),
-                match_made: StoreMatch::MatchNone
-            },
-            result
-        );
-    }
-
-    #[tokio::test]
-    async fn test_query_immutable_partial_match() {
-        let repository = random::<Context>();
-        let (fragment, address, _) = fragment::generate_random();
-
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            FragmentsEntry::new(repository, address),
-            StoreMatch::MatchPartition,
-            StoreMatch::MatchPartition,
-        );
-
-        let metadata_entry = FragmentMetadataEntry::new(address.hash);
-        let av_map: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(metadata_entry.clone()).unwrap();
-        let full_entry = metadata_entry.with_fragment(fragment);
-        let full_entry_av_map = serde_dynamo::to_item(full_entry.clone()).unwrap();
-
-        dynamodb_mock
-            .expect_get_item()
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(av_map),
-                eq(true),
-            )
-            .return_once(move |_, _, _| {
-                Ok(GetItemOutput::builder()
-                    .set_item(Some(full_entry_av_map))
-                    .build())
-            });
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
-
-        let other_address = address_with_random_context(address);
-
-        let result = store
-            .clone()
-            .query(repository.into(), other_address, StoreMatch::MatchPartition)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            StoreQueryResult {
-                fragment,
-                match_made: StoreMatch::MatchPartition
-            },
-            result
-        );
-    }
-
-    #[tokio::test]
-    async fn test_query_lower_specificity_match() {
-        let repository = random::<Context>();
-        let (fragment, address, _) = fragment::generate_random();
-
-        let other_address = address_with_random_context(address);
-
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            FragmentsEntry::new(repository, other_address),
-            StoreMatch::MatchPartition,
-            StoreMatch::MatchHash,
-        );
-
-        let metadata_entry = FragmentMetadataEntry::new(address.hash);
-        let av_map: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(metadata_entry.clone()).unwrap();
-        let full_entry = metadata_entry.with_fragment(fragment);
-        let full_entry_av_map = serde_dynamo::to_item(full_entry.clone()).unwrap();
-
-        dynamodb_mock
-            .expect_get_item()
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(av_map),
-                eq(true),
-            )
-            .return_once(move |_, _, _| {
-                Ok(GetItemOutput::builder()
-                    .set_item(Some(full_entry_av_map))
-                    .build())
-            });
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
-
-        let result = store
-            .clone()
-            .query(repository.into(), other_address, StoreMatch::MatchPartition)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            StoreQueryResult {
-                fragment,
-                match_made: StoreMatch::MatchHash
-            },
-            result
-        );
-    }
-
-    #[tokio::test]
-    async fn test_put_immutable() {
-        let repository = random::<Context>();
-        let (fragment, address, payload) = fragment::generate_random();
-
-        let mut s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let entry = FragmentsEntry::new(repository, address);
-
-        // Mock the list objects calls that `put_immutable` makes when querying for an object.
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            entry.clone(),
-            StoreMatch::MatchFull,
-            StoreMatch::MatchNone,
-        );
-
-        let item: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(FragmentMetadataEntry::new(address.hash).with_fragment(fragment))
-                .unwrap();
-
-        dynamodb_mock
-            .expect_put_item()
-            .with(eq(Arc::<str>::from(METADATA_TABLE_NAME)), eq(item.clone()))
-            .return_once(move |_, _| {
-                Ok(PutItemOutput::builder().set_attributes(Some(item)).build())
-            });
-
-        mock_associate_fragment(&mut dynamodb_mock, &entry);
-
-        s3mock
-            .expect_put_object()
-            .with(
-                eq(BUCKET),
-                eq(address.hash.to_string()),
-                eq(payload.to_vec()),
-            )
-            .return_once(move |_, _, _: Vec<u8>| Ok(PutObjectOutput::builder().build()));
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
-
-        store
-            .clone()
-            .put(repository.into(), address, fragment, Some(payload), false)
-            .await
-            .expect("failed to write to store");
-    }
-
-    #[tokio::test]
-    #[ignore] // Partial puts are not currently supported
-    async fn test_put_immutable_partial() {
-        let repository = random::<Context>();
-        let (fragment, address, payload) = fragment::generate_random();
-
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let entry = FragmentsEntry::new(repository, address);
-
-        // Mock the list objects calls that `put_immutable` makes when querying for an object.
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            entry.clone(),
-            StoreMatch::MatchFull,
-            StoreMatch::MatchPartition,
-        );
-
-        let metadata_entry = FragmentMetadataEntry::new(address.hash);
-        let av_map: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(metadata_entry.clone()).unwrap();
-        let full_entry = metadata_entry.with_fragment(fragment);
-        let full_entry_av_map = serde_dynamo::to_item(full_entry.clone()).unwrap();
-
-        dynamodb_mock
-            .expect_get_item()
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(av_map),
-                eq(true),
-            )
-            .return_once(move |_, _, _| {
-                Ok(GetItemOutput::builder()
-                    .set_item(Some(full_entry_av_map))
-                    .build())
-            });
-
-        mock_associate_fragment(&mut dynamodb_mock, &entry);
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
-
-        store
-            .clone()
-            .put(repository.into(), address, fragment, Some(payload), false)
-            .await
-            .expect("failed to write to store");
-    }
-
-    #[tokio::test]
-    async fn test_put_immutable_obliterating() {
-        let repository = random::<Context>();
-        let (mut fragment, address, payload) = fragment::generate_random();
-        fragment.flags = FragmentFlags::PayloadObliterating.bits();
-
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let entry = FragmentsEntry::new(repository, address);
-
-        // Mock the list objects calls that `put_immutable` makes when querying for an object.
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            entry.clone(),
-            StoreMatch::MatchFull,
-            StoreMatch::MatchFull,
-        );
-
-        let metadata_entry = FragmentMetadataEntry::new(address.hash);
-        let av_map: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(metadata_entry.clone()).unwrap();
-        let full_entry = metadata_entry.with_fragment(fragment);
-        let full_entry_av_map = serde_dynamo::to_item(full_entry.clone()).unwrap();
-
-        dynamodb_mock
-            .expect_get_item()
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(av_map),
-                eq(true),
-            )
-            .return_once(move |_, _, _| {
-                Ok(GetItemOutput::builder()
-                    .set_item(Some(full_entry_av_map))
-                    .build())
-            });
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
-
-        assert!(
-            store
-                .put(repository.into(), address, fragment, Some(payload), false)
-                .await
-                .expect_err("expected put to fail")
-                .is_internal()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_put_immutable_obliterated() {
-        let repository = random::<Context>();
-        let (fragment, address, payload) = fragment::generate_random();
-
-        let mut s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let entry = FragmentsEntry::new(repository, address);
-
-        // Mock the list objects calls that `put_immutable` makes when querying for an object.
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            entry.clone(),
-            StoreMatch::MatchFull,
-            StoreMatch::MatchHash,
-        );
-
-        let obliterated_fragment = Fragment {
-            flags: FragmentFlags::PayloadObliterated.bits(),
-            size_payload: 0,
-            size_content: 0,
-        };
-
-        let metadata_entry = FragmentMetadataEntry::new(address.hash);
-        let av_map: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(metadata_entry.clone()).unwrap();
-        let full_entry = metadata_entry.with_fragment(obliterated_fragment);
-        let full_entry_av_map = serde_dynamo::to_item(full_entry.clone()).unwrap();
-
-        dynamodb_mock
-            .expect_get_item()
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(av_map),
-                eq(true),
-            )
-            .return_once(move |_, _, _| {
-                Ok(GetItemOutput::builder()
-                    .set_item(Some(full_entry_av_map))
-                    .build())
-            });
-
-        let item: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(FragmentMetadataEntry::new(address.hash).with_fragment(fragment))
-                .unwrap();
-
-        dynamodb_mock
-            .expect_put_item()
-            .with(eq(Arc::<str>::from(METADATA_TABLE_NAME)), eq(item.clone()))
-            .return_once(move |_, _| {
-                Ok(PutItemOutput::builder().set_attributes(Some(item)).build())
-            });
-
-        mock_associate_fragment(&mut dynamodb_mock, &entry);
-
-        s3mock
-            .expect_put_object()
-            .with(
-                eq(BUCKET),
-                eq(address.hash.to_string()),
-                eq(payload.to_vec()),
-            )
-            .return_once(move |_, _, _: Vec<u8>| Ok(PutObjectOutput::builder().build()));
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
-
-        store
-            .put(repository.into(), address, fragment, Some(payload), false)
-            .await
-            .expect("failed to write to store");
-    }
-
-    #[tokio::test]
-    #[ignore] // Partial puts are not currently supported
-    async fn test_put_immutable_partial_hash_collision() {
-        let repository = random::<Context>();
-        let (fragment, address, payload) = fragment::generate_random();
-
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let entry = FragmentsEntry::new(repository, address);
-
-        // Mock the list objects calls that `put` makes when querying for an object.
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            entry,
-            StoreMatch::MatchFull,
-            StoreMatch::MatchPartition,
-        );
-
-        let mut different_fragment = fragment;
-        different_fragment.size_content *= 2;
-
-        let metadata_entry = FragmentMetadataEntry::new(address.hash);
-        let av_map: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(metadata_entry.clone()).unwrap();
-        let full_entry = metadata_entry.with_fragment(different_fragment);
-        let full_entry_av_map = serde_dynamo::to_item(full_entry.clone()).unwrap();
-
-        dynamodb_mock
-            .expect_get_item()
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(av_map),
-                eq(true),
-            )
-            .return_once(move |_, _, _| {
-                Ok(GetItemOutput::builder()
-                    .set_item(Some(full_entry_av_map))
-                    .build())
-            });
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
-
-        assert!(
-            store
-                .put(repository.into(), address, fragment, Some(payload), false)
-                .await
-                .err()
-                .unwrap()
-                .is_internal()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_put_immutable_payload_required() {
-        let repository = random::<Context>();
-        let (fragment, address, _) = fragment::generate_random();
-
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let entry = FragmentsEntry::new(repository, address);
-
-        // Mock the list objects calls that `put_immutable` makes when querying for an object.
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            entry,
-            StoreMatch::MatchFull,
-            StoreMatch::MatchHash,
-        );
-
-        let metadata_entry = FragmentMetadataEntry::new(address.hash);
-        let av_map: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(metadata_entry.clone()).unwrap();
-        let full_entry = metadata_entry.with_fragment(fragment);
-        let full_entry_av_map = serde_dynamo::to_item(full_entry.clone()).unwrap();
-
-        dynamodb_mock
-            .expect_get_item()
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(av_map),
-                eq(true),
-            )
-            .return_once(move |_, _, _| {
-                Ok(GetItemOutput::builder()
-                    .set_item(Some(full_entry_av_map))
-                    .build())
-            });
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
-
-        assert!(
-            store
-                .put(repository.into(), address, fragment, None, false)
-                .await
-                .expect_err("should have returned an error")
-                .is_internal()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_put_immutable_extra_data() {
-        let repository = random::<Context>();
-        let (fragment, address, payload) = fragment::generate_random();
-
-        let mut s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let entry = FragmentsEntry::new(repository, address);
-
-        // Mock the list objects calls that `put_immutable` makes when querying for an object.
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            entry.clone(),
-            StoreMatch::MatchFull,
-            StoreMatch::MatchNone,
-        );
-
-        let item: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(FragmentMetadataEntry::new(address.hash).with_fragment(fragment))
-                .unwrap();
-
-        dynamodb_mock
-            .expect_put_item()
-            .with(eq(Arc::<str>::from(METADATA_TABLE_NAME)), eq(item.clone()))
-            .return_once(move |_, _| {
-                Ok(PutItemOutput::builder().set_attributes(Some(item)).build())
-            });
-
-        mock_associate_fragment(&mut dynamodb_mock, &entry);
-
-        let mut body = vec![];
-        body.extend_from_slice(payload.as_ref());
-
-        let real_len = body.len();
-
-        let extra = random::<[u8; 32]>();
-        body.extend_from_slice(extra.as_slice());
-
-        // Ensure we only write bytes equal to the actual payload size, regardless of how much extra
-        // was sent.
-        let expected = body[..real_len].to_vec();
-        s3mock
-            .expect_put_object()
-            .with(eq(BUCKET), eq(address.hash.to_string()), eq(expected))
-            .return_once(move |_, _, _: Vec<u8>| Ok(PutObjectOutput::builder().build()));
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
-
-        store
-            .put(repository.into(), address, fragment, Some(payload), false)
-            .await
-            .expect("failed to write to store");
-    }
-
-    #[tokio::test]
-    async fn test_put_immutable_not_enough_data() {
-        let repository = random::<Context>();
-        let (fragment, address, payload) = fragment::generate_random();
-
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let entry = FragmentsEntry::new(repository, address);
-
-        // Mock the list objects calls that `put_immutable` makes when querying for an object.
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            entry.clone(),
-            StoreMatch::MatchFull,
-            StoreMatch::MatchNone,
-        );
-
-        mock_associate_fragment(&mut dynamodb_mock, &entry);
-
-        let mut body = vec![];
-        body.extend_from_slice(fragment.as_bytes());
-
-        let truncated_payload = Bytes::copy_from_slice(&payload[..payload.len() - 1]);
-
-        body.extend_from_slice(truncated_payload.as_ref());
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
-
-        assert!(
-            store
-                .put(
-                    repository.into(),
-                    address,
-                    fragment,
-                    Some(truncated_payload),
-                    false
-                )
-                .await
-                .expect_err("should have failed")
-                .is_internal()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_immutable() {
-        let repository = random::<Context>();
-        let (fragment, address, payload) = fragment::generate_random();
-
-        let mut s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let entry = FragmentsEntry::new(repository, address);
-
-        // Mock the list objects calls that `put_immutable` makes when querying for an object.
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            entry.clone(),
-            StoreMatch::MatchHash,
-            StoreMatch::MatchHash,
-        );
-
-        let metadata_entry = FragmentMetadataEntry::new(address.hash);
-        let av_map: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(metadata_entry.clone()).unwrap();
-        let full_entry_av_map =
-            serde_dynamo::to_item(metadata_entry.with_fragment(fragment)).unwrap();
-
-        dynamodb_mock
-            .expect_get_item()
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(av_map),
-                eq(true),
-            )
-            .return_once(move |_, _, _| {
-                Ok(GetItemOutput::builder()
-                    .set_item(Some(full_entry_av_map))
-                    .build())
-            });
-
-        let mut s3payload = vec![];
-        s3payload.extend_from_slice(payload.as_ref());
-
-        s3mock
-            .expect_get_object()
-            .with(eq(BUCKET), eq(address.hash.to_string()), eq(None))
-            .return_once(move |_, _, _| {
-                Ok(GetObjectOutput::builder()
-                    .set_body(Some(s3payload.into()))
-                    .build())
-            });
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
-
-        let (result_fragment, result_buffer) = store
-            .get(repository.into(), address, StoreMatch::MatchHash)
-            .await
-            .expect("failed to get from store");
-
-        assert_eq!(fragment, result_fragment);
-
-        assert_eq!(payload.as_ref(), result_buffer.as_ref());
-    }
-
-    #[tokio::test]
-    async fn test_get_immutable_not_found() {
-        let repository = random::<Context>();
-        let (fragment, address, payload) = fragment::generate_random();
-
-        let mut s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let entry = FragmentsEntry::new(repository, address);
-
-        // Mock the list objects calls that `put_immutable` makes when querying for an object.
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            entry.clone(),
-            StoreMatch::MatchHash,
-            StoreMatch::MatchNone,
-        );
-
-        // `load` runs concurrently with `ensure_exists` in `get`, and its two internal
-        // futures (`load_metadata` and `get_s3_object_contents`) also race each other.
-        // Depending on select! polling order either or both may be called before being
-        // cancelled by the `ensure_exists` error, so these expectations are optional.
-        {
-            let metadata_entry = FragmentMetadataEntry::new(address.hash);
-            let av_map: HashMap<String, AttributeValue> =
-                serde_dynamo::to_item(metadata_entry.clone()).unwrap();
-            let full_entry_av_map =
-                serde_dynamo::to_item(metadata_entry.with_fragment(fragment)).unwrap();
-            dynamodb_mock
-                .expect_get_item()
-                .with(
-                    eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                    eq(av_map),
-                    eq(true),
-                )
-                .times(..=1)
-                .return_once(move |_, _, _| {
-                    Ok(GetItemOutput::builder()
-                        .set_item(Some(full_entry_av_map))
-                        .build())
-                });
-
-            let mut s3payload = vec![];
-            s3payload.extend_from_slice(payload.as_ref());
-            s3mock
-                .expect_get_object()
-                .with(eq(BUCKET), eq(address.hash.to_string()), eq(None))
-                .times(..=1)
-                .return_once(move |_, _, _| {
-                    Ok(GetObjectOutput::builder()
-                        .set_body(Some(s3payload.into()))
-                        .build())
-                });
-        }
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
-
-        assert!(
-            store
-                .get(repository.into(), address, StoreMatch::MatchHash,)
-                .await
-                .expect_err("should have returned an error")
-                .is_address_not_found()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_get_immutable_obliterated() {
-        let (_, address, payload) = fragment::generate_random();
-        let repository = random::<Context>();
-        let fragment = Fragment {
-            flags: FragmentFlags::PayloadObliterating.bits(),
-            size_payload: 0,
-            size_content: 0,
-        };
-
-        let mut s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let entry = FragmentsEntry::new(repository, address);
-
-        // Mock the list objects calls that `get` makes when querying for an object.
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            entry.clone(),
-            StoreMatch::MatchHash,
-            StoreMatch::MatchHash,
-        );
-
-        // the store will opportunistically try to get the data
-        // from s3, but because the metadata shows it is obliterated
-        // it will not load, even if s3 says it is there
-        {
-            let mut s3payload = vec![];
-            s3payload.extend_from_slice(payload.as_ref());
-
-            s3mock.expect_get_object().return_once(|_, _, _| {
-                Ok(GetObjectOutput::builder()
-                    .set_body(Some(s3payload.into()))
-                    .build())
-            });
-        }
-
-        let metadata_entry = FragmentMetadataEntry::new(address.hash);
-        let av_map: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(metadata_entry.clone()).unwrap();
-        let full_entry_av_map =
-            serde_dynamo::to_item(metadata_entry.with_fragment(fragment)).unwrap();
-
-        dynamodb_mock
-            .expect_get_item()
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(av_map),
-                eq(true),
-            )
-            .return_once(move |_, _, _| {
-                Ok(GetItemOutput::builder()
-                    .set_item(Some(full_entry_av_map))
-                    .build())
-            });
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
-
-        let err = store
-            .get(repository.into(), address, StoreMatch::MatchHash)
-            .await
-            .expect_err("should have returned an error");
-
-        assert!(err.is_address_not_found());
-    }
-
-    #[allow(dead_code)]
-    async fn test_get_immutable_partial_match() {
-        let repository = random::<Context>();
-        let (fragment, address, payload) = fragment::generate_random();
-
-        let mut s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = DynamoDb::default();
-
-        let entry = FragmentsEntry::new(repository, address);
-
-        // Mock the list objects calls that `put_immutable` makes when querying for an object.
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            entry.clone(),
-            StoreMatch::MatchFull,
-            StoreMatch::MatchPartition,
-        );
-
-        let mut s3payload = vec![];
-        s3payload.extend_from_slice(fragment.as_bytes());
-        s3payload.extend_from_slice(payload.as_ref());
-
-        s3mock
-            .expect_get_object()
-            .with(eq(BUCKET), eq(address.hash.to_string()), eq(None))
-            .return_once(move |_, _, _| {
-                Ok(GetObjectOutput::builder()
-                    .set_body(Some(s3payload.into()))
-                    .build())
-            });
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
-
-        let (result_fragment, result_buffer) = store
-            .get(repository.into(), address, StoreMatch::MatchPartition)
-            .await
-            .expect("failed to get from store");
-
-        assert_eq!(fragment, result_fragment);
-
-        assert_eq!(payload.as_ref(), result_buffer.as_ref());
-    }
-
-    #[tokio::test]
-    async fn test_get_immutable_payload_size_mismatch() {
-        let repository = random::<Context>();
-        let (fragment, address, payload) = fragment::generate_random();
-
-        let mut s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let entry = FragmentsEntry::new(repository, address);
-
-        // Mock the list objects calls that `put_immutable` makes when querying for an object.
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            entry.clone(),
-            StoreMatch::MatchHash,
-            StoreMatch::MatchHash,
-        );
-
-        let metadata_entry = FragmentMetadataEntry::new(address.hash);
-        let av_map: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(metadata_entry.clone()).unwrap();
-        let full_entry_av_map =
-            serde_dynamo::to_item(metadata_entry.with_fragment(fragment)).unwrap();
-
-        dynamodb_mock
-            .expect_get_item()
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(av_map),
-                eq(true),
-            )
-            .return_once(move |_, _, _| {
-                Ok(GetItemOutput::builder()
-                    .set_item(Some(full_entry_av_map))
-                    .build())
-            });
-
-        let mut s3payload = vec![];
-        s3payload.extend_from_slice(&payload.as_ref()[..16]);
-
-        s3mock
-            .expect_get_object()
-            .with(eq(BUCKET), eq(address.hash.to_string()), eq(None))
-            .return_once(move |_, _, _| {
-                Ok(GetObjectOutput::builder()
-                    .set_body(Some(s3payload.into()))
-                    .build())
-            });
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
-
-        assert!(
-            store
-                .get(repository.into(), address, StoreMatch::MatchHash,)
-                .await
-                .expect_err("Request did not fail as expected")
-                .is_internal()
-        );
-    }
-
-    fn mock_load_fragment_metadata(
-        dynamodb_mock: &mut MockDynamoDb,
-        extra_flags: Option<FragmentFlags>,
-        fail: bool,
-    ) -> (Fragment, Address) {
-        let (mut fragment, address, _payload) = fragment::generate_random();
-
-        fragment.flags |= FragmentFlags::PayloadStoredDurable;
-        if let Some(extra_flags) = extra_flags {
-            fragment.flags |= extra_flags;
-        }
-
-        let metadata_entry = FragmentMetadataEntry::new(address.hash);
-        let av_map: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(metadata_entry.clone()).unwrap();
-        let full_entry_av_map =
-            serde_dynamo::to_item(metadata_entry.with_fragment(fragment)).unwrap();
-
-        // Mock loading the fragment metadata
-        dynamodb_mock
-            .expect_get_item()
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(av_map),
-                eq(true),
-            )
-            .return_once(move |_, _, _| {
-                if fail {
-                    Ok(GetItemOutput::builder().set_item(None).build())
-                } else {
-                    Ok(GetItemOutput::builder()
-                        .set_item(Some(full_entry_av_map))
-                        .build())
-                }
-            });
-
-        (fragment, address)
-    }
-
-    #[tokio::test]
-    async fn test_obliterate_already_obliterating() {
-        let repository = random::<Context>();
-
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let (_fragment, address) = mock_load_fragment_metadata(
-            &mut dynamodb_mock,
-            Some(FragmentFlags::PayloadObliterating),
-            false, /* fail */
-        );
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-
-        let stats = Default::default();
-        Arc::new(store)
-            .obliterate(repository.into(), address, stats)
-            .await
-            .expect("obliterate failed");
-    }
-
-    #[tokio::test]
-    async fn test_obliterate_already_obliterated() {
-        let repository = random::<Context>();
-
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let (_fragment, address) = mock_load_fragment_metadata(
-            &mut dynamodb_mock,
-            Some(FragmentFlags::PayloadObliterated),
-            false, /* fail */
-        );
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-
-        let stats = Default::default();
-        Arc::new(store)
-            .obliterate(repository.into(), address, stats)
-            .await
-            .expect("obliterate failed");
-    }
-
-    #[derive(Clone, Copy)]
-    enum MockLockMode {
-        Finalize,
-        Revert,
-        AcquireFail,
-        FinalizeFail,
-        None,
-    }
+    const FRAGMENT_STATE_TABLE_NAME: &str = "fragment-state";
 
     fn aws_error<E>(error: E, status: u16) -> AwsError<SdkError<E, HttpResponse>> {
         AwsError::AwsSdkError(SdkError::ServiceError(
@@ -2941,1092 +2093,2127 @@ mod test {
         ))
     }
 
-    fn mock_acquire_obliterate_lock(
-        dynamodb_mock: &mut MockDynamoDb,
-        fragment: Fragment,
-        hash: Hash,
-        lock_mode: MockLockMode,
-        in_sequence: bool,
-    ) {
-        let mut updated_metadata = fragment;
-        updated_metadata.flags |= FragmentFlags::PayloadObliterating;
-        let item: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(FragmentMetadataEntry::new(hash).with_fragment(updated_metadata))
-                .expect("failed to serialize");
+    fn blob(item: &HashMap<String, AttributeValue>, key: &str) -> Vec<u8> {
+        item.get(key)
+            .and_then(|value| value.as_b().ok())
+            .map(|value| value.as_ref().to_vec())
+            .unwrap_or_default()
+    }
 
-        let mut seq = mockall::Sequence::default();
+    /// An in-memory stand-in for the bucket and the two tables.
+    ///
+    /// The tests are written against behaviour rather than a call sequence: they put and get
+    /// through the real store and assert on what ends up stored. That is what lets the concurrency
+    /// test exist at all — a mock programmed with an expected order of calls cannot express
+    /// "any interleaving, and the result must still be coherent".
+    /// A stored object: its body, and the object metadata written with it.
+    type StoredObject = (Vec<u8>, HashMap<String, String>);
 
-        // Mock the metadata updates to acquire the lock
-        let mut expectation = dynamodb_mock.expect_put_item_conditional().times(1);
+    /// An operation the fake can be told to fail, so error paths are reachable.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+    enum Fault {
+        StateRead,
+        StateReadTimeout,
+        StateReadBroken,
+        StateWrite,
+        StateDelete,
+        AssociationWrite,
+        AssociationDelete,
+        AssociationCount,
+        ObjectDelete,
+        ObjectList,
+    }
 
-        if in_sequence {
-            expectation = expectation.in_sequence(&mut seq);
+    #[derive(Default)]
+    struct Storage {
+        faults: HashSet<Fault>,
+        race_state: Option<(Hash, FragmentState)>,
+        object_reads: usize,
+        objects: HashMap<Vec<u8>, StoredObject>,
+        associations: HashMap<(Vec<u8>, Vec<u8>), HashMap<String, AttributeValue>>,
+        state: HashMap<Vec<u8>, HashMap<String, AttributeValue>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct Fake(Arc<Mutex<Storage>>);
+
+    impl Fake {
+        fn lock(&self) -> std::sync::MutexGuard<'_, Storage> {
+            self.0.lock().unwrap()
         }
 
-        expectation
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(item.clone()),
-                eq(UpdateMetadataCondition(fragment)),
-            )
-            .return_once(move |_, _, _| {
-                if matches!(lock_mode, MockLockMode::AcquireFail) {
-                    Err(aws_error(
-                        PutItemError::ConditionalCheckFailedException(
-                            ConditionalCheckFailedException::builder()
-                                .set_item(Some(item))
-                                .build(),
-                        ),
-                        400u16,
-                    ))
+        /// Make `fault` fail from now on. Latched rather than one-shot, so a retrying caller sees a
+        /// persistent failure rather than one that heals underneath it.
+        fn fail(&self, fault: Fault) {
+            self.lock().faults.insert(fault);
+        }
+
+        /// Move `hash` into `state` at the moment its payload is uploaded, so a put reaches its
+        /// publish step having probed before an obliteration and uploaded after it. That window
+        /// cannot be hit by ordering calls from the outside.
+        fn obliterate_during_upload(&self, hash: Hash, state: FragmentState) {
+            self.lock().race_state = Some((hash, state));
+        }
+
+        fn failing(&self, fault: Fault) -> bool {
+            self.lock().faults.contains(&fault)
+        }
+
+        fn object_reads(&self) -> usize {
+            self.lock().object_reads
+        }
+
+        fn object(&self, hash: Hash) -> Option<StoredObject> {
+            self.lock()
+                .objects
+                .get(&hash.to_string().into_bytes())
+                .cloned()
+        }
+
+        fn stored_fragment(&self, hash: Hash) -> Option<Fragment> {
+            self.object(hash)
+                .map(|(_, metadata)| from_object_metadata(Some(&metadata)).unwrap())
+        }
+
+        fn state_of(&self, hash: Hash) -> Option<FragmentState> {
+            self.lock()
+                .state
+                .get(hash.data().as_slice())
+                .map(|item| serde_dynamo::from_item::<_, FragmentStateEntry>(item.clone()).unwrap())
+                .map(|entry| entry.state())
+        }
+
+        fn association_count(&self, hash: Hash) -> usize {
+            self.lock()
+                .associations
+                .keys()
+                .filter(|(stored, _)| stored == hash.data())
+                .count()
+        }
+
+        fn set_state(&self, hash: Hash, state: FragmentState) {
+            let item = serde_dynamo::to_item(FragmentStateEntry::new(hash, state)).unwrap();
+            self.lock().state.insert(hash.data().to_vec(), item);
+        }
+
+        /// Write a row in the shape used before fragments moved onto the object: no `state`, and a
+        /// whole flattened fragment whose `flags` also carry the obliteration bits.
+        fn set_fragment_metadata_row(&self, hash: Hash, fragment: Fragment) {
+            let item = HashMap::from([
+                (
+                    "hash".to_owned(),
+                    AttributeValue::B(Blob::new(hash.data().to_vec())),
+                ),
+                (
+                    "flags".to_owned(),
+                    AttributeValue::N(fragment.flags.to_string()),
+                ),
+                (
+                    "size_payload".to_owned(),
+                    AttributeValue::N(fragment.size_payload.to_string()),
+                ),
+                (
+                    "size_content".to_owned(),
+                    AttributeValue::N(fragment.size_content.to_string()),
+                ),
+            ]);
+
+            self.lock().state.insert(hash.data().to_vec(), item);
+        }
+
+        /// Delete an object while leaving every reference to it in place, as an obliteration
+        /// interrupted before its tombstone or an S3 durability event would.
+        fn lose_object(&self, hash: Hash) {
+            self.lock().objects.remove(&hash.to_string().into_bytes());
+        }
+
+        /// Store an object the way one was stored before the fragment moved onto it: bare bytes,
+        /// no fragment metadata.
+        fn put_object_without_metadata(&self, hash: Hash, body: &[u8]) {
+            self.lock().objects.insert(
+                hash.to_string().into_bytes(),
+                (body.to_vec(), HashMap::new()),
+            );
+        }
+
+        /// Store an object whose metadata is present but unreadable.
+        fn put_object_with_damaged_metadata(&self, hash: Hash, body: &[u8]) {
+            let mut metadata = HashMap::new();
+            metadata.insert("lore-fragment".to_owned(), "not:a:fragment".to_owned());
+
+            self.lock()
+                .objects
+                .insert(hash.to_string().into_bytes(), (body.to_vec(), metadata));
+        }
+
+        fn add_association(&self, repository: Context, address: Address) {
+            let entry = FragmentsEntry::new(repository, address);
+            let item: HashMap<String, AttributeValue> = serde_dynamo::to_item(&entry).unwrap();
+            self.lock().associations.insert(
+                (
+                    entry.hash.data().to_vec(),
+                    entry.repository_context.to_vec(),
+                ),
+                item,
+            );
+        }
+    }
+
+    /// Wire the fake into the generated mocks.
+    ///
+    /// Every expectation is unbounded and stateful, so a test asserts on the resulting storage
+    /// rather than on how many times something was called.
+    fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
+        let mut s3 = MockS3Impl::default();
+        let mut dynamodb = MockDynamoDb::default();
+
+        let f = fake.clone();
+        s3.expect_put_object::<Vec<u8>>()
+            .returning(move |_, key, body, metadata| {
+                let mut storage = f.lock();
+                storage.objects.insert(
+                    key.as_bytes().to_vec(),
+                    (body, metadata.unwrap_or_default()),
+                );
+
+                if let Some((hash, state)) = storage.race_state.take() {
+                    let item = serde_dynamo::to_item(FragmentStateEntry::new(hash, state)).unwrap();
+                    storage.state.insert(hash.data().to_vec(), item);
+                }
+
+                Ok(PutObjectOutput::builder().build())
+            });
+
+        let f = fake.clone();
+        s3.expect_get_object().returning(move |_, key, _| {
+            let mut storage = f.lock();
+            storage.object_reads += 1;
+            match storage.objects.get(key.as_bytes()) {
+                Some((body, metadata)) => Ok(GetObjectOutput::builder()
+                    .set_body(Some(body.clone().into()))
+                    .set_metadata(Some(metadata.clone()))
+                    .build()),
+                None => Err(aws_error(
+                    GetObjectError::NoSuchKey(NoSuchKey::builder().build()),
+                    404,
+                )),
+            }
+        });
+
+        let f = fake.clone();
+        s3.expect_head_object().returning(move |_, key| {
+            let mut storage = f.lock();
+            storage.object_reads += 1;
+            match storage.objects.get(key.as_bytes()) {
+                Some((_, metadata)) => Ok(HeadObjectOutput::builder()
+                    .set_metadata(Some(metadata.clone()))
+                    .build()),
+                None => Err(aws_error(
+                    HeadObjectError::NotFound(NotFound::builder().build()),
+                    404,
+                )),
+            }
+        });
+
+        let f = fake.clone();
+        s3.expect_delete_object().returning(move |_, key, _| {
+            if f.failing(Fault::ObjectDelete) {
+                return Err(aws_error(
+                    DeleteObjectError::generic(ErrorMetadata::builder().code("500").build()),
+                    500,
+                ));
+            }
+
+            f.lock().objects.remove(key.as_bytes());
+            Ok(DeleteObjectOutput::builder().build())
+        });
+
+        let f = fake.clone();
+        s3.expect_list_versions().returning(move |_, _| {
+            if f.failing(Fault::ObjectList) {
+                return Err(aws_error(
+                    ListObjectVersionsError::generic(ErrorMetadata::builder().code("500").build()),
+                    500,
+                ));
+            }
+
+            Ok(ListObjectVersionsOutput::builder().build())
+        });
+
+        let f = fake.clone();
+        dynamodb
+            .expect_get_item()
+            .returning(move |table, item, _| {
+                if &**table == FRAGMENT_STATE_TABLE_NAME {
+                    if f.failing(Fault::StateReadTimeout) {
+                        return Err(AwsError::AwsSdkError(SdkError::timeout_error(Box::new(
+                            std::io::Error::other("injected timeout"),
+                        ))));
+                    }
+                    if f.failing(Fault::StateReadBroken) {
+                        return Err(aws_error(
+                            GetItemError::ResourceNotFoundException(
+                                ResourceNotFoundException::builder().build(),
+                            ),
+                            400,
+                        ));
+                    }
+                    if f.failing(Fault::StateRead) {
+                        return Err(throughput_exceeded(
+                            GetItemError::ProvisionedThroughputExceededException(
+                                throttling_exception(),
+                            ),
+                        ));
+                    }
+                }
+
+                let storage = f.lock();
+                let found = if &**table == FRAGMENT_STATE_TABLE_NAME {
+                    storage.state.get(&blob(&item, "hash")).cloned()
                 } else {
+                    storage
+                        .associations
+                        .get(&(blob(&item, "hash"), blob(&item, "repository_context")))
+                        .cloned()
+                };
+
+                Ok(GetItemOutput::builder().set_item(found).build())
+            });
+
+        let f = fake.clone();
+        dynamodb
+            .expect_batch_get_item()
+            .returning(move |_, keys, _| {
+                let storage = f.lock();
+
+                Ok(keys
+                    .iter()
+                    .filter_map(|key| {
+                        storage
+                            .associations
+                            .get(&(blob(key, "hash"), blob(key, "repository_context")))
+                            .cloned()
+                    })
+                    .collect())
+            });
+
+        let f = fake.clone();
+        dynamodb.expect_put_item().returning(move |table, item| {
+            if &**table == FRAGMENTS_TABLE_NAME && f.failing(Fault::AssociationWrite) {
+                return Err(throughput_exceeded(
+                    PutItemError::ProvisionedThroughputExceededException(throttling_exception()),
+                ));
+            }
+
+            let mut storage = f.lock();
+            if &**table == FRAGMENT_STATE_TABLE_NAME {
+                storage.state.insert(blob(&item, "hash"), item);
+            } else {
+                storage.associations.insert(
+                    (blob(&item, "hash"), blob(&item, "repository_context")),
+                    item,
+                );
+            }
+            Ok(PutItemOutput::builder().build())
+        });
+
+        let f = fake.clone();
+        dynamodb
+            .expect_put_item_conditional::<RowAbsent>()
+            .returning(move |_, item, _| {
+                let mut storage = f.lock();
+                let key = blob(&item, "hash");
+
+                if let Some(existing) = storage.state.get(&key) {
+                    return Err(conditional_check_failed(existing.clone()));
+                }
+
+                storage.state.insert(key, item);
+                Ok(PutItemOutput::builder().build())
+            });
+
+        let f = fake.clone();
+        dynamodb
+            .expect_put_item_conditional::<StateUnchanged>()
+            .returning(move |_, item, condition| {
+                if f.failing(Fault::StateWrite) {
+                    return Err(throughput_exceeded(
+                        PutItemError::ProvisionedThroughputExceededException(
+                            throttling_exception(),
+                        ),
+                    ));
+                }
+
+                let mut storage = f.lock();
+                let key = blob(&item, "hash");
+
+                let current = storage.state.get(&key).map(|existing| {
+                    serde_dynamo::from_item::<_, FragmentStateEntry>(existing.clone())
+                        .unwrap()
+                        .state()
+                });
+
+                if current == Some(condition.0) {
+                    storage.state.insert(key, item);
                     Ok(PutItemOutput::builder().build())
-                }
-            });
-
-        match lock_mode {
-            MockLockMode::Finalize | MockLockMode::FinalizeFail => {
-                let mut final_metadata = updated_metadata;
-                final_metadata.flags = FragmentFlags::PayloadObliterated.bits();
-                final_metadata.size_content = 0;
-                final_metadata.size_payload = 0;
-                let item: HashMap<String, AttributeValue> = serde_dynamo::to_item(
-                    FragmentMetadataEntry::new(hash).with_fragment(final_metadata),
-                )
-                .expect("failed to serialize");
-
-                // And a second one that releases the lock
-                let mut expectation = dynamodb_mock.expect_put_item_conditional().times(1);
-
-                if in_sequence {
-                    expectation = expectation.in_sequence(&mut seq);
-                }
-
-                expectation
-                    .with(
-                        eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                        eq(item.clone()),
-                        eq(UpdateMetadataCondition(updated_metadata)),
-                    )
-                    .return_once(move |_, _, _| {
-                        if matches!(lock_mode, MockLockMode::Finalize) {
-                            Ok(PutItemOutput::builder().build())
-                        } else {
-                            Err(aws_error(
-                                PutItemError::ConditionalCheckFailedException(
-                                    ConditionalCheckFailedException::builder()
-                                        .set_item(Some(item))
-                                        .build(),
-                                ),
-                                400u16,
-                            ))
-                        }
-                    });
-            }
-            MockLockMode::Revert => {
-                let item: HashMap<String, AttributeValue> =
-                    serde_dynamo::to_item(FragmentMetadataEntry::new(hash).with_fragment(fragment))
-                        .expect("failed to serialize");
-
-                // And a second one that releases the lock
-                let mut expectation = dynamodb_mock.expect_put_item_conditional().times(1);
-
-                if in_sequence {
-                    expectation = expectation.in_sequence(&mut seq);
-                }
-
-                expectation
-                    .with(
-                        eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                        eq(item),
-                        eq(UpdateMetadataCondition(updated_metadata)),
-                    )
-                    .return_once(move |_, _, _| Ok(PutItemOutput::builder().build()));
-            }
-            MockLockMode::None | MockLockMode::AcquireFail => {}
-        }
-    }
-
-    fn mock_count_associations(
-        dynamodb_mock: &mut MockDynamoDb,
-        hash: Hash,
-        count: i32,
-        fail: bool,
-    ) {
-        dynamodb_mock
-            .expect_query_single()
-            .times(1)
-            .with(
-                eq(Arc::<str>::from(FRAGMENTS_TABLE_NAME)),
-                eq(FragmentsQuery::HashCount(hash)),
-            )
-            .return_once(move |_, _| {
-                if fail {
-                    Err(aws_error(
-                        QueryError::ProvisionedThroughputExceededException(
-                            ProvisionedThroughputExceededException::builder().build(),
-                        ),
-                        503u16,
-                    ))
                 } else {
-                    Ok(QueryOutput::builder().count(count).build())
-                }
-            });
-    }
-
-    fn mock_remove_association(
-        dynamodb_mock: &mut MockDynamoDb,
-        repository: Context,
-        address: Address,
-        fail: bool,
-    ) {
-        let entry = FragmentsEntry::new(repository, address);
-        let item: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(entry).expect("failed to serialize fragments entry");
-
-        dynamodb_mock
-            .expect_delete_item()
-            .with(eq(Arc::<str>::from(FRAGMENTS_TABLE_NAME)), eq(item))
-            .return_once(move |_, _| {
-                if fail {
-                    Err(aws_error(
-                        DeleteItemError::ProvisionedThroughputExceededException(
-                            ProvisionedThroughputExceededException::builder().build(),
-                        ),
-                        503u16,
+                    Err(conditional_check_failed(
+                        storage.state.get(&key).cloned().unwrap_or_default(),
                     ))
-                } else {
-                    Ok(DeleteItemOutput::builder().build())
                 }
             });
-    }
 
-    fn mock_list_versions(
-        s3mock: &mut MockS3Impl,
-        hash: Hash,
-        version: Option<String>,
-        fail: bool,
-    ) {
-        s3mock
-            .expect_list_versions()
-            .with(eq(BUCKET), eq(hash.to_string()))
-            .return_once(move |_, _| {
-                if fail {
-                    Err(aws_error(
-                        ListObjectVersionsError::generic(ErrorMetadata::builder().build()),
-                        500u16,
-                    ))
-                } else {
-                    let versions = if version.is_some() {
-                        Some(vec![
-                            ObjectVersion::builder().set_version_id(version).build(),
-                        ])
-                    } else {
-                        None
-                    };
-                    Ok(ListObjectVersionsOutput::builder()
-                        .set_versions(versions)
-                        .build())
-                }
-            });
-    }
-
-    fn mock_delete_payload(
-        s3mock: &mut MockS3Impl,
-        hash: Hash,
-        version: Option<String>,
-        fail: bool,
-    ) {
-        s3mock
-            .expect_delete_object()
-            .with(eq(BUCKET), eq(hash.to_string()), eq(version))
-            .return_once(move |_, _, _| {
-                if fail {
-                    Err(aws_error(
-                        DeleteObjectError::generic(ErrorMetadata::builder().build()),
-                        500u16,
-                    ))
-                } else {
-                    Ok(DeleteObjectOutput::builder().build())
-                }
-            });
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_obliterate_single_fragment() {
-        let repository = random::<Context>();
-
-        let mut s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let (fragment, address) =
-            mock_load_fragment_metadata(&mut dynamodb_mock, None, false /* fail */);
-
-        mock_acquire_obliterate_lock(
-            &mut dynamodb_mock,
-            fragment,
-            address.hash,
-            MockLockMode::Finalize,
-            true, /* in sequence */
-        );
-
-        // Mock the association count, this is currently done twice (for now), the first time we
-        // return 1, the second 0.
-        mock_count_associations(&mut dynamodb_mock, address.hash, 0, false /* fail */);
-
-        mock_remove_association(
-            &mut dynamodb_mock,
-            repository,
-            address,
-            false, /* fail */
-        );
-
-        let version_id = Some("some-version".to_string());
-        mock_list_versions(&mut s3mock, address.hash, version_id.clone(), false);
-
-        mock_delete_payload(&mut s3mock, address.hash, version_id, false /* fail */);
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-
-        let stats: Arc<StoreObliterateStats> = Default::default();
-        Arc::new(store)
-            .obliterate(repository.into(), address, stats.clone())
-            .await
-            .expect("obliterate failed");
-
-        // The rest of the necessary assertions are handled by expectations on the Dynamo and S3
-        // mocks.
-        assert_eq!(stats.num_fragments.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_obliterate_single_fragment_multiple_associations() {
-        let repository = random::<Context>();
-
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let (fragment, address) =
-            mock_load_fragment_metadata(&mut dynamodb_mock, None, false /* fail */);
-
-        mock_acquire_obliterate_lock(
-            &mut dynamodb_mock,
-            fragment,
-            address.hash,
-            MockLockMode::Revert,
-            true, /* in sequence */
-        );
-
-        // Mock the association count, this is currently done twice (for now), the first time we
-        // return 2, the second 1.
-        mock_count_associations(&mut dynamodb_mock, address.hash, 1, false /* fail */);
-
-        mock_remove_association(
-            &mut dynamodb_mock,
-            repository,
-            address,
-            false, /* fail */
-        );
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-
-        let stats: Arc<StoreObliterateStats> = Default::default();
-        Arc::new(store)
-            .obliterate(repository.into(), address, stats.clone())
-            .await
-            .expect("obliterate failed");
-
-        // The rest of the necessary assertions are handled by expectations on the Dynamo and S3
-        // mocks.
-        assert_eq!(stats.num_fragments.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_obliterate_single_fragment_metadata_load_fails() {
-        let repository = random::<Context>();
-
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let (_fragment, address) =
-            mock_load_fragment_metadata(&mut dynamodb_mock, None, true /* fail */);
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-
-        let stats: Arc<StoreObliterateStats> = Default::default();
-        assert!(
-            Arc::new(store)
-                .obliterate(repository.into(), address, stats.clone())
-                .await
-                .unwrap_err()
-                .is_address_not_found()
-        );
-
-        // The rest of the necessary assertions are handled by expectations on the Dynamo and S3
-        // mocks.
-        assert_eq!(stats.num_fragments.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    async fn test_load_metadata_sdk_timeout_returns_slow_down() {
-        let (_fragment, address, _payload) = fragment::generate_random();
-
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let metadata_entry = FragmentMetadataEntry::new(address.hash);
-        let av_map: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(metadata_entry).unwrap();
-
-        #[derive(Debug, thiserror::Error)]
-        #[error("stub")]
-        struct StubError;
-
-        dynamodb_mock
-            .expect_get_item()
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(av_map),
-                eq(true),
-            )
-            .return_once(move |_, _, _| {
-                Err(AwsError::AwsSdkError(SdkError::TimeoutError(
-                    TimeoutError::builder().source(Box::new(StubError)).build(),
-                )))
-            });
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-
-        assert!(
-            store
-                .load_metadata(address.hash)
-                .await
-                .unwrap_err()
-                .is_slow_down()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_load_metadata_sdk_service_error_returns_address_not_found() {
-        let (_fragment, address, _payload) = fragment::generate_random();
-
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let metadata_entry = FragmentMetadataEntry::new(address.hash);
-        let av_map: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(metadata_entry).unwrap();
-
-        dynamodb_mock
-            .expect_get_item()
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(av_map),
-                eq(true),
-            )
-            .return_once(move |_, _, _| {
-                Err(aws_error(
-                    GetItemError::ResourceNotFoundException(
-                        ResourceNotFoundException::builder()
-                            .message("Table not found")
-                            .build(),
-                    ),
-                    400u16,
-                ))
-            });
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-
-        assert!(
-            store
-                .load_metadata(address.hash)
-                .await
-                .unwrap_err()
-                .is_address_not_found()
-        );
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_obliterate_single_fragment_acquire_lock_fails() {
-        let repository = random::<Context>();
-
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let (fragment, address) =
-            mock_load_fragment_metadata(&mut dynamodb_mock, None, false /* fail */);
-
-        mock_acquire_obliterate_lock(
-            &mut dynamodb_mock,
-            fragment,
-            address.hash,
-            MockLockMode::AcquireFail,
-            true, /* in sequence */
-        );
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-
-        let stats: Arc<StoreObliterateStats> = Default::default();
-        assert!(
-            Arc::new(store)
-                .obliterate(repository.into(), address, stats.clone())
-                .await
-                .unwrap_err()
-                .is_internal(),
-        );
-
-        // The rest of the necessary assertions are handled by expectations on the Dynamo and S3
-        // mocks.
-        assert_eq!(stats.num_fragments.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_obliterate_single_fragment_count_associations_fails() {
-        let repository = random::<Context>();
-
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let (fragment, address) =
-            mock_load_fragment_metadata(&mut dynamodb_mock, None, false /* fail */);
-
-        mock_acquire_obliterate_lock(
-            &mut dynamodb_mock,
-            fragment,
-            address.hash,
-            MockLockMode::None,
-            true, /* in sequence */
-        );
-
-        mock_remove_association(&mut dynamodb_mock, repository, address, false);
-
-        mock_count_associations(&mut dynamodb_mock, address.hash, 0, true /* fail */);
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-
-        let stats: Arc<StoreObliterateStats> = Default::default();
-        assert!(
-            Arc::new(store)
-                .obliterate(repository.into(), address, stats.clone())
-                .await
-                .unwrap_err()
-                .is_slow_down()
-        );
-
-        // The rest of the necessary assertions are handled by expectations on the Dynamo and S3
-        // mocks.
-        assert_eq!(stats.num_fragments.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_obliterate_single_fragment_remove_fragment_association_fails() {
-        let repository = random::<Context>();
-
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let (fragment, address) =
-            mock_load_fragment_metadata(&mut dynamodb_mock, None, false /* fail */);
-
-        mock_acquire_obliterate_lock(
-            &mut dynamodb_mock,
-            fragment,
-            address.hash,
-            MockLockMode::None,
-            true, /* in sequence */
-        );
-
-        mock_remove_association(
-            &mut dynamodb_mock,
-            repository,
-            address,
-            true, /* fail */
-        );
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-
-        let stats: Arc<StoreObliterateStats> = Default::default();
-        assert!(
-            Arc::new(store)
-                .obliterate(repository.into(), address, stats.clone())
-                .await
-                .unwrap_err()
-                .is_slow_down()
-        );
-
-        // The rest of the necessary assertions are handled by expectations on the Dynamo and S3
-        // mocks.
-        assert_eq!(stats.num_fragments.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 0);
-    }
-
-    // Delete payload fails
-    #[tokio::test]
-    #[traced_test]
-    async fn test_obliterate_single_fragment_delete_payload_fails() {
-        let repository = random::<Context>();
-
-        let mut s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let (fragment, address) =
-            mock_load_fragment_metadata(&mut dynamodb_mock, None, false /* fail */);
-
-        mock_acquire_obliterate_lock(
-            &mut dynamodb_mock,
-            fragment,
-            address.hash,
-            MockLockMode::None,
-            true, /* in sequence */
-        );
-
-        // Mock the association count, this is currently done twice (for now), the first time we
-        // return 1, the second 0.
-        mock_count_associations(&mut dynamodb_mock, address.hash, 0, false /* fail */);
-
-        mock_remove_association(
-            &mut dynamodb_mock,
-            repository,
-            address,
-            false, /* fail */
-        );
-
-        let version_id = Some("some-version".to_string());
-        mock_list_versions(&mut s3mock, address.hash, version_id.clone(), false);
-
-        mock_delete_payload(&mut s3mock, address.hash, version_id, true /* fail */);
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-
-        let stats: Arc<StoreObliterateStats> = Default::default();
-        assert!(
-            Arc::new(store)
-                .obliterate(repository.into(), address, stats.clone())
-                .await
-                .unwrap_err()
-                .is_slow_down()
-        );
-
-        // The rest of the necessary assertions are handled by expectations on the Dynamo and S3
-        // mocks.
-        assert_eq!(stats.num_fragments.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 0);
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_obliterate_single_fragment_delete_payload_fails_to_list_versions() {
-        let repository = random::<Context>();
-
-        let mut s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let (fragment, address) =
-            mock_load_fragment_metadata(&mut dynamodb_mock, None, false /* fail */);
-
-        mock_acquire_obliterate_lock(
-            &mut dynamodb_mock,
-            fragment,
-            address.hash,
-            MockLockMode::None,
-            true, /* in sequence */
-        );
-
-        // Mock the association count, this is currently done twice (for now), the first time we
-        // return 1, the second 0.
-        mock_count_associations(&mut dynamodb_mock, address.hash, 0, false /* fail */);
-
-        mock_remove_association(
-            &mut dynamodb_mock,
-            repository,
-            address,
-            false, /* fail */
-        );
-
-        let version_id = Some("some-version".to_string());
-        mock_list_versions(&mut s3mock, address.hash, version_id.clone(), true);
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-
-        let stats: Arc<StoreObliterateStats> = Default::default();
-        assert!(
-            Arc::new(store)
-                .obliterate(repository.into(), address, stats.clone())
-                .await
-                .unwrap_err()
-                .is_slow_down()
-        );
-
-        // The rest of the necessary assertions are handled by expectations on the Dynamo and S3
-        // mocks.
-        assert_eq!(stats.num_fragments.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 0);
-    }
-
-    // Finalize metadata fails
-    #[tokio::test]
-    #[traced_test]
-    async fn test_obliterate_single_fragment_finalize_metadata_fails() {
-        let repository = random::<Context>();
-
-        let mut s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        let (fragment, address) =
-            mock_load_fragment_metadata(&mut dynamodb_mock, None, false /* fail */);
-
-        mock_acquire_obliterate_lock(
-            &mut dynamodb_mock,
-            fragment,
-            address.hash,
-            MockLockMode::FinalizeFail,
-            true, /* in sequence */
-        );
-
-        // Mock the association count, this is currently done twice (for now), the first time we
-        // return 1, the second 0.
-        mock_count_associations(&mut dynamodb_mock, address.hash, 0, false /* fail */);
-
-        mock_remove_association(
-            &mut dynamodb_mock,
-            repository,
-            address,
-            false, /* fail */
-        );
-
-        let version_id = Some("some-version".to_string());
-        mock_list_versions(&mut s3mock, address.hash, version_id.clone(), false);
-
-        mock_delete_payload(&mut s3mock, address.hash, version_id, false /* fail */);
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-
-        let stats: Arc<StoreObliterateStats> = Default::default();
-        assert!(
-            Arc::new(store)
-                .obliterate(repository.into(), address, stats.clone())
-                .await
-                .unwrap_err()
-                .is_internal()
-        );
-
-        // The rest of the necessary assertions are handled by expectations on the Dynamo and S3
-        // mocks.
-        assert_eq!(stats.num_fragments.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn test_obliterate_fragment_is_fragmented() {
-        let repository = random::<Context>();
-
-        let mut s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        // Build the fragment list payload
-        let address = random::<Address>();
-        let context = address.context;
-
-        let mut payload = BytesMut::new();
-        const SUB_FRAGMENT_COUNT: u64 = 5;
-        const SUB_FRAGMENT_SIZE: u64 = 32;
-
-        for i in 0..SUB_FRAGMENT_COUNT {
-            let (fragment, mut address) =
-                mock_load_fragment_metadata(&mut dynamodb_mock, None, false /* fail */);
-            address.context = context;
-
-            mock_acquire_obliterate_lock(
-                &mut dynamodb_mock,
-                fragment,
-                address.hash,
-                MockLockMode::Finalize,
-                // We do not mock the expectations in sequence because order of obliterates for each
-                // sub-fragment is non-deterministic.
-                false, /* in sequence */
-            );
-
-            // Mock the association count, this is currently done twice (for now), the first time we
-            // return 1, the second 0.
-            mock_count_associations(&mut dynamodb_mock, address.hash, 0, false /* fail */);
-
-            mock_remove_association(
-                &mut dynamodb_mock,
-                repository,
-                address,
-                false, /* fail */
-            );
-
-            let version_id = Some("some-version".to_string());
-            mock_list_versions(&mut s3mock, address.hash, version_id.clone(), false);
-
-            mock_delete_payload(&mut s3mock, address.hash, version_id, false /* fail */);
-
-            let reference = FragmentReference {
-                hash: address.hash,
-                offset_content: i * SUB_FRAGMENT_SIZE,
+        let f = fake.clone();
+        dynamodb.expect_delete_item().returning(move |table, item| {
+            let fault = if &**table == FRAGMENT_STATE_TABLE_NAME {
+                Fault::StateDelete
+            } else {
+                Fault::AssociationDelete
             };
-            payload.extend_from_slice(reference.as_bytes());
+            if f.failing(fault) {
+                return Err(throughput_exceeded(
+                    DeleteItemError::ProvisionedThroughputExceededException(throttling_exception()),
+                ));
+            }
+
+            let mut storage = f.lock();
+            if &**table == FRAGMENT_STATE_TABLE_NAME {
+                storage.state.remove(&blob(&item, "hash"));
+            } else {
+                storage
+                    .associations
+                    .remove(&(blob(&item, "hash"), blob(&item, "repository_context")));
+            }
+            Ok(DeleteItemOutput::builder().build())
+        });
+
+        let f = fake.clone();
+        dynamodb.expect_query_single().returning(move |_, query| {
+            if f.failing(Fault::AssociationCount) {
+                return Err(throughput_exceeded(
+                    QueryError::ProvisionedThroughputExceededException(throttling_exception()),
+                ));
+            }
+
+            let storage = f.lock();
+            let count = match query {
+                FragmentsQuery::Hash(hash) | FragmentsQuery::HashCount(hash) => storage
+                    .associations
+                    .keys()
+                    .filter(|(stored, _)| stored == hash.data())
+                    .count(),
+                FragmentsQuery::Repository(hash, repository) => storage
+                    .associations
+                    .keys()
+                    .filter(|(stored, repository_context)| {
+                        stored == hash.data() && repository_context.starts_with(repository.data())
+                    })
+                    .count(),
+            };
+
+            Ok(QueryOutput::builder()
+                .count(i32::try_from(count).unwrap())
+                .build())
+        });
+
+        (s3, dynamodb)
+    }
+
+    /// A throttling exception carrying the error code a real response would, which is what the
+    /// classifier reads — a builder-constructed exception has no metadata at all.
+    fn throttling_exception() -> ProvisionedThroughputExceededException {
+        ProvisionedThroughputExceededException::builder()
+            .meta(
+                ErrorMetadata::builder()
+                    .code("ProvisionedThroughputExceededException")
+                    .build(),
+            )
+            .build()
+    }
+
+    fn throughput_exceeded<E>(error: E) -> AwsError<SdkError<E, HttpResponse>> {
+        aws_error(error, 400)
+    }
+
+    fn conditional_check_failed(
+        item: HashMap<String, AttributeValue>,
+    ) -> AwsError<SdkError<PutItemError, HttpResponse>> {
+        aws_error(
+            PutItemError::ConditionalCheckFailedException(
+                ConditionalCheckFailedException::builder()
+                    .set_item(Some(item))
+                    .build(),
+            ),
+            400,
+        )
+    }
+
+    async fn store_with(
+        fake: &Fake,
+        force_write: bool,
+        fragment_metadata: bool,
+    ) -> Arc<AwsImmutableStore> {
+        let (s3, dynamodb) = wire(fake);
+        let mut dynamodb_settings = DynamoDbImmutableStoreSettings::new(
+            FRAGMENTS_TABLE_NAME.to_string(),
+            FRAGMENT_STATE_TABLE_NAME.to_string(),
+        );
+        dynamodb_settings.timeout_millis = 1;
+
+        if fragment_metadata {
+            dynamodb_settings = dynamodb_settings
+                .with_fragment_metadata_table(FRAGMENT_STATE_TABLE_NAME.to_string());
         }
 
-        let fragment = Fragment {
-            flags: (FragmentFlags::PayloadStoredDurable | FragmentFlags::PayloadFragmented).bits(),
-            size_payload: payload.len() as u32,
-            size_content: SUB_FRAGMENT_SIZE * SUB_FRAGMENT_COUNT,
+        let settings = AwsImmutableStoreSettings {
+            s3: S3StoreSettings::new(BUCKET.to_string()),
+            dynamodb: dynamodb_settings,
+            force_write,
+            batch_exist_submission_limit: 1000,
         };
 
-        let metadata_entry = FragmentMetadataEntry::new(address.hash);
-        let av_map: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(metadata_entry.clone()).unwrap();
-        let full_entry_av_map =
-            serde_dynamo::to_item(metadata_entry.with_fragment(fragment)).unwrap();
-
-        // Mock loading the fragment metadata
-        dynamodb_mock
-            .expect_get_item()
-            .times(1)
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(av_map),
-                eq(true),
-            )
-            .return_once(move |_, _, _| {
-                Ok(GetItemOutput::builder()
-                    .set_item(Some(full_entry_av_map))
-                    .build())
-            });
-
-        // Mock reading the payload to get the sub-fragments
-        s3mock
-            .expect_get_object()
-            .with(eq(BUCKET), eq(format!("{}", address.hash)), eq(None))
-            .return_once(move |_, _, _| {
-                Ok(GetObjectOutput::builder()
-                    .body(payload.to_vec().into())
-                    .build())
-            });
-
-        mock_acquire_obliterate_lock(
-            &mut dynamodb_mock,
-            fragment,
-            address.hash,
-            MockLockMode::Finalize,
-            // We do not mock the expectations in sequence because order of obliterates for each
-            // sub-fragment is non-deterministic.
-            false, /* in sequence */
-        );
-
-        // Mock the association count, this is currently done twice (for now), the first time we
-        // return 1, the second 0.
-        mock_count_associations(&mut dynamodb_mock, address.hash, 0, false /* fail */);
-
-        mock_remove_association(
-            &mut dynamodb_mock,
-            repository,
-            address,
-            false, /* fail */
-        );
-
-        let version_id = Some("some-version".to_string());
-        mock_list_versions(&mut s3mock, address.hash, version_id.clone(), false);
-
-        mock_delete_payload(&mut s3mock, address.hash, version_id, false /* fail */);
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-
-        let stats: Arc<StoreObliterateStats> = Default::default();
-        Arc::new(store)
-            .obliterate(repository.into(), address, stats.clone())
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                Arc::new(AwsImmutableStore::new(s3, dynamodb, &settings))
+            })
             .await
-            .expect("obliterate failed");
+    }
 
-        // The rest of the necessary assertions are handled by expectations on the Dynamo and S3
-        // mocks.
-        assert_eq!(
-            stats.num_fragments.load(Ordering::Relaxed),
-            (SUB_FRAGMENT_COUNT + 1) as usize
-        );
-        assert_eq!(
-            stats.num_payloads.load(Ordering::Relaxed),
-            (SUB_FRAGMENT_COUNT + 1) as usize
-        );
+    async fn store(fake: &Fake) -> Arc<AwsImmutableStore> {
+        store_with(fake, false, false).await
+    }
+
+    /// A store on a deployment that may still hold objects written before fragments moved onto
+    /// them, and so is configured to read the rows describing those.
+    async fn migrated_store(fake: &Fake) -> Arc<AwsImmutableStore> {
+        store_with(fake, false, true).await
+    }
+
+    /// A payload and the fragment that correctly describes it.
+    fn representation(
+        codec: FragmentFlags,
+        size_payload: usize,
+        size_content: u64,
+    ) -> (Fragment, Bytes) {
+        let payload = Bytes::from(vec![codec.bits() as u8; size_payload]);
+        let fragment = Fragment {
+            flags: codec.bits(),
+            size_payload: u32::try_from(size_payload).unwrap(),
+            size_content,
+        };
+
+        (fragment, payload)
     }
 
     #[tokio::test]
-    #[traced_test]
-    async fn test_obliterate_fragment_is_fragmented_obliterate_subfragment_fails() {
-        let repository = random::<Context>();
+    async fn put_stores_the_fragment_on_the_object() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
-        let mut s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
-
-        // Build the fragment list payload
-        let address = random::<Address>();
-        let context = address.context;
-
-        let mut payload = BytesMut::new();
-        const SUB_FRAGMENT_COUNT: u64 = 2;
-        const SUB_FRAGMENT_SIZE: u64 = 32;
-
-        for i in 0..SUB_FRAGMENT_COUNT {
-            let (fragment, mut address) =
-                mock_load_fragment_metadata(&mut dynamodb_mock, None, false /* fail */);
-            address.context = context;
-
-            mock_acquire_obliterate_lock(
-                &mut dynamodb_mock,
+        store(&fake)
+            .await
+            .put(
+                repository.into(),
+                address,
                 fragment,
-                address.hash,
-                if i == 0 {
-                    MockLockMode::Finalize
-                } else {
-                    MockLockMode::None
+                Some(payload.clone()),
+                false,
+            )
+            .await
+            .expect("put should succeed");
+
+        assert_eq!(fake.stored_fragment(address.hash), Some(fragment));
+        assert_eq!(fake.object(address.hash).unwrap().0, payload.as_ref());
+        assert_eq!(fake.state_of(address.hash), Some(FragmentState::Stored));
+        assert_eq!(fake.association_count(address.hash), 1);
+    }
+
+    #[tokio::test]
+    async fn put_of_an_already_associated_fragment_writes_nothing() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(
+                repository.into(),
+                address,
+                fragment,
+                Some(payload.clone()),
+                false,
+            )
+            .await
+            .expect("first put should succeed");
+
+        let (other, other_payload) = representation(FragmentFlags::PayloadCompressedLZ4, 96, 256);
+        store
+            .put(
+                repository.into(),
+                address,
+                other,
+                Some(other_payload),
+                false,
+            )
+            .await
+            .expect("second put should succeed");
+
+        assert_eq!(
+            fake.stored_fragment(address.hash),
+            Some(fragment),
+            "an already associated put must not re-upload"
+        );
+        assert_eq!(fake.object(address.hash).unwrap().0, payload.as_ref());
+    }
+
+    #[tokio::test]
+    async fn put_deduplicates_across_partitions_without_uploading() {
+        let fake = Fake::default();
+        let hash: Hash = random();
+        let first = Address {
+            hash,
+            context: random(),
+        };
+        let second = Address {
+            hash,
+            context: random(),
+        };
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(
+                random::<Context>().into(),
+                first,
+                fragment,
+                Some(payload.clone()),
+                false,
+            )
+            .await
+            .expect("first put should succeed");
+
+        let (other, other_payload) = representation(FragmentFlags::PayloadCompressedLZ4, 96, 256);
+        store
+            .put(
+                random::<Context>().into(),
+                second,
+                other,
+                Some(other_payload),
+                false,
+            )
+            .await
+            .expect("cross-partition put should succeed");
+
+        assert_eq!(
+            fake.stored_fragment(hash),
+            Some(fragment),
+            "deduplication must leave the stored representation alone"
+        );
+        assert_eq!(fake.association_count(hash), 2);
+    }
+
+    #[tokio::test]
+    async fn put_without_a_payload_may_not_claim_stored_content() {
+        let fake = Fake::default();
+        let hash: Hash = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(
+                random::<Context>().into(),
+                Address {
+                    hash,
+                    context: random(),
                 },
-                // We do not mock the expectations in sequence because order of obliterates for each
-                // sub-fragment is non-deterministic.
-                false, /* in sequence */
-            );
+                fragment,
+                Some(payload),
+                false,
+            )
+            .await
+            .expect("first put should succeed");
 
-            // Mock the association count, this is currently done twice (for now), the first time we
-            // return 1, the second 0.
-            mock_count_associations(&mut dynamodb_mock, address.hash, 0, false /* fail */);
+        let claimed = Address {
+            hash,
+            context: random(),
+        };
+        store
+            .put(random::<Context>().into(), claimed, fragment, None, false)
+            .await
+            .expect_err("a hash alone is not evidence the caller holds the content");
 
-            mock_remove_association(
-                &mut dynamodb_mock,
-                repository,
+        assert_eq!(fake.association_count(hash), 1);
+    }
+
+    #[tokio::test]
+    async fn get_reads_the_fragment_from_the_object_it_returns() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(
+                repository.into(),
                 address,
-                false, /* fail */
-            );
+                fragment,
+                Some(payload.clone()),
+                false,
+            )
+            .await
+            .expect("put should succeed");
 
-            let version_id = Some("some-version".to_string());
-            mock_list_versions(&mut s3mock, address.hash, version_id.clone(), false);
+        let (loaded, bytes) = store
+            .get(repository.into(), address, StoreMatch::MatchFull)
+            .await
+            .expect("get should succeed");
 
-            mock_delete_payload(
-                &mut s3mock,
-                address.hash,
-                version_id,
-                i == 1, /* fail for the second sub-fragment */
-            );
+        assert_eq!(bytes, payload);
+        assert_eq!(loaded.size_payload, fragment.size_payload);
+        assert_eq!(loaded.size_content, fragment.size_content);
+        assert_eq!(
+            loaded.flags & FragmentFlags::PayloadStoredDurable,
+            FragmentFlags::PayloadStoredDurable,
+            "durability is derived from the object existing, not read from a record"
+        );
+    }
 
-            let reference = FragmentReference {
-                hash: address.hash,
-                offset_content: i * SUB_FRAGMENT_SIZE,
-            };
-            payload.extend_from_slice(reference.as_bytes());
-        }
+    /// Query answers from `DynamoDB` alone. It is on the ingress write path, once per fragment
+    /// stored, so it must not reach S3 — which means it reports whether the payload is there and
+    /// durable, not what representation is stored.
+    #[tokio::test]
+    async fn query_reports_a_match_without_reading_s3() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
-        let fragment = Fragment {
-            flags: (FragmentFlags::PayloadStoredDurable | FragmentFlags::PayloadFragmented).bits(),
-            size_payload: payload.len() as u32,
-            size_content: SUB_FRAGMENT_SIZE * SUB_FRAGMENT_COUNT,
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect("put should succeed");
+
+        let result = store
+            .query(repository.into(), address, StoreMatch::MatchFull)
+            .await
+            .expect("query should succeed");
+
+        assert_eq!(result.match_made, StoreMatch::MatchFull);
+        assert_eq!(
+            result.fragment.flags & FragmentFlags::PayloadStoredDurable,
+            FragmentFlags::PayloadStoredDurable
+        );
+        assert_eq!(
+            fake.object_reads(),
+            0,
+            "query must not touch S3; it is called once per fragment on the ingress write path"
+        );
+    }
+
+    /// The representation a put stored must come back from a later metadata read — the whole
+    /// reason this path exists separately from `query`, which cannot report it.
+    #[tokio::test]
+    async fn get_metadata_returns_the_representation_that_was_stored() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect("put should succeed");
+
+        let result = store
+            .get_metadata(repository.into(), address)
+            .await
+            .expect("get_metadata should succeed");
+
+        assert_eq!(result.match_made, StoreMatch::MatchFull);
+        assert_eq!(result.fragment.size_payload, fragment.size_payload);
+        assert_eq!(result.fragment.size_content, fragment.size_content);
+        assert_eq!(
+            result.fragment.flags & PAYLOAD_FLAGS,
+            fragment.flags & PAYLOAD_FLAGS,
+            "the stored compression must survive the round trip"
+        );
+        assert_eq!(
+            result.fragment.flags & FragmentFlags::PayloadStoredDurable,
+            FragmentFlags::PayloadStoredDurable
+        );
+        assert_eq!(
+            fake.object_reads(),
+            1,
+            "exactly one HeadObject, and only on this path"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_metadata_reads_a_preexisting_object_from_the_fragment_metadata_table() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, _) = preexisting_object(&fake, repository, address);
+
+        let result = migrated_store(&fake)
+            .await
+            .get_metadata(repository.into(), address)
+            .await
+            .expect("get_metadata should succeed");
+
+        assert_eq!(result.match_made, StoreMatch::MatchFull);
+        assert_eq!(result.fragment.size_payload, fragment.size_payload);
+        assert_eq!(result.fragment.size_content, fragment.size_content);
+    }
+
+    #[tokio::test]
+    async fn get_metadata_reports_a_miss_for_an_unknown_address() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
         };
 
-        let metadata_entry = FragmentMetadataEntry::new(address.hash);
-        let av_map: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(metadata_entry.clone()).unwrap();
-        let full_entry_av_map =
-            serde_dynamo::to_item(metadata_entry.with_fragment(fragment)).unwrap();
+        let result = store(&fake)
+            .await
+            .get_metadata(random::<Context>().into(), address)
+            .await
+            .expect("get_metadata should succeed");
 
-        // Mock loading the fragment metadata
-        dynamodb_mock
-            .expect_get_item()
-            .times(1)
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(av_map),
-                eq(true),
-            )
-            .return_once(move |_, _, _| {
-                Ok(GetItemOutput::builder()
-                    .set_item(Some(full_entry_av_map))
-                    .build())
-            });
-
-        // Mock reading the payload to get the sub-fragments
-        s3mock
-            .expect_get_object()
-            .with(eq(BUCKET), eq(format!("{}", address.hash)), eq(None))
-            .return_once(move |_, _, _| {
-                Ok(GetObjectOutput::builder()
-                    .body(payload.to_vec().into())
-                    .build())
-            });
-
-        mock_acquire_obliterate_lock(
-            &mut dynamodb_mock,
-            fragment,
-            address.hash,
-            MockLockMode::None,
-            // We do not mock the expectations in sequence because order of obliterates for each
-            // sub-fragment is non-deterministic.
-            false, /* in sequence */
-        );
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-
-        let stats: Arc<StoreObliterateStats> = Default::default();
-        assert!(
-            Arc::new(store)
-                .obliterate(repository.into(), address, stats.clone())
-                .await
-                .unwrap_err()
-                .is_internal()
-        );
-
-        // The rest of the necessary assertions are handled by expectations on the Dynamo and S3
-        // mocks.
-        assert_eq!(
-            stats.num_fragments.load(Ordering::Relaxed),
-            // We deleted associations for both sub-fragments, but not the parent fragment
-            SUB_FRAGMENT_COUNT as usize
-        );
-        assert_eq!(
-            stats.num_payloads.load(Ordering::Relaxed),
-            // We deleted payloads for one sub-fragment, but failed on the second which should
-            // prevent the parent payload from being deleted as well
-            (SUB_FRAGMENT_COUNT - 1) as usize
-        );
+        assert_eq!(result.match_made, StoreMatch::MatchNone);
+        assert_eq!(fake.object_reads(), 0, "a miss must not reach S3");
     }
 
     #[tokio::test]
-    async fn test_copy_not_found() {
-        let source_repository = random::<Context>();
-        let source_address = random::<Address>();
-        let destination_repository = random::<Context>();
+    async fn query_reports_a_miss_when_no_state_row_exists() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
 
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
+        fake.add_association(repository, address);
 
-        // Source does not exist — lookup returns MatchNone.
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            FragmentsEntry::new(source_repository, source_address),
-            StoreMatch::MatchFull,
-            StoreMatch::MatchNone,
-        );
+        let result = store(&fake)
+            .await
+            .query(repository.into(), address, StoreMatch::MatchFull)
+            .await
+            .expect("query should succeed");
 
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
+        assert_eq!(result.match_made, StoreMatch::MatchNone);
+    }
 
-        let err = store
-            .copy(
-                source_repository.into(),
-                source_address,
-                destination_repository.into(),
-                source_address.context,
+    #[tokio::test]
+    async fn force_write_replaces_the_stored_representation() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        store(&fake)
+            .await
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect("put should succeed");
+
+        let (replacement, replacement_payload) =
+            representation(FragmentFlags::PayloadCompressedLZ4, 96, 256);
+        store_with(&fake, true, false)
+            .await
+            .put(
+                repository.into(),
+                address,
+                replacement,
+                Some(replacement_payload.clone()),
                 false,
             )
             .await
-            .expect_err("copy should have returned NotFound");
+            .expect("forced put should succeed");
 
-        assert!(
-            err.is_address_not_found(),
-            "Expected AddressNotFound, got {err:?}"
+        assert_eq!(fake.stored_fragment(address.hash), Some(replacement));
+        assert_eq!(
+            fake.object(address.hash).unwrap().0,
+            replacement_payload.as_ref()
         );
     }
 
     #[tokio::test]
-    async fn test_copy_partial_match_returns_not_found() {
-        let source_repository = random::<Context>();
-        let source_address = random::<Address>();
-        let destination_repository = random::<Context>();
+    async fn put_backs_off_while_an_obliteration_holds_the_hash() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
+        fake.set_state(address.hash, FragmentState::Obliterating);
 
-        // Fragment exists by hash globally but not in source_repository (MatchHash).
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            FragmentsEntry::new(source_repository, source_address),
-            StoreMatch::MatchFull,
-            StoreMatch::MatchHash,
-        );
-
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
-
-        let err = store
-            .copy(
-                source_repository.into(),
-                source_address,
-                destination_repository.into(),
-                source_address.context,
+        let error = store(&fake)
+            .await
+            .put(
+                random::<Context>().into(),
+                address,
+                fragment,
+                Some(payload),
                 false,
             )
             .await
-            .expect_err("copy should have returned NotFound for partial match");
+            .expect_err("a put racing an obliteration must back off");
 
-        assert!(
-            err.is_address_not_found(),
-            "Expected AddressNotFound, got {err:?}"
-        );
+        assert!(error.is_slow_down(), "expected a retryable back-off");
+        assert_eq!(fake.association_count(address.hash), 0);
+    }
+
+    /// Sets up an object as it was stored before the fragment moved onto it: bare bytes in S3, the
+    /// fragment in a table row.
+    fn preexisting_object(fake: &Fake, repository: Context, address: Address) -> (Fragment, Bytes) {
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        fake.put_object_without_metadata(address.hash, payload.as_ref());
+        fake.set_fragment_metadata_row(address.hash, fragment);
+        fake.add_association(repository, address);
+
+        (fragment, payload)
     }
 
     #[tokio::test]
-    async fn test_copy_success() {
-        let source_repository = random::<Context>();
-        let (fragment, source_address, _) = fragment::generate_random();
-        let destination_repository = random::<Context>();
+    async fn get_falls_back_to_the_legacy_row_for_an_object_with_no_metadata() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = preexisting_object(&fake, repository, address);
 
-        let s3mock = MockS3Impl::default();
-        let mut dynamodb_mock = MockDynamoDb::default();
+        let (loaded, bytes) = migrated_store(&fake)
+            .await
+            .get(repository.into(), address, StoreMatch::MatchFull)
+            .await
+            .expect("an object written before the cut-over must still be readable");
 
-        // Source exists at MatchFull.
-        mock_lookup_fragments(
-            &mut dynamodb_mock,
-            FragmentsEntry::new(source_repository, source_address),
-            StoreMatch::MatchFull,
-            StoreMatch::MatchFull,
+        assert_eq!(bytes, payload);
+        assert_eq!(loaded.size_payload, fragment.size_payload);
+        assert_eq!(loaded.size_content, fragment.size_content);
+        assert_eq!(
+            loaded.flags & FragmentFlags::PayloadStoredDurable,
+            FragmentFlags::PayloadStoredDurable
         );
+    }
 
-        // Metadata load required by do_query when match_made != MatchNone.
-        let metadata_entry = FragmentMetadataEntry::new(source_address.hash);
-        let av_map: HashMap<String, AttributeValue> =
-            serde_dynamo::to_item(metadata_entry.clone()).unwrap();
-        let full_entry_av_map =
-            serde_dynamo::to_item(metadata_entry.with_fragment(fragment)).unwrap();
+    /// A pre-cut-over object is answered from its state row like any other, with no fallback read:
+    /// query never needs the representation, so it never needs the fragment metadata table either.
+    #[tokio::test]
+    async fn query_matches_a_preexisting_object_without_reading_s3() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        preexisting_object(&fake, repository, address);
 
-        dynamodb_mock
-            .expect_get_item()
-            .with(
-                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
-                eq(av_map),
-                eq(true),
+        let result = migrated_store(&fake)
+            .await
+            .query(repository.into(), address, StoreMatch::MatchFull)
+            .await
+            .expect("query should succeed");
+
+        assert_eq!(result.match_made, StoreMatch::MatchFull);
+        assert_eq!(fake.object_reads(), 0, "query must not touch S3");
+    }
+
+    /// A deployment that never wrote an object without metadata should not go looking for a row
+    /// describing one. An object in that shape is damaged, not old.
+    #[tokio::test]
+    async fn get_refuses_an_object_with_no_metadata_when_no_legacy_table_is_configured() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        preexisting_object(&fake, repository, address);
+
+        store(&fake)
+            .await
+            .get(repository.into(), address, StoreMatch::MatchFull)
+            .await
+            .expect_err("without a legacy table configured there is nothing to fall back to");
+    }
+
+    /// Metadata that is present but unreadable means a damaged object. Describing it from a
+    /// separate record is exactly the mismatch this design removes, so it must not fall back even
+    /// where a legacy row exists.
+    #[tokio::test]
+    async fn get_does_not_fall_back_for_an_object_with_damaged_metadata() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        fake.put_object_with_damaged_metadata(address.hash, payload.as_ref());
+        fake.set_fragment_metadata_row(address.hash, fragment);
+        fake.add_association(repository, address);
+
+        migrated_store(&fake)
+            .await
+            .get(repository.into(), address, StoreMatch::MatchFull)
+            .await
+            .expect_err("a damaged object must not be described by a legacy row");
+    }
+
+    /// A lost payload must not stay lost. Clearing the state row is what lets the next put stop
+    /// short-circuiting on "already durable" and upload the content again.
+    #[tokio::test]
+    async fn a_read_of_a_lost_payload_clears_its_state_so_a_put_can_restore_it() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(
+                repository.into(),
+                address,
+                fragment,
+                Some(payload.clone()),
+                false,
             )
-            .return_once(move |_, _, _| {
-                Ok(GetItemOutput::builder()
-                    .set_item(Some(full_entry_av_map))
-                    .build())
-            });
+            .await
+            .expect("put should succeed");
 
-        // The destination association should be written to DynamoDB.
-        let destination_entry = FragmentsEntry::new(destination_repository, source_address);
-        mock_associate_fragment(&mut dynamodb_mock, &destination_entry);
+        fake.lose_object(address.hash);
 
-        let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
-        let store = Arc::new(store);
+        let error = store
+            .clone()
+            .get(repository.into(), address, StoreMatch::MatchFull)
+            .await
+            .expect_err("a lost payload reads as not found");
+        assert!(error.is_address_not_found());
+
+        assert_eq!(
+            fake.state_of(address.hash),
+            None,
+            "the state row must be cleared so the hash stops looking durable"
+        );
 
         store
-            .copy(
-                source_repository.into(),
-                source_address,
-                destination_repository.into(),
-                source_address.context,
+            .clone()
+            .put(
+                repository.into(),
+                address,
+                fragment,
+                Some(payload.clone()),
                 false,
+            )
+            .await
+            .expect("re-put should succeed");
+
+        assert_eq!(fake.object(address.hash).unwrap().0, payload.as_ref());
+        assert_eq!(fake.state_of(address.hash), Some(FragmentState::Stored));
+
+        let (_, restored) = store
+            .get(repository.into(), address, StoreMatch::MatchFull)
+            .await
+            .expect("the payload should be readable again");
+        assert_eq!(restored, payload);
+    }
+
+    /// A lost payload must be reported however it is found. `get_metadata` is the cheaper call, so
+    /// a client that only ever reads metadata would otherwise never raise the alarm.
+    #[tokio::test]
+    async fn get_metadata_of_a_lost_payload_reports_and_repairs_it() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect("put should succeed");
+
+        fake.lose_object(address.hash);
+
+        let result = store
+            .get_metadata(repository.into(), address)
+            .await
+            .expect("a lost payload reports a miss");
+
+        assert_eq!(result.match_made, StoreMatch::MatchNone);
+        assert_eq!(
+            fake.state_of(address.hash),
+            None,
+            "get_metadata must repair the loss it found, exactly as get does"
+        );
+    }
+
+    /// An obliteration in flight owns the hash. Its mark must survive a read that races the payload
+    /// deletion, or a put could republish underneath it.
+    #[tokio::test]
+    async fn a_read_of_a_lost_payload_leaves_an_obliteration_mark_alone() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect("put should succeed");
+
+        fake.lose_object(address.hash);
+        fake.set_state(address.hash, FragmentState::Obliterating);
+
+        store
+            .get(repository.into(), address, StoreMatch::MatchFull)
+            .await
+            .expect_err("a lost payload reads as not found");
+
+        assert_eq!(
+            fake.state_of(address.hash),
+            Some(FragmentState::Obliterating),
+            "a read must not clear a mark an obliteration is holding"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_revives_a_tombstoned_hash() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        fake.set_state(address.hash, FragmentState::Obliterated);
+
+        store(&fake)
+            .await
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect("re-upload over a tombstone is allowed");
+
+        assert_eq!(fake.state_of(address.hash), Some(FragmentState::Stored));
+        assert_eq!(fake.stored_fragment(address.hash), Some(fragment));
+        assert_eq!(fake.association_count(address.hash), 1);
+    }
+
+    /// Store a fragmented parent whose payload is a list of references to `leaves`, all under one
+    /// repository and context so obliteration walks from the parent into each leaf.
+    async fn store_fragmented(
+        store: &Arc<AwsImmutableStore>,
+        repository: Context,
+        context: Context,
+        leaves: &[Hash],
+    ) -> Address {
+        const LEAF_CONTENT: u64 = 256;
+
+        for (index, hash) in leaves.iter().enumerate() {
+            let (fragment, payload) = representation(
+                FragmentFlags::PayloadCompressedZstd,
+                64 + index,
+                LEAF_CONTENT,
+            );
+            store
+                .clone()
+                .put(
+                    repository.into(),
+                    Address {
+                        hash: *hash,
+                        context,
+                    },
+                    fragment,
+                    Some(payload),
+                    false,
+                )
+                .await
+                .expect("leaf put should succeed");
+        }
+
+        let references: Vec<FragmentReference> = leaves
+            .iter()
+            .enumerate()
+            .map(|(index, hash)| FragmentReference {
+                hash: *hash,
+                offset_content: index as u64 * LEAF_CONTENT,
+            })
+            .collect();
+
+        let payload = Bytes::from(references.as_bytes().to_vec());
+        let parent = Address {
+            hash: random(),
+            context,
+        };
+        let fragment = Fragment {
+            flags: FragmentFlags::PayloadFragmented.bits(),
+            size_payload: u32::try_from(payload.len()).unwrap(),
+            size_content: LEAF_CONTENT * leaves.len() as u64,
+        };
+
+        store
+            .clone()
+            .put(repository.into(), parent, fragment, Some(payload), false)
+            .await
+            .expect("parent put should succeed");
+
+        parent
+    }
+
+    #[tokio::test]
+    async fn obliterate_recurses_into_sub_fragments() {
+        let fake = Fake::default();
+        let repository: Context = random();
+        let context: Context = random();
+        let leaves = [random::<Hash>(), random::<Hash>()];
+
+        let store = store(&fake).await;
+        let parent = store_fragmented(&store, repository, context, &leaves).await;
+
+        let stats = Arc::new(StoreObliterateStats::default());
+        store
+            .obliterate(repository.into(), parent, stats.clone())
+            .await
+            .expect("obliterate should succeed");
+
+        assert!(fake.object(parent.hash).is_none(), "parent payload remains");
+        assert_eq!(fake.association_count(parent.hash), 0);
+
+        for leaf in leaves {
+            assert!(
+                fake.object(leaf).is_none(),
+                "a sub-fragment payload was not obliterated"
+            );
+            assert_eq!(fake.association_count(leaf), 0);
+            assert_eq!(fake.state_of(leaf), Some(FragmentState::Obliterated));
+        }
+
+        assert_eq!(
+            stats.num_fragments.load(Ordering::Relaxed),
+            3,
+            "the parent and both sub-fragments should each be counted"
+        );
+        assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 3);
+    }
+
+    /// Recursion must respect each sub-fragment's own reference count. A leaf another partition
+    /// still holds survives, and its mark is released so the hash stays writable.
+    #[tokio::test]
+    async fn obliterate_keeps_a_sub_fragment_another_partition_references() {
+        let fake = Fake::default();
+        let repository: Context = random();
+        let context: Context = random();
+        let shared = random::<Hash>();
+        let leaves = [shared, random::<Hash>()];
+
+        let store = store(&fake).await;
+        let parent = store_fragmented(&store, repository, context, &leaves).await;
+
+        let other = Address {
+            hash: shared,
+            context: random(),
+        };
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+        store
+            .clone()
+            .put(
+                random::<Context>().into(),
+                other,
+                fragment,
+                Some(payload),
+                false,
+            )
+            .await
+            .expect("second partition put should succeed");
+
+        store
+            .obliterate(
+                repository.into(),
+                parent,
+                Arc::new(StoreObliterateStats::default()),
+            )
+            .await
+            .expect("obliterate should succeed");
+
+        assert!(
+            fake.object(shared).is_some(),
+            "a sub-fragment referenced elsewhere must survive"
+        );
+        assert_eq!(fake.association_count(shared), 1);
+        assert_eq!(
+            fake.state_of(shared),
+            Some(FragmentState::Stored),
+            "the surviving sub-fragment must not be left marked"
+        );
+
+        assert!(fake.object(leaves[1]).is_none(), "unshared leaf remains");
+        assert!(fake.object(parent.hash).is_none(), "parent remains");
+    }
+
+    /// The parent's payload must still be readable when recursion runs, since that is where the
+    /// reference list comes from — it is deleted only after the sub-fragments are handled.
+    #[tokio::test]
+    async fn obliterate_reads_the_reference_list_before_deleting_the_parent() {
+        let fake = Fake::default();
+        let repository: Context = random();
+        let context: Context = random();
+        let leaves = [random::<Hash>()];
+
+        let store = store(&fake).await;
+        let parent = store_fragmented(&store, repository, context, &leaves).await;
+
+        store
+            .obliterate(
+                repository.into(),
+                parent,
+                Arc::new(StoreObliterateStats::default()),
+            )
+            .await
+            .expect("obliterate should succeed");
+
+        assert!(
+            fake.object(leaves[0]).is_none(),
+            "the reference list was not read, so the sub-fragment survived"
+        );
+    }
+
+    #[tokio::test]
+    async fn obliterate_removes_the_reference_and_the_payload() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect("put should succeed");
+
+        let stats = Arc::new(StoreObliterateStats::default());
+        store
+            .obliterate(repository.into(), address, stats.clone())
+            .await
+            .expect("obliterate should succeed");
+
+        assert_eq!(fake.association_count(address.hash), 0);
+        assert!(fake.object(address.hash).is_none());
+        assert_eq!(
+            fake.state_of(address.hash),
+            Some(FragmentState::Obliterated)
+        );
+        assert_eq!(stats.num_fragments.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn obliterate_keeps_the_payload_while_another_partition_references_it() {
+        let fake = Fake::default();
+        let hash: Hash = random();
+        let mine = Address {
+            hash,
+            context: random(),
+        };
+        let theirs = Address {
+            hash,
+            context: random(),
+        };
+        let repository: Context = random();
+        let other_repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(
+                repository.into(),
+                mine,
+                fragment,
+                Some(payload.clone()),
+                false,
+            )
+            .await
+            .expect("put should succeed");
+        store
+            .clone()
+            .put(
+                other_repository.into(),
+                theirs,
+                fragment,
+                Some(payload),
+                false,
+            )
+            .await
+            .expect("second put should succeed");
+
+        store
+            .obliterate(
+                repository.into(),
+                mine,
+                Arc::new(StoreObliterateStats::default()),
+            )
+            .await
+            .expect("obliterate should succeed");
+
+        assert_eq!(fake.association_count(hash), 1);
+        assert!(
+            fake.object(hash).is_some(),
+            "compliance only requires the obliterated partition's reference to be gone"
+        );
+        assert_eq!(
+            fake.state_of(hash),
+            Some(FragmentState::Stored),
+            "the mark must be released so the hash stays writable"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Failure paths
+    // ---------------------------------------------------------------------
+
+    /// A timeout means the answer is unknown, so the caller must be told to retry. Any other
+    /// `DynamoDB` failure means the hash could not be resolved, which reads as not found.
+    #[tokio::test]
+    async fn a_state_read_timeout_asks_the_caller_to_retry() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        fake.fail(Fault::StateReadTimeout);
+
+        let error = store(&fake)
+            .await
+            .put(
+                random::<Context>().into(),
+                address,
+                fragment,
+                Some(payload),
+                false,
+            )
+            .await
+            .expect_err("a timeout must not be reported as a definite answer");
+
+        assert!(error.is_slow_down(), "expected a retryable back-off");
+    }
+
+    #[tokio::test]
+    async fn a_throttled_state_read_asks_the_caller_to_retry() {
+        let fake = Fake::default();
+        fake.fail(Fault::StateRead);
+
+        let error = store(&fake)
+            .await
+            .load_state(random())
+            .await
+            .expect_err("throttling is not an answer");
+
+        assert!(error.is_slow_down(), "throttling must be retryable");
+    }
+
+    /// A failed read must never read as a miss. A caller told "not found" for a hash it references
+    /// treats the content as lost, which counts data loss and clears the state row — off a
+    /// `DynamoDB` error that says nothing about whether the content is there.
+    #[tokio::test]
+    async fn a_broken_state_read_is_an_error_not_a_miss() {
+        let fake = Fake::default();
+        fake.fail(Fault::StateReadBroken);
+
+        let error = store(&fake)
+            .await
+            .load_state(random())
+            .await
+            .expect_err("a broken read is not an empty table");
+
+        assert!(!error.is_address_not_found(), "must not read as a miss");
+        assert!(!error.is_slow_down(), "and is not retryable either");
+    }
+
+    /// The same rule on the fallback path, where the consequence is sharpest: this read only
+    /// happens for a hash a partition references, so a miss here is what triggers the repair.
+    #[tokio::test]
+    async fn a_failed_fragment_metadata_read_does_not_clear_the_state_row() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        preexisting_object(&fake, repository, address);
+
+        let store = migrated_store(&fake).await;
+        fake.fail(Fault::StateRead);
+
+        let error = store
+            .get(repository.into(), address, StoreMatch::MatchFull)
+            .await
+            .expect_err("the metadata read is throttled");
+
+        assert!(error.is_slow_down());
+        assert!(
+            fake.state_of(address.hash).is_some(),
+            "a throttle must not be mistaken for a lost payload and clear the row"
+        );
+    }
+
+    /// Two writers reviving the same tombstone both want the hash stored. The one that loses the
+    /// compare-and-set has already uploaded its bytes and got the state it wanted, so it must not
+    /// fail.
+    #[tokio::test]
+    async fn reviving_a_hash_another_writer_already_revived_succeeds() {
+        let fake = Fake::default();
+        let hash: Hash = random();
+
+        fake.set_state(hash, FragmentState::Stored);
+
+        store(&fake)
+            .await
+            .revive_state(hash)
+            .await
+            .expect("losing the revival race is not a failure");
+    }
+
+    #[tokio::test]
+    async fn reviving_a_hash_an_obliteration_retook_backs_off() {
+        let fake = Fake::default();
+        let hash: Hash = random();
+
+        fake.set_state(hash, FragmentState::Obliterating);
+
+        let error = store(&fake)
+            .await
+            .revive_state(hash)
+            .await
+            .expect_err("an obliteration holds the hash again");
+
+        assert!(error.is_slow_down(), "the mark is transient, so back off");
+    }
+
+    /// The upload and the state row survive an association failure, so a retry finishes the job
+    /// without re-uploading. Nothing is left that a later put would mistake for a complete write.
+    #[tokio::test]
+    async fn a_put_that_cannot_associate_leaves_the_payload_ready_for_a_retry() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        fake.fail(Fault::AssociationWrite);
+
+        store(&fake)
+            .await
+            .put(
+                repository.into(),
+                address,
+                fragment,
+                Some(payload.clone()),
+                false,
+            )
+            .await
+            .expect_err("the association write fails");
+
+        assert_eq!(fake.object(address.hash).unwrap().0, payload.as_ref());
+        assert_eq!(fake.state_of(address.hash), Some(FragmentState::Stored));
+        assert_eq!(fake.association_count(address.hash), 0);
+
+        let recovered = Fake::default();
+        recovered.set_state(address.hash, FragmentState::Stored);
+        recovered.put_object_without_metadata(address.hash, payload.as_ref());
+        store(&recovered)
+            .await
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect("a retry associates without re-uploading");
+        assert_eq!(recovered.association_count(address.hash), 1);
+    }
+
+    /// Compliance is discharged by the association delete. If the count that follows fails, the
+    /// obliteration reports failure and holds its mark — but the reference is already gone.
+    #[tokio::test]
+    async fn an_obliterate_that_cannot_count_references_still_removed_the_reference() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect("put should succeed");
+
+        fake.fail(Fault::AssociationCount);
+
+        store
+            .obliterate(
+                repository.into(),
+                address,
+                Arc::new(StoreObliterateStats::default()),
+            )
+            .await
+            .expect_err("counting references fails");
+
+        assert_eq!(
+            fake.association_count(address.hash),
+            0,
+            "the compliance obligation is discharged before anything that can fail after it"
+        );
+        assert_eq!(
+            fake.state_of(address.hash),
+            Some(FragmentState::Obliterating),
+            "the mark is held, which is the known crashed-obliteration gap"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_obliterate_that_cannot_delete_the_payload_does_not_tombstone_it() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect("put should succeed");
+
+        fake.fail(Fault::ObjectDelete);
+
+        store
+            .obliterate(
+                repository.into(),
+                address,
+                Arc::new(StoreObliterateStats::default()),
+            )
+            .await
+            .expect_err("deleting the payload fails");
+
+        assert!(
+            fake.object(address.hash).is_some(),
+            "the payload survives a failed delete"
+        );
+        assert_eq!(
+            fake.state_of(address.hash),
+            Some(FragmentState::Obliterating),
+            "it must not be tombstoned while its payload is still there"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_obliterate_that_cannot_list_versions_does_not_tombstone_the_payload() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect("put should succeed");
+
+        fake.fail(Fault::ObjectList);
+
+        store
+            .obliterate(
+                repository.into(),
+                address,
+                Arc::new(StoreObliterateStats::default()),
+            )
+            .await
+            .expect_err("listing versions fails");
+
+        assert_ne!(
+            fake.state_of(address.hash),
+            Some(FragmentState::Obliterated)
+        );
+    }
+
+    /// Recursion must not report success when a sub-fragment could not be obliterated, or the
+    /// parent would be tombstoned over content that is still referenced.
+    #[tokio::test]
+    async fn obliterate_fails_when_a_sub_fragment_fails() {
+        let fake = Fake::default();
+        let repository: Context = random();
+        let context: Context = random();
+        let leaves = [random::<Hash>(), random::<Hash>()];
+
+        let store = store(&fake).await;
+        let parent = store_fragmented(&store, repository, context, &leaves).await;
+
+        fake.fail(Fault::ObjectDelete);
+
+        store
+            .obliterate(
+                repository.into(),
+                parent,
+                Arc::new(StoreObliterateStats::default()),
+            )
+            .await
+            .expect_err("a sub-fragment failure must fail the parent");
+
+        assert_ne!(fake.state_of(parent.hash), Some(FragmentState::Obliterated));
+    }
+
+    /// The repair is best effort: failing to clear the row must not turn a not-found into an error,
+    /// because the caller's answer does not depend on the repair succeeding.
+    #[tokio::test]
+    async fn a_failed_repair_still_reports_the_lost_payload_as_not_found() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect("put should succeed");
+
+        fake.lose_object(address.hash);
+        fake.fail(Fault::StateDelete);
+
+        let error = store
+            .get(repository.into(), address, StoreMatch::MatchFull)
+            .await
+            .expect_err("the payload is gone");
+
+        assert!(error.is_address_not_found());
+        assert_eq!(
+            fake.state_of(address.hash),
+            Some(FragmentState::Stored),
+            "the row survives a failed repair, unchanged"
+        );
+    }
+
+    /// The probe saw nothing, the upload landed, and an obliteration took the hash in between. The
+    /// put must not associate, or it would restore a reference the obliteration is removing.
+    #[tokio::test]
+    async fn a_put_that_loses_the_hash_mid_upload_backs_off_without_associating() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        fake.obliterate_during_upload(address.hash, FragmentState::Obliterating);
+
+        let error = store(&fake)
+            .await
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect_err("an obliteration holds the hash by the time the put publishes");
+
+        assert!(
+            error.is_slow_down(),
+            "the mark is transient, so this is a back-off"
+        );
+        assert_eq!(
+            fake.association_count(address.hash),
+            0,
+            "no reference may be created while an obliteration holds the hash"
+        );
+        assert_eq!(
+            fake.state_of(address.hash),
+            Some(FragmentState::Obliterating),
+            "the put must not disturb the mark"
+        );
+    }
+
+    /// Racing a *completed* obliteration is different: the tombstone is not a lock, and re-upload
+    /// over one is allowed, so the put finishes and revives the hash.
+    #[tokio::test]
+    async fn a_put_that_lands_on_a_fresh_tombstone_revives_it() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        fake.obliterate_during_upload(address.hash, FragmentState::Obliterated);
+
+        store(&fake)
+            .await
+            .put(repository.into(), address, fragment, Some(payload), false)
+            .await
+            .expect("re-upload over a tombstone is allowed");
+
+        assert_eq!(fake.state_of(address.hash), Some(FragmentState::Stored));
+        assert_eq!(fake.association_count(address.hash), 1);
+    }
+
+    /// The drain exists so a put that had already passed its state probe can land its association
+    /// and be counted. Without the wait the count runs immediately, sees nothing, and the payload
+    /// is deleted underneath a partition that legitimately stored it.
+    #[tokio::test]
+    async fn the_drain_lets_an_in_flight_association_be_counted() {
+        let fake = Fake::default();
+        let hash: Hash = random();
+        let mine = Address {
+            hash,
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(repository.into(), mine, fragment, Some(payload), false)
+            .await
+            .expect("put should succeed");
+
+        let injector = fake.clone();
+        let racing_repository: Context = random();
+        let racing = Address {
+            hash,
+            context: random(),
+        };
+        let mut tasks = JoinSet::new();
+        lore_base::lore_spawn!(tasks, async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            injector.add_association(racing_repository, racing);
+        });
+
+        store
+            .obliterate(
+                repository.into(),
+                mine,
+                Arc::new(StoreObliterateStats::default()),
+            )
+            .await
+            .expect("obliterate should succeed");
+
+        while tasks.join_next().await.is_some() {}
+
+        assert!(
+            fake.object(hash).is_some(),
+            "an association that landed during the drain must keep the payload alive"
+        );
+        assert_eq!(fake.association_count(hash), 1);
+        assert_eq!(
+            fake.state_of(hash),
+            Some(FragmentState::Stored),
+            "the mark must be released so the surviving reference stays usable"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Surface that had coverage on main
+    // ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn copy_associates_the_destination_without_touching_the_payload() {
+        let fake = Fake::default();
+        let source = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(
+                repository.into(),
+                source,
+                fragment,
+                Some(payload.clone()),
+                false,
+            )
+            .await
+            .expect("put should succeed");
+
+        let destination_context: Context = random();
+        store
+            .copy(
+                repository.into(),
+                source,
+                repository.into(),
+                destination_context,
+                true,
             )
             .await
             .expect("copy should succeed");
+
+        assert_eq!(fake.association_count(source.hash), 2);
+        assert_eq!(
+            fake.object(source.hash).unwrap().0,
+            payload.as_ref(),
+            "copy must not rewrite the payload"
+        );
+        assert_eq!(fake.object_reads(), 0, "copy must not read S3");
+    }
+
+    #[tokio::test]
+    async fn copy_of_an_unknown_address_is_not_found() {
+        let fake = Fake::default();
+        let source = Address {
+            hash: random(),
+            context: random(),
+        };
+        let repository: Context = random();
+
+        store(&fake)
+            .await
+            .copy(
+                repository.into(),
+                source,
+                repository.into(),
+                random::<Context>(),
+                true,
+            )
+            .await
+            .expect_err("nothing to copy");
+
+        assert_eq!(fake.association_count(source.hash), 0);
+    }
+
+    /// A hash present in another context is not a full match, so it must not be copyable from this
+    /// one — the copy would otherwise fabricate a reference from a partial match.
+    #[tokio::test]
+    async fn copy_of_a_partial_match_is_not_found() {
+        let fake = Fake::default();
+        let hash: Hash = random();
+        let stored = Address {
+            hash,
+            context: random(),
+        };
+        let repository: Context = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(repository.into(), stored, fragment, Some(payload), false)
+            .await
+            .expect("put should succeed");
+
+        let other_context = Address {
+            hash,
+            context: random(),
+        };
+        store
+            .copy(
+                repository.into(),
+                other_context,
+                repository.into(),
+                random::<Context>(),
+                true,
+            )
+            .await
+            .expect_err("a different context is not a full match");
+
+        assert_eq!(fake.association_count(hash), 1);
+    }
+
+    #[tokio::test]
+    async fn exist_batch_reports_a_match_per_address_in_order() {
+        let fake = Fake::default();
+        let repository: Context = random();
+        let absent = Address {
+            hash: random(),
+            context: random(),
+        };
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        let mut stored = Vec::new();
+        for _ in 0..2 {
+            let address = Address {
+                hash: random(),
+                context: random(),
+            };
+            store
+                .clone()
+                .put(
+                    repository.into(),
+                    address,
+                    fragment,
+                    Some(payload.clone()),
+                    false,
+                )
+                .await
+                .expect("put should succeed");
+            stored.push(address);
+        }
+
+        let results = store
+            .exist_batch(
+                repository.into(),
+                &[stored[0], absent, stored[1]],
+                StoreMatch::MatchFull,
+            )
+            .await
+            .expect("exist_batch should succeed");
+
+        assert_eq!(
+            results,
+            vec![
+                StoreMatch::MatchFull,
+                StoreMatch::MatchNone,
+                StoreMatch::MatchFull
+            ],
+            "results must line up with the addresses given, misses included"
+        );
+    }
+
+    /// The corruption this design exists to make impossible.
+    ///
+    /// Writers race on one hash with different representations, each a valid encoding of the same
+    /// content. Under a model that stores the fragment separately from the bytes, an interleaving
+    /// can leave one writer's fragment describing another writer's payload. Here the fragment
+    /// travels on the object, so whichever upload lands last is the one that is read back — whole.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writers_cannot_tear_the_fragment_from_its_payload() {
+        const CONTENT_SIZE: u64 = 4096;
+
+        for _ in 0..64 {
+            let fake = Fake::default();
+            let hash: Hash = random();
+            let store = store(&fake).await;
+
+            let representations = [
+                representation(FragmentFlags::PayloadCompressedZstd, 64, CONTENT_SIZE),
+                representation(FragmentFlags::PayloadCompressedLZ4, 512, CONTENT_SIZE),
+                representation(FragmentFlags::PayloadCompressedOodle2, 1024, CONTENT_SIZE),
+                representation(FragmentFlags::PayloadFragmented, 2048, CONTENT_SIZE),
+            ];
+
+            let mut writers = JoinSet::new();
+            for (fragment, payload) in representations {
+                let store = store.clone();
+                let address = Address {
+                    hash,
+                    context: random(),
+                };
+                let repository: Context = random();
+
+                lore_base::lore_spawn!(writers, async move {
+                    store
+                        .put(repository.into(), address, fragment, Some(payload), false)
+                        .await
+                });
+            }
+
+            while let Some(result) = writers.join_next().await {
+                result
+                    .expect("writer task should not panic")
+                    .expect("every writer should succeed");
+            }
+
+            let (body, metadata) = fake.object(hash).expect("a payload must be stored");
+            let stored = from_object_metadata(Some(&metadata))
+                .expect("the stored object must carry a fragment");
+
+            assert_eq!(
+                stored.size_payload as usize,
+                body.len(),
+                "the fragment on the object must describe the bytes on that same object"
+            );
+            assert_eq!(stored.size_content, CONTENT_SIZE);
+            assert_eq!(
+                fake.state_of(hash),
+                Some(FragmentState::Stored),
+                "the state row must not be left mid-flight"
+            );
+            assert_eq!(
+                fake.association_count(hash),
+                4,
+                "every writer's partition must end up referencing the payload"
+            );
+
+            let expected_byte = (stored.flags & PAYLOAD_FLAGS) as u8;
+            assert!(
+                body.iter().all(|byte| *byte == expected_byte),
+                "the bytes must be the ones the winning writer uploaded, not a mix"
+            );
+        }
     }
 }

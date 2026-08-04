@@ -292,7 +292,7 @@ pub async fn store_raw(
     buffer: Bytes,
     cache_local: bool,
     remote_write: bool,
-) -> Result<(Address, Fragment), ImmutableError> {
+) -> Result<Address, ImmutableError> {
     store_raw_with_tracker(
         repository,
         address,
@@ -318,7 +318,7 @@ pub async fn store_raw_with_tracker(
     cache_local: bool,
     remote_write: bool,
     tracker: Option<Arc<lore_storage::write_tracker::WriteTracker>>,
-) -> Result<(Address, Fragment), ImmutableError> {
+) -> Result<Address, ImmutableError> {
     let session = if remote_write {
         Some(resolve_session(&repository))
     } else {
@@ -339,7 +339,7 @@ pub async fn store_raw_with_tracker(
     .await
     .forward::<ImmutableError>("storing fragment")?;
 
-    Ok((result.address, result.fragment))
+    Ok(result.address)
 }
 
 // ---------------------------------------------------------------------------
@@ -351,7 +351,7 @@ pub async fn write(
     context: Context,
     buffer: Bytes,
     flags: WriteOptions,
-) -> Result<(Address, Fragment), ImmutableError> {
+) -> Result<Address, ImmutableError> {
     write_with_tracker(repository, context, buffer, flags, None).await
 }
 
@@ -362,7 +362,7 @@ pub async fn write_with_tracker(
     buffer: Bytes,
     flags: WriteOptions,
     tracker: Option<Arc<lore_storage::write_tracker::WriteTracker>>,
-) -> Result<(Address, Fragment), ImmutableError> {
+) -> Result<Address, ImmutableError> {
     let session = if flags.remote_write {
         Some(resolve_session(&repository))
     } else {
@@ -382,12 +382,14 @@ pub async fn write_with_tracker(
     .forward("writing immutable content")
 }
 
+/// Write a file to the immutable store, returning its address and the size of the content that
+/// address stands for.
 pub async fn write_from_file(
     repository: Arc<RepositoryContext>,
     path: &Path,
     context: Context,
     flags: WriteOptions,
-) -> Result<(Address, Fragment), ImmutableError> {
+) -> Result<(Address, u64), ImmutableError> {
     write_from_file_with_tracker(repository, path, context, flags, None).await
 }
 
@@ -398,7 +400,7 @@ pub async fn write_from_file_with_tracker(
     context: Context,
     flags: WriteOptions,
     tracker: Option<Arc<lore_storage::write_tracker::WriteTracker>>,
-) -> Result<(Address, Fragment), ImmutableError> {
+) -> Result<(Address, u64), ImmutableError> {
     let session = if flags.remote_write {
         Some(resolve_session(&repository))
     } else {
@@ -742,7 +744,7 @@ pub trait WriteToImmutable: zerocopy::IntoBytes + zerocopy::Immutable + std::mar
         repository: Arc<RepositoryContext>,
         context: Context,
         flags: WriteOptions,
-    ) -> Result<(Address, Fragment), ImmutableError> {
+    ) -> Result<Address, ImmutableError> {
         let self_slice = self.as_bytes();
         // Unsafe extension of the lifetime of the self-as-buffer memory. Since
         // we await the task and no shared references of the buffer will be kept

@@ -161,6 +161,14 @@ mod tests {
 
     #[async_trait]
     impl lore_storage::ImmutableStore for TestStore<'static> {
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreQueryResult, StoreError> {
+            self.query(partition, address, StoreMatch::MatchFull).await
+        }
+
         async fn exist(
             self: Arc<Self>,
             _repository: Partition,
@@ -1037,6 +1045,14 @@ mod tests {
 
         #[async_trait]
         impl ImmutableStore for DelayStore {
+            async fn get_metadata(
+                self: Arc<Self>,
+                partition: Partition,
+                address: Address,
+            ) -> Result<StoreQueryResult, StoreError> {
+                self.query(partition, address, StoreMatch::MatchFull).await
+            }
+
             async fn is_available(self: Arc<Self>, _timeout: Duration) -> bool {
                 true
             }
@@ -1853,6 +1869,14 @@ mod tests {
 
         #[async_trait]
         impl ImmutableStore for CountingStore {
+            async fn get_metadata(
+                self: Arc<Self>,
+                partition: Partition,
+                address: Address,
+            ) -> Result<StoreQueryResult, StoreError> {
+                self.query(partition, address, StoreMatch::MatchFull).await
+            }
+
             async fn exist(
                 self: Arc<Self>,
                 partition: Partition,

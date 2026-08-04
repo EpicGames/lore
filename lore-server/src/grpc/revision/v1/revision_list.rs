@@ -1494,7 +1494,7 @@ mod test {
             let mut buffer = bytes::BytesMut::new();
             buffer.extend_from_slice(bogus_header.as_bytes());
             buffer.extend_from_slice([bogus_item].as_bytes());
-            let (address, _) = lore_revision::immutable::write(
+            let address = lore_revision::immutable::write(
                 repository_context.clone(),
                 lore_storage::Context::default(),
                 buffer.freeze(),
