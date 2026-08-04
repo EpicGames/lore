@@ -341,7 +341,6 @@ Clone a remote repository into the given path
 * `--bare` — Clone without files, only fetch latest revision tree
 * `--virtual` — Clone virtually using split-write filesystem
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into place
-* `--direct-file-io` — Use direct file I/O instead of memory mapping files
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
 * `--prefetch <file>` — File containing list of files to prefetch
@@ -2235,7 +2234,6 @@ Clone a remote repository into the given path
 * `--bare` — Clone without files, only fetch latest revision tree
 * `--virtual` — Clone virtually using split-write filesystem
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into place
-* `--direct-file-io` — Use direct file I/O instead of memory mapping files
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
 * `--prefetch <file>` — File containing list of files to prefetch

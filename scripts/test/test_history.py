@@ -34,7 +34,7 @@ def test_history(new_lore_repo):
     # Push changes
     repo.push()
     # Clone repository
-    clone = repo.clone(direct_file_io=True)
+    clone = repo.clone()
 
     # Add some more revisions
     for i in range(5):

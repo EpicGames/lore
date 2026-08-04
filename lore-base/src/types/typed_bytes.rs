@@ -110,10 +110,16 @@ pub trait TypedBytesMut {
     where
         T: zerocopy::IntoBytes;
 
+    /// Reinterprets the buffer's whole capacity as a slice of `T`.
+    ///
+    /// Empty when the capacity holds no whole `T`: a zero-length slice still needs an aligned
+    /// pointer, and an unallocated buffer has only a dangling one. Past that, alignment is the
+    /// allocator's, asserted in debug builds.
     fn as_type_slice<T>(&self) -> &[T]
     where
         T: zerocopy::IntoBytes;
 
+    /// Mutable [`TypedBytesMut::as_type_slice`], with the same empty and alignment rules.
     fn as_type_slice_mut<T>(&mut self) -> &mut [T]
     where
         T: zerocopy::IntoBytes;
@@ -154,22 +160,25 @@ impl TypedBytesMut for bytes::BytesMut {
     where
         T: zerocopy::IntoBytes,
     {
-        unsafe {
-            std::slice::from_raw_parts(
-                self.as_ptr() as *mut T,
-                self.capacity() / std::mem::size_of::<T>(),
-            )
+        let count = self.capacity() / std::mem::size_of::<T>();
+        if count == 0 {
+            return &[];
         }
+        let ptr = self.as_ptr().cast::<T>();
+        debug_assert!(ptr.is_aligned(), "BytesMut buffer is not aligned for type");
+        unsafe { std::slice::from_raw_parts(ptr, count) }
     }
+
     fn as_type_slice_mut<T>(&mut self) -> &mut [T]
     where
         T: zerocopy::IntoBytes,
     {
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.as_mut_ptr().cast::<T>(),
-                self.capacity() / std::mem::size_of::<T>(),
-            )
+        let count = self.capacity() / std::mem::size_of::<T>();
+        if count == 0 {
+            return &mut [];
         }
+        let ptr = self.as_mut_ptr().cast::<T>();
+        debug_assert!(ptr.is_aligned(), "BytesMut buffer is not aligned for type");
+        unsafe { std::slice::from_raw_parts_mut(ptr, count) }
     }
 }

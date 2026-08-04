@@ -1772,9 +1772,11 @@ impl NodeDelta {
     pub fn from_node_change(change: NodeChange) -> Self {
         let node = match change.action {
             FileAction::Delete => change.from.node,
-            FileAction::Add | FileAction::Move | FileAction::Copy | FileAction::Keep => {
-                change.to.node
-            }
+            FileAction::Add
+            | FileAction::Move
+            | FileAction::Copy
+            | FileAction::Graft
+            | FileAction::Keep => change.to.node,
         };
         NodeDelta {
             node,

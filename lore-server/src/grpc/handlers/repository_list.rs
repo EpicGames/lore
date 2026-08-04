@@ -3,6 +3,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Context;
 use lore_proto::RepositoryListRequest;
@@ -63,7 +64,8 @@ pub async fn handler(
                 let mut meta_tasks = JoinSet::new();
                 for id in authorized_repositories {
                     let repository = Arc::new(repository.to_server_context(id.into()));
-                    meta_tasks.spawn(
+                    lore_spawn!(
+                        meta_tasks,
                         LORE_CONTEXT
                             .scope(execution_context(), async move {
                                 (id, repository::metadata_hash(repository).await)
@@ -82,7 +84,8 @@ pub async fn handler(
                 let mut meta_tasks = JoinSet::new();
                 while let Some(id) = repository_list.next().await {
                     let repository = Arc::new(repository.to_server_context(id.into()));
-                    meta_tasks.spawn(
+                    lore_spawn!(
+                        meta_tasks,
                         LORE_CONTEXT
                             .scope(execution_context(), async move {
                                 (id, repository::metadata_hash(repository).await)

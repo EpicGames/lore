@@ -11,7 +11,7 @@ use lore_base::error::NotFound;
 use lore_base::error::SlowDown;
 use lore_base::lore_debug;
 use lore_base::lore_error;
-use lore_base::lore_spawn;
+use lore_base::lore_spawn_net;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Fragment;
@@ -530,7 +530,7 @@ impl StorageService {
         };
 
         let ctx = ctx.clone();
-        lore_spawn!({
+        lore_spawn_net!({
             async move {
                 let mut req = tonic::Request::new(request_stream);
                 inject_metadata(&mut req, &ctx);
@@ -634,7 +634,7 @@ impl StorageService {
         };
 
         let ctx = ctx.clone();
-        lore_spawn!(async move {
+        lore_spawn_net!(async move {
             let mut req = tonic::Request::new(request);
             inject_metadata(&mut req, &ctx);
 
@@ -726,7 +726,7 @@ impl StorageService {
         };
 
         let ctx = ctx.clone();
-        lore_spawn!(async move {
+        lore_spawn_net!(async move {
             let mut req = tonic::Request::new(request);
             inject_metadata(&mut req, &ctx);
 
@@ -833,7 +833,7 @@ impl StorageService {
         let request = request_stream;
 
         let ctx = ctx.clone();
-        lore_spawn!({
+        lore_spawn_net!({
             async move {
                 let mut req = tonic::Request::new(request);
                 inject_metadata(&mut req, &ctx);

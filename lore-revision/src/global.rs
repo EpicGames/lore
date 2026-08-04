@@ -6,13 +6,13 @@ use std::path::PathBuf;
 
 use lore_base::directories::project_directory;
 use lore_base::fs::lock::FSLock;
+use lore_base::lore_spawn_blocking;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
-use tokio::task::spawn_blocking;
 
 use crate::util;
 use crate::util::url::normalize_remote_url;
@@ -190,7 +190,9 @@ pub async fn load_config_with_lock<ConfigType: Default + Serialize + for<'a> Des
     path: impl AsRef<Path> + Copy,
 ) -> Result<(ConfigType, FSLock), LoadConfigError> {
     let path_buf = path.as_ref().to_owned();
-    let lock = spawn_blocking(|| {
+    // Pin to core: a bare `spawn_blocking` follows the current runtime, and an
+    // untimed flock on net would occupy its single blocking thread.
+    let lock = lore_spawn_blocking!(|| {
         FSLock::acquire_file_lock(path_buf)
             .map_err(|err| LoadConfigError::internal(format!("Failed acquiring lock {err}")))
     })

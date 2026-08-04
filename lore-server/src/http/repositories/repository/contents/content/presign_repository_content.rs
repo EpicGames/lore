@@ -10,6 +10,7 @@ use axum::Json;
 use axum::extract::Path;
 use axum::extract::State;
 use axum::http::HeaderMap;
+use axum::http::HeaderValue;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use hex::FromHexError;
@@ -42,6 +43,10 @@ pub enum PresignError {
     NotConfigured,
     #[error("Only service accounts may vend presigned URLs")]
     NotServiceAccount,
+    #[error("content_type is not allowed: {0}")]
+    DisallowedContentType(String),
+    #[error("header value is not valid: {0}")]
+    InvalidHeaderValue(String),
     #[error("Content not found")]
     NotFound,
     #[error("Store error checking content existence")]
@@ -53,9 +58,10 @@ pub enum PresignError {
 impl IntoResponse for PresignError {
     fn into_response(self) -> axum::response::Response {
         let (status, msg) = match &self {
-            PresignError::ParseRepository(_) | PresignError::ParseAddress(_) => {
-                (StatusCode::BAD_REQUEST, self.to_string())
-            }
+            PresignError::ParseRepository(_)
+            | PresignError::ParseAddress(_)
+            | PresignError::DisallowedContentType(_)
+            | PresignError::InvalidHeaderValue(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             PresignError::NotConfigured => (
                 StatusCode::NOT_FOUND,
                 "presigned URL feature is not enabled".to_string(),
@@ -128,6 +134,32 @@ pub async fn handler(
     let parsed_address = address
         .parse::<Address>()
         .map_err(PresignError::ParseAddress)?;
+
+    // Fast-feedback rejection; redeem also enforces the allowlist for
+    // already issued tokens.
+    if let Some(content_type) = body.content_type.as_deref()
+        && !presign_config
+            .content_type_allowlist
+            .is_allowed(content_type)
+    {
+        return Err(PresignError::DisallowedContentType(
+            content_type.to_string(),
+        ));
+    }
+
+    // Reject values redeem could not serialize into a response header, so a
+    // token mint accepts is always one redeem can serve.
+    for value in [
+        &body.content_type,
+        &body.content_encoding,
+        &body.content_disposition,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        HeaderValue::from_str(value)
+            .map_err(|_err| PresignError::InvalidHeaderValue(value.clone()))?;
+    }
 
     let correlation_id = headers
         .get(CORRELATION_ID_HEADER)
@@ -256,16 +288,19 @@ mod tests {
             min_ttl_seconds: 1,
             default_ttl_seconds: 3600,
             max_ttl_seconds: 86400,
+            content_type_allowlist: crate::http::security_headers::ContentTypeAllowlist::default(),
         }
     }
 
-    #[tokio::test]
-    async fn returns_404_when_address_not_found() {
+    /// Posts `body` to the mint endpoint against a fresh store; the address does
+    /// not exist, so requests that pass validation reach the existence check.
+    async fn mint(body: serde_json::Value) -> axum_test::TestResponse {
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
         LORE_CONTEXT
             .scope(execution, async move {
                 let repository = random::<lore_revision::lore::RepositoryId>();
+                let repo_hex = format!("{repository}");
                 let address = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff-ffffffffffffffffffffffffffffffff";
 
                 let test_health = ServerHealth::new_without_availability(immutable_store.clone());
@@ -276,18 +311,35 @@ mod tests {
                     max_file_size: 100,
                     presign_config: Some(test_presign_config()),
                 };
-                let repo_hex = format!("{repository}");
                 let settings = LoreHttpServerSettings::default();
-                let app = create_router(state, test_health, &settings);
-                let server = TestServer::new(app).unwrap();
+                let server =
+                    TestServer::new(create_router(state, test_health, &settings)).unwrap();
 
-                let response = server
+                server
                     .post(&format!("/v1/repository/{repo_hex}/content/{address}/presign"))
-                    .json(&json!({"ttl_seconds": 3600}))
-                    .await;
-
-                assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+                    .json(&body)
+                    .await
             })
-            .await;
+            .await
+    }
+
+    #[tokio::test]
+    async fn returns_404_when_address_not_found() {
+        let response = mint(json!({"ttl_seconds": 3600})).await;
+        assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn returns_400_for_disallowed_content_type() {
+        let response = mint(json!({"content_type": "text/html"})).await;
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn returns_400_for_unserializable_header_value() {
+        // Allowlisted media type, but a control char in the parameter makes it
+        // an invalid header value; mint must reject rather than let redeem 500.
+        let response = mint(json!({"content_type": "image/png; x=\u{7}"})).await;
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
     }
 }

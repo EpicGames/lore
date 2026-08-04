@@ -85,6 +85,20 @@ pub trait InstrumentProvider {
         self.meter()
             .u64_histogram(self.scope_name(name))
             .with_unit("bytes")
+            .with_boundaries(vec![
+                64.,      // 64 B
+                256.,     // 256 B
+                512.,     // 512 B
+                1_024.,   // 1 KiB
+                2_048.,   // 2 KiB
+                4_096.,   // 4 KiB
+                8_192.,   // 8 KiB
+                16_384.,  // 16 KiB
+                32_768.,  // 32 KiB
+                65_536.,  // 64 KiB
+                131_072., // 128 KiB
+                262_144., // 256 KiB - Fragment Size
+            ])
             .build()
     }
 

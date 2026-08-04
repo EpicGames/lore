@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
 
+# Runs the test suite on GitHub-hosted runners. This workflow needs no secrets:
+# it checks the source out from git and starts the integration test services
+# from public container images.
 name: PR Validate
 
 on:
@@ -13,17 +16,222 @@ concurrency:
   group: pr-validate-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
 jobs:
-  validate:
-    name: validate
-    runs-on: ubuntu-latest
+  # Runs `cargo test` for the workspace. A cargo feature gates the integration
+  # tests, so they do not run here.
+  unit:
+    name: unit (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
     permissions:
-      contents: read # Check out the PR head to validate it
+      contents: read # Check out the PR head to test it
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-latest }
+          # TODO: re-enable. `cargo test --workspace` links every test binary
+          # with embedded DWARF, because .cargo/config.toml sets
+          # split-debuginfo=off for aarch64-unknown-linux-gnu. The linker
+          # exhausts the 16 GB arm64 runner, which kills the job before any test
+          # runs. Setting split-debuginfo=packed for that target, or building the
+          # tests with line tables only, lowers the linker's peak memory.
+          # - { name: linux-aarch64, os: ubuntu-24.04-arm }
+          # TODO: re-enable. Only linux-x86_64 runs while this workflow is still
+          # being changed.
+          # - { name: macos-aarch64, os: macos-latest }
+          # - { name: windows-x86_64, os: windows-latest }
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           persist-credentials: false
 
-      # TODO: add validation steps.
-      - name: Validate
-        run: echo "pr-validate stub — no checks yet"
+      - uses: dtolnay/rust-toolchain@stable
+
+      # `cargo test --workspace` builds a debug test binary for every crate with
+      # embedded DWARF, which does not fit on the runner's root filesystem. The
+      # Linux runners carry a larger volume at /mnt, so build there. This step
+      # runs before rust-cache so the cache uses this target directory. The
+      # macOS and Windows runners have no /mnt and build in the workspace.
+      - name: Build on the larger /mnt volume
+        if: runner.os == 'Linux'
+        run: |
+          sudo mkdir -p /mnt/cargo-target
+          sudo chown -R "$(id -u):$(id -g)" /mnt/cargo-target
+          echo "CARGO_TARGET_DIR=/mnt/cargo-target" >> "$GITHUB_ENV"
+          df -h / /mnt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: unit-${{ matrix.name }}
+
+      - name: cargo test
+        run: cargo test --workspace --verbose
+
+  # Runs the integration tests against the MinIO, DynamoDB Local, and Consul
+  # services that Docker Compose starts. Only the Linux runners provide Docker.
+  # The tests connect to 127.0.0.1 on ports 9000, 9090, and 8500, which the
+  # compose file maps.
+  integration:
+    name: integration (linux-x86_64)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # Check out the PR head to test it
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Build on /mnt. See the unit job for the reason.
+      - name: Build on the larger /mnt volume
+        run: |
+          sudo mkdir -p /mnt/cargo-target
+          sudo chown -R "$(id -u):$(id -g)" /mnt/cargo-target
+          echo "CARGO_TARGET_DIR=/mnt/cargo-target" >> "$GITHUB_ENV"
+          df -h / /mnt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: integration
+
+      - name: Start backing services (MinIO, DynamoDB Local, Consul)
+        run: docker compose --file lore-integration-tests/compose.yaml up --detach
+
+      - name: Wait for services to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:9000/minio/health/ready \
+               && curl -sf http://127.0.0.1:8500/v1/status/leader \
+               && curl -s -o /dev/null http://127.0.0.1:9090; then
+              echo "services ready"
+              exit 0
+            fi
+            echo "waiting for services (attempt $i)..."
+            sleep 2
+          done
+          echo "services did not become ready in time"
+          exit 1
+
+      - name: cargo test (integration)
+        env:
+          AWS_ACCESS_KEY_ID: lorelocal
+          AWS_SECRET_ACCESS_KEY: lorelocal
+          AWS_REGION: us-east-1
+        run: >
+          cargo test --package lore-integration-tests
+          --features integration_tests --verbose
+
+      - name: Dump service logs on failure
+        if: failure()
+        run: docker compose --file lore-integration-tests/compose.yaml logs
+
+      - name: Stop services
+        if: always()
+        run: docker compose --file lore-integration-tests/compose.yaml down --volumes
+
+  # Runs the tests in scripts/test that carry the `smoke` marker, through uv,
+  # against release binaries built here. The server build enables
+  # failure_generator so the fault injection tests run instead of skipping.
+  smoke:
+    name: smoke (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read # Check out the PR head to test it
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # basetemp-arg puts the pytest working data on the tmpfs that the
+          # "Grow /dev/shm" step below resizes.
+          - { name: linux-x86_64, os: ubuntu-latest, basetemp-arg: "--basetemp=/dev/shm/lore-smoke" }
+          # TODO: re-enable. Only linux-x86_64 runs while this workflow is still
+          # being changed.
+          # - { name: linux-aarch64, os: ubuntu-24.04-arm, basetemp-arg: "--basetemp=/dev/shm/lore-smoke" }
+          # - { name: macos-aarch64, os: macos-latest }
+          # Windows needs explicit loopback ports for the local remote server.
+          # - name: windows-x86_64
+          #   os: windows-latest
+          #   extra-args: >-
+          #     --lore-remote-http-port 41339
+          #     --lore-remote-quic-port 41338
+          #     --lore-remote-grpc-port 41338
+          #     --lore-remote-internal-port 41340
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Build on /mnt. See the unit job for the reason. conftest resolves the
+      # `release` binary keyword to <cwd>/target/release, which stays empty when
+      # CARGO_TARGET_DIR points elsewhere, so name the binaries directly.
+      # LORE_EXECUTABLE_PATH and LORE_SERVER_EXECUTABLE_PATH take precedence
+      # over the --lore-*-binary flags below.
+      - name: Build on the larger /mnt volume
+        if: runner.os == 'Linux'
+        run: |
+          sudo mkdir -p /mnt/cargo-target
+          sudo chown -R "$(id -u):$(id -g)" /mnt/cargo-target
+          {
+            echo "CARGO_TARGET_DIR=/mnt/cargo-target"
+            echo "LORE_EXECUTABLE_PATH=/mnt/cargo-target/release/lore"
+            echo "LORE_SERVER_EXECUTABLE_PATH=/mnt/cargo-target/release/loreserver"
+          } >> "$GITHUB_ENV"
+          df -h / /mnt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: smoke-${{ matrix.name }}
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Build lore and loreserver (release)
+        run: >
+          cargo build --release
+          --package lore-client --package lore-server
+          --features lore-server/failure_generator
+          --bin lore --bin loreserver
+
+      # The suite writes about 10 GB of server stores and per-test repositories,
+      # and pytest keeps all of it for the session. Holding that on tmpfs instead
+      # of the runner disk speeds up these I/O-bound tests. /dev/shm defaults to
+      # 8 GB, which the suite exceeds, so raise it to 12 GB. The runners have
+      # 16 GB of RAM, and tmpfs only uses RAM for the data written to it.
+      - name: Grow /dev/shm for smoke test data (tmpfs)
+        if: runner.os == 'Linux'
+        run: sudo mount -o remount,size=12G /dev/shm
+
+      # `uv run` installs the test dependencies from uv.lock.
+      - name: Smoke tests
+        run: >
+          uv run pytest scripts/test -m smoke -n 4
+          --lore-client-binary release
+          --lore-server-binary release
+          ${{ matrix.basetemp-arg }}
+
+  # Reports one result for the jobs above so branch protection can require a
+  # single check.
+  pr-validate:
+    name: PR Validate
+    if: ${{ always() }}
+    needs: [unit, integration, smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify all validation jobs passed
+        run: |
+          echo "unit=${{ needs.unit.result }}"
+          echo "integration=${{ needs.integration.result }}"
+          echo "smoke=${{ needs.smoke.result }}"
+          if [ "${{ needs.unit.result }}" != "success" ] \
+             || [ "${{ needs.integration.result }}" != "success" ] \
+             || [ "${{ needs.smoke.result }}" != "success" ]; then
+            echo "One or more validation jobs failed."
+            exit 1
+          fi
+          echo "All validation jobs passed."

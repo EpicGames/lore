@@ -3,6 +3,7 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
+use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Context;
 use lore_proto::lore::repository::v1::RepositoryListRequest;
@@ -76,7 +77,7 @@ pub async fn handler(
 
     let (tx, rx) = mpsc::channel::<Result<RepositoryListResponse, Status>>(16);
 
-    tokio::spawn(
+    lore_spawn!(
         LORE_CONTEXT
             .scope(execution, async move {
                 let mut tasks: JoinSet<()> = JoinSet::new();
@@ -85,7 +86,8 @@ pub async fn handler(
                     let mutable_store = mutable_store.clone();
                     let creator_filter = creator_filter.clone();
                     let tx = tx.clone();
-                    tasks.spawn(
+                    lore_spawn!(
+                        tasks,
                         LORE_CONTEXT
                             .scope(execution_context(), async move {
                                 let item = load_and_filter_repository(

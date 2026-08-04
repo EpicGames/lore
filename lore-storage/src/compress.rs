@@ -253,7 +253,7 @@ fn compress_scratch_buffer() -> BytesMut {
         return buffer;
     }
 
-    let limit = *SCRATCH_BUFFER_LIMIT.get_or_init(lore_base::runtime::compute_pool_thread_count);
+    let limit = *SCRATCH_BUFFER_LIMIT.get_or_init(lore_base::runtime::default_worker_threads);
     let current = COMPRESS_SCRATCH_BUFFER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
     if current < limit {
         let current =
@@ -288,7 +288,7 @@ fn decompress_scratch_buffer() -> BytesMut {
         return buffer;
     }
 
-    let limit = *SCRATCH_BUFFER_LIMIT.get_or_init(lore_base::runtime::compute_pool_thread_count);
+    let limit = *SCRATCH_BUFFER_LIMIT.get_or_init(lore_base::runtime::default_worker_threads);
     let current = DECOMPRESS_SCRATCH_BUFFER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
     if current < limit {
         let current =
@@ -394,10 +394,11 @@ static ZSTD_DECOMPRESS_CTX_QUEUE: OnceLock<crossbeam::queue::ArrayQueue<ZstdDCtx
     OnceLock::new();
 
 fn zstd_compress_ctx_queue() -> &'static crossbeam::queue::ArrayQueue<ZstdCCtx> {
-    // Queue capacity = thread count. Push is atomic — overflow contexts from bursts
-    // fail to push and drop immediately, so the pool can't grow beyond thread count.
+    // Compression runs inline on tokio workers, so queue capacity = worker
+    // count. Push is atomic — overflow contexts from bursts fail to push and
+    // drop immediately, so the pool can't grow beyond the worker count.
     ZSTD_COMPRESS_CTX_QUEUE.get_or_init(|| {
-        crossbeam::queue::ArrayQueue::new(lore_base::runtime::compute_pool_thread_count())
+        crossbeam::queue::ArrayQueue::new(lore_base::runtime::default_worker_threads())
     })
 }
 
@@ -421,7 +422,7 @@ fn zstd_compress_ctx_done(ctx: ZstdCCtx) {
 
 fn zstd_decompress_ctx_queue() -> &'static crossbeam::queue::ArrayQueue<ZstdDCtx> {
     ZSTD_DECOMPRESS_CTX_QUEUE.get_or_init(|| {
-        crossbeam::queue::ArrayQueue::new(lore_base::runtime::compute_pool_thread_count())
+        crossbeam::queue::ArrayQueue::new(lore_base::runtime::default_worker_threads())
     })
 }
 
@@ -441,11 +442,6 @@ fn zstd_decompress_ctx_done(ctx: ZstdDCtx) {
     let _ = queue.push(ctx);
 }
 
-mod pool;
-
-pub use pool::compress_async;
-pub use pool::decompress_async;
-
 pub fn decompress(
     fragment: Fragment,
     compressed: &[u8],
@@ -458,10 +454,6 @@ pub fn decompress(
 /// buffer's capacity must be at least `fragment.size_content` bytes;
 /// callers that do not want to size the buffer themselves should use
 /// [`decompress`] which allocates it.
-///
-/// Separated from `decompress` so async callers can allocate the output
-/// buffer on the tokio worker thread before dispatching work to a rayon
-/// compute worker, keeping large allocations on the producer's heap.
 fn decompress_into(
     fragment: Fragment,
     compressed: &[u8],
@@ -735,8 +727,7 @@ fn compression_level() -> u32 {
 }
 
 /// Returns the maximum compressed size for the given payload length and
-/// compression mode. Used to pre-allocate an output buffer on the caller's
-/// thread so large allocations stay off the compute-worker heap.
+/// compression mode. Used to pre-allocate the output buffer for [`compress`].
 ///
 /// Returns 0 for modes that will refuse to compress (`NoCompression`;
 /// `Oodle` without the oodle feature). In those cases the compress call
@@ -780,10 +771,6 @@ pub fn compress(
 /// capacity must be at least `compress_bound(fragment.size_payload, mode)`;
 /// callers that do not know the correct bound should use [`compress`] which
 /// sizes the buffer itself.
-///
-/// Separated from `compress` so async callers can allocate the output
-/// buffer on the tokio worker thread before dispatching work to a rayon
-/// compute worker, keeping large allocations on the producer's heap.
 fn compress_into(
     fragment: Fragment,
     payload: &[u8],

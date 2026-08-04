@@ -100,7 +100,6 @@ pub fn read_options_from_repository(repository: &RepositoryContext) -> ReadOptio
     ReadOptions {
         cache: !repository.disable_cache(),
         direct_write: repository.direct_file_write(),
-        direct_file_io: repository.direct_file_io(),
         sync_data,
         ..Default::default()
     }

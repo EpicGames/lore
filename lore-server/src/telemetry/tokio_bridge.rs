@@ -7,6 +7,8 @@ use opentelemetry::metrics::Gauge;
 use opentelemetry::metrics::Histogram;
 use opentelemetry::metrics::Meter;
 #[cfg(tokio_unstable)]
+use tokio::runtime::Handle;
+#[cfg(tokio_unstable)]
 use tokio_metrics::RuntimeMetrics;
 use tokio_metrics::TaskMetrics;
 use tracing::trace;
@@ -18,8 +20,20 @@ use tracing::trace;
 /// - Task scheduling metrics
 /// - Queue depths
 /// - I/O driver statistics
+///
+/// One instance monitors one runtime. Lore runs two — core and net — so every
+/// metric is tagged with the `labels` this bridge was built with (`runtime=core`
+/// or `runtime=net`) and the instrument names are shared between them. A query
+/// that does not filter on `runtime` therefore aggregates both.
 #[cfg(tokio_unstable)]
 pub struct OtelTokioRuntimeMetrics {
+    labels: Vec<KeyValue>,
+
+    /// Handle to the runtime this bridge monitors, for the metrics reachable only
+    /// through it. Held rather than taken from `Handle::current()`, which yields
+    /// whichever runtime the recording task runs on.
+    handle: Handle,
+
     budget_forced_yield_count: Gauge<u64>,
     elapsed: Histogram<u64>,
     io_driver_ready_count: Gauge<u64>,
@@ -62,8 +76,10 @@ pub struct OtelTokioRuntimeMetrics {
 
 #[cfg(tokio_unstable)]
 impl OtelTokioRuntimeMetrics {
-    pub fn new(meter: &Meter) -> Self {
+    pub fn new(meter: &Meter, handle: Handle, labels: Vec<KeyValue>) -> Self {
         Self {
+            labels,
+            handle,
             budget_forced_yield_count: meter.u64_gauge("budget_forced_yield_count").build(),
             elapsed: meter.u64_histogram("elapsed").build(),
             io_driver_ready_count: meter.u64_gauge("io_driver_ready_count").build(),
@@ -114,7 +130,7 @@ impl OtelTokioRuntimeMetrics {
                     stringify!($field),
                     data
                 );
-                self.$field.record(data, &[]);
+                self.$field.record(data, &self.labels);
             }};
             ( $field:ident, "float gauge" ) => {{
                 let data = metrics.$field();
@@ -123,7 +139,7 @@ impl OtelTokioRuntimeMetrics {
                     stringify!($field),
                     data
                 );
-                self.$field.record(data, &[]);
+                self.$field.record(data, &self.labels);
             }};
             ( $field:ident, "histogram" ) => {{
                 let data = metrics.$field.as_millis() as u64;
@@ -132,7 +148,7 @@ impl OtelTokioRuntimeMetrics {
                     stringify!($field),
                     data
                 );
-                self.$field.record(data, &[])
+                self.$field.record(data, &self.labels)
             }};
         }
 
@@ -171,18 +187,16 @@ impl OtelTokioRuntimeMetrics {
         record!(mean_polls_per_park, "float gauge");
         record!(busy_ratio, "float gauge");
 
-        // There are a few metrics exposed by directly from the runtime handle that aren't exposed
-        // above.
-        let m = tokio::runtime::Handle::current().metrics();
+        let m = self.handle.metrics();
 
         self.num_active_tasks
-            .record(m.num_alive_tasks() as u64, &[]);
+            .record(m.num_alive_tasks() as u64, &self.labels);
         self.num_blocking_threads
-            .record(m.num_blocking_threads() as u64, &[]);
+            .record(m.num_blocking_threads() as u64, &self.labels);
         self.num_idle_blocking_threads
-            .record(m.num_idle_blocking_threads() as u64, &[]);
+            .record(m.num_idle_blocking_threads() as u64, &self.labels);
         self.spawned_tasks_count
-            .record(m.spawned_tasks_count(), &[]);
+            .record(m.spawned_tasks_count(), &self.labels);
     }
 }
 

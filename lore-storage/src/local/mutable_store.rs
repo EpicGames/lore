@@ -65,6 +65,9 @@ pub struct MutableStoreSettings {
     pub initial_fan_out_level: usize,
     /// Per-bucket entry threshold that triggers fan-out at the next serialize. Default is `1000`.
     pub fan_out_threshold: usize,
+    /// Source of truth (server) rather than a cache. When `true`, a corrupt bucket is a hard
+    /// error; when `false`, it is reset to empty since its entries repopulate on next sync.
+    pub authoritative: bool,
 }
 
 impl Default for MutableStoreSettings {
@@ -73,6 +76,7 @@ impl Default for MutableStoreSettings {
             flush_delay_seconds: DEFAULT_FLUSH_DELAY_SECONDS,
             initial_fan_out_level: 1,
             fan_out_threshold: crate::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
+            authoritative: false,
         }
     }
 }
@@ -176,6 +180,7 @@ pub struct LocalMutableStore {
     pub group: Vec<Arc<MutableStoreGroup>>,
     pub flush_delay_seconds: u64,
     pub needs_upgrade: AtomicBool,
+    pub authoritative: bool,
 
     // This field must be dropped last so it must be declared last
     #[allow(dead_code)]
@@ -220,6 +225,7 @@ enum DeserializeFileError {
 impl MutableStoreBucket {
     fn deserialize_files(
         path: PathBuf,
+        authoritative: bool,
     ) -> Result<
         (
             GrowVec<u32, CHUNK_SIZE_U32>,
@@ -248,7 +254,6 @@ impl MutableStoreBucket {
             }
         };
 
-        // Reset a corrupt bucket to empty rather than failing the whole store open.
         match Self::deserialize_files_parse(&mut file, latest_version) {
             Ok(result) => Ok(result),
             Err(DeserializeFileError::FutureVersion(_version)) => {
@@ -258,6 +263,13 @@ impl MutableStoreBucket {
                     ),
                     "Failed to deserialize storage bucket",
                 ))
+            }
+            // Authoritative store: the bucket is the only copy, so fail loud and keep the file.
+            Err(DeserializeFileError::Corrupt(reason)) if authoritative => {
+                Err(LocalMutableStoreError::internal(format!(
+                    "corrupt mutable store bucket {}: {reason}",
+                    path.display()
+                )))
             }
             Err(DeserializeFileError::Corrupt(reason)) => {
                 Self::recover_corrupt_bucket(&path, reason, latest_version)
@@ -351,6 +363,7 @@ impl MutableStoreBucket {
         group_index: usize,
         bucket_index: usize,
         _epoch_reset: bool,
+        authoritative: bool,
     ) -> Result<(), LocalMutableStoreError> {
         if self.deserialized {
             return Ok(());
@@ -366,7 +379,7 @@ impl MutableStoreBucket {
         let path = format_bucket_path(path, group_index, bucket_index);
 
         let (sorted_index, entry, version) =
-            lore_base::lore_spawn_blocking!(move || Self::deserialize_files(path))
+            lore_base::lore_spawn_blocking!(move || Self::deserialize_files(path, authoritative))
                 .await
                 .map_err(|err| {
                     LocalMutableStoreError::internal_with_context(
@@ -691,6 +704,7 @@ impl LocalMutableStore {
         _immutable_store: Arc<dyn ImmutableStore>,
     ) -> Result<Self, LocalMutableStoreError> {
         let flush_delay_seconds = settings.flush_delay_seconds;
+        let authoritative = settings.authoritative;
         let mutable_path = path.as_ref().map(|path| {
             let mut path = path.as_ref().to_path_buf();
             path.push("mutable");
@@ -860,6 +874,7 @@ impl LocalMutableStore {
             group: Vec::with_capacity(GROUP_COUNT),
             flush_delay_seconds,
             needs_upgrade: AtomicBool::new(needs_upgrade),
+            authoritative,
         };
 
         for (group_index, &count) in bucket_counts.iter().enumerate() {
@@ -953,6 +968,7 @@ impl LocalMutableStore {
         let path = Arc::new(path.as_ref().clone());
 
         let mut tasks = JoinSet::new();
+        let authoritative = self.authoritative;
 
         for (group_index, group) in self.group.iter().enumerate() {
             // Lock-free scan: skip entire group if nothing is dirty.
@@ -971,7 +987,8 @@ impl LocalMutableStore {
 
                 // Fan-out trigger: if any dirty bucket exceeds the threshold and we're below max level, redistribute entries before serializing.
                 if let Err(err) =
-                    maybe_fan_out_mutable_group(&group, path.as_ref(), group_index).await
+                    maybe_fan_out_mutable_group(&group, path.as_ref(), group_index, authoritative)
+                        .await
                 {
                     first_err = Some(err);
                 }
@@ -1215,6 +1232,7 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
                 group_index,
                 bucket_index,
                 false,
+                self.authoritative,
             ))
             .await
             .map_err(|e| {
@@ -1280,6 +1298,7 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
             if !bucket.deserialized && self.path.is_some() {
                 drop(bucket);
                 let path = self.path.clone().unwrap();
+                let authoritative = self.authoritative;
                 let bucket_clone = bucket_ref.clone();
                 let group_for_check = self.group[group_index].clone();
                 let res = Box::pin(async move {
@@ -1289,7 +1308,7 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
                     }
                     if !bucket_write.deserialized {
                         bucket_write
-                            .deserialize(&path, group_index, bucket_index, false)
+                            .deserialize(&path, group_index, bucket_index, false, authoritative)
                             .await
                             .map_err(|e| {
                                 StoreError::internal_with_context(
@@ -1350,6 +1369,7 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
                 group_index,
                 bucket_index,
                 false,
+                self.authoritative,
             ))
             .await
             .map_err(|e| {
@@ -1409,6 +1429,7 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
 
         for group_index in 0..self.group.len() {
             let path = self.path.clone();
+            let authoritative = self.authoritative;
             let sender = sender.clone();
             let group = self.group[group_index].clone();
             let task = async move {
@@ -1432,6 +1453,7 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
                                     group_index,
                                     bucket_index,
                                     false,
+                                    authoritative,
                                 )
                                 .await
                                 .map_err(|err| {
@@ -1561,6 +1583,7 @@ async fn maybe_fan_out_mutable_group(
     group: &Arc<MutableStoreGroup>,
     path: &Path,
     group_index: usize,
+    authoritative: bool,
 ) -> Result<(), LocalMutableStoreError> {
     let n = group.bucket_count.load(atomic::Ordering::Relaxed);
     if n >= crate::local::fan_out::FAN_OUT_LEVEL_MAX {
@@ -1598,7 +1621,8 @@ async fn maybe_fan_out_mutable_group(
     // Force-deserialize any [0..n] bucket whose entries are still on disk only. Without this, on-disk-only buckets contribute zero entries to the redistribute and their data is lost when serialize overwrites their files with empty buckets at the new layout.
     for (bucket_index, guard) in guards.iter_mut().take(n).enumerate() {
         if !guard.deserialized {
-            Box::pin(guard.deserialize(path, group_index, bucket_index, false)).await?;
+            Box::pin(guard.deserialize(path, group_index, bucket_index, false, authoritative))
+                .await?;
         }
     }
 
@@ -1682,7 +1706,7 @@ mod tests {
         let dir = crate::test_util::TempDir::new("ms_v2_");
         let path = dir.path().join("bucket");
         write_bucket_file(&path, MutableStoreVersion::TypedItems as u32);
-        let result = MutableStoreBucket::deserialize_files(path);
+        let result = MutableStoreBucket::deserialize_files(path, false);
         assert!(result.is_ok(), "v2 (TypedItems) bucket should deserialize");
     }
 
@@ -1691,7 +1715,7 @@ mod tests {
         let dir = crate::test_util::TempDir::new("ms_v3_");
         let path = dir.path().join("bucket");
         write_bucket_file(&path, MutableStoreVersion::LazyFanOut as u32);
-        let result = MutableStoreBucket::deserialize_files(path);
+        let result = MutableStoreBucket::deserialize_files(path, false);
         assert!(result.is_ok(), "v3 (LazyFanOut) bucket should deserialize");
     }
 
@@ -1700,7 +1724,7 @@ mod tests {
         let dir = crate::test_util::TempDir::new("ms_v100_");
         let path = dir.path().join("bucket");
         write_bucket_file(&path, 100);
-        let result = MutableStoreBucket::deserialize_files(path);
+        let result = MutableStoreBucket::deserialize_files(path, false);
         assert!(result.is_err(), "v100 bucket should be rejected as too new");
     }
 
@@ -1716,11 +1740,30 @@ mod tests {
             size_of::<MutableStoreHeader>() + size_of::<u32>() + size_of::<MutableStoreEntry>();
         std::fs::write(&path, vec![0u8; len]).unwrap();
 
-        let (sorted_index, entry, version) = MutableStoreBucket::deserialize_files(path)
+        let (sorted_index, entry, version) = MutableStoreBucket::deserialize_files(path, false)
             .expect("zero-filled bucket should recover to empty");
         assert_eq!(sorted_index.len(), 0);
         assert_eq!(entry.len(), 0);
         assert_eq!(version, MutableStoreVersion::LazyFanOut as u32);
+    }
+
+    #[test]
+    fn deserialize_authoritative_errors_and_preserves_corrupt_bucket() {
+        let dir = crate::test_util::TempDir::new("ms_auth_corrupt_");
+        let path = dir.path().join("bucket");
+        let len =
+            size_of::<MutableStoreHeader>() + size_of::<u32>() + size_of::<MutableStoreEntry>();
+        std::fs::write(&path, vec![0u8; len]).unwrap();
+
+        let result = MutableStoreBucket::deserialize_files(path.clone(), true);
+        assert!(
+            result.is_err(),
+            "authoritative store must not reset a corrupt bucket"
+        );
+        assert!(
+            path.exists(),
+            "authoritative store must preserve the corrupt bucket file"
+        );
     }
 
     #[test]
@@ -1733,7 +1776,7 @@ mod tests {
         let dir = crate::test_util::TempDir::new("ms_latest_");
         let path = dir.path().join("bucket");
         write_bucket_file(&path, MutableStoreVersion::LazyFanOut as u32);
-        let (_, _, version) = MutableStoreBucket::deserialize_files(path).unwrap();
+        let (_, _, version) = MutableStoreBucket::deserialize_files(path, false).unwrap();
         assert_eq!(version, MutableStoreVersion::LazyFanOut as u32);
     }
 

@@ -17,6 +17,13 @@ use crate::eprintln;
 use crate::println;
 use crate::styling::CommonStyles;
 
+/// Discover the repository root by walking up from the process working
+/// directory, when `--repository` named none.
+///
+/// Runs in the CLI process while building `LoreGlobalArgs`, before any call
+/// crosses to the service, so the process working directory is the user's own —
+/// which is exactly what "the repository I am standing in" has to mean.
+#[allow(clippy::disallowed_methods)]
 pub fn get_repository_path(path: Option<String>) -> LoreString {
     if let Some(path) = path {
         path.into()
@@ -99,6 +106,11 @@ pub fn relativize_for_display(repo_root: &Path, cwd: &Path, repo_relative: &str)
 
 /// Build a closure that rebases repo-root-relative paths onto the current
 /// working directory for display, capturing the repo root and cwd once.
+///
+/// Presentation only, and runs in the CLI process, so the process working
+/// directory is the user's terminal directory — the frame paths must be printed
+/// relative to. A failure to read it degrades to repo-root-relative output.
+#[allow(clippy::disallowed_methods)]
 pub fn cwd_relativizer(globals: &LoreGlobalArgs) -> impl Fn(&str) -> String + 'static {
     let repo_root = std::path::absolute(globals.repository_path())
         .unwrap_or_else(|_| PathBuf::from(globals.repository_path()));

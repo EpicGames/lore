@@ -6,8 +6,11 @@ use std::sync::Arc;
 use bytes::Bytes;
 use bytes::BytesMut;
 use lore_transport::StorageSession;
+use tokio::sync::Semaphore;
+use tokio::task::JoinError;
 use tokio::task::JoinSet;
 
+use crate::chunker::FileChunker;
 use crate::compress::FRAGMENT_SIZE_THRESHOLD;
 use crate::concurrency::FRAGMENT_SIZE_EXPECTED;
 use crate::concurrency::FRAGMENT_SIZE_MINIMUM;
@@ -17,6 +20,7 @@ use crate::hash;
 use crate::immutable_store::ImmutableStore;
 use crate::options::WriteOptions;
 use crate::typed_bytes::TypedBytes;
+use crate::typed_bytes::TypedBytesMut;
 use crate::types::Address;
 use crate::types::Context;
 use crate::types::Fragment;
@@ -25,48 +29,28 @@ use crate::types::Partition;
 use crate::write::store_fragment;
 
 /// Figure out where to cut `buffer` into chunks, all in one go.
-async fn chunk_boundaries(
+///
+/// `cut_size` comes from [`WriteOptions::cut_size`], which is where the bound on a fixed chunk
+/// size is applied; this cuts at whatever it is given.
+fn chunk_boundaries(
     buffer: Bytes,
-    fixed_size_chunk: usize,
+    cut_size: Option<usize>,
 ) -> Result<Vec<(usize, usize)>, StorageError> {
     let size = buffer.len();
-    if fixed_size_chunk > 0 {
-        let step = fixed_size_chunk;
+    if let Some(step) = cut_size {
         Ok((0..size)
             .step_by(step)
             .map(|offset| (offset, (offset + step).min(size)))
             .collect())
     } else {
-        let chunker = {
-            // SAFETY: The chunker borrows `buffer` via a forged `'static` slice (see
-            // `extend_lifetime`). The compute-pool task is detached and is not
-            // cancelled if this future is dropped at the `rx.await` below, so
-            // we must keep the buffer allocation alive for the whole task.
-            // `Bytes::clone` bumps the refcount with a stable data pointer,
-            // guaranteeing the slice stays valid until the task finishes.
-            let slice: &[u8] = unsafe { extend_lifetime(buffer.as_ref()) };
-            fastcdc::v2020::FastCDC::with_level(
-                slice,
-                FRAGMENT_SIZE_MINIMUM as u32,
-                FRAGMENT_SIZE_EXPECTED as u32,
-                FRAGMENT_SIZE_THRESHOLD as u32,
-                fastcdc::v2020::Normalization::Level1,
-            )
-        };
-        let buffer_guard = buffer.clone();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        lore_base::runtime::compute_pool().spawn(move || {
-            let _ = tx.send(
-                chunker
-                    .map(|c| (c.offset, c.offset + c.length))
-                    .collect::<Vec<_>>(),
-            );
-            drop(buffer_guard);
-        });
-        let boundaries = rx
-            .await
-            .map_err(|e| StorageError::internal_with_context(e, "chunker task failed"))?;
-        Ok(boundaries)
+        let chunker = fastcdc::v2020::FastCDC::with_level(
+            buffer.as_ref(),
+            FRAGMENT_SIZE_MINIMUM as u32,
+            FRAGMENT_SIZE_EXPECTED as u32,
+            FRAGMENT_SIZE_THRESHOLD as u32,
+            fastcdc::v2020::Normalization::Level1,
+        );
+        Ok(chunker.map(|c| (c.offset, c.offset + c.length)).collect())
     }
 }
 
@@ -94,13 +78,12 @@ pub async fn write_fragmented(
 ) -> Result<(Address, Fragment), StorageError> {
     let size = buffer.len();
     let mut read_permit = permit;
-    let mut tasks = JoinSet::<Result<(usize, usize, Address), StorageError>>::new();
+    let mut tasks = JoinSet::<Result<StoredChunk, StorageError>>::new();
 
     lore_base::lore_trace!(
         "Write and fragment buffer to immutable store: {size} bytes representing {size} bytes (flags {flags:?})",
     );
-
-    let chunk_boundaries = chunk_boundaries(buffer.clone(), flags.fixed_size_chunk).await?;
+    let chunk_boundaries = chunk_boundaries(buffer.clone(), flags.cut_size())?;
 
     for (chunk_index, (chunk_offset, chunk_end)) in chunk_boundaries.into_iter().enumerate() {
         let chunk_size = chunk_end - chunk_offset;
@@ -112,12 +95,8 @@ pub async fn write_fragmented(
             size_content: chunk_size as u64,
         };
 
-        // Split the read reservation per fragment (heap), or reserve before the
-        // mmap copy — reserved before allocation either way.
         let chunk_permit = if hash_only {
             None
-        } else if flags.clone_buffer {
-            crate::concurrency::acquire_fragment_memory_permit(chunk_size).await
         } else {
             let needed = crate::concurrency::fragment_permit_count(chunk_size) as usize;
             match read_permit.as_mut().and_then(|permit| permit.split(needed)) {
@@ -128,11 +107,6 @@ pub async fn write_fragmented(
 
         if chunk_offset == 0 && chunk_size == size {
             // Everything was put in a single fragment
-            let chunk_buffer = if flags.clone_buffer {
-                Bytes::copy_from_slice(chunk_buffer.as_ref())
-            } else {
-                chunk_buffer
-            };
             let hash = hash::hash_slice(chunk_buffer.as_ref());
             let result = store_fragment(
                 store,
@@ -153,11 +127,6 @@ pub async fn write_fragmented(
         let session = remote_session.clone();
         let task_tracker = tracker.clone();
         lore_base::lore_spawn!(tasks, async move {
-            let chunk_buffer = if flags.clone_buffer {
-                Bytes::copy_from_slice(chunk_buffer.as_ref())
-            } else {
-                chunk_buffer
-            };
             let hash = hash::hash_slice(chunk_buffer.as_ref());
             let chunk_address = if hash_only {
                 Address { context, hash }
@@ -176,46 +145,243 @@ pub async fn write_fragmented(
                 .await?;
                 result.address
             };
-            Ok((chunk_index, chunk_offset, chunk_address))
+            Ok(StoredChunk {
+                index: chunk_index,
+                content_offset: chunk_offset,
+                address: chunk_address,
+            })
         });
     }
 
-    let mut list_buffer =
-        BytesMut::with_capacity(tasks.len() * std::mem::size_of::<FragmentReference>());
-    let list = unsafe {
-        std::slice::from_raw_parts_mut(
-            list_buffer.as_mut_ptr().cast::<FragmentReference>(),
-            tasks.len(),
-        )
+    drop(read_permit);
+
+    let chunk_count = tasks.len();
+    write_chunk_list(
+        tasks,
+        ChunkResults::default(),
+        chunk_count,
+        store,
+        partition,
+        context,
+        size,
+        flags,
+        hash_only,
+        remote_session,
+        tracker,
+    )
+    .await
+}
+
+/// Cuts a file into chunks with [`FileChunker`] and stores each one via
+/// [`store_fragment`], without ever holding the file whole. Boundaries are identical
+/// to fragmenting the same bytes in memory; see [`crate::chunker`].
+///
+/// Each chunk's memory permit is taken before its task is spawned, so the chunker
+/// stops reading ahead once the fragment limiter saturates: peak residency is bounded
+/// by the limiter rather than by the file size.
+///
+/// A chunk that cannot get a permit uses the one chunk [`FileChunker`] reserved, held as a
+/// single-permit slot. Either way the budget travels into the write with the buffer it
+/// covers and is released where that buffer is dropped — which is not where this loop
+/// dispatched it: a tracker hands the write to a detached leader task, so a budget kept
+/// behind here would stop accounting for bytes still resident and, being free again at
+/// once, would let this loop stream the whole file into detached writes uncharged.
+///
+/// Only when the slot is occupied too does the loop wait, for whichever of a permit or the
+/// slot comes back first — the chunk holding the slot needs no budget to finish, so the
+/// wait always resolves and the window is never held waiting on budget only this file
+/// could release.
+///
+/// This is only reached for files larger than one fragment, so the single-fragment
+/// fast path in [`write_fragmented`] cannot apply — no chunk ever exceeds
+/// `FRAGMENT_SIZE_THRESHOLD`, so such a file always yields at least two chunks.
+#[allow(clippy::too_many_arguments)]
+pub async fn write_fragmented_from_file(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    context: Context,
+    file: Arc<std::fs::File>,
+    size: usize,
+    flags: WriteOptions,
+    hash_only: bool,
+    remote_session: Option<Arc<StorageSession>>,
+    tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
+) -> Result<(Address, Fragment), StorageError> {
+    let mut tasks = JoinSet::<Result<StoredChunk, StorageError>>::new();
+
+    lore_base::lore_trace!(
+        "Write and fragment file to immutable store: {size} bytes (flags {flags:?})",
+    );
+
+    let file_size = size as u64;
+    let mut chunker = if let Some(step) = flags.cut_size() {
+        FileChunker::fixed_size(file, file_size, step).await
+    } else {
+        FileChunker::content_defined(file, file_size).await
     };
 
-    let mut failure = None;
-    while let Some(result) = tasks.join_next().await {
+    // The chunk the chunker pre-paid, as a slot so its use is tracked rather than inferred.
+    let reserved_chunk = Arc::new(Semaphore::new(1));
+
+    let mut results = ChunkResults::default();
+    let mut chunk_index = 0usize;
+    while let Some(chunk) = chunker.next_chunk().await? {
+        results.reap(&mut tasks);
+        if results.failure.is_some() {
+            break;
+        }
+
+        let chunk_offset = chunk.offset as usize;
+        let chunk_buffer = chunk.data;
+        let chunk_size = chunk_buffer.len();
+
+        let fragment = Fragment {
+            flags: flags.into(),
+            size_payload: chunk_size as u32,
+            size_content: chunk_size as u64,
+        };
+
+        let chunk_budget =
+            crate::concurrency::acquire_chunk_budget(chunk_size, &reserved_chunk).await;
+
+        let store = store.clone();
+        let session = remote_session.clone();
+        let task_tracker = tracker.clone();
+        lore_base::lore_spawn!(tasks, async move {
+            let hash = hash::hash_slice(chunk_buffer.as_ref());
+            let chunk_address = if hash_only {
+                Address { context, hash }
+            } else {
+                let result = store_fragment(
+                    store,
+                    partition,
+                    Address { context, hash },
+                    fragment,
+                    chunk_buffer,
+                    flags.local_cache_priority,
+                    session,
+                    task_tracker,
+                    chunk_budget,
+                )
+                .await?;
+                result.address
+            };
+            Ok(StoredChunk {
+                index: chunk_index,
+                content_offset: chunk_offset,
+                address: chunk_address,
+            })
+        });
+        chunk_index += 1;
+    }
+
+    // Holding a window while the list waits for budget is the hold-and-wait the
+    // reservation exists to avoid.
+    drop(chunker);
+
+    write_chunk_list(
+        tasks,
+        results,
+        chunk_index,
+        store,
+        partition,
+        context,
+        size,
+        flags,
+        hash_only,
+        remote_session,
+        tracker,
+    )
+    .await
+}
+
+/// What one stored chunk reports back: where its reference belongs in the fragment list, where
+/// its bytes begin in the content, and the address it hashed to.
+struct StoredChunk {
+    index: usize,
+    content_offset: usize,
+    address: Address,
+}
+
+/// Chunk store results gathered so far, so a file can drain its in-flight tasks part
+/// way through without losing what already finished.
+#[derive(Default)]
+struct ChunkResults {
+    entries: Vec<StoredChunk>,
+    failure: Option<StorageError>,
+}
+
+impl ChunkResults {
+    /// Await every task currently in `tasks`, keeping the first error seen.
+    async fn drain(&mut self, tasks: &mut JoinSet<Result<StoredChunk, StorageError>>) {
+        while let Some(result) = tasks.join_next().await {
+            self.record(result);
+        }
+    }
+
+    /// Collect the tasks that have already finished, without waiting for any.
+    fn reap(&mut self, tasks: &mut JoinSet<Result<StoredChunk, StorageError>>) {
+        while let Some(result) = tasks.try_join_next() {
+            self.record(result);
+        }
+    }
+
+    fn record(&mut self, result: Result<Result<StoredChunk, StorageError>, JoinError>) {
         match result
             .map_err(|e| StorageError::internal_with_context(e, "task failure"))
             .and_then(|r| r)
         {
-            Ok((chunk_index, chunk_content_offset, chunk_address)) => {
-                list[chunk_index].hash = chunk_address.hash;
-                list[chunk_index].offset_content = chunk_content_offset as u64;
-            }
-            Err(err) => {
-                failure = failure.or(Some(err));
-            }
+            Ok(entry) => self.entries.push(entry),
+            Err(err) => self.failure = self.failure.take().or(Some(err)),
         }
     }
+}
 
-    if let Some(err) = failure {
+/// Joins the per-chunk store tasks into a fragment reference list, then Merklizes it.
+///
+/// The list is reserved before it is allocated and the reservation travels into the write: a
+/// list outlives the chunks it names, going on to be compressed, uploaded and stored.
+#[allow(clippy::too_many_arguments)]
+async fn write_chunk_list(
+    mut tasks: JoinSet<Result<StoredChunk, StorageError>>,
+    mut results: ChunkResults,
+    chunk_count: usize,
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    context: Context,
+    size: usize,
+    flags: WriteOptions,
+    hash_only: bool,
+    remote_session: Option<Arc<StorageSession>>,
+    tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
+) -> Result<(Address, Fragment), StorageError> {
+    results.drain(&mut tasks).await;
+
+    if let Some(err) = results.failure {
         return Err(err);
     }
 
-    unsafe {
-        list_buffer.set_len(list_buffer.capacity());
+    if chunk_count == 0 {
+        return Err(StorageError::internal(format!(
+            "no chunks were written for {size} bytes of content"
+        )));
     }
 
-    // This never needs to be cloned, it's a unique immutable buffer
-    let mut flags = flags;
-    flags.clone_buffer = false;
+    let list_bytes = chunk_count * std::mem::size_of::<FragmentReference>();
+    let list_permit = crate::concurrency::acquire_fragment_memory_permit(list_bytes).await;
+
+    let mut list_buffer = BytesMut::with_count_capacity::<FragmentReference>(chunk_count);
+    let list = list_buffer.as_type_slice_mut::<FragmentReference>();
+
+    for chunk in results.entries {
+        list[chunk.index].hash = chunk.address.hash;
+        list[chunk.index].offset_content = chunk.content_offset as u64;
+    }
+
+    // Safety: one entry per chunk was written above, and the capacity was sized for that many.
+    unsafe {
+        list_buffer.set_count::<FragmentReference>(chunk_count);
+    }
 
     write_fragmentlist(
         store,
@@ -227,11 +393,20 @@ pub async fn write_fragmented(
         hash_only,
         remote_session,
         tracker,
+        list_permit,
     )
     .await
 }
 
 /// Helper function to write a list of fragment references
+///
+/// `permit` covers `buffer`, which the caller reserved before allocating it. It is reused for a
+/// list that fits one fragment and split per chunk for one that does not, so the bytes are
+/// charged once however deep the tree goes.
+///
+/// The next level is reserved while this level's chunks still hold their splits. That cannot
+/// deadlock: nothing holding a chunk permit ever waits on the budget, so every holder drains
+/// regardless.
 #[allow(clippy::too_many_arguments)]
 async fn write_fragmentlist_impl(
     store: Arc<dyn ImmutableStore>,
@@ -243,6 +418,7 @@ async fn write_fragmentlist_impl(
     hash_only: bool,
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Result<(Address, Fragment), StorageError> {
     let size = buffer.len();
 
@@ -256,7 +432,10 @@ async fn write_fragmentlist_impl(
         if hash_only {
             Ok((Address { context, hash }, fragment))
         } else {
-            let permit = crate::concurrency::acquire_fragment_memory_permit(buffer.len()).await;
+            let permit = match permit {
+                Some(permit) => Some(permit),
+                None => crate::concurrency::acquire_fragment_memory_permit(buffer.len()).await,
+            };
             let result = store_fragment(
                 store,
                 partition,
@@ -273,7 +452,8 @@ async fn write_fragmentlist_impl(
         }
     } else {
         // Fixed size chunking for fragment list
-        let mut tasks = JoinSet::<Result<(usize, usize, Address), StorageError>>::new();
+        let mut list_permit = permit;
+        let mut tasks = JoinSet::<Result<StoredChunk, StorageError>>::new();
         let mut chunk_index = 0usize;
         let mut chunk_offset = 0;
         let mut chunk_content_offset = 0;
@@ -306,6 +486,16 @@ async fn write_fragmentlist_impl(
                 size_content: chunk_content_size as u64,
             };
 
+            let chunk_permit = if hash_only {
+                None
+            } else {
+                let needed = crate::concurrency::fragment_permit_count(chunk_size) as usize;
+                match list_permit.as_mut().and_then(|permit| permit.split(needed)) {
+                    Some(permit) => Some(permit),
+                    None => crate::concurrency::acquire_fragment_memory_permit(chunk_size).await,
+                }
+            };
+
             let store = store.clone();
             let session = remote_session.clone();
             let task_tracker = tracker.clone();
@@ -314,9 +504,7 @@ async fn write_fragmentlist_impl(
                 let chunk_address = if hash_only {
                     Address { context, hash }
                 } else {
-                    let permit =
-                        crate::concurrency::acquire_fragment_memory_permit(chunk_buffer.len())
-                            .await;
+                    let permit = chunk_permit;
                     let result = store_fragment(
                         store,
                         partition,
@@ -331,7 +519,11 @@ async fn write_fragmentlist_impl(
                     .await?;
                     result.address
                 };
-                Ok((chunk_index, chunk_content_offset, chunk_address))
+                Ok(StoredChunk {
+                    index: chunk_index,
+                    content_offset: chunk_content_offset,
+                    address: chunk_address,
+                })
             });
 
             chunk_content_offset += chunk_content_size;
@@ -340,14 +532,11 @@ async fn write_fragmentlist_impl(
         }
         drop(buffer);
 
-        let mut list_buffer =
-            BytesMut::with_capacity(tasks.len() * std::mem::size_of::<FragmentReference>());
-        let list = unsafe {
-            std::slice::from_raw_parts_mut(
-                list_buffer.as_mut_ptr().cast::<FragmentReference>(),
-                tasks.len(),
-            )
-        };
+        let list_count = tasks.len();
+        let next_bytes = list_count * std::mem::size_of::<FragmentReference>();
+        let next_permit = crate::concurrency::acquire_fragment_memory_permit(next_bytes).await;
+        let mut list_buffer = BytesMut::with_count_capacity::<FragmentReference>(list_count);
+        let list = list_buffer.as_type_slice_mut::<FragmentReference>();
 
         let mut failure = None;
         while let Some(result) = tasks.join_next().await {
@@ -355,9 +544,9 @@ async fn write_fragmentlist_impl(
                 .map_err(|e| StorageError::internal_with_context(e, "task failure"))
                 .and_then(|r| r)
             {
-                Ok((chunk_index, chunk_content_offset, chunk_address)) => {
-                    list[chunk_index].hash = chunk_address.hash;
-                    list[chunk_index].offset_content = chunk_content_offset as u64;
+                Ok(chunk) => {
+                    list[chunk.index].hash = chunk.address.hash;
+                    list[chunk.index].offset_content = chunk.content_offset as u64;
                 }
                 Err(err) => {
                     failure = failure.or(Some(err));
@@ -368,9 +557,11 @@ async fn write_fragmentlist_impl(
         if let Some(err) = failure {
             return Err(err);
         }
+        drop(list_permit);
 
+        // Safety: one entry per chunk was written above, and the capacity was sized for that many.
         unsafe {
-            list_buffer.set_len(list_buffer.capacity());
+            list_buffer.set_count::<FragmentReference>(list_count);
         }
         let buffer = list_buffer.freeze();
 
@@ -384,6 +575,7 @@ async fn write_fragmentlist_impl(
             hash_only,
             remote_session,
             tracker,
+            next_permit,
         )
         .await
     }
@@ -402,6 +594,7 @@ pub fn write_fragmentlist(
     hash_only: bool,
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<(Address, Fragment), StorageError>> + Send>,
 > {
@@ -415,16 +608,8 @@ pub fn write_fragmentlist(
         hash_only,
         remote_session,
         tracker,
+        permit,
     ))
-}
-
-/// Unsafe extension of lifetime. Caller must guarantee the reference outlives
-/// all uses. Used for `FastCDC`'s borrow of the buffer slice.
-pub(crate) unsafe fn extend_lifetime<T>(data: &T) -> &'static T
-where
-    T: ?Sized,
-{
-    unsafe { &*(data as *const T) }
 }
 
 #[cfg(test)]
@@ -441,22 +626,86 @@ mod tests {
         Bytes::from(data)
     }
 
+    /// The builder clamps, but `fixed_size_chunk` is `pub`, so a struct literal reaches the
+    /// cutting paths without passing through it. Both paths ask `cut_size`, which is why an
+    /// oversized request cannot produce a leaf chunk that no store would accept.
+    #[tokio::test]
+    async fn an_oversized_fixed_chunk_request_is_bounded_on_both_paths() {
+        let flags = WriteOptions {
+            fixed_size_chunk: 4 * FRAGMENT_SIZE_THRESHOLD,
+            ..WriteOptions::default()
+        };
+        assert_eq!(flags.cut_size(), Some(FRAGMENT_SIZE_THRESHOLD));
+
+        let buffer = mixed_pattern_buffer(3 * FRAGMENT_SIZE_THRESHOLD);
+        let actual = chunk_boundaries(buffer.clone(), flags.cut_size()).expect("chunking succeeds");
+
+        assert!(
+            actual
+                .iter()
+                .all(|&(start, end)| end - start <= FRAGMENT_SIZE_THRESHOLD),
+            "a leaf chunk above the threshold is unstorable and reads back as a sublist"
+        );
+        assert_eq!(actual.first().copied(), Some((0, FRAGMENT_SIZE_THRESHOLD)));
+        assert_eq!(actual.last().unwrap().1, buffer.len());
+    }
+
+    /// Content-defined chunking is what a zero request means, not a zero-length cut.
+    #[tokio::test]
+    async fn a_zero_fixed_chunk_request_means_content_defined() {
+        assert_eq!(WriteOptions::default().cut_size(), None);
+    }
+
     #[tokio::test]
     async fn fastcdc_batch_handles_buffer_smaller_than_min_chunk() {
         // Tiny buffer — should be one chunk covering the whole thing.
         let buffer = mixed_pattern_buffer(1024);
-        let actual = chunk_boundaries(buffer.clone(), 0)
-            .await
-            .expect("chunking succeeds");
+        let actual = chunk_boundaries(buffer.clone(), None).expect("chunking succeeds");
         assert_eq!(actual, vec![(0, buffer.len())]);
+    }
+
+    /// A file holding less than the size it was measured at is the truncation race: the size
+    /// comes from `metadata()`, taken before the chunker ever opens the file, so the chunker
+    /// can find nothing to cut. Zero-length content is the zero hash and no fragment list
+    /// stands in for nothing, so this has to fail rather than describe content that was never
+    /// written.
+    #[tokio::test]
+    async fn a_file_holding_less_than_its_measured_size_is_rejected() {
+        let dir = crate::test_util::TempDir::new("lore-storage-truncated-");
+        let path = std::path::Path::new(dir.as_ref()).join("truncated");
+        std::fs::write(&path, b"").expect("create empty file");
+        let file = Arc::new(std::fs::File::open(&path).expect("open file"));
+        let store = crate::local::immutable_store::LocalImmutableStore::new(
+            Some(std::path::PathBuf::from(dir.as_ref())),
+            crate::local::immutable_store::ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("create test store");
+
+        let err = write_fragmented_from_file(
+            store,
+            Partition::from([1u8; 16]),
+            Context::from([1u8; 16]),
+            file,
+            4 * FRAGMENT_SIZE_THRESHOLD,
+            WriteOptions::default(),
+            true,
+            None,
+            None,
+        )
+        .await
+        .expect_err("a fragment list with no entries must not be written");
+
+        assert!(
+            format!("{err}").contains("no chunks were written"),
+            "unexpected failure: {err}"
+        );
     }
 
     #[tokio::test]
     async fn fastcdc_batch_handles_empty_buffer() {
         let buffer = Bytes::new();
-        let actual = chunk_boundaries(buffer, 0)
-            .await
-            .expect("chunking succeeds");
+        let actual = chunk_boundaries(buffer, None).expect("chunking succeeds");
         assert!(actual.is_empty());
     }
 
@@ -464,9 +713,7 @@ mod tests {
     async fn fastcdc_batch_handles_pathological_all_zero_buffer() {
         // All-zero input — the rolling hash never matches, but the split should still be clean.
         let buffer = Bytes::from(vec![0u8; 512 * 1024]);
-        let actual = chunk_boundaries(buffer.clone(), 0)
-            .await
-            .expect("chunking succeeds");
+        let actual = chunk_boundaries(buffer.clone(), None).expect("chunking succeeds");
         let reconstructed_size: usize = actual.iter().map(|(s, e)| e - s).sum();
         assert_eq!(reconstructed_size, buffer.len());
         assert!(actual.iter().all(|&(s, e)| s < e));
@@ -478,9 +725,7 @@ mod tests {
     async fn fixed_size_chunking_covers_whole_buffer() {
         let buffer = mixed_pattern_buffer(10 * 1024 + 17);
         let step = 1024;
-        let actual = chunk_boundaries(buffer.clone(), step)
-            .await
-            .expect("chunking succeeds");
+        let actual = chunk_boundaries(buffer.clone(), Some(step)).expect("chunking succeeds");
 
         let expected: Vec<(usize, usize)> = (0..buffer.len())
             .step_by(step)
@@ -495,9 +740,7 @@ mod tests {
     #[tokio::test]
     async fn fixed_size_chunking_handles_buffer_smaller_than_step() {
         let buffer = Bytes::from(vec![1u8; 100]);
-        let actual = chunk_boundaries(buffer.clone(), 1024)
-            .await
-            .expect("chunking succeeds");
+        let actual = chunk_boundaries(buffer.clone(), Some(1024)).expect("chunking succeeds");
         assert_eq!(actual, vec![(0, buffer.len())]);
     }
 }

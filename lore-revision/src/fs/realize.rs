@@ -743,6 +743,8 @@ pub async fn realize_changes(
     });
 
     let consumer_stats = stats.clone();
+    // A view-excluded path is staged into the tree but not written to disk.
+    let view_filter = repository.filter.clone();
     let consumer = lore_spawn!(async move {
         sync_execute_modify_add(
             rx,
@@ -750,6 +752,7 @@ pub async fn realize_changes(
             state_stage,
             dry_run,
             is_merge,
+            view_filter,
             consumer_stats,
         )
         .await
@@ -843,6 +846,7 @@ pub async fn realize_conflicts(
         state_stage.clone(),
         conflicts.clone(),
         dry_run,
+        repository.filter.clone(),
         stats.clone(),
         merge_type,
     )
@@ -1198,6 +1202,7 @@ async fn sync_execute_modify_add(
     state_stage: Option<Arc<State>>,
     dry_run: bool,
     is_merge: bool,
+    view_filter: Arc<crate::filter::Filter>,
     stats: Arc<SyncRealizeStats>,
 ) -> Result<(), SyncError> {
     const MAX_TASK_COUNT: usize = 10000;
@@ -1213,6 +1218,7 @@ async fn sync_execute_modify_add(
             state_stage.clone(),
             dry_run,
             is_merge,
+            view_filter.clone(),
             stats.clone(),
         )
         .await;
@@ -1264,12 +1270,30 @@ async fn realize_change_modify_add(
     state_stage: Option<Arc<State>>,
     dry_run: bool,
     is_merge: bool,
+    view_filter: Arc<crate::filter::Filter>,
     stats: Arc<SyncRealizeStats>,
 ) -> Result<(), SyncError> {
+    // During a merge this is the filter-free walk context, not the instance's.
+    // The instance's view arrives separately as `view_filter`. The staging
+    // below needs the first, the disk writes need the second.
     let repository = change.to.repository.clone();
     let size = node.size;
     let is_file = node.is_file();
     let path = &change.path;
+
+    // Only on-disk work honours the view. This gates directory creation, link
+    // cloning and the file write. The move rename below is not gated, because
+    // it repositions a path an earlier in-view realize may have written.
+    let write_to_disk = !view_filter.excludes(path, node.is_directory(), FilterMode::View);
+
+    // A move is realized by renaming the file already on disk, which lets the
+    // content write be skipped when the content did not change. That only holds
+    // when the source was in view and so had a file to rename. A sparse working
+    // tree holds nothing at an excluded source, so the rename finds no file and
+    // the destination has to be written from the immutable store like any add.
+    let moved_from_in_view = change.from_path.as_ref().is_some_and(|from_path| {
+        !view_filter.excludes(from_path, node.is_directory(), FilterMode::View)
+    });
 
     lore_trace!(
         "{}{} {}",
@@ -1302,7 +1326,7 @@ async fn realize_change_modify_add(
         }
     }
 
-    if node.is_directory() || node.is_link() {
+    if (node.is_directory() || node.is_link()) && write_to_disk {
         if !dry_run
             && operation
                 .create_dir_all(FilesystemPath::Repository(path))
@@ -1364,9 +1388,10 @@ async fn realize_change_modify_add(
             .await
             .forward::<SyncError>("Failed to sync link")?;
         }
-    } else if node.is_file() && !dry_run {
+    } else if node.is_file() && !dry_run && write_to_disk {
         // For move changes where content didn't change, the rename already positioned the file correctly and the current branch's content should be preserved.
         if change.action != change::FileAction::Move
+            || !moved_from_in_view
             || change.from.address.hash != change.to.address.hash
         {
             lore_spawn!(tasks, {
@@ -1558,6 +1583,7 @@ async fn realize_changes_merge(
     state_stage: Option<Arc<State>>,
     merges: Arc<Vec<(NodeChange, NodeChange)>>,
     dry_run: bool,
+    view_filter: Arc<crate::filter::Filter>,
     stats: Arc<SyncRealizeStats>,
     merge_type: MergeType,
 ) -> Result<(), SyncError> {
@@ -1574,6 +1600,7 @@ async fn realize_changes_merge(
             let state_stage = state_stage.clone();
             let change_from = change_from.clone();
             let change_to = change_to.clone();
+            let view_filter = view_filter.clone();
             let stats = stats.clone();
             async move {
                 realize_file_merge(
@@ -1586,6 +1613,7 @@ async fn realize_changes_merge(
                     change_from,
                     change_to,
                     dry_run,
+                    view_filter,
                     stats,
                     merge_type,
                 )
@@ -1634,6 +1662,7 @@ async fn realize_file_merge(
     change_from: NodeChange,
     change_to: NodeChange,
     dry_run: bool,
+    view_filter: Arc<crate::filter::Filter>,
     stats: Arc<SyncRealizeStats>,
     merge_type: MergeType,
 ) -> Result<(), SyncError> {
@@ -1643,6 +1672,16 @@ async fn realize_file_merge(
     let mut conflict = true;
     let mut size = 0;
 
+    let in_view = !view_filter.excludes(&change_to.path, false, FilterMode::View);
+
+    // A view-excluded path has no working-tree file, so there is nothing to
+    // compare and no merge result to edit. Adopt the incoming side, recorded
+    // with the same flag `merge resolve theirs` sets.
+    let take_theirs = !in_view;
+    if take_theirs {
+        conflict = false;
+    }
+
     if change_from.path == change_to.path {
         // Fetch base / theirs version for conflicting files and try to text merge,
         // if that fails fall back to leaving mine/theirs/base in the file system
@@ -1650,166 +1689,63 @@ async fn realize_file_merge(
         let theirs_path = change_from.path.append_into_buf(THEIRS_SUFFIX).freeze();
         let base_path = change_from.path.append_into_buf(BASE_SUFFIX).freeze();
 
-        let mut has_theirs = false;
-        if change_from.to.node.is_valid_node_id() {
-            lore_trace!("Change from has valid to node, realize theirs file {theirs_path}");
-            let node_to = state_from
-                .block(repository.clone(), NodeBlock::index(change_from.to.node))
-                .await
-                .forward::<SyncError>("Failed deserializing state node block")?
-                .node(Node::index(change_from.to.node));
+        if in_view {
+            let mut has_theirs = false;
+            if change_from.to.node.is_valid_node_id() {
+                lore_trace!("Change from has valid to node, realize theirs file {theirs_path}");
+                let node_to = state_from
+                    .block(repository.clone(), NodeBlock::index(change_from.to.node))
+                    .await
+                    .forward::<SyncError>("Failed deserializing state node block")?
+                    .node(Node::index(change_from.to.node));
 
-            // TODO(vri): Implement merging links/link nodes
+                // TODO(vri): Implement merging links/link nodes
 
-            if node_to.is_directory() {
-                lore_trace!("Change from is a directory, no theirs file");
-            } else if node_to.is_file() {
-                realize_file(
-                    repository.clone(),
-                    operation.clone(),
-                    &theirs_path,
-                    node_to,
-                    Arc::default(),
-                )
-                .await?;
-                has_theirs = true;
-                size = node_to.size;
-            }
-        } else {
-            lore_trace!("Change from has no valid to node, no theirs file");
-        }
-
-        if change_to.to.node.is_valid_node_id() {
-            // Diff3 function takes care of identifying identical files
-            // and mergeable operations such as delete in both branches etc
-            // Only thing remaining is identifying diffable files and split
-            // the mergeable files from unresolvable conflicts
-            let absolute_path = change_from
-                .path
-                .to_absolute_path(repository.require_path()?);
-            if has_theirs
-                && operation
-                    .infer_is_diffable(FilesystemPath::Repository(&change_from.path))
-                    .await?
-            {
-                lore_trace!(
-                    "Merge identified text file for merge: {}",
-                    absolute_path.display()
-                );
-
-                if change_from.from.node.is_valid_node_id() {
-                    lore_trace!("Change from has valid from node, realize base file {base_path}");
-                    let node_from = state_base
-                        .block(repository.clone(), NodeBlock::index(change_from.from.node))
-                        .await
-                        .forward::<SyncError>("Failed deserializing state node block")?
-                        .node(Node::index(change_from.from.node));
+                if node_to.is_directory() {
+                    lore_trace!("Change from is a directory, no theirs file");
+                } else if node_to.is_file() {
                     realize_file(
                         repository.clone(),
                         operation.clone(),
-                        &base_path,
-                        node_from,
+                        &theirs_path,
+                        node_to,
                         Arc::default(),
                     )
                     .await?;
-                } else {
-                    lore_trace!("Change from has no valid from node, empty base file");
-                    let _ = operation
-                        .create_file(FilesystemPath::Repository(&base_path))
-                        .await;
-                }
-
-                // Realize the "mine" file as the current file
-                let mine_abs_path = mine_path.to_absolute_path(repository.require_path()?);
-                operation
-                    .copy_to_scratch_file(
-                        FilesystemPath::Repository(&change_from.path),
-                        &mine_abs_path,
-                    )
-                    .await
-                    .forward_with::<SyncError, _>(|| format!("Failed to sync file {mine_path}"))?;
-
-                // Try performing a text merge
-                let mode = if dry_run {
-                    crate::merge::MergeTextMode::DryRun
-                } else {
-                    let write_token = repository
-                        .try_write_token()
-                        .ok_or_else(|| SyncError::from(WriteRequired))?;
-                    crate::merge::MergeTextMode::Write(write_token)
-                };
-                let merged = match operation
-                    .merge3_text_by_path(
-                        &base_path,
-                        &mine_path,
-                        &theirs_path,
-                        &change_to.path,
-                        mode,
-                    )
-                    .await
-                {
-                    Err(err) => {
-                        // Could not merge, maybe file from binary to text, fall back to
-                        // mine/theirs conflict handling
-                        lore_debug!(
-                            "Merge as text failed base {}, mine {}, theirs {} - fallback to binary file conflict to {}: {}",
-                            base_path,
-                            change_to.path,
-                            theirs_path,
-                            absolute_path.display(),
-                            err
-                        );
-                        false
-                    }
-                    Ok(true) => {
-                        // Merged with conflict markers
-                        lore_debug!(
-                            "Merged as text with conflict markers, base {}, mine {}, theirs {}: {}",
-                            base_path,
-                            change_to.path,
-                            theirs_path,
-                            absolute_path.display()
-                        );
-                        true
-                    }
-                    Ok(false) => {
-                        // Merged with no conflicts
-                        lore_trace!(
-                            "Merged as text without any line conflicts: {}",
-                            absolute_path.display()
-                        );
-                        conflict = false;
-                        resolved = true;
-                        true
-                    }
-                };
-
-                if merged && !conflict {
-                    let _ = operation
-                        .remove(FilesystemPath::Repository(&base_path))
-                        .await;
-                    let _ = operation
-                        .remove(FilesystemPath::Repository(&theirs_path))
-                        .await;
-                    let _ = operation
-                        .remove(FilesystemPath::Repository(&mine_path))
-                        .await;
+                    has_theirs = true;
+                    size = node_to.size;
                 }
             } else {
-                lore_debug!(
-                    "Merge identified binary file for unresolved conflict: {}",
-                    absolute_path.display()
-                );
+                lore_trace!("Change from has no valid to node, no theirs file");
+            }
 
-                // Realize the base file for binary conflicts so users can compare
-                if change_from.from.node.is_valid_node_id() {
-                    lore_trace!("Realize base file for binary conflict {base_path}");
-                    let node_from = state_base
-                        .block(repository.clone(), NodeBlock::index(change_from.from.node))
-                        .await
-                        .forward::<SyncError>("Failed deserializing state node block")?
-                        .node(Node::index(change_from.from.node));
-                    if node_from.is_file() {
+            if change_to.to.node.is_valid_node_id() {
+                // Diff3 function takes care of identifying identical files
+                // and mergeable operations such as delete in both branches etc
+                // Only thing remaining is identifying diffable files and split
+                // the mergeable files from unresolvable conflicts
+                let absolute_path = change_from
+                    .path
+                    .to_absolute_path(repository.require_path()?);
+                if has_theirs
+                    && operation
+                        .infer_is_diffable(FilesystemPath::Repository(&change_from.path))
+                        .await?
+                {
+                    lore_trace!(
+                        "Merge identified text file for merge: {}",
+                        absolute_path.display()
+                    );
+
+                    if change_from.from.node.is_valid_node_id() {
+                        lore_trace!(
+                            "Change from has valid from node, realize base file {base_path}"
+                        );
+                        let node_from = state_base
+                            .block(repository.clone(), NodeBlock::index(change_from.from.node))
+                            .await
+                            .forward::<SyncError>("Failed deserializing state node block")?
+                            .node(Node::index(change_from.from.node));
                         realize_file(
                             repository.clone(),
                             operation.clone(),
@@ -1818,27 +1754,143 @@ async fn realize_file_merge(
                             Arc::default(),
                         )
                         .await?;
+                    } else {
+                        lore_trace!("Change from has no valid from node, empty base file");
+                        let _ = operation
+                            .create_file(FilesystemPath::Repository(&base_path))
+                            .await;
+                    }
+
+                    // Realize the "mine" file as the current file
+                    let mine_abs_path = mine_path.to_absolute_path(repository.require_path()?);
+                    operation
+                        .copy_to_scratch_file(
+                            FilesystemPath::Repository(&change_from.path),
+                            &mine_abs_path,
+                        )
+                        .await
+                        .forward_with::<SyncError, _>(|| {
+                            format!("Failed to sync file {mine_path}")
+                        })?;
+
+                    // Try performing a text merge
+                    let mode = if dry_run {
+                        crate::merge::MergeTextMode::DryRun
+                    } else {
+                        let write_token = repository
+                            .try_write_token()
+                            .ok_or_else(|| SyncError::from(WriteRequired))?;
+                        crate::merge::MergeTextMode::Write(write_token)
+                    };
+                    let merged = match operation
+                        .merge3_text_by_path(
+                            &base_path,
+                            &mine_path,
+                            &theirs_path,
+                            &change_to.path,
+                            mode,
+                        )
+                        .await
+                    {
+                        Err(err) => {
+                            // Could not merge, maybe file from binary to text, fall back to
+                            // mine/theirs conflict handling
+                            lore_debug!(
+                                "Merge as text failed base {}, mine {}, theirs {} - fallback to binary file conflict to {}: {}",
+                                base_path,
+                                change_to.path,
+                                theirs_path,
+                                absolute_path.display(),
+                                err
+                            );
+                            false
+                        }
+                        Ok(true) => {
+                            // Merged with conflict markers
+                            lore_debug!(
+                                "Merged as text with conflict markers, base {}, mine {}, theirs {}: {}",
+                                base_path,
+                                change_to.path,
+                                theirs_path,
+                                absolute_path.display()
+                            );
+                            true
+                        }
+                        Ok(false) => {
+                            // Merged with no conflicts
+                            lore_trace!(
+                                "Merged as text without any line conflicts: {}",
+                                absolute_path.display()
+                            );
+                            conflict = false;
+                            resolved = true;
+                            true
+                        }
+                    };
+
+                    if merged && !conflict {
+                        let _ = operation
+                            .remove(FilesystemPath::Repository(&base_path))
+                            .await;
+                        let _ = operation
+                            .remove(FilesystemPath::Repository(&theirs_path))
+                            .await;
+                        let _ = operation
+                            .remove(FilesystemPath::Repository(&mine_path))
+                            .await;
+                    }
+                } else {
+                    lore_debug!(
+                        "Merge identified binary file for unresolved conflict: {}",
+                        absolute_path.display()
+                    );
+
+                    // Realize the base file for binary conflicts so users can compare
+                    if change_from.from.node.is_valid_node_id() {
+                        lore_trace!("Realize base file for binary conflict {base_path}");
+                        let node_from = state_base
+                            .block(repository.clone(), NodeBlock::index(change_from.from.node))
+                            .await
+                            .forward::<SyncError>("Failed deserializing state node block")?
+                            .node(Node::index(change_from.from.node));
+                        if node_from.is_file() {
+                            realize_file(
+                                repository.clone(),
+                                operation.clone(),
+                                &base_path,
+                                node_from,
+                                Arc::default(),
+                            )
+                            .await?;
+                        }
                     }
                 }
+            } else {
+                lore_trace!("Target state node does not exist (deleted)");
             }
-        } else {
-            lore_trace!("Target state node does not exist (deleted)");
-        }
 
-        if dry_run {
-            let _ = operation
-                .remove(FilesystemPath::Repository(&base_path))
-                .await;
-            let _ = operation
-                .remove(FilesystemPath::Repository(&theirs_path))
-                .await;
-            let _ = operation
-                .remove(FilesystemPath::Repository(&mine_path))
-                .await;
+            if dry_run {
+                let _ = operation
+                    .remove(FilesystemPath::Repository(&base_path))
+                    .await;
+                let _ = operation
+                    .remove(FilesystemPath::Repository(&theirs_path))
+                    .await;
+                let _ = operation
+                    .remove(FilesystemPath::Repository(&mine_path))
+                    .await;
+            }
         }
 
         if let Some(state_stage) = state_stage.clone() {
-            let mut node = if change_to.to.node.is_valid_node_id() {
+            let mut node = if take_theirs && change_from.to.node.is_valid_node_id() {
+                change_from
+                    .to
+                    .state
+                    .node(change_from.to.repository.clone(), change_from.to.node)
+                    .await
+                    .forward::<SyncError>("Failed to resolve node in merge revisions")?
+            } else if change_to.to.node.is_valid_node_id() {
                 change_to
                     .to
                     .state
@@ -1857,7 +1909,13 @@ async fn realize_file_merge(
                 lore_error!("Unexpected merge conflict of deleted file in both incoming revisions");
                 return Err(SyncError::internal("Invalid change data"));
             };
-            if conflict && !change_to.to.node.is_valid_node_id() {
+            if take_theirs {
+                size = node.size;
+            }
+            if take_theirs && !change_from.to.node.is_valid_node_id() {
+                // The incoming side deleted the path, so adopting it deletes.
+                node.flags |= NodeFlags::StagedDelete;
+            } else if conflict && !change_to.to.node.is_valid_node_id() {
                 node.flags |= NodeFlags::StagedDelete;
 
                 operation
@@ -1870,6 +1928,9 @@ async fn realize_file_merge(
                 .bits();
 
             node.flags |= NodeFlags::StagedMerge;
+            if take_theirs {
+                node.flags |= NodeFlags::StagedMergeTheirs;
+            }
             if conflict {
                 node.flags |= NodeFlags::StagedMergeConflict;
             }
@@ -1886,8 +1947,16 @@ async fn realize_file_merge(
                 node.flags
             );
 
+            // The change's own context carries no view filter, so a
+            // view-excluded node reaches the staged state instead of being
+            // filtered out of it.
+            let stage_repository = if take_theirs {
+                change_to.to.repository.clone()
+            } else {
+                repository.clone()
+            };
             stage::stage_single_node(
-                repository.clone(),
+                stage_repository,
                 state_stage.clone(),
                 change_to.path.clone(),
                 node,

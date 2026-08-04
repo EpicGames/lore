@@ -769,6 +769,9 @@ async fn unstage_node(
                         }
                     }
 
+                    // The `or_default` guard dies at the `;`, so the shard lock is
+                    // not held across the await below.
+                    #[allow(clippy::disallowed_methods)]
                     discard
                         .entry(current_repository.id)
                         .or_default()

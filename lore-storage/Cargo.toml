@@ -22,7 +22,6 @@ libc = { workspace = true }
 lore-transport = { workspace = true }
 lz4-sys = { workspace = true }
 zstd-sys = { workspace = true }
-memmap2 = { workspace = true }
 opentelemetry = { workspace = true }
 parking_lot = { workspace = true }
 rand = { workspace = true }

@@ -799,7 +799,7 @@ mod stream_error_tests {
             let mut stream = request.into_inner();
             let (tx, rx) = mpsc::channel(100);
 
-            tokio::spawn(async move {
+            lore_spawn!(async move {
                 let mut count = 0;
                 while let Some(req) = stream.next().await {
                     let Ok(req) = req else { break };
@@ -832,7 +832,7 @@ mod stream_error_tests {
 
         let addr: SocketAddr = ([127, 0, 0, 1], port).into();
 
-        tokio::spawn(async move {
+        lore_spawn!(async move {
             tonic::transport::Server::builder()
                 .add_service(ReplicationServiceServer::new(service))
                 .serve(addr)
@@ -877,7 +877,7 @@ mod stream_error_tests {
         let mut join_set = tokio::task::JoinSet::new();
         for _ in 0..20 {
             let client = client.clone();
-            join_set.spawn(async move {
+            lore_spawn!(join_set, async move {
                 let repository = rand::random::<Partition>();
                 let (fragment, address, payload) = generate_random();
                 client

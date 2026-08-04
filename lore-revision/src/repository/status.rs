@@ -287,7 +287,9 @@ impl StatusSummaryStats {
             FileAction::Delete => &self.deletes,
             FileAction::Move => &self.moves,
             FileAction::Copy => &self.copies,
-            FileAction::Keep => &self.modifies,
+            // A graft replaces a directory's subtree. Count it as a
+            // modification of that directory.
+            FileAction::Graft | FileAction::Keep => &self.modifies,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }

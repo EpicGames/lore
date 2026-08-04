@@ -254,7 +254,7 @@ mod tests {
             .expect("bind test jwks server");
         let address = listener.local_addr().expect("get test jwks server address");
 
-        tokio::spawn(async move {
+        lore_base::lore_spawn!(async move {
             axum::serve(listener, app)
                 .await
                 .expect("serve test jwks server");

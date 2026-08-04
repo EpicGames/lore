@@ -86,7 +86,7 @@ def test_sync(new_lore_repo):
     repo.push()
     repo.repository_verify()
 
-    clone = repo.clone(direct_file_io=True)
+    clone = repo.clone()
 
     # Verify files contents, mode and last modified timestamp
 

@@ -17,8 +17,11 @@ use lore_storage::StoreError;
 use lore_storage::validate_fragment_list;
 use lore_storage::validate_fragment_metadata;
 use lore_telemetry::InstrumentProvider;
+use lore_telemetry::LabelArray;
 use lore_telemetry::tracing::fields::ADDRESS;
+use opentelemetry::KeyValue;
 use opentelemetry::metrics::Histogram;
+use smallvec::SmallVec;
 use tracing::debug;
 use tracing::warn;
 
@@ -31,6 +34,8 @@ use crate::protocol::storage::messages::MessageHandleError;
 use crate::protocol::storage::messages::MessageParseError;
 use crate::protocol::storage::messages::Response;
 use crate::util::setup_execution;
+
+const METRICS_COMPRESSION_LABEL: &str = "fragment_compression";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Put {
@@ -96,14 +101,24 @@ struct PutInstrument {
 }
 
 impl PutInstrument {
-    fn payload_size(&self, size: u32) {
-        self.payload_size_histogram
-            .record(size as u64, self.provider.labels());
+    fn fragment_labels(&self, fragment: &Fragment) -> LabelArray {
+        let mut labels = SmallVec::new();
+        labels.extend(self.provider.labels().iter().cloned());
+
+        labels.push(KeyValue::new(
+            METRICS_COMPRESSION_LABEL,
+            FragmentFlags::compression_label(fragment.flags),
+        ));
+
+        labels
     }
 
-    fn content_size(&self, size: u64) {
-        self.content_size_histogram
-            .record(size, self.provider.labels());
+    fn payload_size(&self, size: u32, labels: &[KeyValue]) {
+        self.payload_size_histogram.record(size as u64, labels);
+    }
+
+    fn content_size(&self, size: u64, labels: &[KeyValue]) {
+        self.content_size_histogram.record(size, labels);
     }
 }
 
@@ -239,8 +254,6 @@ pub async fn handle_put(
     );
 
     let instruments = instruments();
-    instruments.payload_size(put.fragment.size_payload);
-    instruments.content_size(put.fragment.size_content);
 
     let address = put.address;
     let fragment = put.fragment;
@@ -253,6 +266,20 @@ pub async fn handle_put(
 
             let mut fragment = fragment;
             fragment.flags &= !FragmentFlags::PayloadStored;
+
+            // Transcode incoming Oodle payloads to Zstd.
+            // The hash is over uncompressed content, so the address is unchanged.
+            #[cfg(feature = "oodle")]
+            let (fragment, payload) = crate::protocol::oodle_ingress::convert_oodle_on_ingress(
+                address, fragment, payload,
+            )
+            .await;
+
+            {
+                let labels = instruments.fragment_labels(&fragment);
+                instruments.payload_size(put.fragment.size_payload, &labels);
+                instruments.content_size(put.fragment.size_content, &labels);
+            }
 
             match immutable_store
                 .put(repository, address, fragment, payload, false)

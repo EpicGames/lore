@@ -1129,6 +1129,9 @@ impl From<u32> for LoreFileAction {
             return LoreFileAction::Copy;
         }
 
+        // `FileAction::Graft` maps here too. A graft replaces a directory's
+        // subtree, which reads as a modification, and the C enum stays
+        // unchanged.
         LoreFileAction::Keep
     }
 }

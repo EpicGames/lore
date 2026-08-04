@@ -6,7 +6,6 @@ from lore import Lore
 
 
 @pytest.mark.regression
-@pytest.mark.bug_reproduction
 def test_directory_to_file(new_lore_repo):
     repo: Lore = new_lore_repo()
 

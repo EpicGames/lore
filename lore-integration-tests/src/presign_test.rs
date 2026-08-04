@@ -30,6 +30,8 @@ mod presign_tests {
             min_ttl_seconds: 1,
             default_ttl_seconds: 3600,
             max_ttl_seconds: 86400,
+            content_type_allowlist:
+                lore_server::http::security_headers::ContentTypeAllowlist::default(),
         }
     }
 

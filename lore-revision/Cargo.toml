@@ -27,7 +27,6 @@ infer = { workspace = true }
 jsonwebtoken = { workspace = true }
 keyring = { workspace = true }
 libc = { workspace = true }
-memmap2 = { workspace = true }
 open = "5.3.2"
 opentelemetry = { workspace = true }
 parking_lot = { workspace = true }

@@ -6,7 +6,12 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+// Required, not redundant: `#[error_set]` expands to paths rooted at `lore_error_set`.
+use lore::error_set as lore_error_set;
+use lore::error_set::prelude::*;
 use lore::interface::LoreEvent;
+use lore::lore_spawn;
+use lore::lore_spawn_blocking;
 use lore::remote::connection::ConnectionError;
 use lore::remote::connection::ConnectionErrorWithId;
 use lore::remote::connection::ConnectionId;
@@ -19,8 +24,6 @@ use lore::remote::message::write_v1_message;
 use lore::remote::network::UdsListener;
 use lore::remote::network::UdsStream;
 use lore::remote::network::uds_supported;
-use lore::runtime;
-use lore_error_set::prelude::*;
 use tokio::sync::mpsc;
 
 use crate::eprintln;
@@ -80,7 +83,9 @@ pub async fn service_main(
     let shutting_down = Arc::new(AtomicBool::new(false));
     let accept_shutting_down = Arc::clone(&shutting_down);
 
-    let accept_task = runtime().spawn_blocking(move || {
+    // Parks a blocking thread for the service's lifetime; pinned to core because
+    // it would occupy net's single blocking thread outright.
+    let accept_task = lore_spawn_blocking!(move || {
         let mut connection_id = 0;
         loop {
             match listener.accept() {
@@ -90,7 +95,7 @@ pub async fn service_main(
                     }
                     let new_connection_id = connection_id;
                     connection_id += 1;
-                    runtime().spawn(async move {
+                    lore_spawn!(async move {
                         IpcConnection::new(ConnectionId(new_connection_id), stream)
                             .handle_connection()
                             .await;
@@ -149,8 +154,7 @@ impl IpcConnection {
     ) -> Result<(), ConnectionError> {
         let message_bytes = write_v1_message(message, serialization_type)
             .forward::<ConnectionError>("writing message")?;
-        runtime()
-            .spawn_blocking(move || stream.writer().write_all(message_bytes.as_slice()))
+        lore_spawn_blocking!(move || stream.writer().write_all(message_bytes.as_slice()))
             .await
             .internal("failed writing")?
             .internal("io")?;
@@ -169,11 +173,13 @@ impl IpcConnection {
 
     async fn handle_connection_impl(self) -> Result<(), ConnectionError> {
         let mut connection = self.connection.try_clone().internal("cloning connection")?;
-        let message: Option<(V1Header, MessageToServer)> = runtime()
-            .spawn_blocking(move || blocking_read_v1_message(connection.reader()))
-            .await
-            .internal("failed reading")?
-            .forward::<ConnectionError>("reading message")?;
+        // Parks a core blocking thread until the peer sends or hangs up, so live
+        // connections consume core's blocking pool one thread apiece.
+        let message: Option<(V1Header, MessageToServer)> =
+            lore_spawn_blocking!(move || blocking_read_v1_message(connection.reader()))
+                .await
+                .internal("failed reading")?
+                .forward::<ConnectionError>("reading message")?;
 
         let Some((header, command)) = message else {
             return Ok(());
@@ -185,7 +191,7 @@ impl IpcConnection {
         let (to_client_sender, mut to_client_receiver) =
             mpsc::unbounded_channel::<(MessageToClient, SerializationType)>();
 
-        runtime().spawn(async move {
+        lore_spawn!(async move {
             let sender = to_client_sender.clone();
 
             // Note: this callback is intentionally NOT wrapped with .with_defaults().

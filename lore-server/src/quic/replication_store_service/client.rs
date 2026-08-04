@@ -10,8 +10,6 @@ use bytes::Bytes;
 use lore_base::error::AddressNotFound;
 use lore_base::error::PayloadNotFound;
 use lore_base::error::SlowDown;
-use lore_base::runtime::LORE_CONTEXT;
-use lore_base::runtime::runtime;
 use lore_base::types::Address;
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 use lore_base::types::Fragment;
@@ -172,19 +170,11 @@ pub struct ReplicationStoreClient {
 
 impl Drop for ReplicationStoreClient {
     fn drop(&mut self) {
-        let runtime = runtime();
-        if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
-            // Only in tests, here we cannot block in place to call the async flush
-            // Just ignore for now, until we actually need to flush on drop in tests
-        } else {
-            trace!("ReplicationStoreClient drop block on readers in place");
-            tokio::task::block_in_place(move || {
-                runtime.block_on(LORE_CONTEXT.scope(execution_context(), async move {
-                    self.quic.close().await;
-                }));
-            });
-        }
-
+        // Close the QUIC connection immediately without draining streams. Quinn sends
+        // a CLOSE frame and RSTs open streams; the server cleans up sessions on
+        // connection close. Non-blocking, so Drop never stalls a per-core worker -
+        // this fires on every client refresh/reconnect, not just at shutdown.
+        self.quic.close_immediate();
         trace!("ReplicationStoreClient dropped");
     }
 }

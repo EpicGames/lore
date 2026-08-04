@@ -11,6 +11,7 @@ use tokio::task::JoinSet;
 use crate::change;
 use crate::change::NodeChangeState;
 use crate::filter::FilterMode;
+use crate::lore::Address;
 use crate::lore_debug;
 use crate::lore_drain_tasks;
 use crate::lore_trace;
@@ -20,6 +21,7 @@ use crate::node::NodeBlock;
 use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::NodeIDExt;
+use crate::repository::RepositoryContext;
 use crate::state::ChangeSink;
 use crate::state::OwnedChangeSink;
 use crate::state::State;
@@ -30,11 +32,88 @@ use crate::state::add_change;
 use crate::state::named_node_sort;
 use crate::util::path::RelativePath;
 
+/// Decides whether a source subtree can be adopted whole during a merge.
+///
+/// Two things must hold. The view must exclude the whole subtree, so nothing in
+/// it reaches the working tree. And the target's version of the directory must
+/// be byte-identical to the base's, which means the branch changed nothing
+/// inside it at any depth.
+pub struct GraftOracle {
+    repository: Arc<RepositoryContext>,
+    state_target: Arc<State>,
+    view: Arc<crate::filter::Filter>,
+}
+
+impl GraftOracle {
+    pub fn new(
+        repository: Arc<RepositoryContext>,
+        state_target: Arc<State>,
+        view: Arc<crate::filter::Filter>,
+    ) -> Self {
+        Self {
+            repository,
+            state_target,
+            view,
+        }
+    }
+
+    /// True when `path` in the target tree still matches `base_address` and
+    /// holds no uncommitted work.
+    async fn adoptable(&self, path: &RelativePath, base_address: Address) -> bool {
+        // An out-of-view subtree never reaches the working tree, so merging it
+        // is a tree operation only. An in-view subtree keeps the per-file
+        // merge, because there the detail is needed on disk.
+        //
+        // Every descendant must be excluded, not just the directory node.
+        if !self.view.excludes_subtree(path, FilterMode::View) {
+            return false;
+        }
+        let Ok(link) = self
+            .state_target
+            .find_node_link(self.repository.clone(), path.as_str())
+            .await
+        else {
+            return false;
+        };
+        if !link.is_valid_or_root() {
+            return false;
+        }
+        // `find_node_link` resolves through links. A path in another
+        // repository is merged through that link instead.
+        if link.repository != self.repository.id {
+            return false;
+        }
+        let Ok(node) = self
+            .state_target
+            .node(self.repository.clone(), link.node)
+            .await
+        else {
+            return false;
+        };
+        if node.is_link() || node.is_file() {
+            return false;
+        }
+        // Target's subtree is identical to base's.
+        if node.address != base_address {
+            return false;
+        }
+        // Do not adopt over uncommitted work.
+        if node.is_staged() || node.is_dirty() {
+            return false;
+        }
+        self.state_target
+            .node_has_staged_children(self.repository.clone(), link.node)
+            .await
+            .is_ok_and(|has_staged| !has_staged)
+    }
+}
+
 pub async fn diff_subtree(
     from: NodeChangeState,
     to: NodeChangeState,
     path: RelativePath,
     flags: u32,
+    graft: Option<Arc<GraftOracle>>,
     sink: &mut ChangeSink<'_>,
     filter_mode: FilterMode,
 ) -> Result<(), StateError> {
@@ -51,6 +130,7 @@ pub async fn diff_subtree(
             to: path,
         },
         flags,
+        graft,
         sink,
         filter_mode,
     )
@@ -62,12 +142,13 @@ fn recurse_diff_subtree_node(
     to: NodeChangeState,
     paths: DiffPaths,
     flags: u32,
+    graft: Option<Arc<GraftOracle>>,
     mut sink: OwnedChangeSink,
     filter_mode: FilterMode,
 ) -> Pin<Box<dyn Future<Output = Result<OwnedChangeSink, StateError>> + Send>> {
     Box::pin(async move {
         let mut local = sink.as_sink();
-        diff_subtree_node(from, to, paths, flags, &mut local, filter_mode).await?;
+        diff_subtree_node(from, to, paths, flags, graft, &mut local, filter_mode).await?;
         Ok(sink)
     })
 }
@@ -82,6 +163,7 @@ async fn diff_subtree_node(
     to: NodeChangeState,
     paths: DiffPaths,
     flags: u32,
+    graft: Option<Arc<GraftOracle>>,
     sink: &mut ChangeSink<'_>,
     filter_mode: FilterMode,
 ) -> Result<(), StateError> {
@@ -101,6 +183,7 @@ async fn diff_subtree_node(
         &to,
         &paths,
         flags,
+        graft,
         sink,
         filter_mode,
         &from_nodes,
@@ -127,6 +210,7 @@ async fn diff_subtree_node_walk(
     to: &NodeChangeState,
     paths: &DiffPaths,
     flags: u32,
+    graft: Option<Arc<GraftOracle>>,
     sink: &mut ChangeSink<'_>,
     filter_mode: FilterMode,
     from_nodes: &StateChildrenNodes,
@@ -183,6 +267,7 @@ async fn diff_subtree_node_walk(
             add_change_for_paired_nodes(
                 subtasks,
                 flags,
+                graft.clone(),
                 DiffContext {
                     sink,
                     from_nodes,
@@ -365,6 +450,7 @@ async fn add_change_for_solo_to_node(
 async fn add_change_for_paired_nodes(
     subtasks: &mut JoinSet<Result<OwnedChangeSink, StateError>>,
     flags: u32,
+    graft: Option<Arc<GraftOracle>>,
     context: DiffContext<'_, '_>,
     to_named_node: &StateNamedNode,
     from_node_id: NodeID,
@@ -544,6 +630,9 @@ async fn add_change_for_paired_nodes(
                                     to: subpath,
                                 },
                                 flags,
+                                // A linked repository merges through its own
+                                // link.
+                                None,
                                 task_sink,
                                 filter_mode,
                             )
@@ -551,25 +640,52 @@ async fn add_change_for_paired_nodes(
                         });
                     }
                 } else {
-                    lore_trace!(
-                        "Diff node {subpath} directory hash change from {from_address} to {to_address}, recurse diff"
-                    );
-                    let from_path = from_path.clone();
-                    let task_sink = sink.task_sink();
-                    lore_spawn!(subtasks, async move {
-                        recurse_diff_subtree_node(
-                            from,
-                            to,
-                            DiffPaths {
-                                from: from_path,
-                                to: subpath,
-                            },
-                            flags,
-                            task_sink,
+                    // Source changed this directory and the target branch did
+                    // not, so nothing inside needs a three-way merge. Emit one
+                    // change for the subtree instead of one per file.
+                    let adopted = match graft.as_ref() {
+                        Some(oracle) if !hash_equal => {
+                            oracle.adoptable(&subpath, from_address).await
+                        }
+                        _ => false,
+                    };
+
+                    if adopted {
+                        lore_trace!(
+                            "Diff node {subpath} unchanged on target, grafting subtree {from_address} -> {to_address}"
+                        );
+                        add_change(
+                            from.clone(),
+                            to.clone(),
+                            change::FileAction::Graft,
+                            &subpath,
+                            None,
+                            sink,
                             filter_mode,
                         )
-                        .await
-                    });
+                        .await?;
+                    } else {
+                        lore_trace!(
+                            "Diff node {subpath} directory hash change from {from_address} to {to_address}, recurse diff"
+                        );
+                        let from_path = from_path.clone();
+                        let task_sink = sink.task_sink();
+                        lore_spawn!(subtasks, async move {
+                            recurse_diff_subtree_node(
+                                from,
+                                to,
+                                DiffPaths {
+                                    from: from_path,
+                                    to: subpath,
+                                },
+                                flags,
+                                graft,
+                                task_sink,
+                                filter_mode,
+                            )
+                            .await
+                        });
+                    }
                 }
             }
         } else {

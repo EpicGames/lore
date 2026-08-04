@@ -4,6 +4,8 @@ pub use lore_telemetry::execution_state::ServerExecutionState;
 
 #[cfg(test)]
 mod tests {
+    use lore_base::lore_spawn;
+
     use super::*;
 
     #[test]
@@ -94,7 +96,7 @@ mod tests {
             .unwrap();
 
         let observed_id = rt.block_on(LORE_CONTEXT.scope(execution, async {
-            let handle = tokio::spawn(
+            let handle = lore_spawn!(
                 LORE_CONTEXT.scope(lore_revision::runtime::execution_context(), async {
                     get_current_span_id().await
                 }),

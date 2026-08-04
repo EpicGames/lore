@@ -31,6 +31,7 @@ use crate::error::LoreResultExt;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
+use crate::filter::FilterMode;
 use crate::immutable;
 use crate::infer;
 use crate::interface::LoreArray;
@@ -1968,47 +1969,66 @@ async fn commit_file(
         node.flags
     );
 
-    if node.address.context.is_zero() {
-        // TODO(mjansson): Optionally find previous identical file content and deduplicate by using same context
-        node.address.context = uuid::Uuid::now_v7().into();
-        lore_trace!(
-            "Generate file ID for file: {} {}",
-            relative_path.as_str(),
-            node.address.context
-        );
-    }
+    // A sparse checkout has no working-tree file for a view-excluded path, so
+    // the staged content hash is the only source. Re-fragmenting would read a
+    // file that is absent or stale.
+    //
+    // This test must stay identical to the one realize gates disk writes on
+    // (`fs/realize.rs`), because that is what decided whether the file was
+    // written.
+    let (address, content_size, mode) =
+        if repository
+            .filter
+            .excludes(&relative_path, false, FilterMode::View)
+        {
+            (node.address, node.size, node.mode)
+        } else {
+            if node.address.context.is_zero() {
+                // TODO(mjansson): Optionally find previous identical file content and deduplicate by using same context
+                node.address.context = uuid::Uuid::now_v7().into();
+                lore_trace!(
+                    "Generate file ID for file: {} {}",
+                    relative_path.as_str(),
+                    node.address.context
+                );
+            }
 
-    let (address, fragment) = immutable::write_from_file_with_tracker(
-        repository.clone(),
-        absolute_path.as_path(),
-        node.address.context,
-        immutable::write_options_from_repository(repository.clone()),
-        Some(tracker),
-    )
-    .await
-    .forward_with::<CommitError, _>(|| {
-        format!(
-            "Failed writing file {} to immutable store",
-            relative_path.as_str()
-        )
-    })?;
+            let (address, fragment) = immutable::write_from_file_with_tracker(
+                repository.clone(),
+                absolute_path.as_path(),
+                node.address.context,
+                immutable::write_options_from_repository(repository.clone()),
+                Some(tracker),
+            )
+            .await
+            .forward_with::<CommitError, _>(|| {
+                format!(
+                    "Failed writing file {} to immutable store",
+                    relative_path.as_str()
+                )
+            })?;
 
-    stats
-        .complete
-        .bytes_transferred
-        .fetch_add(fragment.size_content, Ordering::Relaxed);
+            stats
+                .complete
+                .bytes_transferred
+                .fetch_add(fragment.size_content, Ordering::Relaxed);
 
-    let Ok(metadata) = tokio::fs::metadata(absolute_path.as_path()).await else {
-        return Err(CommitError::internal(format!(
-            "Failed to get metadata for file {}",
-            absolute_path.display()
-        )));
-    };
+            let Ok(metadata) = tokio::fs::metadata(absolute_path.as_path()).await else {
+                return Err(CommitError::internal(format!(
+                    "Failed to get metadata for file {}",
+                    absolute_path.display()
+                )));
+            };
 
-    let mode = util::fs::metadata_to_mode(&metadata, node.mode);
+            (
+                address,
+                fragment.size_content,
+                util::fs::metadata_to_mode(&metadata, node.mode),
+            )
+        };
 
     let modified = util::fs::mode_changed(node.mode, mode)
-        || node.size != fragment.size_content
+        || node.size != content_size
         || node.address.hash != address.hash;
 
     if modified
@@ -2040,7 +2060,7 @@ async fn commit_file(
             let node = block_writer.node(node_index);
 
             node.address = address;
-            node.size = fragment.size_content;
+            node.size = content_size;
             node.mode = mode;
             node.child = 0;
 

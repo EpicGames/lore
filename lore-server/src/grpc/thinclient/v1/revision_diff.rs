@@ -463,6 +463,8 @@ async fn run_three_way(
             autoresolve,
             Some(config.source_cap),
             config.history_walk_concurrency,
+            // The display diff reports every changed path individually.
+            None,
             producer_tx,
         ))
         .await

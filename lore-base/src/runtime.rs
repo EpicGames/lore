@@ -4,6 +4,7 @@ use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::task::Context;
@@ -190,6 +191,158 @@ macro_rules! lore_spawn {
             }
         }
     }};
+    // Trailing-comma forms, so a multi-line call formats like any other.
+    ($joinset:ident, $name:literal, $expression:expr,) => {
+        $crate::lore_spawn!($joinset, $name, $expression)
+    };
+    ($joinset:ident, $expression:expr,) => {
+        $crate::lore_spawn!($joinset, $expression)
+    };
+    ($name_lit:literal, $expression:expr,) => {
+        $crate::lore_spawn!($name_lit, $expression)
+    };
+    ($expression:expr,) => {
+        $crate::lore_spawn!($expression)
+    };
+}
+
+/// Spawns a task on the dedicated network runtime with `LORE_CONTEXT`
+/// propagated — same variants and semantics as [`lore_spawn!`], different
+/// runtime. Use for quinn/tonic construction, transport loops and stream
+/// multiplexers; never for compute or file I/O.
+#[macro_export]
+macro_rules! lore_spawn_net {
+    ($joinset:ident, $expression:expr) => {{
+        #[allow(clippy::disallowed_methods)]
+        {
+            let __task = $crate::runtime::ObservedTask::new($expression);
+            if let Some(__ctx) = $crate::runtime::try_lore_context() {
+                $joinset.spawn_on(
+                    $crate::runtime::LORE_CONTEXT.scope(__ctx, __task),
+                    &$crate::runtime::net_runtime(),
+                )
+            } else {
+                $joinset.spawn_on(__task, &$crate::runtime::net_runtime())
+            }
+        }
+    }};
+    ($expression:expr) => {{
+        #[allow(clippy::disallowed_methods)]
+        {
+            let __task = $crate::runtime::ObservedTask::new($expression);
+            if let Some(__ctx) = $crate::runtime::try_lore_context() {
+                $crate::runtime::net_runtime()
+                    .spawn($crate::runtime::LORE_CONTEXT.scope(__ctx, __task))
+            } else {
+                $crate::runtime::net_runtime().spawn(__task)
+            }
+        }
+    }};
+    // Trailing-comma forms, so a multi-line call formats like any other.
+    ($joinset:ident, $expression:expr,) => {
+        $crate::lore_spawn_net!($joinset, $expression)
+    };
+    ($expression:expr,) => {
+        $crate::lore_spawn_net!($expression)
+    };
+}
+
+/// Spawns a task on the network runtime **without** propagating `LORE_CONTEXT`.
+///
+/// For transport tasks that outlive the command which happens to create them. A `LORE_CONTEXT`
+/// belongs to one command, so a connection-lifetime task that captured one would go on
+/// reporting that command's correlation id while serving every later command — misattribution
+/// rather than attribution. Use [`lore_spawn_net!`] for anything scoped to the command that
+/// spawns it.
+#[macro_export]
+macro_rules! lore_spawn_net_nocontext {
+    ($expression:expr) => {{
+        #[allow(clippy::disallowed_methods)]
+        {
+            $crate::runtime::net_runtime().spawn($crate::runtime::ObservedTask::new($expression))
+        }
+    }};
+    ($expression:expr,) => {
+        $crate::lore_spawn_net_nocontext!($expression)
+    };
+}
+
+/// Spawns a task on the core runtime with `LORE_CONTEXT` propagated — same
+/// variants and semantics as [`lore_spawn!`], but pinned rather than following
+/// the current runtime.
+///
+/// Use this at a transport-to-handler boundary: a task spawned with
+/// [`lore_spawn!`] from code already running on net stays on net, and so does
+/// everything it spawns in turn, which would put compute and file I/O on net's
+/// single blocking thread. Inside handler code reached through such a boundary,
+/// plain [`lore_spawn!`] is correct — it inherits core from its caller.
+#[macro_export]
+macro_rules! lore_spawn_core {
+    ($joinset:ident, $name:literal, $expression:expr) => {{
+        #[allow(clippy::disallowed_methods)]
+        {
+            let __task = $crate::runtime::ObservedTask::new($expression);
+            if let Some(__ctx) = $crate::runtime::try_lore_context() {
+                $joinset.spawn_on(
+                    $crate::runtime::LORE_CONTEXT.scope(__ctx, __task),
+                    &$crate::runtime::core_runtime(),
+                )
+            } else {
+                $joinset.spawn_on(__task, &$crate::runtime::core_runtime())
+            }
+        }
+    }};
+    ($joinset:ident, $expression:expr) => {{
+        #[allow(clippy::disallowed_methods)]
+        {
+            let __task = $crate::runtime::ObservedTask::new($expression);
+            if let Some(__ctx) = $crate::runtime::try_lore_context() {
+                $joinset.spawn_on(
+                    $crate::runtime::LORE_CONTEXT.scope(__ctx, __task),
+                    &$crate::runtime::core_runtime(),
+                )
+            } else {
+                $joinset.spawn_on(__task, &$crate::runtime::core_runtime())
+            }
+        }
+    }};
+    ($name:literal, $expression:expr) => {{
+        #[allow(clippy::disallowed_methods)]
+        {
+            let __task = $crate::runtime::ObservedTask::new($expression);
+            if let Some(__ctx) = $crate::runtime::try_lore_context() {
+                $crate::runtime::core_runtime()
+                    .spawn($crate::runtime::LORE_CONTEXT.scope(__ctx, __task))
+            } else {
+                $crate::runtime::core_runtime().spawn(__task)
+            }
+        }
+    }};
+    ($expression:expr) => {{
+        #[allow(clippy::disallowed_methods)]
+        {
+            let __task = $crate::runtime::ObservedTask::new($expression);
+            if let Some(__ctx) = $crate::runtime::try_lore_context() {
+                $crate::runtime::core_runtime()
+                    .spawn($crate::runtime::LORE_CONTEXT.scope(__ctx, __task))
+            } else {
+                $crate::runtime::core_runtime().spawn(__task)
+            }
+        }
+    }};
+    // Trailing-comma forms, so a multi-line call formats like any other.
+    ($joinset:ident, $name:literal, $expression:expr,) => {
+        $crate::lore_spawn_core!($joinset, $name, $expression)
+    };
+    ($joinset:ident, $expression:expr,) => {
+        $crate::lore_spawn_core!($joinset, $expression)
+    };
+    ($name_lit:literal, $expression:expr,) => {
+        $crate::lore_spawn_core!($name_lit, $expression)
+    };
+    ($expression:expr,) => {
+        $crate::lore_spawn_core!($expression)
+    };
 }
 
 /// Spawns a blocking task with `LORE_CONTEXT` set.
@@ -203,10 +356,10 @@ macro_rules! lore_spawn_blocking {
             if let Some(__ctx) = $crate::runtime::try_lore_context() {
                 $joinset.spawn_blocking_on(
                     move || $crate::runtime::LORE_CONTEXT.sync_scope(__ctx, $expression),
-                    &$crate::runtime::runtime(),
+                    &$crate::runtime::core_runtime(),
                 )
             } else {
-                $joinset.spawn_blocking_on($expression, &$crate::runtime::runtime())
+                $joinset.spawn_blocking_on($expression, &$crate::runtime::core_runtime())
             }
         }
     }};
@@ -216,10 +369,10 @@ macro_rules! lore_spawn_blocking {
             if let Some(__ctx) = $crate::runtime::try_lore_context() {
                 $joinset.spawn_blocking_on(
                     move || $crate::runtime::LORE_CONTEXT.sync_scope(__ctx, $expression),
-                    &$crate::runtime::runtime(),
+                    &$crate::runtime::core_runtime(),
                 )
             } else {
-                $joinset.spawn_blocking_on($expression, &$crate::runtime::runtime())
+                $joinset.spawn_blocking_on($expression, &$crate::runtime::core_runtime())
             }
         }
     }};
@@ -227,11 +380,11 @@ macro_rules! lore_spawn_blocking {
         #[allow(clippy::disallowed_methods)]
         {
             if let Some(__ctx) = $crate::runtime::try_lore_context() {
-                $crate::runtime::runtime().spawn_blocking(move || {
+                $crate::runtime::core_runtime().spawn_blocking(move || {
                     $crate::runtime::LORE_CONTEXT.sync_scope(__ctx, $expression)
                 })
             } else {
-                $crate::runtime::runtime().spawn_blocking($expression)
+                $crate::runtime::core_runtime().spawn_blocking($expression)
             }
         }
     }};
@@ -239,11 +392,11 @@ macro_rules! lore_spawn_blocking {
         #[allow(clippy::disallowed_methods)]
         {
             if let Some(__ctx) = $crate::runtime::try_lore_context() {
-                $crate::runtime::runtime().spawn_blocking(move || {
+                $crate::runtime::core_runtime().spawn_blocking(move || {
                     $crate::runtime::LORE_CONTEXT.sync_scope(__ctx, $expression)
                 })
             } else {
-                $crate::runtime::runtime().spawn_blocking($expression)
+                $crate::runtime::core_runtime().spawn_blocking($expression)
             }
         }
     }};
@@ -332,34 +485,106 @@ macro_rules! lore_spawn_guarded {
     }};
 }
 
-static DEFAULT_RUNTIME: Mutex<Option<tokio::runtime::Runtime>> = Mutex::new(None);
-static DEFAULT_THREAD_KEEP_ALIVE_SECONDS: u64 = 10;
-
-/// Shared compute thread pool used by CPU-bound work (compression, hashing,
-/// etc.) that needs isolation from rayon's global pool and from the tokio
-/// runtime. `OnceLock` gives a lock-free reference on the hot path; the
-/// pool is eagerly built alongside the tokio runtime in
-/// [`runtime_with_settings`] so the first dispatch does not pay init cost.
-/// Not dropped at shutdown — tokio drain ensures no work is in flight, and
-/// process exit terminates the worker threads.
-static COMPUTE_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-
-/// Stack size for compute-pool worker threads. Compression (zstd/oodle/lz4),
-/// hashing and similar CPU-bound work hold their state in heap-allocated
-/// contexts and scratch buffers, not on the stack. 256 KiB leaves generous
-/// headroom compared with the few-KiB the worker hot path actually uses,
-/// while saving ~1.75 MiB of virtual memory per worker vs the Rust default
-/// (2 MiB on Linux).
-const COMPUTE_POOL_STACK_SIZE: usize = 256 * 1024;
-
-fn build_compute_pool() -> rayon::ThreadPool {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(compute_pool_thread_count())
-        .thread_name(|i| format!("lore-compute-{i}"))
-        .stack_size(COMPUTE_POOL_STACK_SIZE)
-        .build()
-        .expect("Failed to build compute pool")
+/// A process-wide tokio runtime, built once on first use.
+///
+/// The handle is cached because the pinned spawn macros read it on request
+/// paths — `lore_spawn_core!` once per inbound gRPC and HTTP request,
+/// `lore_spawn_net!` once per QUIC stream and once per AWS SDK request — so
+/// resolving a runtime is a load rather than a process-global lock.
+struct SharedRuntime {
+    handle: Handle,
+    /// The runtime, owned through a pointer because `shutdown_timeout`
+    /// consumes it and a `&'static Self` cannot give up ownership.
+    /// [`SharedRuntime::take`] swaps it out for shutdown.
+    runtime: AtomicPtr<tokio::runtime::Runtime>,
 }
+
+impl SharedRuntime {
+    fn new(runtime: tokio::runtime::Runtime) -> Self {
+        Self {
+            handle: runtime.handle().clone(),
+            runtime: AtomicPtr::new(Box::into_raw(Box::new(runtime))),
+        }
+    }
+
+    /// Claims the runtime for shutdown, leaving the cached handle behind.
+    /// Returns `None` once any caller has claimed it.
+    fn take(&self) -> Option<tokio::runtime::Runtime> {
+        let runtime = self.runtime.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if runtime.is_null() {
+            return None;
+        }
+        // SAFETY: The pointer comes from `Box::into_raw` in `new`, and the swap
+        // hands it to exactly one caller, so this reclaims the box once.
+        Some(*unsafe { Box::from_raw(runtime) })
+    }
+}
+
+/// Core runtime — see [`core_runtime`].
+static CORE_RUNTIME: OnceLock<SharedRuntime> = OnceLock::new();
+
+/// Network runtime — see [`net_runtime`].
+static NET_RUNTIME: OnceLock<SharedRuntime> = OnceLock::new();
+
+/// Process-configured net-runtime default thread count (the server sets one
+/// per processor at startup; unset means the client default).
+static NET_THREADS_DEFAULT: OnceLock<usize> = OnceLock::new();
+
+/// Net runtime worker threads when nothing configures it: one user's worth
+/// of QUIC streams and gRPC channels.
+const DEFAULT_NET_THREADS: usize = 2;
+
+/// Sets the process-default net-runtime thread count — the server sets one
+/// per processor, since serving thousands of concurrent client connections
+/// is its normal case. Must run before the net runtime is first used;
+/// returns false if a default was already set.
+pub fn set_net_threads_default(count: usize) -> bool {
+    NET_THREADS_DEFAULT.set(count.max(1)).is_ok()
+}
+
+/// Net runtime worker threads: `LORE_NET_THREADS` if set, else the
+/// process-configured default (e.g. the server's one-per-processor), else the
+/// net share of the client thread budget (see [`thread_counts`]).
+pub fn default_net_threads() -> usize {
+    env_thread_override("LORE_NET_THREADS")
+        .or_else(|| NET_THREADS_DEFAULT.get().copied())
+        .unwrap_or_else(|| budget_thread_counts().net)
+}
+
+/// Handle to the dedicated network runtime, created lazily on first use.
+///
+/// quinn/tonic driver tasks and transport loops live here so QUIC packet
+/// processing, TLS, HTTP/2 framing and protocol timers are never delayed
+/// by compute or file-I/O continuations saturating the core runtime;
+/// per-request futures remain waker-only and are awaited directly from
+/// core tasks. No blocking work belongs on this runtime — its blocking
+/// pool is pinned to a single thread so a stray `spawn_blocking` cannot
+/// grow it.
+///
+/// Built once per process: after [`runtime_shutdown_timeout`] this keeps
+/// returning the shut-down handle, so late spawns are dropped rather than
+/// resurrecting a runtime with fresh threads during teardown.
+pub fn net_runtime() -> Handle {
+    NET_RUNTIME
+        .get_or_init(|| SharedRuntime::new(build_net_runtime()))
+        .handle
+        .clone()
+}
+
+fn build_net_runtime() -> tokio::runtime::Runtime {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
+        .enable_all()
+        .worker_threads(default_net_threads())
+        .max_blocking_threads(1)
+        .thread_keep_alive(Duration::from_secs(default_thread_keep_alive()))
+        .thread_name_fn(|| {
+            static ID: AtomicUsize = AtomicUsize::new(0);
+            format!("lore-net-{}", ID.fetch_add(1, Ordering::Relaxed))
+        });
+    builder.build().expect("Failed to create net runtime")
+}
+static DEFAULT_THREAD_KEEP_ALIVE_SECONDS: u64 = 10;
 
 #[cfg(target_os = "windows")]
 fn platform_processor_count() -> usize {
@@ -388,8 +613,8 @@ pub fn processor_count() -> usize {
     }
 }
 
-/// Optional ceiling on the *sum* of the worker, blocking and compute pool
-/// sizes. Set once via [`set_thread_limit`]; `0` means "no limit". The
+/// Optional ceiling on the *sum* of the worker, blocking, and net pool sizes.
+/// Set once via [`set_thread_limit`]; `0` means "no limit". The
 /// `LORE_MAX_THREADS` env var overrides it when set above zero. See
 /// [`thread_limit`] and [`thread_counts`].
 static THREAD_LIMIT: OnceLock<usize> = OnceLock::new();
@@ -419,20 +644,22 @@ pub struct ThreadCounts {
     pub worker: usize,
     /// Tokio blocking (`spawn_blocking`) threads.
     pub blocking: usize,
-    /// Rayon compute-pool threads (compression, hashing, …).
-    pub compute: usize,
+    /// Net runtime worker threads (client budget; the server sizes its net
+    /// runtime explicitly via [`set_net_threads_default`] and is not budgeted).
+    pub net: usize,
 }
 
 impl ThreadCounts {
-    /// Total threads across all three pools.
+    /// Total threads across all pools.
     pub fn total(&self) -> usize {
-        self.worker + self.blocking + self.compute
+        self.worker + self.blocking + self.net
     }
 }
 
 /// Minimum threads per pool, even under a tight limit — a starved pool can
-/// deadlock work another pool blocks on (e.g. compute awaited by workers). Takes
-/// precedence over the limit, so the smallest achievable total is `3 * MIN`.
+/// deadlock work another pool blocks on (e.g. blocking calls awaited by
+/// workers). Takes precedence over the limit, so the smallest achievable
+/// total is `3 * MIN`.
 const MIN_THREADS_PER_POOL: usize = 2;
 
 /// Lore's unconstrained per-pool counts, used when no thread limit is set.
@@ -440,7 +667,7 @@ fn default_thread_counts(cores: usize) -> ThreadCounts {
     ThreadCounts {
         worker: cores.max(MIN_THREADS_PER_POOL),
         blocking: std::cmp::min(2 * (cores + 1), 128).max(MIN_THREADS_PER_POOL),
-        compute: cores.saturating_sub(1).max(MIN_THREADS_PER_POOL),
+        net: DEFAULT_NET_THREADS.max(MIN_THREADS_PER_POOL),
     }
 }
 
@@ -454,7 +681,7 @@ fn apportion_thread_counts(defaults: ThreadCounts, limit: usize) -> ThreadCounts
         return defaults;
     }
 
-    let ideal = [defaults.worker, defaults.blocking, defaults.compute];
+    let ideal = [defaults.worker, defaults.blocking, defaults.net];
     let mut alloc = [0usize; 3];
     let mut remainder = [0usize; 3];
     for i in 0..3 {
@@ -487,7 +714,7 @@ fn apportion_thread_counts(defaults: ThreadCounts, limit: usize) -> ThreadCounts
     ThreadCounts {
         worker: alloc[0],
         blocking: alloc[1],
-        compute: alloc[2],
+        net: alloc[2],
     }
 }
 
@@ -516,7 +743,7 @@ pub fn thread_counts() -> ThreadCounts {
     ThreadCounts {
         worker: default_worker_threads(),
         blocking: default_blocking_threads(),
-        compute: compute_pool_thread_count(),
+        net: default_net_threads(),
     }
 }
 
@@ -541,6 +768,10 @@ pub struct TokioSettings {
     #[serde(default = "default_thread_keep_alive")]
     pub thread_keep_alive_seconds: u64,
     pub worker_threads: Option<usize>,
+    /// Net runtime worker threads; `None` keeps the process default (2 on
+    /// clients, one per processor where the server sets it).
+    #[serde(default)]
+    pub net_threads: Option<usize>,
 }
 
 impl Default for TokioSettings {
@@ -549,6 +780,7 @@ impl Default for TokioSettings {
             max_blocking_threads: default_blocking_threads(),
             thread_keep_alive_seconds: default_thread_keep_alive(),
             worker_threads: None,
+            net_threads: None,
         }
     }
 }
@@ -562,73 +794,80 @@ pub fn runtime() -> Handle {
 ///
 /// If no runtime exists yet, creates one with the provided settings (or defaults if `None`).
 /// If a tokio runtime is already active on the current thread, returns its handle instead.
-/// Respects the `LORE_WORKER_THREADS` environment variable for overriding worker thread count.
+/// Worker count comes from `settings` when it sets one, else from the thread budget.
 pub fn runtime_with_settings(settings: Option<TokioSettings>) -> Handle {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         handle
     } else {
-        let mut default_runtime = DEFAULT_RUNTIME.lock();
-        if let Some(runtime) = default_runtime.as_ref() {
-            runtime.handle().clone()
-        } else {
-            let settings = settings.unwrap_or_default();
-            let mut builder = tokio::runtime::Builder::new_multi_thread();
-            builder
-                .enable_all()
-                .max_blocking_threads(settings.max_blocking_threads)
-                .thread_keep_alive(Duration::from_secs(settings.thread_keep_alive_seconds))
-                .thread_name_fn(|| {
-                    static ID: AtomicUsize = AtomicUsize::new(0);
-                    format!("lore-tokio-{}", ID.fetch_add(1, Ordering::Relaxed))
-                });
-            // Always set an explicit count, else tokio would default to the raw
-            // core count and ignore the thread limit. Precedence: env override,
-            // explicit setting, budget-derived default.
-            let worker_threads = match (
-                env_thread_override("LORE_WORKER_THREADS"),
-                settings.worker_threads,
-            ) {
-                (Some(val), _) => val,
-                (None, Some(val)) if val > 0 => val,
-                _ => default_worker_threads(),
-            };
-            builder.worker_threads(worker_threads);
-            let runtime = builder.build().expect("Failed to create runtime");
-            let handle = runtime.handle().clone();
-            *default_runtime = Some(runtime);
+        core_runtime_with_settings(settings)
+    }
+}
 
-            // Build the compute pool off-thread so runtime creation isn't
-            // blocked on spawning N rayon workers. No LORE_CONTEXT is active
-            // yet, so Handle::spawn directly rather than lore_spawn!.
-            #[allow(clippy::disallowed_methods)]
-            handle.spawn(async {
-                let _ = COMPUTE_POOL.get_or_init(build_compute_pool);
-            });
+/// Handle to the shared core runtime, created lazily.
+///
+/// Unlike [`runtime`] this never substitutes the caller's current runtime. Blocking work
+/// must land on core's pool wherever it is issued from: the net runtime is built with
+/// `max_blocking_threads(1)`, so one long blocking call dispatched there starves every
+/// later net-side blocking call, and with it the QUIC and HTTP/2 timers.
+///
+/// Built once per process, with the same post-shutdown behaviour as
+/// [`net_runtime`].
+pub fn core_runtime() -> Handle {
+    core_runtime_with_settings(None)
+}
 
-            handle
+fn core_runtime_with_settings(settings: Option<TokioSettings>) -> Handle {
+    CORE_RUNTIME
+        .get_or_init(|| SharedRuntime::new(build_core_runtime(settings)))
+        .handle
+        .clone()
+}
+
+/// Warns once for a retired per-pool thread variable that is still set.
+///
+/// Removing the knob silently would lose whatever tuning a caller had configured without telling
+/// them; `LORE_MAX_THREADS` is what replaces it.
+fn warn_retired_thread_vars() {
+    for var in ["LORE_WORKER_THREADS", "LORE_COMPUTE_THREADS"] {
+        if std::env::var_os(var).is_some() {
+            crate::lore_warn!("{var} is no longer used, size the runtime with LORE_MAX_THREADS");
         }
     }
 }
 
-/// Threads for the shared compute pool: `LORE_COMPUTE_THREADS` if set, else the
-/// compute share of the budget (see [`thread_counts`]). Exposed so callers that
-/// size per-worker data structures can use the same bound the pool uses.
-pub fn compute_pool_thread_count() -> usize {
-    env_thread_override("LORE_COMPUTE_THREADS").unwrap_or_else(|| budget_thread_counts().compute)
+fn build_core_runtime(settings: Option<TokioSettings>) -> tokio::runtime::Runtime {
+    warn_retired_thread_vars();
+    let settings = settings.unwrap_or_default();
+    if let Some(net_threads) = settings.net_threads.filter(|&count| count > 0) {
+        let _ = NET_THREADS_DEFAULT.set(net_threads);
+    }
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
+        .enable_all()
+        .max_blocking_threads(settings.max_blocking_threads)
+        .thread_keep_alive(Duration::from_secs(settings.thread_keep_alive_seconds))
+        .thread_name_fn(|| {
+            static ID: AtomicUsize = AtomicUsize::new(0);
+            format!("lore-tokio-{}", ID.fetch_add(1, Ordering::Relaxed))
+        });
+    // Always set an explicit count, else tokio would default to the raw core count and ignore
+    // the thread limit. Precedence: explicit setting, then budget-derived default.
+    let worker_threads = match settings.worker_threads {
+        Some(val) if val > 0 => val,
+        _ => default_worker_threads(),
+    };
+    builder.worker_threads(worker_threads);
+    builder.build().expect("Failed to create runtime")
 }
 
-/// Tokio worker threads: `LORE_WORKER_THREADS` if set, else the worker share of
-/// the budget (see [`thread_counts`]).
+/// Tokio worker threads: the worker share of the budget (see [`thread_counts`]). Exposed so
+/// callers that size per-worker data structures (e.g. compression scratch pools) can use the same
+/// bound the runtime uses.
+///
+/// There is no per-pool environment override. `LORE_MAX_THREADS` is the one knob, and a var that
+/// bypassed it could raise the total above the ceiling an embedder asked for.
 pub fn default_worker_threads() -> usize {
-    env_thread_override("LORE_WORKER_THREADS").unwrap_or_else(|| budget_thread_counts().worker)
-}
-
-/// Returns a reference to the shared compute thread pool. The pool is
-/// eagerly built by [`runtime_with_settings`] and on first access here if
-/// the runtime has not been constructed yet. Access is lock-free after
-/// initialization. Use for CPU-bound work (compression, hashing, etc).
-pub fn compute_pool() -> &'static rayon::ThreadPool {
-    COMPUTE_POOL.get_or_init(build_compute_pool)
+    budget_thread_counts().worker
 }
 
 /// Guarded task set — tasks added here are awaited during `runtime_flush_guarded()`
@@ -665,19 +904,213 @@ pub async fn runtime_flush_guarded() {
     }
 }
 
-/// Gracefully shuts down the tokio runtime: flushes guarded tasks, then shuts
+/// Drives `future` to completion from a synchronous caller, wherever that caller
+/// runs, and gives up after `wait_timeout` instead of hanging. Returns whether it
+/// completed.
+///
+/// Shutdown paths need this: their signatures are synchronous — FFI entry points,
+/// `Drop` — but the work they must finish before the runtime goes away is async.
+/// Three contexts are possible and each needs different handling:
+///
+/// 1. **No runtime on the calling thread**, the usual FFI entry from C: drive it
+///    on core directly.
+/// 2. **A multi-thread runtime is current:** `block_in_place` hands this worker
+///    over while the runtime keeps its other workers running, so tasks the future
+///    depends on still progress.
+/// 3. **A `current_thread` runtime is current** (`#[tokio::test]`, embedders):
+///    there is no way to block this thread *and* let this runtime run, because
+///    this thread **is** the runtime. The future is driven on core from a separate
+///    thread, which covers everything except what the caller's own runtime would
+///    have had to drive — and that is why the timeout is not optional here.
+///
+/// The distinction is the whole point: `block_in_place` panics on a
+/// `current_thread` runtime, and `Handle::block_on` cannot drive a
+/// `current_thread` runtime's I/O or timers from a foreign thread, so bouncing
+/// the future onto the caller's own handle hangs.
+pub fn shutdown_block_on<F>(future: F, wait_timeout: Duration) -> bool
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let bounded = async move { tokio::time::timeout(wait_timeout, future).await.is_ok() };
+
+    match Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(move || handle.block_on(bounded))
+        }
+        Ok(_) => {
+            let core = core_runtime();
+            let worker = std::thread::Builder::new()
+                .name("lore-shutdown-wait".to_string())
+                .spawn(move || core.block_on(bounded))
+                .expect("Failed to spawn shutdown wait thread");
+            match worker.join() {
+                Ok(completed) => completed,
+                Err(panic) => std::panic::resume_unwind(panic),
+            }
+        }
+        Err(_) => core_runtime().block_on(bounded),
+    }
+}
+
+/// Gracefully shuts down the tokio runtimes: flushes guarded tasks, then shuts
 /// down tokio with a timeout.
+///
+/// Terminal for the process — neither runtime is rebuilt afterwards, and the
+/// accessors keep handing out the shut-down handles. Concurrent callers past
+/// this point are not blocked by the shutdown; their spawns are dropped.
+///
+/// The work runs on a dedicated thread rather than the caller's, because
+/// `Runtime::block_on` and `Runtime::shutdown_timeout` both panic inside an
+/// async context and the C `lore_shutdown()` can be called from one. The two tokio
+/// shutdowns are bounded by `wait_timeout`; the guarded flush is not, because those
+/// tasks are the work that has to finish before the runtime goes away. A guarded
+/// task that never completes therefore holds shutdown open.
+/// Calling this from a task *on* one of these runtimes is still a poor idea:
+/// it cannot panic any more, but that runtime cannot finish shutting down
+/// while the caller is parked in it, so it costs the full timeout.
 pub fn runtime_shutdown_timeout(wait_timeout: Duration) {
-    let mut default_runtime = DEFAULT_RUNTIME.lock();
-    if let Some(runtime) = default_runtime.take() {
-        runtime.block_on(runtime_flush_guarded());
-        runtime.shutdown_timeout(wait_timeout);
+    let core = CORE_RUNTIME.get().and_then(SharedRuntime::take);
+    let net = NET_RUNTIME.get().and_then(SharedRuntime::take);
+    if core.is_none() && net.is_none() {
+        return;
+    }
+
+    let shutdown = std::thread::Builder::new()
+        .name("lore-shutdown".to_string())
+        .spawn(move || {
+            if let Some(runtime) = core {
+                // Unbounded on purpose: guarded tasks are the work that must finish before the
+                // runtime goes away, so cutting the flush short abandons it. The timeouts below
+                // bound the shutdown itself.
+                runtime.block_on(runtime_flush_guarded());
+                runtime.shutdown_timeout(wait_timeout);
+            }
+            // The net runtime goes second: guarded core tasks may still be
+            // flushing writes over the network.
+            if let Some(runtime) = net {
+                runtime.shutdown_timeout(wait_timeout);
+            }
+        })
+        .expect("Failed to spawn runtime shutdown thread");
+
+    if let Err(panic) = shutdown.join() {
+        std::panic::resume_unwind(panic);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The net runtime has `max_blocking_threads(1)`, so blocking work dispatched there
+    /// starves every later net-side blocking call. Thread names distinguish the pools:
+    /// core spawns `lore-tokio-*`, net spawns `lore-net-*`.
+    #[test]
+    fn blocking_macros_target_core_even_from_a_net_task() {
+        let thread_name = net_runtime().block_on(async {
+            crate::lore_spawn_net!(async {
+                crate::lore_spawn_blocking!(|| std::thread::current()
+                    .name()
+                    .unwrap_or_default()
+                    .to_string())
+                .await
+                .expect("blocking task joins")
+            })
+            .await
+            .expect("net task joins")
+        });
+
+        assert!(
+            thread_name.starts_with("lore-tokio-"),
+            "blocking work issued from a net task ran on {thread_name:?}, \
+             which is not a core blocking thread"
+        );
+    }
+
+    /// The accessors sit on request paths, so they must resolve to the one
+    /// runtime built for the process — never rebuild, never serialise.
+    #[test]
+    fn accessors_resolve_to_one_runtime_per_process() {
+        let expected = (core_runtime().id(), net_runtime().id());
+        assert_ne!(expected.0, expected.1, "core and net share a runtime");
+
+        let threads: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| (core_runtime().id(), net_runtime().id())))
+            .collect();
+        for thread in threads {
+            assert_eq!(thread.join().expect("thread joins"), expected);
+        }
+    }
+
+    /// Driving the work on a `current_thread` caller's own handle from a foreign thread
+    /// cannot work — `Handle::block_on` does not drive a `current_thread` runtime's tasks,
+    /// and the thread that would have is parked waiting for this one — so it hangs. The
+    /// spawned task completing is the proof that the work runs on core instead: it is what
+    /// the storage close does.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_block_on_runs_spawns_from_a_current_thread_caller() {
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+
+        let completed = shutdown_block_on(
+            async move {
+                crate::lore_spawn!(async move { flag.store(true, Ordering::SeqCst) })
+                    .await
+                    .expect("spawned task joins");
+            },
+            Duration::from_secs(10),
+        );
+
+        assert!(completed, "shutdown work timed out instead of completing");
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "the task the shutdown work spawned never ran"
+        );
+    }
+
+    /// The same from a multi-thread caller, which takes the `block_in_place` path — the one
+    /// that panics outright on a `current_thread` runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_block_on_runs_spawns_from_a_multi_thread_caller() {
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+
+        let completed = shutdown_block_on(
+            async move {
+                crate::lore_spawn!(async move { flag.store(true, Ordering::SeqCst) })
+                    .await
+                    .expect("spawned task joins");
+            },
+            Duration::from_secs(10),
+        );
+
+        assert!(completed, "shutdown work timed out instead of completing");
+        assert!(ran.load(Ordering::SeqCst), "the spawned task never ran");
+    }
+
+    #[test]
+    fn shutdown_block_on_runs_without_a_runtime() {
+        let completed = shutdown_block_on(
+            async {
+                tokio::task::yield_now().await;
+            },
+            Duration::from_secs(10),
+        );
+
+        assert!(completed, "shutdown work timed out instead of completing");
+    }
+
+    /// Bounded, not best-effort: a `current_thread` caller may hold the only thread that
+    /// could drive part of the work, so shutdown has to be able to give up on it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_block_on_gives_up_instead_of_hanging() {
+        let completed = shutdown_block_on(std::future::pending::<()>(), Duration::from_millis(50));
+
+        assert!(
+            !completed,
+            "a future that cannot finish must report timeout"
+        );
+    }
 
     #[test]
     fn runtime_returns_valid_handle() {
@@ -693,6 +1126,7 @@ mod tests {
             max_blocking_threads: 4,
             thread_keep_alive_seconds: 5,
             worker_threads: Some(2),
+            net_threads: None,
         };
         let handle = runtime_with_settings(Some(settings));
         handle.block_on(async {
@@ -705,7 +1139,7 @@ mod tests {
         let counts = default_thread_counts(8);
         assert_eq!(counts.worker, 8);
         assert_eq!(counts.blocking, std::cmp::min(2 * (8 + 1), 128));
-        assert_eq!(counts.compute, 7);
+        assert_eq!(counts.net, DEFAULT_NET_THREADS);
     }
 
     #[test]
@@ -724,26 +1158,27 @@ mod tests {
             assert_eq!(counts.total(), limit, "limit {limit} not used exactly");
             assert!(counts.worker >= MIN_THREADS_PER_POOL);
             assert!(counts.blocking >= MIN_THREADS_PER_POOL);
-            assert!(counts.compute >= MIN_THREADS_PER_POOL);
+            assert!(counts.net >= MIN_THREADS_PER_POOL);
         }
     }
 
     #[test]
-    fn apportion_floors_below_three_times_min() {
+    fn apportion_floors_below_min_total() {
         let counts = apportion_thread_counts(default_thread_counts(64), 1);
         assert_eq!(counts.worker, MIN_THREADS_PER_POOL);
         assert_eq!(counts.blocking, MIN_THREADS_PER_POOL);
-        assert_eq!(counts.compute, MIN_THREADS_PER_POOL);
+        assert_eq!(counts.net, MIN_THREADS_PER_POOL);
     }
 
     #[test]
     fn apportion_at_limit_64_on_64_core_host() {
         let defaults = default_thread_counts(64);
-        assert_eq!(defaults.total(), 255);
+        assert_eq!(defaults.total(), 194);
         let counts = apportion_thread_counts(defaults, 64);
-        assert_eq!(counts.worker, 16);
-        assert_eq!(counts.blocking, 32);
-        assert_eq!(counts.compute, 16);
+        assert_eq!(counts.worker, 21);
+        assert_eq!(counts.blocking, 41);
+        assert_eq!(counts.net, MIN_THREADS_PER_POOL);
+        assert_eq!(counts.total(), 64);
     }
 
     #[tokio::test]
@@ -762,27 +1197,5 @@ mod tests {
 
         runtime_flush_guarded().await;
         assert!(completed.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn compute_pool_runs_work() {
-        use std::sync::atomic::AtomicBool;
-        use std::sync::atomic::Ordering;
-
-        let done = Arc::new(AtomicBool::new(false));
-        let done_clone = Arc::clone(&done);
-        compute_pool().spawn(move || {
-            done_clone.store(true, Ordering::Release);
-        });
-
-        // Spin briefly; in CI the spawn + execute is sub-millisecond.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !done.load(Ordering::Acquire) {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "compute_pool task did not run"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
     }
 }

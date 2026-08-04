@@ -568,3 +568,17 @@ def pytest_configure(config):
         "markers",
         "bug_reproduction: mark tests that are known to fail and are a reproduction of a bug",
     )
+
+
+def pytest_collection_modifyitems(config, items):
+    """A bug_reproduction test reproduces a known, unfixed bug, so it is expected
+    to fail. Mark it xfail(strict): the failure is the known state (reported as
+    xfail, not a suite failure), and if it ever passes the bug is fixed and the
+    strict xpass fails the run so the marker gets removed."""
+    for item in items:
+        if item.get_closest_marker("bug_reproduction"):
+            item.add_marker(
+                pytest.mark.xfail(
+                    reason="bug_reproduction: known unfixed bug", strict=True
+                )
+            )

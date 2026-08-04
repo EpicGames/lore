@@ -4,6 +4,7 @@ pub mod health_check;
 pub mod presign_token;
 pub mod presigned;
 pub mod repositories;
+pub mod security_headers;
 pub mod server;
 pub mod tracing;
 

@@ -3,10 +3,10 @@ lep: 2026-05-14-low-level-revision-api
 title: Low-Level Memory-Based Revision Control API
 authors:
   - mattias.jansson
-status: Draft
+status: Approved
 created: 2026-05-14
 updated: 2026-05-15
-discussion: <TBD — fill in CR link when discussion CR is opened>
+discussion: Internal
 ---
 
 # Low-Level Memory-Based Revision Control API

@@ -60,8 +60,6 @@ pub struct LoreRepositoryCloneArgs {
     pub virtually: u8,
     /// Use direct file write
     pub direct_file_write: u8,
-    /// Use direct file I/O instead of memory mapping files
-    pub direct_file_io: u8,
     /// (Optional) Layer module
     pub layer: LoreString,
     /// (Optional) Layer metadata key to link revisions with
@@ -152,7 +150,6 @@ async fn clone_impl(
     let ignore_existing = false;
     let virtually = args.virtually != 0;
     let direct_file_write = args.direct_file_write != 0;
-    let direct_file_io = args.direct_file_io != 0;
     let no_tracking = args.no_tracking != 0;
 
     let view_path = if args.view.length > 0 {
@@ -193,7 +190,6 @@ async fn clone_impl(
         ignore_existing,
         virtually,
         direct_file_write,
-        direct_file_io,
         prefetch,
         shared_store_options,
         no_tracking,

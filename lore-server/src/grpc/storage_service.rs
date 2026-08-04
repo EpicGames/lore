@@ -7,7 +7,6 @@ use std::time::Instant;
 use bytes::BytesMut;
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
-use lore_base::runtime::runtime;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
@@ -128,7 +127,7 @@ impl StorageService for LoreStorageService {
         let histogram =
             Arc::new(self.latency_histogram_ms(METRICS_STREAMING_MESSAGE_HANDLER_LATENCY));
 
-        runtime().spawn(LORE_CONTEXT.scope(execution, async move {
+        lore_spawn!(LORE_CONTEXT.scope(execution, async move {
             while let Some(request) = stream.next().await {
                 let immutable_store = immutable_store.clone();
                 let tx = tx.clone();
@@ -148,7 +147,7 @@ impl StorageService for LoreStorageService {
                     { USER_ID } = get_user_id_from_context(&attrs),
                 );
 
-                runtime().spawn(
+                lore_spawn!(
                     LORE_CONTEXT.scope(
                         execution_context(),
                         async move {
@@ -270,7 +269,7 @@ impl StorageService for LoreStorageService {
         let histogram =
             Arc::new(self.latency_histogram_ms(METRICS_STREAMING_MESSAGE_HANDLER_LATENCY));
 
-        runtime().spawn(LORE_CONTEXT.scope(execution, async move {
+        lore_spawn!(LORE_CONTEXT.scope(execution, async move {
             while let Some(req) = stream.next().await {
                 let immutable_store = immutable_store.clone();
                 let tx = tx.clone();
@@ -292,7 +291,7 @@ impl StorageService for LoreStorageService {
 
                 // Spawn task to store fragment - may want to just do this one at a time,
                 // we'll see how this performs at scale
-                runtime().spawn(
+                lore_spawn!(
                     LORE_CONTEXT.scope(
                         execution_context(),
                         async move {
@@ -473,7 +472,7 @@ impl StorageService for LoreStorageService {
         let histogram =
             Arc::new(self.latency_histogram_ms(METRICS_STREAMING_MESSAGE_HANDLER_LATENCY));
 
-        runtime().spawn(
+        lore_spawn!(
             LORE_CONTEXT.scope(
                 execution,
                 async move {

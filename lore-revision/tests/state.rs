@@ -16,11 +16,9 @@ mod tests {
     use lore_revision::node::*;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryFormat;
-    use lore_revision::state::NodeSource;
     use lore_revision::state::State;
     use lore_revision::state::StateData;
     use lore_revision::state::collect_new_fragments;
-    use lore_revision::state::determine_node_source;
     use lore_storage::hash::hash_string;
     use lore_storage::local::immutable_store::LocalImmutableStore;
     use lore_transport::ProtocolError;
@@ -300,60 +298,6 @@ mod tests {
         assert!(flags.contains(change::Flags::Staged));
         assert!(flags.contains(change::Flags::Merge));
         assert!(flags.contains(change::Flags::Conflict));
-    }
-
-    #[test]
-    fn returns_to_for_add_action_with_valid_to() {
-        let source = determine_node_source(FileAction::Add, false, true);
-        assert_eq!(source, NodeSource::To);
-    }
-
-    #[test]
-    fn returns_to_for_keep_action_with_valid_to() {
-        let source = determine_node_source(FileAction::Keep, true, true);
-        assert_eq!(source, NodeSource::To);
-    }
-
-    #[test]
-    fn returns_to_for_move_action_with_valid_to() {
-        let source = determine_node_source(FileAction::Move, true, true);
-        assert_eq!(source, NodeSource::To);
-    }
-
-    #[test]
-    fn returns_to_for_delete_action_with_valid_from() {
-        let source = determine_node_source(FileAction::Delete, true, true);
-        assert_eq!(source, NodeSource::To);
-    }
-
-    #[test]
-    fn returns_from_for_delete_action_even_with_invalid_to() {
-        let source = determine_node_source(FileAction::Delete, true, false);
-        assert_eq!(source, NodeSource::From);
-    }
-
-    #[test]
-    fn returns_from_when_to_is_invalid_for_non_delete() {
-        let source = determine_node_source(FileAction::Keep, true, false);
-        assert_eq!(source, NodeSource::From);
-    }
-
-    #[test]
-    fn returns_invalid_when_to_is_invalid_and_from_is_invalid() {
-        let source = determine_node_source(FileAction::Add, false, false);
-        assert_eq!(source, NodeSource::Invalid);
-    }
-
-    #[test]
-    fn returns_to_for_delete_with_invalid_from() {
-        let source = determine_node_source(FileAction::Delete, false, true);
-        assert_eq!(source, NodeSource::To);
-    }
-
-    #[test]
-    fn returns_to_for_copy_action_with_valid_to() {
-        let source = determine_node_source(FileAction::Copy, true, true);
-        assert_eq!(source, NodeSource::To);
     }
 }
 

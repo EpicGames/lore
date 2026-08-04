@@ -7,12 +7,10 @@ use std::sync::Weak;
 use std::sync::atomic::Ordering;
 
 use lore_base::lore_debug;
-use lore_base::lore_spawn;
+use lore_base::lore_spawn_net;
 use lore_base::lore_trace;
 use lore_base::lore_warn;
-use lore_base::runtime::LORE_CONTEXT;
-use lore_base::runtime::runtime;
-use lore_base::runtime::try_lore_context;
+use lore_base::runtime::shutdown_block_on;
 use lore_base::types::*;
 use lore_error_set::prelude::*;
 use parking_lot::Mutex;
@@ -127,12 +125,18 @@ pub fn remove_connection(connection: Arc<Connection>) {
     }
 }
 
+/// Time allowed for the close frames to reach the peer before shutdown proceeds without
+/// them. The cost of expiring is a server-side session lingering to its idle timeout, not
+/// lost data, so this is shorter than the runtime shutdown timeout it runs ahead of.
+const DROP_CONNECTIONS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub fn drop_connections() {
     if let Some(map) = CONNECTION_MAP.lock().take() {
-        // This is done during library shutdown, setup a dummy context
-        // for dropping the remaining connections
-        tokio::task::block_in_place(move || {
-            runtime().block_on(async {
+        // Called from library shutdown, which is synchronous and may be on any runtime or
+        // none, so `shutdown_block_on` picks how to drive this and bounds it. Calling
+        // `block_in_place` here would panic on a `current_thread` runtime.
+        let completed = shutdown_block_on(
+            async move {
                 for connection in map {
                     let _ = connection.1.cancel_connect().await;
                     // Drain in-flight streams and flush transport close frames to the peer
@@ -140,8 +144,15 @@ pub fn drop_connections() {
                     // outstanding stream read as a transport error on client exit.
                     connection.1.close_transport().await;
                 }
-            });
-        });
+            },
+            DROP_CONNECTIONS_WAIT,
+        );
+        if !completed {
+            lore_base::lore_warn!(
+                "Timed out closing connections during shutdown; peers may log outstanding \
+                 streams as transport errors"
+            );
+        }
     }
 }
 
@@ -271,7 +282,7 @@ async fn connect_impl(
     let subtask_aborts: Arc<parking_lot::Mutex<Vec<tokio::task::AbortHandle>>> =
         Arc::new(parking_lot::Mutex::new(Vec::new()));
 
-    let connect_task = lore_spawn!({
+    let connect_task = lore_spawn_net!({
         let environment_client = environment_client.clone();
         let connection = connection.clone();
         let remote_url = remote_url.clone();
@@ -337,7 +348,7 @@ async fn connect_impl(
                 let environment_client = environment_client.clone();
                 let storage_remaining = storage_remaining.clone();
                 let storage_error = storage_error.clone();
-                let handle = lore_spawn!(async move {
+                let handle = lore_spawn_net!(async move {
                     let _environment_client = environment_client;
                     let result = connection
                         .protocol
@@ -398,7 +409,7 @@ async fn connect_impl(
                     let connection = connection.clone();
                     let identity = identity.clone();
                     let environment_client = environment_client.clone();
-                    let handle = lore_spawn!(async move {
+                    let handle = lore_spawn_net!(async move {
                         let _environment_client = environment_client;
                         let result = connection
                             .protocol
@@ -428,7 +439,7 @@ async fn connect_impl(
                     let connection = connection.clone();
                     let identity = identity.clone();
                     let environment_client = environment_client.clone();
-                    let handle = lore_spawn!(async move {
+                    let handle = lore_spawn_net!(async move {
                         let _environment_client = environment_client;
                         let result = connection
                             .protocol
@@ -461,7 +472,7 @@ async fn connect_impl(
                 let connection = connection.clone();
                 let identity = identity.clone();
                 let environment_client = environment_client.clone();
-                let handle = lore_spawn!(async move {
+                let handle = lore_spawn_net!(async move {
                     let _environment_client = environment_client;
                     let result = connection
                         .protocol
@@ -585,22 +596,18 @@ pub struct Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        let runtime = runtime();
-        if runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread {
-            // Only in tests, here we cannot block in place to call the async complete
-        } else {
-            // Connection may be dropped from a fire-and-forget task (e.g. StorageSession::drop)
-            // that has no context. Use try_lore_context to avoid panicking.
-            #[allow(clippy::disallowed_methods)]
-            tokio::task::block_in_place(move || {
-                let future = async move { self.cancel_connect().await };
-                if let Some(ctx) = try_lore_context() {
-                    let _ = runtime.block_on(LORE_CONTEXT.scope(ctx, future));
-                } else {
-                    let _ = runtime.block_on(future);
-                }
-            });
-        }
+        // We hold `&mut self`, so take the connector without locking. Awaiting the
+        // aborted setup task inline would block whichever worker runs this Drop, and it
+        // can run on a net worker, so hand the await to a task instead. Pinned to net
+        // rather than following the dropper: the handle belongs to a net task, and the
+        // placement should not depend on who happens to drop the connection.
+        let Some(connector) = self.connector.get_mut().take() else {
+            return;
+        };
+        let setup_handle = self.abort_connector(connector);
+        lore_spawn_net!(async move {
+            let _ = setup_handle.await;
+        });
     }
 }
 
@@ -659,10 +666,18 @@ impl Connection {
     }
 
     async fn cancel_connect(&self) -> Result<(), ProtocolError> {
-        let mut connector_lock = self.connector.lock().await;
-        let Some(connector) = connector_lock.take() else {
+        let Some(connector) = self.connector.lock().await.take() else {
             return Ok(());
         };
+        let setup_handle = self.abort_connector(connector);
+        let _ = setup_handle.await;
+        Ok(())
+    }
+
+    /// Aborts the connector's setup and subtasks and fails every readiness gate.
+    /// Returns the setup task handle so the caller can await it (or, from `Drop`,
+    /// await it off the blocking path). Everything here is synchronous.
+    fn abort_connector(&self, connector: Connector) -> JoinHandle<()> {
         self.stale.store(true, Ordering::Relaxed);
         lore_trace!("Connection to {} cancelled", self.remote_url);
         connector.setup_handle.abort();
@@ -676,8 +691,7 @@ impl Connection {
         self.revision_ready.complete(Err(cancelled()));
         self.lock_ready.complete(Err(cancelled()));
         self.repository_ready.complete(Err(cancelled()));
-        let _ = connector.setup_handle.await;
-        Ok(())
+        connector.setup_handle
     }
 
     /// Gracefully drain the transport connections held by this `Connection`.

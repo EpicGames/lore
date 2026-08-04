@@ -177,11 +177,18 @@ pub fn server_main(config: ServerConfig) -> Result<()> {
 
     lore_base::log::set_log_callback(Some(server_log_dispatch));
 
-    let result = match settings.tokio.as_ref() {
+    // Server default: one net-runtime thread per processor — serving
+    // thousands of concurrent client connections is its normal case. An
+    // explicit `tokio.net_threads` config (seeded first inside
+    // runtime_with_settings) wins over this default.
+    let runtime_handle = match settings.tokio.as_ref() {
         Some(tokio) => runtime_with_settings(Some(tokio.clone())),
         None => runtime(),
-    }
-    .block_on({
+    };
+    let _ = lore_base::runtime::set_net_threads_default(
+        std::thread::available_parallelism().map_or(2, |count| count.get()),
+    );
+    let result = runtime_handle.block_on({
         let execution = setup_execution(module_path!(), String::default(), String::default());
         #[allow(clippy::large_futures)]
         LORE_CONTEXT.scope(execution, async move {
@@ -1115,6 +1122,7 @@ async fn configure_local_mutable_store(
             flush_delay_seconds: settings.flush_delay_seconds as u64,
             initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX, /* Server mode, full 256-bucket layout from the start */
             fan_out_threshold: lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
+            authoritative: true, /* Server local store is the source of truth, not a cache */
         },
         immutable_store,
     )
@@ -1638,16 +1646,26 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     lore_storage::concurrency::LOCAL_ISOLATION.store(true, std::sync::atomic::Ordering::Release);
 
     let execution = execution_context();
-    let runtime_monitor = tokio_metrics::RuntimeMonitor::new(&runtime);
-
-    let metrics_bridge = OtelTokioRuntimeMetrics::new(&lore_telemetry::meter("tokio_runtime"));
     let frequency = Duration::from_millis(metrics_config.export_interval_millis);
-    runtime.spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-        for metrics in runtime_monitor.intervals() {
-            metrics_bridge.record(metrics);
-            tokio::time::sleep(frequency).await;
-        }
-    }));
+    let meter = lore_telemetry::meter("tokio_runtime");
+
+    // Both recorders run on core so monitoring never competes with net's
+    // transport work; each bridge holds its own handle, so that does not skew
+    // what it reports.
+    for (label, handle) in [
+        ("core", lore_base::runtime::core_runtime()),
+        ("net", lore_base::runtime::net_runtime()),
+    ] {
+        let runtime_monitor = tokio_metrics::RuntimeMonitor::new(&handle);
+        let metrics_bridge =
+            OtelTokioRuntimeMetrics::new(&meter, handle, vec![KeyValue::new("runtime", label)]);
+        lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+            for metrics in runtime_monitor.intervals() {
+                metrics_bridge.record(metrics);
+                tokio::time::sleep(frequency).await;
+            }
+        }));
+    }
 
     if let Some(mode) = settings
         .environment

@@ -364,6 +364,8 @@ mod tests {
             .expect("Failed to create user path");
         assert_eq!(relative_path.as_str(), "test");
 
+        // Test-only: any real absolute directory serves as the repository root.
+        #[allow(clippy::disallowed_methods)]
         let repository_path = std::env::current_dir().expect("No current dir");
         let relative_path = RelativePath::new_from_user_path(&repository_path, "")
             .expect("Relative path from empty user path failed");
@@ -1067,6 +1069,8 @@ mod tests {
 
     #[test]
     fn relative_path_buf_new_from_user_path() {
+        // Test-only: any real absolute directory serves as the repository root.
+        #[allow(clippy::disallowed_methods)]
         let repository_path = std::env::current_dir().expect("No current dir");
         let buf = RelativePathBuf::new_from_user_path(&repository_path, "")
             .expect("Failed to create path");

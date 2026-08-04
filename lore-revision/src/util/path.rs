@@ -33,6 +33,13 @@ pub fn make_absolute(path: impl AsRef<str>) -> Result<PathBuf, PathError> {
 /// [`make_absolute`] with the base directory supplied by the caller, for the
 /// call wrappers that resolve paths before the execution context exists and so
 /// cannot look it up.
+///
+/// This is the one sanctioned `current_dir` fallback the `disallowed_methods`
+/// fence points every other caller at, so it cannot itself route through
+/// [`make_absolute`]. Reached only when the caller named no base and the call
+/// carries no working directory — in-process use, never a service call, which
+/// fills the field on the caller's side before it crosses the IPC boundary.
+#[allow(clippy::disallowed_methods)]
 pub fn make_absolute_from(
     path: impl AsRef<str>,
     base: Option<&Path>,

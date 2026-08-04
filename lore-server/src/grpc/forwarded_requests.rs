@@ -7,6 +7,7 @@ pub mod revision_service;
 use std::str::FromStr;
 
 use http::Uri;
+use lore_base::lore_spawn_net;
 use lore_base::types::RepositoryId;
 use lore_error_set::WrapInternal;
 use lore_revision::errors::UnhandledError;
@@ -165,11 +166,14 @@ async fn make_channel(settings: &GrpcInternalClientSettings) -> Result<Channel, 
         endpoint = endpoint.tls_config(tls).internal("using TLS config")?;
     }
 
-    let channel = endpoint
+    let endpoint = endpoint
         .user_agent(user_agent())
-        .internal("error setting user agent")?
-        .connect()
+        .internal("error setting user agent")?;
+    // Connect from net so the hyper/h2 driver tasks this spawns bind there rather
+    // than to the core runtime the caller runs on.
+    let channel = lore_spawn_net!(async move { endpoint.connect().await })
         .await
+        .internal("connection task to endpoint")?
         .internal("connecting to endpoint")?;
     Ok(channel)
 }

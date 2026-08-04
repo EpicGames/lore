@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use lore_base::lore_spawn_net;
 use lore_proto::lore::repository::v1::forwarded_repository_service_server::ForwardedRepositoryServiceServer;
 use lore_proto::lore::revision::v1::forwarded_revision_service_server::ForwardedRevisionServiceServer;
 use lore_proto::rpc::replication_service_server::ReplicationServiceServer;
@@ -54,7 +55,10 @@ type GrpcRouter = tonic::transport::server::Router<
                     >,
                     crate::correlation::layer::CorrelationIdLayer,
                 >,
-                tower::layer::util::Identity,
+                tower::layer::util::Stack<
+                    crate::util::core_hop::CoreHopLayer,
+                    tower::layer::util::Identity,
+                >,
             >,
         >,
     >,
@@ -184,6 +188,9 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
         }
         let tracing_levels = TraceLayerConfig::default();
         let mut router = server
+            // Outermost, so everything inward runs on core: this stack is served
+            // from net.
+            .layer(crate::util::core_hop::CoreHopLayer)
             .layer(
                 CorrelationIdLayerBuilder::new()
                     .with_grpc_tracer(tracing_levels)
@@ -224,12 +231,14 @@ pub struct WantsAddress {
 }
 
 impl GrpcInternalServerBuilder<WantsAddress> {
+    /// Serves on the net runtime; see [`super::server::GrpcServerBuilder::serve`].
     pub async fn serve(
         self,
         addr: SocketAddr,
-        signal: impl Future<Output = ()>,
+        signal: impl Future<Output = ()> + Send + 'static,
     ) -> anyhow::Result<()> {
-        self.0.router.serve_with_shutdown(addr, signal).await?;
+        lore_spawn_net!(async move { self.0.router.serve_with_shutdown(addr, signal).await })
+            .await??;
         Ok(())
     }
 }

@@ -907,6 +907,10 @@ mod tests {
 
     /// Discovers all config files in the config directory.
     /// Excludes `.example` files which are templates.
+    ///
+    /// Test-only, and the `current_dir` read is diagnostic text in the panic
+    /// message identifying where the search started from.
+    #[allow(clippy::disallowed_methods)]
     fn discover_standalone_config_files() -> Vec<PathBuf> {
         let config_dir = find_config_dir();
 

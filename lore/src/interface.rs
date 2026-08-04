@@ -28,6 +28,7 @@ pub type Context = lore_storage::Context;
 pub type Hash = lore_storage::Hash;
 pub type Fragment = lore_storage::Fragment;
 pub type FragmentFlags = lore_storage::FragmentFlags;
+pub use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 pub type LoreString = lore_revision::interface::LoreString;
 pub type LoreArray<T> = lore_revision::interface::LoreArray<T>;
 
@@ -6963,17 +6964,18 @@ pub extern "C" fn lore_shutdown() -> i32 {
 
 /// Limits the total number of threads Lore sizes its pools for.
 ///
-/// Lore internally decides how many worker, blocking and compute threads to use
-/// based on this ceiling and the host's processor count. Pass `0` for "no
-/// limit" (the default — pools are sized from the processor count). The
+/// Lore internally decides how many worker and blocking threads to use based
+/// on this ceiling and the host's processor count. Pass `0` for "no limit"
+/// (the default — pools are sized from the processor count). The
 /// `LORE_MAX_THREADS` environment variable overrides this count when set above
-/// zero. The `LORE_WORKER_THREADS`, `LORE_BLOCKING_THREADS` and
-/// `LORE_COMPUTE_THREADS` environment variables still override the count of
-/// their respective pool with an absolute value when set.
+/// zero, and is the only environment control over thread counts: the retired
+/// per-pool variables are ignored, since one that bypassed this ceiling could
+/// raise the total above what the caller asked for. `LORE_BLOCKING_THREADS`
+/// still sizes the blocking pool until that pool goes away.
 ///
-/// Must be called before the first Lore operation, while the runtime and
-/// compute pool are still unconstructed. Returns `0` if the limit was applied,
-/// `1` if it had already been set (or the runtime was already running).
+/// Must be called before the first Lore operation, while the runtime is still
+/// unconstructed. Returns `0` if the limit was applied, `1` if it had already
+/// been set (or the runtime was already running).
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_set_thread_limit(count: usize) -> i32 {
     if crate::set_thread_limit(count) { 0 } else { 1 }

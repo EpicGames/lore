@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use bytes::Bytes;
-use lore_base::runtime::runtime;
+use lore_base::lore_spawn_core;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::WeakUnboundedSender;
@@ -51,7 +51,9 @@ impl Default for EventDispatcher {
 }
 
 impl EventDispatcher {
-    #[allow(clippy::disallowed_methods)]
+    /// The forwarder is pinned to core rather than following the caller: it invokes host
+    /// callbacks for the life of the dispatcher, and a dispatcher built from a net task would
+    /// otherwise run them on the runtime driving sockets.
     pub fn new(callback: LoreEventCallback) -> Self {
         let completed = CancellationToken::new();
         let (sender, mut receiver) = unbounded_channel();
@@ -65,7 +67,7 @@ impl EventDispatcher {
             // drops it AFTER the callback returns, so any `LoreBytes`
             // view in the event points at a live buffer for the full
             // callback invocation.
-            runtime().spawn(async move {
+            lore_spawn_core!(async move {
                 while let Some((event, _keepalive)) = receiver.recv().await {
                     callback(&event);
                     // `_keepalive` drops here — the referenced buffer

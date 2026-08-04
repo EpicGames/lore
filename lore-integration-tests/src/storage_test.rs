@@ -4180,144 +4180,59 @@ mod open_tests {
         }
     }
 
-    /// Parallelism proof via timing: N concurrent multi-fragment puts must finish
-    /// substantially faster than the same N puts run sequentially. The wall-clock ratio is
-    /// measured on a multi-thread runtime (4 worker threads) using payloads large enough
-    /// that scheduler noise and per-op fixed costs are dwarfed by the work.
+    /// The batch path has to run its items concurrently.
     ///
-    /// Robustness: the measurement is repeated `SAMPLES` times and the BEST observed ratio
-    /// is checked against the threshold. A fully-serialized dispatcher fails every sample
-    /// (no run can produce speedup); transient CI load that starves a single run gets
-    /// absorbed. Each sample alternates parallel/sequential to keep system load symmetric.
+    /// Asserted from the peak items in flight rather than from wall clock. A ratio of parallel to
+    /// sequential time measures the machine as much as the code: external load slows the parallel
+    /// run without slowing the sequential one, so every sample drifts toward 1.0. Load moves this
+    /// assertion the safe way instead, since slower items overlap more.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_calls_observably_run_in_parallel_via_timing() {
-        use std::time::Duration;
-        use std::time::Instant;
-
+    async fn concurrent_calls_observably_run_in_parallel() {
         use lore_base::types::Context;
         use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
         use lore_base::types::Partition;
-        use tokio::task::JoinSet;
 
         let (open_sink, open_cb) = make_sink();
         assert_eq!(open_in_memory(open_cb).await, 0);
         let id = take_opened(&open_sink.lock().unwrap()).unwrap();
         let handle = lore::storage::handle::LoreStore { handle_id: id };
 
-        // Each put is large enough that hashing + chunking dominates scheduler noise. With
-        // 4 MiB and FRAGMENT_SIZE_THRESHOLD = ~256 KiB, each put fragments into ~16 leaves.
-        let len = 4 * FRAGMENT_SIZE_THRESHOLD;
+        // Multi-fragment payloads, so an item cannot finish before the next one starts.
         const N: usize = 4;
-        const SAMPLES: usize = 3;
+        let len = 4 * FRAGMENT_SIZE_THRESHOLD;
+        let payloads: Vec<Vec<u8>> = (0..N)
+            .map(|i| {
+                let mix = (i * 31) as u8;
+                (0..len)
+                    .map(|j| (j as u8).wrapping_mul(mix.wrapping_add(7)))
+                    .collect()
+            })
+            .collect();
+        let items: Vec<_> = payloads
+            .iter()
+            .enumerate()
+            .map(|(i, payload)| lore::storage::put::LoreStoragePutItem {
+                id: i as u64,
+                partition: Partition::from([0xF0; 16]),
+                context: Context::from([0xE0 + i as u8; 16]),
+                data: lore_revision::event::LoreBytes {
+                    ptr: payload.as_ptr().cast(),
+                    len: payload.len(),
+                },
+                remote_write: 0,
+                local_cache: 0,
+                fixed_size_chunk: 0,
+            })
+            .collect();
 
-        async fn sequential_run(
-            handle: lore::storage::handle::LoreStore,
-            sample: usize,
-            len: usize,
-        ) -> Duration {
-            let payloads: Vec<Vec<u8>> = (0..N)
-                .map(|i| {
-                    let mix = (sample * 71 + i * 31) as u8;
-                    (0..len)
-                        .map(|j| (j as u8).wrapping_mul(mix.wrapping_add(7)))
-                        .collect()
-                })
-                .collect();
-            let start = Instant::now();
-            for (i, payload) in payloads.iter().enumerate() {
-                let item = lore::storage::put::LoreStoragePutItem {
-                    id: (sample * 100 + i) as u64,
-                    partition: Partition::from([0xF0 + sample as u8; 16]),
-                    context: Context::from([0xE0 + (sample * N + i) as u8; 16]),
-                    data: lore_revision::event::LoreBytes {
-                        ptr: payload.as_ptr().cast(),
-                        len: payload.len(),
-                    },
-                    remote_write: 0,
-                    local_cache: 0,
-                    fixed_size_chunk: 0,
-                };
-                let (status, _) = put_items(handle, vec![item]).await;
-                assert_eq!(status, 0, "sequential put sample={sample} #{i}");
-            }
-            start.elapsed()
-        }
+        lore_storage::reset_content_write_peak();
+        let (status, _completes) = put_items(handle, items).await;
+        assert_eq!(status, 0, "batch put");
 
-        async fn parallel_run(
-            handle: lore::storage::handle::LoreStore,
-            sample: usize,
-            len: usize,
-        ) -> Duration {
-            let payloads: Vec<Vec<u8>> = (0..N)
-                .map(|i| {
-                    let mix = (sample * 53 + i * 17) as u8;
-                    (0..len)
-                        .map(|j| (j as u8).wrapping_mul(mix.wrapping_add(11)))
-                        .collect()
-                })
-                .collect();
-            let start = Instant::now();
-            let mut tasks: JoinSet<i32> = JoinSet::new();
-            for (i, payload) in payloads.into_iter().enumerate() {
-                lore_spawn!(tasks, async move {
-                    let item = lore::storage::put::LoreStoragePutItem {
-                        id: (sample * 1000 + 5000 + i) as u64,
-                        partition: Partition::from([0xC0 + sample as u8; 16]),
-                        context: Context::from([0xA0 + (sample * N + i) as u8; 16]),
-                        data: lore_revision::event::LoreBytes {
-                            ptr: payload.as_ptr().cast(),
-                            len: payload.len(),
-                        },
-                        remote_write: 0,
-                        local_cache: 0,
-                        fixed_size_chunk: 0,
-                    };
-                    let (status, _completes) = put_items(handle, vec![item]).await;
-                    drop(payload);
-                    status
-                });
-            }
-            while let Some(result) = tasks.join_next().await {
-                assert_eq!(
-                    result.expect("task panic"),
-                    0,
-                    "parallel put sample={sample}"
-                );
-            }
-            start.elapsed()
-        }
-
-        // Take SAMPLES paired measurements; record the smallest parallel/sequential ratio
-        // across all samples. The scheme alternates which mode runs first per sample so any
-        // warm-cache or cool-down bias evens out.
-        let mut best_ratio: Option<f64> = None;
-        let mut samples_log: Vec<(Duration, Duration, f64)> = Vec::with_capacity(SAMPLES);
-        for sample in 0..SAMPLES {
-            let (seq_elapsed, par_elapsed) = if sample % 2 == 0 {
-                let s = sequential_run(handle, sample, len).await;
-                let p = parallel_run(handle, sample, len).await;
-                (s, p)
-            } else {
-                let p = parallel_run(handle, sample, len).await;
-                let s = sequential_run(handle, sample, len).await;
-                (s, p)
-            };
-            let ratio = par_elapsed.as_secs_f64() / seq_elapsed.as_secs_f64();
-            samples_log.push((seq_elapsed, par_elapsed, ratio));
-            best_ratio = Some(best_ratio.map_or(ratio, |b: f64| b.min(ratio)));
-        }
-        let best_ratio = best_ratio.expect("at least one sample");
-
-        // Threshold: best observed parallel/sequential ratio must be < 0.7 (≥1.43× speedup).
-        // With 4 worker threads doing CPU-bound hashing on an N=4 batch, the actual speedup
-        // is typically 2.5–3.5×. A fully-serialized dispatcher would produce ratios near
-        // 1.0× across every sample, so the regression-catching property is preserved while
-        // transient noise on a single run is absorbed.
+        let peak = lore_storage::content_write_peak();
         assert!(
-            best_ratio < 0.7,
-            "best parallel/sequential ratio across {SAMPLES} samples was {best_ratio:.3}, \
-             expected < 0.7; per-sample (seq, par, ratio): {samples_log:?} — concurrent \
-             calls appear to be serialized",
+            peak > 1,
+            "a batch of {N} items peaked at {peak} in flight, so they ran one at a time"
         );
     }
 

@@ -94,6 +94,14 @@ where
     Key: Debug + Eq + Hash + Clone,
     Output: Debug + Clone,
 {
+    /// Claim the right to produce the result for `key`, or get a receiver for
+    /// the result a concurrent caller is already producing.
+    ///
+    /// The `entry` shard write lock is confined to the `match` below: both arms
+    /// only construct or subscribe to a broadcast channel, neither awaits nor
+    /// touches `requests` again, and the guard is dropped before this function
+    /// returns — so no caller can hold it across a suspension point.
+    #[allow(clippy::disallowed_methods)]
     pub fn request(&self, key: Key) -> RequestRole<Key, Output> {
         match self.requests.entry(key) {
             Entry::Occupied(entry) => {

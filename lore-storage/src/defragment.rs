@@ -1,18 +1,18 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::ops::Range;
+#[cfg(target_family = "unix")]
+use std::os::unix::fs::FileExt;
+#[cfg(target_family = "windows")]
+use std::os::windows::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use bytes::BytesMut;
 use lore_transport::StorageSession;
-use memmap2::Mmap;
-use memmap2::MmapMut;
-use tokio::fs::File;
-use tokio::io::AsyncSeekExt;
-use tokio::io::AsyncWriteExt;
-use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
+use tokio::sync::SemaphorePermit;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::channel;
@@ -39,18 +39,22 @@ use crate::types::Partition;
 /// Target for the streaming defragmentation pipeline.
 #[derive(Clone)]
 pub enum DefragmentSink {
-    /// Write at offset to a memory-mapped file (unordered, concurrent writes).
-    Mmap { ptr: *mut u8, len: usize },
-    /// Write at offset to a file via seek+write (unordered, mutex-serialized).
-    File { file: Arc<Mutex<File>> },
+    /// Write at offset to a file (unordered, concurrent positional writes).
+    /// `size` is the expected content length, used to reject out-of-range offsets.
+    File {
+        file: Arc<std::fs::File>,
+        size: usize,
+    },
     /// Stream buffers in content order to a caller-provided channel.
     Stream { sender: Sender<Bytes> },
 }
 
-// SAFETY: Same invariants as the original — the mmap pointer outlives
-// all tasks using this sink and writes target non-overlapping regions.
-unsafe impl Send for DefragmentSink {}
-unsafe impl Sync for DefragmentSink {}
+/// A fetched payload on its way to the write sink: target offset, bytes, and the
+/// fragment memory permit covering those bytes. The permit rides along so it is
+/// released when the write completes rather than when the fetch did.
+type DataMessage = (usize, Bytes, tokio::sync::SemaphorePermit<'static>);
+type DataSender = Sender<DataMessage>;
+type DataReceiver = Receiver<DataMessage>;
 
 /// Leaf fragment reference yielded by the tree walker to the fetch pool.
 #[cfg_attr(test, derive(Debug))]
@@ -118,6 +122,14 @@ async fn walk_fragment_tree(
     .await
 }
 
+/// Walks one level of the tree, dispatching to the leaf or intermediate walker by peeking at
+/// the first entry.
+///
+/// An empty list is invalid at every level, whatever its parent claims and including a parent
+/// claiming zero: zero-length content is addressed by the zero hash, never by a fragment whose
+/// list expands to nothing. Accepting one would report a level as walked when nothing had been
+/// written, and since the target file is sized before the walk starts, that is a zero-filled
+/// range indistinguishable from content.
 #[allow(clippy::too_many_arguments)]
 async fn walk_fragment_level(
     store: Arc<dyn ImmutableStore>,
@@ -137,9 +149,10 @@ async fn walk_fragment_level(
     }
 
     if fragment_list.is_empty() {
-        return Ok(());
+        return Err(StorageError::internal(format!(
+            "fragment list is empty, claiming {total_content_size} bytes of content"
+        )));
     }
-
     let base_offset = fragment_list[0].offset_content;
 
     // Peek at the first entry to determine if this level is intermediate or leaf
@@ -162,6 +175,7 @@ async fn walk_fragment_level(
             partition,
             context,
             fragment_list,
+            total_content_size,
             first_frag,
             first_buf,
             leaf_tx,
@@ -189,7 +203,7 @@ async fn walk_fragment_level(
 /// non-increasing offsets, offsets outside the content window, or a total
 /// span that overflows u64 fails with a clear error rather than producing a
 /// wrapped `expected_size` that would blow up downstream permit accounting
-/// or mmap writes.
+/// or file writes.
 async fn walk_leaf_level(
     fragment_list: &[FragmentReference],
     total_content_size: usize,
@@ -225,6 +239,12 @@ async fn walk_leaf_level(
         if expected_content_size == 0 {
             return Err(StorageError::internal("fragment list chunk has zero size"));
         }
+        if frag_ref.hash.is_zero() {
+            return Err(StorageError::internal(format!(
+                "fragment list entry {i} at content offset {} has a zero hash",
+                frag_ref.offset_content
+            )));
+        }
 
         let leaf = LeafReference {
             hash: frag_ref.hash,
@@ -239,12 +259,89 @@ async fn walk_leaf_level(
     Ok(())
 }
 
+/// Verifies that one sublist covers exactly the range its parent entry claims, returning
+/// the content offset the next sibling has to start at.
+///
+/// Sublist offsets are absolute in the whole content, so in a well-formed tree a parent
+/// entry's `offset_content` equals its sublist's own first offset, and consecutive siblings
+/// tile the parent's range end to end. A gap between siblings is not a read error on its own:
+/// the output file is `set_len` to its full size before the walk starts, so a range no leaf
+/// ever writes reads back as zeros and the file is renamed into place as complete. An overlap
+/// is the same fault from the other side, which is why this compares offsets rather than only
+/// summing sizes.
+///
+/// A sublist that is empty or expands to zero bytes is invalid outright: zero-length content
+/// is addressed by the zero hash, so no valid tree contains a list standing in for nothing.
+/// The zero hash itself is just as invalid as an entry, and is checked here rather than in a
+/// pass of its own — `load_fragment` resolves it to a default `Fragment` instead of an error,
+/// and that carries no `PayloadFragmented` flag and zero `size_content`, so an unchecked one
+/// turns a level of intermediate references into leaves.
+fn sublist_coverage(
+    parent: &FragmentReference,
+    sub_list: &[FragmentReference],
+    sub_content_size: usize,
+    expected_offset: u64,
+    level_end: u64,
+) -> Result<u64, StorageError> {
+    if parent.offset_content != expected_offset {
+        return Err(StorageError::internal(format!(
+            "fragment sublist starts at {} but the previous sibling ends at {expected_offset}",
+            parent.offset_content
+        )));
+    }
+    if parent.hash.is_zero() {
+        return Err(StorageError::internal(format!(
+            "fragment list entry at content offset {expected_offset} has a zero hash"
+        )));
+    }
+    if sub_list.is_empty() {
+        return Err(StorageError::internal(format!(
+            "fragment sublist at offset {expected_offset} is empty"
+        )));
+    }
+    if sub_content_size == 0 {
+        return Err(StorageError::internal(format!(
+            "fragment sublist at offset {expected_offset} expands to zero bytes"
+        )));
+    }
+    if sub_list[0].offset_content != parent.offset_content {
+        return Err(StorageError::internal(format!(
+            "fragment sublist starts at {} but its parent entry places it at {}",
+            sub_list[0].offset_content, parent.offset_content
+        )));
+    }
+    let end = parent
+        .offset_content
+        .checked_add(sub_content_size as u64)
+        .ok_or_else(|| {
+            StorageError::internal("fragment sublist offset + content size overflows u64")
+        })?;
+    if end > level_end {
+        return Err(StorageError::internal(format!(
+            "fragment sublist ends at {end}, past its parent's content end {level_end}"
+        )));
+    }
+    Ok(end)
+}
+
+/// The sublists of one level have to reach the end of their parent's content range, not
+/// merely stay inside it. Stopping short leaves the tail of the file uncovered.
+fn level_fully_covered(covered: u64, level_end: u64) -> Result<(), StorageError> {
+    if covered != level_end {
+        return Err(StorageError::internal(format!(
+            "fragment sublists cover up to {covered} but their parent's content ends at {level_end}"
+        )));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn walk_intermediate_level(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     context: Context,
     fragment_list: &[FragmentReference],
+    total_content_size: usize,
     first_frag: Fragment,
     first_buf: Bytes,
     leaf_tx: &Sender<LeafReference>,
@@ -261,9 +358,19 @@ async fn walk_intermediate_level(
     let first_buffer = first_buf.to_aligned::<FragmentReference>();
     let first_list = first_buffer.as_type_slice::<FragmentReference>();
 
-    if first_list.is_empty() {
-        return Ok(());
-    }
+    let base_offset = fragment_list[0].offset_content;
+    let level_end = base_offset
+        .checked_add(total_content_size as u64)
+        .ok_or_else(|| {
+            StorageError::internal("fragment list base_offset + total_content_size overflows u64")
+        })?;
+    let mut covered = sublist_coverage(
+        &fragment_list[0],
+        first_list,
+        first_content_size,
+        base_offset,
+        level_end,
+    )?;
 
     // Determine sub-level type by peeking at the first child
     let peek_address = Address {
@@ -309,7 +416,7 @@ async fn walk_intermediate_level(
     };
 
     if fragment_list.len() <= 1 || result.is_err() {
-        return result;
+        return result.and(level_fully_covered(covered, level_end));
     }
 
     // Prefetch remaining intermediate entries
@@ -341,7 +448,11 @@ async fn walk_intermediate_level(
         })
     };
 
+    // Advances on every iteration, bail-outs included, or a later sublist checks against
+    // the wrong parent.
+    let mut index = 0usize;
     while let Some(handle) = prefetch_rx.recv().await {
+        index += 1;
         let (sub_frag, sub_buf) = match handle
             .await
             .map_err(|e| StorageError::internal_with_context(e, "load task join"))
@@ -367,16 +478,25 @@ async fn walk_intermediate_level(
         let sub_list = sub_buffer.as_type_slice::<FragmentReference>();
         let sub_content_size = sub_frag.size_content as usize;
 
+        let Some(parent) = fragment_list.get(index) else {
+            result = result.and(Err(StorageError::internal(
+                "more prefetched sublists than fragment list entries",
+            )));
+            continue;
+        };
+        match sublist_coverage(parent, sub_list, sub_content_size, covered, level_end) {
+            Ok(end) => covered = end,
+            Err(err) => {
+                result = result.and(Err(err));
+                continue;
+            }
+        }
+
         let subresult = if children_are_leaves {
-            let sub_base_offset = if sub_list.is_empty() {
-                0
-            } else {
-                sub_list[0].offset_content
-            };
             walk_leaf_level(
                 sub_list,
                 sub_content_size,
-                sub_base_offset,
+                sub_list[0].offset_content,
                 context,
                 leaf_tx,
             )
@@ -398,20 +518,22 @@ async fn walk_intermediate_level(
         result = result.and(subresult);
     }
 
-    result.and(
-        launcher
-            .await
-            .map_err(|e| StorageError::internal_with_context(e, "stream queue join"))
-            .and_then(|r| r),
-    )
+    let launcher_result = launcher
+        .await
+        .map_err(|e| StorageError::internal_with_context(e, "stream queue join"))
+        .and_then(|r| r);
+
+    result
+        .and(level_fully_covered(covered, level_end))
+        .and(launcher_result)
 }
 
-/// Unordered fetch pool for file/mmap targets.
+/// Unordered fetch pool for file targets.
 async fn fetch_unordered(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     mut leaf_rx: Receiver<LeafReference>,
-    data_tx: Sender<(usize, Bytes)>,
+    data_tx: DataSender,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
 ) -> Result<(), StorageError> {
@@ -449,10 +571,8 @@ async fn fetch_unordered(
 
         let expected_size = leaf.expected_size;
         lore_base::lore_spawn!(tasks, async move {
-            let load_result =
-                load_fragment(store, partition, subaddress, options, remote_session).await;
-            drop(permit);
-            let (loaded_fragment, buffer) = load_result?;
+            let (loaded_fragment, buffer) =
+                load_fragment(store, partition, subaddress, options, remote_session).await?;
             // Tier check: the parent list decided this reference was a leaf
             // by peeking at the first child. If a peer mixed an intermediate
             // fragment list into the same level, the "buffer" here is a list
@@ -473,7 +593,7 @@ async fn fetch_unordered(
                     buffer.len()
                 )));
             }
-            tx.send((offset, buffer))
+            tx.send((offset, buffer, permit))
                 .await
                 .map_err(|_err| StorageError::internal("stream send failed"))
         });
@@ -501,7 +621,33 @@ async fn fetch_unordered(
 }
 
 /// Ordered fetch pool for streaming targets.
+///
+/// Every payload carries its memory permit from the load until it is handed to the
+/// caller's channel, so the fragment budget bounds what the pipeline holds even when the
+/// caller consumes slowly. The fetch is one task per leaf, awaited in list order, which is
+/// what makes the output a stream rather than positional writes.
 async fn fetch_ordered_and_stream(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    leaf_rx: Receiver<LeafReference>,
+    sender: Sender<Bytes>,
+    options: ReadOptions,
+    remote_session: Option<Arc<StorageSession>>,
+) -> Result<(), StorageError> {
+    fetch_ordered_and_stream_from(
+        fragment_limiter(),
+        store,
+        partition,
+        leaf_rx,
+        sender,
+        options,
+        remote_session,
+    )
+    .await
+}
+
+async fn fetch_ordered_and_stream_from(
+    semaphore: &'static Semaphore,
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     mut leaf_rx: Receiver<LeafReference>,
@@ -511,11 +657,11 @@ async fn fetch_ordered_and_stream(
 ) -> Result<(), StorageError> {
     // See fetch_unordered: defragmentation leaves are always decompressed.
     let options = options.with_decompress();
-    let semaphore = fragment_limiter();
 
+    // Sized so it never binds before the budget does; every payload in it holds a permit.
     let max_tasks = FRAGMENT_BUDGET_KIB / FRAGMENT_MINIMUM_COST_KIB as usize;
-    let (fetch_queue_tx, mut fetch_queue_rx) =
-        channel::<JoinHandle<Result<Bytes, StorageError>>>(max_tasks);
+    type FetchResult = Result<(Bytes, SemaphorePermit<'static>), StorageError>;
+    let (fetch_queue_tx, mut fetch_queue_rx) = channel::<JoinHandle<FetchResult>>(max_tasks);
 
     // Launcher: read leaf refs from walker, spawn fetch tasks, push handles
     let launcher: JoinHandle<Result<(), StorageError>> = {
@@ -537,27 +683,23 @@ async fn fetch_ordered_and_stream(
                 let remote_session = remote_session.clone();
                 let expected_size = leaf.expected_size;
 
-                let handle: JoinHandle<Result<Bytes, StorageError>> = lore_base::lore_spawn!(
-                    async move {
-                        let load_result =
-                            load_fragment(store, partition, subaddress, options, remote_session)
-                                .await;
-                        drop(permit);
-                        let (loaded_fragment, buffer) = load_result?;
-                        if loaded_fragment.flags & FragmentFlags::PayloadFragmented != 0 {
-                            return Err(StorageError::internal(
-                                "expected leaf fragment but peer returned an intermediate fragment list",
-                            ));
-                        }
-                        if buffer.len() as u64 != expected_size {
-                            return Err(StorageError::internal(format!(
-                                "leaf fragment content size {} does not match expected {expected_size}",
-                                buffer.len()
-                            )));
-                        }
-                        Ok(buffer)
+                let handle: JoinHandle<FetchResult> = lore_base::lore_spawn!(async move {
+                    let (loaded_fragment, buffer) =
+                        load_fragment(store, partition, subaddress, options, remote_session)
+                            .await?;
+                    if loaded_fragment.flags & FragmentFlags::PayloadFragmented != 0 {
+                        return Err(StorageError::internal(
+                            "expected leaf fragment but peer returned an intermediate fragment list",
+                        ));
                     }
-                );
+                    if buffer.len() as u64 != expected_size {
+                        return Err(StorageError::internal(format!(
+                            "leaf fragment content size {} does not match expected {expected_size}",
+                            buffer.len()
+                        )));
+                    }
+                    Ok((buffer, permit))
+                });
 
                 if fetch_queue_tx.send(handle).await.is_err() {
                     break;
@@ -575,13 +717,15 @@ async fn fetch_ordered_and_stream(
             .map_err(|e| StorageError::internal_with_context(e, "load task join"))
             .and_then(|r| r)
         {
-            Ok(buffer) => {
+            Ok((buffer, permit)) => {
                 if result.is_ok() {
                     result = sender
                         .send(buffer)
                         .await
                         .map_err(|_err| StorageError::internal("stream send failed"));
                 }
+                // Released here, not at load, so the budget bounds the pipeline.
+                drop(permit);
             }
             Err(e) => {
                 result = result.and(Err(e));
@@ -597,16 +741,10 @@ async fn fetch_ordered_and_stream(
     )
 }
 
-/// Write sink for file/mmap targets.
-async fn write_to_sink(
-    sink: DefragmentSink,
-    data_rx: Receiver<(usize, Bytes)>,
-) -> Result<(), StorageError> {
+/// Write sink for file targets.
+async fn write_to_sink(sink: DefragmentSink, data_rx: DataReceiver) -> Result<(), StorageError> {
     match sink {
-        DefragmentSink::Mmap { ptr, len } => {
-            write_to_sink_mmap(MmapPtr { ptr, len }, data_rx).await
-        }
-        DefragmentSink::File { file } => write_to_sink_file(file, data_rx).await,
+        DefragmentSink::File { file, size } => write_to_sink_file(file, size, data_rx).await,
         DefragmentSink::Stream { .. } => {
             debug_assert!(false, "write_to_sink called with Stream sink");
             Ok(())
@@ -614,102 +752,73 @@ async fn write_to_sink(
     }
 }
 
-/// Send-safe wrapper for a raw mmap pointer.
-struct MmapPtr {
-    ptr: *mut u8,
-    len: usize,
-}
-
-unsafe impl Send for MmapPtr {}
-unsafe impl Sync for MmapPtr {}
-
-/// Send-safe wrapper for a single bounds-checked destination pointer moved
-/// into a blocking copy task. The whole wrapper must be captured (not the
-/// bare `*mut u8` field) for the closure to stay `Send`.
-struct DstPtr(*mut u8);
-
-unsafe impl Send for DstPtr {}
-
-/// Copy size above which the mmap `memcpy` is offloaded to a blocking thread.
-/// A file-backed mmap faults each touched page in synchronously, so a large
-/// copy can stall for milliseconds; below this size the `spawn_blocking` round
-/// trip costs more than copying inline.
-const MMAP_COPY_OFFLOAD_THRESHOLD: usize = 4 * 1024;
-
-/// Drains `(offset, data)` messages from the fetch pool and copies each
-/// payload to the corresponding mmap region.
+/// Drains `(offset, data, permit)` messages from the fetch pool and writes each
+/// payload at its offset.
 ///
-/// The copy into a file-backed mmap is effectively an `fwrite`: each touched
-/// page faults in synchronously, so on a cold mapping the `memcpy` can stall
-/// for milliseconds. The drain loop and bounds check stay on the async worker
-/// (cheap), but copies at or above [`MMAP_COPY_OFFLOAD_THRESHOLD`] are spawned
-/// onto blocking threads via a `JoinSet`, so page-fault stalls never block a
-/// runtime worker and independent copies overlap. Smaller copies run inline as
-/// the `spawn_blocking` round trip would cost more than the copy. Completed
-/// copies are reaped each iteration; the rest are joined after the channel
-/// closes. A copy-task or bounds error breaks the drain loop and still joins
-/// the spawned tasks before returning.
+/// Positional writes carry their own offset, so concurrent writes to disjoint ranges
+/// need no lock — the previous seek-plus-write sink had to serialize behind a mutex
+/// because the pair is not atomic. Each write is one blocking task, so the syscall
+/// never stalls a runtime worker and independent writes overlap. Completed writes are
+/// reaped each iteration; the rest are joined after the channel closes, including
+/// after an early error break.
 ///
-/// # Invariants relied on
+/// Each message carries the fragment memory permit for its payload, released only when
+/// the write task ends. That keeps the payload accounted for its whole life rather than
+/// just while it was being fetched.
 ///
-/// - **Non-overlapping writes.** Messages are assumed to target disjoint
-///   byte ranges. The fragment-list walker's strict-increasing offset check
-///   plus the leaf contiguity check (actual leaf `size_content` equals the
-///   offset delta) guarantee this for any well-formed fragment tree. This is
-///   now load-bearing for *memory safety*: offloaded copies run concurrently,
-///   so two copies into overlapping regions would be a data race. A future
-///   producer that forwards into this channel without that validation must
-///   re-establish disjointness.
-/// - **Bounded offset.** The bounds check below is the last line of defence
-///   against a compromised offset; do not remove it even if upstream
-///   appears to already cap offsets.
-async fn write_to_sink_mmap(
-    mmap: MmapPtr,
-    mut data_rx: Receiver<(usize, Bytes)>,
+/// Overlapping ranges would corrupt the output but are not a soundness problem, unlike
+/// the memory-mapped sink this replaced: the fragment-list walker's strict-increasing
+/// offset check and the leaf contiguity check still guarantee disjointness for any
+/// well-formed fragment tree.
+///
+/// The bounds check against `size` is the last line of defence against a compromised
+/// fragment list. It is no longer a memory-safety boundary as it was for the mapping,
+/// but an unchecked offset would still punch a sparse hole far past the intended end of
+/// file rather than failing; do not remove it even if upstream appears to cap offsets.
+///
+/// The byte count against `size` is the other half of that: the file is `set_len` to its
+/// full size before the first write, so a range no payload covers is not a short file but
+/// a zero-filled hole, indistinguishable from content. Every payload for the whole file
+/// passes through here, which makes this the one place that can see the total. The walker's
+/// tiling checks mean it should never fire, which is the point of having it.
+async fn write_to_sink_file(
+    file: Arc<std::fs::File>,
+    size: usize,
+    mut data_rx: DataReceiver,
 ) -> Result<(), StorageError> {
-    let mut tasks: JoinSet<()> = JoinSet::new();
+    let mut tasks: JoinSet<Result<(), StorageError>> = JoinSet::new();
     let mut result = Ok(());
+    let mut written = 0usize;
 
-    while let Some((offset, payload)) = data_rx.recv().await {
-        let len = payload.len();
-        // Runtime bounds check: a compromised fragment list can feed an
-        // out-of-range `offset` here. An OOB write would be memory-unsafe.
-        let Some(end) = offset.checked_add(len) else {
+    while let Some((offset, payload, permit)) = data_rx.recv().await {
+        let Some(end) = offset.checked_add(payload.len()) else {
             result = Err(StorageError::internal(
-                "mmap write offset + data length overflows usize",
+                "file write offset + data length overflows usize",
             ));
             break;
         };
-        if end > mmap.len {
+        if end > size {
             result = Err(StorageError::internal(format!(
-                "mmap write out of bounds: offset {offset} + {len} > {}",
-                mmap.len
+                "file write out of bounds: offset {offset} + {} > {size}",
+                payload.len()
             )));
             break;
         }
 
-        // SAFETY: `offset + len <= mmap.len` was just verified, so the region
-        // lies within the mapping, and the non-overlapping invariant above
-        // guarantees it does not alias any concurrent copy's destination.
-        let dst = DstPtr(unsafe { mmap.ptr.add(offset) });
+        written += payload.len();
 
-        if len < MMAP_COPY_OFFLOAD_THRESHOLD {
-            unsafe {
-                std::ptr::copy_nonoverlapping(payload.as_ptr(), dst.0, len);
-            }
-        } else {
-            lore_base::lore_spawn_blocking!(tasks, move || {
-                let dst = dst;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(payload.as_ptr(), dst.0, len);
-                }
-            });
-        }
+        let file = file.clone();
+        lore_base::lore_spawn_blocking!(tasks, move || {
+            let _permit = permit;
+            write_all_at(&file, payload.as_ref(), offset as u64)
+                .map_err(|e| StorageError::internal_with_context(e, "write to file"))
+        });
 
-        // Reap copies that have already finished without blocking.
         while let Some(join_result) = tasks.try_join_next() {
             result = result.and(
-                join_result.map_err(|e| StorageError::internal_with_context(e, "mmap copy task")),
+                join_result
+                    .map_err(|e| StorageError::internal_with_context(e, "write task"))
+                    .and_then(|r| r),
             );
         }
         if result.is_err() {
@@ -717,42 +826,75 @@ async fn write_to_sink_mmap(
         }
     }
 
-    // Join any copies still in flight (also drains them after an early break).
     while let Some(join_result) = tasks.join_next().await {
-        result = result
-            .and(join_result.map_err(|e| StorageError::internal_with_context(e, "mmap copy task")));
+        result = result.and(
+            join_result
+                .map_err(|e| StorageError::internal_with_context(e, "write task"))
+                .and_then(|r| r),
+        );
+    }
+
+    if result.is_ok() && written != size {
+        result = Err(StorageError::internal(format!(
+            "defragmented content covers {written} of {size} bytes"
+        )));
     }
 
     result
 }
 
-async fn write_to_sink_file(
-    file: Arc<Mutex<File>>,
-    mut data_rx: Receiver<(usize, Bytes)>,
-) -> Result<(), StorageError> {
-    let mut retry = crate::retry(10, 10_000, 10);
-    while let Some((offset, payload)) = data_rx.recv().await {
-        loop {
-            let mut locked_file = file.lock().await;
-            if let Err(err) = locked_file
-                .seek(tokio::io::SeekFrom::Start(offset as u64))
-                .await
-            {
-                if !retry.wait().await {
-                    return Err(StorageError::internal_with_context(err, "write to file"));
-                }
-                continue;
-            }
-            if let Err(err) = locked_file.write_all(payload.as_ref()).await {
-                if !retry.wait().await {
-                    return Err(StorageError::internal_with_context(err, "write to file"));
-                }
-                continue;
-            }
+/// Read the whole file into `buffer`, returning the byte count. Test-only readback for
+/// the write sink.
+#[cfg(test)]
+fn read_all_at_for_test(file: &std::fs::File, buffer: &mut [u8]) -> usize {
+    let mut read = 0;
+    while read < buffer.len() {
+        #[cfg(target_family = "unix")]
+        let count = file
+            .read_at(&mut buffer[read..], read as u64)
+            .expect("read");
+        #[cfg(target_family = "windows")]
+        let count = file
+            .seek_read(&mut buffer[read..], read as u64)
+            .expect("read");
+        if count == 0 {
             break;
         }
+        read += count;
     }
-    Ok(())
+    read
+}
+
+/// Write every byte at `offset`, retrying interrupted calls. On Windows `seek_write`
+/// also moves the file cursor, which is harmless because no caller of this sink reads
+/// the cursor; note the handle is not opened overlapped, so concurrent writes to it are
+/// serialized by the kernel there even though each carries its own offset.
+fn write_all_at(file: &std::fs::File, buffer: &[u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(target_family = "unix")]
+    {
+        file.write_all_at(buffer, offset)
+    }
+    #[cfg(target_family = "windows")]
+    {
+        let mut written = 0;
+        while written < buffer.len() {
+            match file.seek_write(&buffer[written..], offset + written as u64) {
+                Ok(0) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        format!(
+                            "wrote {written} of {} bytes at offset {offset}",
+                            buffer.len()
+                        ),
+                    ));
+                }
+                Ok(count) => written += count,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Unified streaming defragmentation pipeline.
@@ -807,7 +949,7 @@ pub async fn defragment_pipeline(
             )
     } else {
         // Unordered fetch -> data channel -> write sink
-        let (data_tx, data_rx) = channel::<(usize, Bytes)>(PIPELINE_DATA_CHANNEL_SIZE);
+        let (data_tx, data_rx) = channel::<DataMessage>(PIPELINE_DATA_CHANNEL_SIZE);
 
         let store_fetch = store.clone();
         let session_fetch = remote_session.clone();
@@ -1026,98 +1168,34 @@ fn read_defragment_subread(
     })
 }
 
+/// Open (creating if needed) and size a file for positional writes. The handle is
+/// shared: positional writes carry their own offset, so concurrent writers to disjoint
+/// ranges need no exclusion.
+/// Opens a file for positional writing and sizes it to the whole content up front.
+///
+/// On Windows the handle is deliberately **not** overlapped. `seek_write` issues a synchronous
+/// `WriteFile` with the offset in an `OVERLAPPED` and no event, which is only defined for a
+/// synchronous handle; against an overlapped one it can report `ERROR_IO_PENDING` while the
+/// kernel still holds the buffer. So `FILE_FLAG_OVERLAPPED` is not a way to parallelise these
+/// writes, even though the handle being synchronous is what serializes them.
 pub async fn open_file_write(
     path: impl AsRef<Path>,
     size: usize,
-) -> Result<tokio::fs::File, std::io::Error> {
-    let file = tokio::fs::File::options()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)
-        .await?;
-
-    file.set_len(size as u64).await?;
-
-    Ok(file)
-}
-
-pub async fn open_mmap_write(
-    path: impl AsRef<Path>,
-    size: usize,
-) -> Result<(tokio::fs::File, MmapMut), std::io::Error> {
-    let file = tokio::fs::File::options()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)
-        .await?;
-
-    file.set_len(size as u64).await?;
-
-    let mmap = unsafe { MmapMut::map_mut(&file)? };
-
-    Ok((file, mmap))
-}
-
-/// Open a file for reading and return its content as [`Bytes`] along with a flag
-/// indicating whether the buffer is a live memory mapping.
-///
-/// Files at or below [`MMAP_READ_THRESHOLD`] are read into a heap buffer (a snapshot);
-/// larger files are memory mapped (live — callers that require a stable view must
-/// copy the bytes themselves). The file size is queried from the open handle to
-/// avoid a separate metadata syscall on the path. All filesystem work runs on a
-/// blocking thread via [`lore_spawn_blocking!`].
-pub async fn open_mmap_read(
-    path: impl AsRef<Path>,
-) -> Result<(Bytes, bool, Option<tokio::sync::OwnedSemaphorePermit>), std::io::Error> {
+) -> Result<Arc<std::fs::File>, std::io::Error> {
     let path = path.as_ref().to_path_buf();
-
-    // Reserve before allocating; mmapped files aren't copied, so they take none.
-    let read_permit = match tokio::fs::metadata(&path).await {
-        Ok(meta) if meta.len() > 0 && meta.len() <= MMAP_READ_THRESHOLD => {
-            crate::concurrency::acquire_fragment_memory_permit(meta.len() as usize).await
-        }
-        _ => None,
-    };
-
-    let (bytes, is_mmapped) =
-        lore_base::lore_spawn_blocking!(move || -> std::io::Result<(Bytes, bool)> {
-            use std::io::Read;
-
-            let mut file = std::fs::File::options()
-                .create(false)
-                .truncate(false)
-                .read(true)
-                .write(false)
-                .open(&path)?;
-
-            let size = file.metadata()?.len();
-
-            if size <= MMAP_READ_THRESHOLD {
-                let size = size as usize;
-                let mut buf = BytesMut::with_capacity(size);
-                // Safety: `with_capacity(size)` guarantees that the allocation holds
-                // at least `size` bytes. The following `read_exact` initialises every
-                // byte up to `size`, so no uninitialised memory is ever observed.
-                unsafe { buf.set_len(size) };
-                file.read_exact(&mut buf)?;
-                Ok((buf.freeze(), false))
-            } else {
-                let mmap = unsafe { Mmap::map(&file)? };
-                Ok((Bytes::from_owner(mmap), true))
-            }
-        })
-        .await
-        .map_err(std::io::Error::other)??;
-
-    Ok((bytes, is_mmapped, read_permit))
+    lore_base::lore_spawn_blocking!(move || -> std::io::Result<Arc<std::fs::File>> {
+        let file = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        file.set_len(size as u64)?;
+        Ok(Arc::new(file))
+    })
+    .await
+    .map_err(std::io::Error::other)?
 }
-
-/// Files at or below this size are read into a heap buffer rather than memory mapped.
-pub const MMAP_READ_THRESHOLD: u64 = 4 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -1126,11 +1204,14 @@ mod tests {
     mod walk_leaf_level {
         use super::*;
 
+        /// Hashes are distinct and non-zero: a zero hash is not a legal list entry, so a
+        /// list built from `Hash::default()` would be rejected before the offset arithmetic
+        /// these tests are about.
         fn refs(offsets: &[u64]) -> Vec<FragmentReference> {
             offsets
                 .iter()
                 .map(|&o| FragmentReference {
-                    hash: Hash::default(),
+                    hash: crate::hash::hash_slice(&o.to_le_bytes()),
                     offset_content: o,
                 })
                 .collect()
@@ -1234,48 +1315,93 @@ mod tests {
         }
     }
 
-    mod write_to_sink_mmap {
-        //! Direct unit tests for the mmap write sink's runtime bounds check.
+    mod write_to_sink_file {
+        //! Direct unit tests for the file write sink's runtime bounds check.
         //!
         //! In the full pipeline the leaf contiguity check in `fetch_unordered`
         //! filters out the inputs that would make this bound fire, so these
         //! tests exercise the sink in isolation — the bound is defense-in-depth
-        //! against any future producer that bypasses earlier validation.
+        //! against any future producer that bypasses earlier validation. Unlike
+        //! the memory-mapped sink this replaced, an unchecked offset here is not
+        //! unsound, but it would still write far past the intended end of file.
         use super::*;
+        use crate::test_util::TempDir;
+
+        const SIZE: usize = 100;
+
+        /// A sized target file plus a channel wired to the sink.
+        fn target(dir: &TempDir, name: &str) -> Arc<std::fs::File> {
+            let path = dir.path().join(name);
+            let file = std::fs::File::options()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .expect("create target file");
+            file.set_len(SIZE as u64).expect("size target file");
+            Arc::new(file)
+        }
+
+        /// Send one message carrying a permit, as the fetch pool does.
+        async fn send_one(tx: &DataSender, offset: usize, payload: Bytes) {
+            let permit = fragment_limiter()
+                .acquire_many(fragment_permit_count(payload.len()))
+                .await
+                .expect("permit");
+            tx.send((offset, payload, permit)).await.expect("send");
+        }
 
         #[tokio::test]
         async fn accepts_in_bounds_write() {
-            let mut buf = vec![0u8; 100];
-            let ptr = buf.as_mut_ptr();
-            let mmap = MmapPtr {
-                ptr,
-                len: buf.len(),
-            };
-            let (tx, rx) = channel::<(usize, Bytes)>(4);
-            tx.send((10usize, Bytes::from(vec![0xAB; 20])))
-                .await
-                .expect("send");
+            let dir = TempDir::new("lore-storage-sink-test-");
+            let file = target(&dir, "in-bounds");
+            let (tx, rx) = channel::<DataMessage>(4);
+            send_one(&tx, 0, Bytes::from(vec![0xCD; 10])).await;
+            send_one(&tx, 10, Bytes::from(vec![0xAB; 20])).await;
+            send_one(&tx, 30, Bytes::from(vec![0xEF; SIZE - 30])).await;
             drop(tx);
-            super::super::write_to_sink_mmap(mmap, rx)
+
+            super::super::write_to_sink_file(file.clone(), SIZE, rx)
                 .await
                 .expect("in-bounds write");
+
+            let mut buf = vec![0u8; SIZE];
+            let read = super::super::read_all_at_for_test(&file, &mut buf);
+            assert_eq!(read, SIZE);
             assert_eq!(&buf[10..30], &[0xAB; 20]);
+        }
+
+        /// Payloads that stay in bounds but do not add up to the file: the target is
+        /// `set_len` up front, so the uncovered range is zeros in a file that would
+        /// otherwise be renamed into place as complete.
+        #[tokio::test]
+        async fn rejects_payloads_that_do_not_cover_the_file() {
+            let dir = TempDir::new("lore-storage-sink-test-");
+            let file = target(&dir, "hole");
+            let (tx, rx) = channel::<DataMessage>(4);
+            send_one(&tx, 0, Bytes::from(vec![0xAB; 20])).await;
+            send_one(&tx, 40, Bytes::from(vec![0xAB; SIZE - 40])).await;
+            drop(tx);
+
+            let err = super::super::write_to_sink_file(file, SIZE, rx)
+                .await
+                .expect_err("a hole should be rejected");
+            assert!(
+                err.to_string().contains("covers 80 of 100 bytes"),
+                "unexpected error: {err}"
+            );
         }
 
         #[tokio::test]
         async fn rejects_offset_plus_length_past_end() {
-            let mut buf = vec![0u8; 100];
-            let ptr = buf.as_mut_ptr();
-            let mmap = MmapPtr {
-                ptr,
-                len: buf.len(),
-            };
-            let (tx, rx) = channel::<(usize, Bytes)>(4);
-            tx.send((95usize, Bytes::from(vec![0u8; 10])))
-                .await
-                .expect("send"); // 95 + 10 = 105 > 100
+            let dir = TempDir::new("lore-storage-sink-test-");
+            let file = target(&dir, "past-end");
+            let (tx, rx) = channel::<DataMessage>(4);
+            send_one(&tx, 95, Bytes::from(vec![0u8; 10])).await; // 95 + 10 > 100
             drop(tx);
-            let err = super::super::write_to_sink_mmap(mmap, rx)
+
+            let err = super::super::write_to_sink_file(file, SIZE, rx)
                 .await
                 .expect_err("OOB should be rejected");
             assert!(
@@ -1286,36 +1412,26 @@ mod tests {
 
         #[tokio::test]
         async fn rejects_offset_at_exact_end_with_nonzero_length() {
-            let mut buf = vec![0u8; 100];
-            let ptr = buf.as_mut_ptr();
-            let mmap = MmapPtr {
-                ptr,
-                len: buf.len(),
-            };
-            let (tx, rx) = channel::<(usize, Bytes)>(4);
-            tx.send((100usize, Bytes::from(vec![0u8; 1])))
-                .await
-                .expect("send");
+            let dir = TempDir::new("lore-storage-sink-test-");
+            let file = target(&dir, "exact-end");
+            let (tx, rx) = channel::<DataMessage>(4);
+            send_one(&tx, SIZE, Bytes::from(vec![0u8; 1])).await;
             drop(tx);
-            super::super::write_to_sink_mmap(mmap, rx)
+
+            super::super::write_to_sink_file(file, SIZE, rx)
                 .await
-                .expect_err("offset==len with data should be rejected");
+                .expect_err("offset==size with data should be rejected");
         }
 
         #[tokio::test]
         async fn rejects_arithmetic_overflow() {
-            let mut buf = vec![0u8; 100];
-            let ptr = buf.as_mut_ptr();
-            let mmap = MmapPtr {
-                ptr,
-                len: buf.len(),
-            };
-            let (tx, rx) = channel::<(usize, Bytes)>(4);
-            tx.send((usize::MAX - 5, Bytes::from(vec![0u8; 10])))
-                .await
-                .expect("send");
+            let dir = TempDir::new("lore-storage-sink-test-");
+            let file = target(&dir, "overflow");
+            let (tx, rx) = channel::<DataMessage>(4);
+            send_one(&tx, usize::MAX - 5, Bytes::from(vec![0u8; 10])).await;
             drop(tx);
-            let err = super::super::write_to_sink_mmap(mmap, rx)
+
+            let err = super::super::write_to_sink_file(file, SIZE, rx)
                 .await
                 .expect_err("offset + len overflow rejected");
             assert!(
@@ -1379,7 +1495,18 @@ mod tests {
             (address, fragment)
         }
 
-        async fn put_root_list(
+        /// Build a fragment list placing each address at the given content offset.
+        fn refs_at(entries: &[(Address, u64)]) -> Vec<FragmentReference> {
+            entries
+                .iter()
+                .map(|&(address, offset_content)| FragmentReference {
+                    hash: address.hash,
+                    offset_content,
+                })
+                .collect()
+        }
+
+        async fn put_list(
             store: &Arc<dyn ImmutableStore>,
             partition: Partition,
             context: Context,
@@ -1436,7 +1563,7 @@ mod tests {
                     offset_content: 200,
                 },
             ];
-            let root_address = put_root_list(&store, partition, context, &refs, 300).await;
+            let root_address = put_list(&store, partition, context, &refs, 300).await;
 
             let out_path = dir.join("contiguity-fail.bin");
             let err = crate::read::read_into_file(
@@ -1477,7 +1604,7 @@ mod tests {
                     offset_content: 100,
                 },
             ];
-            let root_address = put_root_list(&store, partition, context, &refs, 250).await;
+            let root_address = put_list(&store, partition, context, &refs, 250).await;
 
             let out_path = dir.join("well-formed.bin");
             crate::read::read_into_file(
@@ -1562,7 +1689,7 @@ mod tests {
                     offset_content: 100,
                 },
             ];
-            let root_address = put_root_list(&store, partition, context, &refs, 200).await;
+            let root_address = put_list(&store, partition, context, &refs, 200).await;
 
             let out_path = dir.join("mixed-tier.bin");
             let err = crate::read::read_into_file(
@@ -1652,6 +1779,557 @@ mod tests {
             assert!(
                 err.to_string().contains("recursion depth exceeded"),
                 "unexpected error: {err}"
+            );
+        }
+
+        /// Control for the tiling checks below: a two-level tree whose sublists tile their
+        /// parent exactly must still read back byte for byte. Every tree the writer
+        /// produces has this shape, so a check that rejected it would make existing
+        /// repositories unreadable.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn accepts_a_two_level_tree_that_tiles() {
+            let (dir, store) = make_store().await;
+            let partition = Partition::from([0x05; 16]);
+            let context = Context::from([0x05; 16]);
+
+            let (leaf_a, _) = put_leaf(&store, partition, context, vec![0xAA; 100]).await;
+            let (leaf_b, _) = put_leaf(&store, partition, context, vec![0xBB; 150]).await;
+
+            let sub_a = put_list(&store, partition, context, &refs_at(&[(leaf_a, 0)]), 100).await;
+            let sub_b = put_list(&store, partition, context, &refs_at(&[(leaf_b, 100)]), 150).await;
+            let root = put_list(
+                &store,
+                partition,
+                context,
+                &refs_at(&[(sub_a, 0), (sub_b, 100)]),
+                250,
+            )
+            .await;
+
+            let out_path = dir.join("two-level.bin");
+            crate::read::read_into_file(
+                store.clone(),
+                partition,
+                root,
+                &out_path,
+                ".tmp",
+                ReadOptions::default().no_verify(),
+                None,
+            )
+            .await
+            .expect("well-formed two-level read succeeds");
+
+            let content = std::fs::read(&out_path).expect("read output file");
+            assert_eq!(content.len(), 250);
+            assert!(content[0..100].iter().all(|&b| b == 0xAA));
+            assert!(content[100..250].iter().all(|&b| b == 0xBB));
+        }
+
+        /// Sibling sublists that skip a range: the second starts past where the first
+        /// ended, so [100, 200) is claimed by nobody. Without the tiling check the read
+        /// succeeds and the gap is zeros, because the target file is sized up front.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn rejects_sibling_sublists_that_leave_a_hole() {
+            let (dir, store) = make_store().await;
+            let partition = Partition::from([0x06; 16]);
+            let context = Context::from([0x06; 16]);
+
+            let (leaf_a, _) = put_leaf(&store, partition, context, vec![0xAA; 100]).await;
+            let (leaf_b, _) = put_leaf(&store, partition, context, vec![0xBB; 100]).await;
+
+            let sub_a = put_list(&store, partition, context, &refs_at(&[(leaf_a, 0)]), 100).await;
+            let sub_b = put_list(&store, partition, context, &refs_at(&[(leaf_b, 200)]), 100).await;
+            let root = put_list(
+                &store,
+                partition,
+                context,
+                &refs_at(&[(sub_a, 0), (sub_b, 200)]),
+                300,
+            )
+            .await;
+
+            let out_path = dir.join("sibling-hole.bin");
+            let err = crate::read::read_into_file(
+                store.clone(),
+                partition,
+                root,
+                &out_path,
+                ".tmp",
+                ReadOptions::default().no_verify(),
+                None,
+            )
+            .await
+            .expect_err("a gap between siblings should be rejected");
+
+            assert!(
+                err.to_string().contains("previous sibling ends at 100"),
+                "unexpected error: {err}"
+            );
+        }
+
+        /// Sublists that tile from the start but stop short of the parent's declared size.
+        /// The hole is the tail of the file rather than a gap in the middle, and reads back
+        /// the same way: zeros, no error.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn rejects_sublists_that_stop_short_of_the_parent() {
+            let (dir, store) = make_store().await;
+            let partition = Partition::from([0x07; 16]);
+            let context = Context::from([0x07; 16]);
+
+            let (leaf_a, _) = put_leaf(&store, partition, context, vec![0xAA; 100]).await;
+            let (leaf_b, _) = put_leaf(&store, partition, context, vec![0xBB; 100]).await;
+
+            let sub_a = put_list(&store, partition, context, &refs_at(&[(leaf_a, 0)]), 100).await;
+            let sub_b = put_list(&store, partition, context, &refs_at(&[(leaf_b, 100)]), 100).await;
+            let root = put_list(
+                &store,
+                partition,
+                context,
+                &refs_at(&[(sub_a, 0), (sub_b, 100)]),
+                300,
+            )
+            .await;
+
+            let out_path = dir.join("short-tail.bin");
+            let err = crate::read::read_into_file(
+                store.clone(),
+                partition,
+                root,
+                &out_path,
+                ".tmp",
+                ReadOptions::default().no_verify(),
+                None,
+            )
+            .await
+            .expect_err("a short tail should be rejected");
+
+            assert!(
+                err.to_string().contains("cover up to 200"),
+                "unexpected error: {err}"
+            );
+        }
+
+        /// An empty first sublist. Accepting it stands for the whole level, so a root
+        /// claiming 200 bytes yields a wholly zero-filled file and its second sublist is
+        /// never looked at.
+        ///
+        /// The empty list is a payload too short to hold one `FragmentReference` rather
+        /// than a zero-length one, because the store rejects `size_payload == 0` at `put`.
+        /// `as_type_slice` rounds down, so any payload under 40 bytes reads as no entries.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn rejects_an_empty_sublist() {
+            let (dir, store) = make_store().await;
+            let partition = Partition::from([0x08; 16]);
+            let context = Context::from([0x08; 16]);
+
+            let (leaf_b, _) = put_leaf(&store, partition, context, vec![0xBB; 100]).await;
+
+            let stub = Bytes::from_static(&[0u8; 8]);
+            let sub_empty = Address {
+                hash: hash::hash_slice(stub.as_ref()),
+                context,
+            };
+            store
+                .clone()
+                .put(
+                    partition,
+                    sub_empty,
+                    Fragment {
+                        flags: FragmentFlags::PayloadFragmented.bits(),
+                        size_payload: stub.len() as u32,
+                        size_content: 100,
+                    },
+                    Some(stub),
+                    false,
+                )
+                .await
+                .expect("put empty sublist");
+            let sub_b = put_list(&store, partition, context, &refs_at(&[(leaf_b, 100)]), 100).await;
+            let root = put_list(
+                &store,
+                partition,
+                context,
+                &refs_at(&[(sub_empty, 0), (sub_b, 100)]),
+                200,
+            )
+            .await;
+
+            let out_path = dir.join("empty-sublist.bin");
+            let err = crate::read::read_into_file(
+                store.clone(),
+                partition,
+                root,
+                &out_path,
+                ".tmp",
+                ReadOptions::default().no_verify(),
+                None,
+            )
+            .await
+            .expect_err("an empty sublist should be rejected");
+
+            assert!(
+                err.to_string().contains("is empty"),
+                "unexpected error: {err}"
+            );
+        }
+
+        /// A sublist that expands to zero bytes. Like an empty list, it stands in for no
+        /// content at all, which is the zero hash's job and never a list's.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn rejects_a_sublist_that_expands_to_nothing() {
+            let (dir, store) = make_store().await;
+            let partition = Partition::from([0x0C; 16]);
+            let context = Context::from([0x0C; 16]);
+
+            let (leaf_a, _) = put_leaf(&store, partition, context, vec![0xAA; 100]).await;
+            let (leaf_b, _) = put_leaf(&store, partition, context, vec![0xBB; 100]).await;
+
+            // Distinct payloads: two lists differing only in `size_content` hash the same
+            // and the store rejects the second as a collision.
+            let sub_zero = put_list(&store, partition, context, &refs_at(&[(leaf_b, 0)]), 0).await;
+            let sub_a = put_list(&store, partition, context, &refs_at(&[(leaf_a, 0)]), 100).await;
+            let root = put_list(
+                &store,
+                partition,
+                context,
+                &refs_at(&[(sub_zero, 0), (sub_a, 0)]),
+                100,
+            )
+            .await;
+
+            let out_path = dir.join("zero-expansion.bin");
+            let err = crate::read::read_into_file(
+                store.clone(),
+                partition,
+                root,
+                &out_path,
+                ".tmp",
+                ReadOptions::default().no_verify(),
+                None,
+            )
+            .await
+            .expect_err("a sublist expanding to nothing should be rejected");
+
+            assert!(
+                err.to_string().contains("expands to zero bytes"),
+                "unexpected error: {err}"
+            );
+        }
+
+        /// A zero hash in a list addresses zero-length content, which is never a fragment.
+        /// `load_fragment` answers it with a default `Fragment`, so an unchecked entry in the
+        /// first position would make a level of intermediate references read as leaves.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn rejects_a_zero_hash_in_a_fragment_list() {
+            let (dir, store) = make_store().await;
+            let partition = Partition::from([0x0D; 16]);
+            let context = Context::from([0x0D; 16]);
+
+            let (leaf_a, _) = put_leaf(&store, partition, context, vec![0xAA; 100]).await;
+            let zero = Address {
+                hash: Hash::default(),
+                context,
+            };
+            let root = put_list(
+                &store,
+                partition,
+                context,
+                &refs_at(&[(leaf_a, 0), (zero, 100)]),
+                200,
+            )
+            .await;
+
+            let out_path = dir.join("zero-hash.bin");
+            let err = crate::read::read_into_file(
+                store.clone(),
+                partition,
+                root,
+                &out_path,
+                ".tmp",
+                ReadOptions::default().no_verify(),
+                None,
+            )
+            .await
+            .expect_err("a zero hash in a list should be rejected");
+
+            assert!(
+                err.to_string()
+                    .contains("entry 1 at content offset 100 has a zero hash"),
+                "unexpected error: {err}"
+            );
+        }
+
+        /// The same rule where the zero hash stands in the intermediate position: a sibling
+        /// of a real sublist. The load answers with an empty default fragment, so without
+        /// the check the entry is reported as an empty sublist rather than as what it is.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn rejects_a_zero_hash_among_intermediate_entries() {
+            let (dir, store) = make_store().await;
+            let partition = Partition::from([0x0F; 16]);
+            let context = Context::from([0x0F; 16]);
+
+            let (leaf_a, _) = put_leaf(&store, partition, context, vec![0xAA; 100]).await;
+            let zero = Address {
+                hash: Hash::default(),
+                context,
+            };
+
+            let sub_a = put_list(&store, partition, context, &refs_at(&[(leaf_a, 0)]), 100).await;
+            let root = put_list(
+                &store,
+                partition,
+                context,
+                &refs_at(&[(sub_a, 0), (zero, 100)]),
+                200,
+            )
+            .await;
+
+            let out_path = dir.join("zero-hash-intermediate.bin");
+            let err = crate::read::read_into_file(
+                store.clone(),
+                partition,
+                root,
+                &out_path,
+                ".tmp",
+                ReadOptions::default().no_verify(),
+                None,
+            )
+            .await
+            .expect_err("a zero hash among intermediate entries should be rejected");
+
+            assert!(
+                err.to_string()
+                    .contains("entry at content offset 100 has a zero hash"),
+                "unexpected error: {err}"
+            );
+        }
+
+        /// The same rule one level down, where the sublist reaches `walk_leaf_level`
+        /// straight from `walk_intermediate_level` and never passes the root's check.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn rejects_a_zero_hash_inside_a_sublist() {
+            let (dir, store) = make_store().await;
+            let partition = Partition::from([0x0E; 16]);
+            let context = Context::from([0x0E; 16]);
+
+            let (leaf_a, _) = put_leaf(&store, partition, context, vec![0xAA; 100]).await;
+            let zero = Address {
+                hash: Hash::default(),
+                context,
+            };
+
+            let sub_a = put_list(&store, partition, context, &refs_at(&[(leaf_a, 0)]), 100).await;
+            let sub_zero =
+                put_list(&store, partition, context, &refs_at(&[(zero, 100)]), 100).await;
+            let root = put_list(
+                &store,
+                partition,
+                context,
+                &refs_at(&[(sub_a, 0), (sub_zero, 100)]),
+                200,
+            )
+            .await;
+
+            let out_path = dir.join("zero-hash-sublist.bin");
+            let err = crate::read::read_into_file(
+                store.clone(),
+                partition,
+                root,
+                &out_path,
+                ".tmp",
+                ReadOptions::default().no_verify(),
+                None,
+            )
+            .await
+            .expect_err("a zero hash inside a sublist should be rejected");
+
+            assert!(
+                err.to_string().contains("has a zero hash"),
+                "unexpected error: {err}"
+            );
+        }
+
+        /// The other half of the same acceptance: an empty list at the root, where there is
+        /// no parent entry to check it against. `walk_fragment_level` returned `Ok` and the
+        /// pipeline wrote nothing at all into a file already sized to 100 bytes.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn rejects_an_empty_root_list() {
+            let (dir, store) = make_store().await;
+            let partition = Partition::from([0x0B; 16]);
+            let context = Context::from([0x0B; 16]);
+
+            let stub = Bytes::from_static(&[1u8; 8]);
+            let root = Address {
+                hash: hash::hash_slice(stub.as_ref()),
+                context,
+            };
+            store
+                .clone()
+                .put(
+                    partition,
+                    root,
+                    Fragment {
+                        flags: FragmentFlags::PayloadFragmented.bits(),
+                        size_payload: stub.len() as u32,
+                        size_content: 100,
+                    },
+                    Some(stub),
+                    false,
+                )
+                .await
+                .expect("put empty root list");
+
+            let out_path = dir.join("empty-root.bin");
+            let err = crate::read::read_into_file(
+                store.clone(),
+                partition,
+                root,
+                &out_path,
+                ".tmp",
+                ReadOptions::default().no_verify(),
+                None,
+            )
+            .await
+            .expect_err("an empty root list should be rejected");
+
+            assert!(
+                err.to_string().contains("fragment list is empty"),
+                "unexpected error: {err}"
+            );
+        }
+
+        /// A sublist whose own first offset disagrees with where its parent places it. The
+        /// leaves are then written at offsets the parent never accounted for, which both
+        /// leaves a hole and overwrites a sibling's range.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn rejects_a_sublist_that_disagrees_with_its_parent_offset() {
+            let (dir, store) = make_store().await;
+            let partition = Partition::from([0x09; 16]);
+            let context = Context::from([0x09; 16]);
+
+            let (leaf_a, _) = put_leaf(&store, partition, context, vec![0xAA; 100]).await;
+            let (leaf_b, _) = put_leaf(&store, partition, context, vec![0xBB; 100]).await;
+
+            let sub_a = put_list(&store, partition, context, &refs_at(&[(leaf_a, 0)]), 100).await;
+            // Parent places this at 100; the sublist itself claims to start at 0.
+            let sub_b = put_list(&store, partition, context, &refs_at(&[(leaf_b, 0)]), 100).await;
+            let root = put_list(
+                &store,
+                partition,
+                context,
+                &refs_at(&[(sub_a, 0), (sub_b, 100)]),
+                200,
+            )
+            .await;
+
+            let out_path = dir.join("offset-disagreement.bin");
+            let err = crate::read::read_into_file(
+                store.clone(),
+                partition,
+                root,
+                &out_path,
+                ".tmp",
+                ReadOptions::default().no_verify(),
+                None,
+            )
+            .await
+            .expect_err("a sublist contradicting its parent should be rejected");
+
+            assert!(
+                err.to_string().contains("parent entry places it at 100"),
+                "unexpected error: {err}"
+            );
+        }
+
+        /// A payload must stay charged to the fragment budget until the caller has taken
+        /// it. Releasing at load bounds only the fetch, leaving the payloads themselves to
+        /// pile up in a queue sized for 262,144 of them.
+        ///
+        /// Budget for two payloads, four leaves, and a caller that stops consuming: the
+        /// pipeline must run out of budget and stay out of it. With the permit released at
+        /// load, all four load, all four permits come back, and the budget reads full while
+        /// nothing has been delivered.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn payloads_stay_charged_to_the_budget_until_the_caller_takes_them() {
+            const LEAVES: usize = 4;
+            const PAYLOAD: usize = 100;
+            let charged = 2 * FRAGMENT_MINIMUM_COST_KIB as usize;
+
+            let (_dir, store) = make_store().await;
+            let partition = Partition::from([0x0A; 16]);
+            let context = Context::from([0x0A; 16]);
+
+            // Leaked so the pipeline can hold `SemaphorePermit<'static>` against a budget
+            // this test owns; sampling the global one is unreliable because every other
+            // test in the binary draws on it.
+            let budget: &'static Semaphore = Box::leak(Box::new(Semaphore::new(charged)));
+
+            let (leaf_tx, leaf_rx) = channel::<LeafReference>(LEAVES);
+            for index in 0..LEAVES {
+                let (address, _) =
+                    put_leaf(&store, partition, context, vec![index as u8; PAYLOAD]).await;
+                leaf_tx
+                    .send(LeafReference {
+                        hash: address.hash,
+                        offset_content: (index * PAYLOAD) as u64,
+                        expected_size: PAYLOAD as u64,
+                        context,
+                    })
+                    .await
+                    .expect("queue leaf");
+            }
+            drop(leaf_tx);
+
+            // One slot, so only the first payload leaves the pipeline's accounting.
+            let (data_tx, mut data_rx) = channel::<Bytes>(1);
+            let pipeline = lore_base::lore_spawn!(fetch_ordered_and_stream_from(
+                budget,
+                store.clone(),
+                partition,
+                leaf_rx,
+                data_tx,
+                ReadOptions::default().no_verify(),
+                None,
+            ));
+
+            // Wait for the pipeline to reach the budget, rather than assuming it got there.
+            let mut waited = 0;
+            while budget.available_permits() > 0 && waited < 100 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                waited += 1;
+            }
+            assert_eq!(
+                budget.available_permits(),
+                0,
+                "pipeline never took the budget it needs for payloads it is holding"
+            );
+
+            // And stays there: the state above is momentary while permits are released at
+            // load, permanent while they travel with the payload.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert_eq!(
+                budget.available_permits(),
+                0,
+                "budget came back while payloads were still undelivered"
+            );
+
+            // Draining releases them in order, and the walk completes.
+            for index in 0..LEAVES {
+                let payload = data_rx.recv().await.expect("payload");
+                assert_eq!(payload.len(), PAYLOAD);
+                assert!(
+                    payload.iter().all(|&byte| byte == index as u8),
+                    "payloads must arrive in list order"
+                );
+            }
+            pipeline
+                .await
+                .expect("pipeline join")
+                .expect("pipeline result");
+            assert_eq!(
+                budget.available_permits(),
+                charged,
+                "every permit must come back once the payloads are delivered"
             );
         }
     }

@@ -1586,6 +1586,26 @@ mod tests {
         assert_eq!(read_slice[1], 99);
     }
 
+    /// A buffer with no capacity never allocated, so its pointer is dangling and aligned for
+    /// bytes rather than for the type. A zero-length slice still requires an aligned pointer,
+    /// so the count has to be answered without forming one.
+    #[test]
+    fn typed_bytes_mut_type_slices_are_empty_without_capacity() {
+        use bytes::BytesMut;
+        let mut buf = BytesMut::with_count_capacity::<FragmentReference>(0);
+        assert!(buf.as_type_slice_mut::<FragmentReference>().is_empty());
+        assert!(buf.as_type_slice::<FragmentReference>().is_empty());
+    }
+
+    /// A capacity too small to hold one element is the same case as none at all.
+    #[test]
+    fn typed_bytes_mut_type_slices_are_empty_below_one_element() {
+        use bytes::BytesMut;
+        let mut buf = BytesMut::with_capacity(std::mem::size_of::<FragmentReference>() - 1);
+        assert!(buf.as_type_slice_mut::<FragmentReference>().is_empty());
+        assert!(buf.as_type_slice::<FragmentReference>().is_empty());
+    }
+
     mod validate_response {
         use super::*;
 

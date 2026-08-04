@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use anyhow::anyhow;
+use lore_base::lore_spawn_net;
 use lore_proto::AdminServiceServer;
 use lore_proto::LockServiceServer;
 use lore_proto::lore::environment::v1::environment_service_server as environment_v1_server;
@@ -63,6 +64,7 @@ use crate::legacy::rpc::environment_service_server::EnvironmentServiceServer;
 use crate::legacy::rpc::repository_service_server::RepositoryServiceServer;
 use crate::legacy::rpc::revision_service_server::RevisionServiceServer;
 use crate::legacy::rpc::storage_service_server::StorageServiceServer;
+use crate::util::core_hop::CoreHopLayer;
 
 // Why Tower, why?
 // Just try to make this type alias match the 'router' type in GrpcServerBuilder.
@@ -79,7 +81,7 @@ type GrpcRouter = tonic::transport::server::Router<
                         TraceLayer<SharedClassifier<GrpcErrorsAsFailures>, MakeCorrelationIdSpan>,
                         CorrelationIdLayer,
                     >,
-                    tower::layer::util::Identity,
+                    Stack<CoreHopLayer, tower::layer::util::Identity>,
                 >,
             >,
         >,
@@ -590,6 +592,9 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             config
         };
         let mut router = server
+            // Outermost, so everything inward runs on core: this stack is served
+            // from net.
+            .layer(CoreHopLayer)
             .layer(
                 CorrelationIdLayerBuilder::new()
                     .with_grpc_tracer(trace_layer_config)
@@ -705,8 +710,16 @@ pub struct WantsAddress {
 }
 
 impl GrpcServerBuilder<WantsAddress> {
-    pub async fn serve(self, addr: SocketAddr, signal: impl Future<Output = ()>) -> Result<()> {
-        self.0.router.serve_with_shutdown(addr, signal).await?;
+    /// Serves on the net runtime. Handler bodies are hopped back to core by the
+    /// [`CoreHopLayer`] at the outside of the stack, so only the transport and
+    /// h2 driver stay here.
+    pub async fn serve(
+        self,
+        addr: SocketAddr,
+        signal: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<()> {
+        lore_spawn_net!(async move { self.0.router.serve_with_shutdown(addr, signal).await })
+            .await??;
         Ok(())
     }
 }
@@ -720,7 +733,7 @@ pub async fn serve_maintenance(
     cert_path: Option<PathBuf>,
     key_path: Option<PathBuf>,
     cert_chain_path: Option<PathBuf>,
-    signal: impl Future<Output = ()>,
+    signal: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     let environment_svc = LoreEnvironmentService::maintenance(environment.clone());
     let environment_v1_svc = LoreEnvironmentV1Service::maintenance(environment);
@@ -742,13 +755,14 @@ pub async fn serve_maintenance(
         server = server.tls_config(tls_config)?;
     }
 
-    server
+    // Served from net like the other listeners. No `CoreHopLayer`: both handlers
+    // only return UNAVAILABLE, so there is nothing to keep off net.
+    let router = server
         .add_service(EnvironmentServiceServer::new(environment_svc))
         .add_service(environment_v1_server::EnvironmentServiceServer::new(
             environment_v1_svc,
-        ))
-        .serve_with_shutdown(addr, signal)
-        .await?;
+        ));
+    lore_spawn_net!(async move { router.serve_with_shutdown(addr, signal).await }).await??;
 
     Ok(())
 }

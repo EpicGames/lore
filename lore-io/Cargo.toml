@@ -1,0 +1,56 @@
+[package]
+name = "lore-io"
+edition = "2024"
+version.workspace = true
+publish = false
+
+[lib]
+name = "lore_io"
+
+[dependencies]
+bytes = { workspace = true }
+parking_lot = { workspace = true }
+
+# The uring backend is the only part of the library that calls libc, for eventfd and poll.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { workspace = true }
+libc = { workspace = true }
+
+# Windows only, and load-bearing rather than convenience: handles opened here are overlapped, so
+# that concurrent operations on one of them are not serialized by the I/O manager, and `std` has no
+# positional call that is defined against such a handle. The data path issues `ReadFile`/`WriteFile`
+# with its own `OVERLAPPED` instead. windows-sys is the workspace's Win32 binding already.
+[target.'cfg(target_family = "windows")'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    # `CreateEventW` takes a `SECURITY_ATTRIBUTES`, so its module is only compiled with this. The
+    # crate built without it while the workspace happened to enable it elsewhere; naming it here is
+    # what makes `cargo build -p lore-io` stand on its own.
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    # For FILE_SKIP_COMPLETION_PORT_ON_SUCCESS and FILE_SKIP_SET_EVENT_ON_HANDLE, which the
+    # completion-port backend needs to own a synchronous completion rather than race the reaper
+    # for it.
+    "Win32_System_WindowsProgramming",
+] }
+
+# The library depends on no async runtime: its futures suspend on wakers alone. tokio is here for
+# the tests' own runtime, and futures drives the case that proves the point without one. lore-base
+# is here for its `#[global_allocator]`: the read path's design rests on the process allocator
+# caching spans per thread, so a benchmark on glibc malloc measures a different program than the
+# one that ships. Dev-only, so the library's own dependency graph is unchanged.
+[dev-dependencies]
+futures = { workspace = true }
+lore-base = { workspace = true }
+tokio = { workspace = true }
+
+# The benchmark example uses libc for cache eviction and sync on every unix, not only Linux.
+[target.'cfg(target_family = "unix")'.dev-dependencies]
+libc = { workspace = true }
+
+# A named pipe is the only thing a unit test can make defer on demand, and deferring is the whole
+# of what the completion-port backend is for. See `iocp::tests::overlapped_pipe_pair`.
+[target.'cfg(target_family = "windows")'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Pipes"] }

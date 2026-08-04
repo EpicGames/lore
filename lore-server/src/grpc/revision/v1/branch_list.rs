@@ -4,8 +4,8 @@ use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
-use lore_base::runtime::runtime;
 use lore_base::types::KeyType;
 use lore_proto::lore::revision::v1::BranchListRequest;
 use lore_proto::lore::revision::v1::BranchListResponse;
@@ -116,7 +116,7 @@ pub async fn branch_list_implementation(
 
     let (tx, rx) = mpsc::channel(64);
 
-    runtime().spawn(LORE_CONTEXT.scope(execution, async move {
+    lore_spawn!(LORE_CONTEXT.scope(execution, async move {
         stream_branches(repository, creator_filter, include_deleted, tx).await;
     }));
 

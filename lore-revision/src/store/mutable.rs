@@ -111,6 +111,8 @@ async fn migrate_initial_to_typed(
         group: Vec::with_capacity(GROUP_COUNT),
         flush_delay_seconds: 0,
         needs_upgrade: AtomicBool::new(false),
+        // Authoritative: a corrupt bucket must fail the upgrade, not be silently dropped.
+        authoritative: true,
     };
 
     for _ in 0..GROUP_COUNT {
@@ -142,7 +144,7 @@ async fn migrate_initial_to_typed(
                 let bucket = group.bucket(bucket_index).clone();
                 let mut bucket = bucket.write().await;
                 bucket
-                    .deserialize(&path, group_index, bucket_index, false)
+                    .deserialize(&path, group_index, bucket_index, false, true)
                     .await
                     .map_err(|e| {
                         MutableStoreError::internal_with_context(e, "deserialize failed")

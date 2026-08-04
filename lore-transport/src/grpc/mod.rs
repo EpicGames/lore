@@ -27,7 +27,6 @@ use dashmap::DashMap;
 use http::header::AUTHORIZATION;
 use lore_base::lore_debug;
 use lore_base::lore_info;
-use lore_base::lore_spawn;
 use lore_base::lore_trace;
 use lore_base::types::*;
 use lore_base::version::LORE_LIBRARY_VERSION;
@@ -107,7 +106,7 @@ impl GRPCAuth {
         }));
 
         let auth_ref = Arc::downgrade(&auth);
-        let refresher = Some(lore_spawn!(grpc_auth_refresher(
+        let refresher = Some(lore_base::lore_spawn_net!(grpc_auth_refresher(
             auth_ref,
             auth_url.to_string(),
             remote_domain,
@@ -145,13 +144,15 @@ impl GRPCAuth {
         }));
 
         let auth_ref = Arc::downgrade(&auth);
-        let refresher = Some(lore_spawn!(grpc_auth_refresher_custom_resource(
-            auth_ref,
-            auth_url.to_string(),
-            remote_domain,
-            resolved_identity,
-            resource_id.to_string(),
-        )));
+        let refresher = Some(lore_base::lore_spawn_net!(
+            grpc_auth_refresher_custom_resource(
+                auth_ref,
+                auth_url.to_string(),
+                remote_domain,
+                resolved_identity,
+                resource_id.to_string(),
+            )
+        ));
 
         {
             let mut auth = auth.write();
@@ -578,14 +579,26 @@ async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
 
     endpoint = endpoint.connect_timeout(Duration::from_secs(GRPC_CONNECT_TIMEOUT_SECS));
 
-    // A failed transport connect means the server is unreachable; classify it
-    // as `Disconnected`. The transport error has no variant to preserve, so log
-    // it before collapsing.
-    let channel = match endpoint.connect().await {
+    // Connect from a net-runtime task so the hyper/h2 driver tasks the
+    // connection spawns are bound to the net runtime, isolated from compute and
+    // file-I/O continuations on the core runtime.
+    let channel = match lore_base::lore_spawn_net!(async move { endpoint.connect().await })
+        .await
+        .internal_with(|| format!("gRPC connection task to {remote}"))?
+    {
         Ok(channel) => channel,
         Err(err) => {
-            lore_debug!("gRPC connection to {remote} failed: {err}");
-            return Err(ProtocolError::from(lore_base::error::Disconnected));
+            // An unreachable server is `Disconnected` so the reconnect paths
+            // engage, but the transport error's detail is kept on the trace
+            // rather than collapsed into a bare variant.
+            let mut disconnected = ProtocolError::from(lore_base::error::Disconnected);
+            disconnected.push_trace(lore_error_set::Location::with_context(
+                file!(),
+                line!(),
+                column!(),
+                Arc::from(format!("gRPC connection to {remote} failed: {err}")),
+            ));
+            return Err(disconnected);
         }
     };
 

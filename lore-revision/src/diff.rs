@@ -77,6 +77,7 @@ pub async fn diff_revision_paths(
                     walker_repo,
                     state_target,
                     path,
+                    None,
                     &mut sink,
                     FilterMode::View,
                 )
