@@ -169,13 +169,24 @@ pub async fn wait_if_in_flight(partition: Partition, address: Address) {
 }
 
 /// Result of a [`store_fragment`] operation.
+#[derive(Debug)]
 pub struct StoreResult {
     pub address: Address,
     pub fragment: Fragment,
     pub deduplicated: bool,
 }
 
-/// Put a fragment to a remote session with retry on `SlowDown`.
+/// Bound on retries for `Disconnected` in `remote_put_retry`. Mirrors
+/// `MAX_STALE_SESSION_RETRIES` on the read path: transient timeouts and QUIC
+/// reconnects typically recover within a retry or two once the session is
+/// re-established, while a genuinely unreachable server should surface
+/// quickly rather than looping through the full backoff schedule.
+const MAX_PUT_DISCONNECT_RETRIES: u32 = 5;
+
+/// Put a fragment to a remote session with retry on `SlowDown` and bounded
+/// retry on `Disconnected` (transient timeouts/disconnects map to
+/// `Disconnected`; the session is invalidated so the next attempt
+/// re-establishes it).
 ///
 /// Takes an owned `Arc<StorageSession>` so callers can spawn this into a
 /// background task (the returned future must be `'static`).
@@ -186,12 +197,22 @@ async fn remote_put_retry(
     payload: Option<Bytes>,
 ) -> Result<(), StorageError> {
     let mut retry = store_retry();
+    let mut disconnect_retries = 0;
     loop {
         match session.put(address, fragment, payload.clone()).await {
             Ok(_) => return Ok(()),
             Err(ref e) if e.is_slow_down() => {
                 if !retry.wait().await {
                     return Err(StorageError::from(SlowDown));
+                }
+            }
+            Err(ref e)
+                if e.is_disconnected() && disconnect_retries < MAX_PUT_DISCONNECT_RETRIES =>
+            {
+                disconnect_retries += 1;
+                session.invalidate().await;
+                if !retry.wait().await {
+                    return Err(crate::error::protocol_error_to_storage(e.clone(), address));
                 }
             }
             Err(err) => return Err(crate::error::protocol_error_to_storage(err, address)),
@@ -411,7 +432,13 @@ async fn store_fragment_dispatched(
             // Follower path: drop buffer and permit, register on the tracker.
             drop(buffer);
             drop(permit);
-            tracker.register_follower(follower_future(store.clone(), partition, address, token));
+            tracker.register_follower(follower_future(
+                store.clone(),
+                partition,
+                address,
+                token,
+                remote_session.is_some(),
+            ));
             return Ok(StoreResult {
                 address,
                 fragment,
@@ -569,11 +596,16 @@ async fn leader_body(
         }
     }
 
-    // Remote upload if session provided and not already durable
+    // Remote upload if session provided and not already durable. A failed
+    // upload must not be silently downgraded to a local-only write; the error
+    // must propagate. The payload is still written to the local store below
+    // (non-durable, cached) so the bytes remain locally recoverable.
+    let mut upload_error: Option<StorageError> = None;
     if !stored_durable && let Some(session) = remote_session.clone() {
-        stored_durable = remote_put_retry(session, address, fragment, Some(buffer.clone()))
-            .await
-            .is_ok();
+        match remote_put_retry(session, address, fragment, Some(buffer.clone())).await {
+            Ok(()) => stored_durable = true,
+            Err(err) => upload_error = Some(err),
+        }
     }
 
     if stored_durable {
@@ -594,6 +626,9 @@ async fn leader_body(
 
     drop(permit);
     drop(guard);
+    if let Some(err) = upload_error {
+        return Err(err);
+    }
     Ok((address, fragment))
 }
 
@@ -1179,10 +1214,13 @@ async fn previous_chunks_still_match(
 /// terminal store state for `address`.
 ///
 /// Returns `Ok((address, fragment))` if the store now holds a full-match entry
-/// with either [`PayloadStoredDurable`](FragmentFlags::PayloadStoredDurable) or
-/// [`PayloadStoredLocal`](FragmentFlags::PayloadStoredLocal) set. Returns an
-/// internal error if no terminal entry exists — that means the leader errored
-/// out and we have nothing to dedup against.
+/// with the flags the follower's write required: when `require_durable` is set
+/// (the follower's own write was remote-coupled), only
+/// [`PayloadStoredDurable`](FragmentFlags::PayloadStoredDurable) counts —
+/// a leader whose upload failed must not turn the follower into a false
+/// success. Otherwise [`PayloadStoredLocal`](FragmentFlags::PayloadStoredLocal)
+/// also satisfies. Returns an internal error if no terminal entry exists —
+/// that means the leader errored out and we have nothing to dedup against.
 ///
 /// The follower holds no memory permit and no buffer; the caller is expected
 /// to have dropped both before invoking this future.
@@ -1191,15 +1229,18 @@ pub async fn follower_future(
     partition: Partition,
     address: Address,
     token: CancellationToken,
+    require_durable: bool,
 ) -> Result<(Address, Fragment), StorageError> {
     token.cancelled().await;
+    let required_flags = if require_durable {
+        FragmentFlags::PayloadStoredDurable.bits()
+    } else {
+        FragmentFlags::PayloadStoredDurable.bits() | FragmentFlags::PayloadStoredLocal.bits()
+    };
     match store.query(partition, address, StoreMatch::MatchFull).await {
         Ok(result)
             if result.match_made == StoreMatch::MatchFull
-                && (result.fragment.flags
-                    & (FragmentFlags::PayloadStoredDurable.bits()
-                        | FragmentFlags::PayloadStoredLocal.bits()))
-                    != 0 =>
+                && (result.fragment.flags & required_flags) != 0 =>
         {
             Ok((address, result.fragment))
         }
@@ -1280,7 +1321,7 @@ mod tests {
 
         let token = CancellationToken::new();
         token.cancel();
-        let result = follower_future(store, partition, address, token).await;
+        let result = follower_future(store, partition, address, token, false).await;
         let (addr, frag) = result.expect("follower should observe terminal entry");
         assert_eq!(addr, address);
         assert_ne!(
@@ -1297,7 +1338,7 @@ mod tests {
 
         let token = CancellationToken::new();
         token.cancel();
-        let err = follower_future(store, partition, address, token)
+        let err = follower_future(store, partition, address, token, false)
             .await
             .expect_err("follower should fail when no terminal entry");
         let msg = format!("{err:?}");
@@ -1324,6 +1365,7 @@ mod tests {
             partition,
             address,
             token.clone(),
+            true,
         ));
 
         // Follower is waiting on the token. Write the entry AFTER spawn, THEN cancel.
@@ -1694,6 +1736,137 @@ mod tests {
             .await
             .expect("query on empty store");
         assert_eq!(query.match_made, StoreMatch::MatchNone);
+    }
+
+    /// A session whose every operation fails with `Disconnected` — the
+    /// pending resolver never succeeds, simulating a remote that times out
+    /// or is unreachable during upload.
+    fn failing_session() -> Arc<StorageSession> {
+        Arc::new(StorageSession::pending(|| async {
+            Err(lore_transport::ProtocolError::from(
+                lore_base::error::Disconnected,
+            ))
+        }))
+    }
+
+    #[tokio::test]
+    async fn upload_failure_fails_inline_store_but_keeps_local_payload() {
+        let (_dir, store) = make_test_store().await;
+        let (partition, address, fragment, buffer) = make_input(0x70);
+
+        let err = store_fragment(
+            store.clone(),
+            partition,
+            address,
+            fragment,
+            buffer,
+            false,
+            Some(failing_session()),
+            None,
+            None,
+        )
+        .await
+        .expect_err("failed remote upload must fail the store operation");
+        assert!(
+            matches!(err, StorageError::Disconnected(_)),
+            "expected Disconnected, got: {err:?}"
+        );
+
+        // The payload must still be written locally (non-durable, cached).
+        let query = store
+            .query(partition, address, StoreMatch::MatchFull)
+            .await
+            .expect("query after failed upload");
+        assert_eq!(query.match_made, StoreMatch::MatchFull);
+        assert_eq!(
+            query.fragment.flags & FragmentFlags::PayloadStoredDurable.bits(),
+            0,
+            "durable flag must be clear after failed upload"
+        );
+        assert_ne!(
+            query.fragment.flags & FragmentFlags::PayloadStoredLocal.bits(),
+            0,
+            "payload must remain cached locally after failed upload"
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_failure_surfaces_through_tracker_await_all() {
+        let (_dir, store) = make_test_store().await;
+        let (partition, address, fragment, buffer) = make_input(0x71);
+        let tracker = Arc::new(WriteTracker::new());
+
+        // Dispatch path returns Ok immediately; the leader's failed upload
+        // must be recorded in the tracker so a commit draining it fails
+        // before publishing the branch.
+        store_fragment(
+            store.clone(),
+            partition,
+            address,
+            fragment,
+            buffer,
+            false,
+            Some(failing_session()),
+            Some(tracker.clone()),
+            None,
+        )
+        .await
+        .expect("dispatch returns Ok — upload runs in the leader task");
+
+        let err = tracker
+            .await_all()
+            .await
+            .expect_err("failed upload must surface through await_all");
+        assert!(
+            matches!(err, StorageError::Disconnected(_)),
+            "expected Disconnected, got: {err:?}"
+        );
+
+        // Local payload retained for later repair.
+        let query = store
+            .query(partition, address, StoreMatch::MatchFull)
+            .await
+            .expect("query after failed upload");
+        assert_eq!(query.match_made, StoreMatch::MatchFull);
+        assert_eq!(
+            query.fragment.flags & FragmentFlags::PayloadStoredDurable.bits(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn follower_requiring_durable_rejects_local_only_entry() {
+        let (_dir, store) = make_test_store().await;
+        let (partition, address) = make_address(0x72);
+        let payload = vec![0x72; 64];
+        let fragment = Fragment {
+            flags: FragmentFlags::PayloadStoredLocal.bits(),
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+        store
+            .clone()
+            .put(
+                partition,
+                address,
+                fragment,
+                Some(Bytes::from(payload)),
+                false,
+            )
+            .await
+            .expect("put local-only terminal entry");
+
+        let token = CancellationToken::new();
+        token.cancel();
+        // A remote-coupled follower must not treat a local-only entry (the
+        // leader's upload failed) as success.
+        follower_future(store.clone(), partition, address, token.clone(), true)
+            .await
+            .expect_err("local-only entry must not satisfy a durable follower");
+        // A local-only follower is satisfied by the same entry.
+        follower_future(store, partition, address, token, false)
+            .await
+            .expect("local-only follower accepts local entry");
     }
 
     #[tokio::test(flavor = "multi_thread")]

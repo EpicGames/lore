@@ -473,6 +473,19 @@ class Lore:
             **kwargs,
         )
 
+    def repository_push_content(
+        self,
+        addresses: list[str] | None = None,
+        scan: bool = False,
+        **kwargs: Unpack[GlobalOptions],
+    ):
+        return self.run(
+            ["repository", "push-content"]
+            + (addresses if addresses else [])
+            + (["--scan"] if scan else []),
+            **kwargs,
+        )
+
     @overload
     def branch_list(
         self, *, archived: bool = False, **kwargs: Unpack[GlobalOptionsParseable]

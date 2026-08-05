@@ -11,6 +11,7 @@ pub mod delete;
 pub mod dump;
 pub mod info;
 pub mod list;
+pub mod push_content;
 pub mod status;
 pub mod store;
 pub mod verify;

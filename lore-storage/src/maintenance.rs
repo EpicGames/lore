@@ -741,6 +741,7 @@ mod tests {
             ),
             packstore: PackStore::new(Some(tempdir.to_path_buf()), 1, None),
             flush: tokio::sync::Mutex::new(JoinSet::new()),
+            flush_barrier: crate::local::immutable_store::FlushBarrier::default(),
         });
 
         // Buffer lengths are primes to ensure test actually verify the correct thing

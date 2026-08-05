@@ -93,6 +93,7 @@ pub enum LoreCommand {
     RepositoryStoreImmutableQuery(crate::repository::LoreRepositoryStoreImmutableQueryArgs),
     RepositoryVerifyState(crate::repository::LoreRepositoryVerifyStateArgs),
     RepositoryVerifyFragment(crate::repository::LoreRepositoryVerifyFragmentArgs),
+    RepositoryPushContent(crate::repository::LoreRepositoryPushContentArgs),
     RevisionAmend(crate::revision::LoreRevisionAmendArgs),
     RevisionCommit(crate::revision::LoreRevisionCommitArgs),
     RevisionInfo(crate::revision::LoreRevisionInfoArgs),

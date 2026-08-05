@@ -25,6 +25,7 @@ This page is generated from `lore --markdown-help` (CLI `0.8.2-nightly+31`). Eve
 * [`lore repository verify`↴](#lore-repository-verify)
 * [`lore repository verify state`↴](#lore-repository-verify-state)
 * [`lore repository verify fragment`↴](#lore-repository-verify-fragment)
+* [`lore repository push-content`↴](#lore-repository-push-content)
 * [`lore repository dump`↴](#lore-repository-dump)
 * [`lore repository gc`↴](#lore-repository-gc)
 * [`lore repository store`↴](#lore-repository-store)
@@ -219,8 +220,9 @@ This page is generated from `lore --markdown-help` (CLI `0.8.2-nightly+31`). Eve
 * `--compress-limit <count>` — Set maximum number of parallel compress operations
 * `--search-limit <SEARCH_LIMIT>` — Set maximum number of revisions to search when matching or finding revisions
 * `--search-nearest` — Set to search for nearest match when matching revisions
-* `--gc` — Set to run automatic garbage collection on local store in background
+* `--no-gc` — Prevent automatic incremental garbage collection for this command; it otherwise runs in the background on writes. `lore repository gc` always runs a full pass regardless
 * `--sync-data` — Force sync data to storage media during flush
+* `--cache` — Cache fragment payloads fetched from remote in the local store
 * `--non-interactive` — Disable interactive prompts (e.g., per-link commit messages)
 
 
@@ -240,6 +242,7 @@ Repository commands
 * `clone` — Clone a remote repository into the given path
 * `delete` — Delete a repository
 * `verify` — Verify repository state consistency
+* `push-content` — Push locally-stored content that is not yet durable on the remote
 * `dump` — Dump repository state information
 * `gc` — Run a full garbage collection pass on the local repository store
 * `store` — Access the repository data store
@@ -413,6 +416,22 @@ Verify a specific fragment in the local store
 
 * `--context <CONTEXT>` — Context part of the address to verify
 * `--heal` — Attempt to heal if verification fails (remote only)
+
+
+
+## `lore repository push-content`
+
+Push locally-stored content that is not yet durable on the remote
+
+**Usage:** `lore repository push-content [OPTIONS] [ADDRESSES]...`
+
+###### **Arguments:**
+
+* `<ADDRESSES>` — Fragment addresses to push, as `hash` or `hash-context` (the format printed in `Address not found` errors)
+
+###### **Options:**
+
+* `--scan` — Scan the local store for all content of this repository that was never confirmed durable on the remote (e.g. after a commit whose upload timed out) and push all of it
 
 
 
