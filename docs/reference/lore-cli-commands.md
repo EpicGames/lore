@@ -12,7 +12,7 @@ This page is generated from `lore --markdown-help` (CLI `0.8.2-nightly+31`). Eve
 
 <!-- BEGIN generated: lore --markdown-help -->
 
-**Command Overview:**
+**Command Overview:
 
 * [`lore`↴](#lore)
 * [`lore repository`↴](#lore-repository)
@@ -173,7 +173,7 @@ This page is generated from `lore --markdown-help` (CLI `0.8.2-nightly+31`). Eve
 
 **Usage:** `lore [OPTIONS] [COMMAND]`
 
-###### **Subcommands:**
+### Subcommands
 
 * `repository` — Repository commands
 * `branch` — Branch commands
@@ -201,7 +201,7 @@ This page is generated from `lore --markdown-help` (CLI `0.8.2-nightly+31`). Eve
 * `completions` — Generate terminal autocompletions
 * `shared-store` — Manage the shared store
 
-###### **Options:**
+### Options
 
 * `--repository <path>` — Use given path as repository path
 * `--log-level <level>` — Set the logging level
@@ -223,15 +223,13 @@ This page is generated from `lore --markdown-help` (CLI `0.8.2-nightly+31`). Eve
 * `--sync-data` — Force sync data to storage media during flush
 * `--non-interactive` — Disable interactive prompts (e.g., per-link commit messages)
 
-
-
 ## `lore repository`
 
 Repository commands
 
 **Usage:** `lore repository <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `status` — Show current repository status
 * `info` — Get info about a repository
@@ -248,8 +246,6 @@ Repository commands
 * `config` — Read a configuration value
 * `update-path` — Update the stored path for this instance
 
-
-
 ## `lore repository status`
 
 Show current repository status.
@@ -258,11 +254,11 @@ Reports the staged revision (if any) and the files currently marked dirty. No fi
 
 **Usage:** `lore repository status [OPTIONS] [PATH]...`
 
-###### **Arguments:**
+### Arguments
 
 * `<PATH>` — Optional paths in repository
 
-###### **Options:**
+### Options
 
 * `--scan` — Walk the filesystem under the given paths and reconcile every file against the current revision.
 
@@ -277,19 +273,15 @@ Reports the staged revision (if any) and the files currently marked dirty. No fi
 * `--count` — Count directories and files (staged state if present, else current revision; view-filtered)
 * `--targets <file>` — Path to a targets file
 
-
-
 ## `lore repository info`
 
 Get info about a repository
 
 **Usage:** `lore repository info [url]`
 
-###### **Arguments:**
+### Arguments
 
 * `<url>` — URL of repository
-
-
 
 ## `lore repository list`
 
@@ -297,11 +289,9 @@ List repositories
 
 **Usage:** `lore repository list <url>`
 
-###### **Arguments:**
+### Arguments
 
 * `<url>` — URL of remote
-
-
 
 ## `lore repository create`
 
@@ -309,18 +299,16 @@ Create a repository in the given directory
 
 **Usage:** `lore repository create [OPTIONS] <url>`
 
-###### **Arguments:**
+### Arguments
 
 * `<url>` — URL of repository
 
-###### **Options:**
+### Options
 
 * `--description <description>` — Optional description of repository
 * `--id <id>` — Optional ID of repository
 * `--use-shared-store` — Use the shared store rather than create a local immutable store
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
-
-
 
 ## `lore repository clone`
 
@@ -328,12 +316,12 @@ Clone a remote repository into the given path
 
 **Usage:** `lore repository clone [OPTIONS] <url> [path]`
 
-###### **Arguments:**
+### Arguments
 
 * `<url>` — URL of repository
 * `<path>` — Path to clone into
 
-###### **Options:**
+### Options
 
 * `--view <view>` — Optional client side view filter file
 * `--revision <revision>` — Optional revision to sync
@@ -354,19 +342,15 @@ Clone a remote repository into the given path
 
   Default value: `0`
 
-
-
 ## `lore repository delete`
 
 Delete a repository
 
 **Usage:** `lore repository delete <url>`
 
-###### **Arguments:**
+### Arguments
 
 * `<url>` — URL of repository
-
-
 
 ## `lore repository verify`
 
@@ -374,17 +358,15 @@ Verify repository state consistency
 
 **Usage:** `lore repository verify [OPTIONS] [COMMAND]`
 
-###### **Subcommands:**
+### Subcommands
 
 * `state` — Verify repository state consistency (default)
 * `fragment` — Verify a specific fragment in the local store
 
-###### **Options:**
+### Options
 
 * `--path <path>` — Optional path in the repository to start verification from (for state verification)
 * `--heal` — Attempt to heal discrepancies found in a new staged state
-
-
 
 ## `lore repository verify state`
 
@@ -392,12 +374,10 @@ Verify repository state consistency (default)
 
 **Usage:** `lore repository verify state [OPTIONS]`
 
-###### **Options:**
+### Options
 
 * `--path <path>` — Optional path in the repository to start verification from
 * `--heal` — Attempt to heal discrepancies found in a new staged state
-
-
 
 ## `lore repository verify fragment`
 
@@ -405,16 +385,14 @@ Verify a specific fragment in the local store
 
 **Usage:** `lore repository verify fragment [OPTIONS] <HASH>`
 
-###### **Arguments:**
+### Arguments
 
 * `<HASH>` — Fragment hash to verify
 
-###### **Options:**
+### Options
 
 * `--context <CONTEXT>` — Context part of the address to verify
 * `--heal` — Attempt to heal if verification fails (remote only)
-
-
 
 ## `lore repository dump`
 
@@ -422,13 +400,11 @@ Dump repository state information
 
 **Usage:** `lore repository dump [OPTIONS]`
 
-###### **Options:**
+### Options
 
 * `--path <path>` — Optional path in the repository to start dumping from
 * `--revision <revision>` — Optional revision to dump
 * `--max-depth <max-depth>` — Optional max depth of tree dump
-
-
 
 ## `lore repository gc`
 
@@ -436,19 +412,15 @@ Run a full garbage collection pass on the local repository store
 
 **Usage:** `lore repository gc`
 
-
-
 ## `lore repository store`
 
 Access the repository data store
 
 **Usage:** `lore repository store <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `immutable` — Operations on the immutable store
-
-
 
 ## `lore repository store immutable`
 
@@ -456,11 +428,9 @@ Operations on the immutable store
 
 **Usage:** `lore repository store immutable <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `query` — Query the store
-
-
 
 ## `lore repository store immutable query`
 
@@ -468,15 +438,13 @@ Query the store
 
 **Usage:** `lore repository store immutable query [OPTIONS] <ADDRESS>`
 
-###### **Arguments:**
+### Arguments
 
 * `<ADDRESS>` — Fragment address to query
 
-###### **Options:**
+### Options
 
 * `--recurse` — Recurse into subfragments
-
-
 
 ## `lore repository metadata`
 
@@ -484,13 +452,11 @@ Repository metadata operations
 
 **Usage:** `lore repository metadata <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `get` — Get metadata from the repository (omit key to list all)
 * `set` — Set metadata on the repository
 * `clear` — Clear metadata from the repository
-
-
 
 ## `lore repository metadata get`
 
@@ -498,11 +464,9 @@ Get metadata from the repository (omit key to list all)
 
 **Usage:** `lore repository metadata get [key]`
 
-###### **Arguments:**
+### Arguments
 
 * `<key>` — Attribute to get (omit to list all)
-
-
 
 ## `lore repository metadata set`
 
@@ -510,16 +474,14 @@ Set metadata on the repository
 
 **Usage:** `lore repository metadata set [OPTIONS] [pairs]...`
 
-###### **Arguments:**
+### Arguments
 
 * `<pairs>` — Metadata key/value pairs
 
-###### **Options:**
+### Options
 
 * `--binary` — Indicator that values are paths to binary files
 * `--numeric` — Indicator that values are numeric (u64)
-
-
 
 ## `lore repository metadata clear`
 
@@ -527,11 +489,9 @@ Clear metadata from the repository
 
 **Usage:** `lore repository metadata clear [keys]...`
 
-###### **Arguments:**
+### Arguments
 
 * `<keys>` — Keys to clear (omit to clear all user-defined keys)
-
-
 
 ## `lore repository instance`
 
@@ -539,12 +499,10 @@ Instance management
 
 **Usage:** `lore repository instance <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `list` — List all registered instances for this repository
 * `prune` — Remove stale instance entries
-
-
 
 ## `lore repository instance list`
 
@@ -552,15 +510,11 @@ List all registered instances for this repository
 
 **Usage:** `lore repository instance list`
 
-
-
 ## `lore repository instance prune`
 
 Remove stale instance entries
 
 **Usage:** `lore repository instance prune`
-
-
 
 ## `lore repository config`
 
@@ -568,11 +522,9 @@ Read a configuration value
 
 **Usage:** `lore repository config <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `get` — Get a configuration value
-
-
 
 ## `lore repository config get`
 
@@ -580,11 +532,9 @@ Get a configuration value
 
 **Usage:** `lore repository config get <KEY>`
 
-###### **Arguments:**
+### Arguments
 
 * `<KEY>` — The configuration key to read
-
-
 
 ## `lore repository update-path`
 
@@ -592,15 +542,13 @@ Update the stored path for this instance
 
 **Usage:** `lore repository update-path`
 
-
-
 ## `lore branch`
 
 Branch commands
 
 **Usage:** `lore branch <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `list` — List available branches
 * `info` — Get info about the given branch
@@ -616,19 +564,15 @@ Branch commands
 * `latest` — Branch latest related commands
 * `metadata` — Branch metadata operations
 
-
-
 ## `lore branch list`
 
 List available branches
 
 **Usage:** `lore branch list [OPTIONS]`
 
-###### **Options:**
+### Options
 
 * `--archived` — Include archived local branches
-
-
 
 ## `lore branch info`
 
@@ -636,11 +580,9 @@ Get info about the given branch
 
 **Usage:** `lore branch info [branch]`
 
-###### **Arguments:**
+### Arguments
 
 * `<branch>` — Name of the branch
-
-
 
 ## `lore branch create`
 
@@ -648,15 +590,13 @@ Create a new branch
 
 **Usage:** `lore branch create [OPTIONS] <branch>`
 
-###### **Arguments:**
+### Arguments
 
 * `<branch>` — Name of the branch
 
-###### **Options:**
+### Options
 
 * `--id <id>` — Optional explicit branch ID (hex-encoded 16-byte identifier)
-
-
 
 ## `lore branch switch`
 
@@ -664,19 +604,17 @@ Switch to a different branch
 
 **Usage:** `lore branch switch [OPTIONS] <branch> [revision]`
 
-###### **Arguments:**
+### Arguments
 
 * `<branch>` — Name of the branch
 * `<revision>` — Revision to switch to
 
-###### **Options:**
+### Options
 
 * `--dry-run` — Do a dry run sync and only report what changes would be done, do not change anything in the file system
 * `--local` — Keep last local latest revision, do not sync latest revision from remote (implied by offline mode)
 * `--reset` — Reset any local modified files to match the incoming revision
 * `--bare` — Only update anchor tracking without modifying or verifying files, useful for bare repositories
-
-
 
 ## `lore branch push`
 
@@ -684,15 +622,13 @@ Push commits to remote
 
 **Usage:** `lore branch push [OPTIONS] [branch]`
 
-###### **Arguments:**
+### Arguments
 
 * `<branch>` — Optional name or identifier of the branch, push current branch if not specified
 
-###### **Options:**
+### Options
 
 * `--fast-forward-merge` — Allow the server to fast-forward merge if the target branch head has moved
-
-
 
 ## `lore branch merge`
 
@@ -701,7 +637,7 @@ Merge two branches
 **Usage:** `lore branch merge [OPTIONS] <branch|--id <branch-id>>
        merge [OPTIONS] <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `unresolve` — Marks the merge unresolved
 * `into` — Merge into branch
@@ -710,16 +646,14 @@ Merge two branches
 * `resolve` — Resolves the merge
 * `abort` — Abort a merge process
 
-###### **Arguments:**
+### Arguments
 
 * `<branch>` — Name of the source branch to merge into the current branch
 
-###### **Options:**
+### Options
 
 * `--id <branch-id>` — ID of the source branch to merge into the current branch
 * `--message <MESSAGE>` — Change the message for committing when no conflicts arise from the merge
-
-
 
 ## `lore branch merge unresolve`
 
@@ -727,15 +661,13 @@ Marks the merge unresolved
 
 **Usage:** `lore branch merge unresolve <paths|--targets <file>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files to unresolve
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore branch merge into`
 
@@ -743,18 +675,16 @@ Merge into branch
 
 **Usage:** `lore branch merge into [OPTIONS] <branch|--id <branch-id>> <MESSAGE>`
 
-###### **Arguments:**
+### Arguments
 
 * `<branch>` — Name of the target branch to merge the current branch into
 * `<MESSAGE>` — Commit message
 
-###### **Options:**
+### Options
 
 * `--id <branch-id>` — ID of the target branch to merge the current branch into
 * `--link <LINK>` — Merge only a specific linked repository at the given mount path
 * `--ignore-links` — Merge only the main repository, skipping all linked repositories
-
-
 
 ## `lore branch merge start`
 
@@ -762,11 +692,11 @@ Start a merge process
 
 **Usage:** `lore branch merge start [OPTIONS] <branch|--id <branch-id>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<branch>` — Name of the source branch to merge into the current branch
 
-###### **Options:**
+### Options
 
 * `--id <branch-id>` — ID of the source branch to merge into the current branch
 * `--message <MESSAGE>` — Change the message for committing when no conflicts arise from the merge
@@ -775,23 +705,19 @@ Start a merge process
 * `--link <LINK>` — Merge only a specific linked repository at the given mount path
 * `--ignore-links` — Merge only the main repository, skipping all linked repositories
 
-
-
 ## `lore branch merge restart`
 
 Restart the merge, resetting the current merge state
 
 **Usage:** `lore branch merge restart <paths|--targets <file>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files to restart
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore branch merge resolve`
 
@@ -800,20 +726,18 @@ Resolves the merge
 **Usage:** `lore branch merge resolve [OPTIONS] [paths]...
        resolve <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `mine` — Resolve using my changes
 * `theirs` — Resolve using their changes
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files to reset
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore branch merge resolve mine`
 
@@ -821,15 +745,13 @@ Resolve using my changes
 
 **Usage:** `lore branch merge resolve mine <paths|--targets <file>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files to stage
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore branch merge resolve theirs`
 
@@ -837,15 +759,13 @@ Resolve using their changes
 
 **Usage:** `lore branch merge resolve theirs <paths|--targets <file>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files to stage
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore branch merge abort`
 
@@ -853,12 +773,10 @@ Abort a merge process
 
 **Usage:** `lore branch merge abort [OPTIONS]`
 
-###### **Options:**
+### Options
 
 * `--link <LINK>` — Abort only a specific linked repository merge at the given mount path
 * `--ignore-links` — Abort only the main repository merge, keeping link pin updates
-
-
 
 ## `lore branch diff`
 
@@ -866,16 +784,14 @@ Diff two branches using the common ancestor base revision Will calculate the set
 
 **Usage:** `lore branch diff [OPTIONS] <target>`
 
-###### **Arguments:**
+### Arguments
 
 * `<target>` — Name of the target branch
 
-###### **Options:**
+### Options
 
 * `--source <source>` — Name of the source branch
 * `--auto-resolve` — Attempt to auto resolve conflicts if true
-
-
 
 ## `lore branch archive`
 
@@ -883,11 +799,9 @@ Archive an existing branch
 
 **Usage:** `lore branch archive <branch>`
 
-###### **Arguments:**
+### Arguments
 
 * `<branch>` — Name of the branch to archive
-
-
 
 ## `lore branch reset`
 
@@ -895,15 +809,13 @@ Reset local latest pointer for a branch
 
 **Usage:** `lore branch reset [OPTIONS] <revision>`
 
-###### **Arguments:**
+### Arguments
 
 * `<revision>` — Revision to reset the local latest pointer to
 
-###### **Options:**
+### Options
 
 * `--branch <branch>` — Branch to reset, or the current branch if not set
-
-
 
 ## `lore branch protect`
 
@@ -911,11 +823,9 @@ Protect a branch from direct pushes
 
 **Usage:** `lore branch protect <branch>`
 
-###### **Arguments:**
+### Arguments
 
 * `<branch>` — Name of the branch to protect
-
-
 
 ## `lore branch unprotect`
 
@@ -923,11 +833,9 @@ Remove push protection from a branch
 
 **Usage:** `lore branch unprotect <branch>`
 
-###### **Arguments:**
+### Arguments
 
 * `<branch>` — Name of the branch to unprotect
-
-
 
 ## `lore branch latest`
 
@@ -935,25 +843,21 @@ Branch latest related commands
 
 **Usage:** `lore branch latest <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `list` —
-
-
 
 ## `lore branch latest list`
 
 **Usage:** `lore branch latest list [OPTIONS] [LIMIT]`
 
-###### **Arguments:**
+### Arguments
 
 * `<LIMIT>` — Max number of history entries to show
 
-###### **Options:**
+### Options
 
 * `--branch <branch>` — Branch to query
-
-
 
 ## `lore branch metadata`
 
@@ -961,13 +865,11 @@ Branch metadata operations
 
 **Usage:** `lore branch metadata <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `get` — Get metadata from the branch (omit key to list all)
 * `set` — Set metadata on the branch
 * `clear` — Clear metadata from the branch
-
-
 
 ## `lore branch metadata get`
 
@@ -975,15 +877,13 @@ Get metadata from the branch (omit key to list all)
 
 **Usage:** `lore branch metadata get [OPTIONS] [key]`
 
-###### **Arguments:**
+### Arguments
 
 * `<key>` — Attribute to get (omit to list all)
 
-###### **Options:**
+### Options
 
 * `--branch <branch>` — Branch name (uses current branch if not specified)
-
-
 
 ## `lore branch metadata set`
 
@@ -991,17 +891,15 @@ Set metadata on the branch
 
 **Usage:** `lore branch metadata set [OPTIONS] [pairs]...`
 
-###### **Arguments:**
+### Arguments
 
 * `<pairs>` — Metadata key/value pairs
 
-###### **Options:**
+### Options
 
 * `--binary` — Indicator that values are paths to binary files
 * `--numeric` — Indicator that values are numeric (u64)
 * `--branch <branch>` — Branch name (uses current branch if not specified)
-
-
 
 ## `lore branch metadata clear`
 
@@ -1009,15 +907,13 @@ Clear metadata from the branch
 
 **Usage:** `lore branch metadata clear [OPTIONS] [keys]...`
 
-###### **Arguments:**
+### Arguments
 
 * `<keys>` — Keys to clear (omit to clear all user-defined keys)
 
-###### **Options:**
+### Options
 
 * `--branch <branch>` — Branch name (uses current branch if not specified)
-
-
 
 ## `lore revision`
 
@@ -1025,7 +921,7 @@ Revision commands
 
 **Usage:** `lore revision <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `history` — List revisions of a repository
 * `info` — Get info about a revision
@@ -1040,26 +936,22 @@ Revision commands
 * `revert` — Revert a revision from the currently synced revision
 * `metadata` — Manage metadata of a given revision
 
-
-
 ## `lore revision history`
 
 List revisions of a repository
 
 **Usage:** `lore revision history [OPTIONS] [LENGTH]`
 
-###### **Arguments:**
+### Arguments
 
 * `<LENGTH>` — Number of revisions to show
 
-###### **Options:**
+### Options
 
 * `--revision <revision>` — Start listing from the specified revision. If not specified, start listing from the current branch latest revision
 * `--branch <branch>` — Show branch revisions
 * `--only-branch` — Stop when reaching a revision on a different branch (includes the branch point revision)
 * `--oneline` — Output each revision on one line only
-
-
 
 ## `lore revision info`
 
@@ -1067,16 +959,14 @@ Get info about a revision
 
 **Usage:** `lore revision info [OPTIONS] [revision]`
 
-###### **Arguments:**
+### Arguments
 
 * `<revision>` — Revision to get info for
 
-###### **Options:**
+### Options
 
 * `--delta` — Show delta information
 * `--metadata` — Show file metadata information
-
-
 
 ## `lore revision commit`
 
@@ -1084,11 +974,11 @@ Commit the staged state
 
 **Usage:** `lore revision commit [OPTIONS] <MESSAGE>`
 
-###### **Arguments:**
+### Arguments
 
 * `<MESSAGE>` — Commit message
 
-###### **Options:**
+### Options
 
 * `--stats` — Print stats
 * `--link <LINK>` — Commit only changes in this linked repository (mount path relative to repo root)
@@ -1096,23 +986,19 @@ Commit the staged state
 * `--layer <LAYER>` — Commit only changes in this layer (mount path relative to repo root)
 * `--layer-message <PATH>` — Per-layer commit message. Takes two values: <path> <message>. Can be specified multiple times
 
-
-
 ## `lore revision amend`
 
 Amend the latest commit's message
 
 **Usage:** `lore revision amend [OPTIONS] <MESSAGE>`
 
-###### **Arguments:**
+### Arguments
 
 * `<MESSAGE>` — Commit message
 
-###### **Options:**
+### Options
 
 * `--stats` — Print stats
-
-
 
 ## `lore revision sync`
 
@@ -1120,13 +1006,13 @@ Synchronize to a given state of a repository
 
 **Usage:** `lore revision sync [OPTIONS] [revision]`
 
-**Command Alias:** `synchronize`
+**Command Alias: `synchronize`
 
-###### **Arguments:**
+### Arguments
 
 * `<revision>` — Revision hash signature to synchronize to. Can be a signature on any branch — if the target revision is on a different branch, the current branch is updated accordingly. Can be a partial hash signature
 
-###### **Options:**
+### Options
 
 * `--forward-changes` — Fast forward any local changes if syncing to a local revision
 * `--reset` — Reset any local modified files to match the incoming revision
@@ -1137,20 +1023,16 @@ Synchronize to a given state of a repository
 
   Default value: `0`
 
-
-
 ## `lore revision bisect`
 
 Binary search for a change introduced between start (exclusive) and end (inclusive.)
 
 **Usage:** `lore revision bisect --start <start_revision> --end <end_revision>`
 
-###### **Options:**
+### Options
 
 * `--start <start_revision>` — The latest revision known to not have the change
 * `--end <end_revision>` — The earliest revision known to have the change
-
-
 
 ## `lore revision diff`
 
@@ -1158,17 +1040,15 @@ Diff two revisions
 
 **Usage:** `lore revision diff [OPTIONS] <revision_source>`
 
-###### **Arguments:**
+### Arguments
 
 * `<revision_source>` — Source revision to compare
 
-###### **Options:**
+### Options
 
 * `--target <revision_target>` — Target revision to compare, by default the current revision
 * `--path <PATH>` — Optional path in repository
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore revision find`
 
@@ -1176,12 +1056,10 @@ Find revision
 
 **Usage:** `lore revision find <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `metadata` — Find revision by metadata
 * `number` — Find revision by number
-
-
 
 ## `lore revision find metadata`
 
@@ -1189,12 +1067,10 @@ Find revision by metadata
 
 **Usage:** `lore revision find metadata <key> [value]`
 
-###### **Arguments:**
+### Arguments
 
 * `<key>` — Metadata key to search for
 * `<value>` — Metadata value to match with
-
-
 
 ## `lore revision find number`
 
@@ -1202,11 +1078,9 @@ Find revision by number
 
 **Usage:** `lore revision find number <NUMBER>`
 
-###### **Arguments:**
+### Arguments
 
 * `<NUMBER>` — Revision number to search for
-
-
 
 ## `lore revision restore`
 
@@ -1214,11 +1088,9 @@ Restore current revision as latest revision
 
 **Usage:** `lore revision restore [MESSAGE]`
 
-###### **Arguments:**
+### Arguments
 
 * `<MESSAGE>` — Commit message
-
-
 
 ## `lore revision cherry-pick`
 
@@ -1227,23 +1099,21 @@ Cherry-pick a revision onto the currently synced revision
 **Usage:** `lore revision cherry-pick [OPTIONS] <revision>
        cherry-pick [OPTIONS] [revision] <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `unresolve` — Marks the cherry-pick unresolved
 * `restart` — Restart the cherry-pick, resetting the current cherry-pick state
 * `resolve` — Resolve conflicts
 * `abort` — Abort a cherry-pick
 
-###### **Arguments:**
+### Arguments
 
 * `<revision>` — Target revision to cherry-pick
 
-###### **Options:**
+### Options
 
 * `--message <MESSAGE>` — Change the message for committing when no conflicts arise from the cherry-pick
 * `--no-commit` — Disable auto commits even if no conflicts arise from the cherry-pick
-
-
 
 ## `lore revision cherry-pick unresolve`
 
@@ -1251,15 +1121,13 @@ Marks the cherry-pick unresolved
 
 **Usage:** `lore revision cherry-pick unresolve <paths|--targets <file>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files to target
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore revision cherry-pick restart`
 
@@ -1267,15 +1135,13 @@ Restart the cherry-pick, resetting the current cherry-pick state
 
 **Usage:** `lore revision cherry-pick restart <paths|--targets <file>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files to target
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore revision cherry-pick resolve`
 
@@ -1284,20 +1150,18 @@ Resolve conflicts
 **Usage:** `lore revision cherry-pick resolve <paths|--targets <file>>
        resolve <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `mine` — Resolve using my changes
 * `theirs` — Resolve using the incoming changes
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files to target
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore revision cherry-pick resolve mine`
 
@@ -1305,15 +1169,13 @@ Resolve using my changes
 
 **Usage:** `lore revision cherry-pick resolve mine <paths|--targets <file>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files to target
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore revision cherry-pick resolve theirs`
 
@@ -1321,23 +1183,19 @@ Resolve using the incoming changes
 
 **Usage:** `lore revision cherry-pick resolve theirs <paths|--targets <file>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files to target
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore revision cherry-pick abort`
 
 Abort a cherry-pick
 
 **Usage:** `lore revision cherry-pick abort`
-
-
 
 ## `lore revision revert`
 
@@ -1346,23 +1204,21 @@ Revert a revision from the currently synced revision
 **Usage:** `lore revision revert [OPTIONS] <revision>
        revert [OPTIONS] [revision] <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `unresolve` — Marks the revert unresolved
 * `restart` — Restart the revert, resetting the current revert state
 * `resolve` — Resolve conflicts
 * `abort` — Abort a revert
 
-###### **Arguments:**
+### Arguments
 
 * `<revision>` — Target revision to revert
 
-###### **Options:**
+### Options
 
 * `--message <MESSAGE>` — Change the message for committing when no conflicts arise from the revert
 * `--no-commit` — Disable auto commits even if no conflicts arise from the revert
-
-
 
 ## `lore revision revert unresolve`
 
@@ -1370,15 +1226,13 @@ Marks the revert unresolved
 
 **Usage:** `lore revision revert unresolve <paths|--targets <file>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files to target
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore revision revert restart`
 
@@ -1386,15 +1240,13 @@ Restart the revert, resetting the current revert state
 
 **Usage:** `lore revision revert restart <paths|--targets <file>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files to target
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore revision revert resolve`
 
@@ -1403,20 +1255,18 @@ Resolve conflicts
 **Usage:** `lore revision revert resolve <paths|--targets <file>>
        resolve <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `mine` — Resolve using my changes
 * `theirs` — Resolve using the incoming changes
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files to target
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore revision revert resolve mine`
 
@@ -1424,15 +1274,13 @@ Resolve using my changes
 
 **Usage:** `lore revision revert resolve mine <paths|--targets <file>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files to target
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore revision revert resolve theirs`
 
@@ -1440,15 +1288,13 @@ Resolve using the incoming changes
 
 **Usage:** `lore revision revert resolve theirs <paths|--targets <file>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files to target
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore revision revert abort`
 
@@ -1456,21 +1302,17 @@ Abort a revert
 
 **Usage:** `lore revision revert abort`
 
-
-
 ## `lore revision metadata`
 
 Manage metadata of a given revision
 
 **Usage:** `lore revision metadata <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `clear` — Clear metadata for a staged revision
 * `get` — Get metadata from a revision
 * `set` — Set metadata on for a staged revision
-
-
 
 ## `lore revision metadata clear`
 
@@ -1478,23 +1320,19 @@ Clear metadata for a staged revision
 
 **Usage:** `lore revision metadata clear`
 
-
-
 ## `lore revision metadata get`
 
 Get metadata from a revision
 
 **Usage:** `lore revision metadata get [OPTIONS] [key]`
 
-###### **Arguments:**
+### Arguments
 
 * `<key>` — Attribute to get metadata for
 
-###### **Options:**
+### Options
 
 * `--revision <revision>` — Revision to get metadata for
-
-
 
 ## `lore revision metadata set`
 
@@ -1502,15 +1340,13 @@ Set metadata on for a staged revision
 
 **Usage:** `lore revision metadata set [OPTIONS] [pairs]...`
 
-###### **Arguments:**
+### Arguments
 
 * `<pairs>` — Metadata key/value pairs
 
-###### **Options:**
+### Options
 
 * `--binary` — Indicator that values are paths to files
-
-
 
 ## `lore file`
 
@@ -1518,7 +1354,7 @@ File commands
 
 **Usage:** `lore file <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `info` — Get info about the given file or directory
 * `metadata` — Manage metadata of a given file or directory
@@ -1533,26 +1369,22 @@ File commands
 * `write` — Write data to a specific location
 * `hash` — Hash a local file
 
-
-
 ## `lore file info`
 
 Get info about the given file or directory
 
 **Usage:** `lore file info [OPTIONS] <paths|--targets <file>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 * `--revision <revision>` — Revision to get info from
 * `--local` — If given, calculate the local file system size and hash based on the current local filter
 * `--filtered` — If given, calculate the repository size based on the current local filter
-
-
 
 ## `lore file metadata`
 
@@ -1560,13 +1392,11 @@ Manage metadata of a given file or directory
 
 **Usage:** `lore file metadata <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `clear` — Clear metadata for a staged file
 * `get` — Get metadata from a file
 * `set` — Set metadata on for a staged file
-
-
 
 ## `lore file metadata clear`
 
@@ -1574,11 +1404,9 @@ Clear metadata for a staged file
 
 **Usage:** `lore file metadata clear <PATH>`
 
-###### **Arguments:**
+### Arguments
 
 * `<PATH>` — File path to clear metadata for
-
-
 
 ## `lore file metadata get`
 
@@ -1586,16 +1414,14 @@ Get metadata from a file
 
 **Usage:** `lore file metadata get [OPTIONS] <PATH> [key]`
 
-###### **Arguments:**
+### Arguments
 
 * `<PATH>` — File to get metadata for
 * `<key>` — Attribute to get metadata for
 
-###### **Options:**
+### Options
 
 * `--revision <revision>` — Revision to get metadata for
-
-
 
 ## `lore file metadata set`
 
@@ -1603,16 +1429,14 @@ Set metadata on for a staged file
 
 **Usage:** `lore file metadata set [OPTIONS] <PATH> [pairs]...`
 
-###### **Arguments:**
+### Arguments
 
 * `<PATH>` — File path to set metadata on
 * `<pairs>` — Metadata key/value pairs
 
-###### **Options:**
+### Options
 
 * `--binary` — Indicator that values are paths to files
-
-
 
 ## `lore file dependency`
 
@@ -1620,13 +1444,11 @@ Manage file dependencies
 
 **Usage:** `lore file dependency <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `add` — Add dependency edges from a source file to one or more dependency files
 * `remove` — Remove dependency edges from a source file to one or more dependency files
 * `list` — List dependencies or dependents for files
-
-
 
 ## `lore file dependency add`
 
@@ -1634,17 +1456,15 @@ Add dependency edges from a source file to one or more dependency files
 
 **Usage:** `lore file dependency add [OPTIONS] <SOURCE> [dependencies]...`
 
-###### **Arguments:**
+### Arguments
 
 * `<SOURCE>` — Source file that depends on the listed dependencies
 * `<dependencies>` — One or more dependency file paths
 
-###### **Options:**
+### Options
 
 * `--tag <tag>` — Tags to apply to all added dependency edges
 * `--force` — Skip cycle detection
-
-
 
 ## `lore file dependency remove`
 
@@ -1652,16 +1472,14 @@ Remove dependency edges from a source file to one or more dependency files
 
 **Usage:** `lore file dependency remove [OPTIONS] <SOURCE> [dependencies]...`
 
-###### **Arguments:**
+### Arguments
 
 * `<SOURCE>` — Source file to remove dependencies from
 * `<dependencies>` — One or more dependency file paths to remove
 
-###### **Options:**
+### Options
 
 * `--tag <tag>` — Remove only specific tags instead of entire edges
-
-
 
 ## `lore file dependency list`
 
@@ -1669,11 +1487,11 @@ List dependencies or dependents for files
 
 **Usage:** `lore file dependency list [OPTIONS] [paths]...`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Paths to list dependencies for (all files if omitted)
 
-###### **Options:**
+### Options
 
 * `--reverse` — List dependents instead of dependencies
 * `--recursive` — Recursively resolve transitive dependencies
@@ -1682,8 +1500,6 @@ List dependencies or dependents for files
 
   Default value: `0`
 * `--revision <revision>` — Revision to query (defaults to staged/current)
-
-
 
 ## `lore file stage`
 
@@ -1698,25 +1514,25 @@ Specific file paths are checked against the filesystem and staged if content dif
 **Usage:** `lore file stage [OPTIONS] <paths|--targets <file>>
        stage [OPTIONS] <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `move` — Move or rename a file or directory
 * `merge` — Stage as a merge
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files
 
-###### **Options:**
+### Options
 
 * `--case <case>` — Case change handling
 
   Possible values:
-  - `error`:
+  * `error`:
     Generate error on case mismatch
-  - `keep`:
+  * `keep`:
     Keep current case in repository (update file system)
-  - `rename`:
+  * `rename`:
     Rename case in repository (keep file system)
 
 * `--scan` — Walk the filesystem under the given paths to detect modified, added, and deleted files.
@@ -1726,20 +1542,16 @@ Specific file paths are checked against the filesystem and staged if content dif
    Without `--scan`, directory staging stages only files already marked dirty under that directory — mark them first with `lore dirty <paths>`, or run `lore status --scan` to reconcile dirty flags across a tree. Single-file stage paths are always checked against the filesystem regardless of this flag.
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 
-
-
 ## `lore file stage move`
 
 Move or rename a file or directory
 
 **Usage:** `lore file stage move <from> <to>`
 
-###### **Arguments:**
+### Arguments
 
 * `<from>` — Original path of file
 * `<to>` — New path of file
-
-
 
 ## `lore file stage merge`
 
@@ -1747,15 +1559,13 @@ Stage as a merge
 
 **Usage:** `lore file stage merge <paths|--targets <file>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file containing all the paths to all files
-
-
 
 ## `lore file dirty`
 
@@ -1765,20 +1575,18 @@ Use when files were changed externally and you want to notify Lore of specific p
 
 **Usage:** `lore file dirty [OPTIONS] [paths]... [COMMAND]`
 
-###### **Subcommands:**
+### Subcommands
 
 * `move` — Mark a file as moved (dirty)
 * `copy` — Mark a file as copied (dirty)
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file containing all the paths to all files
-
-
 
 ## `lore file dirty move`
 
@@ -1786,12 +1594,10 @@ Mark a file as moved (dirty)
 
 **Usage:** `lore file dirty move <from> <to>`
 
-###### **Arguments:**
+### Arguments
 
 * `<from>` — Original path of file
 * `<to>` — New path of file
-
-
 
 ## `lore file dirty copy`
 
@@ -1799,12 +1605,10 @@ Mark a file as copied (dirty)
 
 **Usage:** `lore file dirty copy <from> <to>`
 
-###### **Arguments:**
+### Arguments
 
 * `<from>` — Source path of file
 * `<to>` — Destination path of copy
-
-
 
 ## `lore file unstage`
 
@@ -1812,15 +1616,13 @@ Unstage changes to a file or directory
 
 **Usage:** `lore file unstage <paths|--targets <file>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files to unstage
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore file reset`
 
@@ -1828,18 +1630,16 @@ Reset changes to a path or file to the current revision, discarding your local c
 
 **Usage:** `lore file reset [OPTIONS] <paths|--targets <file>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files
 
-###### **Options:**
+### Options
 
 * `--purge` — Delete untracked files
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 * `--revision <revision>` — Revision to reset files to
 * `--last-merged-from <branch>` — If given, the files will be reset to the last point of merge from this branch, or the branch point from this branch if no merge has been performed
-
-
 
 ## `lore file obliterate`
 
@@ -1847,12 +1647,10 @@ Obliterate a file or fragment
 
 **Usage:** `lore file obliterate <--address <ADDRESS>|--path <PATH>>`
 
-###### **Options:**
+### Options
 
 * `--address <ADDRESS>` — Address of a blob
 * `--path <PATH>` — Path to a file
-
-
 
 ## `lore file history`
 
@@ -1860,19 +1658,17 @@ List revisions of a file
 
 **Usage:** `lore file history [OPTIONS] <PATH> [LENGTH]`
 
-###### **Arguments:**
+### Arguments
 
 * `<PATH>` — File path to get revisions for
 * `<LENGTH>` — Number of revisions to show
 
-###### **Options:**
+### Options
 
 * `--revision <revision>` — Revision to start from
 * `--branch <branch>` — Show branch revisions
 * `--depth <depth>` — Number of revisions to search initially
 * `--oneline` — Output each revision on one line only
-
-
 
 ## `lore file diff`
 
@@ -1880,11 +1676,11 @@ Show differences between two revisions of a file
 
 **Usage:** `lore file diff [OPTIONS] [paths]...`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files
 
-###### **Options:**
+### Options
 
 * `--source <revision_source>` — Optional signature of the source revision to diff from, by default the current revision
 * `--target <revision_target>` — Optional signature of the target revision to diff to, by default the current file system state
@@ -1896,22 +1692,18 @@ Show differences between two revisions of a file
 * `--ignore-space-change` — Collapse runs of internal whitespace to a single space before comparing
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 
-
-
 ## `lore file write`
 
 Write data to a specific location
 
 **Usage:** `lore file write [OPTIONS] --output <OUTPUT>`
 
-###### **Options:**
+### Options
 
 * `--address <ADDRESS>` — Address of a blob
 * `--path <PATH>` — Path to a file
 * `--revision <REVISION>` — Revision specifier
 * `--output <OUTPUT>` — Path to a destination
-
-
 
 ## `lore file hash`
 
@@ -1919,15 +1711,13 @@ Hash a local file
 
 **Usage:** `lore file hash [OPTIONS] [paths]...`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files to unstage
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore auth`
 
@@ -1935,7 +1725,7 @@ Authentication commands
 
 **Usage:** `lore auth <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `login` — Authenticate the CLI
 * `info` — Display identity information for the current user or specified user IDs
@@ -1943,26 +1733,22 @@ Authentication commands
 * `logout` — Remove stored authentication and authorization tokens
 * `clear` — Clear all stored authentication data
 
-
-
 ## `lore auth login`
 
 Authenticate the CLI
 
 **Usage:** `lore auth login [OPTIONS] [remote-url]`
 
-###### **Arguments:**
+### Arguments
 
 * `<remote-url>` — Server URL
 
-###### **Options:**
+### Options
 
 * `--token-type <TOKEN_TYPE>` — Token type for non-interactive login (e.g. "api-key", "eg1", "lore")
 * `--token <TOKEN>` — Token value for non-interactive login (requires --token-type)
 * `--auth-url <AUTH_URL>` — Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`). Required when logging in with `--token` outside a repository without a remote-url
 * `--no-browser` — Avoid opening a browser to login
-
-
 
 ## `lore auth info`
 
@@ -1970,15 +1756,13 @@ Display identity information for the current user or specified user IDs
 
 **Usage:** `lore auth info [OPTIONS] [user-id]...`
 
-###### **Arguments:**
+### Arguments
 
 * `<user-id>` — User IDs to resolve (omit for current user)
 
-###### **Options:**
+### Options
 
 * `--with-token` — Include cached tokens in the output
-
-
 
 ## `lore auth list`
 
@@ -1986,11 +1770,9 @@ List all stored authentication identities
 
 **Usage:** `lore auth list [OPTIONS]`
 
-###### **Options:**
+### Options
 
 * `--with-token` — Include cached tokens in the output
-
-
 
 ## `lore auth logout`
 
@@ -1998,13 +1780,11 @@ Remove stored authentication and authorization tokens
 
 **Usage:** `lore auth logout [OPTIONS]`
 
-###### **Options:**
+### Options
 
 * `--auth-url <auth-url>` — Auth service URL (omit to use current repository's auth URL)
 * `--resource <resource>` — Resource ID to remove a specific authorization (e.g. "urc-{id}")
 * `--user-id <user-id>` — User ID to remove (omit to remove all identities)
-
-
 
 ## `lore auth clear`
 
@@ -2012,21 +1792,17 @@ Clear all stored authentication data
 
 **Usage:** `lore auth clear`
 
-
-
 ## `lore layer`
 
 Layer commands
 
 **Usage:** `lore layer <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `add` — Add a repository layer
 * `remove` — Remove a repository layer
 * `list` — List repository layers
-
-
 
 ## `lore layer add`
 
@@ -2034,17 +1810,15 @@ Add a repository layer
 
 **Usage:** `lore layer add [OPTIONS] <path> <repository> <path>`
 
-###### **Arguments:**
+### Arguments
 
 * `<path>` — Path in the current repository where the layer should be placed
 * `<repository>` — Repository to add as a layer, either an ID or a name
 * `<path>` — Path in the layer repository where the layer should start
 
-###### **Options:**
+### Options
 
 * `--metadata <metadata>` — Metadata key to use for matching revisions
-
-
 
 ## `lore layer remove`
 
@@ -2052,16 +1826,14 @@ Remove a repository layer
 
 **Usage:** `lore layer remove [OPTIONS] <path> [repository]`
 
-###### **Arguments:**
+### Arguments
 
 * `<path>` — Path in the current repository where the layer is placed
 * `<repository>` — Repository placed as a layer. Optional when the target path matches a single configured layer; required to disambiguate when multiple layers share the same target path
 
-###### **Options:**
+### Options
 
 * `--purge` — Also delete untracked files and all directories inside the layer mount
-
-
 
 ## `lore layer list`
 
@@ -2069,19 +1841,15 @@ List repository layers
 
 **Usage:** `lore layer list`
 
-
-
 ## `lore logfile`
 
 Logfile commands
 
 **Usage:** `lore logfile <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `info` — Info
-
-
 
 ## `lore logfile info`
 
@@ -2089,26 +1857,22 @@ Info
 
 **Usage:** `lore logfile info`
 
-
-
 ## `lore login`
 
 Authenticate the CLI
 
 **Usage:** `lore login [OPTIONS] [remote-url]`
 
-###### **Arguments:**
+### Arguments
 
 * `<remote-url>` — Server URL
 
-###### **Options:**
+### Options
 
 * `--token-type <TOKEN_TYPE>` — Token type for non-interactive login (e.g. "api-key", "eg1", "lore")
 * `--token <TOKEN>` — Token value for non-interactive login (requires --token-type)
 * `--auth-url <AUTH_URL>` — Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`). Required when logging in with `--token` outside a repository without a remote-url
 * `--no-browser` — Avoid opening a browser to login
-
-
 
 ## `lore link`
 
@@ -2116,14 +1880,12 @@ Link commands
 
 **Usage:** `lore link <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `add` — Link to the given point in the repository and subpath from the given repository
 * `remove` — Remove the link at the given point in the repository
 * `update` — Update the link to a new pin
 * `list` — List all links in the repository
-
-
 
 ## `lore link add`
 
@@ -2131,18 +1893,16 @@ Link to the given point in the repository and subpath from the given repository
 
 **Usage:** `lore link add [OPTIONS] <link_path> <link_url> <source_path>`
 
-###### **Arguments:**
+### Arguments
 
 * `<link_path>` — Path in the current repository where the repository should be linked in
 * `<link_url>` — Repository URL
 * `<source_path>` — Path in the link repository that should be linked in
 
-###### **Options:**
+### Options
 
 * `--pin <pin>` — Branch or specific revision to pin the link to, defaulting to latest on the main branch
 * `--disable-branching` — Disable automatic branch creation in the linked repository
-
-
 
 ## `lore link remove`
 
@@ -2150,11 +1910,9 @@ Remove the link at the given point in the repository
 
 **Usage:** `lore link remove <link_path>`
 
-###### **Arguments:**
+### Arguments
 
 * `<link_path>` — Path in the current repository where the module is linked in
-
-
 
 ## `lore link update`
 
@@ -2162,15 +1920,13 @@ Update the link to a new pin
 
 **Usage:** `lore link update [OPTIONS] <link_path>`
 
-###### **Arguments:**
+### Arguments
 
 * `<link_path>` — Path in the repository where the link should be updated
 
-###### **Options:**
+### Options
 
 * `--pin <pin>` — Branch or specific revision to pin the link to, defaulting to latest on the current branch
-
-
 
 ## `lore link list`
 
@@ -2178,11 +1934,9 @@ List all links in the repository
 
 **Usage:** `lore link list [OPTIONS]`
 
-###### **Options:**
+### Options
 
 * `--staged` — Only show links with staged changes
-
-
 
 ## `lore status`
 
@@ -2194,11 +1948,11 @@ Pass `--scan` to walk the filesystem under the given paths, reconcile every file
 
 **Usage:** `lore status [OPTIONS] [PATH]...`
 
-###### **Arguments:**
+### Arguments
 
 * `<PATH>` — Optional paths in repository
 
-###### **Options:**
+### Options
 
 * `--scan` — Walk the filesystem under the given paths and reconcile every file against the current revision.
 
@@ -2213,20 +1967,18 @@ Pass `--scan` to walk the filesystem under the given paths, reconcile every file
 * `--count` — Count directories and files (staged state if present, else current revision; view-filtered)
 * `--targets <file>` — Path to a targets file
 
-
-
 ## `lore clone`
 
 Clone a remote repository into the given path
 
 **Usage:** `lore clone [OPTIONS] <url> [path]`
 
-###### **Arguments:**
+### Arguments
 
 * `<url>` — URL of repository
 * `<path>` — Path to clone into
 
-###### **Options:**
+### Options
 
 * `--view <view>` — Optional client side view filter file
 * `--revision <revision>` — Optional revision to sync
@@ -2247,8 +1999,6 @@ Clone a remote repository into the given path
 
   Default value: `0`
 
-
-
 ## `lore stage`
 
 Stage changes for commit.
@@ -2262,25 +2012,25 @@ Specific file path: checked against the filesystem and staged if its on-disk con
 **Usage:** `lore stage [OPTIONS] <paths|--targets <file>>
        stage [OPTIONS] <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `move` — Move or rename a file or directory
 * `merge` — Stage as a merge
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files
 
-###### **Options:**
+### Options
 
 * `--case <case>` — Case change handling
 
   Possible values:
-  - `error`:
+  * `error`:
     Generate error on case mismatch
-  - `keep`:
+  * `keep`:
     Keep current case in repository (update file system)
-  - `rename`:
+  * `rename`:
     Rename case in repository (keep file system)
 
 * `--scan` — Walk the filesystem under the given paths to detect modified, added, and deleted files.
@@ -2290,20 +2040,16 @@ Specific file path: checked against the filesystem and staged if its on-disk con
    Without `--scan`, directory staging stages only files already marked dirty under that directory — mark them first with `lore dirty <paths>`, or run `lore status --scan` to reconcile dirty flags across a tree. Single-file stage paths are always checked against the filesystem regardless of this flag.
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 
-
-
 ## `lore stage move`
 
 Move or rename a file or directory
 
 **Usage:** `lore stage move <from> <to>`
 
-###### **Arguments:**
+### Arguments
 
 * `<from>` — Original path of file
 * `<to>` — New path of file
-
-
 
 ## `lore stage merge`
 
@@ -2311,15 +2057,13 @@ Stage as a merge
 
 **Usage:** `lore stage merge <paths|--targets <file>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file containing all the paths to all files
-
-
 
 ## `lore dirty`
 
@@ -2329,20 +2073,18 @@ Use this when your editor or build tool has modified files and you want to infor
 
 **Usage:** `lore dirty [OPTIONS] [paths]... [COMMAND]`
 
-###### **Subcommands:**
+### Subcommands
 
 * `move` — Mark a file as moved (dirty)
 * `copy` — Mark a file as copied (dirty)
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file containing all the paths to all files
-
-
 
 ## `lore dirty move`
 
@@ -2350,12 +2092,10 @@ Mark a file as moved (dirty)
 
 **Usage:** `lore dirty move <from> <to>`
 
-###### **Arguments:**
+### Arguments
 
 * `<from>` — Original path of file
 * `<to>` — New path of file
-
-
 
 ## `lore dirty copy`
 
@@ -2363,12 +2103,10 @@ Mark a file as copied (dirty)
 
 **Usage:** `lore dirty copy <from> <to>`
 
-###### **Arguments:**
+### Arguments
 
 * `<from>` — Source path of file
 * `<to>` — Destination path of copy
-
-
 
 ## `lore unstage`
 
@@ -2376,15 +2114,13 @@ Unstage changes to a file or directory
 
 **Usage:** `lore unstage <paths|--targets <file>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files to unstage
 
-###### **Options:**
+### Options
 
 * `--targets <file>` — Path to a targets file
-
-
 
 ## `lore reset`
 
@@ -2392,18 +2128,16 @@ Reset changes to a file or directory
 
 **Usage:** `lore reset [OPTIONS] <paths|--targets <file>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files
 
-###### **Options:**
+### Options
 
 * `--purge` — Delete untracked files
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 * `--revision <revision>` — Revision to reset files to
 * `--last-merged-from <branch>` — If given, the files will be reset to the last point of merge from this branch, or the branch point from this branch if no merge has been performed
-
-
 
 ## `lore diff`
 
@@ -2411,11 +2145,11 @@ Show differences between two revisions of a file
 
 **Usage:** `lore diff [OPTIONS] [paths]...`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of paths or files
 
-###### **Options:**
+### Options
 
 * `--source <revision_source>` — Optional signature of the source revision to diff from, by default the current revision
 * `--target <revision_target>` — Optional signature of the target revision to diff to, by default the current file system state
@@ -2427,26 +2161,22 @@ Show differences between two revisions of a file
 * `--ignore-space-change` — Collapse runs of internal whitespace to a single space before comparing
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 
-
-
 ## `lore history`
 
 List revisions of a repository
 
 **Usage:** `lore history [OPTIONS] [LENGTH]`
 
-###### **Arguments:**
+### Arguments
 
 * `<LENGTH>` — Number of revisions to show
 
-###### **Options:**
+### Options
 
 * `--revision <revision>` — Start listing from the specified revision. If not specified, start listing from the current branch latest revision
 * `--branch <branch>` — Show branch revisions
 * `--only-branch` — Stop when reaching a revision on a different branch (includes the branch point revision)
 * `--oneline` — Output each revision on one line only
-
-
 
 ## `lore commit`
 
@@ -2454,11 +2184,11 @@ Commit the staged revision
 
 **Usage:** `lore commit [OPTIONS] <MESSAGE>`
 
-###### **Arguments:**
+### Arguments
 
 * `<MESSAGE>` — Commit message
 
-###### **Options:**
+### Options
 
 * `--stats` — Print stats
 * `--link <LINK>` — Commit only changes in this linked repository (mount path relative to repo root)
@@ -2466,21 +2196,19 @@ Commit the staged revision
 * `--layer <LAYER>` — Commit only changes in this layer (mount path relative to repo root)
 * `--layer-message <PATH>` — Per-layer commit message. Takes two values: <path> <message>. Can be specified multiple times
 
-
-
 ## `lore sync`
 
 Synchronize to a repository state
 
 **Usage:** `lore sync [OPTIONS] [revision]`
 
-**Command Alias:** `synchronize`
+**Command Alias: `synchronize`
 
-###### **Arguments:**
+### Arguments
 
 * `<revision>` — Revision hash signature to synchronize to. Can be a signature on any branch — if the target revision is on a different branch, the current branch is updated accordingly. Can be a partial hash signature
 
-###### **Options:**
+### Options
 
 * `--forward-changes` — Fast forward any local changes if syncing to a local revision
 * `--reset` — Reset any local modified files to match the incoming revision
@@ -2491,23 +2219,19 @@ Synchronize to a repository state
 
   Default value: `0`
 
-
-
 ## `lore push`
 
 Push commits to remote
 
 **Usage:** `lore push [OPTIONS] [branch]`
 
-###### **Arguments:**
+### Arguments
 
 * `<branch>` — Optional name or identifier of the branch, push current branch if not specified
 
-###### **Options:**
+### Options
 
 * `--fast-forward-merge` — Allow the server to fast-forward merge if the target branch head has moved
-
-
 
 ## `lore lock`
 
@@ -2515,14 +2239,12 @@ Lock file
 
 **Usage:** `lore lock <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `acquire` — Acquire lock on file(s)
 * `status` — Get lock status on file(s)
 * `query` — Query the lock status given a branch, owner or path
 * `release` — Release lock on file(s)
-
-
 
 ## `lore lock acquire`
 
@@ -2530,15 +2252,13 @@ Acquire lock on file(s)
 
 **Usage:** `lore lock acquire <paths|--branch <branch>>`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of file paths to lock
 
-###### **Options:**
+### Options
 
 * `--branch <branch>` — Branch where lock is to be acquired
-
-
 
 ## `lore lock status`
 
@@ -2546,15 +2266,13 @@ Get lock status on file(s)
 
 **Usage:** `lore lock status [OPTIONS] [paths]...`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of file paths to get the lock status
 
-###### **Options:**
+### Options
 
 * `--branch <branch>` — Branch where lock was acquired
-
-
 
 ## `lore lock query`
 
@@ -2562,13 +2280,11 @@ Query the lock status given a branch, owner or path
 
 **Usage:** `lore lock query [OPTIONS]`
 
-###### **Options:**
+### Options
 
 * `--branch <branch-name>` — Branch to query locks on
 * `--owner <owner-id>` — Owner to query locks belonging to them
 * `--path <path>` — Path to query lock information on
-
-
 
 ## `lore lock release`
 
@@ -2576,16 +2292,14 @@ Release lock on file(s)
 
 **Usage:** `lore lock release [OPTIONS] [paths]...`
 
-###### **Arguments:**
+### Arguments
 
 * `<paths>` — Any number of file paths to release the lock
 
-###### **Options:**
+### Options
 
 * `--branch <branch>` — Branch where lock was acquired
 * `--owner <owner>` — Owner of the lock
-
-
 
 ## `lore service`
 
@@ -2593,13 +2307,11 @@ Manage the repository in a service process
 
 **Usage:** `lore service <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `run` — Run this process as the service
 * `start` — Start service for a repository
 * `stop` — Stop service for a repository
-
-
 
 ## `lore service run`
 
@@ -2607,15 +2319,11 @@ Run this process as the service
 
 **Usage:** `lore service run`
 
-
-
 ## `lore service start`
 
 Start service for a repository
 
 **Usage:** `lore service start`
-
-
 
 ## `lore service stop`
 
@@ -2623,14 +2331,11 @@ Stop service for a repository
 
 **Usage:** `lore service stop [all]`
 
-###### **Arguments:**
+### Arguments
 
 * `<all>` — Flag to stop servicing all repositories
 
   Possible values: `true`, `false`
-
-
-
 
 ## `lore notification`
 
@@ -2638,11 +2343,9 @@ Notifications
 
 **Usage:** `lore notification <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `subscribe` — Subscribe to events on the given repository
-
-
 
 ## `lore notification subscribe`
 
@@ -2650,11 +2353,9 @@ Subscribe to events on the given repository
 
 **Usage:** `lore notification subscribe [seconds]`
 
-###### **Arguments:**
+### Arguments
 
 * `<seconds>` — Time to be subscribed in seconds
-
-
 
 ## `lore completions`
 
@@ -2662,7 +2363,7 @@ Generate terminal autocompletions
 
 **Usage:** `lore completions <shell> [path]`
 
-###### **Arguments:**
+### Arguments
 
 * `<shell>` — Shell to generate autocompletions for
 
@@ -2670,58 +2371,46 @@ Generate terminal autocompletions
 
 * `<path>` — Directory path to write the autocompletion script to
 
-
-
 ## `lore shared-store`
 
 Manage the shared store
 
 **Usage:** `lore shared-store <COMMAND>`
 
-###### **Subcommands:**
+### Subcommands
 
 * `create` —
 * `info` —
 * `set-use-automatically` —
 
-
-
 ## `lore shared-store create`
 
 **Usage:** `lore shared-store create [OPTIONS] <remote-url>`
 
-###### **Arguments:**
+### Arguments
 
 * `<remote-url>` — Remote URL that will back the store
 
-###### **Options:**
+### Options
 
 * `--path <path>` — Where to create the shared store
 * `--make-default <MAKE_DEFAULT>` — Set this as the default shared store in the global config file, defaults to true
 
   Possible values: `true`, `false`
 
-
-
-
 ## `lore shared-store info`
 
 **Usage:** `lore shared-store info`
-
-
 
 ## `lore shared-store set-use-automatically`
 
 **Usage:** `lore shared-store set-use-automatically <enabled>`
 
-###### **Arguments:**
+### Arguments
 
 * `<enabled>` — Whether to automatically use the shared store
 
   Possible values: `true`, `false`
-
-
-
 
 <hr/>
 
