@@ -177,7 +177,7 @@ def test_merge_conflict_reset_shows_file_once(new_lore_repo):
 
     # Initial commit with a typo in auto_merged_file
     with repo.open_file(auto_merged_file, "w+") as output_file:
-        output_file.writelines(["conflic in main\n"])
+        output_file.writelines(["conflic in main\n"])  # codespell:ignore conflic
 
     with repo.open_file(conflicting_file, "w+") as output_file:
         output_file.writelines(["Line A\n", "Line B\n", "Line C\n"])
@@ -201,7 +201,7 @@ def test_merge_conflict_reset_shows_file_once(new_lore_repo):
     repo.branch_switch("main")
     repo.branch_create("branch2")
     with repo.open_file(auto_merged_file, "w+") as output_file:
-        output_file.writelines(["conflic in main\n"])
+        output_file.writelines(["conflic in main\n"])  # codespell:ignore conflic
 
     with repo.open_file(conflicting_file, "w+") as output_file:
         output_file.writelines(["Line A\n", "Modified by branch2\n", "Line C\n"])
@@ -218,7 +218,7 @@ def test_merge_conflict_reset_shows_file_once(new_lore_repo):
     # Unstage the auto-merged file (now contains "conflict in main")
     repo.unstage(auto_merged_file)
 
-    # Reset the auto-merged file (reverts to "conflic in main" - branch2's HEAD)
+    # Reset the auto-merged file (reverts to "conflic in main" - branch2's HEAD)  # codespell:ignore conflic
     # BUG: This should show the file once, but it shows twice
     repo.reset(auto_merged_file)
 
