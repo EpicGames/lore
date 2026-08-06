@@ -23,19 +23,25 @@ use crate::hooks::HookRegistrationContext;
 use crate::hooks::HookRegistry;
 use crate::hooks::HookResponse;
 
-const HOOK_NAME: &str = "spacesync_events";
+const HOOK_NAME: &str = "lore_index_events";
 const SOURCE: &str = "lore_hook";
 const DEFAULT_DATABASE_URL_ENV: &str = "DATABASE_URL";
+const INDEX_HOOK_POINTS: &[HookPoint] = &[
+    HookPoint::BranchPush,
+    HookPoint::BranchCreate,
+    HookPoint::BranchDelete,
+    HookPoint::RepositoryCreate,
+];
 const INSERT_EVENT_SQL: &str = r#"
-insert into spacesync_events (
+insert into lore_index_events (
     id,
     source,
     event_key,
     event_type,
-    space_id,
-    universe_id,
-    revision_signature,
-    revision_number,
+    lore_repository_id,
+    lore_branch_id,
+    lore_revision_signature,
+    lore_revision_number,
     user_id,
     correlation_id,
     payload
@@ -55,27 +61,25 @@ insert into spacesync_events (
 on conflict (event_key) do nothing
 "#;
 
-struct SpacesyncEventsHook {
+struct LoreIndexEventsHook {
     tx: Mutex<Sender<EventRecord>>,
 }
 
 #[async_trait]
-impl Hook for SpacesyncEventsHook {
+impl Hook for LoreIndexEventsHook {
     fn name(&self) -> &'static str {
         HOOK_NAME
     }
 
     fn hook_points(&self) -> &'static [HookPoint] {
-        HookPoint::all()
+        INDEX_HOOK_POINTS
     }
 
-    fn pre_handler(&self, ctx: &HookContext) -> Result<(), HookError> {
-        self.enqueue("pre", ctx);
+    fn pre_handler(&self, _ctx: &HookContext) -> Result<(), HookError> {
         Ok(())
     }
 
-    fn response_handler(&self, ctx: &HookContext) -> Result<HookResponse, HookError> {
-        self.enqueue("response", ctx);
+    fn response_handler(&self, _ctx: &HookContext) -> Result<HookResponse, HookError> {
         Ok(HookResponse::empty())
     }
 
@@ -85,7 +89,7 @@ impl Hook for SpacesyncEventsHook {
     }
 }
 
-impl SpacesyncEventsHook {
+impl LoreIndexEventsHook {
     fn enqueue(&self, phase: &'static str, ctx: &HookContext) {
         let event = EventRecord::from_context(phase, ctx);
         if let Err(err) = self.tx.lock().send(event) {
@@ -94,9 +98,9 @@ impl SpacesyncEventsHook {
     }
 }
 
-struct SpacesyncEventsHookFactory;
+struct LoreIndexEventsHookFactory;
 
-impl HookFactory for SpacesyncEventsHookFactory {
+impl HookFactory for LoreIndexEventsHookFactory {
     fn name(&self) -> &'static str {
         HOOK_NAME
     }
@@ -104,7 +108,7 @@ impl HookFactory for SpacesyncEventsHookFactory {
     fn create(&self, config: &toml::Value) -> Result<Box<dyn Hook>, HookError> {
         let database_url = database_url_from_config(config)?;
         let tx = spawn_event_worker(database_url)?;
-        Ok(Box::new(SpacesyncEventsHook { tx: Mutex::new(tx) }))
+        Ok(Box::new(LoreIndexEventsHook { tx: Mutex::new(tx) }))
     }
 }
 
@@ -113,10 +117,10 @@ struct EventRecord {
     id: Uuid,
     event_key: String,
     event_type: String,
-    space_id: Vec<u8>,
-    universe_id: Option<Vec<u8>>,
-    revision_signature: Option<Vec<u8>>,
-    revision_number: Option<i64>,
+    lore_repository_id: Vec<u8>,
+    lore_branch_id: Option<Vec<u8>>,
+    lore_revision_signature: Option<Vec<u8>>,
+    lore_revision_number: Option<i64>,
     user_id: Option<Uuid>,
     correlation_id: Option<Uuid>,
     payload: String,
@@ -124,22 +128,18 @@ struct EventRecord {
 
 impl EventRecord {
     fn from_context(phase: &'static str, ctx: &HookContext) -> Self {
-        let space_id = ctx.repository().as_ref().to_vec();
-        let universe_id = ctx.branch().map(|branch| branch.as_ref().to_vec());
-        let revision_signature = ctx.revision().map(|revision| revision.as_ref().to_vec());
-        let revision_number = ctx
+        let lore_repository_id = ctx.repository().as_ref().to_vec();
+        let lore_branch_id = ctx.branch().map(|branch| branch.as_ref().to_vec());
+        let lore_revision_signature = ctx.revision().map(|revision| revision.as_ref().to_vec());
+        let lore_revision_number = ctx
             .revision_number()
             .map(|revision_number| i64::try_from(revision_number).unwrap_or(i64::MAX));
         let raw_user_id = non_empty(ctx.user());
         let user_id = raw_user_id.as_deref().and_then(uuid_value);
-        eprintln!(
-            "[loreserver-hook:{HOOK_NAME}] insert user_id : {}",
-            raw_user_id.as_deref().unwrap_or("NO USER ID")
-        );
 
         let raw_correlation_id = non_empty(Some(ctx.correlation_id()));
         let correlation_id = raw_correlation_id.as_deref().and_then(uuid_value);
-        let hook_point = ctx.hook_point().to_string();
+        let hook_point = canonical_hook_point(ctx.hook_point());
         let event_type = format!("{hook_point}.{phase}");
         let metadata: BTreeMap<String, String> = ctx
             .metadata()
@@ -148,21 +148,21 @@ impl EventRecord {
             .collect();
         let event_key = event_key(
             &event_type,
-            &space_id,
-            universe_id.as_deref(),
-            revision_signature.as_deref(),
-            revision_number,
+            &lore_repository_id,
+            lore_branch_id.as_deref(),
+            lore_revision_signature.as_deref(),
+            lore_revision_number,
             raw_user_id.as_deref(),
             raw_correlation_id.as_deref(),
             &metadata,
         );
         let payload = payload_json(
             phase,
-            &hook_point,
-            &space_id,
-            universe_id.as_deref(),
-            revision_signature.as_deref(),
-            revision_number,
+            hook_point,
+            &lore_repository_id,
+            lore_branch_id.as_deref(),
+            lore_revision_signature.as_deref(),
+            lore_revision_number,
             user_id.as_ref(),
             raw_user_id.as_deref(),
             correlation_id.as_ref(),
@@ -174,14 +174,24 @@ impl EventRecord {
             id: Uuid::now_v7(),
             event_key,
             event_type,
-            space_id,
-            universe_id,
-            revision_signature,
-            revision_number,
+            lore_repository_id,
+            lore_branch_id,
+            lore_revision_signature,
+            lore_revision_number,
             user_id,
             correlation_id,
             payload,
         }
+    }
+}
+
+fn canonical_hook_point(hook_point: HookPoint) -> &'static str {
+    match hook_point {
+        HookPoint::BranchPush => "branch_push",
+        HookPoint::BranchCreate => "branch_create",
+        HookPoint::BranchDelete => "branch_delete",
+        HookPoint::RepositoryCreate => "repository_create",
+        HookPoint::Obliterate => "obliterate",
     }
 }
 
@@ -198,10 +208,10 @@ fn non_empty(value: Option<&str>) -> Option<String> {
 
 fn event_key(
     event_type: &str,
-    space_id: &[u8],
-    universe_id: Option<&[u8]>,
-    revision_signature: Option<&[u8]>,
-    revision_number: Option<i64>,
+    lore_repository_id: &[u8],
+    lore_branch_id: Option<&[u8]>,
+    lore_revision_signature: Option<&[u8]>,
+    lore_revision_number: Option<i64>,
     user_id: Option<&str>,
     correlation_id: Option<&str>,
     metadata: &BTreeMap<String, String>,
@@ -209,17 +219,20 @@ fn event_key(
     let mut hasher = blake3::Hasher::new();
     update_str(&mut hasher, "source", SOURCE);
     update_str(&mut hasher, "event_type", event_type);
-    update_bytes(&mut hasher, "space_id", space_id);
-    update_optional_bytes(&mut hasher, "universe_id", universe_id);
-    update_optional_bytes(&mut hasher, "revision_signature", revision_signature);
-    update_optional_i64(&mut hasher, "revision_number", revision_number);
+    update_bytes(&mut hasher, "lore_repository_id", lore_repository_id);
+    update_optional_bytes(&mut hasher, "lore_branch_id", lore_branch_id);
+    update_optional_bytes(
+        &mut hasher,
+        "lore_revision_signature",
+        lore_revision_signature,
+    );
+    update_optional_i64(&mut hasher, "lore_revision_number", lore_revision_number);
     update_optional_str(&mut hasher, "user_id", user_id);
     update_optional_str(&mut hasher, "correlation_id", correlation_id);
     for (key, value) in metadata {
         update_str(&mut hasher, "metadata_key", key);
         update_str(&mut hasher, "metadata_value", value);
     }
-    // format!("{SOURCE}:{event_type}:{}", hasher.finalize().to_hex())
     hasher.finalize().to_hex().to_string()
 }
 
@@ -259,10 +272,10 @@ fn update_bytes(hasher: &mut blake3::Hasher, field: &str, value: &[u8]) {
 fn payload_json(
     phase: &str,
     hook_point: &str,
-    space_id: &[u8],
-    universe_id: Option<&[u8]>,
-    revision_signature: Option<&[u8]>,
-    revision_number: Option<i64>,
+    lore_repository_id: &[u8],
+    lore_branch_id: Option<&[u8]>,
+    lore_revision_signature: Option<&[u8]>,
+    lore_revision_number: Option<i64>,
     user_id: Option<&Uuid>,
     raw_user_id: Option<&str>,
     correlation_id: Option<&Uuid>,
@@ -275,10 +288,10 @@ fn payload_json(
         "hook_name": HOOK_NAME,
         "phase": phase,
         "hook_point": hook_point,
-        "space_id": hex::encode(space_id),
-        "universe_id": universe_id.map(hex::encode),
-        "revision_signature": revision_signature.map(hex::encode),
-        "revision_number": revision_number,
+        "lore_repository_id": hex::encode(lore_repository_id),
+        "lore_branch_id": lore_branch_id.map(hex::encode),
+        "lore_revision_signature": lore_revision_signature.map(hex::encode),
+        "lore_revision_number": lore_revision_number,
         "user_id": user_id,
         "raw_user_id": raw_user_id,
         "correlation_id": correlation_id,
@@ -295,7 +308,7 @@ fn payload_json(
 fn spawn_event_worker(database_url: String) -> Result<Sender<EventRecord>, HookError> {
     let (tx, rx) = mpsc::channel();
     thread::Builder::new()
-        .name("lore-spacesync-events".to_string())
+        .name("lore-index-events".to_string())
         .spawn(move || run_event_worker(database_url, rx))
         .map_err(|err| {
             HookError::init_error(HOOK_NAME, format!("failed to spawn worker: {err}"))
@@ -332,9 +345,12 @@ fn insert_with_reconnect(database_url: &str, client: &mut Option<Client>, event:
             Ok(_) => return,
             Err(err) => {
                 eprintln!(
-                    "[loreserver-hook:{HOOK_NAME}] failed to insert event {}: {err}",
+                    "[loreserver-hook:{HOOK_NAME}] failed to insert event {}: {err:?}",
                     event.event_key
                 );
+                if !err.is_closed() {
+                    return;
+                }
                 *client = None;
                 if attempt == 1 {
                     return;
@@ -352,10 +368,10 @@ fn insert_event(client: &mut Client, event: &EventRecord) -> Result<u64, postgre
             &SOURCE,
             &event.event_key,
             &event.event_type,
-            &event.space_id,
-            &event.universe_id,
-            &event.revision_signature,
-            &event.revision_number,
+            &event.lore_repository_id,
+            &event.lore_branch_id,
+            &event.lore_revision_signature,
+            &event.lore_revision_number,
             &event.user_id,
             &event.correlation_id,
             &event.payload,
@@ -438,7 +454,7 @@ fn unquote_env_value(value: &str) -> String {
 }
 
 pub fn register(registry: &mut HookRegistry, _ctx: &HookRegistrationContext) {
-    registry.register_hook(Box::new(SpacesyncEventsHookFactory));
+    registry.register_hook(Box::new(LoreIndexEventsHookFactory));
 }
 
 #[cfg(test)]
@@ -465,23 +481,23 @@ mod tests {
     }
 
     #[test]
-    fn factory_creates_hook_for_all_hook_points() {
-        let hook = SpacesyncEventsHookFactory
+    fn factory_creates_hook_for_indexable_hook_points() {
+        let hook = LoreIndexEventsHookFactory
             .create(&config_with_database_url())
             .unwrap();
 
         assert_eq!(hook.name(), HOOK_NAME);
-        assert_eq!(hook.hook_points(), HookPoint::all());
+        assert_eq!(hook.hook_points(), INDEX_HOOK_POINTS);
     }
 
     #[test]
     fn event_key_is_deterministic_but_id_is_unique() {
         let ctx = test_context();
 
-        let first = EventRecord::from_context("pre", &ctx);
-        let second = EventRecord::from_context("pre", &ctx);
+        let first = EventRecord::from_context("post", &ctx);
+        let second = EventRecord::from_context("post", &ctx);
 
-        assert_eq!(first.event_type, "BranchPush.pre");
+        assert_eq!(first.event_type, "branch_push.post");
         assert_eq!(first.event_key, second.event_key);
         assert_ne!(first.id, second.id);
         assert!(first.user_id.is_none());
@@ -493,41 +509,43 @@ mod tests {
     #[test]
     fn response_handler_does_not_modify_client_response() {
         let (tx, rx) = mpsc::channel();
-        let hook = SpacesyncEventsHook { tx: Mutex::new(tx) };
+        let hook = LoreIndexEventsHook { tx: Mutex::new(tx) };
         let ctx = test_context();
 
         let response = hook.response_handler(&ctx).unwrap();
-        let event = rx.try_recv().unwrap();
 
         assert!(response.message.is_none());
-        assert_eq!(event.event_type, "BranchPush.response");
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
-    #[ignore = "requires DATABASE_URL and a local spacesync_events table"]
+    #[ignore = "requires DATABASE_URL and a local lore_index_events table"]
     fn inserts_event_into_postgres() {
         let database_url = std::env::var(DEFAULT_DATABASE_URL_ENV).unwrap();
         let mut client = Client::connect(&database_url, NoTls).unwrap();
-        let mut event = EventRecord::from_context("pre", &test_context());
+        let mut event = EventRecord::from_context("post", &test_context());
+        let unknown_user_id = Uuid::now_v7();
+        event.user_id = Some(unknown_user_id);
         event.event_key = format!("test:{SOURCE}:{}", Uuid::now_v7());
 
         insert_event(&mut client, &event).unwrap();
         let rows = client
             .query(
-                "select source, event_type, payload->>'phase' from spacesync_events where event_key = $1",
+                "select source, event_type, payload->>'phase', user_id from lore_index_events where event_key = $1",
                 &[&event.event_key],
             )
             .unwrap();
         client
             .execute(
-                "delete from spacesync_events where event_key = $1",
+                "delete from lore_index_events where event_key = $1",
                 &[&event.event_key],
             )
             .unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get::<_, String>(0), SOURCE);
-        assert_eq!(rows[0].get::<_, String>(1), "BranchPush.pre");
-        assert_eq!(rows[0].get::<_, String>(2), "pre");
+        assert_eq!(rows[0].get::<_, String>(1), "branch_push.post");
+        assert_eq!(rows[0].get::<_, String>(2), "post");
+        assert_eq!(rows[0].get::<_, Uuid>(3), unknown_user_id);
     }
 }

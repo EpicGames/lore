@@ -243,7 +243,7 @@ pub mod registry;
 pub mod traits;
 
 // Auto-discovered hook modules
-pub mod spacesync_events;
+pub mod lore_index_events;
 
 // Re-export commonly used items at the module level
 pub use context::HookContext;
@@ -271,7 +271,7 @@ pub use traits::StatusCode;
 /// * `registry` - The hook registry to register hooks with
 /// * `ctx` - Registration context providing runtime dependencies for hook factories
 pub fn register_all_hooks(registry: &mut HookRegistry, ctx: &HookRegistrationContext) {
-    spacesync_events::register(registry, ctx);
+    lore_index_events::register(registry, ctx);
 }
 
 #[cfg(test)]
