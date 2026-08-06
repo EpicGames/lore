@@ -316,6 +316,11 @@ pub async fn sync(
 
     let mut revision;
     if let Some(revision_string) = options.revision.as_ref() {
+        location = match execution_context().globals().search_location() {
+            revision::ResolveSearchLocation::Remote => LoreBranchLocation::Remote,
+            revision::ResolveSearchLocation::Local
+            | revision::ResolveSearchLocation::RemoteOrLocal => LoreBranchLocation::Local,
+        };
         revision = revision::resolve(
             repository.clone(),
             revision_string,
@@ -632,14 +637,14 @@ pub async fn sync(
         if location == LoreBranchLocation::Remote {
             branch::store_latest(
                 repository.clone(),
-                branch_id,
+                synced_branch,
                 revision,
                 BranchLatestStatus::Convergent,
             )
             .await
             .internal("Failed to store revision as current branch latest")?;
 
-            branch::store_last_sync(repository, branch_id, revision).await;
+            branch::store_last_sync(repository, synced_branch, revision).await;
         }
     }
 

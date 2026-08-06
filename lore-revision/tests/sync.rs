@@ -14,10 +14,13 @@ mod tests {
     use lore_revision::commit;
     use lore_revision::commit::CommitOptions;
     use lore_revision::file;
+    use lore_revision::instance;
+    use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreString;
     use lore_revision::lore::RepositoryId;
     use lore_revision::node::NodeFlags;
+    use lore_revision::relay::EventDispatcher;
     use lore_revision::repository;
     use lore_revision::revision::sync;
     use lore_revision::revision::sync::SyncOptions;
@@ -134,7 +137,11 @@ mod tests {
                         .await
                         .expect("Failed to commit revision");
 
-                // Sync back to first revision
+                let (_current_revision, branch_id) = instance::load_current_anchor(&repository)
+                    .await
+                    .expect("Failed to load current anchor");
+
+                // Sync back to first revision (local search keeps branch latest unchanged)
                 Box::pin(sync::sync(
                     repository.clone(),
                     &write_token,
@@ -146,6 +153,14 @@ mod tests {
                 ))
                 .await
                 .expect("Failed to sync back to first revision");
+
+                let latest_after_back = branch::load_latest(repository.clone(), branch_id)
+                    .await
+                    .expect("Failed to load branch latest after sync back");
+                assert_eq!(
+                    latest_after_back, second_signature,
+                    "Local explicit sync should not move branch latest backwards"
+                );
 
                 // Verify file added in first revision is still there
                 assert!(
@@ -159,18 +174,48 @@ mod tests {
                     "File added in second revision was not removed as expected after sync back",
                 );
 
-                // Sync forward to second revision
-                Box::pin(sync::sync(
+                // Simulate stale branch latest after an explicit remote sync bug
+                branch::store_latest(
                     repository.clone(),
-                    &write_token,
-                    SyncOptions {
-                        revision: Some(second_signature.to_string()),
-                        filter_mode: lore_revision::filter::FilterMode::Full,
+                    branch_id,
+                    first_signature,
+                    branch::BranchLatestStatus::Convergent,
+                )
+                .await
+                .expect("Failed to seed stale branch latest");
+
+                let remote_execution = std::sync::Arc::new(ExecutionContext::new_client(
+                    LoreGlobalArgs {
+                        remote: 1,
                         ..Default::default()
                     },
-                ))
-                .await
-                .expect("Failed to sync forward to second revision");
+                    EventDispatcher::no_dispatch(),
+                ));
+
+                // Sync forward to second revision with explicit remote search location
+                LORE_CONTEXT
+                    .scope(
+                        remote_execution,
+                        Box::pin(sync::sync(
+                            repository.clone(),
+                            &write_token,
+                            SyncOptions {
+                                revision: Some(second_signature.to_string()),
+                                filter_mode: lore_revision::filter::FilterMode::Full,
+                                ..Default::default()
+                            },
+                        )),
+                    )
+                    .await
+                    .expect("Failed to sync forward to second revision");
+
+                let latest_after_forward = branch::load_latest(repository.clone(), branch_id)
+                    .await
+                    .expect("Failed to load branch latest after sync forward");
+                assert_eq!(
+                    latest_after_forward, second_signature,
+                    "Explicit remote sync should update branch latest pointer"
+                );
 
                 // Verify file added in first revision is still there
                 assert!(
