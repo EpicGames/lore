@@ -1106,8 +1106,11 @@ fn generate_encryption_key_nonce() -> Vec<u8> {
     let rand = SystemRandom::new();
     let mut key_bytes = vec![0; AES_256_GCM.key_len()];
     let _ = rand.fill(&mut key_bytes);
+    let mut nonce_bytes = [0u8; 4];
+    let _ = rand.fill(&mut nonce_bytes);
+    let nonce = u32::from_le_bytes(nonce_bytes);
     lore_debug!("Generated new encryption key");
-    get_encryption_key_with_nonce(key_bytes, 1)
+    get_encryption_key_with_nonce(key_bytes, nonce)
 }
 
 fn get_encryption_key_with_nonce(key: Vec<u8>, nonce: u32) -> Vec<u8> {
