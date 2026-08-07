@@ -34,6 +34,7 @@ use crate::store::ImmutableStore;
 use crate::store::KeyType;
 use crate::store::StoreError;
 use crate::store::StoreMatch;
+use crate::store::query_one;
 
 // Backward compatibility aliases
 #[error_set]
@@ -269,15 +270,12 @@ async fn migrate_bucket_initial_to_typed(
             context: Context::default(),
         };
 
-        let is_local_immutable = if let Ok(result) = immutable_store
-            .clone()
-            .query(entry.partition, address, StoreMatch::MatchFull)
-            .await
-        {
-            result.match_made != StoreMatch::MatchNone
-        } else {
-            false
-        };
+        let is_local_immutable =
+            if let Ok(result) = query_one(&immutable_store, entry.partition, address).await {
+                result.match_made != StoreMatch::MatchNone
+            } else {
+                false
+            };
 
         if is_local_immutable {
             migrate_immutable_value_to_typed(

@@ -27,11 +27,13 @@ use crate::fragment_flags::FragmentFlags;
 use crate::hash;
 use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
+use crate::immutable_store::query_one;
 use crate::options::ReadOptions;
 use crate::options::WriteOptions;
 use crate::read::load_fragment;
+use crate::store_types::StoreGetData;
 use crate::store_types::StoreMatch;
-use crate::store_types::StoreQueryResult;
+use crate::store_types::StoreMatchResult;
 use crate::typed_bytes::TypedBytes;
 use crate::types::Address;
 use crate::types::Context;
@@ -343,7 +345,7 @@ async fn store_fragment_inline(
     remote_session: Option<Arc<StorageSession>>,
     permit: Option<OwnedSemaphorePermit>,
 ) -> Result<StoreResult, StorageError> {
-    let query = query_match_full(&store, partition, address).await;
+    let query = resolve_or_absent(&store, partition, address).await;
     let deduplicated = query.match_made != StoreMatch::MatchNone;
     let (stored_local, stored_durable) = stored_flags(&query);
 
@@ -458,7 +460,7 @@ async fn store_fragment_dispatched(
         }
     };
 
-    let query = query_match_full(&store, partition, address).await;
+    let query = resolve_or_absent(&store, partition, address).await;
     let (stored_local, stored_durable) = stored_flags(&query);
 
     if is_fully_satisfied(
@@ -507,37 +509,32 @@ async fn store_fragment_dispatched(
     })
 }
 
-async fn query_match_full(
+async fn resolve_or_absent(
     store: &Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
-) -> StoreQueryResult {
-    store
-        .clone()
-        .query(partition, address, StoreMatch::MatchFull)
+) -> StoreMatchResult {
+    query_one(store, partition, address)
         .await
-        .unwrap_or(StoreQueryResult {
-            fragment: Fragment::default(),
-            match_made: StoreMatch::MatchNone,
-        })
+        .unwrap_or_default()
 }
 
-fn stored_flags(query: &StoreQueryResult) -> (bool, bool) {
-    let stored_local = query.match_made != StoreMatch::MatchNone
-        && query.fragment.flags & FragmentFlags::PayloadStoredLocal != 0;
-    let stored_durable = query.match_made == StoreMatch::MatchFull
-        && query.fragment.flags & FragmentFlags::PayloadStoredDurable != 0;
-    (stored_local, stored_durable)
+/// Durability only counts for this address when this address is what matched. The same content
+/// under another partition is durable without our association being, and an upload skipped on that
+/// basis would leave the address registered nowhere.
+fn stored_flags(resolved: &StoreMatchResult) -> (bool, bool) {
+    let stored_durable = resolved.match_made == StoreMatch::MatchFull && resolved.stored_durable;
+    (resolved.stored_local, stored_durable)
 }
 
 fn is_fully_satisfied(
-    query: &StoreQueryResult,
+    resolved: &StoreMatchResult,
     cache_local: bool,
     stored_local: bool,
     remote_session: &Option<Arc<StorageSession>>,
     stored_durable: bool,
 ) -> bool {
-    query.match_made == StoreMatch::MatchFull
+    resolved.match_made == StoreMatch::MatchFull
         && (!cache_local || stored_local)
         && (remote_session.is_none() || stored_durable)
 }
@@ -560,7 +557,7 @@ async fn leader_body(
     mut buffer: Bytes,
     cache_local: bool,
     remote_session: Option<Arc<StorageSession>>,
-    query: StoreQueryResult,
+    query: StoreMatchResult,
     guard: Option<StoreInFlightGuard>,
     permit: Option<OwnedSemaphorePermit>,
 ) -> Result<(bool, bool), StorageError> {
@@ -570,8 +567,9 @@ async fn leader_body(
     if stored_local {
         if let Ok((stored_fragment, stored_buffer)) = store
             .clone()
-            .get(partition, address, StoreMatch::MatchHash)
+            .get(partition, address)
             .await
+            .and_then(StoreGetData::into_payload)
         {
             let loaded_hash =
                 hash::hash_fragment(stored_fragment, stored_buffer.as_ref()).unwrap_or_default();
@@ -1291,13 +1289,10 @@ pub async fn follower_future(
     token: CancellationToken,
 ) -> Result<(), StorageError> {
     token.cancelled().await;
-    match store.query(partition, address, StoreMatch::MatchFull).await {
-        Ok(result)
-            if result.match_made == StoreMatch::MatchFull
-                && (result.fragment.flags
-                    & (FragmentFlags::PayloadStoredDurable.bits()
-                        | FragmentFlags::PayloadStoredLocal.bits()))
-                    != 0 =>
+    match query_one(&store, partition, address).await {
+        Ok(resolved)
+            if resolved.match_made == StoreMatch::MatchFull
+                && (resolved.stored_local || resolved.stored_durable) =>
         {
             Ok(())
         }
@@ -1479,7 +1474,7 @@ mod tests {
 
         // Entry should be present in the store after the call returns.
         let query = store
-            .query(partition, address, StoreMatch::MatchFull)
+            .get_metadata(partition, address)
             .await
             .expect("query after sync write");
         assert_eq!(query.match_made, StoreMatch::MatchFull);
@@ -1595,7 +1590,7 @@ mod tests {
 
         // After await_all, the entry should be in the store.
         let query = store
-            .query(partition, address, StoreMatch::MatchFull)
+            .get_metadata(partition, address)
             .await
             .expect("query after leader completed");
         assert_eq!(query.match_made, StoreMatch::MatchFull);
@@ -1620,47 +1615,23 @@ mod tests {
             self: Arc<Self>,
             partition: Partition,
             address: Address,
-        ) -> Result<StoreQueryResult, StoreError> {
-            self.query(partition, address, StoreMatch::MatchFull).await
+        ) -> Result<StoreGetData, StoreError> {
+            self.inner.clone().get_metadata(partition, address).await
         }
 
         fn is_local(&self) -> bool {
             self.inner.clone().is_local()
         }
 
-        async fn exist(
-            self: Arc<Self>,
-            partition: Partition,
-            address: Address,
-            match_requested: crate::store_types::StoreMatch,
-        ) -> Result<crate::store_types::StoreMatch, StoreError> {
-            self.inner
-                .clone()
-                .exist(partition, address, match_requested)
-                .await
-        }
-
-        async fn exist_batch(
-            self: Arc<Self>,
-            partition: Partition,
-            addresses: &[Address],
-            match_requested: crate::store_types::StoreMatch,
-        ) -> Result<Vec<crate::store_types::StoreMatch>, StoreError> {
-            self.inner
-                .clone()
-                .exist_batch(partition, addresses, match_requested)
-                .await
-        }
-
         async fn query(
             self: Arc<Self>,
             partition: Partition,
-            address: Address,
-            match_requested: StoreMatch,
-        ) -> Result<StoreQueryResult, StoreError> {
+            addresses: &[Address],
+            results: &mut [StoreMatchResult],
+        ) -> Result<(), StoreError> {
             self.inner
                 .clone()
-                .query(partition, address, match_requested)
+                .query(partition, addresses, results)
                 .await
         }
 
@@ -1668,12 +1639,8 @@ mod tests {
             self: Arc<Self>,
             partition: Partition,
             address: Address,
-            match_required: StoreMatch,
-        ) -> Result<(Fragment, Bytes), StoreError> {
-            self.inner
-                .clone()
-                .get(partition, address, match_required)
-                .await
+        ) -> Result<StoreGetData, StoreError> {
+            self.inner.clone().get(partition, address).await
         }
 
         async fn put(
@@ -1783,11 +1750,10 @@ mod tests {
 
         // After await_all returns, no terminal entry exists — confirming the
         // leader's failure left the store in its original empty state.
-        let query = failing
-            .query(partition, address, StoreMatch::MatchFull)
+        let resolved = query_one(&(failing as Arc<dyn ImmutableStore>), partition, address)
             .await
-            .expect("query on empty store");
-        assert_eq!(query.match_made, StoreMatch::MatchNone);
+            .expect("resolve on empty store");
+        assert_eq!(resolved.match_made, StoreMatch::MatchNone);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1845,7 +1811,7 @@ mod tests {
 
         // Exactly one terminal entry exists in the store.
         let query = store
-            .query(partition, address, StoreMatch::MatchFull)
+            .get_metadata(partition, address)
             .await
             .expect("query after concurrent writers");
         assert_eq!(query.match_made, StoreMatch::MatchFull);
@@ -1899,10 +1865,7 @@ mod tests {
             .await
             .expect("tracker await_all succeeds");
 
-        let query = store
-            .query(partition, address, StoreMatch::MatchFull)
-            .await
-            .expect("query");
+        let query = store.get_metadata(partition, address).await.expect("query");
         assert_eq!(query.match_made, StoreMatch::MatchFull);
     }
 
@@ -1922,47 +1885,23 @@ mod tests {
             self: Arc<Self>,
             partition: Partition,
             address: Address,
-        ) -> Result<StoreQueryResult, StoreError> {
-            self.query(partition, address, StoreMatch::MatchFull).await
+        ) -> Result<StoreGetData, StoreError> {
+            self.inner.clone().get_metadata(partition, address).await
         }
 
         fn is_local(&self) -> bool {
             self.inner.clone().is_local()
         }
 
-        async fn exist(
-            self: Arc<Self>,
-            partition: Partition,
-            address: Address,
-            match_requested: crate::store_types::StoreMatch,
-        ) -> Result<crate::store_types::StoreMatch, StoreError> {
-            self.inner
-                .clone()
-                .exist(partition, address, match_requested)
-                .await
-        }
-
-        async fn exist_batch(
-            self: Arc<Self>,
-            partition: Partition,
-            addresses: &[Address],
-            match_requested: crate::store_types::StoreMatch,
-        ) -> Result<Vec<crate::store_types::StoreMatch>, StoreError> {
-            self.inner
-                .clone()
-                .exist_batch(partition, addresses, match_requested)
-                .await
-        }
-
         async fn query(
             self: Arc<Self>,
             partition: Partition,
-            address: Address,
-            match_requested: StoreMatch,
-        ) -> Result<StoreQueryResult, StoreError> {
+            addresses: &[Address],
+            results: &mut [StoreMatchResult],
+        ) -> Result<(), StoreError> {
             self.inner
                 .clone()
-                .query(partition, address, match_requested)
+                .query(partition, addresses, results)
                 .await
         }
 
@@ -1970,12 +1909,8 @@ mod tests {
             self: Arc<Self>,
             partition: Partition,
             address: Address,
-            match_required: StoreMatch,
-        ) -> Result<(Fragment, Bytes), StoreError> {
-            self.inner
-                .clone()
-                .get(partition, address, match_required)
-                .await
+        ) -> Result<StoreGetData, StoreError> {
+            self.inner.clone().get(partition, address).await
         }
 
         async fn put(
@@ -2177,47 +2112,23 @@ mod tests {
             self: Arc<Self>,
             partition: Partition,
             address: Address,
-        ) -> Result<StoreQueryResult, StoreError> {
-            self.query(partition, address, StoreMatch::MatchFull).await
+        ) -> Result<StoreGetData, StoreError> {
+            self.inner.clone().get_metadata(partition, address).await
         }
 
         fn is_local(&self) -> bool {
             self.inner.clone().is_local()
         }
 
-        async fn exist(
-            self: Arc<Self>,
-            partition: Partition,
-            address: Address,
-            match_requested: StoreMatch,
-        ) -> Result<StoreMatch, StoreError> {
-            self.inner
-                .clone()
-                .exist(partition, address, match_requested)
-                .await
-        }
-
-        async fn exist_batch(
-            self: Arc<Self>,
-            partition: Partition,
-            addresses: &[Address],
-            match_requested: StoreMatch,
-        ) -> Result<Vec<StoreMatch>, StoreError> {
-            self.inner
-                .clone()
-                .exist_batch(partition, addresses, match_requested)
-                .await
-        }
-
         async fn query(
             self: Arc<Self>,
             partition: Partition,
-            address: Address,
-            match_requested: StoreMatch,
-        ) -> Result<StoreQueryResult, StoreError> {
+            addresses: &[Address],
+            results: &mut [StoreMatchResult],
+        ) -> Result<(), StoreError> {
             self.inner
                 .clone()
-                .query(partition, address, match_requested)
+                .query(partition, addresses, results)
                 .await
         }
 
@@ -2225,12 +2136,8 @@ mod tests {
             self: Arc<Self>,
             partition: Partition,
             address: Address,
-            match_required: StoreMatch,
-        ) -> Result<(Fragment, Bytes), StoreError> {
-            self.inner
-                .clone()
-                .get(partition, address, match_required)
-                .await
+        ) -> Result<StoreGetData, StoreError> {
+            self.inner.clone().get(partition, address).await
         }
 
         async fn put(

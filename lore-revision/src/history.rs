@@ -12,6 +12,7 @@ use crate::lore::Hash;
 use crate::repository::RepositoryContext;
 use crate::state::State;
 use crate::store::StoreMatch;
+use crate::store::query_one;
 
 #[error_set]
 pub enum HistoryError {
@@ -88,15 +89,13 @@ pub async fn find_branch_point(
                 left_history.push(current_left);
                 left_fetch_count += 1;
 
-                if let Ok(matched) = repository
-                    .immutable_store()
-                    .exist(
-                        repository.id,
-                        Address::zero_context_hash(current_left),
-                        StoreMatch::MatchHash,
-                    )
-                    .await
-                    && matched != StoreMatch::MatchNone
+                if let Ok(matched) = query_one(
+                    &repository.immutable_store(),
+                    repository.id,
+                    Address::zero_context_hash(current_left),
+                )
+                .await
+                    && matched.match_made != StoreMatch::MatchNone
                 {
                     let hash = current_left;
                     let state = State::deserialize(repository.clone(), current_left)
@@ -120,15 +119,13 @@ pub async fn find_branch_point(
                 right_history.push(current_right);
                 right_fetch_count += 1;
 
-                if let Ok(matched) = repository
-                    .immutable_store()
-                    .exist(
-                        repository.id,
-                        Address::zero_context_hash(current_right),
-                        StoreMatch::MatchHash,
-                    )
-                    .await
-                    && matched != StoreMatch::MatchNone
+                if let Ok(matched) = query_one(
+                    &repository.immutable_store(),
+                    repository.id,
+                    Address::zero_context_hash(current_right),
+                )
+                .await
+                    && matched.match_made != StoreMatch::MatchNone
                 {
                     let hash = current_right;
                     let state = State::deserialize(repository.clone(), current_right)

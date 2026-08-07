@@ -1517,91 +1517,6 @@ mod open_tests {
         assert_eq!(data_blue, b"blue partition payload");
     }
 
-    /// Serializes the tests that toggle the process-wide `LOCAL_ISOLATION` flag. Cargo runs
-    /// tests in parallel; the flag's only writer of `false` is `IsolationGuard::drop`, so two
-    /// overlapping guard windows let one test's drop clear the flag mid-`get` of the other.
-    /// Held for the lifetime of an [`IsolationGuard`], the two windows can never overlap.
-    static ISOLATION_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    /// Save/restore guard for the process-wide `LOCAL_ISOLATION` flag so a test can toggle it
-    /// without leaking the change to parallel tests. Acquiring [`ISOLATION_SERIAL`] keeps the
-    /// isolation-sensitive tests from running their toggle windows concurrently. Other storage
-    /// tests target matching `(partition, address)` pairs, so the flag being set does not change
-    /// their outcome.
-    struct IsolationGuard {
-        previous: bool,
-        _serial: tokio::sync::MutexGuard<'static, ()>,
-    }
-
-    impl IsolationGuard {
-        async fn force_on() -> Self {
-            let serial = ISOLATION_SERIAL.lock().await;
-            let previous =
-                lore_storage::LOCAL_ISOLATION.swap(true, std::sync::atomic::Ordering::AcqRel);
-            Self {
-                previous,
-                _serial: serial,
-            }
-        }
-    }
-
-    impl Drop for IsolationGuard {
-        fn drop(&mut self) {
-            // Runs before `_serial` is dropped, so the flag is restored while the serial lock is
-            // still held — the next guard observes a settled flag.
-            lore_storage::LOCAL_ISOLATION
-                .store(self.previous, std::sync::atomic::Ordering::Release);
-        }
-    }
-
-    #[tokio::test]
-    async fn cross_partition_read_fails_when_local_isolation_enabled() {
-        // Partitions are content namespacing: with `LOCAL_ISOLATION` on,
-        // reading an address stored under partition X via partition Y
-        // must yield AddressNotFound. lore-server enables this flag at
-        // startup (server.rs:1294); the storage API honors it through
-        // `ReadOptions::default()`.
-        use lore_base::types::Context;
-        use lore_base::types::Partition;
-
-        let _guard = IsolationGuard::force_on().await;
-
-        let (open_sink, open_cb) = make_sink();
-        assert_eq!(open_in_memory(open_cb).await, 0);
-        let id = take_opened(&open_sink.lock().unwrap()).unwrap();
-        let handle = lore::storage::handle::LoreStore { handle_id: id };
-
-        let part_x = Partition::from([0x01u8; 16]);
-        let part_y = Partition::from([0x02u8; 16]);
-        let ctx = Context::from([0x03u8; 16]);
-        let payload = b"isolated to partition X".to_vec();
-        let address = put_once(handle, part_x, ctx, &payload).await;
-
-        let (status, events) = get_items_capture(
-            handle,
-            vec![lore::storage::get::LoreStorageGetItem {
-                id: 9,
-                partition: part_y,
-                address,
-                streaming: 0,
-                local_cache: 0,
-            }],
-        )
-        .await;
-        assert_eq!(status, -1);
-        let complete = events
-            .iter()
-            .find_map(|e| match e {
-                GetCaptured::ItemComplete { id, error_code, .. } => Some((*id, *error_code)),
-                _ => None,
-            })
-            .expect("expected GET_ITEM_COMPLETE");
-        assert_eq!(
-            complete,
-            (9, lore_revision::event::LoreErrorCode::AddressNotFound),
-        );
-    }
-
     #[tokio::test]
     async fn duplicate_content_items_correlate_by_id() {
         // Two put items with the same payload share the same address —
@@ -2514,9 +2429,11 @@ mod open_tests {
             (1, 1, 0, 0, 1, lore_revision::event::LoreErrorCode::None),
         );
 
-        // Tombstone observable via get_metadata: entry still matches, but the
-        // fragment flag set says the payload is gone.
-        let (q_status, q_events) = get_metadata_items(
+        // Obliterated content matches nothing, through every path. The entry survives in the
+        // index carrying its tombstone, but nothing describes it: `get_metadata` answers as it
+        // would for an address the store never held, rather than handing back a fragment whose
+        // flags say the payload is gone. With no remote configured there is nowhere else to ask.
+        let (_q_status, q_events) = get_metadata_items(
             handle,
             vec![lore::storage::get_metadata::LoreStorageGetMetadataItem {
                 id: 99,
@@ -2525,22 +2442,26 @@ mod open_tests {
             }],
         )
         .await;
-        assert_eq!(q_status, 0);
-        let fragment = q_events
+        let (fragment, error_code) = q_events
             .iter()
             .find_map(|e| match e {
-                GetMetadataCaptured::Complete { fragment, .. } => Some(*fragment),
+                GetMetadataCaptured::Complete {
+                    fragment,
+                    error_code,
+                    ..
+                } => Some((*fragment, *error_code)),
                 _ => None,
             })
             .expect("post-obliterate get_metadata event missing");
-        let flags = FragmentFlags::from_bits_truncate(fragment.flags);
-        assert!(
-            flags.contains(FragmentFlags::PayloadObliterated),
-            "obliterated entry must carry PayloadObliterated, got {flags:?}",
+        assert_eq!(
+            error_code,
+            lore_revision::event::LoreErrorCode::AddressNotFound,
+            "an obliterated address must resolve to nothing, not to a tombstoned fragment",
         );
-        assert!(
-            !flags.contains(FragmentFlags::PayloadStoredLocal),
-            "obliterated entry must drop PayloadStoredLocal, got {flags:?}",
+        assert_eq!(
+            FragmentFlags::from_bits_truncate(fragment.flags),
+            FragmentFlags::empty(),
+            "a miss carries no fragment",
         );
     }
 
@@ -2720,7 +2641,6 @@ mod open_tests {
         assert_eq!(complete.5, address.context);
 
         // Verify the target carries the payload locally without Durable.
-        let _guard = IsolationGuard::force_on().await;
         let (q_status, q_events) = get_metadata_items(
             handle,
             vec![lore::storage::get_metadata::LoreStorageGetMetadataItem {

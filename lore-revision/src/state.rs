@@ -78,6 +78,7 @@ use crate::state::diff::get_filtered_node_and_path;
 use crate::state::diff::get_node_and_path;
 use crate::store::KeyType;
 use crate::store::StoreMatch;
+use crate::store::query_one;
 use crate::util;
 use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
@@ -1456,9 +1457,7 @@ impl State {
 
         let address = Address::zero_context_hash(block_hash[block_index]);
         Some(lore_spawn!(async move {
-            let matched = repository
-                .immutable_store()
-                .query(repository.id, address, StoreMatch::MatchHash)
+            let matched = query_one(&repository.immutable_store(), repository.id, address)
                 .await
                 .map_or(StoreMatch::MatchNone, |result| result.match_made);
             if matched == StoreMatch::MatchNone {
@@ -7884,7 +7883,7 @@ async fn collect_new_addresses(
             async move {
                 if let Ok(query) = repository
                     .immutable_store()
-                    .query(repository.id, address, StoreMatch::MatchFull)
+                    .get_metadata(repository.id, address)
                     .await
                 {
                     let mut addresses = vec![];

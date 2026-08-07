@@ -25,6 +25,7 @@ use lore_revision::state;
 use lore_revision::state::State;
 use lore_storage::StoreError;
 use lore_storage::StoreMatch;
+use lore_storage::StoreMatchResult;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::REVISION;
@@ -826,10 +827,12 @@ async fn verify_fragments(
                 lore_spawn!(
                     tasks,
                     async move {
+                        let mut resolved = vec![StoreMatchResult::default(); batch.len()];
                         let result = repository
                             .immutable_store()
-                            .exist_batch(repository.id, batch.as_slice(), StoreMatch::MatchFull)
-                            .await;
+                            .query(repository.id, batch.as_slice(), &mut resolved)
+                            .await
+                            .map(|()| resolved);
                         (batch, result)
                     }
                     .in_current_span()
@@ -843,8 +846,8 @@ async fn verify_fragments(
                 result.warn_map_err(|err| Status::internal(format!("Query task failed: {err}")))?;
             match result {
                 Ok(result) => {
-                    if result.iter().enumerate().any(|(pos, match_found)| {
-                        if *match_found != StoreMatch::MatchFull {
+                    if result.iter().enumerate().any(|(pos, resolved)| {
+                        if resolved.match_made != StoreMatch::MatchFull {
                             warn!("Branch push failed, fragment not found for {}", batch[pos]);
                             true
                         } else {

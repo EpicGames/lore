@@ -34,6 +34,8 @@ use crate::repository::RepositoryContext;
 use crate::store::ImmutableStore;
 use crate::store::StoreError;
 use crate::store::StoreMatch;
+use crate::store::StoreMatchResult;
+use crate::store::query_one;
 
 #[error_set]
 pub enum ImmutableError {
@@ -137,9 +139,8 @@ pub async fn load_raw_store_retry(
     store: Arc<dyn ImmutableStore>,
     repository: Partition,
     address: Address,
-    match_required: StoreMatch,
 ) -> Result<(Fragment, Bytes), ImmutableError> {
-    lore_storage::read::read_raw(store, repository, address, match_required)
+    lore_storage::read::read_raw(store, repository, address)
         .await
         .forward("loading raw fragment from store")
 }
@@ -481,7 +482,8 @@ pub async fn cache(
         total_query_count += query_count;
         lore_trace!("Query and cache {query_count} immutable fragments from remote");
 
-        let mut query_tasks: JoinSet<Result<(Bytes, Vec<StoreMatch>), StoreError>> = JoinSet::new();
+        let mut query_tasks: JoinSet<Result<(Bytes, Vec<StoreMatchResult>), StoreError>> =
+            JoinSet::new();
         while !query_address.is_empty() {
             // Cap number of tasks to a reasonable batch size
             const BATCH_COUNT: usize = 100;
@@ -497,13 +499,11 @@ pub async fn cache(
 
             let repository = repository.clone();
             lore_spawn!(query_tasks, async move {
-                let matches = repository
+                let addresses = slice.as_type_slice::<Address>();
+                let mut matches = vec![StoreMatchResult::default(); addresses.len()];
+                repository
                     .immutable_store()
-                    .exist_batch(
-                        repository.id,
-                        slice.as_type_slice::<Address>(),
-                        StoreMatch::MatchHash,
-                    )
+                    .query(repository.id, addresses, &mut matches)
                     .await?;
                 Ok((slice, matches))
             });
@@ -552,8 +552,8 @@ pub async fn cache(
                 && address.count::<Address>() == matches.len()
             {
                 let address = address.as_type_slice::<Address>();
-                for (index, match_made) in matches.iter().enumerate() {
-                    if *match_made != StoreMatch::MatchNone {
+                for (index, resolved) in matches.iter().enumerate() {
+                    if resolved.match_made != StoreMatch::MatchNone {
                         continue;
                     }
 
@@ -629,14 +629,9 @@ pub async fn cache(
 
 pub async fn is_stored_local(repository: Arc<RepositoryContext>, address: Address) -> bool {
     lore_trace!("Check if {} is cached in local store", address);
-    if let Ok(query) = repository
-        .immutable_store()
-        .query(repository.id, address, StoreMatch::MatchHash)
-        .await
-    {
-        lore_trace!("Query result {:?}", query);
-        query.match_made != StoreMatch::MatchNone
-            && (query.fragment.flags & FragmentFlags::PayloadStoredLocal) != 0
+    if let Ok(resolved) = query_one(&repository.immutable_store(), repository.id, address).await {
+        lore_trace!("Resolve result {:?}", resolved);
+        resolved.stored_local
     } else {
         false
     }

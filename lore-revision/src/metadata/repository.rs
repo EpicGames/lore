@@ -27,7 +27,6 @@ use crate::metadata::Metadata;
 use crate::metadata::MetadataType;
 use crate::repository;
 use crate::repository::RepositoryContext;
-use crate::store;
 use crate::util::path::RelativePath;
 
 /// Keys that cannot be modified or removed via the metadata API.
@@ -160,14 +159,10 @@ async fn ensure_remote_blobs(
     }
 
     for address in missing {
-        let (fragment, payload) = immutable::load_raw_store_retry(
-            repo.immutable_store(),
-            repo.id,
-            address,
-            store::StoreMatch::MatchFull,
-        )
-        .await
-        .internal("loading metadata blob from local store for upload")?;
+        let (fragment, payload) =
+            immutable::load_raw_store_retry(repo.immutable_store(), repo.id, address)
+                .await
+                .internal("loading metadata blob from local store for upload")?;
 
         immutable::store_raw_remote_retry(storage.clone(), address, fragment, Some(payload))
             .await

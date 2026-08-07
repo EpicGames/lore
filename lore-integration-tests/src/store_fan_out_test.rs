@@ -194,7 +194,7 @@ mod tests {
         // All 100k addresses must be findable.
         for address in &addresses {
             let result = store
-                .find(partition, *address, lore_storage::StoreMatch::MatchFull)
+                .find(partition, *address)
                 .await
                 .expect("find returned an error");
             assert_eq!(
@@ -875,10 +875,7 @@ mod tests {
         assert_eq!(marker_level, 32, "Marker level mismatches in-memory level");
 
         for address in &addresses {
-            let result = store
-                .find(partition, *address, lore_storage::StoreMatch::MatchFull)
-                .await
-                .unwrap();
+            let result = store.find(partition, *address).await.unwrap();
             assert_eq!(
                 result.matching,
                 lore_storage::StoreMatch::MatchFull,

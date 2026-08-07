@@ -18,6 +18,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_revision::lore::RepositoryId;
 use lore_storage::StoreMatch;
+use lore_storage::immutable_store::query_one;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use serde::Deserialize;
 use serde::Serialize;
@@ -176,16 +177,14 @@ pub async fn handler(
     LORE_CONTEXT
         .scope(execution, async move {
             // Verify the address exists before issuing a URL for it.
-            let match_result = immutable_store
-                .clone()
-                .exist(repository, parsed_address, StoreMatch::MatchFull)
+            let match_result = query_one(&immutable_store, repository, parsed_address)
                 .await
                 .map_err(|e| {
-                    warn!(%e, "Presign exist check failed");
+                    warn!(%e, "Presign resolve check failed");
                     PresignError::StoreError
                 })?;
 
-            if match_result == StoreMatch::MatchNone {
+            if match_result.match_made != StoreMatch::MatchFull {
                 return Err(PresignError::NotFound);
             }
 

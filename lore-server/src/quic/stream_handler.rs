@@ -657,7 +657,6 @@ mod tests {
     use lore_base::lore_spawn;
     use lore_base::types::Context;
     use lore_revision::fragment::generate_random;
-    use lore_storage::StoreMatch;
     use lore_transport::quic::QuicOpCode;
     use lore_transport::quic::client::CertificateSettings;
     use lore_transport::quic::client::ClientCerts;
@@ -986,7 +985,6 @@ mod tests {
                         repository: random(),
                     },
                     address,
-                    match_required: StoreMatch::MatchFull,
                 })
                 .await
                 .expect_err("Failed to get request");
@@ -1078,7 +1076,6 @@ mod tests {
                         repository: random(),
                     },
                     address,
-                    match_required: StoreMatch::MatchFull,
                 })
                 .await
                 .expect_err("request over a rejected connection must fail");
@@ -1153,7 +1150,6 @@ mod tests {
                         repository: random(),
                     },
                     address,
-                    match_required: StoreMatch::MatchFull,
                 })
                 .await
                 .expect_err("Failed to get request");
@@ -1758,7 +1754,7 @@ mod tests {
             assert!(!resp.error, "Copy via session 1 failed: {resp:?}");
             assert_eq!(resp.session_id, session_id);
 
-            // === Query via session 2: both addresses should exist ===
+            // === GetMetadata via session 2: both addresses should exist ===
             let mut query_payload_2 = Vec::new();
             query_payload_2.extend_from_slice(address.as_bytes());
             query_payload_2.extend_from_slice(address2.as_bytes());
@@ -1777,7 +1773,7 @@ mod tests {
             )
             .await;
 
-            assert!(!resp.error, "Query via session 2 failed: {resp:?}");
+            assert!(!resp.error, "GetMetadata via session 2 failed: {resp:?}");
             assert_eq!(resp.size_or_status, 2);
             let query_results_2 = read_payload(&mut recv, 2).await;
             assert_eq!(query_results_2[0], 0, "address from session 1 should exist");

@@ -21,7 +21,10 @@ mod remote_store_tests {
     use lore_server::hooks::HookDispatcher;
     use lore_storage::ImmutableStore;
     use lore_storage::MutableStore;
+    use lore_storage::StoreGetData;
     use lore_storage::StoreMatch;
+    use lore_storage::StoreMatchResult;
+    use lore_storage::immutable_store::query_one;
     use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
     use rand::random;
@@ -45,6 +48,9 @@ mod remote_store_tests {
                 allow_partial_fragment: false,
                 protect_local_fragment: false,
                 implicit_durable_stored: true,
+                // As a real server runs it. One process holds content for every tenant, so it
+                // serves the association it was asked for and nothing else.
+                isolate_partitions: true,
                 ..Default::default()
             },
         )
@@ -59,9 +65,10 @@ mod remote_store_tests {
         .await
         .unwrap();
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // Bound here and handed over, so nothing can take the port between choosing it and
+        // serving on it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
-        drop(listener);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let signal = async {
@@ -72,10 +79,11 @@ mod remote_store_tests {
             Arc::new(lore_server::notification::local::NotificationSender::default());
         let hook_dispatcher = Arc::new(HookDispatcher::empty());
 
+        let (stopped_tx, mut stopped_rx) = tokio::sync::oneshot::channel::<String>();
         // Background server task in a test; LORE_CONTEXT propagation is unnecessary here.
         #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
-            GrpcServerBuilder::new()
+            let outcome = GrpcServerBuilder::new()
                 .with_environment(EnvironmentConfig::default())
                 .with_feature(FeatureSettings::default())
                 .with_immutable_store(backend_immutable.clone(), backend_immutable)
@@ -96,30 +104,65 @@ mod remote_store_tests {
                 )
                 .with_jwt_verifier(None)
                 .unwrap()
-                .serve(addr, signal)
-                .await
-                .unwrap();
+                .serve_with_listener(listener, signal)
+                .await;
+            let _ = stopped_tx.send(match outcome {
+                Ok(()) => "stopped before the test finished".to_string(),
+                Err(error) => format!("failed: {error}"),
+            });
         });
 
+        // A server that never starts must say so. Falling through to a client that can never be
+        // answered is what turns a startup failure into a test that hangs with nothing on stderr.
+        let mut ready = false;
         for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Ok(reason) = stopped_rx.try_recv() {
+                panic!("test server on {addr} {reason}");
+            }
             if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                ready = true;
                 break;
             }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        assert!(ready, "test server on {addr} never accepted a connection");
 
         let url = format!("grpc://127.0.0.1:{}", addr.port());
-        let immutable_store = Arc::new(RemoteImmutableStore::new(&url, None));
-        let mutable_store = Arc::new(RemoteMutableStore::new(&url, None));
-
         TestServer {
-            immutable_store,
-            mutable_store,
+            immutable_store: Arc::new(RemoteImmutableStore::new(&url, None)),
+            mutable_store: Arc::new(RemoteMutableStore::new(&url, None)),
             _shutdown: shutdown_tx,
         }
     }
 
     // ── Immutable Store Tests ──
+
+    /// The contract, checked against a store on the other end of a wire.
+    ///
+    /// The clauses bind a protocol handler and the client store that decodes its answers just as
+    /// they bind a store called in process - together they are one implementation spanning a
+    /// connection. The server is configured the way a real one is, isolating partitions, because
+    /// the pair satisfies the client store's declared read scope only if the server it talks to
+    /// answers exact associations. The wire collapse of a hash-only match is covered where the
+    /// mapping lives, in `lore-server`'s query handler, against a store that does report one.
+    #[tokio::test]
+    async fn remote_store_satisfies_the_immutable_store_contract() -> TestResult {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+
+                lore_storage::conformance::verify_immutable_store(
+                    server.immutable_store.clone(),
+                    lore_storage::conformance::Capabilities::new("RemoteImmutableStore")
+                        .over_wire(),
+                )
+                .await;
+
+                Ok(())
+            })
+            .await
+    }
 
     #[tokio::test]
     async fn test_immutable_put_and_get() -> TestResult {
@@ -139,8 +182,9 @@ mod remote_store_tests {
                 let (got_fragment, got_payload) = server
                     .immutable_store
                     .clone()
-                    .get(repository, address, StoreMatch::MatchFull)
-                    .await?;
+                    .get(repository, address)
+                    .await
+                    .and_then(StoreGetData::into_payload)?;
 
                 assert_eq!(payload, got_payload);
                 assert_eq!(fragment.size_payload, got_fragment.size_payload);
@@ -163,7 +207,7 @@ mod remote_store_tests {
                 let result = server
                     .immutable_store
                     .clone()
-                    .get(repository, address, StoreMatch::MatchFull)
+                    .get(repository, address)
                     .await;
 
                 assert!(result.is_err());
@@ -188,13 +232,14 @@ mod remote_store_tests {
                     .put(repository, address, fragment, Some(payload), false)
                     .await?;
 
-                let match_result = server
-                    .immutable_store
-                    .clone()
-                    .exist(repository, address, StoreMatch::MatchFull)
-                    .await?;
+                let match_result = query_one(
+                    &(server.immutable_store.clone() as Arc<dyn ImmutableStore>),
+                    repository,
+                    address,
+                )
+                .await?;
 
-                assert_eq!(StoreMatch::MatchFull, match_result);
+                assert_eq!(StoreMatch::MatchFull, match_result.match_made);
 
                 Ok(())
             })
@@ -210,13 +255,14 @@ mod remote_store_tests {
                 let repository = random::<RepositoryId>();
                 let (_, address, _) = fragment::generate_random();
 
-                let match_result = server
-                    .immutable_store
-                    .clone()
-                    .exist(repository, address, StoreMatch::MatchFull)
-                    .await?;
+                let match_result = query_one(
+                    &(server.immutable_store.clone() as Arc<dyn ImmutableStore>),
+                    repository,
+                    address,
+                )
+                .await?;
 
-                assert_eq!(StoreMatch::MatchNone, match_result);
+                assert_eq!(StoreMatch::MatchNone, match_result.match_made);
 
                 Ok(())
             })
@@ -254,18 +300,18 @@ mod remote_store_tests {
                     .await?;
 
                 let addresses = [addr1, addr2, missing1, addr3, missing2];
-                let results = server
+                let mut results = [StoreMatchResult::default(); 5];
+                server
                     .immutable_store
                     .clone()
-                    .exist_batch(repository, &addresses, StoreMatch::MatchFull)
+                    .query(repository, &addresses, &mut results)
                     .await?;
 
-                assert_eq!(5, results.len());
-                assert_eq!(StoreMatch::MatchFull, results[0]);
-                assert_eq!(StoreMatch::MatchFull, results[1]);
-                assert_eq!(StoreMatch::MatchNone, results[2]);
-                assert_eq!(StoreMatch::MatchFull, results[3]);
-                assert_eq!(StoreMatch::MatchNone, results[4]);
+                assert_eq!(StoreMatch::MatchFull, results[0].match_made);
+                assert_eq!(StoreMatch::MatchFull, results[1].match_made);
+                assert_eq!(StoreMatch::MatchNone, results[2].match_made);
+                assert_eq!(StoreMatch::MatchFull, results[3].match_made);
+                assert_eq!(StoreMatch::MatchNone, results[4].match_made);
 
                 Ok(())
             })
@@ -290,7 +336,7 @@ mod remote_store_tests {
                 let result = server
                     .immutable_store
                     .clone()
-                    .query(repository, address, StoreMatch::MatchFull)
+                    .get_metadata(repository, address)
                     .await?;
 
                 assert_eq!(StoreMatch::MatchFull, result.match_made);
@@ -314,7 +360,7 @@ mod remote_store_tests {
                 let result = server
                     .immutable_store
                     .clone()
-                    .query(repository, address, StoreMatch::MatchFull)
+                    .get_metadata(repository, address)
                     .await?;
 
                 assert_eq!(StoreMatch::MatchNone, result.match_made);
@@ -349,8 +395,9 @@ mod remote_store_tests {
                 let (got_fragment, got_payload) = server
                     .immutable_store
                     .clone()
-                    .get(repo_b, address, StoreMatch::MatchFull)
-                    .await?;
+                    .get(repo_b, address)
+                    .await
+                    .and_then(StoreGetData::into_payload)?;
 
                 assert_eq!(payload, got_payload);
                 assert_eq!(fragment.size_payload, got_fragment.size_payload);

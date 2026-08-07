@@ -38,9 +38,11 @@ mod aws_store_tests {
     use lore_storage::ImmutableStore;
     use lore_storage::MutableStore;
     use lore_storage::StoreError;
+    use lore_storage::StoreGetData;
     use lore_storage::StoreMatch;
+    use lore_storage::StoreMatchResult;
     use lore_storage::StoreObliterateStats;
-    use lore_storage::StoreQueryResult;
+    use lore_storage::immutable_store::query_one;
     use rand::random;
 
     use crate::common::aws_common::FRAGMENT_METADATA_TABLE_NAME;
@@ -76,58 +78,39 @@ mod aws_store_tests {
     impl ImmutableStore for LocalStore {
         async fn get_metadata(
             self: Arc<Self>,
-            partition: Partition,
-            address: Address,
-        ) -> Result<StoreQueryResult, StoreError> {
-            self.query(partition, address, StoreMatch::MatchFull).await
-        }
-
-        async fn exist(
-            self: Arc<Self>,
-            _repository: Partition,
+            _partition: Partition,
             _address: Address,
-            _match_requested: StoreMatch,
-        ) -> Result<StoreMatch, StoreError> {
-            Ok(StoreMatch::MatchNone)
-        }
-
-        async fn exist_batch(
-            self: Arc<Self>,
-            _repository: Partition,
-            addresses: &[Address],
-            _match_requested: StoreMatch,
-        ) -> Result<Vec<StoreMatch>, StoreError> {
-            let mut output = vec![];
-
-            for address in addresses {
-                if self.local_exists_addresses.contains(address) {
-                    output.push(StoreMatch::MatchFull);
-                } else {
-                    output.push(StoreMatch::MatchNone);
-                }
-            }
-
-            Ok(output)
+        ) -> Result<StoreGetData, StoreError> {
+            Ok(StoreGetData::default())
         }
 
         async fn query(
             self: Arc<Self>,
-            _repository: Partition,
-            _address: Address,
-            _match_requested: StoreMatch,
-        ) -> Result<StoreQueryResult, StoreError> {
-            Ok(StoreQueryResult {
-                fragment: Fragment::default(),
-                match_made: StoreMatch::MatchNone,
-            })
+            repository: Partition,
+            addresses: &[Address],
+            results: &mut [StoreMatchResult],
+        ) -> Result<(), StoreError> {
+            for (address, result) in addresses.iter().zip(results.iter_mut()) {
+                *result = if self.local_exists_addresses.contains(address) {
+                    StoreMatchResult {
+                        match_made: StoreMatch::MatchFull,
+                        partition: repository,
+                        stored_local: true,
+                        stored_durable: false,
+                    }
+                } else {
+                    StoreMatchResult::default()
+                };
+            }
+
+            Ok(())
         }
 
         async fn get(
             self: Arc<Self>,
             _repository: Partition,
             _address: Address,
-            _match_required: StoreMatch,
-        ) -> Result<(Fragment, Bytes), StoreError> {
+        ) -> Result<StoreGetData, StoreError> {
             Err(StoreError::from(AddressNotFound::from(Address::default())))
         }
 
@@ -230,7 +213,7 @@ mod aws_store_tests {
                 let mut dst = [0u8; 64];
                 let key = lore_revision::util::to_hex_str(address.hash.data(), &mut dst);
                 raw_s3
-                    .put_object(STORE_BUCKET_NAME, key, payload.to_vec(), None)
+                    .put_object(STORE_BUCKET_NAME, key, payload.clone(), None)
                     .await
                     .expect("rewriting the object without metadata should succeed");
 
@@ -259,8 +242,9 @@ mod aws_store_tests {
                     .expect("writing the pre-cut-over row should succeed");
 
                 let (got_fragment, got_payload) = store
-                    .get(repository, address, StoreMatch::MatchFull)
-                    .await?;
+                    .get(repository, address)
+                    .await
+                    .and_then(StoreGetData::into_payload)?;
 
                 assert_eq!(got_payload, payload, "the payload must read back intact");
                 assert_eq!(got_fragment.size_payload, fragment.size_payload);
@@ -314,12 +298,12 @@ mod aws_store_tests {
                 let mut dst = [0u8; 64];
                 let key = lore_revision::util::to_hex_str(address.hash.data(), &mut dst);
                 raw_s3
-                    .put_object(STORE_BUCKET_NAME, key, payload.to_vec(), None)
+                    .put_object(STORE_BUCKET_NAME, key, payload.clone(), None)
                     .await
                     .expect("rewriting the object without metadata should succeed");
 
                 let error = store
-                    .get(repository, address, StoreMatch::MatchFull)
+                    .get(repository, address)
                     .await
                     .expect_err("an object with no metadata and nowhere to look is damaged");
 
@@ -443,18 +427,19 @@ mod aws_store_tests {
                     address_found_durable,
                     address_not_found,
                 ];
-                let result = immutable_store
+                let mut result = [StoreMatchResult::default(); 3];
+                immutable_store
                     .clone()
-                    .exist_batch(repository, addresses.as_slice(), StoreMatch::MatchFull)
+                    .query(repository, addresses.as_slice(), &mut result)
                     .await?;
 
                 assert_eq!(
-                    vec![
+                    result.map(|entry| entry.match_made),
+                    [
                         StoreMatch::MatchFull,
                         StoreMatch::MatchFull,
                         StoreMatch::MatchNone
                     ],
-                    result
                 );
 
                 Ok(())
@@ -471,18 +456,14 @@ mod aws_store_tests {
             initialize_store().await.expect("Failed to create store");
         LORE_CONTEXT
             .scope(execution.clone(), async move {
-                let result = immutable_store
-                    .clone()
-                    .query(repository, address, StoreMatch::MatchFull)
-                    .await?;
+                let result = query_one(
+                    &(immutable_store as Arc<dyn ImmutableStore>),
+                    repository,
+                    address,
+                )
+                .await?;
 
-                assert_eq!(
-                    StoreQueryResult {
-                        fragment: Fragment::default(),
-                        match_made: StoreMatch::MatchNone
-                    },
-                    result
-                );
+                assert_eq!(StoreMatchResult::default(), result);
 
                 Ok(())
             })
@@ -512,21 +493,21 @@ mod aws_store_tests {
                 let mut want_fragment = fragment;
                 want_fragment.flags = FragmentFlags::PayloadStoredDurable.bits()
                     | (fragment.flags & FragmentFlags::PayloadCompressed);
-                assert_eq!(
-                    StoreQueryResult {
-                        fragment: want_fragment,
-                        match_made: StoreMatch::MatchFull
-                    },
-                    result
-                );
+                assert_eq!(result.fragment, want_fragment);
+                assert_eq!(result.match_made, StoreMatch::MatchFull);
+                assert_eq!(result.partition, repository);
 
                 Ok(())
             })
             .await
     }
 
+    /// The same hash under a sibling context, on a store that isolates partitions. Nothing answers,
+    /// for two separate reasons: the read reaches no further than the exact association, and the
+    /// existence path resolves associations alone, so it reports less than the truth rather than
+    /// claiming the partition holds no such hash.
     #[tokio::test]
-    async fn test_query_immutable_partial_match() -> TestResult {
+    async fn test_a_sibling_context_resolves_to_nothing() -> TestResult {
         let repository = random::<RepositoryId>();
         let (fragment, address, payload) = fragment::generate_random();
 
@@ -541,19 +522,22 @@ mod aws_store_tests {
                 let mut address = address;
                 address.context = random::<Context>();
 
-                let want_fragment = Fragment {
-                    flags: FragmentFlags::PayloadStoredDurable.bits(),
-                    ..Default::default()
-                };
+                let result = immutable_store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await?;
                 assert_eq!(
-                    StoreQueryResult {
-                        fragment: want_fragment,
-                        match_made: StoreMatch::MatchPartition
-                    },
-                    immutable_store
-                        .clone()
-                        .query(repository, address, StoreMatch::MatchPartition)
-                        .await?
+                    result.match_made,
+                    StoreMatch::MatchNone,
+                    "an isolating store described an association it does not hold"
+                );
+
+                let store: Arc<dyn ImmutableStore> = immutable_store.clone();
+                let resolved = query_one(&store, repository, address).await?;
+                assert_eq!(
+                    resolved.match_made,
+                    StoreMatch::MatchNone,
+                    "this store resolves associations alone, so it has nothing to report here"
                 );
 
                 Ok(())
@@ -562,7 +546,9 @@ mod aws_store_tests {
     }
 
     #[tokio::test]
-    async fn test_query_lower_specificity_match() -> TestResult {
+    /// The store isolates partitions, so a hash held only by another one is not its to report -
+    /// where this once answered with a hash match, absence is now the whole answer.
+    async fn test_query_does_not_match_across_partitions() -> TestResult {
         let repository = random::<RepositoryId>();
         let (fragment, address, payload) = fragment::generate_random();
 
@@ -577,24 +563,13 @@ mod aws_store_tests {
                 let mut address = address;
                 address.context = random::<Context>();
 
-                let want_fragment = Fragment {
-                    flags: FragmentFlags::PayloadStoredDurable.bits(),
-                    ..Default::default()
-                };
-                assert_eq!(
-                    StoreQueryResult {
-                        fragment: want_fragment,
-                        match_made: StoreMatch::MatchHash
-                    },
-                    immutable_store
-                        .clone()
-                        .query(
-                            random::<RepositoryId>(),
-                            address,
-                            StoreMatch::MatchPartition
-                        )
-                        .await?
-                );
+                let result = query_one(
+                    &(immutable_store as Arc<dyn ImmutableStore>),
+                    random::<RepositoryId>(),
+                    address,
+                )
+                .await?;
+                assert_eq!(result, StoreMatchResult::default());
 
                 Ok(())
             })
@@ -623,16 +598,12 @@ mod aws_store_tests {
                 let mut want_fragment = fragment;
                 want_fragment.flags = FragmentFlags::PayloadStoredDurable.bits()
                     | (fragment.flags & FragmentFlags::PayloadCompressed);
-                assert_eq!(
-                    StoreQueryResult {
-                        fragment: want_fragment,
-                        match_made: StoreMatch::MatchPartition
-                    },
-                    immutable_store
-                        .clone()
-                        .query(repository, address, StoreMatch::MatchFull)
-                        .await?
-                );
+                let result = immutable_store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await?;
+                assert_eq!(result.fragment, want_fragment);
+                assert_eq!(result.match_made, StoreMatch::MatchPartition);
 
                 // Put the fragment again with a separate context in the same repo, but send no payload
                 immutable_store
@@ -644,16 +615,12 @@ mod aws_store_tests {
                 let mut want_fragment = fragment;
                 want_fragment.flags = FragmentFlags::PayloadStoredDurable.bits()
                     | (fragment.flags & FragmentFlags::PayloadCompressed);
-                assert_eq!(
-                    StoreQueryResult {
-                        fragment: want_fragment,
-                        match_made: StoreMatch::MatchFull
-                    },
-                    immutable_store
-                        .clone()
-                        .query(repository, address, StoreMatch::MatchFull)
-                        .await?
-                );
+                let result = immutable_store
+                    .clone()
+                    .get_metadata(repository, address)
+                    .await?;
+                assert_eq!(result.fragment, want_fragment);
+                assert_eq!(result.match_made, StoreMatch::MatchFull);
 
                 Ok(())
             })
@@ -705,8 +672,9 @@ mod aws_store_tests {
                     .await?;
 
                 let (got_fragment, got_buffer) = immutable_store
-                    .get(repository, address, StoreMatch::MatchHash)
+                    .get(repository, address)
                     .await
+                    .and_then(lore_storage::StoreGetData::into_payload)
                     .expect("Failed to get immutable object");
 
                 let mut want_fragment = fragment;
@@ -732,7 +700,7 @@ mod aws_store_tests {
                 assert!(
                     immutable_store
                         .clone()
-                        .get(repository, address, StoreMatch::MatchHash,)
+                        .get(repository, address)
                         .await
                         .expect_err("should have returned an error")
                         .is_address_not_found()
@@ -743,8 +711,11 @@ mod aws_store_tests {
             .await
     }
 
+    /// A read names an association, and this store holds none for a sibling context. It isolates
+    /// partitions, and nothing carries the level alongside a payload it serves, so a caller on the
+    /// far side of a wire would read anything handed over here as an association of its own.
     #[tokio::test]
-    async fn test_get_immutable_partial_match() -> TestResult {
+    async fn test_get_immutable_refuses_a_sibling_context() -> TestResult {
         let repository = random::<RepositoryId>();
         let (fragment, address, payload) = fragment::generate_random();
 
@@ -759,20 +730,14 @@ mod aws_store_tests {
                 let mut address = address;
                 address.context = random::<Context>();
 
-                // Getting the fragment with a different context should still return the fragment as long as we
-                // specify a repository match.
-                let (got_fragment, got_buffer) = immutable_store
-                    .clone()
-                    .get(repository, address, StoreMatch::MatchPartition)
-                    .await
-                    .expect("Failed to get immutable object");
-
-                let mut want_fragment = fragment;
-                want_fragment.flags = FragmentFlags::PayloadStoredDurable.bits()
-                    | (fragment.flags & FragmentFlags::PayloadCompressed);
-                assert_eq!(want_fragment, got_fragment);
-
-                assert_eq!(payload.as_ref(), got_buffer.as_ref());
+                assert!(
+                    immutable_store
+                        .clone()
+                        .get(repository, address)
+                        .await
+                        .expect_err("an isolating store served a sibling context's payload")
+                        .is_address_not_found()
+                );
 
                 Ok(())
             })
@@ -828,8 +793,9 @@ mod aws_store_tests {
 
                 let (got_fragment, got_buffer) = immutable_store
                     .clone()
-                    .get(repository, address, StoreMatch::MatchHash)
+                    .get(repository, address)
                     .await
+                    .and_then(lore_storage::StoreGetData::into_payload)
                     .expect("Failed to get immutable object");
 
                 let mut want_fragment = fragment;
@@ -872,8 +838,9 @@ mod aws_store_tests {
 
                 let (got_fragment, got_buffer) = immutable_store
                     .clone()
-                    .get(repository, address, StoreMatch::MatchHash)
+                    .get(repository, address)
                     .await
+                    .and_then(lore_storage::StoreGetData::into_payload)
                     .expect("Failed to get immutable object");
 
                 let mut want_fragment = fragment;
@@ -903,8 +870,9 @@ mod aws_store_tests {
                     .expect("Failed to put immutable object");
 
                 let (got_fragment, got_payload) = immutable_store_two
-                    .get(repository, address, StoreMatch::MatchFull)
+                    .get(repository, address)
                     .await
+                    .and_then(lore_storage::StoreGetData::into_payload)
                     .expect("Failed to get immutable object");
 
                 let mut want_fragment = fragment;
@@ -932,12 +900,19 @@ mod aws_store_tests {
                 let mut expected = vec![];
                 expected.resize(10000, StoreMatch::MatchNone);
 
-                let result = immutable_store
+                let mut result = vec![StoreMatchResult::default(); address.len()];
+                immutable_store
                     .clone()
-                    .exist_batch(repository, &address, StoreMatch::MatchFull)
+                    .query(repository, &address, &mut result)
                     .await
-                    .expect("Failed to query exist batch");
-                assert_eq!(result, expected);
+                    .expect("Failed to query batch");
+                assert_eq!(
+                    result
+                        .into_iter()
+                        .map(|entry| entry.match_made)
+                        .collect::<Vec<_>>(),
+                    expected
+                );
 
                 Ok(())
             })

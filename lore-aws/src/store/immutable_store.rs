@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::string::ToString;
@@ -29,14 +30,14 @@ use lore_base::types::FragmentReference;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_base::types::TypedBytes;
-use lore_revision::lore_warn;
-use lore_revision::util::task_queue::METRICS_TASK_QUEUE_LABEL;
-use lore_revision::util::task_queue::TaskQueue;
 use lore_storage::ImmutableStore as ImmutableStoreTrait;
 use lore_storage::StoreError;
+use lore_storage::StoreGetData;
 use lore_storage::StoreMatch;
+use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
-use lore_storage::StoreQueryResult;
+#[cfg(test)]
+use lore_storage::immutable_store::query_one;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::LabelArray;
@@ -51,7 +52,6 @@ use opentelemetry::metrics::Histogram;
 use serde::Deserialize;
 use serde::Serialize;
 use smallvec::SmallVec;
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 use tracing::debug;
@@ -80,15 +80,17 @@ enum QueryResultSource {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct FragmentsEntry {
     hash: Hash,
-    #[serde(with = "serde_bytes")]
-    repository_context: [u8; size_of::<Context>() * 2],
+    /// The partition that holds the association, followed by the address's context. Stored under
+    /// its original attribute name, which predates the split between the two.
+    #[serde(with = "serde_bytes", rename = "repository_context")]
+    partition_context: [u8; size_of::<Context>() * 2],
 }
 
 impl From<&FragmentsEntry> for Address {
     fn from(value: &FragmentsEntry) -> Self {
         Address {
             hash: value.hash,
-            context: Context::from(&value.repository_context[size_of::<Context>()..]),
+            context: Context::from(&value.partition_context[size_of::<Context>()..]),
         }
     }
 }
@@ -97,20 +99,20 @@ impl Debug for FragmentsEntry {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FragmentsEntry")
             .field("hash", &self.hash)
-            .field("repository_context", &hex::encode(self.repository_context))
+            .field("partition_context", &hex::encode(self.partition_context))
             .finish()
     }
 }
 
 impl FragmentsEntry {
-    fn new(repository: Context, address: Address) -> Self {
-        let mut repository_context = [0u8; size_of::<Context>() * 2];
-        repository_context[..size_of::<Context>()].copy_from_slice(repository.data());
-        repository_context[size_of::<Context>()..].copy_from_slice(address.context.data());
+    fn new(partition: Partition, address: Address) -> Self {
+        let mut partition_context = [0u8; size_of::<Context>() * 2];
+        partition_context[..size_of::<Context>()].copy_from_slice(partition.data());
+        partition_context[size_of::<Context>()..].copy_from_slice(address.context.data());
 
         Self {
             hash: address.hash,
-            repository_context,
+            partition_context,
         }
     }
 }
@@ -175,7 +177,6 @@ struct FragmentStateEntry {
 /// Deserialization only. Nothing writes this shape any more.
 #[derive(Clone, Debug, Deserialize)]
 struct FragmentMetadataEntry {
-    #[allow(dead_code)]
     hash: Hash,
     #[serde(flatten)]
     fragment: Option<Fragment>,
@@ -277,10 +278,6 @@ impl DynamoDbImmutableStoreSettings {
 
 /// The maximum number of individual exists tasks we'll allow to be submitted across all concurrent
 /// requests.
-fn default_submission_limit() -> usize {
-    150_000
-}
-
 #[derive(Clone, Debug, Deserialize)]
 #[serde(bound(deserialize = "'de: 'static"))]
 pub struct AwsImmutableStoreSettings {
@@ -288,8 +285,6 @@ pub struct AwsImmutableStoreSettings {
     pub dynamodb: DynamoDbImmutableStoreSettings,
     #[serde(default)]
     pub force_write: bool,
-    #[serde(default = "default_submission_limit")]
-    pub batch_exist_submission_limit: usize,
 }
 
 impl AwsImmutableStoreSettings {
@@ -302,7 +297,6 @@ impl AwsImmutableStoreSettings {
             s3,
             dynamodb,
             force_write,
-            batch_exist_submission_limit: default_submission_limit(),
         }
     }
 }
@@ -310,75 +304,46 @@ impl AwsImmutableStoreSettings {
 pub const FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE: &str = "hash";
 pub const FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE: &str = "repository_context";
 
+/// How many associations exist for a hash, across every partition.
+///
+/// The only `Query` this store issues. Everything else it asks is a keyed read: it reads no wider
+/// than the exact association, so there is nothing to scan a hash partition for except counting
+/// the references that keep a payload alive.
 #[derive(Debug, Clone, PartialEq)]
 enum FragmentsQuery {
-    Repository(Hash, Context),
-    Hash(Hash),
     HashCount(Hash),
 }
 
 impl DynamoDbQuery for FragmentsQuery {
     fn key_condition_expression(&self) -> &str {
-        match self {
-            FragmentsQuery::Repository(_, _) => "#pk = :hash and begins_with(#sk, :repository)",
-            FragmentsQuery::Hash(_) | FragmentsQuery::HashCount(_) => "#pk = :hash",
-        }
+        "#pk = :hash"
     }
 
     fn expression_attribute_names(&self) -> HashMap<String, String> {
-        match self {
-            FragmentsQuery::Repository(_, _) => HashMap::from([
-                (
-                    "#pk".to_string(),
-                    FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
-                ),
-                (
-                    "#sk".to_string(),
-                    FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE.to_string(),
-                ),
-            ]),
-            FragmentsQuery::Hash(_) | FragmentsQuery::HashCount(_) => HashMap::from([(
-                "#pk".to_string(),
-                FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
-            )]),
-        }
+        HashMap::from([(
+            "#pk".to_string(),
+            FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
+        )])
     }
 
     fn expression_attribute_values(&self) -> HashMap<String, AttributeValue> {
-        match self {
-            FragmentsQuery::Repository(hash, repository) => HashMap::from([
-                (
-                    ":hash".to_string(),
-                    AttributeValue::B(Blob::new(hash.data())),
-                ),
-                (
-                    ":repository".to_string(),
-                    AttributeValue::B(Blob::new(repository.data())),
-                ),
-            ]),
-            FragmentsQuery::Hash(hash) | FragmentsQuery::HashCount(hash) => HashMap::from([(
-                ":hash".to_string(),
-                AttributeValue::B(Blob::new(hash.data())),
-            )]),
-        }
+        let FragmentsQuery::HashCount(hash) = self;
+        HashMap::from([(
+            ":hash".to_string(),
+            AttributeValue::B(Blob::new(hash.data())),
+        )])
     }
 
     fn limit(&self) -> Option<i32> {
-        match self {
-            FragmentsQuery::Repository(_, _) | FragmentsQuery::Hash(_) => Some(1),
-            FragmentsQuery::HashCount(_) => None,
-        }
+        None
     }
 
     fn select(&self) -> Option<Select> {
-        match self {
-            FragmentsQuery::Repository(_, _) | FragmentsQuery::Hash(_) => None,
-            FragmentsQuery::HashCount(_) => Some(Select::Count),
-        }
+        Some(Select::Count)
     }
 
     fn consistent_read(&self) -> bool {
-        matches!(self, FragmentsQuery::HashCount(_))
+        true
     }
 }
 
@@ -424,6 +389,17 @@ impl DynamoDbPutCondition for StateUnchanged {
 /// Non-zero means content has been lost. The read itself is reported as a plain not-found, which is
 /// indistinguishable from content that was never stored, so without this the loss is silent.
 const METRICS_MISSING_PAYLOAD_METRIC_NAME: &str = "store.immutable.missing_payload";
+
+/// Counts reads that found an association whose hash has no lifecycle state recorded anywhere.
+///
+/// A put publishes the state before it writes the association, so a correctly written fragment
+/// always has one. Content stored before the state table existed does not, and is read from the
+/// legacy metadata table instead — which is only consulted when that table is configured. So a
+/// non-zero count means either a deployment holding legacy content without
+/// `fragment_metadata_table_name` set, or a put that stopped between publishing and associating.
+/// The read reports absence either way, so without this the cause is invisible.
+const METRICS_ASSOCIATION_WITHOUT_STATE_METRIC_NAME: &str =
+    "store.immutable.association_without_state";
 
 /// Lower bound on the obliteration drain, regardless of how the `DynamoDB` timeout is configured.
 const MIN_OBLITERATION_DRAIN_MILLIS: u64 = 100;
@@ -482,8 +458,6 @@ fn stored_durable(mut fragment: Fragment) -> Fragment {
 static STORE_ATTRIBUTES: LazyLock<[KeyValue; 1]> =
     LazyLock::new(|| [KeyValue::new("store", "aws")]);
 
-type BatchTaskResult = Result<(usize, StoreMatch), (usize, StoreError)>;
-
 struct GetS3objectContentsOutput {
     read: usize,
     bytes: BytesMut,
@@ -495,7 +469,6 @@ struct GetS3objectContentsOutput {
 pub struct AwsImmutableStore {
     s3: S3,
     dynamodb: DynamoDb,
-    task_queue: TaskQueue<BatchTaskResult>,
     bucket: String,
     fragments_table_name: Arc<str>,
     /// Table of [`FragmentStateEntry`] rows. Named "metadata" for historical reasons; it holds
@@ -511,14 +484,13 @@ pub struct AwsImmutableStore {
     latency_histogram: Histogram<f64>,
     labels_get: LabelArray,
     labels_put: LabelArray,
-    labels_exist: LabelArray,
-    labels_exist_batch: LabelArray,
     labels_obliterate: LabelArray,
-    labels_query: LabelArray,
     labels_copy: LabelArray,
     labels_get_metadata: LabelArray,
     missing_payload_counter: Counter<u64>,
     labels_missing_payload: LabelArray,
+    association_without_state_counter: Counter<u64>,
+    labels_association_without_state: LabelArray,
 }
 
 impl AwsImmutableStore {
@@ -527,28 +499,20 @@ impl AwsImmutableStore {
 
         let latency_histogram =
             provider.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME);
-        let labels_exist = provider.get_labels_for_operation_context("exist");
         let labels_get = provider.get_labels_for_operation_context("get");
         let labels_put = provider.get_labels_for_operation_context("put");
-        let labels_exist_batch = provider.get_labels_for_operation_context("exist_batch");
         let labels_obliterate = provider.get_labels_for_operation_context("obliterate");
-        let labels_query = provider.get_labels_for_operation_context("query");
         let labels_copy = provider.get_labels_for_operation_context("copy");
         let labels_get_metadata = provider.get_labels_for_operation_context("get_metadata");
         let missing_payload_counter = provider.counter(METRICS_MISSING_PAYLOAD_METRIC_NAME);
         let labels_missing_payload = provider.get_labels_for_operation_context("missing_payload");
+        let association_without_state_counter =
+            provider.counter(METRICS_ASSOCIATION_WITHOUT_STATE_METRIC_NAME);
+        let labels_association_without_state =
+            provider.get_labels_for_operation_context("association_without_state");
         Self {
             s3,
             dynamodb,
-            task_queue: TaskQueue::new(
-                u32::MAX,
-                Semaphore::MAX_PERMITS,
-                settings.batch_exist_submission_limit,
-                vec![KeyValue::new(
-                    METRICS_TASK_QUEUE_LABEL,
-                    "store.immutable.aws",
-                )],
-            ),
             bucket: settings.s3.bucket.clone(),
             fragments_table_name: Arc::from(settings.dynamodb.fragments_table_name.clone()),
             fragment_state_table_name: Arc::from(
@@ -569,19 +533,22 @@ impl AwsImmutableStore {
             latency_histogram,
             labels_get,
             labels_put,
-            labels_exist,
-            labels_exist_batch,
             labels_obliterate,
-            labels_query,
             labels_copy,
             labels_get_metadata,
             missing_payload_counter,
             labels_missing_payload,
+            association_without_state_counter,
+            labels_association_without_state,
         }
     }
 
-    async fn exists_exact(&self, entry: &FragmentsEntry) -> Result<bool, StoreError> {
-        let item = serde_dynamo::to_item(entry).map_err(|e| {
+    /// Whether this partition holds the association for this address, which is the whole of what
+    /// this store will serve: it isolates partitions, so it reads no wider than the association
+    /// asked about.
+    async fn exists(&self, partition: Partition, address: Address) -> Result<bool, StoreError> {
+        let entry = FragmentsEntry::new(partition, address);
+        let item = serde_dynamo::to_item(&entry).map_err(|e| {
             warn!(
                 "Failed to convert fragment entry: {entry:?} to dynamo attribute value map: {e:?}",
             );
@@ -611,287 +578,61 @@ impl AwsImmutableStore {
         Ok(output.item.is_some())
     }
 
-    async fn exists_repository(&self, entry: &FragmentsEntry) -> Result<bool, StoreError> {
-        let repo = Context::from(&entry.repository_context[..size_of::<Context>()]);
-
-        self.dynamodb
-            .query_single(
-                &self.fragments_table_name,
-                FragmentsQuery::Repository(entry.hash, repo),
-            )
-            .await
-            .map(|output| output.count > 0)
-            .map_err(|e| {
-                warn!(
-                    "DynamoDb query for fragment entry by hash and repo failed for {entry:?}: {e:?}"
-                );
-                if matches!(&e, AwsError::AwsSdkError(_)) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(
-                        e,
-                        "DynamoDB fragment query by repository failed",
-                    )
-                }
-            })
-    }
-
-    async fn exists_hash(&self, entry: &FragmentsEntry) -> Result<bool, StoreError> {
-        self.dynamodb
-            .query_single(&self.fragments_table_name, FragmentsQuery::Hash(entry.hash))
-            .await
-            .map(|output| output.count > 0)
-            .map_err(|e| {
-                warn!("DynamoDb query for fragment entry by hash failed for {entry:?}: {e:?}");
-                if matches!(&e, AwsError::AwsSdkError(_)) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(e, "DynamoDB fragment query by hash failed")
-                }
-            })
-    }
-
-    async fn ensure_exists(
+    /// The level this address matched at, or `AddressNotFound` when nothing within the store's read
+    /// scope does. One call: the read scope is the exact association, so a miss is the answer
+    /// rather than the start of a wider search.
+    /// The addresses among `addresses` that this partition holds an association for.
+    ///
+    /// A set rather than positions: a batch may name the same address more than once, and keying
+    /// positions by address loses every occurrence but the last. `BatchGetItem` also rejects
+    /// duplicate keys outright, so the request is built from distinct addresses regardless.
+    async fn associations_present(
         &self,
-        repository: Context,
-        address: Address,
-        match_required: StoreMatch,
-    ) -> Result<(), StoreError> {
-        if !self.exists(repository, address, match_required).await? {
-            return Err(StoreError::from(AddressNotFound::from(address)));
-        }
-
-        Ok(())
-    }
-
-    async fn exists(
-        &self,
-        repository: Context,
-        address: Address,
-        match_requested: StoreMatch,
-    ) -> Result<bool, StoreError> {
-        if match_requested == StoreMatch::MatchNone {
-            return Ok(false);
-        }
-
-        let key = FragmentsEntry::new(repository, address);
-
-        match match_requested {
-            StoreMatch::MatchFull => self.exists_exact(&key).await,
-            StoreMatch::MatchPartition => self.exists_repository(&key).await,
-            StoreMatch::MatchHash => self.exists_hash(&key).await,
-            StoreMatch::MatchNone => Ok(false),
-        }.inspect(|matched| {
-            if !matched {
-                debug!("Fragment does not exist for repository: {repository} and address: {address} with match required: {match_requested:?}.");
-            }
-        })
-    }
-
-    // Performs an existence check for a batch of addresses at the `MatchFull` level. This means we
-    // can use `BatchGetItem` to reduce the number of Dynamo calls we need to have in flight at
-    // once.
-    async fn exist_batch_exact(
-        &self,
-        repository: Context,
+        partition: Partition,
         addresses: &[Address],
-    ) -> Result<Vec<StoreMatch>, StoreError> {
-        let mut items = Vec::with_capacity(addresses.len());
+    ) -> Result<HashSet<Address>, StoreError> {
+        let distinct: HashSet<Address> = addresses.iter().copied().collect();
+        if distinct.is_empty() {
+            return Ok(HashSet::new());
+        }
 
-        let mut address_index_map = HashMap::new();
-
-        for (pos, address) in addresses.iter().enumerate() {
-            let address = *address;
-
-            address_index_map.insert(address, pos);
-
-            let entry = FragmentsEntry::new(repository, address);
+        let mut items = Vec::with_capacity(distinct.len());
+        for address in &distinct {
+            let entry = FragmentsEntry::new(partition, *address);
             items.push(serde_dynamo::to_item(&entry).map_err(|e| {
-                warn!(
-                    "Failed to convert fragment entry: {entry:?} to dynamo attribute value map: {e:?}",
-                );
-                StoreError::internal_with_context(e, "Failed to serialize fragment entry for DynamoDB batch lookup")
+                warn!("Failed to serialize fragment entry {entry:?} for resolve: {e:?}");
+                StoreError::internal_with_context(e, "Failed to serialize fragment entry")
             })?);
         }
 
         let output = self
             .dynamodb
-            .batch_get_item(
-                &self.fragments_table_name,
-                items,
-                true, /* consistent read */
-            )
+            .batch_get_item(&self.fragments_table_name, items, true)
             .await
-            .map_err(|err| {
-                warn!("DynamoDb batch exists failed: {err:?}");
-                if matches!(&err, AwsError::AwsSdkError(_)) {
+            .map_err(|e| {
+                warn!("DynamoDb association resolve failed: {e:?}");
+                if is_dynamodb_overloaded(&e) {
                     StoreError::from(SlowDown)
                 } else {
-                    warn!("DynamoDb batch exists failed addresses: {addresses:?}");
-                    StoreError::internal_with_context(err, "DynamoDB batch get items failed")
+                    StoreError::internal_with_context(e, "DynamoDB batch get items failed")
                 }
             })?;
 
-        let mut result: Vec<StoreMatch> = addresses.iter().map(|_| StoreMatch::MatchNone).collect();
-
+        let mut present = HashSet::with_capacity(output.len());
         for item in output {
             match serde_dynamo::from_item::<HashMap<String, AttributeValue>, FragmentsEntry>(item) {
-                Ok(entry) => match address_index_map.get(&((&entry).into())) {
-                    Some(pos) => result[*pos] = StoreMatch::MatchFull,
-                    None => {
-                        warn!(
-                            "Found entry in batch get item result that didn't exist in the input addresses? {entry:?}"
-                        );
-                    }
-                },
-                Err(e) => {
-                    warn!("Failed to convert dynamo item to fragments entry: {e:?}");
+                Ok(entry) => {
+                    present.insert((&entry).into());
                 }
+                Err(e) => warn!("Failed to convert dynamo item to fragments entry: {e:?}"),
             }
         }
 
-        Ok(result)
+        Ok(present)
     }
 
-    // Performs an existence check for a batch of addresses at either the `MatchHash` or
-    // `MatchPartition` level. Any other value for `match_requested` will result in an error. This
-    // method will perform individual DynamoDb queries for each provided address, limiting the
-    // number of submitted tasks via a `TaskQueue` with a submission limit in place in order to
-    // enforce an upper bound on memory usage when checking the existence of a large number of
-    // fragments concurrently.
-    async fn exist_batch_inexact(
-        &self,
-        repository: Context,
-        addresses: &[Address],
-        match_requested: StoreMatch,
-    ) -> Result<Vec<StoreMatch>, StoreError> {
-        if matches!(
-            match_requested,
-            StoreMatch::MatchNone | StoreMatch::MatchFull
-        ) {
-            warn!("Invalid match requested for exist_batch_internal: {match_requested:?}");
-            return Err(StoreError::internal(
-                "Invalid match type for batch inexact exist (must be Hash or Repository)",
-            ));
-        }
-
-        let mut join_set = JoinSet::new();
-
-        let dynamodb = self.dynamodb.clone();
-        for (pos, address) in addresses.iter().enumerate() {
-            let dynamodb = dynamodb.clone();
-            let address = *address;
-
-            let table_name = self.fragments_table_name.clone();
-            let task = async move {
-                match match_requested {
-                    StoreMatch::MatchPartition => dynamodb.query_single(
-                        &table_name,
-                        FragmentsQuery::Repository(address.hash, repository),
-                    ),
-                    StoreMatch::MatchHash => dynamodb.query_single(
-                        &table_name,
-                        FragmentsQuery::Hash(address.hash),
-                    ),
-                    _ => {
-                        // We've already checked for the other match types above, so we should never
-                        // reach this
-                        error!("Invalid match requested: {match_requested:?}");
-                        unreachable!();
-                    }
-                }.await
-                    .map(|output| (pos, if output.count > 0 { match_requested } else { StoreMatch::MatchNone }))
-                    .map_err(|e| {
-                        warn!(
-                            "DynamoDb query for fragment entry by hash and repo failed for repository: {repository} and address: {address}: {e:?}"
-                        );
-                        if matches!(&e, AwsError::AwsSdkError(_)) {
-                            (pos, StoreError::from(SlowDown))
-                        } else {
-                            (pos, StoreError::internal_with_context(e, "DynamoDB query for batch inexact exist failed"))
-                        }
-                    })
-            }.in_current_span();
-
-            lore_base::lore_spawn!(
-                join_set,
-                self.task_queue
-                    .submit(Box::pin(task))
-                    .await
-                    .map_err(|err| {
-                        lore_warn!("Task queue error: {err}");
-                        StoreError::internal_with_context(
-                            err,
-                            "Failed to submit batch inexact exist task",
-                        )
-                    })?
-                    .in_current_span()
-            );
-        }
-
-        let mut output: Vec<StoreMatch> = addresses.iter().map(|_| StoreMatch::MatchNone).collect();
-
-        while let Some(join_result) = join_set.join_next().await {
-            if let Err(e) = join_result {
-                warn!("Failed to join exist batch task, falling back to no match {e:?}");
-                continue;
-            }
-
-            let result = join_result.unwrap().map_err(|e| {
-                // If the task queue itself failed, something has gone terribly wrong.
-                error!("TaskQueue failure: {e:?}");
-                StoreError::internal_with_context(
-                    e,
-                    "Failed to process batch inexact exist results",
-                )
-            })?;
-
-            match result {
-                Ok((pos, m)) => output[pos] = m,
-                Err((pos, e)) => {
-                    // If an individual check failed, log the error and continue on, using the
-                    // default `MatchNone` that was prepopulated for the index.
-                    warn!(
-                        "Failed to check existence for address {} in repository {repository}: {e:?}",
-                        addresses[pos]
-                    );
-                }
-            }
-        }
-
-        Ok(output)
-    }
-
-    async fn lookup(
-        &self,
-        repository: Context,
-        address: Address,
-        match_requested: StoreMatch,
-    ) -> Result<StoreMatch, StoreError> {
-        let mut match_requested = match_requested;
-        let mut exists = self.exists(repository, address, match_requested).await?;
-
-        // If a full match was requested but not found, short circuit. Since we do not currently
-        // support partial uploads there's no benefit to checking to see if a match exists at any
-        // other granularity.
-        // TODO(jcohen): If we decide to re-add support for partial uploads, this will need to be
-        //  removed.
-        if !exists && match_requested == StoreMatch::MatchFull {
-            return Ok(StoreMatch::MatchNone);
-        }
-
-        while !exists && match_requested.prev().is_some() {
-            match_requested = match_requested.prev().unwrap();
-            exists = self.exists(repository, address, match_requested).await?;
-        }
-
-        Ok(if exists {
-            match_requested
-        } else {
-            StoreMatch::MatchNone
-        })
-    }
-
+    /// A full match or nothing. This store reads no wider than the exact association, so there is
+    /// no weaker level for a miss to fall back to.
     /// Resolve an address to the fragment stored for it, without transferring the payload.
     ///
     /// An obliterated hash needs no special case: obliteration deletes the object, so the head
@@ -901,38 +642,29 @@ impl AwsImmutableStore {
     /// reference to it does.
     async fn do_query(
         &self,
-        repository: Context,
+        partition: Partition,
         address: Address,
-        match_requested: StoreMatch,
-    ) -> Result<(QueryResultSource, StoreQueryResult), StoreError> {
-        let (match_made, state) = tokio::join!(
-            self.lookup(repository, address, match_requested),
+    ) -> Result<(QueryResultSource, StoreGetData), StoreError> {
+        let (associated, state) = tokio::join!(
+            self.exists(partition, address),
             self.load_state(address.hash)
         );
 
-        let match_made = match_made?;
-        let miss = Ok((
-            QueryResultSource::State,
-            StoreQueryResult {
-                fragment: Fragment::default(),
-                match_made: StoreMatch::MatchNone,
-            },
-        ));
+        let miss = Ok((QueryResultSource::State, StoreGetData::default()));
 
-        if match_made == StoreMatch::MatchNone {
+        if !associated? {
             return miss;
         }
+
+        let match_made = StoreMatch::MatchFull;
 
         match state? {
             Some(FragmentState::Stored) => Ok((
                 QueryResultSource::State,
-                StoreQueryResult {
-                    fragment: stored_durable(Fragment::default()),
-                    match_made,
-                },
+                StoreGetData::metadata(stored_durable(Fragment::default()), match_made, partition),
             )),
             Some(FragmentState::Obliterating | FragmentState::Obliterated) => {
-                debug!("Query found obliterated fragment at address {address}");
+                trace!("Query found obliterated fragment at address {address}");
                 miss
             }
             None => {
@@ -948,20 +680,19 @@ impl AwsImmutableStore {
                             let fragment = stored_durable(fragment);
                             Ok((
                                 QueryResultSource::LegacyMetadata(fragment),
-                                StoreQueryResult {
-                                    fragment,
-                                    match_made,
-                                },
+                                StoreGetData::metadata(fragment, match_made, partition),
                             ))
                         }
                         FragmentState::Obliterating | FragmentState::Obliterated => {
-                            debug!("Query found obliterated legacy fragment at address {address}");
+                            trace!("Query found obliterated legacy fragment at address {address}");
                             miss
                         }
                     };
                 }
 
-                debug!("Query found an association at {address} with no stored payload");
+                self.association_without_state_counter
+                    .add(1, &self.labels_association_without_state);
+                trace!("Query found an association at {address} with no stored payload");
                 miss
             }
         }
@@ -1157,10 +888,10 @@ impl AwsImmutableStore {
 
     async fn associate_fragment(
         &self,
-        repository: Context,
+        partition: Partition,
         address: Address,
     ) -> Result<(), StoreError> {
-        let entry = FragmentsEntry::new(repository, address);
+        let entry = FragmentsEntry::new(partition, address);
 
         let item = serde_dynamo::to_item(&entry).map_err(|e| {
             warn!("Failed to convert fragment entry: {entry:?} to dynamo attribute value map: {e}");
@@ -1172,7 +903,7 @@ impl AwsImmutableStore {
 
         self.dynamodb.put_item(&self.fragments_table_name, item).await
             .map_err(|e| {
-                warn!({REPOSITORY_ID} = %repository, {ADDRESS} = %address, error = ?e, "Failed to put item while storing fragment association");
+                warn!({REPOSITORY_ID} = %partition, {ADDRESS} = %address, error = ?e, "Failed to put item while storing fragment association");
                 if matches!(&e, AwsError::AwsSdkError(_)) {
                     StoreError::from(SlowDown)
                 } else {
@@ -1181,6 +912,122 @@ impl AwsImmutableStore {
             })?;
 
         Ok(())
+    }
+
+    /// The lifecycle state of each distinct hash among `addresses`, where a row exists.
+    ///
+    /// One request for the batch rather than one per hash: the state table is keyed by hash alone,
+    /// which is the whole reason it is a separate table.
+    async fn states_for(
+        &self,
+        addresses: &[Address],
+    ) -> Result<HashMap<Hash, FragmentState>, StoreError> {
+        let distinct: HashSet<Hash> = addresses.iter().map(|address| address.hash).collect();
+        if distinct.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut items = Vec::with_capacity(distinct.len());
+        for hash in &distinct {
+            items.push(
+                serde_dynamo::to_item(FragmentStateEntry::key(*hash)).map_err(|e| {
+                    warn!("Failed to serialize fragment state entry for {hash}: {e:?}");
+                    StoreError::internal_with_context(e, "Failed to serialize fragment state entry")
+                })?,
+            );
+        }
+
+        let output = self
+            .dynamodb
+            .batch_get_item(&self.fragment_state_table_name, items, true)
+            .await
+            .map_err(|e| {
+                warn!("DynamoDb fragment state resolve failed: {e:?}");
+                if is_dynamodb_overloaded(&e) {
+                    StoreError::from(SlowDown)
+                } else {
+                    StoreError::internal_with_context(e, "DynamoDB batch get items failed")
+                }
+            })?;
+
+        let mut states = HashMap::with_capacity(output.len());
+        for item in output {
+            match serde_dynamo::from_item::<HashMap<String, AttributeValue>, FragmentStateEntry>(
+                item,
+            ) {
+                Ok(entry) => {
+                    states.insert(entry.hash, entry.state());
+                }
+                Err(e) => warn!("Failed to convert dynamo item to fragment state entry: {e:?}"),
+            }
+        }
+
+        Ok(states)
+    }
+
+    /// The state of each hash that still lives only in the legacy metadata table, read in one
+    /// request rather than one per hash.
+    ///
+    /// A fragment written before the state table existed has no state row, and its lifecycle lives
+    /// in the flags of its metadata row instead. Without this an address stored in that era resolves
+    /// to absence, and a push would ask a client to upload content it does not have and the store
+    /// already holds.
+    async fn legacy_states_for(
+        &self,
+        hashes: &[Hash],
+    ) -> Result<HashMap<Hash, FragmentState>, StoreError> {
+        let Some(table_name) = self.fragment_metadata_table_name.as_ref() else {
+            return Ok(HashMap::new());
+        };
+
+        // `BatchGetItem` rejects a request carrying the same key twice, and a batch may well name
+        // one hash under two contexts.
+        let distinct: HashSet<Hash> = hashes.iter().copied().collect();
+        if distinct.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut items = Vec::with_capacity(distinct.len());
+        for hash in &distinct {
+            items.push(
+                serde_dynamo::to_item(FragmentStateEntry::key(*hash)).map_err(|e| {
+                    warn!("Failed to serialize legacy fragment key for {hash}: {e:?}");
+                    StoreError::internal_with_context(
+                        e,
+                        "Failed to serialize fragment entry for legacy metadata load",
+                    )
+                })?,
+            );
+        }
+
+        let output = self
+            .dynamodb
+            .batch_get_item(table_name, items, true /* consistent read */)
+            .await
+            .map_err(|e| {
+                warn!("DynamoDb legacy fragment metadata batch read failed: {e:?}");
+                if is_dynamodb_overloaded(&e) {
+                    StoreError::from(SlowDown)
+                } else {
+                    StoreError::internal_with_context(e, "DynamoDB batch get items failed")
+                }
+            })?;
+
+        let mut states = HashMap::with_capacity(output.len());
+        for item in output {
+            match serde_dynamo::from_item::<HashMap<String, AttributeValue>, FragmentMetadataEntry>(
+                item,
+            ) {
+                Ok(entry) => {
+                    if let Some(fragment) = entry.fragment {
+                        states.insert(entry.hash, FragmentState::from_bits(fragment.flags));
+                    }
+                }
+                Err(e) => warn!("Failed to convert dynamo item to legacy metadata entry: {e:?}"),
+            }
+        }
+
+        Ok(states)
     }
 
     async fn has_associations(&self, hash: Hash) -> Result<bool, StoreError> {
@@ -1205,10 +1052,10 @@ impl AwsImmutableStore {
 
     async fn delete_association(
         &self,
-        repository: Context,
+        partition: Partition,
         address: Address,
     ) -> Result<(), StoreError> {
-        let entry = FragmentsEntry::new(repository, address);
+        let entry = FragmentsEntry::new(partition, address);
 
         let item = serde_dynamo::to_item(&entry).map_err(|e| {
             warn!("Failed to convert fragment entry: {entry:?} to dynamo attribute value map: {e}");
@@ -1222,7 +1069,7 @@ impl AwsImmutableStore {
             .delete_item(&self.fragments_table_name, item)
             .await
             .map_err(|e| {
-                warn!("Failed to delete fragment association for repository: {repository} and address: {address}: {e:?}");
+                warn!("Failed to delete fragment association for partition: {partition} and address: {address}: {e:?}");
                 if matches!(&e, AwsError::AwsSdkError(_)) {
                     StoreError::from(SlowDown)
                 } else {
@@ -1235,7 +1082,7 @@ impl AwsImmutableStore {
 
     async fn write_payload(
         &self,
-        repository: Context,
+        partition: Partition,
         address: Address,
         fragment: Fragment,
         payload: Bytes,
@@ -1259,7 +1106,7 @@ impl AwsImmutableStore {
             .put_object(
                 self.bucket.as_str(),
                 hash,
-                payload.to_vec(),
+                payload,
                 Some(to_object_metadata(&fragment)),
             )
             .await
@@ -1288,7 +1135,7 @@ impl AwsImmutableStore {
             }
         }
 
-        self.associate_fragment(repository, address).await?;
+        self.associate_fragment(partition, address).await?;
 
         Ok(())
     }
@@ -1305,7 +1152,7 @@ impl AwsImmutableStore {
             .map(|output| {
                 output
                     .versions
-                    .map(|v| v.iter().map(|v| v.version_id.clone()).collect())
+                    .map(|versions| versions.into_iter().map(|v| v.version_id).collect())
             })
             .map_err(|e| {
                 warn!("Failed to list versions for hash: {hash}: {e:?}");
@@ -1529,7 +1376,17 @@ impl AwsImmutableStore {
 
         let fragment = from_object_metadata(output.metadata());
 
-        let mut buffer = BytesMut::with_capacity(FRAGMENT_SIZE_THRESHOLD);
+        // Clamped because the length is the response's claim, and a fragment cannot exceed the
+        // threshold.
+        let capacity = output
+            .content_length()
+            .and_then(|length| usize::try_from(length).ok())
+            .filter(|length| *length > 0)
+            .map_or(FRAGMENT_SIZE_THRESHOLD, |length| {
+                length.min(FRAGMENT_SIZE_THRESHOLD)
+            });
+
+        let mut buffer = BytesMut::with_capacity(capacity);
         let mut read = 0_usize;
         while let Some(bytes) = output.body.next().await {
             let bytes = bytes.map_err(|e| {
@@ -1618,7 +1475,7 @@ impl AwsImmutableStore {
     /// present to be read and nothing can be adding references beneath it.
     async fn obliterate_sub_fragments(
         self: Arc<Self>,
-        repository: Context,
+        partition: Partition,
         address: Address,
         stats: Arc<StoreObliterateStats>,
     ) -> Result<(), StoreError> {
@@ -1657,7 +1514,7 @@ impl AwsImmutableStore {
                 join_set,
                 async move {
                     self_clone
-                        .obliterate(repository.into(), sub_address, stats)
+                        .obliterate(partition, sub_address, stats)
                         .await
                         .map_err(|e| (sub_address, e))
                 }
@@ -1694,68 +1551,101 @@ impl AwsImmutableStore {
 
 #[async_trait]
 impl ImmutableStoreTrait for AwsImmutableStore {
-    #[lore_macro::lore_instrument]
-    #[tracing::instrument(name= "AwsImmutableStore::exists" skip(self))]
-    async fn exist(
-        self: Arc<Self>,
-        partition: Partition,
-        address: Address,
-        match_requested: StoreMatch,
-    ) -> Result<StoreMatch, StoreError> {
-        let repository: Context = partition.into();
-        timed!(self.latency_histogram, &self.labels_exist, {
-            if self.exists(repository, address, match_requested).await? {
-                Ok(match_requested)
-            } else {
-                Ok(StoreMatch::MatchNone)
-            }
-        })
-        .into()
+    /// Durable storage for every tenant at once, so a payload is only ever served to the partition
+    /// that holds an association for it.
+    fn isolates_partitions(&self) -> bool {
+        true
     }
 
+    /// Two batch reads, issued together: the associations this partition holds, and the lifecycle
+    /// state of each hash. What they yield resolves without a third:
+    ///
+    /// | state | association | reported |
+    /// |---|---|---|
+    /// | not `Stored` | either | `MatchNone` |
+    /// | `Stored` | present | `MatchFull` |
+    /// | `Stored` | absent | `MatchNone` |
+    ///
+    /// The associations alone carry that much because of how they are written: a put adds the
+    /// association last, after the payload and the state are in place, and an obliteration deletes
+    /// it first. A visible association therefore already means retrievable content.
+    ///
+    /// The last row reports less than the truth rather than claiming the partition holds no such
+    /// hash. Telling an unassociated hash apart from an absent one costs a `Query` per address, and
+    /// this store declines to spend it — so it never reports `MatchPartition` either. A caller
+    /// reads the weaker answer as "no shortcut available", and in the usual deployment a cache in
+    /// front of this store supplies the partition match instead.
+    ///
+    /// State is read only while the legacy metadata table is configured, and it is what makes
+    /// obliteration bind for content written before the state table existed.
     #[lore_macro::lore_instrument]
-    async fn exist_batch(
-        self: Arc<Self>,
-        partition: Partition,
-        addresses: &[Address],
-        match_requested: StoreMatch,
-    ) -> Result<Vec<StoreMatch>, StoreError> {
-        let repository: Context = partition.into();
-        timed!(self.latency_histogram, &self.labels_exist_batch, {
-            match match_requested {
-                StoreMatch::MatchNone => {
-                    Ok(addresses.iter().map(|_| StoreMatch::MatchNone).collect())
-                }
-                StoreMatch::MatchHash | StoreMatch::MatchPartition => {
-                    // We cannot use Dynamo batch gets for these, so must fall back to performing
-                    // individual prefix queries
-                    self.exist_batch_inexact(repository, addresses, match_requested)
-                        .await
-                }
-                StoreMatch::MatchFull => self.exist_batch_exact(repository, addresses).await,
-            }
-        })
-        .into()
-    }
-
-    #[lore_macro::lore_instrument]
-    #[tracing::instrument(name= "AwsImmutableStore::query" skip(self))]
+    #[tracing::instrument(name = "AwsImmutableStore::resolve" skip(self))]
     async fn query(
         self: Arc<Self>,
         partition: Partition,
-        address: Address,
-        match_requested: StoreMatch,
-    ) -> Result<StoreQueryResult, StoreError> {
-        let repository: Context = partition.into();
-        timed!(self.latency_histogram, &self.labels_query, {
-            let (_, query_result) =
-                Box::pin(self.do_query(repository, address, match_requested)).await?;
-            Ok(query_result)
-        })
-        .into()
+        addresses: &[Address],
+        results: &mut [StoreMatchResult],
+    ) -> Result<(), StoreError> {
+        debug_assert_eq!(addresses.len(), results.len());
+
+        // Neither read needs what the other returns.
+        let (associations, states) = if self.fragment_metadata_table_name.is_some() {
+            let (associations, states) = tokio::join!(
+                self.associations_present(partition, addresses),
+                self.states_for(addresses)
+            );
+            (associations?, Some(states?))
+        } else {
+            (self.associations_present(partition, addresses).await?, None)
+        };
+
+        // This one has to wait: which hashes it asks about is whatever the two reads above left
+        // unresolved.
+        let legacy_states = match states.as_ref() {
+            Some(states) => {
+                let pending: Vec<Hash> = addresses
+                    .iter()
+                    .filter(|address| {
+                        associations.contains(address) && !states.contains_key(&address.hash)
+                    })
+                    .map(|address| address.hash)
+                    .collect();
+                self.legacy_states_for(&pending).await?
+            }
+            None => HashMap::new(),
+        };
+
+        for (address, result) in addresses.iter().zip(results.iter_mut()) {
+            if !associations.contains(address) {
+                *result = StoreMatchResult::default();
+                continue;
+            }
+
+            if let Some(states) = states.as_ref() {
+                let state = states
+                    .get(&address.hash)
+                    .or_else(|| legacy_states.get(&address.hash))
+                    .copied();
+
+                if !matches!(state, Some(FragmentState::Stored)) {
+                    *result = StoreMatchResult::default();
+                    continue;
+                }
+            }
+
+            *result = StoreMatchResult {
+                match_made: StoreMatch::MatchFull,
+                // This store isolates, so it only ever matches inside the partition asked about.
+                partition,
+                stored_local: false,
+                stored_durable: true,
+            };
+        }
+
+        Ok(())
     }
 
-    /// Unlike [`AwsImmutableStore::query`], this reads the object to report the representation
+    /// Unlike [`AwsImmutableStore::resolve`], this reads the object to report the representation
     /// actually stored, which costs a `HeadObject`. It transfers no body, and it is the only path
     /// in this store that spends an S3 request purely on metadata.
     #[lore_macro::lore_instrument]
@@ -1764,16 +1654,13 @@ impl ImmutableStoreTrait for AwsImmutableStore {
         self: Arc<Self>,
         partition: Partition,
         address: Address,
-    ) -> Result<StoreQueryResult, StoreError> {
-        let repository: Context = partition.into();
+    ) -> Result<StoreGetData, StoreError> {
         timed!(self.latency_histogram, &self.labels_get_metadata, {
-            let miss = StoreQueryResult {
-                fragment: Fragment::default(),
-                match_made: StoreMatch::MatchNone,
-            };
+            let miss = StoreGetData::default();
 
-            let (query_source, query_result) =
-                Box::pin(self.do_query(repository, address, StoreMatch::MatchFull)).await?;
+            // One resolution, because this store's read scope is the exact association: there is
+            // no wider level for a miss to fall back to.
+            let (query_source, query_result) = Box::pin(self.do_query(partition, address)).await?;
             let match_made = query_result.match_made;
 
             if match_made == StoreMatch::MatchNone {
@@ -1781,15 +1668,13 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             }
 
             match query_source {
-                QueryResultSource::LegacyMetadata(fragment) => Ok(StoreQueryResult {
-                    fragment,
-                    match_made,
-                }),
+                // A legacy fragment carried its whole representation in the metadata row, so the
+                // `HeadObject` that would describe it has nothing to add and no object to read.
+                QueryResultSource::LegacyMetadata(fragment) => {
+                    Ok(StoreGetData::metadata(fragment, match_made, partition))
+                }
                 QueryResultSource::State => match self.head_fragment(address.hash).await {
-                    Ok(fragment) => Ok(StoreQueryResult {
-                        fragment,
-                        match_made,
-                    }),
+                    Ok(fragment) => Ok(StoreGetData::metadata(fragment, match_made, partition)),
                     Err(e) if e.is_address_not_found() => {
                         self.report_missing_payload(address).await;
                         Ok(miss)
@@ -1807,14 +1692,12 @@ impl ImmutableStoreTrait for AwsImmutableStore {
         self: Arc<Self>,
         partition: Partition,
         address: Address,
-        match_required: StoreMatch,
-    ) -> Result<(Fragment, Bytes), StoreError> {
-        let repository: Context = partition.into();
+    ) -> Result<StoreGetData, StoreError> {
         let result: Result<(Fragment, Bytes), StoreError> =
             timed!(self.latency_histogram, &self.labels_get, {
                 // Run both futures concurrently. The select! loop breaks as soon as exists resolves.
                 // If load finishes first its result is stashed, and we keep waiting for exists check.
-                let exists_fut = self.ensure_exists(repository, address, match_required);
+                let exists_fut = self.exists(partition, address);
                 let load_fut = self.load(address.hash);
                 tokio::pin!(exists_fut, load_fut);
 
@@ -1829,7 +1712,9 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 };
                 // If exists failed, its error is returned here; load_fut is dropped (canceled) on the
                 // early return. Exists error takes priority over any load error.
-                exists_result?;
+                if !exists_result? {
+                    return Err(StoreError::from(AddressNotFound::from(address)));
+                }
 
                 let load_output = match load_result {
                     Some(r) => r,
@@ -1849,7 +1734,12 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             .into();
         let (fragment, payload) = result?;
         lore_storage::validate_fragment_payload(&fragment, payload.len())?;
-        Ok((fragment, payload))
+        Ok(StoreGetData {
+            fragment,
+            match_made: StoreMatch::MatchFull,
+            partition,
+            payload: Some(payload),
+        })
     }
 
     #[lore_macro::lore_instrument]
@@ -1869,20 +1759,20 @@ impl ImmutableStoreTrait for AwsImmutableStore {
         } else {
             lore_storage::validate_fragment_size(&fragment)?;
         }
-        let repository: Context = partition.into();
         timed!(self.latency_histogram, &self.labels_put, {
             let probe = if self.force_write {
                 (None, false)
             } else {
-                let entry = FragmentsEntry::new(repository, address);
-                let (associated, state) =
-                    tokio::join!(self.exists_exact(&entry), self.load_state(address.hash));
+                let (associated, state) = tokio::join!(
+                    self.exists(partition, address),
+                    self.load_state(address.hash)
+                );
                 (state?, associated?)
             };
 
             match probe {
                 (Some(FragmentState::Obliterating), _) => {
-                    info!(
+                    debug!(
                         "Received request to put fragment at {address} that is in the process of \
                          being obliterated"
                     );
@@ -1892,7 +1782,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 (Some(FragmentState::Stored), true) => Ok(()),
 
                 (Some(FragmentState::Stored), false) if payload.is_some() => {
-                    self.associate_fragment(repository, address).await
+                    self.associate_fragment(partition, address).await
                 }
 
                 (Some(FragmentState::Stored), false) => {
@@ -1901,7 +1791,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
 
                 _ => match payload {
                     Some(payload) => {
-                        self.write_payload(repository, address, fragment, payload)
+                        self.write_payload(partition, address, fragment, payload)
                             .await
                     }
                     None => Err(StoreError::internal("Payload buffer required")),
@@ -1919,7 +1809,6 @@ impl ImmutableStoreTrait for AwsImmutableStore {
         address: Address,
         stats: Arc<StoreObliterateStats>,
     ) -> Result<(), StoreError> {
-        let repository: Context = partition.into();
         timed!(self.latency_histogram, &self.labels_obliterate, {
             // Note: given the importance of the work done here, and how relatively infrequently we
             // expect this to be invoked, the log output in this method is intentionally very verbose.
@@ -1939,6 +1828,15 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 return Ok(());
             }
 
+            // The reference goes first, because that is the obligation: once this returns, this
+            // partition does not name the content. Everything after it is reclamation.
+            self.delete_association(partition, address)
+                .instrument(span.clone())
+                .await?;
+            stats
+                .num_fragments
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
             self.advance_state(
                 address.hash,
                 FragmentState::Stored,
@@ -1948,12 +1846,13 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             .await?;
             info!("Acquired obliteration mark for {address}");
 
-            self.delete_association(repository, address)
+            // Again, now the mark is up: a writer that raced the first delete recreated the
+            // association while the hash still looked live, and would otherwise outlive the
+            // obliteration. One that associates after this point sees the mark and is turned away,
+            // or is re-storing content of its own - which is a new write, not this one surviving.
+            self.delete_association(partition, address)
                 .instrument(span.clone())
                 .await?;
-            stats
-                .num_fragments
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             tokio::time::sleep(self.obliteration_drain).await;
 
@@ -1978,7 +1877,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             }
 
             self.clone()
-                .obliterate_sub_fragments(repository, address, stats.clone())
+                .obliterate_sub_fragments(partition, address, stats.clone())
                 .instrument(span.clone())
                 .await?;
 
@@ -2015,8 +1914,6 @@ impl ImmutableStoreTrait for AwsImmutableStore {
         // local-flag bookkeeping that `durable` controls is irrelevant here.
         _durable: bool,
     ) -> Result<(), StoreError> {
-        let source_repository: Context = source_partition.into();
-        let destination_repository: Context = destination_partition.into();
         // The destination tuple shares the source's hash but takes the caller's chosen context
         // — that is the only field the storage trait allows the caller to pivot on a copy.
         let destination_address = Address {
@@ -2024,15 +1921,11 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             context: destination_context,
         };
         timed!(self.latency_histogram, &self.labels_copy, {
-            let match_made = self
-                .lookup(source_repository, source_address, StoreMatch::MatchFull)
-                .await?;
-
-            if match_made != StoreMatch::MatchFull {
+            if !self.exists(source_partition, source_address).await? {
                 return Err(StoreError::from(AddressNotFound::from(source_address)));
             }
 
-            self.associate_fragment(destination_repository, destination_address)
+            self.associate_fragment(destination_partition, destination_address)
                 .await
         })
         .into()
@@ -2355,14 +2248,18 @@ mod test {
             receiver
         }
 
-        fn add_association(&self, repository: Context, address: Address) {
-            let entry = FragmentsEntry::new(repository, address);
+        fn has_association(&self, partition: Partition, address: Address) -> bool {
+            let entry = FragmentsEntry::new(partition, address);
+            self.lock()
+                .associations
+                .contains_key(&(entry.hash.data().to_vec(), entry.partition_context.to_vec()))
+        }
+
+        fn add_association(&self, partition: Partition, address: Address) {
+            let entry = FragmentsEntry::new(partition, address);
             let item: HashMap<String, AttributeValue> = serde_dynamo::to_item(&entry).unwrap();
             self.lock().associations.insert(
-                (
-                    entry.hash.data().to_vec(),
-                    entry.repository_context.to_vec(),
-                ),
+                (entry.hash.data().to_vec(), entry.partition_context.to_vec()),
                 item,
             );
         }
@@ -2377,12 +2274,12 @@ mod test {
         let mut dynamodb = MockDynamoDb::default();
 
         let f = fake.clone();
-        s3.expect_put_object::<Vec<u8>>()
+        s3.expect_put_object()
             .returning(move |_, key, body, metadata| {
                 let mut storage = f.lock();
                 storage.objects.insert(
                     key.as_bytes().to_vec(),
-                    (body, metadata.unwrap_or_default()),
+                    (body.to_vec(), metadata.unwrap_or_default()),
                 );
 
                 if let Some((hash, state)) = storage.race_state.take() {
@@ -2484,7 +2381,7 @@ mod test {
                 } else {
                     storage
                         .associations
-                        .get(&(blob(&item, "hash"), blob(&item, "repository_context")))
+                        .get(&(blob(&item, "hash"), blob(&item, FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE)))
                         .cloned()
                 };
 
@@ -2494,16 +2391,28 @@ mod test {
         let f = fake.clone();
         dynamodb
             .expect_batch_get_item()
-            .returning(move |_, keys, _| {
+            .returning(move |table, keys, _| {
                 let storage = f.lock();
 
+                // Routed by table, like the single-item read above. Reading the state table - and
+                // the legacy metadata table behind it - in one request each is what lets resolution
+                // consult lifecycle state once per batch rather than once per address.
                 Ok(keys
                     .iter()
                     .filter_map(|key| {
-                        storage
-                            .associations
-                            .get(&(blob(key, "hash"), blob(key, "repository_context")))
-                            .cloned()
+                        if &**table == FRAGMENT_STATE_TABLE_NAME {
+                            storage.state.get(&blob(key, "hash")).cloned()
+                        } else if &**table == FRAGMENT_METADATA_TABLE_NAME {
+                            storage.legacy_metadata.get(&blob(key, "hash")).cloned()
+                        } else {
+                            storage
+                                .associations
+                                .get(&(
+                                    blob(key, "hash"),
+                                    blob(key, FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE),
+                                ))
+                                .cloned()
+                        }
                     })
                     .collect())
             });
@@ -2521,7 +2430,10 @@ mod test {
                 storage.state.insert(blob(&item, "hash"), item);
             } else {
                 storage.associations.insert(
-                    (blob(&item, "hash"), blob(&item, "repository_context")),
+                    (
+                        blob(&item, "hash"),
+                        blob(&item, FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE),
+                    ),
                     item,
                 );
             }
@@ -2591,9 +2503,10 @@ mod test {
             if &**table == FRAGMENT_STATE_TABLE_NAME {
                 storage.state.remove(&blob(&item, "hash"));
             } else {
-                storage
-                    .associations
-                    .remove(&(blob(&item, "hash"), blob(&item, "repository_context")));
+                storage.associations.remove(&(
+                    blob(&item, "hash"),
+                    blob(&item, FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE),
+                ));
                 if let Some(deleted) = storage.association_deleted.take() {
                     let _ = deleted.send(());
                 }
@@ -2610,20 +2523,12 @@ mod test {
             }
 
             let storage = f.lock();
-            let count = match query {
-                FragmentsQuery::Hash(hash) | FragmentsQuery::HashCount(hash) => storage
-                    .associations
-                    .keys()
-                    .filter(|(stored, _)| stored == hash.data())
-                    .count(),
-                FragmentsQuery::Repository(hash, repository) => storage
-                    .associations
-                    .keys()
-                    .filter(|(stored, repository_context)| {
-                        stored == hash.data() && repository_context.starts_with(repository.data())
-                    })
-                    .count(),
-            };
+            let FragmentsQuery::HashCount(hash) = query;
+            let count = storage
+                .associations
+                .keys()
+                .filter(|(stored, _)| stored == hash.data())
+                .count();
 
             Ok(QueryOutput::builder()
                 .count(i32::try_from(count).unwrap())
@@ -2683,7 +2588,6 @@ mod test {
             s3: S3StoreSettings::new(BUCKET.to_string()),
             dynamodb: dynamodb_settings,
             force_write,
-            batch_exist_submission_limit: 1000,
         };
 
         let execution = setup_execution("test".to_string());
@@ -2726,7 +2630,6 @@ mod test {
             s3: S3StoreSettings::new(BUCKET.to_string()),
             dynamodb: dynamodb_settings,
             force_write: false,
-            batch_exist_submission_limit: 1000,
         };
 
         let execution = setup_execution("test".to_string());
@@ -2760,18 +2663,12 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         store(&fake)
             .await
-            .put(
-                repository.into(),
-                address,
-                fragment,
-                Some(payload.clone()),
-                false,
-            )
+            .put(partition, address, fragment, Some(payload.clone()), false)
             .await
             .expect("put should succeed");
 
@@ -2788,31 +2685,19 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         let store = store(&fake).await;
         store
             .clone()
-            .put(
-                repository.into(),
-                address,
-                fragment,
-                Some(payload.clone()),
-                false,
-            )
+            .put(partition, address, fragment, Some(payload.clone()), false)
             .await
             .expect("first put should succeed");
 
         let (other, other_payload) = representation(FragmentFlags::PayloadCompressedLZ4, 96, 256);
         store
-            .put(
-                repository.into(),
-                address,
-                other,
-                Some(other_payload),
-                false,
-            )
+            .put(partition, address, other, Some(other_payload), false)
             .await
             .expect("second put should succeed");
 
@@ -2912,25 +2797,20 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         let store = store(&fake).await;
         store
             .clone()
-            .put(
-                repository.into(),
-                address,
-                fragment,
-                Some(payload.clone()),
-                false,
-            )
+            .put(partition, address, fragment, Some(payload.clone()), false)
             .await
             .expect("put should succeed");
 
         let (loaded, bytes) = store
-            .get(repository.into(), address, StoreMatch::MatchFull)
+            .get(partition, address)
             .await
+            .and_then(lore_storage::StoreGetData::into_payload)
             .expect("get should succeed");
 
         assert_eq!(bytes, payload);
@@ -2953,30 +2833,26 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         let store = store(&fake).await;
         store
             .clone()
-            .put(repository.into(), address, fragment, Some(payload), false)
+            .put(partition, address, fragment, Some(payload), false)
             .await
             .expect("put should succeed");
 
-        let result = store
-            .query(repository.into(), address, StoreMatch::MatchFull)
+        let result = query_one(&(store as Arc<dyn ImmutableStoreTrait>), partition, address)
             .await
-            .expect("query should succeed");
+            .expect("resolve should succeed");
 
         assert_eq!(result.match_made, StoreMatch::MatchFull);
-        assert_eq!(
-            result.fragment.flags & FragmentFlags::PayloadStoredDurable,
-            FragmentFlags::PayloadStoredDurable
-        );
+        assert!(result.stored_durable);
         assert_eq!(
             fake.object_reads(),
             0,
-            "query must not touch S3; it is called once per fragment on the ingress write path"
+            "resolve must not touch S3; it is called once per fragment on the ingress write path"
         );
     }
 
@@ -2989,18 +2865,18 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         let store = store(&fake).await;
         store
             .clone()
-            .put(repository.into(), address, fragment, Some(payload), false)
+            .put(partition, address, fragment, Some(payload), false)
             .await
             .expect("put should succeed");
 
         let result = store
-            .get_metadata(repository.into(), address)
+            .get_metadata(partition, address)
             .await
             .expect("get_metadata should succeed");
 
@@ -3030,12 +2906,12 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
-        let (fragment, _) = preexisting_object(&fake, repository, address);
+        let partition: Partition = random();
+        let (fragment, _) = preexisting_object(&fake, partition, address);
 
         let result = migrated_store(&fake)
             .await
-            .get_metadata(repository.into(), address)
+            .get_metadata(partition, address)
             .await
             .expect("get_metadata should succeed");
 
@@ -3062,23 +2938,63 @@ mod test {
         assert_eq!(fake.object_reads(), 0, "a miss must not reach S3");
     }
 
+    /// The ordering the single-read existence path rests on: the association is written last, so
+    /// nothing can observe one whose content is not already stored and published.
     #[tokio::test]
-    async fn query_reports_a_miss_when_no_state_row_exists() {
+    async fn a_put_associates_only_after_publishing_the_state() {
         let fake = Fake::default();
         let address = Address {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
-        fake.add_association(repository, address);
-
-        let result = store(&fake)
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(partition, address, fragment, Some(payload), false)
             .await
-            .query(repository.into(), address, StoreMatch::MatchFull)
+            .expect("put should succeed");
+
+        assert_eq!(fake.state_of(address.hash), Some(FragmentState::Stored));
+        assert!(fake.has_association(partition, address));
+    }
+
+    /// Obliteration drops the reference before it marks the hash, because the reference is the
+    /// obligation and the mark is only bookkeeping for the reclamation that follows.
+    #[tokio::test]
+    async fn obliterate_deletes_the_association_before_marking_the_hash() {
+        let fake = Fake::default();
+        let address = Address {
+            hash: random(),
+            context: random(),
+        };
+        let partition: Partition = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(partition, address, fragment, Some(payload), false)
+            .await
+            .expect("put should succeed");
+
+        store
+            .clone()
+            .obliterate(
+                partition,
+                address,
+                Arc::new(StoreObliterateStats::default()),
+            )
+            .await
+            .expect("obliterate should succeed");
+
+        assert!(!fake.has_association(partition, address));
+
+        let result = query_one(&(store as Arc<dyn ImmutableStoreTrait>), partition, address)
             .await
             .expect("query should succeed");
-
         assert_eq!(result.match_made, StoreMatch::MatchNone);
     }
 
@@ -3089,12 +3005,12 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         store(&fake)
             .await
-            .put(repository.into(), address, fragment, Some(payload), false)
+            .put(partition, address, fragment, Some(payload), false)
             .await
             .expect("put should succeed");
 
@@ -3103,7 +3019,7 @@ mod test {
         store_with(&fake, true, false)
             .await
             .put(
-                repository.into(),
+                partition,
                 address,
                 replacement,
                 Some(replacement_payload.clone()),
@@ -3148,12 +3064,16 @@ mod test {
 
     /// Sets up an object as it was stored before the fragment moved onto it: bare bytes in S3, the
     /// fragment in a table row.
-    fn preexisting_object(fake: &Fake, repository: Context, address: Address) -> (Fragment, Bytes) {
+    fn preexisting_object(
+        fake: &Fake,
+        partition: Partition,
+        address: Address,
+    ) -> (Fragment, Bytes) {
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         fake.put_object_without_metadata(address.hash, payload.as_ref());
         fake.set_fragment_metadata_row(address.hash, fragment);
-        fake.add_association(repository, address);
+        fake.add_association(partition, address);
 
         (fragment, payload)
     }
@@ -3165,13 +3085,14 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
-        let (fragment, payload) = preexisting_object(&fake, repository, address);
+        let partition: Partition = random();
+        let (fragment, payload) = preexisting_object(&fake, partition, address);
 
         let (loaded, bytes) = migrated_store(&fake)
             .await
-            .get(repository.into(), address, StoreMatch::MatchFull)
+            .get(partition, address)
             .await
+            .and_then(lore_storage::StoreGetData::into_payload)
             .expect("an object written before the cut-over must still be readable");
 
         assert_eq!(bytes, payload);
@@ -3192,17 +3113,19 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
-        preexisting_object(&fake, repository, address);
+        let partition: Partition = random();
+        preexisting_object(&fake, partition, address);
 
-        let result = migrated_store(&fake)
-            .await
-            .query(repository.into(), address, StoreMatch::MatchFull)
-            .await
-            .expect("query should succeed");
+        let result = query_one(
+            &(migrated_store(&fake).await as Arc<dyn ImmutableStoreTrait>),
+            partition,
+            address,
+        )
+        .await
+        .expect("resolve should succeed");
 
         assert_eq!(result.match_made, StoreMatch::MatchFull);
-        assert_eq!(fake.object_reads(), 0, "query must not touch S3");
+        assert_eq!(fake.object_reads(), 0, "resolve must not touch S3");
     }
 
     /// A deployment that never wrote an object without metadata should not go looking for a row
@@ -3214,12 +3137,12 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
-        preexisting_object(&fake, repository, address);
+        let partition: Partition = random();
+        preexisting_object(&fake, partition, address);
 
         store(&fake)
             .await
-            .get(repository.into(), address, StoreMatch::MatchFull)
+            .get(partition, address)
             .await
             .expect_err("without a legacy table configured there is nothing to fall back to");
     }
@@ -3234,16 +3157,16 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         fake.put_object_with_damaged_metadata(address.hash, payload.as_ref());
         fake.set_fragment_metadata_row(address.hash, fragment);
-        fake.add_association(repository, address);
+        fake.add_association(partition, address);
 
         migrated_store(&fake)
             .await
-            .get(repository.into(), address, StoreMatch::MatchFull)
+            .get(partition, address)
             .await
             .expect_err("a damaged object must not be described by a legacy row");
     }
@@ -3261,15 +3184,17 @@ mod test {
                 hash: random(),
                 context: random(),
             };
-            let repository: Context = random();
-            fake.add_association(repository, address);
+            let partition: Partition = random();
+            fake.add_association(partition, address);
             // No state row, no legacy metadata row.
 
-            let result = store_with_separate_metadata_table(&fake)
-                .await
-                .query(repository.into(), address, StoreMatch::MatchFull)
-                .await
-                .expect("query should succeed even when no row is found");
+            let result = query_one(
+                &(store_with_separate_metadata_table(&fake).await as Arc<dyn ImmutableStoreTrait>),
+                partition,
+                address,
+            )
+            .await
+            .expect("query should succeed even when no row is found");
 
             assert_eq!(result.match_made, StoreMatch::MatchNone);
         }
@@ -3284,29 +3209,87 @@ mod test {
                 hash: random(),
                 context: random(),
             };
-            let repository: Context = random();
+            let partition: Partition = random();
             let obliterated = Fragment {
                 flags: FragmentFlags::PayloadObliterated.bits(),
                 size_payload: 64,
                 size_content: 256,
             };
 
-            fake.add_association(repository, address);
+            fake.add_association(partition, address);
             fake.set_legacy_metadata_row(address.hash, obliterated);
             // No state row — the obliteration bit lives only in the legacy metadata flags.
 
-            let result = store_with_separate_metadata_table(&fake)
-                .await
-                .query(repository.into(), address, StoreMatch::MatchFull)
-                .await
-                .expect("query should succeed");
+            let result = query_one(
+                &(store_with_separate_metadata_table(&fake).await as Arc<dyn ImmutableStoreTrait>),
+                partition,
+                address,
+            )
+            .await
+            .expect("query should succeed");
 
             assert_eq!(result.match_made, StoreMatch::MatchNone);
         }
 
+        /// What a push actually calls: one batch holding a legacy fragment, a current one and an
+        /// address the store does not have. Each must resolve on its own terms, and the legacy rows
+        /// must be read together rather than one round trip at a time.
+        #[tokio::test]
+        async fn query_resolves_a_batch_mixing_legacy_and_current_fragments() {
+            let fake = Fake::default();
+            let partition: Partition = random();
+            let (fragment, _) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+            let legacy = Address {
+                hash: random(),
+                context: random(),
+            };
+            fake.add_association(partition, legacy);
+            fake.set_legacy_metadata_row(legacy.hash, fragment);
+
+            let current = Address {
+                hash: random(),
+                context: random(),
+            };
+            fake.add_association(partition, current);
+            fake.set_state(current.hash, FragmentState::Stored);
+
+            let obliterated = Address {
+                hash: random(),
+                context: random(),
+            };
+            fake.add_association(partition, obliterated);
+            fake.set_state(obliterated.hash, FragmentState::Obliterated);
+
+            let absent = Address {
+                hash: random(),
+                context: random(),
+            };
+
+            let addresses = [legacy, current, obliterated, absent];
+            let mut results = [StoreMatchResult::default(); 4];
+            store_with_separate_metadata_table(&fake)
+                .await
+                .query(partition, &addresses, &mut results)
+                .await
+                .expect("query should succeed");
+
+            assert_eq!(
+                results.map(|result| result.match_made),
+                [
+                    StoreMatch::MatchFull,
+                    StoreMatch::MatchFull,
+                    StoreMatch::MatchNone,
+                    StoreMatch::MatchNone
+                ],
+                "a legacy fragment and a current one both resolve, an obliterated one does not, \
+                 and an address the store never had does not"
+            );
+        }
+
         /// A fragment stored before the state table existed: an association exists, no state row,
         /// but the metadata table holds the legacy fragment description. `query` must report a
-        /// match — the new `None` branch in `do_query` exists precisely for this scenario.
+        /// match — the legacy fallback exists precisely for this scenario.
         #[tokio::test]
         async fn query_matches_a_legacy_fragment_with_no_state_row() {
             let fake = Fake::default();
@@ -3314,18 +3297,20 @@ mod test {
                 hash: random(),
                 context: random(),
             };
-            let repository: Context = random();
+            let partition: Partition = random();
             let (fragment, _) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
-            fake.add_association(repository, address);
+            fake.add_association(partition, address);
             fake.set_legacy_metadata_row(address.hash, fragment);
             // No state row — `load_state` returns `Ok(None)`.
 
-            let result = store_with_separate_metadata_table(&fake)
-                .await
-                .query(repository.into(), address, StoreMatch::MatchFull)
-                .await
-                .expect("a legacy fragment with no state row must be queryable");
+            let result = query_one(
+                &(store_with_separate_metadata_table(&fake).await as Arc<dyn ImmutableStoreTrait>),
+                partition,
+                address,
+            )
+            .await
+            .expect("a legacy fragment with no state row must be queryable");
 
             assert_eq!(result.match_made, StoreMatch::MatchFull);
         }
@@ -3345,19 +3330,19 @@ mod test {
                 hash: random(),
                 context: random(),
             };
-            let repository: Context = random();
+            let partition: Partition = random();
             let (mut fragment, payload) =
                 representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
             fragment.flags |= FragmentFlags::PayloadDoNotReplicate;
 
-            fake.add_association(repository, address);
+            fake.add_association(partition, address);
             fake.set_legacy_metadata_row(address.hash, fragment);
             fake.put_object_without_metadata(address.hash, payload.as_ref());
             // No state row — `do_query` returns `QueryResultSource::LegacyMetadata`.
 
             let result = store_with_separate_metadata_table(&fake)
                 .await
-                .get_metadata(repository.into(), address)
+                .get_metadata(partition, address)
                 .await
                 .expect("get_metadata must succeed for a legacy fragment");
 
@@ -3391,17 +3376,17 @@ mod test {
                 hash: random(),
                 context: random(),
             };
-            let repository: Context = random();
+            let partition: Partition = random();
             let (_, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
-            fake.add_association(repository, address);
+            fake.add_association(partition, address);
             fake.set_state(address.hash, FragmentState::Stored);
             fake.put_object_without_metadata(address.hash, payload.as_ref());
             // No metadata row — `fragment_from_metadata_table` returns `Ok(None)`.
 
             store_with_separate_metadata_table(&fake)
                 .await
-                .get_metadata(repository.into(), address)
+                .get_metadata(partition, address)
                 .await
                 .expect_err("an object with no S3 metadata and no legacy row must not be returned");
         }
@@ -3415,10 +3400,10 @@ mod test {
                 hash: random(),
                 context: random(),
             };
-            let repository: Context = random();
+            let partition: Partition = random();
             let (_, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
-            fake.add_association(repository, address);
+            fake.add_association(partition, address);
             fake.set_state(address.hash, FragmentState::Stored);
             fake.put_object_without_metadata(address.hash, payload.as_ref());
             // No legacy row — `fragment_from_metadata_table` returns `Ok(None)`, which
@@ -3426,7 +3411,7 @@ mod test {
 
             store_with_separate_metadata_table(&fake)
                 .await
-                .get(repository.into(), address, StoreMatch::MatchFull)
+                .get(partition, address)
                 .await
                 .expect_err("an object with no S3 metadata and no legacy row must not be returned");
         }
@@ -3441,19 +3426,13 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         let store = store(&fake).await;
         store
             .clone()
-            .put(
-                repository.into(),
-                address,
-                fragment,
-                Some(payload.clone()),
-                false,
-            )
+            .put(partition, address, fragment, Some(payload.clone()), false)
             .await
             .expect("put should succeed");
 
@@ -3461,7 +3440,7 @@ mod test {
 
         let error = store
             .clone()
-            .get(repository.into(), address, StoreMatch::MatchFull)
+            .get(partition, address)
             .await
             .expect_err("a lost payload reads as not found");
         assert!(error.is_address_not_found());
@@ -3474,13 +3453,7 @@ mod test {
 
         store
             .clone()
-            .put(
-                repository.into(),
-                address,
-                fragment,
-                Some(payload.clone()),
-                false,
-            )
+            .put(partition, address, fragment, Some(payload.clone()), false)
             .await
             .expect("re-put should succeed");
 
@@ -3488,8 +3461,9 @@ mod test {
         assert_eq!(fake.state_of(address.hash), Some(FragmentState::Stored));
 
         let (_, restored) = store
-            .get(repository.into(), address, StoreMatch::MatchFull)
+            .get(partition, address)
             .await
+            .and_then(lore_storage::StoreGetData::into_payload)
             .expect("the payload should be readable again");
         assert_eq!(restored, payload);
     }
@@ -3503,20 +3477,20 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         let store = store(&fake).await;
         store
             .clone()
-            .put(repository.into(), address, fragment, Some(payload), false)
+            .put(partition, address, fragment, Some(payload), false)
             .await
             .expect("put should succeed");
 
         fake.lose_object(address.hash);
 
         let result = store
-            .get_metadata(repository.into(), address)
+            .get_metadata(partition, address)
             .await
             .expect("a lost payload reports a miss");
 
@@ -3537,13 +3511,13 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         let store = store(&fake).await;
         store
             .clone()
-            .put(repository.into(), address, fragment, Some(payload), false)
+            .put(partition, address, fragment, Some(payload), false)
             .await
             .expect("put should succeed");
 
@@ -3551,7 +3525,7 @@ mod test {
         fake.set_state(address.hash, FragmentState::Obliterating);
 
         store
-            .get(repository.into(), address, StoreMatch::MatchFull)
+            .get(partition, address)
             .await
             .expect_err("a lost payload reads as not found");
 
@@ -3569,14 +3543,14 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         fake.set_state(address.hash, FragmentState::Obliterated);
 
         store(&fake)
             .await
-            .put(repository.into(), address, fragment, Some(payload), false)
+            .put(partition, address, fragment, Some(payload), false)
             .await
             .expect("re-upload over a tombstone is allowed");
 
@@ -3586,10 +3560,10 @@ mod test {
     }
 
     /// Store a fragmented parent whose payload is a list of references to `leaves`, all under one
-    /// repository and context so obliteration walks from the parent into each leaf.
+    /// partition and context so obliteration walks from the parent into each leaf.
     async fn store_fragmented(
         store: &Arc<AwsImmutableStore>,
-        repository: Context,
+        partition: Partition,
         context: Context,
         leaves: &[Hash],
     ) -> Address {
@@ -3604,7 +3578,7 @@ mod test {
             store
                 .clone()
                 .put(
-                    repository.into(),
+                    partition,
                     Address {
                         hash: *hash,
                         context,
@@ -3639,7 +3613,7 @@ mod test {
 
         store
             .clone()
-            .put(repository.into(), parent, fragment, Some(payload), false)
+            .put(partition, parent, fragment, Some(payload), false)
             .await
             .expect("parent put should succeed");
 
@@ -3649,16 +3623,16 @@ mod test {
     #[tokio::test]
     async fn obliterate_recurses_into_sub_fragments() {
         let fake = Fake::default();
-        let repository: Context = random();
+        let partition: Partition = random();
         let context: Context = random();
         let leaves = [random::<Hash>(), random::<Hash>()];
 
         let store = store(&fake).await;
-        let parent = store_fragmented(&store, repository, context, &leaves).await;
+        let parent = store_fragmented(&store, partition, context, &leaves).await;
 
         let stats = Arc::new(StoreObliterateStats::default());
         store
-            .obliterate(repository.into(), parent, stats.clone())
+            .obliterate(partition, parent, stats.clone())
             .await
             .expect("obliterate should succeed");
 
@@ -3687,13 +3661,13 @@ mod test {
     #[tokio::test]
     async fn obliterate_keeps_a_sub_fragment_another_partition_references() {
         let fake = Fake::default();
-        let repository: Context = random();
+        let partition: Partition = random();
         let context: Context = random();
         let shared = random::<Hash>();
         let leaves = [shared, random::<Hash>()];
 
         let store = store(&fake).await;
-        let parent = store_fragmented(&store, repository, context, &leaves).await;
+        let parent = store_fragmented(&store, partition, context, &leaves).await;
 
         let other = Address {
             hash: shared,
@@ -3713,11 +3687,7 @@ mod test {
             .expect("second partition put should succeed");
 
         store
-            .obliterate(
-                repository.into(),
-                parent,
-                Arc::new(StoreObliterateStats::default()),
-            )
+            .obliterate(partition, parent, Arc::new(StoreObliterateStats::default()))
             .await
             .expect("obliterate should succeed");
 
@@ -3741,19 +3711,15 @@ mod test {
     #[tokio::test]
     async fn obliterate_reads_the_reference_list_before_deleting_the_parent() {
         let fake = Fake::default();
-        let repository: Context = random();
+        let partition: Partition = random();
         let context: Context = random();
         let leaves = [random::<Hash>()];
 
         let store = store(&fake).await;
-        let parent = store_fragmented(&store, repository, context, &leaves).await;
+        let parent = store_fragmented(&store, partition, context, &leaves).await;
 
         store
-            .obliterate(
-                repository.into(),
-                parent,
-                Arc::new(StoreObliterateStats::default()),
-            )
+            .obliterate(partition, parent, Arc::new(StoreObliterateStats::default()))
             .await
             .expect("obliterate should succeed");
 
@@ -3770,19 +3736,19 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         let store = store(&fake).await;
         store
             .clone()
-            .put(repository.into(), address, fragment, Some(payload), false)
+            .put(partition, address, fragment, Some(payload), false)
             .await
             .expect("put should succeed");
 
         let stats = Arc::new(StoreObliterateStats::default());
         store
-            .obliterate(repository.into(), address, stats.clone())
+            .obliterate(partition, address, stats.clone())
             .await
             .expect("obliterate should succeed");
 
@@ -3808,40 +3774,24 @@ mod test {
             hash,
             context: random(),
         };
-        let repository: Context = random();
-        let other_repository: Context = random();
+        let partition: Partition = random();
+        let other_partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         let store = store(&fake).await;
         store
             .clone()
-            .put(
-                repository.into(),
-                mine,
-                fragment,
-                Some(payload.clone()),
-                false,
-            )
+            .put(partition, mine, fragment, Some(payload.clone()), false)
             .await
             .expect("put should succeed");
         store
             .clone()
-            .put(
-                other_repository.into(),
-                theirs,
-                fragment,
-                Some(payload),
-                false,
-            )
+            .put(other_partition, theirs, fragment, Some(payload), false)
             .await
             .expect("second put should succeed");
 
         store
-            .obliterate(
-                repository.into(),
-                mine,
-                Arc::new(StoreObliterateStats::default()),
-            )
+            .obliterate(partition, mine, Arc::new(StoreObliterateStats::default()))
             .await
             .expect("obliterate should succeed");
 
@@ -3930,14 +3880,14 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
-        preexisting_object(&fake, repository, address);
+        let partition: Partition = random();
+        preexisting_object(&fake, partition, address);
 
         let store = migrated_store(&fake).await;
         fake.fail(Fault::StateRead);
 
         let error = store
-            .get(repository.into(), address, StoreMatch::MatchFull)
+            .get(partition, address)
             .await
             .expect_err("the metadata read is throttled");
 
@@ -3990,20 +3940,14 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         fake.fail(Fault::AssociationWrite);
 
         store(&fake)
             .await
-            .put(
-                repository.into(),
-                address,
-                fragment,
-                Some(payload.clone()),
-                false,
-            )
+            .put(partition, address, fragment, Some(payload.clone()), false)
             .await
             .expect_err("the association write fails");
 
@@ -4016,7 +3960,7 @@ mod test {
         recovered.put_object_without_metadata(address.hash, payload.as_ref());
         store(&recovered)
             .await
-            .put(repository.into(), address, fragment, Some(payload), false)
+            .put(partition, address, fragment, Some(payload), false)
             .await
             .expect("a retry associates without re-uploading");
         assert_eq!(recovered.association_count(address.hash), 1);
@@ -4031,13 +3975,13 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         let store = store(&fake).await;
         store
             .clone()
-            .put(repository.into(), address, fragment, Some(payload), false)
+            .put(partition, address, fragment, Some(payload), false)
             .await
             .expect("put should succeed");
 
@@ -4045,7 +3989,7 @@ mod test {
 
         store
             .obliterate(
-                repository.into(),
+                partition,
                 address,
                 Arc::new(StoreObliterateStats::default()),
             )
@@ -4071,13 +4015,13 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         let store = store(&fake).await;
         store
             .clone()
-            .put(repository.into(), address, fragment, Some(payload), false)
+            .put(partition, address, fragment, Some(payload), false)
             .await
             .expect("put should succeed");
 
@@ -4085,7 +4029,7 @@ mod test {
 
         store
             .obliterate(
-                repository.into(),
+                partition,
                 address,
                 Arc::new(StoreObliterateStats::default()),
             )
@@ -4110,13 +4054,13 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         let store = store(&fake).await;
         store
             .clone()
-            .put(repository.into(), address, fragment, Some(payload), false)
+            .put(partition, address, fragment, Some(payload), false)
             .await
             .expect("put should succeed");
 
@@ -4124,7 +4068,7 @@ mod test {
 
         store
             .obliterate(
-                repository.into(),
+                partition,
                 address,
                 Arc::new(StoreObliterateStats::default()),
             )
@@ -4142,21 +4086,17 @@ mod test {
     #[tokio::test]
     async fn obliterate_fails_when_a_sub_fragment_fails() {
         let fake = Fake::default();
-        let repository: Context = random();
+        let partition: Partition = random();
         let context: Context = random();
         let leaves = [random::<Hash>(), random::<Hash>()];
 
         let store = store(&fake).await;
-        let parent = store_fragmented(&store, repository, context, &leaves).await;
+        let parent = store_fragmented(&store, partition, context, &leaves).await;
 
         fake.fail(Fault::ObjectDelete);
 
         store
-            .obliterate(
-                repository.into(),
-                parent,
-                Arc::new(StoreObliterateStats::default()),
-            )
+            .obliterate(partition, parent, Arc::new(StoreObliterateStats::default()))
             .await
             .expect_err("a sub-fragment failure must fail the parent");
 
@@ -4172,13 +4112,13 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         let store = store(&fake).await;
         store
             .clone()
-            .put(repository.into(), address, fragment, Some(payload), false)
+            .put(partition, address, fragment, Some(payload), false)
             .await
             .expect("put should succeed");
 
@@ -4186,7 +4126,7 @@ mod test {
         fake.fail(Fault::StateDelete);
 
         let error = store
-            .get(repository.into(), address, StoreMatch::MatchFull)
+            .get(partition, address)
             .await
             .expect_err("the payload is gone");
 
@@ -4207,14 +4147,14 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         fake.obliterate_during_upload(address.hash, FragmentState::Obliterating);
 
         let error = store(&fake)
             .await
-            .put(repository.into(), address, fragment, Some(payload), false)
+            .put(partition, address, fragment, Some(payload), false)
             .await
             .expect_err("an obliteration holds the hash by the time the put publishes");
 
@@ -4243,14 +4183,14 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         fake.obliterate_during_upload(address.hash, FragmentState::Obliterated);
 
         store(&fake)
             .await
-            .put(repository.into(), address, fragment, Some(payload), false)
+            .put(partition, address, fragment, Some(payload), false)
             .await
             .expect("re-upload over a tombstone is allowed");
 
@@ -4269,19 +4209,19 @@ mod test {
             hash,
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         let store = store(&fake).await;
         store
             .clone()
-            .put(repository.into(), mine, fragment, Some(payload), false)
+            .put(partition, mine, fragment, Some(payload), false)
             .await
             .expect("put should succeed");
 
         let deleted = fake.association_deleted();
         let injector = fake.clone();
-        let racing_repository: Context = random();
+        let racing_partition: Partition = random();
         let racing = Address {
             hash,
             context: random(),
@@ -4291,15 +4231,11 @@ mod test {
             deleted
                 .await
                 .expect("the obliteration must delete its association");
-            injector.add_association(racing_repository, racing);
+            injector.add_association(racing_partition, racing);
         });
 
         store
-            .obliterate(
-                repository.into(),
-                mine,
-                Arc::new(StoreObliterateStats::default()),
-            )
+            .obliterate(partition, mine, Arc::new(StoreObliterateStats::default()))
             .await
             .expect("obliterate should succeed");
 
@@ -4330,31 +4266,19 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         let store = store(&fake).await;
         store
             .clone()
-            .put(
-                repository.into(),
-                source,
-                fragment,
-                Some(payload.clone()),
-                false,
-            )
+            .put(partition, source, fragment, Some(payload.clone()), false)
             .await
             .expect("put should succeed");
 
         let destination_context: Context = random();
         store
-            .copy(
-                repository.into(),
-                source,
-                repository.into(),
-                destination_context,
-                true,
-            )
+            .copy(partition, source, partition, destination_context, true)
             .await
             .expect("copy should succeed");
 
@@ -4374,17 +4298,11 @@ mod test {
             hash: random(),
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
 
         store(&fake)
             .await
-            .copy(
-                repository.into(),
-                source,
-                repository.into(),
-                random::<Context>(),
-                true,
-            )
+            .copy(partition, source, partition, random::<Context>(), true)
             .await
             .expect_err("nothing to copy");
 
@@ -4401,13 +4319,13 @@ mod test {
             hash,
             context: random(),
         };
-        let repository: Context = random();
+        let partition: Partition = random();
         let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
 
         let store = store(&fake).await;
         store
             .clone()
-            .put(repository.into(), stored, fragment, Some(payload), false)
+            .put(partition, stored, fragment, Some(payload), false)
             .await
             .expect("put should succeed");
 
@@ -4417,9 +4335,9 @@ mod test {
         };
         store
             .copy(
-                repository.into(),
+                partition,
                 other_context,
-                repository.into(),
+                partition,
                 random::<Context>(),
                 true,
             )
@@ -4432,7 +4350,7 @@ mod test {
     #[tokio::test]
     async fn exist_batch_reports_a_match_per_address_in_order() {
         let fake = Fake::default();
-        let repository: Context = random();
+        let partition: Partition = random();
         let absent = Address {
             hash: random(),
             context: random(),
@@ -4448,30 +4366,22 @@ mod test {
             };
             store
                 .clone()
-                .put(
-                    repository.into(),
-                    address,
-                    fragment,
-                    Some(payload.clone()),
-                    false,
-                )
+                .put(partition, address, fragment, Some(payload.clone()), false)
                 .await
                 .expect("put should succeed");
             stored.push(address);
         }
 
-        let results = store
-            .exist_batch(
-                repository.into(),
-                &[stored[0], absent, stored[1]],
-                StoreMatch::MatchFull,
-            )
+        let addresses = [stored[0], absent, stored[1]];
+        let mut results = [StoreMatchResult::default(); 3];
+        store
+            .query(partition, &addresses, &mut results)
             .await
-            .expect("exist_batch should succeed");
+            .expect("resolve should succeed");
 
         assert_eq!(
-            results,
-            vec![
+            results.map(|result| result.match_made),
+            [
                 StoreMatch::MatchFull,
                 StoreMatch::MatchNone,
                 StoreMatch::MatchFull
@@ -4509,11 +4419,11 @@ mod test {
                     hash,
                     context: random(),
                 };
-                let repository: Context = random();
+                let partition: Partition = random();
 
                 lore_base::lore_spawn!(writers, async move {
                     store
-                        .put(repository.into(), address, fragment, Some(payload), false)
+                        .put(partition, address, fragment, Some(payload), false)
                         .await
                 });
             }
@@ -4551,5 +4461,32 @@ mod test {
                 "the bytes must be the ones the winning writer uploaded, not a mix"
             );
         }
+    }
+
+    /// The store contract, checked against this store the same way it is checked against every
+    /// other one.
+    ///
+    /// Note what this does *not* catch. `exist` resolves against the associations table alone while
+    /// `query` also reads the fragment state table, so the two run through different resolutions
+    /// and only one of them knows about obliteration — but the battery reaches no case where they
+    /// actually disagree, because a completed obliteration deletes the association as well, and
+    /// storing content back over a tombstone does not leave the two answering differently. The
+    /// divergence is structural rather than currently reachable, which is an argument for having
+    /// one resolution instead of two, not for calling it a live defect.
+    #[tokio::test]
+    async fn satisfies_the_immutable_store_contract() {
+        let fake = Fake::default();
+        let store = store(&fake).await;
+
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                lore_storage::conformance::verify_immutable_store(
+                    store,
+                    lore_storage::conformance::Capabilities::new("AwsImmutableStore"),
+                )
+                .await;
+            })
+            .await;
     }
 }

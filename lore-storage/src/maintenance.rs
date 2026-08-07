@@ -413,12 +413,9 @@ mod tests {
 
         let (_frag, payload) = store
             .clone()
-            .get(
-                partition,
-                address,
-                crate::store_types::StoreMatch::MatchHash,
-            )
+            .get(partition, address)
             .await
+            .and_then(crate::store_types::StoreGetData::into_payload)
             .expect("non-durable fragment must survive GC");
         assert_eq!(payload.len(), data.len());
     }

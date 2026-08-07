@@ -9,6 +9,7 @@ use lore_base::types::TypedBytes;
 use lore_revision::lore::RepositoryId;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreMatch;
+use lore_storage::StoreMatchResult;
 use lore_transport::quic::storage_service::QueryStatus;
 use tracing::debug;
 
@@ -48,6 +49,12 @@ impl Query {
     }
 }
 
+/// The one place a resolved level is turned into something a client is told.
+///
+/// Both client-facing protocols land here - the QUIC message and the gRPC v1 handler - so the
+/// collapse that keeps one tenant from learning about another's content is applied once, in the
+/// `match` below, rather than restated per protocol. Anything that starts answering `Query`
+/// without coming through here has to bring the rule with it.
 pub async fn handle_query(
     address: &Bytes,
     repository: RepositoryId,
@@ -56,19 +63,21 @@ pub async fn handle_query(
     let address_count = address.count::<Address>();
     debug!("Handling Query request to find {address_count} fragments in repository: {repository}");
 
+    let addresses = address.as_type_slice::<Address>();
+    let mut resolved = vec![StoreMatchResult::default(); addresses.len()];
+    immutable_store
+        .query(repository, addresses, &mut resolved)
+        .await?;
+
     Ok(LoreResponse::Query(QueryResponse {
         results: Bytes::from(
-            immutable_store
-                .exist_batch(
-                    repository,
-                    address.as_type_slice::<Address>(),
-                    StoreMatch::MatchFull,
-                )
-                .await?
+            resolved
                 .iter()
-                .map(|match_made| match match_made {
+                .map(|resolved| match resolved.match_made {
                     StoreMatch::MatchFull => QueryStatus::ExistFullMatch,
-                    StoreMatch::MatchPartition => QueryStatus::ExistHashMatch,
+                    StoreMatch::MatchPartition => QueryStatus::ExistPartitionMatch,
+                    // A hash the caller's partition does not hold is another tenant's content.
+                    // It collapses into absence rather than being reported one level down.
                     StoreMatch::MatchNone | StoreMatch::MatchHash => QueryStatus::NotFound,
                 } as u8)
                 .collect::<Vec<_>>(),
@@ -175,12 +184,74 @@ mod tests {
 
                 assert_eq!(
                     LoreResponse::Query(QueryResponse {
-                        results: Bytes::copy_from_slice(&[QueryStatus::ExistHashMatch as u8])
+                        results: Bytes::copy_from_slice(&[QueryStatus::ExistPartitionMatch as u8])
                     }),
                     Query {
                         address: Bytes::copy_from_slice(
                             address_with_random_context(address).as_bytes()
                         )
+                    }
+                    .handle(context_map, immutable_store)
+                    .await
+                    .unwrap()
+                );
+            })
+            .await;
+    }
+
+    /// The collapse rule, which is the reason this mapping exists in one place.
+    ///
+    /// Content stored by another partition resolves to a hash match in a store that does not
+    /// isolate, and reporting that back would tell this caller a hash it has no claim to exists
+    /// somewhere. It has to arrive as absence, indistinguishable from content nobody stored.
+    #[tokio::test]
+    async fn a_hash_held_only_by_another_partition_reports_absence() {
+        let stored_under = random::<RepositoryId>();
+        let asked_under = random::<RepositoryId>();
+
+        let context_map = Arc::new(AttributeMap::default());
+        context_map.insert(asked_under);
+
+        let (immutable_store, _mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let payload = Bytes::copy_from_slice(&random::<[u8; 32]>());
+                let hash = Hash::hash_buffer(payload.as_ref());
+                let address = Address {
+                    hash,
+                    context: random::<Context>(),
+                };
+
+                let fragment = Fragment {
+                    flags: 0,
+                    size_payload: payload.len() as u32,
+                    size_content: payload.len() as u64,
+                };
+
+                immutable_store
+                    .clone()
+                    .put(stored_under, address, fragment, Some(payload), false)
+                    .await
+                    .expect("Failed to write fragment");
+
+                // Without this the assertion below would pass on a store that simply found
+                // nothing, and would stop testing the collapse the day resolution changed.
+                let resolved = lore_storage::immutable_store::query_one(
+                    &immutable_store,
+                    asked_under,
+                    address,
+                )
+                .await
+                .expect("resolve should work");
+                assert_eq!(resolved.match_made, StoreMatch::MatchHash);
+
+                assert_eq!(
+                    LoreResponse::Query(QueryResponse {
+                        results: Bytes::copy_from_slice(&[QueryStatus::NotFound as u8])
+                    }),
+                    Query {
+                        address: Bytes::copy_from_slice(address.as_bytes())
                     }
                     .handle(context_map, immutable_store)
                     .await
@@ -275,7 +346,7 @@ mod tests {
 
                     let state: QueryStatus = result.into();
                     match state {
-                        QueryStatus::ExistHashMatch => immutable_store
+                        QueryStatus::ExistPartitionMatch => immutable_store
                             .clone()
                             .put(
                                 repository,

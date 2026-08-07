@@ -16,7 +16,6 @@ use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use tracing::Span;
 use tracing::debug;
 use tracing::info_span;
-use tracing::warn;
 use zerocopy::IntoBytes;
 
 use crate::protocol::replication_store::REPLICATION_SERVICE_USER_ID;
@@ -29,24 +28,26 @@ use crate::util::setup_execution;
 
 pub const BASE_REQUEST_SIZE: usize = size_of::<ReplicationHeader>() +
         size_of::<Address>() +
-        // match_required byte
+        // reserved byte
         1;
+
+/// The byte that used to carry the required match level. See
+/// [`crate::protocol::replication_store::exists_batch`] for why it stays.
+const RESERVED_MATCH_BYTE: u8 = StoreMatch::MatchFull as u8;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Get {
     pub header: ReplicationHeader,
     pub address: Address,
-    pub match_required: StoreMatch,
 }
 
 impl Get {
     pub fn to_quic_chunks(self) -> [Bytes; 4] {
-        let match_required_num: u8 = self.match_required.into();
         [
             Bytes::default(), // command header
             Bytes::from_owner(self.header),
             Bytes::from_owner(self.address),
-            Bytes::copy_from_slice(&[match_required_num]),
+            Bytes::copy_from_slice(&[RESERVED_MATCH_BYTE]),
         ]
     }
 
@@ -57,20 +58,9 @@ impl Get {
 
         let header: ReplicationHeader = bytes.split_to(size_of::<ReplicationHeader>()).into();
         let address: Address = bytes.split_to(size_of::<Address>()).into();
-        let match_required: StoreMatch = {
-            let raw_value = bytes[0];
-            bytes.advance(1);
-            raw_value.try_into().map_err(|error| {
-                warn!(?error, "failed to parse match_required");
-                MessageParseError::ParseFailure("Invalid match_required")
-            })?
-        };
+        bytes.advance(1); // reserved, see RESERVED_MATCH_BYTE
 
-        Ok(Get {
-            header,
-            address,
-            match_required,
-        })
+        Ok(Get { header, address })
     }
 }
 
@@ -144,12 +134,9 @@ impl RequestHandler for GetHandler {
         let (fragment, bytes) = LORE_CONTEXT
             .scope(execution, async move {
                 self.immutable_store
-                    .get(
-                        self.request.header.repository.into(),
-                        self.request.address,
-                        self.request.match_required,
-                    )
+                    .get(self.request.header.repository.into(), self.request.address)
                     .await
+                    .and_then(lore_storage::StoreGetData::into_payload)
             })
             .await?;
 
@@ -184,7 +171,6 @@ pub mod tests {
                     correlation_id: Uuid::new_v4(),
                     repository,
                 },
-                match_required: StoreMatch::MatchFull,
                 address,
             };
             let input_bytes = collapse_bytes_without_header(&input.clone().to_quic_chunks());
@@ -202,7 +188,6 @@ pub mod tests {
                     correlation_id: Uuid::new_v4(),
                     repository,
                 },
-                match_required: StoreMatch::MatchFull,
                 address: Address::default(),
             };
             let input_bytes = collapse_bytes_without_header(&input.to_quic_chunks());

@@ -77,7 +77,7 @@ async fn immutable_query_address(
 
     let result = repository
         .immutable_store()
-        .query(repository.id, address, StoreMatch::MatchFull)
+        .get_metadata(repository.id, address)
         .await
         .forward::<RepositoryError>("Unable to query immutable store")?;
     let has_local_payload = result.fragment.flags & FragmentFlags::PayloadStoredLocal != 0;
@@ -103,8 +103,9 @@ async fn immutable_query_address(
     if has_local_payload
         && let Ok((fragment, payload)) = repository
             .immutable_store()
-            .get(repository.id, address, result.match_made)
+            .get(repository.id, address)
             .await
+            .and_then(lore_storage::StoreGetData::into_payload)
             .forward::<RepositoryError>("Failed to validate payload in local store")
     {
         lore_debug!(
@@ -148,7 +149,7 @@ async fn immutable_query_address(
                     remote: 1,
                     status: match status {
                         QueryStatus::ExistFullMatch => 0,
-                        QueryStatus::ExistHashMatch => 1,
+                        QueryStatus::ExistPartitionMatch => 1,
                         QueryStatus::NotFound => 3,
                     },
                     payload: (fragment.size_payload != 0) as u8,

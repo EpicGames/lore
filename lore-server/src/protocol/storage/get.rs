@@ -12,8 +12,8 @@ use lore_base::types::FragmentFlags;
 use lore_revision::lore::RepositoryId;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
+use lore_storage::StoreGetData;
 use lore_storage::StoreMatch;
-use lore_storage::StoreQueryResult;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::tracing::fields::ADDRESS;
 use opentelemetry::metrics::Histogram;
@@ -125,14 +125,17 @@ pub async fn handle_get_metadata(
                 .get_metadata(repository, address)
                 .await
             {
-                Ok(StoreQueryResult {
+                Ok(StoreGetData {
                     mut fragment,
                     match_made,
+                    ..
                 }) => {
-                    // `query` reports a missing fragment as Ok with `match_made == MatchNone`
-                    // (and a partial match for less-strict lookups). Mirror `handle_get`'s
-                    // semantics: anything short of the requested MatchFull is NotFound.
-                    if match_made != StoreMatch::MatchFull {
+                    // A miss is reported as `Ok` with `MatchNone`, so absence is checked here
+                    // rather than caught as an error. Anything weaker than a full match is still a
+                    // match: the store already applied its own read scope, and refusing what it
+                    // was willing to describe would make this stricter than `handle_get`, which
+                    // serves whatever `get` returns.
+                    if match_made == StoreMatch::MatchNone {
                         info!({ADDRESS} = %address, "Did not find any fragment for address");
                         return Err(MessageHandleError::FragmentNotFound);
                     }
@@ -174,8 +177,9 @@ pub async fn handle_get(
     LORE_CONTEXT
         .scope(execution, async move {
             match immutable_store
-                .get(repository, address, StoreMatch::MatchFull)
+                .get(repository, address)
                 .await
+                .and_then(lore_storage::StoreGetData::into_payload)
             {
                 Ok((mut fragment, payload)) => {
                     debug!(

@@ -26,7 +26,7 @@ use crate::hash;
 use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
 use crate::options::ReadOptions;
-use crate::store_types::StoreMatch;
+use crate::store_types::StoreGetData;
 use crate::types::Address;
 use crate::types::Fragment;
 use crate::types::Partition;
@@ -42,12 +42,12 @@ fn store_retry() -> crate::Retry {
     )
 }
 
-/// Load a single raw fragment from store with retry backoff
+/// Load a single raw fragment from store with retry backoff. How widely the store searches for it
+/// is the store's own business - see [`ImmutableStore::read_scope`].
 pub async fn read_raw(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
-    match_required: StoreMatch,
 ) -> Result<(Fragment, Bytes), StorageError> {
     let mut retry = store_retry();
     loop {
@@ -55,7 +55,12 @@ pub async fn read_raw(
             !address.hash.is_zero(),
             "Cannot request zero hash from store"
         );
-        match store.clone().get(partition, address, match_required).await {
+        match store
+            .clone()
+            .get(partition, address)
+            .await
+            .and_then(StoreGetData::into_payload)
+        {
             Ok((fragment, payload)) => {
                 debug_assert!(
                     match hash::hash_fragment(fragment, payload.as_ref()) {
@@ -231,23 +236,10 @@ pub async fn load_fragment(
         Other,
     }
 
-    // Local load: try MatchFull first, fallback to MatchHash if not isolated. Callers that
-    // bind a handle to remote-only mode disable the local probe entirely via `options.local`.
+    // Callers that bind a handle to remote-only mode disable the local probe entirely via
+    // `options.local`.
     let decompress_result = if options.local {
-        let local_result =
-            match read_raw(store.clone(), partition, address, StoreMatch::MatchFull).await {
-                Ok((fragment, payload)) => Ok((fragment, payload)),
-                Err(ref err) if matches!(err, StorageError::AddressNotFound(_)) => {
-                    if !options.isolate {
-                        read_raw(store.clone(), partition, address, StoreMatch::MatchHash).await
-                    } else {
-                        Err(StorageError::from(crate::errors::AddressNotFound::from(
-                            address,
-                        )))
-                    }
-                }
-                Err(err) => Err(err),
-            };
+        let local_result = read_raw(store.clone(), partition, address).await;
 
         // Decompress + verify local data
         match local_result {
@@ -860,6 +852,74 @@ mod tests {
             size_content: payload.len() as u64,
         };
         (partition, address, fragment, Bytes::from(payload))
+    }
+
+    async fn store_with_isolation(isolate_partitions: bool) -> (TempDir, Arc<dyn ImmutableStore>) {
+        let dir = TempDir::new("lore-storage-isolation-test-");
+        let store = LocalImmutableStore::new(
+            Some(PathBuf::from(dir.as_ref())),
+            ImmutableStoreSettings {
+                isolate_partitions,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create test store");
+        (dir, store)
+    }
+
+    /// Partitions are content namespacing, so the same bytes written by two tenants land on one
+    /// address. Whether reading it back under a partition that never wrote it succeeds is the
+    /// store's decision, not the caller's: a single-tenant client serves it, and a store holding
+    /// content for everyone must not.
+    #[tokio::test]
+    async fn a_cross_partition_read_is_refused_only_by_an_isolated_store() {
+        let stored_under = Partition::from([0x01; 16]);
+        let asked_under = Partition::from([0x02; 16]);
+        let payload = Bytes::from_static(b"content addressed by hash alone");
+        let address = Address {
+            hash: hash::hash_slice(payload.as_ref()),
+            context: Context::from([0x03; 16]),
+        };
+        let fragment = Fragment {
+            flags: FragmentFlags::PayloadStoredLocal.bits(),
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+
+        for isolate_partitions in [false, true] {
+            let (_dir, store) = store_with_isolation(isolate_partitions).await;
+            store
+                .clone()
+                .put(
+                    stored_under,
+                    address,
+                    fragment,
+                    Some(payload.clone()),
+                    false,
+                )
+                .await
+                .expect("put under the owning partition");
+
+            let result = load_fragment(
+                store,
+                asked_under,
+                address,
+                ReadOptions::default().no_remote(),
+                None,
+            )
+            .await;
+
+            if isolate_partitions {
+                assert!(
+                    matches!(result, Err(StorageError::AddressNotFound(_))),
+                    "an isolated store served content from another partition"
+                );
+            } else {
+                let (_fragment, served) = result.expect("a non-isolated store serves by hash");
+                assert_eq!(served, payload);
+            }
+        }
     }
 
     /// A defragment that fails part-way must not leave its temporary behind. The temporary is

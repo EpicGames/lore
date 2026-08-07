@@ -11,6 +11,7 @@ use lore_base::types::VecBytes;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
 use lore_storage::StoreMatch;
+use lore_storage::StoreMatchResult;
 use lore_telemetry::tracing::fields::CORRELATION_ID;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use tracing::Span;
@@ -29,25 +30,28 @@ use crate::util::setup_execution;
 pub const MAX_ADDRESSES: usize = 100;
 
 pub const BASE_REQUEST_SIZE: usize = size_of::<ReplicationHeader>() +
-        // store match byte
+        // reserved byte
         1 +
         // at least 1 address
         size_of::<Address>();
 
+/// The byte that used to carry the requested match level. Callers no longer choose one - the store
+/// decides its own scope - but the byte stays so the request layout does not change. It is written
+/// as the level every caller last sent and ignored on the way in.
+const RESERVED_MATCH_BYTE: u8 = StoreMatch::MatchFull as u8;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExistsBatch {
     pub header: ReplicationHeader,
-    pub store_match: StoreMatch,
     pub addresses: Vec<Address>,
 }
 
 impl ExistsBatch {
     pub fn to_quic_chunks(self) -> [Bytes; 4] {
-        let store_match_num: u8 = self.store_match.into();
         [
             Bytes::default(), // command header
             Bytes::from_owner(self.header),
-            Bytes::copy_from_slice(&[store_match_num]),
+            Bytes::copy_from_slice(&[RESERVED_MATCH_BYTE]),
             Bytes::from_owner(VecBytes(self.addresses)),
         ]
     }
@@ -58,25 +62,14 @@ impl ExistsBatch {
         };
 
         let header: ReplicationHeader = bytes.split_to(size_of::<ReplicationHeader>()).into();
-        let store_match: StoreMatch = {
-            let raw_value = bytes[0];
-            bytes.advance(1);
-            raw_value.try_into().map_err(|error| {
-                warn!(?error, "failed to parse store match");
-                MessageParseError::ParseFailure("Invalid store match")
-            })?
-        };
+        bytes.advance(1); // reserved, see RESERVED_MATCH_BYTE
         let addresses = bytes.as_type_slice::<Address>().to_vec();
 
         if addresses.len() > MAX_ADDRESSES {
             return Err(MessageParseError::InvalidFieldLength);
         }
 
-        Ok(ExistsBatch {
-            header,
-            store_match,
-            addresses,
-        })
+        Ok(ExistsBatch { header, addresses })
     }
 }
 
@@ -152,31 +145,25 @@ impl RequestHandler for ExistsBatchHandler {
             REPLICATION_SERVICE_USER_ID.to_string(),
         );
 
+        // One address and many used to take different paths, because the AWS store answered
+        // `exist` and `exist_batch` differently and the two client kinds must not observe that.
+        // There is one operation now, so there is one path.
         let matches = LORE_CONTEXT
             .scope(execution, async move {
-                // at the time of writing, the AWS Immutable Store
-                // has subtle differences between `exists` and `exists_batch` so keep
-                // the behaviour consistent between AWS Immutable Store clients and Replicated
-                // Store clients who query single/multiple
-                if self.request.addresses.len() == 1 {
-                    let output = self
-                        .immutable_store
-                        .exist(
-                            self.request.header.repository.into(),
-                            self.request.addresses[0],
-                            self.request.store_match,
-                        )
-                        .await?;
-                    Ok(vec![output])
-                } else {
-                    self.immutable_store
-                        .exist_batch(
-                            self.request.header.repository.into(),
-                            &self.request.addresses,
-                            self.request.store_match,
-                        )
-                        .await
-                }
+                let mut resolved = vec![StoreMatchResult::default(); self.request.addresses.len()];
+                self.immutable_store
+                    .query(
+                        self.request.header.repository.into(),
+                        &self.request.addresses,
+                        &mut resolved,
+                    )
+                    .await
+                    .map(|()| {
+                        resolved
+                            .iter()
+                            .map(|resolved| resolved.match_made)
+                            .collect::<Vec<_>>()
+                    })
             })
             .await?;
 
@@ -218,7 +205,6 @@ pub mod tests {
                     correlation_id: Uuid::new_v4(),
                     repository,
                 },
-                store_match: StoreMatch::MatchFull,
                 addresses: vec![address],
             };
             let input_bytes = collapse_bytes_without_header(&input.clone().to_quic_chunks());
@@ -242,7 +228,6 @@ pub mod tests {
                     correlation_id: Uuid::new_v4(),
                     repository,
                 },
-                store_match: StoreMatch::MatchPartition,
                 addresses,
             };
             let input_bytes = collapse_bytes_without_header(&input.clone().to_quic_chunks());
@@ -266,7 +251,6 @@ pub mod tests {
                     correlation_id: Uuid::new_v4(),
                     repository,
                 },
-                store_match: StoreMatch::MatchPartition,
                 addresses,
             };
             let input_bytes = collapse_bytes_without_header(&input.clone().to_quic_chunks());
@@ -284,7 +268,6 @@ pub mod tests {
                     correlation_id: Uuid::new_v4(),
                     repository,
                 },
-                store_match: StoreMatch::MatchFull,
                 // no address is invalid
                 addresses: vec![],
             };

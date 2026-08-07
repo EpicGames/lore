@@ -71,10 +71,10 @@ pub enum Command {
     ImmutableGet = 1,
     ImmutablePut = 2,
     ImmutableObliterate = 3,
-    ImmutableQuery = 4,
+    // 4 and 7 were the single-address `Query`, whose operation no longer exists. Left unused rather
+    // than reassigned, so a peer that still sends one is rejected instead of misread.
     ImmutableLocalExistBatch = 5,
     ImmutableLocalGet = 6,
-    ImmutableLocalQuery = 7,
     ImmutableLocalPut = 8,
     ImmutableGetMetadata = 9,
     ImmutableLocalGetMetadata = 10,
@@ -93,17 +93,15 @@ impl TryFrom<QuicOpCode> for Command {
             v if v == Command::ImmutableGet as u8 => Ok(Command::ImmutableGet),
             v if v == Command::ImmutablePut as u8 => Ok(Command::ImmutablePut),
             v if v == Command::ImmutableObliterate as u8 => Ok(Command::ImmutableObliterate),
-            v if v == Command::ImmutableQuery as u8 => Ok(Command::ImmutableQuery),
+            v if v == Command::ImmutableGetMetadata as u8 => Ok(Command::ImmutableGetMetadata),
             v if v == Command::ImmutableLocalExistBatch as u8 => {
                 Ok(Command::ImmutableLocalExistBatch)
             }
             v if v == Command::ImmutableLocalGet as u8 => Ok(Command::ImmutableLocalGet),
-            v if v == Command::ImmutableLocalQuery as u8 => Ok(Command::ImmutableLocalQuery),
-            v if v == Command::ImmutableLocalPut as u8 => Ok(Command::ImmutableLocalPut),
-            v if v == Command::ImmutableGetMetadata as u8 => Ok(Command::ImmutableGetMetadata),
             v if v == Command::ImmutableLocalGetMetadata as u8 => {
                 Ok(Command::ImmutableLocalGetMetadata)
             }
+            v if v == Command::ImmutableLocalPut as u8 => Ok(Command::ImmutableLocalPut),
             _ => Err(UnknownCommand(value)),
         }
     }

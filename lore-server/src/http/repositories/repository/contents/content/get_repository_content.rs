@@ -149,7 +149,7 @@ pub async fn handler(
                 parsed_repository.into(),
             ));
 
-            let options = immutable::read_options_from_repository(&repository).with_isolation();
+            let options = immutable::read_options_from_repository(&repository);
 
             let (tx, rx) = channel(CHUNKED_RESPONSE_BUFFER_SIZE);
 

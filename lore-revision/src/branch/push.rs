@@ -40,7 +40,6 @@ use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::state;
 use crate::state::State;
-use crate::store;
 use crate::util::serde::u8_as_bool;
 
 /// Data for the event sent when a branch push starts.
@@ -1154,27 +1153,13 @@ pub(crate) async fn push_fragments(
         let storage = storage.clone();
         let stats = stats.clone();
         lore_spawn!(tasks, async move {
-            let (fragment, payload) = match immutable::load_raw_store_retry(
+            let (fragment, payload) = immutable::load_raw_store_retry(
                 repository.immutable_store(),
                 repository.id,
                 address,
-                store::StoreMatch::MatchFull,
             )
             .await
-            {
-                Ok((fragment, payload)) => (fragment, payload),
-                Err(ref e) if e.is_address_not_found() || e.is_payload_not_found() => {
-                    immutable::load_raw_store_retry(
-                        repository.immutable_store(),
-                        repository.id,
-                        address,
-                        store::StoreMatch::MatchHash,
-                    )
-                    .await
-                    .forward::<PushError>("loading fragment payload")?
-                }
-                Err(err) => Err(err).forward::<PushError>("loading fragment payload")?,
-            };
+            .forward::<PushError>("loading fragment payload")?;
 
             let payload_size = payload.len() as u64;
             stats.bytes_total.fetch_add(payload_size, Ordering::Relaxed);

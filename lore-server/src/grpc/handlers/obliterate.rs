@@ -406,8 +406,9 @@ mod tests {
         // Confirm the fragment is readable before obliterating it
         immutable_store
             .clone()
-            .get(repository, address, lore_storage::StoreMatch::MatchFull)
+            .get(repository, address)
             .await
+            .and_then(lore_storage::StoreGetData::into_payload)
             .expect("address should be present before obliterate");
 
         let mut notification = MockNotificationSender::new();
@@ -447,12 +448,11 @@ mod tests {
         .await
         .expect("handler should succeed");
 
-        let get_err = immutable_store
-            .get(repository, address, lore_storage::StoreMatch::MatchFull)
-            .await
-            .unwrap_err();
+        // An obliterated address resolves to nothing rather than to a reference whose payload has
+        // gone missing: the store refuses it on the tombstone, before it ever looks for bytes.
+        let get_err = immutable_store.get(repository, address).await.unwrap_err();
         assert!(
-            get_err.is_payload_not_found(),
+            get_err.is_address_not_found(),
             "payload should be obliterated; got: {get_err:?}"
         );
     }

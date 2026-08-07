@@ -733,9 +733,8 @@ mod tests {
     use lore_revision::lore::RepositoryId;
     use lore_storage::KeyValueStream;
     use lore_storage::StoreError;
-    use lore_storage::StoreMatch;
+    use lore_storage::StoreGetData;
     use lore_storage::StoreObliterateStats;
-    use lore_storage::StoreQueryResult;
     use tokio::sync::broadcast::Receiver;
 
     use super::*;
@@ -754,47 +753,28 @@ mod tests {
 
     #[async_trait]
     impl ImmutableStore for MockImmutableStore {
-        async fn get_metadata(
-            self: Arc<Self>,
-            partition: Partition,
-            address: Address,
-        ) -> Result<StoreQueryResult, StoreError> {
-            self.query(partition, address, StoreMatch::MatchFull).await
-        }
-
-        async fn exist(
-            self: Arc<Self>,
-            _partition: Partition,
-            _address: Address,
-            _match_requested: StoreMatch,
-        ) -> Result<StoreMatch, StoreError> {
-            Ok(StoreMatch::MatchNone)
-        }
-
-        async fn exist_batch(
-            self: Arc<Self>,
-            _partition: Partition,
-            addresses: &[Address],
-            _match_requested: StoreMatch,
-        ) -> Result<Vec<StoreMatch>, StoreError> {
-            Ok(vec![StoreMatch::MatchNone; addresses.len()])
-        }
-
         async fn query(
             self: Arc<Self>,
             _partition: Partition,
+            _addresses: &[Address],
+            _results: &mut [lore_storage::StoreMatchResult],
+        ) -> Result<(), StoreError> {
+            Ok(())
+        }
+
+        async fn get_metadata(
+            self: Arc<Self>,
+            _partition: Partition,
             _address: Address,
-            _match_requested: StoreMatch,
-        ) -> Result<StoreQueryResult, StoreError> {
-            Ok(StoreQueryResult::default())
+        ) -> Result<StoreGetData, StoreError> {
+            Ok(StoreGetData::default())
         }
 
         async fn get(
             self: Arc<Self>,
             _partition: Partition,
             _address: Address,
-            _match_required: StoreMatch,
-        ) -> Result<(Fragment, Bytes), StoreError> {
+        ) -> Result<StoreGetData, StoreError> {
             Err(StoreError::from(AddressNotFound::from(Address::default())))
         }
 

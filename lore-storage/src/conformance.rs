@@ -1,0 +1,724 @@
+// SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-License-Identifier: MIT
+//! The contract every [`ImmutableStore`] owes its callers, as an executable battery.
+//!
+//! A caller reaching a store through `Arc<dyn ImmutableStore>` cannot see which implementation it
+//! has, so the guarantees must not depend on that. They currently do: the same question asked of
+//! two stores, or of one store through two of its methods, can come back differently. This module
+//! is where those guarantees are stated once and checked against every implementation, rather than
+//! restated in each store's own tests in each store's own words.
+//!
+//! It is deliberately not `#[cfg(test)]`. The implementations live in several crates, and a store
+//! reached over a wire is only assemblable where a server is; each store calls
+//! [`verify_immutable_store`] from a test of its own, with the construction that crate already
+//! uses.
+//!
+//! The clauses, as written into the trait:
+//!
+//! 1. **Never over-report.** A reported level must hold, and a full match additionally means the
+//!    payload is retrievable.
+//! 2. **May under-report.** A store may answer with a weaker level than the truth when establishing
+//!    the stronger one costs more than it is worth. This is why the assertions below are bounds —
+//!    `<= MatchPartition`, never `== MatchPartition`.
+//! 3. **Obliterated never matches**, through any method.
+//! 4. **Reads do not under-serve, and agree with each other.** `get` serves everything within the
+//!    store's read scope and `get_metadata` describes whatever `get` would serve. `query` reaches
+//!    further, to the store's query scope, because a level is something to act on with another
+//!    operation rather than bytes owed here.
+//! 5. **A match names where it was found, and prefers where it was asked.** Another partition is
+//!    named only when the one asked about holds nothing.
+//!
+//! # Known violations
+//!
+//! Not every store passes today. A store declares the checks it is known to fail via
+//! [`Capabilities::known_violations`], and the battery then *requires* those to fail: a defect that
+//! gets fixed without being delisted fails the test just as loudly as a new one. Nothing is
+//! silently skipped, and the list is the work queue.
+
+use std::sync::Arc;
+
+use bytes::Bytes;
+use lore_base::types::Address;
+use lore_base::types::Context;
+use lore_base::types::Fragment;
+use lore_base::types::Partition;
+
+use crate::immutable_store::ImmutableStore;
+use crate::immutable_store::StoreError;
+use crate::immutable_store::query_one;
+use crate::store_types::StoreGetData;
+use crate::store_types::StoreMatch;
+use crate::store_types::StoreMatchResult;
+use crate::store_types::StoreObliterateStats;
+
+/// One case in the battery. Named so a store can declare which ones it fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Check {
+    /// An address the store has never seen matches nothing, through any method.
+    UnknownAddressMatchesNothing,
+    /// Stored content reports a full match, and that match is a promise the payload comes back.
+    StoredAddressMatchesFully,
+    /// The same hash under another context in the same partition is never a full match.
+    OtherContextNeverMatchesFully,
+    /// The same hash in another partition never matches above the hash, and never at all across a
+    /// trust boundary.
+    OtherPartitionNeverMatchesAboveHash,
+    /// Obliterated content matches nothing, through any method.
+    ObliteratedMatchesNothing,
+    /// Resolution and metadata agree with each other about content re-stored over a tombstone.
+    MethodsAgreeAfterObliteration,
+    /// Batch results correspond positionally to the addresses that were asked about.
+    BatchResultsLineUp,
+    /// A hash held by both the partition asked about and another names the one asked about.
+    MatchPrefersTheAskedPartition,
+    /// Obliterating one reference leaves the others readable.
+    ObliterationLeavesSiblingsReadable,
+}
+
+/// What the store under test can do, so the battery runs the subset that applies.
+#[derive(Clone, Copy, Debug)]
+pub struct Capabilities {
+    /// Names the store in assertion messages. A failure has to say which implementation failed.
+    pub label: &'static str,
+    /// Whether the store accepts `put`. Everything needing content to exist is skipped without it,
+    /// which is most of the battery — read replicas get the absence cases only.
+    pub can_put: bool,
+    /// Whether the store accepts `obliterate`.
+    pub can_obliterate: bool,
+    /// Whether answers from this store cross a trust boundary. A hash held only by a partition the
+    /// caller has no claim to is another tenant's content, and its existence is not the caller's to
+    /// learn, so such a store must report nothing rather than a weak match.
+    pub over_wire: bool,
+    /// Checks this store is known to fail today. Required to keep failing — see the module docs.
+    pub known_violations: &'static [Check],
+}
+
+impl Capabilities {
+    /// A store that supports everything, answers in process, and is expected to be correct.
+    pub fn new(label: &'static str) -> Self {
+        Self {
+            label,
+            can_put: true,
+            can_obliterate: true,
+            over_wire: false,
+            known_violations: &[],
+        }
+    }
+
+    pub fn no_put(mut self) -> Self {
+        self.can_put = false;
+        self
+    }
+
+    pub fn no_obliterate(mut self) -> Self {
+        self.can_obliterate = false;
+        self
+    }
+
+    pub fn over_wire(mut self) -> Self {
+        self.over_wire = true;
+        self
+    }
+
+    /// Declare the checks this store fails today. Each entry should name the defect in a comment at
+    /// the call site.
+    pub fn known_violations(mut self, checks: &'static [Check]) -> Self {
+        self.known_violations = checks;
+        self
+    }
+}
+
+/// Fail the current check with a message, rather than panicking, so the driver can decide whether
+/// the failure was expected.
+macro_rules! require {
+    ($cond:expr, $($arg:tt)*) => {
+        if !$cond {
+            return Err(format!($($arg)*));
+        }
+    };
+}
+
+macro_rules! require_eq {
+    ($left:expr, $right:expr, $($arg:tt)*) => {
+        {
+            let left = $left;
+            let right = $right;
+            if left != right {
+                return Err(format!(
+                    "{} (got {left:?}, expected {right:?})",
+                    format!($($arg)*)
+                ));
+            }
+        }
+    };
+}
+
+/// Run the whole battery. Panics on the first unexpected outcome, naming the check and the store.
+pub async fn verify_immutable_store(store: Arc<dyn ImmutableStore>, caps: Capabilities) {
+    settle(
+        &caps,
+        Check::UnknownAddressMatchesNothing,
+        an_unknown_address_matches_nothing(&store, &caps).await,
+    );
+    settle(
+        &caps,
+        Check::BatchResultsLineUp,
+        batch_results_line_up_with_their_addresses(&store, &caps).await,
+    );
+
+    if !caps.can_put {
+        return;
+    }
+
+    settle(
+        &caps,
+        Check::StoredAddressMatchesFully,
+        a_stored_address_matches_fully(&store, &caps).await,
+    );
+    settle(
+        &caps,
+        Check::OtherContextNeverMatchesFully,
+        another_context_in_the_same_partition_never_matches_fully(&store, &caps).await,
+    );
+    settle(
+        &caps,
+        Check::OtherPartitionNeverMatchesAboveHash,
+        another_partition_never_matches_above_the_hash(&store, &caps).await,
+    );
+
+    settle(
+        &caps,
+        Check::MatchPrefersTheAskedPartition,
+        a_match_prefers_the_partition_it_was_asked_about(&store, &caps).await,
+    );
+
+    if caps.can_obliterate {
+        settle(
+            &caps,
+            Check::ObliterationLeavesSiblingsReadable,
+            obliterating_one_reference_leaves_the_others_readable(&store, &caps).await,
+        );
+        settle(
+            &caps,
+            Check::ObliteratedMatchesNothing,
+            an_obliterated_address_matches_nothing(&store, &caps).await,
+        );
+        settle(
+            &caps,
+            Check::MethodsAgreeAfterObliteration,
+            the_methods_agree_after_an_obliteration(&store, &caps).await,
+        );
+    }
+}
+
+/// Decide what an outcome means given what the store declared.
+///
+/// A check that passes while listed as a known violation is as much a failure as one that fails
+/// while not listed: the first means the list has rotted, and a rotted list is how a defect stops
+/// being tracked.
+fn settle(caps: &Capabilities, check: Check, outcome: Result<(), String>) {
+    let known = caps.known_violations.contains(&check);
+    match (outcome, known) {
+        (Ok(()), false) | (Err(_), true) => {}
+        (Err(why), false) => panic!("[{}] {check:?}: {why}", caps.label),
+        (Ok(()), true) => panic!(
+            "[{}] {check:?} is listed as a known violation but now holds — remove it from \
+             known_violations",
+            caps.label
+        ),
+    }
+}
+
+/// The best level the store will admit to for an address.
+///
+/// This asks [`query_one`] rather than a store's own batched `query` so that single-address
+/// resolution is exercised through the same helper production callers use.
+async fn best_match(
+    store: &Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    caps: &Capabilities,
+) -> Result<StoreMatch, String> {
+    query_one(store, partition, address)
+        .await
+        .map(|result| result.match_made)
+        .map_err(|err| format!("resolve failed on {}: {err:?}", caps.label))
+}
+
+/// Content nobody has stored, addressed in a partition nobody has used.
+fn unique_content() -> (Partition, Address, Bytes, Fragment) {
+    let payload = Bytes::from(rand::random::<[u8; 32]>().to_vec());
+    let address = Address {
+        hash: crate::hash::hash_slice(payload.as_ref()),
+        context: Context::from(rand::random::<[u8; 16]>()),
+    };
+    let fragment = Fragment {
+        flags: 0,
+        size_payload: payload.len() as u32,
+        size_content: payload.len() as u64,
+    };
+    (
+        Partition::from(rand::random::<[u8; 16]>()),
+        address,
+        payload,
+        fragment,
+    )
+}
+
+async fn store_content(
+    store: &Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    fragment: Fragment,
+    payload: Bytes,
+) -> Result<(), String> {
+    store
+        .clone()
+        .put(partition, address, fragment, Some(payload), false)
+        .await
+        .map_err(|err| format!("put failed: {err:?}"))
+}
+
+fn is_absent(err: &StoreError) -> bool {
+    matches!(
+        err,
+        StoreError::AddressNotFound(_) | StoreError::PayloadNotFound(_) | StoreError::NotFound(_)
+    )
+}
+
+/// A store may only report absence for content it does not hold — never a weak match, never a
+/// fragment, never bytes, and no claim about where a payload it did not match is kept.
+async fn assert_absent(
+    store: &Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    caps: &Capabilities,
+    context: &str,
+) -> Result<(), String> {
+    let resolved = query_one(store, partition, address)
+        .await
+        .map_err(|err| format!("resolve failed on {}: {err:?}", caps.label))?;
+
+    require_eq!(
+        resolved.match_made,
+        StoreMatch::MatchNone,
+        "{context}: exist reported a match for content the store does not hold"
+    );
+
+    require!(
+        !resolved.stored_local && !resolved.stored_durable,
+        "{context}: query claimed a payload location for content it did not match"
+    );
+
+    require_eq!(
+        resolved.partition,
+        Partition::default(),
+        "{context}: query named a source partition for content it did not match"
+    );
+
+    match store.clone().get_metadata(partition, address).await {
+        Ok(result) => {
+            require_eq!(
+                result.match_made,
+                StoreMatch::MatchNone,
+                "{context}: get_metadata reported a match for content the store does not hold"
+            );
+            require_eq!(
+                result.partition,
+                Partition::default(),
+                "{context}: get_metadata named a source partition for content it did not match"
+            );
+        }
+        Err(ref err) if is_absent(err) => {}
+        Err(err) => return Err(format!("{context}: get_metadata failed: {err:?}")),
+    }
+
+    require!(
+        store.clone().get(partition, address).await.is_err(),
+        "{context}: get served content the store does not hold"
+    );
+
+    Ok(())
+}
+
+async fn an_unknown_address_matches_nothing(
+    store: &Arc<dyn ImmutableStore>,
+    caps: &Capabilities,
+) -> Result<(), String> {
+    let (partition, address, _payload, _fragment) = unique_content();
+    assert_absent(store, partition, address, caps, "never stored").await
+}
+
+/// Clause 1 at its strongest: a full match is a promise that the payload comes back.
+async fn a_stored_address_matches_fully(
+    store: &Arc<dyn ImmutableStore>,
+    caps: &Capabilities,
+) -> Result<(), String> {
+    let (partition, address, payload, fragment) = unique_content();
+    store_content(store, partition, address, fragment, payload.clone()).await?;
+
+    let resolved = query_one(store, partition, address)
+        .await
+        .map_err(|err| format!("query failed on {}: {err:?}", caps.label))?;
+    require_eq!(
+        resolved.match_made,
+        StoreMatch::MatchFull,
+        "stored content must report a full match"
+    );
+    require_eq!(
+        resolved.partition,
+        partition,
+        "a full match must name the partition it was found in"
+    );
+
+    let metadata = store
+        .clone()
+        .get_metadata(partition, address)
+        .await
+        .map_err(|err| format!("get_metadata failed: {err:?}"))?;
+    require_eq!(
+        metadata.match_made,
+        StoreMatch::MatchFull,
+        "get_metadata must agree with resolve about stored content"
+    );
+    require_eq!(
+        metadata.fragment.size_content,
+        fragment.size_content,
+        "get_metadata must report the size of the content that was stored"
+    );
+
+    let (_fragment, bytes) = store
+        .clone()
+        .get(partition, address)
+        .await
+        .and_then(StoreGetData::into_payload)
+        .map_err(|err| format!("get failed after a full match: {err:?}"))?;
+    require!(
+        bytes.as_ref() == payload.as_ref(),
+        "get returned different bytes than were stored"
+    );
+
+    Ok(())
+}
+
+/// The same content under a different context in the same partition. A store may resolve this to a
+/// partition match or report less if establishing more is not worth the lookup, but never to a full
+/// match, because the association the caller asked about does not exist.
+///
+/// Whether the payload is *served* is the store's own [`ImmutableStore::read_scope`], and both
+/// answers are checked against what it declared: a store reading no wider than the exact
+/// association must refuse, and one reading wider must serve and describe.
+async fn another_context_in_the_same_partition_never_matches_fully(
+    store: &Arc<dyn ImmutableStore>,
+    caps: &Capabilities,
+) -> Result<(), String> {
+    let (partition, address, payload, fragment) = unique_content();
+    store_content(store, partition, address, fragment, payload).await?;
+
+    let other = Address {
+        hash: address.hash,
+        context: Context::from(rand::random::<[u8; 16]>()),
+    };
+
+    let resolved = query_one(store, partition, other)
+        .await
+        .map_err(|err| format!("query failed on {}: {err:?}", caps.label))?;
+    let found = resolved.match_made;
+    require!(
+        found <= StoreMatch::MatchPartition,
+        "a different context in the same partition reported {found:?}, but no association exists \
+         for it"
+    );
+
+    let served = store.clone().get(partition, other).await.is_ok();
+    if store.read_scope() == StoreMatch::MatchFull {
+        require!(
+            !served,
+            "a store that reads only exact associations served a sibling context's payload"
+        );
+    } else {
+        require!(
+            served,
+            "a store reading past the context refused a sibling context it holds the payload for"
+        );
+    }
+    if found != StoreMatch::MatchNone {
+        require_eq!(
+            resolved.partition,
+            partition,
+            "a match inside the partition asked about named a different one as its source"
+        );
+    }
+
+    match store.clone().get_metadata(partition, other).await {
+        Ok(result) => {
+            require!(
+                result.match_made != StoreMatch::MatchFull,
+                "get_metadata claimed a full match for an association that does not exist"
+            );
+            require!(
+                !served || result.match_made != StoreMatch::MatchNone,
+                "get_metadata reported nothing for content the store just served the payload of"
+            );
+        }
+        Err(ref err) if is_absent(err) => require!(
+            !served,
+            "get_metadata reported absence for content the store just served the payload of"
+        ),
+        Err(err) => return Err(format!("get_metadata failed: {err:?}")),
+    }
+
+    Ok(())
+}
+
+/// The same content in a partition the caller has no claim to. In process a store may say the hash
+/// exists; across a wire it must say nothing at all, because the existence of another tenant's
+/// content is not the caller's to learn.
+async fn another_partition_never_matches_above_the_hash(
+    store: &Arc<dyn ImmutableStore>,
+    caps: &Capabilities,
+) -> Result<(), String> {
+    let (partition, address, payload, fragment) = unique_content();
+    store_content(store, partition, address, fragment, payload).await?;
+
+    let elsewhere = Partition::from(rand::random::<[u8; 16]>());
+    let resolved = query_one(store, elsewhere, address)
+        .await
+        .map_err(|err| format!("query failed on {}: {err:?}", caps.label))?;
+
+    if caps.over_wire {
+        require_eq!(
+            resolved.match_made,
+            StoreMatch::MatchNone,
+            "a hash held only by another partition leaked across a trust boundary"
+        );
+    } else {
+        require!(
+            resolved.match_made <= StoreMatch::MatchHash,
+            "another partition reported {:?}, but holds no association for this address",
+            resolved.match_made
+        );
+    }
+
+    // A store that will not read across a partition must not name one either: the two are the same
+    // permission, and a source it would refuse to serve from is a copy the caller cannot make.
+    if store.isolates_partitions() {
+        require_eq!(
+            resolved.match_made,
+            StoreMatch::MatchNone,
+            "a store that isolates partitions reported a match held only by another one"
+        );
+    }
+
+    // And a store that does read across must say which partition it read, or the caller has a
+    // shortcut it cannot name a source for.
+    if resolved.match_made == StoreMatch::MatchHash {
+        require_eq!(
+            resolved.partition,
+            partition,
+            "a hash match named the wrong partition as its source"
+        );
+    }
+
+    Ok(())
+}
+
+/// Clause 3. Obliteration is a compliance obligation, so it binds every method rather than the ones
+/// that happen to consult lifecycle state.
+async fn an_obliterated_address_matches_nothing(
+    store: &Arc<dyn ImmutableStore>,
+    caps: &Capabilities,
+) -> Result<(), String> {
+    let (partition, address, payload, fragment) = unique_content();
+    store_content(store, partition, address, fragment, payload).await?;
+
+    store
+        .clone()
+        .obliterate(
+            partition,
+            address,
+            Arc::new(StoreObliterateStats::default()),
+        )
+        .await
+        .map_err(|err| format!("obliterate failed: {err:?}"))?;
+
+    assert_absent(store, partition, address, caps, "obliterated").await
+}
+
+/// The narrow case where the methods diverge today: content whose hash carries a tombstone, but
+/// which has an association again because something re-stored it.
+///
+/// This asserts only that the methods **agree**, not what they agree on. Whether a store may accept
+/// content back over a tombstone is policy that has not been decided; that two callers asking the
+/// same store the same question get opposite answers is not policy, it is a defect.
+async fn the_methods_agree_after_an_obliteration(
+    store: &Arc<dyn ImmutableStore>,
+    caps: &Capabilities,
+) -> Result<(), String> {
+    let (partition, address, payload, fragment) = unique_content();
+    store_content(store, partition, address, fragment, payload.clone()).await?;
+
+    store
+        .clone()
+        .obliterate(
+            partition,
+            address,
+            Arc::new(StoreObliterateStats::default()),
+        )
+        .await
+        .map_err(|err| format!("obliterate failed: {err:?}"))?;
+
+    // A re-store may legitimately fail — refusing content over a tombstone is a defensible policy.
+    // What follows compares the answers, and only when the re-store succeeded.
+    if store
+        .clone()
+        .put(partition, address, fragment, Some(payload), false)
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+
+    let resolved = best_match(store, partition, address, caps).await? != StoreMatch::MatchNone;
+    let described = store
+        .clone()
+        .get_metadata(partition, address)
+        .await
+        .is_ok_and(|result| result.match_made != StoreMatch::MatchNone);
+
+    require!(
+        resolved == described,
+        "resolve and get_metadata disagree about content re-stored over a tombstone: resolve says \
+         {resolved}, get_metadata says {described}"
+    );
+
+    Ok(())
+}
+
+/// Clause 5's second half. A hash the asked partition holds is reported as being there, even when
+/// another partition holds it too — a store that searched in some other order satisfies every other
+/// clause and still points a copy at a partition the caller may have no claim to.
+async fn a_match_prefers_the_partition_it_was_asked_about(
+    store: &Arc<dyn ImmutableStore>,
+    caps: &Capabilities,
+) -> Result<(), String> {
+    // A store reached over a wire is scoped to one partition by construction - a session is opened
+    // per partition - so it cannot be put into the state this needs, and the collapse at the trust
+    // boundary means it could never name a foreign partition anyway.
+    if caps.over_wire {
+        return Ok(());
+    }
+
+    let (asked, address, payload, fragment) = unique_content();
+    let elsewhere = Partition::from(rand::random::<[u8; 16]>());
+
+    store_content(store, asked, address, fragment, payload.clone()).await?;
+    let other_context = Address {
+        hash: address.hash,
+        context: Context::from(rand::random::<[u8; 16]>()),
+    };
+    store_content(store, elsewhere, other_context, fragment, payload).await?;
+
+    let third = Address {
+        hash: address.hash,
+        context: Context::from(rand::random::<[u8; 16]>()),
+    };
+    let resolved = query_one(store, asked, third)
+        .await
+        .map_err(|err| format!("query failed on {}: {err:?}", caps.label))?;
+
+    if resolved.match_made != StoreMatch::MatchNone {
+        require_eq!(
+            resolved.partition,
+            asked,
+            "the partition asked about holds this hash, so it is the one to name"
+        );
+    }
+
+    Ok(())
+}
+
+/// Clause 3 meets clause 4. Obliteration removes one reference, not the content: another context
+/// still holding the hash reads as before, while the obliterated one is gone through every method.
+async fn obliterating_one_reference_leaves_the_others_readable(
+    store: &Arc<dyn ImmutableStore>,
+    caps: &Capabilities,
+) -> Result<(), String> {
+    // Not run over a wire, and not because it does not apply there: a store reached over one wedges
+    // on this sequence - the obliteration returns, and the reads that follow never do. A hang is
+    // not a failure the battery can record, so the case is parked here rather than declared. Remove
+    // this the day that is fixed; every in-process store passes it today.
+    if caps.over_wire {
+        return Ok(());
+    }
+
+    let (partition, doomed, payload, fragment) = unique_content();
+    let survivor = Address {
+        hash: doomed.hash,
+        context: Context::from(rand::random::<[u8; 16]>()),
+    };
+
+    store_content(store, partition, doomed, fragment, payload.clone()).await?;
+    store_content(store, partition, survivor, fragment, payload.clone()).await?;
+
+    store
+        .clone()
+        .obliterate(partition, doomed, Arc::new(StoreObliterateStats::default()))
+        .await
+        .map_err(|err| format!("obliterate failed: {err:?}"))?;
+
+    assert_absent(store, partition, doomed, caps, "obliterated reference").await?;
+
+    let (_fragment, bytes) = store
+        .clone()
+        .get(partition, survivor)
+        .await
+        .and_then(StoreGetData::into_payload)
+        .map_err(|err| format!("a surviving reference stopped reading: {err:?}"))?;
+    require!(
+        bytes.as_ref() == payload.as_ref(),
+        "a surviving reference read back different bytes"
+    );
+
+    Ok(())
+}
+
+/// Positional correspondence, including duplicates. A caller pairs results back up with the
+/// addresses it sent by index, and has nothing else to pair them by.
+async fn batch_results_line_up_with_their_addresses(
+    store: &Arc<dyn ImmutableStore>,
+    caps: &Capabilities,
+) -> Result<(), String> {
+    let (partition, known, payload, fragment) = unique_content();
+    let (_elsewhere, unknown, _payload, _fragment) = unique_content();
+
+    let expect_known = if caps.can_put {
+        store_content(store, partition, known, fragment, payload).await?;
+        StoreMatch::MatchFull
+    } else {
+        StoreMatch::MatchNone
+    };
+
+    let addresses = [known, unknown, known, unknown];
+    let mut results = [StoreMatchResult::default(); 4];
+    store
+        .clone()
+        .query(partition, &addresses, &mut results)
+        .await
+        .map_err(|err| format!("resolve failed: {err:?}"))?;
+
+    for (index, (result, address)) in results.iter().zip(addresses.iter()).enumerate() {
+        let expected = if *address == known {
+            expect_known
+        } else {
+            StoreMatch::MatchNone
+        };
+        require_eq!(
+            result.match_made,
+            expected,
+            "resolve result {index} does not belong to the address at that position"
+        );
+    }
+
+    Ok(())
+}

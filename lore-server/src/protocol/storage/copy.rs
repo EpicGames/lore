@@ -181,9 +181,8 @@ mod tests {
     use lore_base::types::Partition;
     use lore_storage::ImmutableStore;
     use lore_storage::StoreError;
-    use lore_storage::StoreMatch;
+    use lore_storage::StoreGetData;
     use lore_storage::StoreObliterateStats;
-    use lore_storage::StoreQueryResult;
     use rand::distr::Alphanumeric;
     use rand::distr::SampleString as _;
     use rand::random;
@@ -197,38 +196,20 @@ mod tests {
 
     #[async_trait]
     impl ImmutableStore for MockCopyFailStore {
-        async fn get_metadata(
-            self: Arc<Self>,
-            partition: Partition,
-            address: Address,
-        ) -> Result<StoreQueryResult, StoreError> {
-            self.query(partition, address, StoreMatch::MatchFull).await
-        }
-
-        async fn exist(
-            self: Arc<Self>,
-            _partition: Partition,
-            _address: Address,
-            _match_requested: StoreMatch,
-        ) -> Result<StoreMatch, StoreError> {
-            Err(StoreError::internal("Not supported"))
-        }
-
-        async fn exist_batch(
-            self: Arc<Self>,
-            _partition: Partition,
-            _addresses: &[Address],
-            _match_requested: StoreMatch,
-        ) -> Result<Vec<StoreMatch>, StoreError> {
-            Err(StoreError::internal("Not supported"))
-        }
-
         async fn query(
             self: Arc<Self>,
             _partition: Partition,
+            _addresses: &[Address],
+            _results: &mut [lore_storage::StoreMatchResult],
+        ) -> Result<(), StoreError> {
+            Err(StoreError::internal("Not supported"))
+        }
+
+        async fn get_metadata(
+            self: Arc<Self>,
+            _partition: Partition,
             _address: Address,
-            _match_requested: StoreMatch,
-        ) -> Result<StoreQueryResult, StoreError> {
+        ) -> Result<StoreGetData, StoreError> {
             Err(StoreError::internal("Not supported"))
         }
 
@@ -236,8 +217,7 @@ mod tests {
             self: Arc<Self>,
             _partition: Partition,
             _address: Address,
-            _match_required: StoreMatch,
-        ) -> Result<(Fragment, Bytes), StoreError> {
+        ) -> Result<StoreGetData, StoreError> {
             Err(StoreError::internal("Not supported"))
         }
 
@@ -319,38 +299,20 @@ mod tests {
 
     #[async_trait]
     impl ImmutableStore for MockCopySuccessStore {
-        async fn get_metadata(
-            self: Arc<Self>,
-            partition: Partition,
-            address: Address,
-        ) -> Result<StoreQueryResult, StoreError> {
-            self.query(partition, address, StoreMatch::MatchFull).await
-        }
-
-        async fn exist(
-            self: Arc<Self>,
-            _partition: Partition,
-            _address: Address,
-            _match_requested: StoreMatch,
-        ) -> Result<StoreMatch, StoreError> {
-            Err(StoreError::internal("Not supported"))
-        }
-
-        async fn exist_batch(
-            self: Arc<Self>,
-            _partition: Partition,
-            _addresses: &[Address],
-            _match_requested: StoreMatch,
-        ) -> Result<Vec<StoreMatch>, StoreError> {
-            Err(StoreError::internal("Not supported"))
-        }
-
         async fn query(
             self: Arc<Self>,
             _partition: Partition,
+            _addresses: &[Address],
+            _results: &mut [lore_storage::StoreMatchResult],
+        ) -> Result<(), StoreError> {
+            Err(StoreError::internal("Not supported"))
+        }
+
+        async fn get_metadata(
+            self: Arc<Self>,
+            _partition: Partition,
             _address: Address,
-            _match_requested: StoreMatch,
-        ) -> Result<StoreQueryResult, StoreError> {
+        ) -> Result<StoreGetData, StoreError> {
             Err(StoreError::internal("Not supported"))
         }
 
@@ -358,8 +320,7 @@ mod tests {
             self: Arc<Self>,
             _partition: Partition,
             _address: Address,
-            _match_required: StoreMatch,
-        ) -> Result<(Fragment, Bytes), StoreError> {
+        ) -> Result<StoreGetData, StoreError> {
             Err(StoreError::internal("Not supported"))
         }
 
@@ -670,15 +631,17 @@ mod tests {
                 // Fragment must now be retrievable from repo B (R1/R2)
                 store
                     .clone()
-                    .get(repo_b, address, lore_storage::StoreMatch::MatchFull)
+                    .get(repo_b, address)
                     .await
+                    .and_then(lore_storage::StoreGetData::into_payload)
                     .expect("Fragment should be accessible in repo B after copy");
 
                 // Original fragment must still exist in repo A (R2)
                 store
                     .clone()
-                    .get(repo_a, address, lore_storage::StoreMatch::MatchFull)
+                    .get(repo_a, address)
                     .await
+                    .and_then(lore_storage::StoreGetData::into_payload)
                     .expect("Fragment should still be accessible in repo A after copy");
 
                 // Second copy call — idempotency (R6)

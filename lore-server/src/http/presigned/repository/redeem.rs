@@ -154,7 +154,7 @@ pub async fn handler(
                 parsed_repository,
             ));
 
-            let options = read_options_from_repository(&repository).with_isolation();
+            let options = read_options_from_repository(&repository);
 
             let (tx, rx) = channel(CHUNKED_RESPONSE_BUFFER_SIZE);
 

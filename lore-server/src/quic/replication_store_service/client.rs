@@ -44,13 +44,13 @@ use crate::protocol::replication_store::exists_batch::ExistsBatch;
 use crate::protocol::replication_store::exists_batch::ExistsBatchResponse;
 use crate::protocol::replication_store::get::Get;
 use crate::protocol::replication_store::get::GetResponse;
+use crate::protocol::replication_store::get_metadata::GetMetadata;
+use crate::protocol::replication_store::get_metadata::GetMetadataResponse;
 use crate::protocol::replication_store::header::ReplicationHeader;
 use crate::protocol::replication_store::obliterate::Obliterate;
 use crate::protocol::replication_store::obliterate::ObliterateResponse;
 use crate::protocol::replication_store::put::Put;
 use crate::protocol::replication_store::put::PutFlags;
-use crate::protocol::replication_store::query::Query;
-use crate::protocol::replication_store::query::QueryResponse;
 use crate::quic::replication_store_service::Command;
 use crate::quic::replication_store_service::MAX_CHUNK_SIZE;
 use crate::quic::replication_store_service::ReplicationServiceErrorCode;
@@ -130,14 +130,11 @@ pub trait StoreClient: Send + Sync + Sized + 'static {
     /// Request an Immutable `Get` on the server
     async fn get(&self, request: Get) -> Result<GetResponse, ReplicationStoreClientError>;
 
-    /// Request an Immutable `Query` on the server
-    async fn query(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError>;
-
-    /// Request an Immutable `GetMetadata` on the server
+    /// Request the representation of an address from the peer
     async fn get_metadata(
         &self,
-        request: Query,
-    ) -> Result<QueryResponse, ReplicationStoreClientError>;
+        request: GetMetadata,
+    ) -> Result<GetMetadataResponse, ReplicationStoreClientError>;
 
     /// Request an Immutable `Put` on the server's local store
     async fn local_put(&self, request: Put) -> Result<(), ReplicationStoreClientError>;
@@ -151,17 +148,11 @@ pub trait StoreClient: Send + Sync + Sized + 'static {
     /// Request an Immutable `Get` on the server's local store
     async fn local_get(&self, request: Get) -> Result<GetResponse, ReplicationStoreClientError>;
 
-    /// Request an Immutable `Query` on the server's local store
-    async fn local_query(
-        &self,
-        request: Query,
-    ) -> Result<QueryResponse, ReplicationStoreClientError>;
-
-    /// Request an Immutable `GetMetadata` on the server's local store
+    /// Request the representation of an address from the peer's local store
     async fn local_get_metadata(
         &self,
-        request: Query,
-    ) -> Result<QueryResponse, ReplicationStoreClientError>;
+        request: GetMetadata,
+    ) -> Result<GetMetadataResponse, ReplicationStoreClientError>;
 }
 
 #[derive(Clone)]
@@ -292,15 +283,15 @@ impl ReplicationStoreClient {
         GetResponse::parse(response_chunks)
     }
 
-    async fn send_query(
+    async fn send_metadata(
         &self,
-        request: Query,
+        request: GetMetadata,
         command: Command,
-    ) -> Result<QueryResponse, ReplicationStoreClientError> {
+    ) -> Result<GetMetadataResponse, ReplicationStoreClientError> {
         let quic_chunks = request.to_quic_chunks();
         let response_chunks =
             send_normal_with_reconnect(self, command, 0, || quic_chunks.clone()).await?;
-        QueryResponse::parse(response_chunks)
+        GetMetadataResponse::parse(response_chunks)
     }
 }
 
@@ -339,15 +330,11 @@ impl StoreClient for ReplicationStoreClient {
         self.send_get(request, Command::ImmutableGet).await
     }
 
-    async fn query(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError> {
-        self.send_query(request, Command::ImmutableQuery).await
-    }
-
     async fn get_metadata(
         &self,
-        request: Query,
-    ) -> Result<QueryResponse, ReplicationStoreClientError> {
-        self.send_query(request, Command::ImmutableGetMetadata)
+        request: GetMetadata,
+    ) -> Result<GetMetadataResponse, ReplicationStoreClientError> {
+        self.send_metadata(request, Command::ImmutableGetMetadata)
             .await
     }
 
@@ -367,18 +354,11 @@ impl StoreClient for ReplicationStoreClient {
         self.send_get(request, Command::ImmutableLocalGet).await
     }
 
-    async fn local_query(
-        &self,
-        request: Query,
-    ) -> Result<QueryResponse, ReplicationStoreClientError> {
-        self.send_query(request, Command::ImmutableLocalQuery).await
-    }
-
     async fn local_get_metadata(
         &self,
-        request: Query,
-    ) -> Result<QueryResponse, ReplicationStoreClientError> {
-        self.send_query(request, Command::ImmutableLocalGetMetadata)
+        request: GetMetadata,
+    ) -> Result<GetMetadataResponse, ReplicationStoreClientError> {
+        self.send_metadata(request, Command::ImmutableLocalGetMetadata)
             .await
     }
 }

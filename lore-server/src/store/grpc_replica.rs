@@ -22,9 +22,9 @@ use lore_revision::util;
 use lore_revision::util::time::RetryPolicy;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
-use lore_storage::StoreMatch;
+use lore_storage::StoreGetData;
+use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
-use lore_storage::StoreQueryResult;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
 use lore_telemetry::drop_record::DropRecord;
@@ -517,6 +517,16 @@ impl InstrumentProvider for ReplicationClientInstrumentProvider {
     }
 }
 
+/// Write-only replication over gRPC: it accepts `put` and `obliterate` and refuses every read.
+///
+/// Not in use, and outstanding work. `query`, `get_metadata` and `get` answer with
+/// `Store does not support operation`, so nothing that resolves an address can be backed by this
+/// store, and it is the one production [`ImmutableStore`] the conformance battery does not run
+/// against — a store that refuses to resolve fails the battery's first check for behaving as
+/// designed, so hooking it up needs the battery to gain a way to express "this store does not
+/// answer reads" and assert the refusal is uniform across all three. Until then this
+/// implementation is unverified against the contract the other stores are held to. Both belong in
+/// the change that brings this store back into use.
 pub struct GrpcReplica {
     client: ReplicationClient,
 }
@@ -529,30 +539,16 @@ impl GrpcReplica {
 
 #[async_trait]
 impl ImmutableStore for GrpcReplica {
-    async fn exist(
-        self: Arc<Self>,
-        _repository: Partition,
-        _address: Address,
-        _match_requested: StoreMatch,
-    ) -> Result<StoreMatch, StoreError> {
-        Err(StoreError::internal("Store does not support operation"))
-    }
-
-    async fn exist_batch(
-        self: Arc<Self>,
-        _repository: Partition,
-        _addresses: &[Address],
-        _match_requested: StoreMatch,
-    ) -> Result<Vec<StoreMatch>, StoreError> {
-        Err(StoreError::internal("Store does not support operation"))
+    fn isolates_partitions(&self) -> bool {
+        true
     }
 
     async fn query(
         self: Arc<Self>,
-        _repository: Partition,
-        _address: Address,
-        _match_requested: StoreMatch,
-    ) -> Result<StoreQueryResult, StoreError> {
+        _partition: Partition,
+        _addresses: &[Address],
+        _results: &mut [StoreMatchResult],
+    ) -> Result<(), StoreError> {
         Err(StoreError::internal("Store does not support operation"))
     }
 
@@ -560,7 +556,7 @@ impl ImmutableStore for GrpcReplica {
         self: Arc<Self>,
         _repository: Partition,
         _address: Address,
-    ) -> Result<StoreQueryResult, StoreError> {
+    ) -> Result<StoreGetData, StoreError> {
         Err(StoreError::internal("Store does not support operation"))
     }
 
@@ -568,8 +564,7 @@ impl ImmutableStore for GrpcReplica {
         self: Arc<Self>,
         _repository: Partition,
         _address: Address,
-        _match_required: StoreMatch,
-    ) -> Result<(Fragment, Bytes), StoreError> {
+    ) -> Result<StoreGetData, StoreError> {
         Err(StoreError::internal("Store does not support operation"))
     }
 

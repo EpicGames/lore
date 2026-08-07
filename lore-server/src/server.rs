@@ -1070,6 +1070,7 @@ async fn create_local_store(
             allow_partial_fragment: false, /* Server mode, partial fragments not allowed */
             protect_local_fragment: false, /* Server mode, no need to try protect local fragments from eviction */
             implicit_durable_stored: true, /* Server mode, consider all fragments as durably stored */
+            isolate_partitions: true, /* Server mode, one process holds content for every tenant */
             flush_background,
             flush_delay_seconds: settings.flush_delay_seconds as u64,
             target_capacity_percentage: settings.target_capacity_percentage.unwrap_or(default_settings.target_capacity_percentage),
@@ -1641,9 +1642,6 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // Linux.
     #[cfg(target_os = "linux")]
     log_base_address().await;
-
-    // Enforce repository isolation in local store by default
-    lore_storage::concurrency::LOCAL_ISOLATION.store(true, std::sync::atomic::Ordering::Release);
 
     let execution = execution_context();
     let frequency = Duration::from_millis(metrics_config.export_interval_millis);

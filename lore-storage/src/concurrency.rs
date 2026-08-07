@@ -28,9 +28,6 @@ static FILE_COUNT_LIMITER: OnceLock<Semaphore> = OnceLock::<Semaphore>::new();
 static FRAGMENT_LIMITER: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static COMPRESS_LIMITER: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
 
-/// When true, load operations enforce repository isolation.
-pub static LOCAL_ISOLATION: atomic::AtomicBool = atomic::AtomicBool::new(false);
-
 /// Configured file count limit. Set via [`configure`] before first use.
 static FILE_COUNT_LIMIT_CONFIG: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
 

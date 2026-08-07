@@ -24,9 +24,9 @@ mod tests {
     use lore_storage::ImmutableStore;
     use lore_storage::KeyValueStream;
     use lore_storage::StoreError;
+    use lore_storage::StoreGetData;
     use lore_storage::StoreMatch;
     use lore_storage::StoreObliterateStats;
-    use lore_storage::StoreQueryResult;
     use lore_storage::local::immutable_store as immutable;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
     use rand::random;
@@ -39,7 +39,7 @@ mod tests {
         match_result: Option<StoreMatch>,
         invocations: RwLock<HashMap<&'a str, u32>>,
         compare_and_swap_result: Option<Hash>,
-        get_immutable_result: Option<(Fragment, Bytes)>,
+        get_immutable_result: Option<StoreGetData>,
         max_query_batch: Option<usize>,
     }
 
@@ -64,7 +64,12 @@ mod tests {
         }
 
         fn with_mock_get_immutable(mut self, fragment: &Fragment, payload: &Bytes) -> Self {
-            self.get_immutable_result = Some((*fragment, payload.clone()));
+            self.get_immutable_result = Some(StoreGetData {
+                fragment: *fragment,
+                match_made: StoreMatch::MatchFull,
+                partition: Partition::default(),
+                payload: Some(payload.clone()),
+            });
             self
         }
 
@@ -163,81 +168,53 @@ mod tests {
     impl lore_storage::ImmutableStore for TestStore<'static> {
         async fn get_metadata(
             self: Arc<Self>,
-            _partition: Partition,
-            _address: Address,
-        ) -> Result<StoreQueryResult, StoreError> {
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreGetData, StoreError> {
             self.track_invocation("get_metadata");
+            let _ = address;
 
             if self.succeed {
-                Ok(StoreQueryResult {
-                    fragment: Fragment::default(),
-                    match_made: StoreMatch::MatchFull,
-                })
+                Ok(StoreGetData::metadata(
+                    Fragment::default(),
+                    StoreMatch::MatchFull,
+                    partition,
+                ))
             } else {
                 Err(StoreError::internal("Mock store failure"))
             }
-        }
-
-        async fn exist(
-            self: Arc<Self>,
-            _repository: Partition,
-            _address: Address,
-            _match_requested: StoreMatch,
-        ) -> Result<StoreMatch, StoreError> {
-            self.track_invocation("exist");
-
-            if self.succeed {
-                if let Some(match_result) = self.match_result {
-                    Ok(match_result)
-                } else {
-                    Ok(StoreMatch::MatchFull)
-                }
-            } else {
-                Err(StoreError::internal("Mock store failure"))
-            }
-        }
-
-        async fn exist_batch(
-            self: Arc<Self>,
-            repository: Partition,
-            addresses: &[Address],
-            match_requested: StoreMatch,
-        ) -> Result<Vec<StoreMatch>, StoreError> {
-            let mut result = vec![];
-            for address in addresses {
-                result.push(
-                    self.clone()
-                        .exist(repository, *address, match_requested)
-                        .await?,
-                );
-            }
-            Ok(result)
         }
 
         async fn query(
             self: Arc<Self>,
             _repository: Partition,
-            _address: Address,
-            _match_requested: StoreMatch,
-        ) -> Result<StoreQueryResult, StoreError> {
-            self.track_invocation("query");
+            addresses: &[Address],
+            results: &mut [lore_storage::StoreMatchResult],
+        ) -> Result<(), StoreError> {
+            self.track_invocation("resolve");
 
-            if self.succeed {
-                Ok(StoreQueryResult {
-                    fragment: Fragment::default(),
-                    match_made: StoreMatch::MatchFull,
-                })
-            } else {
-                Err(StoreError::internal("Mock store failure"))
+            if !self.succeed {
+                return Err(StoreError::internal("Mock store failure"));
             }
+
+            let match_made = self.match_result.unwrap_or(StoreMatch::MatchFull);
+            for result in results.iter_mut().take(addresses.len()) {
+                *result = lore_storage::StoreMatchResult {
+                    match_made,
+                    partition: _repository,
+                    stored_local: false,
+                    stored_durable: false,
+                };
+            }
+
+            Ok(())
         }
 
         async fn get(
             self: Arc<Self>,
             _repository: Partition,
             _address: Address,
-            _match_required: StoreMatch,
-        ) -> Result<(Fragment, Bytes), StoreError> {
+        ) -> Result<StoreGetData, StoreError> {
             self.track_invocation("get");
 
             if self.succeed {
@@ -442,13 +419,22 @@ mod tests {
 
                 // The result is just hard coded in the TestStore impl, so we don't really care what it is,
                 // just whether it was successful.
-                store
-                    .query(repository, address, StoreMatch::MatchFull)
-                    .await
-                    .expect("Store query failed");
+                lore_storage::immutable_store::query_one(
+                    &(store as Arc<dyn ImmutableStore>),
+                    repository,
+                    address,
+                )
+                .await
+                .expect("Store resolve failed");
 
-                assert_eq!(*store1.invocations.read().unwrap().get("query").unwrap(), 1);
-                assert_eq!(*store2.invocations.read().unwrap().get("query").unwrap(), 1);
+                assert_eq!(
+                    *store1.invocations.read().unwrap().get("resolve").unwrap(),
+                    1
+                );
+                assert_eq!(
+                    *store2.invocations.read().unwrap().get("resolve").unwrap(),
+                    1
+                );
             })
             .await;
     }
@@ -476,15 +462,20 @@ mod tests {
                     context: random::<Context>(),
                 };
 
-                store
-                    .clone()
-                    .query(repository, address, StoreMatch::MatchFull)
-                    .await
-                    .expect("Store query failed");
+                lore_storage::immutable_store::query_one(
+                    &(store.clone() as Arc<dyn ImmutableStore>),
+                    repository,
+                    address,
+                )
+                .await
+                .expect("Store resolve failed");
 
-                assert_eq!(*store1.invocations.read().unwrap().get("query").unwrap(), 1);
+                assert_eq!(
+                    *store1.invocations.read().unwrap().get("resolve").unwrap(),
+                    1
+                );
 
-                assert!(store2.invocations.read().unwrap().get("query").is_none());
+                assert!(store2.invocations.read().unwrap().get("resolve").is_none());
             })
             .await;
     }
@@ -680,8 +671,9 @@ mod tests {
                 assert_eq!(
                     fragment,
                     store
-                        .get(repository, address, StoreMatch::MatchFull)
+                        .get(repository, address)
                         .await
+                        .and_then(lore_storage::StoreGetData::into_payload)
                         .expect("Get immutable failed")
                         .0
                 );
@@ -752,14 +744,14 @@ mod tests {
                 let repository: Partition = random::<RepositoryId>();
                 let addresses = [random::<Address>(), random::<Address>()];
 
-                let result = store
-                    .exist_batch(repository, &addresses, StoreMatch::MatchFull)
+                let mut result = [lore_storage::StoreMatchResult::default(); 2];
+                store
+                    .query(repository, &addresses, &mut result)
                     .await
-                    .expect("Exist batch failed");
+                    .expect("Resolve failed");
 
-                assert_eq!(result.len(), addresses.len());
-                assert_eq!(result[0], StoreMatch::MatchFull);
-                assert_eq!(result[1], StoreMatch::MatchFull);
+                assert_eq!(result[0].match_made, StoreMatch::MatchFull);
+                assert_eq!(result[1].match_made, StoreMatch::MatchFull);
             })
             .await;
     }
@@ -781,6 +773,220 @@ mod tests {
 
         assert!(store.max_query_batch().is_some());
         assert_eq!(store.max_query_batch().unwrap(), 100);
+    }
+
+    /// The answer the copy path is built on: a cache holding content under a partition the caller
+    /// also reaches, surviving the fan-out to a caller that can act on it.
+    ///
+    /// The local store keeps several partitions and does not isolate them, so it is the only thing
+    /// in the stack that can establish a hash match. The durable store below has nothing, and the
+    /// merge must keep the weaker-but-useful answer rather than let the miss overwrite it - along
+    /// with the partition, which is what a caller names as the source of a copy.
+    #[tokio::test]
+    async fn a_foreign_partition_survives_the_merge_to_the_caller() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let durable_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings {
+                        implicit_durable_stored: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("durable should have been created");
+                let local_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local should have been created");
+
+                let store = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_durable("test-durable".to_string(), durable_store.clone())
+                        .expect("durable should have worked")
+                        .with_local("test-local".to_string(), local_store.clone())
+                        .expect("local should have worked")
+                        .build()
+                        .expect("build should have worked"),
+                );
+
+                let held_under: Partition = random::<RepositoryId>();
+                let asked_under: Partition = random::<RepositoryId>();
+
+                // Only the local store has this one, and only under another partition.
+                let (elsewhere_fragment, elsewhere, elsewhere_payload) = generate_random();
+                local_store
+                    .put(
+                        held_under,
+                        elsewhere,
+                        elsewhere_fragment,
+                        Some(elsewhere_payload),
+                        false,
+                    )
+                    .await
+                    .expect("put under the holding partition failed");
+
+                // Only the durable store has this one, under the partition being asked about.
+                let (here_fragment, here, here_payload) = generate_random();
+                durable_store
+                    .put(asked_under, here, here_fragment, Some(here_payload), false)
+                    .await
+                    .expect("put under the asked partition failed");
+
+                let addresses = [elsewhere, here];
+                let mut resolved = [lore_storage::StoreMatchResult::default(); 2];
+                store
+                    .query(asked_under, &addresses, &mut resolved)
+                    .await
+                    .expect("query failed");
+
+                assert_eq!(resolved[0].match_made, StoreMatch::MatchHash);
+                assert_eq!(
+                    resolved[0].partition, held_under,
+                    "the merged answer must name where the content actually is, not where it was \
+                     asked for"
+                );
+                assert!(resolved[0].stored_local);
+
+                // The two answers came from different stores in one merge, so each partition has to
+                // travel with the level that carried it - swapping them would point a copy at a
+                // store that never saw the content.
+                assert_eq!(resolved[1].match_made, StoreMatch::MatchFull);
+                assert_eq!(resolved[1].partition, asked_under);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_merges_answers_from_every_store() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let durable_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings {
+                        implicit_durable_stored: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("durable should have been created");
+                let local_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local should have been created");
+
+                let store = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_durable("test-durable".to_string(), durable_store.clone())
+                        .expect("durable should have worked")
+                        .with_local("test-local".to_string(), local_store.clone())
+                        .expect("local should have worked")
+                        .build()
+                        .expect("build should have worked"),
+                );
+
+                let repository: Partition = random::<RepositoryId>();
+                let (local_fragment, local_address, local_payload) = generate_random();
+                let (durable_fragment, durable_address, durable_payload) = generate_random();
+                let (_, missing_address, _) = generate_random();
+
+                local_store
+                    .put(
+                        repository,
+                        local_address,
+                        local_fragment,
+                        Some(local_payload),
+                        false,
+                    )
+                    .await
+                    .expect("put to local failed");
+                durable_store
+                    .put(
+                        repository,
+                        durable_address,
+                        durable_fragment,
+                        Some(durable_payload),
+                        false,
+                    )
+                    .await
+                    .expect("put to durable failed");
+
+                let addresses = [local_address, missing_address, durable_address];
+                let mut results = [lore_storage::StoreMatchResult::default(); 3];
+                store
+                    .query(repository, &addresses, &mut results)
+                    .await
+                    .expect("resolve failed");
+
+                assert_eq!(results[0].match_made, StoreMatch::MatchFull);
+                assert!(results[0].stored_local);
+                assert!(!results[0].stored_durable);
+
+                assert_eq!(results[1].match_made, StoreMatch::MatchNone);
+                assert!(!results[1].stored_local);
+                assert!(!results[1].stored_durable);
+
+                // Answered by the durable store, which is a local store in this topology and so
+                // reports content on its own disk. That is not our local store, and the composite
+                // is the only thing that knows the difference.
+                assert_eq!(results[2].match_made, StoreMatch::MatchFull);
+                assert!(!results[2].stored_local);
+                assert!(results[2].stored_durable);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn satisfies_the_immutable_store_contract() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution.clone(), async move {
+                let durable_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("durable should have been created");
+                let local_store = immutable::create(
+                    None::<&Path>,
+                    immutable::ImmutableStoreCreateOptions::none(),
+                    false,
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local should have been created");
+
+                let store = CompositeStoreBuilder::default()
+                    .with_durable("test-durable".to_string(), durable_store)
+                    .expect("durable should have worked")
+                    .with_local("test-local".to_string(), local_store)
+                    .expect("local should have worked")
+                    .build()
+                    .expect("build should have worked");
+
+                lore_storage::conformance::verify_immutable_store(
+                    Arc::new(store),
+                    lore_storage::conformance::Capabilities::new("CompositeStore"),
+                )
+                .await;
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -821,7 +1027,7 @@ mod tests {
                 // confirm we don't find the address via composite store
                 let result = composite_store
                     .clone()
-                    .query(repository, address, StoreMatch::MatchFull)
+                    .get_metadata(repository, address)
                     .await
                     .expect("Initial query failed");
                 assert!(matches!(result.match_made, StoreMatch::MatchNone));
@@ -837,7 +1043,7 @@ mod tests {
                 // confirm local store doesn't know about this address before going via composite
                 let result = local_store
                     .clone()
-                    .query(repository, address, StoreMatch::MatchFull)
+                    .get_metadata(repository, address)
                     .await
                     .expect("local confirmation failed");
                 assert!(matches!(result.match_made, StoreMatch::MatchNone));
@@ -845,7 +1051,7 @@ mod tests {
                 // now composite query should find the address
                 let result = composite_store
                     .clone()
-                    .query(repository, address, StoreMatch::MatchFull)
+                    .get_metadata(repository, address)
                     .await
                     .expect("post-put query failed");
                 assert!(matches!(result.match_made, StoreMatch::MatchFull));
@@ -855,7 +1061,7 @@ mod tests {
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 let result = local_store
                     .clone()
-                    .query(repository, address, StoreMatch::MatchFull)
+                    .get_metadata(repository, address)
                     .await
                     .expect("local confirmation failed");
                 assert!(matches!(result.match_made, StoreMatch::MatchFull));
@@ -863,7 +1069,7 @@ mod tests {
                 // but local 'get' still fails as it does not have the payload
                 let result = local_store
                     .clone()
-                    .get(repository, address, StoreMatch::MatchFull)
+                    .get(repository, address)
                     .await
                     .expect_err("local get didn't fail");
                 assert!(result.is_payload_not_found());
@@ -916,8 +1122,9 @@ mod tests {
                 // Get through composite — should fetch from durable
                 let (got_fragment, got_payload) = composite_store
                     .clone()
-                    .get(repository, address, StoreMatch::MatchFull)
+                    .get(repository, address)
                     .await
+                    .and_then(lore_storage::StoreGetData::into_payload)
                     .expect("Composite get failed");
                 assert_eq!(got_fragment.size_payload, fragment.size_payload);
                 assert_eq!(got_payload, payload);
@@ -925,18 +1132,17 @@ mod tests {
                 // Wait for detached local cache task
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-                // Local store should have the fragment (exist works)
-                let match_result = local_store
-                    .clone()
-                    .exist(repository, address, StoreMatch::MatchFull)
-                    .await
-                    .expect("local exist failed");
-                assert_eq!(match_result, StoreMatch::MatchFull);
+                // Local store should have the fragment (resolve works)
+                let match_result =
+                    lore_storage::immutable_store::query_one(&local_store, repository, address)
+                        .await
+                        .expect("local resolve failed");
+                assert_eq!(match_result.match_made, StoreMatch::MatchFull);
 
                 // But local get should fail with PayloadNotFound (no payload cached)
                 let result = local_store
                     .clone()
-                    .get(repository, address, StoreMatch::MatchFull)
+                    .get(repository, address)
                     .await
                     .expect_err("local get should have failed — payload not cached");
                 assert!(result.is_payload_not_found());
@@ -990,17 +1196,16 @@ mod tests {
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
                 // Local store should have the fragment metadata
-                let match_result = local_store
-                    .clone()
-                    .exist(repository, address, StoreMatch::MatchFull)
-                    .await
-                    .expect("local exist failed");
-                assert_eq!(match_result, StoreMatch::MatchFull);
+                let match_result =
+                    lore_storage::immutable_store::query_one(&local_store, repository, address)
+                        .await
+                        .expect("local resolve failed");
+                assert_eq!(match_result.match_made, StoreMatch::MatchFull);
 
                 // But local get should fail — payload was stripped
                 let result = local_store
                     .clone()
-                    .get(repository, address, StoreMatch::MatchFull)
+                    .get(repository, address)
                     .await
                     .expect_err("local get should have failed — payload not cached");
                 assert!(result.is_payload_not_found());
@@ -1008,8 +1213,9 @@ mod tests {
                 // Durable should have the full payload
                 let (_, durable_payload) = durable_store
                     .clone()
-                    .get(repository, address, StoreMatch::MatchFull)
+                    .get(repository, address)
                     .await
+                    .and_then(lore_storage::StoreGetData::into_payload)
                     .expect("Durable get failed");
                 assert_eq!(durable_payload, payload);
             })
@@ -1168,9 +1374,8 @@ mod tests {
         use lore_revision::store::composite::CompositeStoreBuilder;
         use lore_storage::ImmutableStore;
         use lore_storage::StoreError;
-        use lore_storage::StoreMatch;
+        use lore_storage::StoreGetData;
         use lore_storage::StoreObliterateStats;
-        use lore_storage::StoreQueryResult;
         use lore_storage::local::immutable_store as immutable;
         use lore_storage::local::immutable_store::ImmutableStoreSettings;
         use rand::random;
@@ -1180,7 +1385,7 @@ mod tests {
 
         struct DelayStore {
             get_delay: Duration,
-            get_result: RwLock<Result<(Fragment, Bytes), StoreError>>,
+            get_result: RwLock<Result<StoreGetData, StoreError>>,
             get_count: AtomicU32,
         }
 
@@ -1188,7 +1393,12 @@ mod tests {
             fn succeeding(fragment: Fragment, payload: Bytes, delay: Duration) -> Self {
                 Self {
                     get_delay: delay,
-                    get_result: RwLock::new(Ok((fragment, payload))),
+                    get_result: RwLock::new(Ok(StoreGetData {
+                        fragment,
+                        match_made: lore_storage::StoreMatch::MatchFull,
+                        partition: Partition::default(),
+                        payload: Some(payload),
+                    })),
                     get_count: AtomicU32::new(0),
                 }
             }
@@ -1218,47 +1428,29 @@ mod tests {
                 self: Arc<Self>,
                 partition: Partition,
                 address: Address,
-            ) -> Result<StoreQueryResult, StoreError> {
-                self.query(partition, address, StoreMatch::MatchFull).await
+            ) -> Result<StoreGetData, StoreError> {
+                let _ = (partition, address);
+                Ok(StoreGetData::default())
             }
 
             async fn is_available(self: Arc<Self>, _timeout: Duration) -> bool {
                 true
             }
 
-            async fn exist(
-                self: Arc<Self>,
-                _repository: Partition,
-                _address: Address,
-                _match_requested: StoreMatch,
-            ) -> Result<StoreMatch, StoreError> {
-                Ok(StoreMatch::MatchNone)
-            }
-
-            async fn exist_batch(
-                self: Arc<Self>,
-                _repository: Partition,
-                addresses: &[Address],
-                _match_requested: StoreMatch,
-            ) -> Result<Vec<StoreMatch>, StoreError> {
-                Ok(vec![StoreMatch::MatchNone; addresses.len()])
-            }
-
             async fn query(
                 self: Arc<Self>,
                 _repository: Partition,
-                _address: Address,
-                _match_requested: StoreMatch,
-            ) -> Result<StoreQueryResult, StoreError> {
-                Ok(StoreQueryResult::default())
+                _addresses: &[Address],
+                _results: &mut [lore_storage::StoreMatchResult],
+            ) -> Result<(), StoreError> {
+                Ok(())
             }
 
             async fn get(
                 self: Arc<Self>,
                 _repository: Partition,
                 _address: Address,
-                _match_required: StoreMatch,
-            ) -> Result<(Fragment, Bytes), StoreError> {
+            ) -> Result<StoreGetData, StoreError> {
                 self.get_count.fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep(self.get_delay).await;
                 self.get_result.read().await.clone()
@@ -1365,14 +1557,17 @@ mod tests {
                     let mut handles = Vec::with_capacity(num_concurrent);
                     for _ in 0..num_concurrent {
                         let store = composite.clone();
-                        handles.push(lore_spawn!(async move {
-                            store.get(repository, address, StoreMatch::MatchFull).await
-                        }));
+                        handles.push(lore_spawn!(
+                            async move { store.get(repository, address).await }
+                        ));
                     }
 
                     for handle in handles {
-                        let (got_fragment, got_payload) =
-                            handle.await.expect("task panicked").expect("get failed");
+                        let (got_fragment, got_payload) = handle
+                            .await
+                            .expect("task panicked")
+                            .and_then(StoreGetData::into_payload)
+                            .expect("get failed");
                         assert_eq!(got_fragment.size_payload, fragment.size_payload);
                         assert_eq!(got_payload, payload);
                     }
@@ -1414,7 +1609,7 @@ mod tests {
                     for _ in 0..num_concurrent {
                         let store = composite.clone();
                         handles.push(lore_spawn!(async move {
-                            store.get(repository, address, StoreMatch::MatchFull).await
+                            store.get(repository, address).await
                         }));
                     }
 
@@ -1903,17 +2098,20 @@ mod tests {
                             .expect("build should work"),
                     );
 
-                    let match_result = composite
-                        .clone()
-                        .exist(repository, address, StoreMatch::MatchFull)
-                        .await
-                        .expect("exist should work");
-                    assert_eq!(match_result, StoreMatch::MatchFull);
+                    let match_result = lore_storage::immutable_store::query_one(
+                        &(composite.clone() as Arc<dyn ImmutableStore>),
+                        repository,
+                        address,
+                    )
+                    .await
+                    .expect("resolve should work");
+                    assert_eq!(match_result.match_made, StoreMatch::MatchFull);
 
                     let (got_fragment, got_payload) = composite
                         .clone()
-                        .get(repository, address, StoreMatch::MatchFull)
+                        .get(repository, address)
                         .await
+                        .and_then(lore_storage::StoreGetData::into_payload)
                         .expect("get should work");
                     assert_eq!(got_fragment, fragment);
                     assert_eq!(got_payload, payload);
@@ -1930,7 +2128,6 @@ mod tests {
                     use lore_revision::fragment::generate_random;
                     use lore_revision::lore::RepositoryId;
                     use lore_storage::ImmutableStore;
-                    use lore_storage::StoreMatch;
 
                     let (fragment, address, payload) = generate_random();
                     let repository: Partition = rand::random::<RepositoryId>();
@@ -1971,8 +2168,9 @@ mod tests {
 
                     let (got_fragment, got_payload) = composite
                         .clone()
-                        .get(repository, address, StoreMatch::MatchFull)
+                        .get(repository, address)
                         .await
+                        .and_then(lore_storage::StoreGetData::into_payload)
                         .expect("get should succeed via durable despite empty replica");
                     assert_eq!(got_fragment, fragment);
                     assert_eq!(got_payload, payload);
@@ -2000,9 +2198,9 @@ mod tests {
         use lore_revision::store::composite::CompositeStoreBuilder;
         use lore_storage::ImmutableStore;
         use lore_storage::StoreError;
+        use lore_storage::StoreGetData;
         use lore_storage::StoreMatch;
         use lore_storage::StoreObliterateStats;
-        use lore_storage::StoreQueryResult;
         use lore_storage::local::immutable_store as immutable;
         use lore_storage::local::immutable_store::ImmutableStoreSettings;
         use rand::random;
@@ -2013,9 +2211,7 @@ mod tests {
         struct CountingStore {
             inner: Arc<dyn ImmutableStore>,
             get_count: AtomicU32,
-            exist_count: AtomicU32,
-            exist_batch_count: AtomicU32,
-            query_count: AtomicU32,
+            resolve_count: AtomicU32,
         }
 
         impl std::fmt::Debug for CountingStore {
@@ -2029,9 +2225,7 @@ mod tests {
                 Self {
                     inner,
                     get_count: AtomicU32::new(0),
-                    exist_count: AtomicU32::new(0),
-                    exist_batch_count: AtomicU32::new(0),
-                    query_count: AtomicU32::new(0),
+                    resolve_count: AtomicU32::new(0),
                 }
             }
         }
@@ -2042,46 +2236,20 @@ mod tests {
                 self: Arc<Self>,
                 partition: Partition,
                 address: Address,
-            ) -> Result<StoreQueryResult, StoreError> {
-                self.query(partition, address, StoreMatch::MatchFull).await
-            }
-
-            async fn exist(
-                self: Arc<Self>,
-                partition: Partition,
-                address: Address,
-                match_requested: StoreMatch,
-            ) -> Result<StoreMatch, StoreError> {
-                self.exist_count.fetch_add(1, Ordering::SeqCst);
-                self.inner
-                    .clone()
-                    .exist(partition, address, match_requested)
-                    .await
-            }
-
-            async fn exist_batch(
-                self: Arc<Self>,
-                partition: Partition,
-                addresses: &[Address],
-                match_requested: StoreMatch,
-            ) -> Result<Vec<StoreMatch>, StoreError> {
-                self.exist_batch_count.fetch_add(1, Ordering::SeqCst);
-                self.inner
-                    .clone()
-                    .exist_batch(partition, addresses, match_requested)
-                    .await
+            ) -> Result<StoreGetData, StoreError> {
+                self.inner.clone().get_metadata(partition, address).await
             }
 
             async fn query(
                 self: Arc<Self>,
                 partition: Partition,
-                address: Address,
-                match_requested: StoreMatch,
-            ) -> Result<StoreQueryResult, StoreError> {
-                self.query_count.fetch_add(1, Ordering::SeqCst);
+                addresses: &[Address],
+                results: &mut [lore_storage::StoreMatchResult],
+            ) -> Result<(), StoreError> {
+                self.resolve_count.fetch_add(1, Ordering::SeqCst);
                 self.inner
                     .clone()
-                    .query(partition, address, match_requested)
+                    .query(partition, addresses, results)
                     .await
             }
 
@@ -2089,13 +2257,9 @@ mod tests {
                 self: Arc<Self>,
                 partition: Partition,
                 address: Address,
-                match_required: StoreMatch,
-            ) -> Result<(Fragment, Bytes), StoreError> {
+            ) -> Result<StoreGetData, StoreError> {
                 self.get_count.fetch_add(1, Ordering::SeqCst);
-                self.inner
-                    .clone()
-                    .get(partition, address, match_required)
-                    .await
+                self.inner.clone().get(partition, address).await
             }
 
             async fn put(
@@ -2248,8 +2412,9 @@ mod tests {
                     .await;
 
                     let (got_fragment, got_payload) = composite
-                        .get(repository, address, StoreMatch::MatchFull)
+                        .get(repository, address)
                         .await
+                        .and_then(lore_storage::StoreGetData::into_payload)
                         .expect("get should succeed via replica");
 
                     assert_eq!(got_fragment.size_payload, fragment.size_payload);
@@ -2287,8 +2452,9 @@ mod tests {
                             .await;
 
                     let (got_fragment, got_payload) = composite
-                        .get(repository, address, StoreMatch::MatchFull)
+                        .get(repository, address)
                         .await
+                        .and_then(lore_storage::StoreGetData::into_payload)
                         .expect("get should succeed immediately via durable");
 
                     assert_eq!(got_fragment.size_payload, fragment.size_payload);
@@ -2305,7 +2471,7 @@ mod tests {
         /// When a read replica responds with `MatchFull` before the durable delay elapses,
         /// the durable `exist` should be cancelled — never invoked.
         #[tokio::test]
-        async fn exist_durable_not_called_when_replica_responds_within_delay() {
+        async fn resolve_durable_not_called_when_replica_responds_within_delay() {
             let execution = setup_test_execution();
             LORE_CONTEXT
                 .scope(execution, async move {
@@ -2334,16 +2500,19 @@ mod tests {
                     )
                     .await;
 
-                    let match_result = composite
-                        .exist(repository, address, StoreMatch::MatchFull)
-                        .await
-                        .expect("exist should succeed via replica");
+                    let match_result = lore_storage::immutable_store::query_one(
+                        &(composite as Arc<dyn ImmutableStore>),
+                        repository,
+                        address,
+                    )
+                    .await
+                    .expect("resolve should succeed via replica");
 
-                    assert_eq!(match_result, StoreMatch::MatchFull);
+                    assert_eq!(match_result.match_made, StoreMatch::MatchFull);
                     assert_eq!(
-                        durable.exist_count.load(Ordering::SeqCst),
+                        durable.resolve_count.load(Ordering::SeqCst),
                         0,
-                        "durable exist must not be called when replica responds within the delay window"
+                        "durable resolve must not be called when replica responds within the delay window"
                     );
                 })
                 .await;
@@ -2352,7 +2521,7 @@ mod tests {
         /// When there are no replicas the configured delay is bypassed entirely — the
         /// durable store is queried immediately regardless of how large the delay is.
         #[tokio::test]
-        async fn exist_durable_not_delayed_when_no_replicas() {
+        async fn resolve_durable_not_delayed_when_no_replicas() {
             let execution = setup_test_execution();
             LORE_CONTEXT
                 .scope(execution, async move {
@@ -2372,111 +2541,19 @@ mod tests {
                         build_composite_no_replica(durable.clone(), Duration::from_millis(500))
                             .await;
 
-                    let match_result = composite
-                        .exist(repository, address, StoreMatch::MatchFull)
-                        .await
-                        .expect("exist should succeed immediately via durable");
+                    let match_result = lore_storage::immutable_store::query_one(
+                        &(composite as Arc<dyn ImmutableStore>),
+                        repository,
+                        address,
+                    )
+                    .await
+                    .expect("resolve should succeed immediately via durable");
 
-                    assert_eq!(match_result, StoreMatch::MatchFull);
+                    assert_eq!(match_result.match_made, StoreMatch::MatchFull);
                     assert_eq!(
-                        durable.exist_count.load(Ordering::SeqCst),
+                        durable.resolve_count.load(Ordering::SeqCst),
                         1,
-                        "durable exist must be called when there are no replicas"
-                    );
-                })
-                .await;
-        }
-
-        /// When a read replica responds with `MatchFull` before the durable delay elapses,
-        /// the durable `query` should be cancelled — never invoked.
-        #[tokio::test]
-        async fn query_durable_not_called_when_replica_responds_within_delay() {
-            let execution = setup_test_execution();
-            LORE_CONTEXT
-                .scope(execution, async move {
-                    let (fragment, address, payload) = generate_random();
-                    let repository: Partition = random::<RepositoryId>();
-
-                    let replica = make_store().await;
-                    replica
-                        .clone()
-                        .put(repository, address, fragment, Some(payload.clone()), false)
-                        .await
-                        .expect("put to replica failed");
-
-                    let durable_inner = make_store().await;
-                    durable_inner
-                        .clone()
-                        .put(repository, address, fragment, Some(payload), false)
-                        .await
-                        .expect("put to durable failed");
-                    let durable = Arc::new(CountingStore::wrapping(durable_inner));
-
-                    let composite = build_composite_with_read_replica(
-                        durable.clone(),
-                        replica,
-                        Duration::from_millis(500),
-                    )
-                    .await;
-
-                    let result = composite
-                        .query(repository, address, StoreMatch::MatchFull)
-                        .await
-                        .expect("query should succeed via replica");
-
-                    assert_eq!(result.match_made, StoreMatch::MatchFull);
-                    assert_eq!(
-                        durable.query_count.load(Ordering::SeqCst),
-                        0,
-                        "durable query must not be called when replica responds within the delay window"
-                    );
-                })
-                .await;
-        }
-
-        /// When a read replica satisfies an `exist_batch` before the durable delay elapses,
-        /// the durable `exist_batch` should be cancelled — never invoked.
-        #[tokio::test]
-        async fn exist_batch_durable_not_called_when_replica_responds_within_delay() {
-            let execution = setup_test_execution();
-            LORE_CONTEXT
-                .scope(execution, async move {
-                    let (fragment, address, payload) = generate_random();
-                    let repository: Partition = random::<RepositoryId>();
-
-                    let replica = make_store().await;
-                    replica
-                        .clone()
-                        .put(repository, address, fragment, Some(payload.clone()), false)
-                        .await
-                        .expect("put to replica failed");
-
-                    let durable_inner = make_store().await;
-                    durable_inner
-                        .clone()
-                        .put(repository, address, fragment, Some(payload), false)
-                        .await
-                        .expect("put to durable failed");
-                    let durable = Arc::new(CountingStore::wrapping(durable_inner));
-
-                    let composite = build_composite_with_read_replica(
-                        durable.clone(),
-                        replica,
-                        Duration::from_millis(500),
-                    )
-                    .await;
-
-                    let matches = composite
-                        .exist_batch(repository, &[address], StoreMatch::MatchFull)
-                        .await
-                        .expect("exist_batch should succeed via replica");
-
-                    assert_eq!(matches.len(), 1);
-                    assert_eq!(matches[0], StoreMatch::MatchFull);
-                    assert_eq!(
-                        durable.exist_batch_count.load(Ordering::SeqCst),
-                        0,
-                        "durable exist_batch must not be called when replica responds within the delay window"
+                        "durable resolve must be called when there are no replicas"
                     );
                 })
                 .await;

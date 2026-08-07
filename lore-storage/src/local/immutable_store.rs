@@ -66,9 +66,10 @@ use crate::fs_util;
 use crate::hash;
 use crate::immutable_store::StoreError;
 use crate::immutable_store::sanitise_fragment_behavior_flags;
+use crate::store_types::StoreGetData;
 use crate::store_types::StoreMatch;
+use crate::store_types::StoreMatchResult;
 use crate::store_types::StoreObliterateStats;
-use crate::store_types::StoreQueryResult;
 
 #[error_set]
 pub enum LocalImmutableStoreError {
@@ -161,6 +162,9 @@ pub struct ImmutableStoreFindResult {
     pub group: usize,
     pub data: ImmutableData,
     pub matching: StoreMatch,
+    /// The partition the matched entry belongs to. The one searched for whenever it holds the hash,
+    /// since `lookup` prefers it; another only when it does not.
+    pub partition: Partition,
 }
 
 #[repr(C)]
@@ -282,6 +286,10 @@ pub struct ImmutableStoreSettings {
     pub protect_local_fragment: bool,
     /// Consider all fragments durably stored (false for clients, generally true for server)
     pub implicit_durable_stored: bool,
+    /// Refuse to serve a payload found under a different partition (false for clients, true for
+    /// server). Partitions are the unit access is granted on, so a process holding content for
+    /// several tenants must not let one of them read another's bytes by hash alone.
+    pub isolate_partitions: bool,
     /// Flush in the background
     pub flush_background: bool,
     /// Flush delay in seconds
@@ -311,6 +319,7 @@ impl Default for ImmutableStoreSettings {
             allow_partial_fragment: true,
             protect_local_fragment: true,
             implicit_durable_stored: false,
+            isolate_partitions: false,
             flush_background: false,
             flush_delay_seconds: DEFAULT_FLUSH_DELAY_SECONDS,
             target_capacity_percentage: 70,
@@ -1679,7 +1688,7 @@ impl LocalImmutableStore {
         {
             let find = self
                 .clone()
-                .find(partition, address, StoreMatch::MatchFull)
+                .find(partition, address)
                 .await
                 .inspect_err(|err| {
                     lore_base::lore_warn!(
@@ -1728,16 +1737,14 @@ impl LocalImmutableStore {
         Ok(())
     }
 
+    /// Resolve an address to the best match the bucket holds, at full strength. Callers gate the
+    /// answer afterwards against the scope they serve or report at; searching at a scope instead
+    /// would cap the level and lose the distinction the caller is asking for.
     pub async fn find(
         &self,
         partition: Partition,
         address: Address,
-        match_request: StoreMatch,
     ) -> Result<ImmutableStoreFindResult, LocalImmutableStoreError> {
-        if match_request == StoreMatch::MatchNone {
-            return Err(LocalImmutableStoreError::internal("Invalid query"));
-        }
-
         let group_index = address.hash.data()[0] as usize;
         let group = &self.group[group_index];
 
@@ -1784,7 +1791,8 @@ impl LocalImmutableStore {
         };
 
         // Binary search the bucket
-        let (match_slot, _, match_made) = Self::lookup(&bucket, partition, address, match_request);
+        let (match_slot, _, match_made) =
+            Self::lookup(&bucket, partition, address, StoreMatch::MatchFull);
 
         if match_made == StoreMatch::MatchNone {
             Ok(ImmutableStoreFindResult {
@@ -1793,6 +1801,7 @@ impl LocalImmutableStore {
             })
         } else {
             let index = bucket.sorted_index[match_slot] as usize;
+            let matched_partition = bucket.entry[index].partition;
             let data = &bucket.entry[index].data;
 
             let data = if data.flags & FragmentFlags::PayloadObliterated
@@ -1821,6 +1830,7 @@ impl LocalImmutableStore {
                 group: group_index,
                 data,
                 matching: match_made,
+                partition: matched_partition,
             })
         }
     }
@@ -3140,6 +3150,10 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         true
     }
 
+    fn isolates_partitions(&self) -> bool {
+        self.settings.isolate_partitions
+    }
+
     async fn is_available(self: Arc<Self>, timeout: Duration) -> bool {
         let mut checks = JoinSet::new();
         for group_index in 0..GROUP_COUNT {
@@ -3170,52 +3184,78 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         true
     }
 
-    async fn exist(
-        self: Arc<Self>,
-        partition: Partition,
-        address: Address,
-        match_requested: StoreMatch,
-    ) -> Result<StoreMatch, StoreError> {
-        Ok(self
-            .find(partition, address, match_requested)
-            .await
-            .forward_with::<StoreError, _>(|| {
-                format!("Failed to query immutable store {}.", address.hash)
-            })?
-            .matching)
-    }
-
-    async fn exist_batch(
-        self: Arc<Self>,
-        partition: Partition,
-        addresses: &[Address],
-        match_requested: StoreMatch,
-    ) -> Result<Vec<StoreMatch>, StoreError> {
-        let mut output = vec![];
-
-        for address in addresses {
-            output.push(
-                self.clone()
-                    .exist(partition, *address, match_requested)
-                    .await?,
-            );
-        }
-
-        Ok(output)
-    }
-
+    /// One bucket pass per address establishes the best match, so this store never has a reason to
+    /// under-report: it does not cost more to learn that the hash is in the partition than to learn
+    /// that it exists at all.
+    ///
+    /// A tombstone resolves to no match. `obliterate` leaves the entry in the index — the
+    /// last-reference scan needs to see it — so this is the one place that has to know the
+    /// difference between an entry and a live one. Where the best match is a tombstone and a weaker
+    /// live match exists elsewhere, this reports nothing rather than the weaker level; that is
+    /// under-reporting, which the contract permits, and it keeps the obliteration rule absolute
+    /// rather than conditional on what else happens to be stored.
+    ///
+    /// Durability is only ever read off a fragment this store actually holds — either recorded on
+    /// it when it was cached, or implied for every entry by a store configured durable. An address
+    /// that did not match carries no claim at all.
     async fn query(
         self: Arc<Self>,
         partition: Partition,
+        addresses: &[Address],
+        results: &mut [StoreMatchResult],
+    ) -> Result<(), StoreError> {
+        debug_assert_eq!(addresses.len(), results.len());
+
+        for (address, result) in addresses.iter().zip(results.iter_mut()) {
+            let found = self
+                .find(partition, *address)
+                .await
+                .forward_with::<StoreError, _>(|| {
+                    format!("Failed to resolve immutable store {}.", address.hash)
+                })?;
+
+            let obliterated = found.data.flags & FragmentFlags::PayloadObliterated.bits() != 0;
+
+            *result = if obliterated || found.matching < self.query_scope() {
+                StoreMatchResult::default()
+            } else {
+                StoreMatchResult {
+                    match_made: found.matching,
+                    partition: found.partition,
+                    stored_local: found.data.pack_file != 0,
+                    stored_durable: found.data.flags & FragmentFlags::PayloadStoredDurable.bits()
+                        != 0
+                        || self.settings.implicit_durable_stored,
+                }
+            };
+        }
+
+        Ok(())
+    }
+
+    /// This store holds the fragment it was given, so the representation comes straight off the
+    /// entry and there is nothing further to fetch.
+    async fn get_metadata(
+        self: Arc<Self>,
+        partition: Partition,
         address: Address,
-        match_requested: StoreMatch,
-    ) -> Result<StoreQueryResult, StoreError> {
+    ) -> Result<StoreGetData, StoreError> {
+        // Resolved at the strongest level so the caller learns whether the association is its own,
+        // then gated on scope: asking `find` for the scope directly would cap the answer there and
+        // a full match would come back indistinguishable from a partition one.
         let find = self
-            .find(partition, address, match_requested)
+            .find(partition, address)
             .await
             .forward_with::<StoreError, _>(|| {
-                format!("Failed to query immutable store {}.", address.hash)
+                format!("Failed to read immutable store metadata {}.", address.hash)
             })?;
+
+        // `find` matches on address alone, so a tombstoned entry still resolves.
+        let obliterated = find.data.flags & FragmentFlags::PayloadObliterated.bits() != 0;
+
+        if obliterated || find.matching < self.read_scope() {
+            return Ok(StoreGetData::default());
+        }
 
         let mut local_flags = 0;
         if find.data.pack_file != 0 {
@@ -3225,32 +3265,22 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             local_flags |= FragmentFlags::PayloadStoredDurable.bits();
         }
 
-        Ok(StoreQueryResult {
-            fragment: Fragment {
+        Ok(StoreGetData::metadata(
+            Fragment {
                 flags: find.data.flags | local_flags,
                 size_payload: find.data.size_payload,
                 size_content: find.data.size_content,
             },
-            match_made: find.matching,
-        })
-    }
-
-    /// This store's `query` reads the fragment it stored, so it already reports the representation
-    /// and there is nothing further to fetch.
-    async fn get_metadata(
-        self: Arc<Self>,
-        partition: Partition,
-        address: Address,
-    ) -> Result<StoreQueryResult, StoreError> {
-        self.query(partition, address, StoreMatch::MatchFull).await
+            find.matching,
+            find.partition,
+        ))
     }
 
     async fn get(
         self: Arc<Self>,
         partition: Partition,
         address: Address,
-        match_required: StoreMatch,
-    ) -> Result<(Fragment, Bytes), StoreError> {
+    ) -> Result<StoreGetData, StoreError> {
         #[cfg(feature = "failure_generator")]
         if self.failure_generator.retry_rate > 0.0
             && rand::random::<f32>() < self.failure_generator.retry_rate
@@ -3258,37 +3288,50 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             return Err(StoreError::from(SlowDown));
         }
 
+        // Resolved at full strength and then gated on scope, the same way `get_metadata` does it,
+        // so the level reported back is the one actually found rather than the one searched at.
         let find = self
-            .find(partition, address, match_required)
+            .find(partition, address)
             .await
             .forward_with::<StoreError, _>(|| {
                 format!("Failed to query immutable store for get {}.", address.hash)
             })?;
 
-        if find.matching == match_required {
-            let mut local_flags = 0;
-            if self.settings.implicit_durable_stored {
-                local_flags |= FragmentFlags::PayloadStoredDurable.bits();
-            }
+        // Not covered by the pack file check below: that one catches this only because obliterate
+        // happens to clear the pack file.
+        let obliterated = find.data.flags & FragmentFlags::PayloadObliterated.bits() != 0;
 
-            let fragment = Fragment {
-                flags: find.data.flags | local_flags,
-                size_payload: find.data.size_payload,
-                size_content: find.data.size_content,
-            };
-            if find.data.pack_file != 0 {
-                crate::validate_fragment_payload(&fragment, find.data.size_payload as usize)?;
-                let payload = Self::load(&self.group[find.group].packstore, find.data)
-                    .await
-                    .forward::<StoreError>("Failed to load payload from local storage.")?;
-                crate::validate_fragment_payload(&fragment, payload.len())?;
-                Ok((fragment, payload))
-            } else {
-                Err(StoreError::from(PayloadNotFound::from(address.hash)))
-            }
-        } else {
-            Err(StoreError::from(AddressNotFound::from(address)))
+        if obliterated || find.matching < self.read_scope() {
+            return Err(StoreError::from(AddressNotFound::from(address)));
         }
+
+        let mut local_flags = 0;
+        if self.settings.implicit_durable_stored {
+            local_flags |= FragmentFlags::PayloadStoredDurable.bits();
+        }
+
+        let fragment = Fragment {
+            flags: find.data.flags | local_flags,
+            size_payload: find.data.size_payload,
+            size_content: find.data.size_content,
+        };
+
+        if find.data.pack_file == 0 {
+            return Err(StoreError::from(PayloadNotFound::from(address.hash)));
+        }
+
+        crate::validate_fragment_payload(&fragment, find.data.size_payload as usize)?;
+        let payload = Self::load(&self.group[find.group].packstore, find.data)
+            .await
+            .forward::<StoreError>("Failed to load payload from local storage.")?;
+        crate::validate_fragment_payload(&fragment, payload.len())?;
+
+        Ok(StoreGetData {
+            fragment,
+            match_made: find.matching,
+            partition: find.partition,
+            payload: Some(payload),
+        })
     }
 
     async fn put(
@@ -3346,7 +3389,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         }
 
         let find = self
-            .find(partition, address, StoreMatch::MatchFull)
+            .find(partition, address)
             .await
             .forward_with::<StoreError, _>(|| {
                 format!(
@@ -5092,5 +5135,101 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(bytes.as_ref(), payload.as_slice());
+    }
+
+    /// The local store is the reference implementation of the store contract: it resolves an
+    /// address in a single bucket pass, so it can establish every level at no extra cost and has
+    /// no reason to under-report any of them.
+    #[tokio::test]
+    async fn satisfies_the_immutable_store_contract() {
+        let dir = crate::test_util::TempDir::new("is_conformance_");
+        let store = LocalImmutableStore::new(
+            Some(std::path::PathBuf::from(dir.as_ref())),
+            ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("create store");
+
+        crate::conformance::verify_immutable_store(
+            store,
+            crate::conformance::Capabilities::new("LocalImmutableStore"),
+        )
+        .await;
+    }
+
+    /// A store that isolates partitions reports further than it reads, and this is the only
+    /// implementation of that split.
+    ///
+    /// A sibling context in the same partition is a partition match, which `query` reports so a
+    /// caller can duplicate the association with a copy, and which `get` refuses so that nothing
+    /// crossing a wire without its level is mistaken for an association of the caller's own. The
+    /// battery bounds the reported level from above and cannot assert this, because a store that
+    /// resolves associations alone is entitled to answer `MatchNone` here instead.
+    #[tokio::test]
+    async fn an_isolating_store_reports_further_than_it_reads() {
+        use crate::immutable_store::ImmutableStore;
+
+        let dir = crate::test_util::TempDir::new("is_scope_split_");
+        let store = LocalImmutableStore::new(
+            Some(std::path::PathBuf::from(dir.as_ref())),
+            ImmutableStoreSettings {
+                isolate_partitions: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create store");
+
+        let partition = Partition::from([0x51u8; 16]);
+        let payload = Bytes::from_static(b"one hash, two contexts, one partition");
+        let stored = Address {
+            hash: crate::hash::hash_slice(payload.as_ref()),
+            context: Context::from([0x52u8; 16]),
+        };
+        let fragment = Fragment {
+            flags: FragmentFlags::PayloadStoredLocal.bits(),
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+
+        store
+            .clone()
+            .put(partition, stored, fragment, Some(payload), false)
+            .await
+            .expect("put under the storing context");
+
+        let sibling = Address {
+            hash: stored.hash,
+            context: Context::from([0x53u8; 16]),
+        };
+
+        let resolved = crate::immutable_store::query_one(
+            &(store.clone() as Arc<dyn ImmutableStore>),
+            partition,
+            sibling,
+        )
+        .await
+        .expect("query a sibling context");
+        assert_eq!(
+            resolved.match_made,
+            StoreMatch::MatchPartition,
+            "an isolating store must still report the partition match a copy would act on"
+        );
+        assert_eq!(resolved.partition, partition);
+
+        assert!(
+            store
+                .clone()
+                .get_metadata(partition, sibling)
+                .await
+                .expect("get_metadata answers rather than failing")
+                .match_made
+                == StoreMatch::MatchNone,
+            "an isolating store described an association it does not hold"
+        );
+        assert!(
+            store.clone().get(partition, sibling).await.is_err(),
+            "an isolating store served a sibling context's payload"
+        );
     }
 }
