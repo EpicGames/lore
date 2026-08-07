@@ -36,6 +36,21 @@ mod tests {
     }
 
     #[test]
+    fn test_conflict_without_trailing_newlines() {
+        let base_string = "This is line 1.\nThis is line 2.";
+        let mine_string = "This is line 1.\nThis is line 2 changed.";
+        let theirs_string = "This is line 1.\nThis is line 2 also changed.";
+        let expected_string = "This is line 1.\n<<<<<<< ours\nThis is line 2 changed.\n||||||| original\nThis is line 2.\n=======\nThis is line 2 also changed.\n>>>>>>> theirs\n";
+
+        let result_string =
+            match merge3_text(base_string, mine_string, theirs_string, None, None, None) {
+                Err(str) | Ok(str) => str,
+            };
+
+        assert_eq!(result_string, expected_string);
+    }
+
+    #[test]
     fn test_markers() {
         let base_string = "This is line 1.\nThis is line 2.\n";
         let mine_string = "This is line 1.\nThis is line 2.\nThis line is added at the end.\n";
