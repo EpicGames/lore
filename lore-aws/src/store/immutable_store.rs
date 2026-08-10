@@ -1814,6 +1814,8 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             // expect this to be invoked, the log output in this method is intentionally very verbose.
             let span = tracing::Span::current();
 
+            // Content written before the state table existed has no row here, so this returns
+            // having deleted nothing: the association stays, and still resolves to a full match.
             let Some(state) = self
                 .load_state(address.hash)
                 .instrument(span.clone())

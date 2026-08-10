@@ -710,6 +710,15 @@ store, where today it is refused only where state happens to be consulted.
 - **Risk:** While the legacy metadata table is configured, existence costs three batched reads
   rather than one — *mitigation:* all three are batched and none is per address, and the extra two
   retire with the table.
+- **Risk:** Clause 3 does not hold for legacy-era content in the AWS store. `obliterate` returns
+  early when a hash has no state row, reporting success without deleting the association, while the
+  legacy fallback added here goes on resolving that association to a full match — so obliterating a
+  fragment written before the state table existed does nothing and says it worked. The early return
+  predates this proposal; what is new is the fallback that keeps such content matchable —
+  *mitigation:* accepted for now as a calculated risk. It is bounded by the legacy table's lifetime
+  and retires with it under [LEP 2026-08-03](2026-08-03-fragment-metadata-on-the-s3-object.md).
+  Until then an obliteration covering legacy-era content has to be confirmed rather than assumed,
+  and the fix, should one be wanted sooner, is to delete the association before consulting state.
 
 ## Drawbacks
 
