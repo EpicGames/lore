@@ -374,8 +374,10 @@ pub trait ImmutableStore: Any + Send + Sync {
     ///
     /// The contract, checked for every implementation by [`crate::conformance`]:
     ///
-    /// 1. **Never over-report.** A reported level must hold, and [`StoreMatch::MatchFull`]
-    ///    additionally means the payload is retrievable.
+    /// 1. **Never over-report.** A reported level must hold: the association it names exists. It
+    ///    says nothing about whether the payload can be handed over here — that is
+    ///    [`StoreMatchResult::stored_local`] and [`StoreMatchResult::stored_durable`]. A store may
+    ///    hold the representation and not the bytes, and reports a full match when it does.
     /// 2. **May under-report.** A store may answer with a weaker level than the truth when
     ///    establishing the stronger one costs more than it is worth — a durable store need not
     ///    spend a lookup to distinguish "in this partition" from "somewhere". Callers must read a

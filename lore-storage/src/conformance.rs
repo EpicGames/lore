@@ -15,8 +15,9 @@
 //!
 //! The clauses, as written into the trait:
 //!
-//! 1. **Never over-report.** A reported level must hold, and a full match additionally means the
-//!    payload is retrievable.
+//! 1. **Never over-report.** A reported level must hold: the association it names exists. Whether
+//!    the payload can be served from here is `stored_local` and `stored_durable`, not the level — a
+//!    store may hold the representation alone and still report a full match.
 //! 2. **May under-report.** A store may answer with a weaker level than the truth when establishing
 //!    the stronger one costs more than it is worth. This is why the assertions below are bounds —
 //!    `<= MatchPartition`, never `== MatchPartition`.
@@ -56,7 +57,7 @@ use crate::store_types::StoreObliterateStats;
 pub enum Check {
     /// An address the store has never seen matches nothing, through any method.
     UnknownAddressMatchesNothing,
-    /// Stored content reports a full match, and that match is a promise the payload comes back.
+    /// Content stored with its payload reports a full match and reads back byte for byte.
     StoredAddressMatchesFully,
     /// The same hash under another context in the same partition is never a full match.
     OtherContextNeverMatchesFully,
@@ -73,6 +74,8 @@ pub enum Check {
     MatchPrefersTheAskedPartition,
     /// Obliterating one reference leaves the others readable.
     ObliterationLeavesSiblingsReadable,
+    /// A fragment stored without its payload is reported and described, but not served.
+    MetadataOnlyIsDescribedNotServed,
 }
 
 /// What the store under test can do, so the battery runs the subset that applies.
@@ -95,6 +98,10 @@ pub struct Capabilities {
     /// stream and every read after it waits forever. Checks that read after a miss are skipped
     /// rather than declared, because a hang is not an outcome the battery can record.
     pub miss_poisons_session: bool,
+    /// Whether this store accepts a `put` carrying no payload, keeping the representation alone.
+    /// Only the local store does; the durable store refuses one outright, and the composite relies
+    /// on the local store taking it — `with_local_metadata_only` writes nothing else.
+    pub stores_metadata_only: bool,
     /// Checks this store is known to fail today. Required to keep failing — see the module docs.
     pub known_violations: &'static [Check],
 }
@@ -108,6 +115,7 @@ impl Capabilities {
             can_obliterate: true,
             over_wire: false,
             miss_poisons_session: false,
+            stores_metadata_only: false,
             known_violations: &[],
         }
     }
@@ -119,6 +127,11 @@ impl Capabilities {
 
     pub fn no_obliterate(mut self) -> Self {
         self.can_obliterate = false;
+        self
+    }
+
+    pub fn stores_metadata_only(mut self) -> Self {
+        self.stores_metadata_only = true;
         self
     }
 
@@ -203,6 +216,14 @@ pub async fn verify_immutable_store(store: Arc<dyn ImmutableStore>, caps: Capabi
         Check::MatchPrefersTheAskedPartition,
         a_match_prefers_the_partition_it_was_asked_about(&store, &caps).await,
     );
+
+    if caps.stores_metadata_only {
+        settle(
+            &caps,
+            Check::MetadataOnlyIsDescribedNotServed,
+            a_metadata_only_entry_is_described_but_not_served(&store, &caps).await,
+        );
+    }
 
     if caps.can_obliterate {
         settle(
@@ -688,6 +709,65 @@ async fn obliterating_one_reference_leaves_the_others_readable(
     require!(
         bytes.as_ref() == payload.as_ref(),
         "a surviving reference read back different bytes"
+    );
+
+    Ok(())
+}
+
+/// Clause 1, on the side people expect to be a defect and is not.
+///
+/// A store may hold the representation without the bytes — the local store takes a `put` with no
+/// payload, and a composite configured `with_local_metadata_only` writes it nothing else. Such an
+/// entry reports a full match, because the association is real, and describes itself, because the
+/// fragment is right there. What it cannot do is serve, and the failing `get` is load-bearing: it
+/// is how the layer above knows to fetch the payload from upstream. A store that reported
+/// `MatchNone` here instead would look more conservative and would break that fallback, so this
+/// pins the behaviour rather than forbidding it.
+async fn a_metadata_only_entry_is_described_but_not_served(
+    store: &Arc<dyn ImmutableStore>,
+    caps: &Capabilities,
+) -> Result<(), String> {
+    let (partition, address, _payload, fragment) = unique_content();
+
+    store
+        .clone()
+        .put(partition, address, fragment, None, false)
+        .await
+        .map_err(|err| format!("put without a payload failed on {}: {err:?}", caps.label))?;
+
+    let resolved = query_one(store, partition, address)
+        .await
+        .map_err(|err| format!("query failed on {}: {err:?}", caps.label))?;
+    require_eq!(
+        resolved.match_made,
+        StoreMatch::MatchFull,
+        "a representation held without its payload is still an association"
+    );
+    require!(
+        !resolved.stored_local,
+        "a store holding no payload must not report it as local"
+    );
+
+    let described = store
+        .clone()
+        .get_metadata(partition, address)
+        .await
+        .map_err(|err| format!("get_metadata failed: {err:?}"))?;
+    require_eq!(
+        described.match_made,
+        StoreMatch::MatchFull,
+        "get_metadata must describe a representation the store holds"
+    );
+    require_eq!(
+        described.fragment.size_content,
+        fragment.size_content,
+        "get_metadata must report the size the representation records"
+    );
+
+    require!(
+        store.clone().get(partition, address).await.is_err(),
+        "get returned something for a fragment whose payload was never stored — the layer above \
+         reads that failure as its signal to fetch from upstream"
     );
 
     Ok(())

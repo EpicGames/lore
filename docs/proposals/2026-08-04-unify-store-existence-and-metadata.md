@@ -295,8 +295,11 @@ two fields, and the fragment stops being a vehicle for smuggling them.
 
 Written into the trait, because the failure modes are asymmetric:
 
-1. **Never over-report.** A reported level must hold. `MatchFull` additionally means the payload is
-   retrievable — a store that finds its payload missing must repair or report, not claim a match.
+1. **Never over-report.** A reported level must hold: the association it names exists. It says
+   nothing about whether the payload can be served from here — that is `stored_local` and
+   `stored_durable`. A store may hold the representation and not the bytes, and reports a full match
+   when it does; the local store does exactly this, and a `get` that fails against a described
+   fragment is how the fragment engine knows to fetch it from upstream.
 2. **May under-report.** A store may answer with a weaker level than the truth when establishing the
    stronger one costs more than it is worth. A caller must read a weak level as "no shortcut
    available", never as proof of absence.
@@ -695,7 +698,9 @@ store, where today it is refused only where state happens to be consulted.
 - **Risk:** A store over-reports, and a caller skips an upload or names a partition that cannot
   serve the copy — *mitigation:* clause 1 is the first case in the battery, every implementation
   runs it, and the client store runs it over a wire; a copy naming an unusable partition is refused
-  by the server, costing a retry rather than a breach.
+  by the server, costing a retry rather than a breach. A caller needing the bytes rather than the
+  level reads `stored_local` and `stored_durable`, which the write path already gates on, so a
+  representation held without its payload cannot be mistaken for one that can be served here.
 - **Risk:** A store resolves a tombstone through a path that does not consult flags. `lookup`
   searches addresses alone, so an obliterated entry still resolves at the level its address matches,
   and every operation answering a caller has to refuse it for itself — which is how `get_metadata`

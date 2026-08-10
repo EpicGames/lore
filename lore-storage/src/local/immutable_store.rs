@@ -5152,7 +5152,7 @@ mod tests {
 
         crate::conformance::verify_immutable_store(
             store,
-            crate::conformance::Capabilities::new("LocalImmutableStore"),
+            crate::conformance::Capabilities::new("LocalImmutableStore").stores_metadata_only(),
         )
         .await;
     }
