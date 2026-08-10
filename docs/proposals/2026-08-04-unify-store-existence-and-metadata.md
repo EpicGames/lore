@@ -149,7 +149,7 @@ or a caller's guarantees change with the deployment.
 - Give the trait a written contract, binding stores and the protocols that carry their answers
   alike, about what a reported level means — so under-reporting is legal and over-reporting is a
   defect — and enforce it with one test battery every implementation runs.
-- Stop allocating a result vector per existence call.
+- Stop the store allocating a result vector per existence call, and let the caller own the buffer.
 - Collapse the duplicated fan-out in the composite store and the duplicated request paths in the
   replica stores.
 - Move cross-partition read scope into store configuration and delete the parallel mechanism.
@@ -254,10 +254,13 @@ and transferring a payload.
 Results are written into a caller-owned slice rather than returned in a `Vec`. Every `exist_batch`
 today allocates one — the local store pushes into a `vec![]`, the AWS store `collect`s one and
 indexes into it — on a path that runs per fragment during a push and over `MAX_FRAGMENTS` addresses
-per client query. A caller that loops over chunks, as push does, reuses one buffer; a caller asking
-about a single address uses a one-element array on the stack. The call does not become
-allocation-free, since `ImmutableStore` is `dyn` and `#[async_trait]` boxes each call's future
-regardless; what goes is the allocation that scales with the batch.
+per client query. A caller asking about a single address — the majority — uses a one-element array
+on the stack and allocates nothing at all. A batching caller still allocates a buffer, but owns it:
+where it previously took whatever the store returned, it may now size one to its chunk and reuse it
+across chunks. The two in the tree, cache fill and push, allocate per batch as they did before, so
+what the slice buys them is the option rather than the saving. The call does not become
+allocation-free either way, since `ImmutableStore` is `dyn` and `#[async_trait]` boxes each call's
+future regardless.
 
 Single-address callers — the majority — get a helper that cannot diverge, written as a free function
 rather than a trait method so no store can override it:
@@ -436,7 +439,8 @@ re-enabling a branch.
 **Composite.** Existence becomes one fan-out over a batch, where it was three over single addresses.
 The stopping rule stops being a comparison against a requested level and becomes: keep fanning out
 while any address is below `MatchFull`; then per address take the highest level any store reported
-and **or** the two booleans across responders. The partition travels with the level that won rather
+and **or** `stored_durable` across responders. `stored_local` is not merged: it stays as the local
+store left it, because a replica reporting the payload on *its* disk says nothing about ours. The partition travels with the level that won rather
 than being merged on its own — it names where *that* store found the content, and pairing one
 store's partition with another's level would point a copy at somewhere the content was never seen.
 
@@ -555,9 +559,14 @@ The trait is internal, so most of the churn is confined to the tree.
   loses a parameter, not a format. The DynamoDB schema is unchanged (no new table, key or
   attribute), and only the order in which `put` and `obliterate` write existing items differs. An
   upgraded and a downgraded process read the same repositories and the same tables.
-- **CLI and public API** — Unchanged. `lore-capi/lore.h` has no diff on this branch, and no `lore`
-  subcommand, exit code or output format changes. `LOCAL_ISOLATION` was `pub` from `lore-storage`
-  but set only inside the server, so deleting it moves nothing a script or integration could reach.
+- **CLI and public API** — No surface change: `lore-capi/lore.h` has no diff on this branch, and no
+  `lore` subcommand, exit code or output format changes. `LOCAL_ISOLATION` was `pub` from
+  `lore-storage` but set only inside the server, so deleting it moves nothing a script or
+  integration could reach. One printed *value* does change, following clause 3: `lore file dump` of
+  an obliterated address reports no match and zeroed sizes where it used to print the tombstone's
+  flags. Describing obliterated content is what clause 3 forbids, so the dump reporting absence is
+  the point rather than a casualty; a script keying on the obliterated flag in that output has to
+  key on the absent match instead.
 
 **One deliberate behaviour change.** An obliterated hash stops reporting as existing on the AWS
 `exist` path — nothing regresses, since the put path already consults `query`, which already
@@ -581,10 +590,12 @@ association it is — is not what this call asks about.
   order: a put publishes the association last, and an obliteration deletes it first, marks, then
   deletes again, so a racing reader sees the state before or the state after, and a writer that
   raced the first delete does not outlive the obliteration.
-- **Memory** — Bounded, and lower. Existence stops allocating a `Vec` per call and per child store
-  and writes into caller-owned slices, on a path that runs per fragment during a push and over
-  `MAX_FRAGMENTS` addresses per client query; what remains is the boxed future `#[async_trait]`
-  produces for a `dyn` trait, which this proposal does not address. The remote store stops
+- **Memory** — Bounded, and lower where it counts. Existence writes into caller-owned slices, so a
+  single-address caller — the majority, including the per-fragment ingress path — allocates nothing
+  at all where it previously took a `Vec` from the store. A batching caller still allocates one, but
+  now owns it and may reuse it across chunks; the two in the tree have not been changed to, so for
+  them the slice buys the option rather than the saving. What remains either way is the boxed future
+  `#[async_trait]` produces for a `dyn` trait, which this proposal does not address. The remote store stops
   downloading a whole payload to answer a metadata question, which removes the one place on this
   path that buffered data proportional to content size. On the durable store a put no longer copies
   the payload to hand it to S3, since the buffer it already holds is refcounted and the SDK takes

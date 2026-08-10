@@ -1579,7 +1579,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
     /// State is read only while the legacy metadata table is configured, and it is what makes
     /// obliteration bind for content written before the state table existed.
     #[lore_macro::lore_instrument]
-    #[tracing::instrument(name = "AwsImmutableStore::resolve" skip(self))]
+    #[tracing::instrument(name = "AwsImmutableStore::query" skip(self))]
     async fn query(
         self: Arc<Self>,
         partition: Partition,
@@ -1645,7 +1645,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
         Ok(())
     }
 
-    /// Unlike [`AwsImmutableStore::resolve`], this reads the object to report the representation
+    /// Unlike [`AwsImmutableStore::query`], this reads the object to report the representation
     /// actually stored, which costs a `HeadObject`. It transfers no body, and it is the only path
     /// in this store that spends an S3 request purely on metadata.
     #[lore_macro::lore_instrument]
