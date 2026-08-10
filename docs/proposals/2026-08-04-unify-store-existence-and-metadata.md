@@ -715,10 +715,12 @@ store, where today it is refused only where state happens to be consulted.
   legacy fallback added here goes on resolving that association to a full match — so obliterating a
   fragment written before the state table existed does nothing and says it worked. The early return
   predates this proposal; what is new is the fallback that keeps such content matchable —
-  *mitigation:* accepted for now as a calculated risk. It is bounded by the legacy table's lifetime
-  and retires with it under [LEP 2026-08-03](2026-08-03-fragment-metadata-on-the-s3-object.md).
-  Until then an obliteration covering legacy-era content has to be confirmed rather than assumed,
-  and the fix, should one be wanted sooner, is to delete the association before consulting state.
+  *mitigation:* accepted as a calculated risk, because it reaches only deployments still holding
+  content written before the state table existed. The recommended path for those is migrating to the
+  new representation under [LEP 2026-08-03](2026-08-03-fragment-metadata-on-the-s3-object.md), which
+  ends the exposure by ending the legacy era rather than by teaching this store a second lifecycle
+  to obliterate through. Until a deployment has migrated, an obliteration covering legacy-era content
+  has to be confirmed rather than assumed.
 
 ## Drawbacks
 

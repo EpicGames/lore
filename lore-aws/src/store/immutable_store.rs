@@ -4468,13 +4468,11 @@ mod test {
     /// The store contract, checked against this store the same way it is checked against every
     /// other one.
     ///
-    /// Note what this does *not* catch. `exist` resolves against the associations table alone while
-    /// `query` also reads the fragment state table, so the two run through different resolutions
-    /// and only one of them knows about obliteration — but the battery reaches no case where they
-    /// actually disagree, because a completed obliteration deletes the association as well, and
-    /// storing content back over a tombstone does not leave the two answering differently. The
-    /// divergence is structural rather than currently reachable, which is an argument for having
-    /// one resolution instead of two, not for calling it a live defect.
+    /// Note what this does *not* reach. The store is built without the legacy metadata table, so
+    /// nothing here exercises the fallback resolution that table turns on, nor the gap that comes
+    /// with it: a hash with no state row is left associated by `obliterate` and goes on matching
+    /// through the fallback. Those paths are covered separately, on
+    /// [`store_with_separate_metadata_table`], where the two tables are genuinely distinct.
     #[tokio::test]
     async fn satisfies_the_immutable_store_contract() {
         let fake = Fake::default();
