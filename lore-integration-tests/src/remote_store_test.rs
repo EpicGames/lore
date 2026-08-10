@@ -19,6 +19,9 @@ mod remote_store_tests {
     use lore_server::grpc::server::FeatureSettings;
     use lore_server::grpc::server::GrpcServerBuilder;
     use lore_server::hooks::HookDispatcher;
+    use lore_server::quic::quinn::QuinnConfigBuilder;
+    use lore_server::quic::quinn::QuinnServer;
+    use lore_server::quic::tests::TestHandlerFactory;
     use lore_storage::ImmutableStore;
     use lore_storage::MutableStore;
     use lore_storage::StoreGetData;
@@ -39,7 +42,29 @@ mod remote_store_tests {
         _shutdown: tokio::sync::oneshot::Sender<()>,
     }
 
-    async fn start_test_server() -> TestServer {
+    /// Bind a loopback port that is free for both TCP and UDP, so one address can carry the gRPC
+    /// services and the QUIC storage endpoint at once.
+    fn bind_shared_port() -> (std::net::TcpListener, SocketAddr) {
+        for _ in 0..50 {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr: SocketAddr = listener.local_addr().unwrap();
+            if std::net::UdpSocket::bind(addr).is_ok() {
+                return (listener, addr);
+            }
+        }
+        panic!("no loopback port was free for both TCP and UDP");
+    }
+
+    /// The stores a real server runs, behind its gRPC services. Both harnesses build on this; the
+    /// QUIC one adds a storage endpoint on the same address.
+    async fn start_backend(
+        listener: std::net::TcpListener,
+        addr: SocketAddr,
+    ) -> (
+        Arc<dyn ImmutableStore>,
+        Arc<dyn MutableStore>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
         let backend_immutable = lore_storage::local::immutable_store::create(
             None::<&str>,
             ImmutableStoreCreateOptions::none(),
@@ -65,11 +90,6 @@ mod remote_store_tests {
         .await
         .unwrap();
 
-        // Bound here and handed over, so nothing can take the port between choosing it and
-        // serving on it.
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr: SocketAddr = listener.local_addr().unwrap();
-
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let signal = async {
             shutdown_rx.await.ok();
@@ -80,14 +100,16 @@ mod remote_store_tests {
         let hook_dispatcher = Arc::new(HookDispatcher::empty());
 
         let (stopped_tx, mut stopped_rx) = tokio::sync::oneshot::channel::<String>();
+        let served_immutable = backend_immutable.clone();
+        let served_mutable = backend_mutable.clone();
         // Background server task in a test; LORE_CONTEXT propagation is unnecessary here.
         #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
             let outcome = GrpcServerBuilder::new()
                 .with_environment(EnvironmentConfig::default())
                 .with_feature(FeatureSettings::default())
-                .with_immutable_store(backend_immutable.clone(), backend_immutable)
-                .with_mutable_store(backend_mutable)
+                .with_immutable_store(served_immutable.clone(), served_immutable)
+                .with_mutable_store(served_mutable)
                 .with_lock_store(None)
                 .with_notification(notification_sender, None)
                 .with_hook_dispatcher(hook_dispatcher)
@@ -127,6 +149,13 @@ mod remote_store_tests {
         }
         assert!(ready, "test server on {addr} never accepted a connection");
 
+        (backend_immutable, backend_mutable, shutdown_tx)
+    }
+
+    async fn start_test_server() -> TestServer {
+        let (listener, addr) = bind_shared_port();
+        let (_immutable, _mutable, shutdown_tx) = start_backend(listener, addr).await;
+
         let url = format!("grpc://127.0.0.1:{}", addr.port());
         TestServer {
             immutable_store: Arc::new(RemoteImmutableStore::new(&url, None)),
@@ -135,7 +164,96 @@ mod remote_store_tests {
         }
     }
 
+    struct QuicTestServer {
+        immutable_store: Arc<RemoteImmutableStore>,
+        _server: QuinnServer,
+        _shutdown: tokio::sync::oneshot::Sender<()>,
+    }
+
+    /// The same stores, with reads and writes carried over QUIC instead of gRPC. A `lore://`
+    /// connection still resolves its environment over gRPC, so both endpoints share one address:
+    /// gRPC on TCP, storage on UDP.
+    ///
+    /// The gRPC storage transport multiplexes every read of a session onto one bidirectional
+    /// stream and reports a missing fragment as that stream's terminal status, so one miss ends
+    /// the stream and every later read on that session waits forever. QUIC frames each command
+    /// separately and has no such coupling, so the contract battery runs here until that is fixed.
+    async fn start_test_quic_server() -> QuicTestServer {
+        let (listener, addr) = bind_shared_port();
+        let (backend_immutable, backend_mutable, shutdown_tx) = start_backend(listener, addr).await;
+
+        let (cert_file, pkey_file, _ca) =
+            lore_server::quic::tests::server_certs().expect("test certificate paths");
+
+        let server = QuinnServer::start(
+            QuinnConfigBuilder::new()
+                .address(addr)
+                .cert_file(cert_file)
+                .pkey_file(pkey_file)
+                .stream_handler_factory(Box::new(TestHandlerFactory::new(
+                    backend_immutable,
+                    backend_mutable,
+                )))
+                .build()
+                .expect("quinn config"),
+        )
+        .expect("quinn server start");
+
+        // Plain `lore` rather than `lores`, so the client skips verification of the self-signed
+        // test certificate.
+        let url = format!("lore://127.0.0.1:{}", addr.port());
+        QuicTestServer {
+            immutable_store: Arc::new(RemoteImmutableStore::new(&url, None)),
+            _server: server,
+            _shutdown: shutdown_tx,
+        }
+    }
+
     // ── Immutable Store Tests ──
+
+    /// A read that misses must not stop the reads after it. This is the shape that wedges the
+    /// gRPC transport, where a miss is the terminal status of the stream every read shares.
+    #[tokio::test]
+    async fn a_missing_read_does_not_stop_the_next_one() -> TestResult {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_quic_server().await;
+                let store = server.immutable_store.clone();
+                let partition = lore_base::types::Partition::from(rand::random::<[u8; 16]>());
+                let payload = bytes::Bytes::from_static(b"read me after a miss");
+                let fragment = lore_base::types::Fragment {
+                    flags: 0,
+                    size_payload: payload.len() as u32,
+                    size_content: payload.len() as u64,
+                };
+                let stored = lore_base::types::Address {
+                    hash: lore_storage::hash::hash_slice(payload.as_ref()),
+                    context: lore_base::types::Context::from(rand::random::<[u8; 16]>()),
+                };
+                store
+                    .clone()
+                    .put(partition, stored, fragment, Some(payload.clone()), false)
+                    .await
+                    .expect("put should succeed");
+
+                let missing = lore_base::types::Address {
+                    hash: rand::random(),
+                    context: lore_base::types::Context::from(rand::random::<[u8; 16]>()),
+                };
+                assert!(store.clone().get(partition, missing).await.is_err());
+
+                let (_fragment, bytes) = store
+                    .clone()
+                    .get(partition, stored)
+                    .await
+                    .and_then(StoreGetData::into_payload)
+                    .expect("a read after a miss should still be answered");
+                assert_eq!(bytes.as_ref(), payload.as_ref());
+                Ok(())
+            })
+            .await
+    }
 
     /// The contract, checked against a store on the other end of a wire.
     ///
@@ -154,7 +272,29 @@ mod remote_store_tests {
 
                 lore_storage::conformance::verify_immutable_store(
                     server.immutable_store.clone(),
-                    lore_storage::conformance::Capabilities::new("RemoteImmutableStore")
+                    lore_storage::conformance::Capabilities::new("RemoteImmutableStore/grpc")
+                        .over_wire()
+                        .miss_poisons_session(),
+                )
+                .await;
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// The same contract over QUIC, which frames each command separately and so carries the
+    /// checks the gRPC transport cannot answer. This is the run that covers reading after a miss.
+    #[tokio::test]
+    async fn quic_remote_store_satisfies_the_immutable_store_contract() -> TestResult {
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_quic_server().await;
+
+                lore_storage::conformance::verify_immutable_store(
+                    server.immutable_store.clone(),
+                    lore_storage::conformance::Capabilities::new("RemoteImmutableStore/quic")
                         .over_wire(),
                 )
                 .await;

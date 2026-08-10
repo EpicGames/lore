@@ -89,6 +89,12 @@ pub struct Capabilities {
     /// caller has no claim to is another tenant's content, and its existence is not the caller's to
     /// learn, so such a store must report nothing rather than a weak match.
     pub over_wire: bool,
+    /// Whether a read that misses leaves the store unable to answer any later read. The gRPC
+    /// storage transport multiplexes every read of a session onto one bidirectional stream and
+    /// reports a missing fragment as that stream's terminal status, so the first miss ends the
+    /// stream and every read after it waits forever. Checks that read after a miss are skipped
+    /// rather than declared, because a hang is not an outcome the battery can record.
+    pub miss_poisons_session: bool,
     /// Checks this store is known to fail today. Required to keep failing — see the module docs.
     pub known_violations: &'static [Check],
 }
@@ -101,6 +107,7 @@ impl Capabilities {
             can_put: true,
             can_obliterate: true,
             over_wire: false,
+            miss_poisons_session: false,
             known_violations: &[],
         }
     }
@@ -112,6 +119,11 @@ impl Capabilities {
 
     pub fn no_obliterate(mut self) -> Self {
         self.can_obliterate = false;
+        self
+    }
+
+    pub fn miss_poisons_session(mut self) -> Self {
+        self.miss_poisons_session = true;
         self
     }
 
@@ -644,11 +656,9 @@ async fn obliterating_one_reference_leaves_the_others_readable(
     store: &Arc<dyn ImmutableStore>,
     caps: &Capabilities,
 ) -> Result<(), String> {
-    // Not run over a wire, and not because it does not apply there: a store reached over one wedges
-    // on this sequence - the obliteration returns, and the reads that follow never do. A hang is
-    // not a failure the battery can record, so the case is parked here rather than declared. Remove
-    // this the day that is fixed; every in-process store passes it today.
-    if caps.over_wire {
+    // The read of the obliterated reference below is a miss, so a store that a miss poisons never
+    // answers the read after it.
+    if caps.miss_poisons_session {
         return Ok(());
     }
 
