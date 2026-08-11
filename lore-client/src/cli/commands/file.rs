@@ -10,10 +10,10 @@ use clap::Args;
 use clap::Subcommand;
 use lore::dependency;
 use lore::file;
+use lore::file::DEFAULT_CONTEXT_LINES;
 use lore::file::LoreFileObliterateArgs;
 use lore::interface::*;
 use lore::runtime;
-use lore_revision::file::diff::DEFAULT_CONTEXT_LINES;
 use parking_lot::Mutex;
 
 use crate::cli::EventCallbackExt;

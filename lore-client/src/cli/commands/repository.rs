@@ -164,10 +164,6 @@ pub struct RepositoryCloneArgs {
     #[clap(long, action)]
     direct_file_write: bool,
 
-    /// Use direct file I/O instead of memory mapping files
-    #[clap(long, action)]
-    direct_file_io: bool,
-
     /// Layer to add
     #[clap(long, value_name = "repository")]
     layer: Option<String>,
@@ -614,6 +610,8 @@ pub fn handle_repository_status(globals: LoreGlobalArgs, args: &RepositoryStatus
 
     let result = runtime().block_on(repository::status(globals, args, callback)) as u8;
 
+    // CLI process, so this is the user's terminal directory.
+    #[allow(clippy::disallowed_methods)]
     let cwd = std::env::current_dir().unwrap_or_else(|_| repo_root.clone());
     let display_path = |path: &str, node_type| {
         path_typed(
@@ -995,7 +993,6 @@ pub fn handle_repository_clone(globals: LoreGlobalArgs, args: &RepositoryCloneAr
         bare: args.bare.into(),
         virtually: args.virtually.into(),
         direct_file_write: args.direct_file_write.into(),
-        direct_file_io: args.direct_file_io.into(),
         layer: args.layer.as_ref().into(),
         layer_metadata: args.layer_metadata.as_ref().into(),
         prefetch: args.prefetch.as_ref().into(),

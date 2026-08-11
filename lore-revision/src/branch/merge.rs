@@ -17,12 +17,14 @@ use crate::branch::push::PushStatistics;
 use crate::branch::push::push_fragments;
 use crate::branch::push::push_query;
 use crate::change;
+use crate::change::FileAction;
 use crate::change::NodeChange;
 use crate::commit;
 use crate::commit::CommitOptions;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
+use crate::filter::Filter;
 use crate::filter::FilterMode;
 use crate::find;
 use crate::infer;
@@ -553,8 +555,10 @@ async fn merge_repository(
         return Err(MergeError::internal("Cannot merge a branch with itself"));
     }
 
-    let diff = Box::pin(branch::diff3_collect(
-        repository.clone(),
+    // Diff over the full tree. A view-scoped diff drops the other branch's
+    // out-of-view changes and leaves this branch divergent from it.
+    let diff = Box::pin(branch::diff3_collect_with_graft(
+        full_tree_context(&repository),
         source_branch,
         revision,
         current_branch,
@@ -562,6 +566,9 @@ async fn merge_repository(
         None,  /* No path */
         true,  /* Include identical changes for merge tracking */
         false, /* Do not autoresolve, this is done later */
+        // The view decides which subtrees are out of view. The walk stays
+        // full-tree.
+        Some(repository.filter.clone()),
     ))
     .await
     .forward::<MergeError>("running diff3 for merge")?;
@@ -1527,6 +1534,274 @@ pub enum MergeType {
     Revert,
 }
 
+/// The same repository with no view filter, so tree operations reach every
+/// node.
+fn full_tree_context(repository: &Arc<RepositoryContext>) -> Arc<RepositoryContext> {
+    Arc::new(repository.to_filter_context(Arc::new(Filter::default())))
+}
+
+/// Node counts from reconciling one grafted subtree.
+#[derive(Default, Clone, Copy)]
+struct GraftCounts {
+    overwritten: usize,
+    added: usize,
+    deleted: usize,
+}
+
+impl GraftCounts {
+    fn touched(&self) -> usize {
+        self.overwritten + self.added + self.deleted
+    }
+}
+
+/// Copy a node's file metadata from source.
+///
+/// `merge_metadata` covers per-file changes. A graft emits one change for the
+/// whole subtree, so the nodes below it are copied here instead. Without this
+/// the staged state differs from a full-tree merge of the same content.
+async fn graft_copy_file_metadata(
+    repository: Arc<RepositoryContext>,
+    state_staged: Arc<State>,
+    source_repository: Arc<RepositoryContext>,
+    state_source: Arc<State>,
+    source_id: NodeID,
+    staged_id: NodeID,
+) -> Result<(), MergeError> {
+    let source_metadata_node = node::node_to_file_metadata(source_id);
+    let source_block = state_source
+        .block_file_metadata(
+            source_repository,
+            NodeFileMetadataBlock::index(source_metadata_node),
+        )
+        .await
+        .forward::<MergeError>("deserializing grafted source metadata block")?;
+    let metadata_hash = {
+        let block_reader = source_block.read();
+        block_reader
+            .node(NodeFileMetadata::index(source_metadata_node))
+            .metadata
+    };
+
+    let staged_metadata_node = node::node_to_file_metadata(staged_id);
+    let block_index = NodeFileMetadataBlock::index(staged_metadata_node);
+    let staged_block = state_staged
+        .block_file_metadata(repository, block_index)
+        .await
+        .forward::<MergeError>("deserializing grafted staged metadata block")?;
+    let dirtied = {
+        let mut block_writer = staged_block.write();
+        let node = block_writer.node(NodeFileMetadata::index(staged_metadata_node));
+        node.metadata = metadata_hash;
+        block_writer.mark_dirty()
+    };
+    if dirtied {
+        state_staged.block_file_metadata_modified(staged_block, block_index);
+        state_staged.mark_dirty();
+    }
+    Ok(())
+}
+
+/// Point an existing staged node at source's content, in place.
+///
+/// An overwrite keeps the node's ID, slot and sibling position, and does not
+/// take the single-permit slot allocator that `node_add` holds.
+async fn graft_overwrite_node(
+    repository: Arc<RepositoryContext>,
+    state_staged: Arc<State>,
+    staged_id: NodeID,
+    source_node: &Node,
+) -> Result<(), MergeError> {
+    let block_index = NodeBlock::index(staged_id);
+    let node_index = Node::index(staged_id);
+    let block = state_staged
+        .block(repository.clone(), block_index)
+        .await
+        .forward::<MergeError>("loading graft overwrite block")?;
+    let dirtied = {
+        let mut block_writer = block.write();
+        let node = block_writer.node(node_index);
+        node.address = source_node.address;
+        node.size = source_node.size;
+        node.mode = source_node.mode;
+        block_writer.mark_dirty()
+    };
+    if dirtied {
+        state_staged.block_modified(block, block_index);
+        state_staged.mark_dirty();
+    }
+
+    // `StagedMerge` holds the `Staged` bit and no action bit. That is what a
+    // per-file merge leaves on a node whose content came from source, and the
+    // staged state must match it. `node_mark` also marks the parent
+    // directories, so the commit recomputes them.
+    state_staged
+        .node_mark(repository, staged_id, NodeFlags::StagedMerge, true)
+        .await
+        .forward::<MergeError>("staging grafted node")?;
+    Ok(())
+}
+
+/// Adopt source's version of an out-of-view subtree.
+///
+/// Only valid for a subtree the view excludes. Realization skips those paths
+/// (`fs/realize.rs`) and commit adopts their staged hash (`commit.rs`), so the
+/// merge is a tree operation only and the files inside need no three-way
+/// merge.
+/// Create a node at `path` in the staged tree, under an existing parent.
+///
+/// Adds arrive in path order, so the parent is already there.
+async fn graft_add_node(
+    repository: Arc<RepositoryContext>,
+    state_staged: Arc<State>,
+    path: &RelativePath,
+    source_node: &Node,
+) -> Result<NodeID, MergeError> {
+    let mut parent_path = path.clone();
+    let parent_path = parent_path.pop();
+    let parent = state_staged
+        .find_node_link(repository.clone(), parent_path.as_str())
+        .await
+        .forward::<MergeError>("resolving adopted node parent")?;
+    if !parent.is_valid_or_root() {
+        return Err(MergeError::internal("Invalid adopted node parent"));
+    }
+
+    let mut node = Node {
+        name_hash: source_node.name_hash,
+        mode: source_node.mode,
+        size: source_node.size,
+        address: source_node.address,
+        flags: source_node.flags,
+        ..Default::default()
+    };
+    // Source's nodes are committed, so they bring no staged or dirty state.
+    node.clear_all_change_flags();
+
+    state_staged
+        .node_add(repository, parent.node, node, path.name())
+        .await
+        .forward::<MergeError>("adding adopted node")
+}
+
+async fn apply_graft_copy(
+    repository: Arc<RepositoryContext>,
+    state_staged: Arc<State>,
+    change: &NodeChange,
+) -> Result<usize, MergeError> {
+    let link = state_staged
+        .find_node_link(repository.clone(), change.path.as_str())
+        .await
+        .forward::<MergeError>("resolving graft path")?;
+    if !link.is_valid_or_root() {
+        return Err(MergeError::internal("Invalid graft path"));
+    }
+    let staged_node_id = link.node;
+
+    // Diff the staged subtree against source's to find what differs. The walk
+    // pairs children by name and stops at a directory whose address already
+    // matches, so the result is proportional to the difference rather than to
+    // the size of the subtree. No oracle here, because this walk has to descend.
+    let mut changes: Vec<NodeChange> = Vec::new();
+    {
+        let mut sink = state::ChangeSink::Vec(&mut changes);
+        state::diff(
+            repository.clone(),
+            state_staged.clone(),
+            change.to.repository.clone(),
+            change.to.state.clone(),
+            Some(change.path.clone()),
+            None,
+            &mut sink,
+            FilterMode::empty(),
+        )
+        .await
+        .forward::<MergeError>("diffing the adopted subtree")?;
+    }
+    change::sort_by_path(&mut changes);
+
+    let mut counts = GraftCounts::default();
+
+    // Adds and overwrites in path order, so a parent exists before its children.
+    for adopted in changes.iter() {
+        if adopted.action == FileAction::Delete {
+            continue;
+        }
+        let source_node = adopted
+            .to
+            .state
+            .node(adopted.to.repository.clone(), adopted.to.node)
+            .await
+            .forward::<MergeError>("resolving adopted node")?;
+
+        let staged = state_staged
+            .find_node_link(repository.clone(), adopted.path.as_str())
+            .await
+            .unwrap_or(NodeLink::invalid());
+        let staged_id = if staged.is_valid_or_root() {
+            graft_overwrite_node(
+                repository.clone(),
+                state_staged.clone(),
+                staged.node,
+                &source_node,
+            )
+            .await?;
+            counts.overwritten += 1;
+            staged.node
+        } else {
+            counts.added += 1;
+            graft_add_node(
+                repository.clone(),
+                state_staged.clone(),
+                &adopted.path,
+                &source_node,
+            )
+            .await?
+        };
+
+        graft_copy_file_metadata(
+            repository.clone(),
+            state_staged.clone(),
+            adopted.to.repository.clone(),
+            adopted.to.state.clone(),
+            adopted.to.node,
+            staged_id,
+        )
+        .await?;
+    }
+
+    // Deletes in reverse path order, so children go before their directory.
+    for adopted in changes.iter().rev() {
+        if adopted.action != FileAction::Delete {
+            continue;
+        }
+        let staged = state_staged
+            .find_node_link(repository.clone(), adopted.path.as_str())
+            .await
+            .unwrap_or(NodeLink::invalid());
+        if !staged.is_valid_or_root() {
+            continue;
+        }
+        state::node_discard_patch(
+            state_staged.clone(),
+            repository.clone(),
+            staged.node,
+            |_node_id, _flags| {},
+        )
+        .await
+        .forward::<MergeError>("discarding adopted node")?;
+        counts.deleted += 1;
+    }
+
+    // Mark the directory staged so the commit recomputes it and its parent
+    // directories from the updated children.
+    state_staged
+        .node_mark(repository.clone(), staged_node_id, NodeFlags::Staged, false)
+        .await
+        .forward::<MergeError>("marking grafted directory")?;
+
+    Ok(counts.touched())
+}
+
 pub async fn apply_diff(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -1571,6 +1846,14 @@ pub async fn apply_diff(
             from.to.repository.id == repository.id && to.to.repository.id == repository.id
         });
     }
+
+    // A graft covers a whole subtree the target branch never touched. Nothing
+    // inside it needs a three-way merge, so it skips per-file verify and
+    // realize.
+    let grafts: Vec<NodeChange> = diff
+        .changes
+        .extract_if(.., |change| change.action == FileAction::Graft)
+        .collect();
 
     let stats = Arc::new(sync::SyncVerifyStats::default());
     let mut changes = vec![];
@@ -1694,6 +1977,40 @@ pub async fn apply_diff(
     let state_staged = state::State::deserialize(repository.clone(), diff.target)
         .await
         .forward::<MergeError>("deserializing target state for staging")?;
+
+    if !grafts.is_empty() {
+        // Node operations only; the filter plays no part here.
+        let graft_repository = full_tree_context(&repository);
+        // Grafted subtrees sit at disjoint paths, so they need no ordering.
+        let mut graft_tasks = JoinSet::new();
+        for graft in grafts.iter() {
+            let graft_repository = graft_repository.clone();
+            let state_staged = state_staged.clone();
+            let graft = graft.clone();
+            lore_spawn!(graft_tasks, async move {
+                apply_graft_copy(graft_repository, state_staged, &graft).await
+            });
+        }
+        let mut adopted_nodes = 0usize;
+        let mut graft_failure = None;
+        while let Some(joined) = graft_tasks.join_next().await {
+            match joined
+                .internal("Graft task failed")
+                .map_err(MergeError::from)
+            {
+                Ok(Ok(nodes)) => adopted_nodes += nodes,
+                Ok(Err(err)) | Err(err) => graft_failure = graft_failure.or(Some(err)),
+            }
+        }
+        if let Some(err) = graft_failure {
+            return Err(err);
+        }
+        lore_info!(
+            "Grafted {} out-of-view subtrees, {} nodes touched",
+            grafts.len(),
+            adopted_nodes
+        );
+    }
 
     // When applying a diff to a linked repository context, skip filesystem
     // realization. The link's repository context shares `path` with the parent,

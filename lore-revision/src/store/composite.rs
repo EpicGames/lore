@@ -27,6 +27,7 @@ use opentelemetry::metrics::Counter;
 use tokio::sync::RwLock;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 use super::StoreObliterateStats;
 use crate::cluster::peer::PeerInfo;
@@ -200,6 +201,9 @@ pub struct CompositeStoreBuilder {
     /// Payloads are only stored in the durable store and replicas.
     /// Local `get()` calls that hit metadata-only entries fall through to durable/replicas for payloads.
     local_metadata_only: bool,
+    /// The delay applied to durable store operations so replicas are given a chance
+    /// to fulfill a request first. `Duration` default is 0 length (no delay)
+    durable_delay: Duration,
 }
 
 impl CompositeStoreBuilder {
@@ -280,6 +284,11 @@ impl CompositeStoreBuilder {
         Ok(self)
     }
 
+    pub fn with_durable_delay(mut self, duration: Duration) -> Self {
+        self.durable_delay = duration;
+        self
+    }
+
     pub fn with_replica_builder(mut self, builder: Arc<dyn ReplicaFactory>) -> Self {
         self.peer_replica_builder = Some(builder);
         self
@@ -307,6 +316,7 @@ impl CompositeStoreBuilder {
             read_replicas: self.read_replicas.into(),
             write_replicas: self.write_replicas.into(),
             durable,
+            durable_delay: self.durable_delay,
             local_durable,
             should_cache_query_results: self.should_cache_query_results,
             local_metadata_only: self.local_metadata_only,
@@ -319,6 +329,7 @@ impl CompositeStoreBuilder {
                 counter_query: provider.counter("query"),
                 counter_exist: provider.counter("exist"),
                 counter_exist_batch: provider.counter("exist_batch"),
+                counter_get_metadata: provider.counter("get_metadata"),
                 gauge_num_replicas: provider.gauge("topology.refresh.num_peers"),
                 topology_refresh_num_changes: provider.counter("topology.refresh.num_changes"),
                 topology_refresh_num_peer_errors: provider
@@ -361,6 +372,9 @@ pub struct CompositeStore {
     write_replicas: RwLock<Vec<ReplicationTarget>>,
     /// Durable read store
     durable: DurableTarget,
+    /// The delay applied to durable store operations so replicas are given a chance
+    /// to fulfill a request first
+    durable_delay: Duration,
     /// Flag if local store is durable
     local_durable: bool,
     /// Should Query results be cached in the local store?
@@ -381,6 +395,38 @@ pub struct ReevaluatePeersSummary {
     pub detected_new_peers: HashSet<PeerInfo>,
     pub num_new_peers_errors: usize,
     pub lost_peers: HashSet<PeerInfo>,
+}
+
+/// Container representing a typical composite store operation,
+/// where many requests are fanned out to durable and replica targets.
+struct CompositeOperation<T>
+where
+    T: 'static,
+{
+    cancellation_token: CancellationToken,
+    queries: JoinSet<T>,
+}
+
+impl<T> CompositeOperation<T> {
+    fn new() -> Self {
+        Self {
+            queries: JoinSet::new(),
+            cancellation_token: CancellationToken::new(),
+        }
+    }
+}
+
+impl<T> Drop for CompositeOperation<T>
+where
+    T: 'static,
+{
+    fn drop(&mut self) {
+        self.cancellation_token.cancel();
+        // not every target of a composite store operation is cancel
+        // safe, e.g. QUIC futures writing to a connection.
+        // Therefore, it is safest to detach all
+        self.queries.detach_all();
+    }
 }
 
 impl CompositeStore {
@@ -532,22 +578,40 @@ impl CompositeStore {
         self.write_replicas.read().await.clone()
     }
 
+    /// At this given moment in time, how much should the durable store be delayed by?
+    /// The delay is pointless if there are no read replicas to take advantage of
+    async fn get_durable_delay_for_operation(&self) -> Duration {
+        if self.read_replicas.read().await.is_empty() {
+            Duration::ZERO
+        } else {
+            self.durable_delay
+        }
+    }
+
     async fn get_from_remotes(
         self: Arc<Self>,
         repository: Partition,
         address: Address,
         match_required: StoreMatch,
     ) -> Result<(Fragment, Bytes), StoreError> {
-        let mut queries = JoinSet::new();
+        let mut fan_out = CompositeOperation::new();
+        let queries = &mut fan_out.queries;
 
         if !self.local_durable {
+            let cancel_token = fan_out.cancellation_token.clone();
+            let delay = self.get_durable_delay_for_operation().await;
             let durable_store = self.durable.store();
             lore_spawn!(queries, async move {
-                let durable_result = durable_store
-                    .get(repository, address, match_required)
-                    .await
-                    .map(CompositeStoreHit::Durable);
-                (true, durable_result)
+                tokio::time::sleep(delay).await;
+                if cancel_token.is_cancelled() {
+                    (true, Err(StoreError::internal("cancelled")))
+                } else {
+                    let durable_result = durable_store
+                        .get(repository, address, match_required)
+                        .await
+                        .map(CompositeStoreHit::Durable);
+                    (true, durable_result)
+                }
             });
         }
         {
@@ -591,7 +655,6 @@ impl CompositeStore {
                             put_result
                         });
                     }
-                    queries.detach_all();
                     return result.into_counted_result(&self.instruments.counter_get);
                 }
                 Err(StoreError::SlowDown(_)) => {
@@ -603,7 +666,6 @@ impl CompositeStore {
                     // about the replicas
                     if is_durable && !is_internal_error {
                         error_to_return = err;
-                        queries.detach_all();
                         break;
                     }
                 }
@@ -649,16 +711,24 @@ impl ImmutableStore for CompositeStore {
             return local_match_made.into_counted_result(&self.instruments.counter_exist);
         }
 
-        let mut queries = JoinSet::new();
+        let mut fan_out = CompositeOperation::new();
+        let queries = &mut fan_out.queries;
 
         if !self.local_durable {
+            let cancel_token = fan_out.cancellation_token.clone();
+            let delay = self.get_durable_delay_for_operation().await;
             let durable_store = self.durable.store();
             lore_spawn!(queries, async move {
-                let durable_result = durable_store
-                    .exist(repository, address, match_requested)
-                    .await
-                    .map(CompositeStoreHit::Durable);
-                (true, durable_result)
+                tokio::time::sleep(delay).await;
+                if cancel_token.is_cancelled() {
+                    (true, Err(StoreError::internal("cancelled")))
+                } else {
+                    let durable_result = durable_store
+                        .exist(repository, address, match_requested)
+                        .await
+                        .map(CompositeStoreHit::Durable);
+                    (true, durable_result)
+                }
             });
         }
         {
@@ -683,7 +753,6 @@ impl ImmutableStore for CompositeStore {
             };
             if let Ok(match_made) = query_result {
                 if match_made.inner() >= &match_requested {
-                    queries.detach_all();
                     return match_made.into_counted_result(&self.instruments.counter_exist);
                 }
                 if match_made.inner() > best_match.inner() {
@@ -692,7 +761,6 @@ impl ImmutableStore for CompositeStore {
 
                 if is_durable {
                     // durable is the source of truth - other replicas aren't going to do any better
-                    queries.detach_all();
                     break;
                 }
             }
@@ -736,9 +804,12 @@ impl ImmutableStore for CompositeStore {
                 .into_counted_result(&self.instruments.counter_exist_batch);
         }
 
-        let mut queries = JoinSet::new();
+        let mut fan_out = CompositeOperation::new();
+        let queries = &mut fan_out.queries;
 
         if !self.local_durable {
+            let cancel_token = fan_out.cancellation_token.clone();
+            let delay = self.get_durable_delay_for_operation().await;
             let durable_store = self.durable.target.clone();
             let addresses = remaining
                 .iter()
@@ -746,11 +817,16 @@ impl ImmutableStore for CompositeStore {
                 .collect::<Vec<_>>();
 
             lore_spawn!(queries, async move {
-                let durable_result = durable_store
-                    .exist_batch(repository, addresses.as_slice(), match_requested)
-                    .await
-                    .map(CompositeStoreHit::Durable);
-                (true, durable_result)
+                tokio::time::sleep(delay).await;
+                if cancel_token.is_cancelled() {
+                    (true, Err(StoreError::internal("cancelled")))
+                } else {
+                    let durable_result = durable_store
+                        .exist_batch(repository, addresses.as_slice(), match_requested)
+                        .await
+                        .map(CompositeStoreHit::Durable);
+                    (true, durable_result)
+                }
             });
         }
 
@@ -811,7 +887,6 @@ impl ImmutableStore for CompositeStore {
                     // complete? If so we can early out
                     if is_durable || result.iter().all(|m| *m >= match_requested) {
                         failure = None;
-                        queries.detach_all();
                         break;
                     }
                 }
@@ -825,7 +900,6 @@ impl ImmutableStore for CompositeStore {
                     // durable is the source of truth - if it error'd bubble its error up and forget
                     // about the replicas
                     if is_durable && !is_internal_error {
-                        queries.detach_all();
                         break;
                     }
                 }
@@ -856,16 +930,24 @@ impl ImmutableStore for CompositeStore {
             return result.into_counted_result(&self.instruments.counter_query);
         }
 
-        let mut queries = JoinSet::new();
+        let mut fan_out = CompositeOperation::new();
+        let queries = &mut fan_out.queries;
 
         if !self.local_durable {
+            let cancel_token = fan_out.cancellation_token.clone();
+            let delay = self.get_durable_delay_for_operation().await;
             let durable_store = self.durable.target.clone();
             lore_spawn!(queries, async move {
-                let durable_result = durable_store
-                    .query(repository, address, match_requested)
-                    .await
-                    .map(CompositeStoreHit::Durable);
-                (true, durable_result)
+                tokio::time::sleep(delay).await;
+                if cancel_token.is_cancelled() {
+                    (true, Err(StoreError::internal("cancelled")))
+                } else {
+                    let durable_result = durable_store
+                        .query(repository, address, match_requested)
+                        .await
+                        .map(CompositeStoreHit::Durable);
+                    (true, durable_result)
+                }
             });
         }
         {
@@ -895,13 +977,11 @@ impl ImmutableStore for CompositeStore {
                         best_result = result;
                         if result_match >= match_requested {
                             // If we found a requested match, the rest of the tasks can elapse
-                            queries.detach_all();
                             break;
                         }
                     }
                     if is_durable {
                         // durable is the source of truth - replicas will not be able to do better
-                        queries.detach_all();
                         break;
                     }
                 }
@@ -909,7 +989,6 @@ impl ImmutableStore for CompositeStore {
                     // durable is the source of truth - if it error'd bubble its error up and forget
                     // about the replicas
                     if is_durable && !error.is_slow_down() && !error.is_internal() {
-                        queries.detach_all();
                         break;
                     }
                 }
@@ -934,6 +1013,91 @@ impl ImmutableStore for CompositeStore {
         }
 
         best_result.into_counted_result(&self.instruments.counter_query)
+    }
+
+    /// Local first, then durable and read replicas in parallel. Like `query`, read replicas are
+    /// consulted so that edge-region replicas can answer without a cross-region round trip to the
+    /// durable store. Durable is the source of truth: when it responds the remaining replica
+    /// futures are dropped.
+    async fn get_metadata(
+        self: Arc<Self>,
+        repository: Partition,
+        address: Address,
+    ) -> Result<StoreQueryResult, StoreError> {
+        if let Ok(result) = self
+            .local
+            .store()
+            .get_metadata(repository, address)
+            .await
+            .map(CompositeStoreHit::Local)
+            && result.inner().match_made == StoreMatch::MatchFull
+        {
+            return result.into_counted_result(&self.instruments.counter_get_metadata);
+        }
+
+        let mut fan_out = CompositeOperation::new();
+        let queries = &mut fan_out.queries;
+
+        if !self.local_durable {
+            let cancel_token = fan_out.cancellation_token.clone();
+            let delay = self.get_durable_delay_for_operation().await;
+            let durable_store = self.durable.target.clone();
+            lore_spawn!(queries, async move {
+                tokio::time::sleep(delay).await;
+                if cancel_token.is_cancelled() {
+                    (true, Err(StoreError::internal("cancelled")))
+                } else {
+                    let durable_result = durable_store
+                        .get_metadata(repository, address)
+                        .await
+                        .map(CompositeStoreHit::Durable);
+                    (true, durable_result)
+                }
+            });
+        }
+        {
+            let read_replicas = self.read_replicas.read().await;
+            for replica in read_replicas.iter() {
+                let replica_store = replica.target.clone();
+                lore_spawn!(queries, async move {
+                    let replica_result = replica_store
+                        .get_metadata(repository, address)
+                        .await
+                        .map(CompositeStoreHit::Replica);
+                    (false, replica_result)
+                });
+            }
+        }
+
+        let mut best_result = CompositeStoreHit::Miss(StoreQueryResult::default());
+
+        while let Some(join_result) = queries.join_next().await {
+            let Ok((is_durable, query_result)) = join_result else {
+                continue;
+            };
+            match query_result {
+                Ok(result) => {
+                    let result_match = result.inner().match_made;
+                    if result_match > best_result.inner().match_made {
+                        best_result = result;
+                        if result_match >= StoreMatch::MatchFull {
+                            break;
+                        }
+                    }
+                    if is_durable {
+                        // durable is the source of truth — replicas will not be able to do better
+                        break;
+                    }
+                }
+                Err(error) => {
+                    if is_durable && !error.is_slow_down() && !error.is_internal() {
+                        break;
+                    }
+                }
+            }
+        }
+
+        best_result.into_counted_result(&self.instruments.counter_get_metadata)
     }
 
     async fn get(
@@ -1221,6 +1385,7 @@ struct CompositeStoreInstruments {
     counter_exist: Counter<u64>,
     counter_exist_batch: Counter<u64>,
     counter_query: Counter<u64>,
+    counter_get_metadata: Counter<u64>,
     gauge_num_replicas: Gauge<u64>,
     topology_refresh_num_changes: Counter<u64>,
     topology_refresh_num_peer_errors: Counter<u64>,

@@ -32,9 +32,11 @@ header = '''// LORE C API
 // A string the library produces is a NUL-terminated buffer. A string carried
 // inside an event is valid only while the callback runs; copy its bytes to keep
 // them after the callback returns. A string the caller passes in must be valid
-// UTF-8, which the library does not check. The library copies the bytes, so the
-// caller may free the string once the call returns. See lore_string_t for the
-// layout of the type.
+// UTF-8: the library checks every string an operation carries before it starts
+// the call, and fails the whole call with error code 1 (invalid arguments)
+// naming the offending field if any of them is not. The library copies the
+// bytes, so the caller may free the string once the call returns. See
+// lore_string_t for the layout of the type.
 //
 // Argument lifetime
 //
@@ -80,6 +82,7 @@ include = [
     "LoreRevisionTreeMoveArgs",
     "LoreRevisionTreeMetadataSetArgs",
     "LoreRevisionTreeMetadataGetArgs",
+    "LoreRevisionTreeMetadataClearArgs",
     "LoreRevisionTreeCommitArgs",
     "LoreRevisionTreeCommitOptions",
 ]
@@ -477,12 +480,14 @@ include = [
 "LoreRevisionTreeNodeInfoEventData" = "lore_revision_tree_node_info_event_data_t"
 "LoreRevisionTreeInfoEventData" = "lore_revision_tree_info_event_data_t"
 "LoreRevisionTreeNodePathEventData" = "lore_revision_tree_node_path_event_data_t"
+"LoreRevisionTreeBatchCompleteEventData" = "lore_revision_tree_batch_complete_event_data_t"
 "LoreRevisionTreeAddCompleteEventData" = "lore_revision_tree_add_complete_event_data_t"
 "LoreRevisionTreeDeleteCompleteEventData" = "lore_revision_tree_delete_complete_event_data_t"
 "LoreRevisionTreeModifyCompleteEventData" = "lore_revision_tree_modify_complete_event_data_t"
 "LoreRevisionTreeMoveCompleteEventData" = "lore_revision_tree_move_complete_event_data_t"
 "LoreRevisionTreeMetadataSetCompleteEventData" = "lore_revision_tree_metadata_set_complete_event_data_t"
 "LoreRevisionTreeMetadataGetCompleteEventData" = "lore_revision_tree_metadata_get_complete_event_data_t"
+"LoreRevisionTreeMetadataClearCompleteEventData" = "lore_revision_tree_metadata_clear_complete_event_data_t"
 "LoreRevisionTreeCommitCompleteEventData" = "lore_revision_tree_commit_complete_event_data_t"
 "LoreRevisionTreeCloseCompleteEventData" = "lore_revision_tree_close_complete_event_data_t"
 "LoreRevisionTreeListChildrenBeginEventData" = "lore_revision_tree_list_children_begin_event_data_t"
@@ -495,11 +500,22 @@ include = [
 "LoreRevisionTreeInfoArgs" = "lore_revision_tree_info_args_t"
 "LoreRevisionTreeNodePathArgs" = "lore_revision_tree_node_path_args_t"
 "LoreRevisionTreeAddArgs" = "lore_revision_tree_add_args_t"
+"LoreRevisionTreeAddEntry" = "lore_revision_tree_add_entry_t"
+"LoreArray_lore_revision_tree_add_entry" = "lore_revision_tree_add_entry_array_t"
 "LoreRevisionTreeDeleteArgs" = "lore_revision_tree_delete_args_t"
 "LoreRevisionTreeModifyArgs" = "lore_revision_tree_modify_args_t"
+"LoreRevisionTreeModifyEntry" = "lore_revision_tree_modify_entry_t"
+"LoreArray_lore_revision_tree_modify_entry" = "lore_revision_tree_modify_entry_array_t"
 "LoreRevisionTreeMoveArgs" = "lore_revision_tree_move_args_t"
 "LoreRevisionTreeMetadataSetArgs" = "lore_revision_tree_metadata_set_args_t"
+"LoreRevisionTreeMetadataSetEntry" = "lore_revision_tree_metadata_set_entry_t"
+"LoreArray_lore_revision_tree_metadata_set_entry" = "lore_revision_tree_metadata_set_entry_array_t"
 "LoreRevisionTreeMetadataGetArgs" = "lore_revision_tree_metadata_get_args_t"
+"LoreRevisionTreeMetadataClearArgs" = "lore_revision_tree_metadata_clear_args_t"
+"LoreRevisionTreeMetadataClearEntry" = "lore_revision_tree_metadata_clear_entry_t"
+"LoreArray_lore_revision_tree_metadata_clear_entry" = "lore_revision_tree_metadata_clear_entry_array_t"
+"LoreRevisionTreeMetadataGetEntry" = "lore_revision_tree_metadata_get_entry_t"
+"LoreArray_lore_revision_tree_metadata_get_entry" = "lore_revision_tree_metadata_get_entry_array_t"
 "LoreRevisionTreeCommitArgs" = "lore_revision_tree_commit_args_t"
 "LoreRevisionTreeCommitOptions" = "lore_revision_tree_commit_options_t"
 "LoreString" = "lore_string_t"

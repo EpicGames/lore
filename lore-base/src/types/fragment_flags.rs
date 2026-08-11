@@ -42,6 +42,20 @@ impl FragmentFlags {
     pub fn as_u32(&self) -> u32 {
         self.bits()
     }
+
+    pub fn compression_label(flags: u32) -> &'static str {
+        if (flags & FragmentFlags::PayloadCompressed) == 0 {
+            "not_compressed"
+        } else if (flags & FragmentFlags::PayloadCompressedLZ4) != 0 {
+            "lz4"
+        } else if (flags & FragmentFlags::PayloadCompressedOodle2) != 0 {
+            "oodle2"
+        } else if (flags & FragmentFlags::PayloadCompressedZstd) != 0 {
+            "zstd"
+        } else {
+            "unknown"
+        }
+    }
 }
 
 impl From<FragmentFlags> for u32 {

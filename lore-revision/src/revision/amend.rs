@@ -167,7 +167,7 @@ async fn amend_revision_impl(
     })
     .send();
 
-    let _ = event::metadata::send(&amended_metadata);
+    event::metadata::send(&amended_metadata);
 
     Ok(signature)
 }

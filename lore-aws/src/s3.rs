@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashMap;
 use std::ops::Range;
 use std::time::Duration;
 
@@ -190,12 +191,18 @@ impl S3Impl {
             .map_err(AwsError::AwsSdkError)
     }
 
+    /// Store an object, optionally attaching object metadata carried as `x-amz-meta-*` headers.
+    ///
+    /// Object metadata is part of the object version rather than a separate record, so a reader
+    /// always observes the metadata that was written with the bytes it is reading. Writing the
+    /// two together is what makes them impossible to tear apart.
     #[tracing::instrument(name = "S3Impl::put_object", skip_all)]
     pub async fn put_object<T>(
         &self,
         bucket: &str,
         key: &str,
         body: T,
+        metadata: Option<HashMap<String, String>>,
     ) -> Result<PutObjectOutput, AwsError<SdkError<PutObjectError>>>
     where
         T: Into<Vec<u8>> + 'static,
@@ -204,6 +211,7 @@ impl S3Impl {
             .put_object()
             .bucket(bucket)
             .key(key)
+            .set_metadata(metadata)
             .body(ByteStream::from(Into::<Vec<u8>>::into(body)))
             .send()
             .observe(

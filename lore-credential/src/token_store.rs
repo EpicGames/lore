@@ -283,14 +283,10 @@ fn store_open_options() -> fs::OpenOptions {
 /// whole load -> modify -> store span (not just the individual file
 /// operations) so concurrent processes cannot interleave their updates.
 async fn lock_store_file(path: &Path) -> Result<FSLock, TokenStoreError> {
-    let path = path.to_path_buf();
-    lore_base::lore_spawn_blocking!(move || FSLock::acquire_file_lock(path))
-        .await
-        .map_err(|e| TokenStoreError::internal_with_context(e, "Failed to lock store file"))?
-        .map_err(|e| {
-            lore_warn!("Failed to lock store file: {e}");
-            TokenStoreError::internal_with_context(e, "Failed to lock store file")
-        })
+    FSLock::acquire_file_lock(path).await.map_err(|e| {
+        lore_warn!("Failed to lock store file: {e}");
+        TokenStoreError::internal_with_context(e, "Failed to lock store file")
+    })
 }
 
 /// Cross-process guard for `tokens.toml`, creating the store directory so
@@ -1000,7 +996,13 @@ async fn get_secret_from_store(target: &str) -> Result<Vec<u8>, TokenStoreError>
     if use_secure_store()
         && let Ok(entry) = keyring_entry(target)
     {
-        match entry.get_secret() {
+        // A locked keychain blocks until the user answers a prompt.
+        let loaded = lore_base::lore_spawn_blocking!(move || entry.get_secret())
+            .await
+            .map_err(|e| {
+                TokenStoreError::internal_with_context(e, "Secure store read task failed")
+            })?;
+        match loaded {
             Ok(secret) => {
                 lore_trace!("Loaded secret from secure store {target}");
                 return Ok(secret);
@@ -1054,8 +1056,15 @@ async fn set_secret_in_store(target: &str, secret: Vec<u8>) -> Result<Vec<u8>, T
     if use_secure_store()
         && let Ok(entry) = keyring_entry(target)
     {
-        if entry
-            .set_secret(&secret)
+        let stored = {
+            let secret = secret.clone();
+            lore_base::lore_spawn_blocking!(move || entry.set_secret(&secret))
+                .await
+                .map_err(|e| {
+                    TokenStoreError::internal_with_context(e, "Secure store write task failed")
+                })?
+        };
+        if stored
             .map_err(|e| {
                 lore_warn!("{SECURE_STORE_MSG}: {e}");
                 TokenStoreError::internal_with_context(e, SECURE_STORE_MSG)

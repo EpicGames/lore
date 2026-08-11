@@ -64,20 +64,25 @@ pub async fn handler(
                 diff::diff_revision_paths(repository, state_source, state_target, None, tx)
             })
             .await;
-            result
-                .map(|(_, mut changes)| {
+            match result {
+                Ok((_, mut changes)) => {
                     change::sort_by_path(&mut changes);
                     debug!("Found {} changes", changes.len());
-                    Response::new(RevisionDiffResponse {
-                        diffs: changes.iter().filter_map(map_to_path_diff).collect(),
-                    })
-                })
-                .map_err(|err| {
+                    let mut diffs = Vec::with_capacity(changes.len());
+                    for change in &changes {
+                        if let Some(diff) = map_to_path_diff(change, repository_id).await {
+                            diffs.push(diff);
+                        }
+                    }
+                    Ok(Response::new(RevisionDiffResponse { diffs }))
+                }
+                Err(err) => {
                     warn!(?err, %revision_from, %revision_to,
                         "Failed to calculate diff",
                     );
-                    Status::internal(err.to_string())
-                })
+                    Err(Status::internal(err.to_string()))
+                }
+            }
         })
         .await
 }

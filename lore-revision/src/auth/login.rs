@@ -187,6 +187,13 @@ pub async fn with_token(
             .and_then(|endpoint| endpoint.auth_url)
             .unwrap_or_default();
 
+        if auth_url.is_empty() {
+            return Err(NotSupported {
+                operation: "No authentication configured on server".to_string(),
+            }
+            .into());
+        }
+
         (auth_url, parsed_remote)
     };
 
@@ -252,9 +259,10 @@ pub async fn interactive(
         .unwrap_or_default();
 
     if auth_url.is_empty() {
-        return Err(InteractiveLoginError::internal(
-            "No authentication configured on server",
-        ));
+        return Err(NotSupported {
+            operation: "No authentication configured on server".to_string(),
+        }
+        .into());
     }
 
     let auth_impl = authentication::find(&auth_url)

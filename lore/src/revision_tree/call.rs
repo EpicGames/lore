@@ -54,10 +54,11 @@ impl EventError for DispatchError {
 /// The helper:
 /// 1. Sets up an `ExecutionContext` and enters its `LORE_CONTEXT` scope.
 /// 2. Acquires a [`RevisionTreeGuard`] for the handle. If the handle is
-///    unknown or already closed, invokes `on_handle_miss` (letting the verb
-///    emit its own `*Complete` terminal carrying the caller id), then
-///    completes with the handle-miss error detail and returns its error code
-///    without invoking the verb impl.
+///    unknown or already closed, invokes `on_handle_miss` with the arguments
+///    (letting the verb emit its own `*Complete` terminal carrying the caller
+///    id, or one per entry for a batch verb), then completes with the
+///    handle-miss error detail and returns its error code without invoking the
+///    verb impl.
 /// 3. Passes a cloned `Arc<RevisionTreeInternal>` to the verb impl
 ///    (ownership transferred; the impl can fan it out to spawned tasks).
 /// 4. Translates the impl's `Result` into a `Complete{status}` event.
@@ -82,7 +83,7 @@ pub(crate) async fn revision_tree_call<Arg, T, F, Fut, ResT, ErrT, M>(
 where
     ErrT: EventError + FfiError + HasTrace,
     Arg: std::fmt::Debug,
-    M: FnOnce(),
+    M: FnOnce(&Arg),
     F: FnOnce(Arc<RevisionTreeInternal>, Arg) -> Fut,
     Fut: Future<Output = Result<ResT, ErrT>> + 'static,
 {
@@ -91,7 +92,7 @@ where
     LORE_CONTEXT
         .scope(execution, async move {
             let Some(guard) = RevisionTreeGuard::enter(handle) else {
-                on_handle_miss();
+                on_handle_miss(&args);
                 let err = DispatchError::from(InvalidArguments {
                     reason: "revision tree handle is unknown or has been closed".into(),
                 });
@@ -145,7 +146,7 @@ mod tests {
             LoreRevisionTree::INVALID,
             (),
             "handle_miss_test",
-            move || missed_setter.store(true, Ordering::SeqCst),
+            move |_args: &()| missed_setter.store(true, Ordering::SeqCst),
             |_internal, _args: ()| async move { Ok::<_, DispatchError>(()) },
         )
         .await;
@@ -194,7 +195,7 @@ mod tests {
             handle_value,
             (),
             "happy_path_test",
-            move || missed_setter.store(true, Ordering::SeqCst),
+            move |_args: &()| missed_setter.store(true, Ordering::SeqCst),
             move |internal_arc, _args: ()| async move {
                 invoked_clone.fetch_add(1, Ordering::AcqRel);
                 assert!(internal_arc.in_flight.load(Ordering::Acquire) >= 1);
@@ -238,7 +239,7 @@ mod tests {
             handle_value,
             (),
             "verb_error_test",
-            move || missed_setter.store(true, Ordering::SeqCst),
+            move |_args: &()| missed_setter.store(true, Ordering::SeqCst),
             move |_internal, _args: ()| async move {
                 Err::<(), _>(DispatchError::from(InvalidArguments {
                     reason: "simulated verb error".into(),

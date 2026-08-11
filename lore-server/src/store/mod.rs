@@ -22,6 +22,7 @@ pub use configuration::empty_plugin_config;
 pub use configuration::has_plugin_config;
 pub use configuration::resolve_plugin_config;
 pub use configuration::resolve_plugin_config_with_fallback;
+use lore_base::lore_spawn;
 #[cfg(test)]
 use lore_revision::runtime::execution_context;
 use lore_storage::ImmutableStore;
@@ -113,7 +114,7 @@ pub async fn memory_stats_reporter(store: Weak<dyn ImmutableStore>, interval: Op
 pub fn spawn_immutable_store_availability_monitor(health: Arc<ServerHealth>) {
     let instruments = STORE_INSTRUMENTS.get_or_init(Default::default);
     if let Some((interval, timeout)) = health.interval_timeout {
-        tokio::spawn(async move {
+        lore_spawn!(async move {
             // Check if the store is in good condition every given interval
             loop {
                 tokio::time::sleep(interval.max(Duration::from_secs(10))).await;

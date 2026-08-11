@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: MIT
 #[cfg(all(test, feature = "integration_tests"))]
 mod aws_store_tests {
+    use std::collections::HashMap;
     use std::error::Error;
     use std::sync::Arc;
 
     use async_trait::async_trait;
+    use aws_sdk_dynamodb::primitives::Blob;
+    use aws_sdk_dynamodb::types::AttributeValue;
     use bytes::Bytes;
     use lore_aws::store::immutable_store::AwsImmutableStore;
     use lore_aws::store::immutable_store::AwsImmutableStoreSettings;
@@ -71,6 +74,14 @@ mod aws_store_tests {
 
     #[async_trait]
     impl ImmutableStore for LocalStore {
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreQueryResult, StoreError> {
+            self.query(partition, address, StoreMatch::MatchFull).await
+        }
+
         async fn exist(
             self: Arc<Self>,
             _repository: Partition,
@@ -176,6 +187,154 @@ mod aws_store_tests {
         fn max_query_batch(&self) -> Option<usize> {
             Some(100)
         }
+    }
+
+    /// An object stored before the fragment moved onto it: bare bytes in S3, the fragment in a row
+    /// of the fragment metadata table. Reading one must still work, since the cut-over does not
+    /// rewrite the existing population — this is the whole of the migration's read path.
+    #[tokio::test]
+    async fn test_get_immutable_falls_back_to_the_fragment_metadata_table() -> TestResult {
+        let repository = random::<RepositoryId>();
+        let (fragment, address, payload) = fragment::generate_random();
+
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (s3, dynamo, _) = setup(vec![
+                    MUTABLE_STORE_TABLE_NAME,
+                    FRAGMENTS_TABLE_NAME,
+                    FRAGMENT_METADATA_TABLE_NAME,
+                ])
+                .await?;
+
+                let settings = AwsImmutableStoreSettings::new(
+                    S3StoreSettings::new(STORE_BUCKET_NAME.to_string()),
+                    DynamoDbImmutableStoreSettings::new(
+                        FRAGMENTS_TABLE_NAME.to_string(),
+                        FRAGMENT_METADATA_TABLE_NAME.to_string(),
+                    )
+                    .with_fragment_metadata_table(FRAGMENT_METADATA_TABLE_NAME.to_string()),
+                    false,
+                );
+                let store = Arc::new(AwsImmutableStore::new(s3, dynamo, &settings));
+
+                // Store it the current way first, so the association and the keys are real.
+                store
+                    .clone()
+                    .put(repository, address, fragment, Some(payload.clone()), false)
+                    .await?;
+
+                let (raw_s3, raw_dynamo, _) = setup(vec![]).await?;
+
+                // Then put it back the way that era stored it: bare bytes, no object metadata.
+                let mut dst = [0u8; 64];
+                let key = lore_revision::util::to_hex_str(address.hash.data(), &mut dst);
+                raw_s3
+                    .put_object(STORE_BUCKET_NAME, key, payload.to_vec(), None)
+                    .await
+                    .expect("rewriting the object without metadata should succeed");
+
+                // And the row that era wrote: the whole fragment flattened, with no state attribute.
+                let row = HashMap::from([
+                    (
+                        "hash".to_string(),
+                        AttributeValue::B(Blob::new(address.hash.data().to_vec())),
+                    ),
+                    (
+                        "flags".to_string(),
+                        AttributeValue::N(fragment.flags.to_string()),
+                    ),
+                    (
+                        "size_payload".to_string(),
+                        AttributeValue::N(fragment.size_payload.to_string()),
+                    ),
+                    (
+                        "size_content".to_string(),
+                        AttributeValue::N(fragment.size_content.to_string()),
+                    ),
+                ]);
+                raw_dynamo
+                    .put_item(&Arc::<str>::from(FRAGMENT_METADATA_TABLE_NAME), row)
+                    .await
+                    .expect("writing the pre-cut-over row should succeed");
+
+                let (got_fragment, got_payload) = store
+                    .get(repository, address, StoreMatch::MatchFull)
+                    .await?;
+
+                assert_eq!(got_payload, payload, "the payload must read back intact");
+                assert_eq!(got_fragment.size_payload, fragment.size_payload);
+                assert_eq!(got_fragment.size_content, fragment.size_content);
+                assert_eq!(
+                    got_fragment.flags & FragmentFlags::PayloadStoredDurable,
+                    FragmentFlags::PayloadStoredDurable,
+                    "durability is derived, not read from the row"
+                );
+
+                Ok(())
+            })
+            .await
+    }
+
+    /// The same object on a deployment that never stored one that way. Leaving the fragment
+    /// metadata table unconfigured declares no such object exists, so this one is damaged rather
+    /// than old — and must be reported, not described from a row that cannot be about it.
+    #[tokio::test]
+    async fn test_get_immutable_without_a_fragment_metadata_table_reports_the_object_as_damaged()
+    -> TestResult {
+        let repository = random::<RepositoryId>();
+        let (fragment, address, payload) = fragment::generate_random();
+
+        let execution = setup_execution("test".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let (s3, dynamo, _) = setup(vec![
+                    MUTABLE_STORE_TABLE_NAME,
+                    FRAGMENTS_TABLE_NAME,
+                    FRAGMENT_METADATA_TABLE_NAME,
+                ])
+                .await?;
+
+                let settings = AwsImmutableStoreSettings::new(
+                    S3StoreSettings::new(STORE_BUCKET_NAME.to_string()),
+                    DynamoDbImmutableStoreSettings::new(
+                        FRAGMENTS_TABLE_NAME.to_string(),
+                        FRAGMENT_METADATA_TABLE_NAME.to_string(),
+                    ),
+                    false,
+                );
+                let store = Arc::new(AwsImmutableStore::new(s3, dynamo, &settings));
+
+                store
+                    .clone()
+                    .put(repository, address, fragment, Some(payload.clone()), false)
+                    .await?;
+
+                let (raw_s3, _, _) = setup(vec![]).await?;
+                let mut dst = [0u8; 64];
+                let key = lore_revision::util::to_hex_str(address.hash.data(), &mut dst);
+                raw_s3
+                    .put_object(STORE_BUCKET_NAME, key, payload.to_vec(), None)
+                    .await
+                    .expect("rewriting the object without metadata should succeed");
+
+                let error = store
+                    .get(repository, address, StoreMatch::MatchFull)
+                    .await
+                    .expect_err("an object with no metadata and nowhere to look is damaged");
+
+                assert!(
+                    error.is_internal(),
+                    "must be reported as an error, not as a miss that a client would retry into"
+                );
+                assert!(
+                    format!("{error:?}").contains("carries no fragment metadata"),
+                    "the error should say what is wrong with the object, got: {error:?}"
+                );
+
+                Ok(())
+            })
+            .await
     }
 
     async fn initialize_store() -> Result<
@@ -346,7 +505,7 @@ mod aws_store_tests {
 
                 let result = immutable_store
                     .clone()
-                    .query(repository, address, StoreMatch::MatchFull)
+                    .get_metadata(repository, address)
                     .await
                     .unwrap();
 
@@ -382,9 +541,10 @@ mod aws_store_tests {
                 let mut address = address;
                 address.context = random::<Context>();
 
-                let mut want_fragment = fragment;
-                want_fragment.flags = FragmentFlags::PayloadStoredDurable.bits()
-                    | (fragment.flags & FragmentFlags::PayloadCompressed);
+                let want_fragment = Fragment {
+                    flags: FragmentFlags::PayloadStoredDurable.bits(),
+                    ..Default::default()
+                };
                 assert_eq!(
                     StoreQueryResult {
                         fragment: want_fragment,
@@ -417,9 +577,10 @@ mod aws_store_tests {
                 let mut address = address;
                 address.context = random::<Context>();
 
-                let mut want_fragment = fragment;
-                want_fragment.flags = FragmentFlags::PayloadStoredDurable.bits()
-                    | (fragment.flags & FragmentFlags::PayloadCompressed);
+                let want_fragment = Fragment {
+                    flags: FragmentFlags::PayloadStoredDurable.bits(),
+                    ..Default::default()
+                };
                 assert_eq!(
                     StoreQueryResult {
                         fragment: want_fragment,
@@ -492,43 +653,6 @@ mod aws_store_tests {
                         .clone()
                         .query(repository, address, StoreMatch::MatchFull)
                         .await?
-                );
-
-                Ok(())
-            })
-            .await
-    }
-
-    #[tokio::test]
-    async fn test_put_immutable_partial_hash_collision() -> TestResult {
-        let repository = random::<RepositoryId>();
-        let (fragment, address, payload) = fragment::generate_random();
-
-        let (immutable_store, _mutable_store, execution) = initialize_store().await?;
-        LORE_CONTEXT
-            .scope(execution.clone(), async move {
-                // Put the fragment with an initial context.
-                immutable_store
-                    .clone()
-                    .put(repository, address, fragment, Some(payload.clone()), false)
-                    .await?;
-
-                let mut invalid_fragment = fragment;
-                invalid_fragment.size_content *= 2;
-
-                assert!(
-                    immutable_store
-                        .clone()
-                        .put(
-                            repository,
-                            address,
-                            invalid_fragment,
-                            Some(payload.clone()),
-                            false
-                        )
-                        .await
-                        .expect_err("should have returned an error")
-                        .is_internal()
                 );
 
                 Ok(())

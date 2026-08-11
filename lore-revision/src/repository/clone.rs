@@ -307,8 +307,6 @@ pub struct CloneOptions {
     pub virtually: bool,
     /// Use direct file write
     pub direct_file_write: bool,
-    /// Use direct file I/O
-    pub direct_file_io: bool,
     /// File containing list of files to prefetch
     pub prefetch: Option<String>,
     /// Whether to use the shared store and options configuring it if desired
@@ -547,7 +545,8 @@ async fn create_empty_directory(
     relative_path: &RelativePath,
 ) -> Result<(), CloneError> {
     let absolute = relative_path.to_absolute_path(repository.require_path()?);
-    tokio::fs::create_dir_all(&absolute)
+    lore_io::IoDriver::global()
+        .create_dir_all(&absolute)
         .await
         .internal_with(|| format!("Failed to create directory {}", absolute.display()))?;
     Ok(())
@@ -804,7 +803,7 @@ async fn process_block_item_dependency(
             // Create parent directories
             let dep_absolute = dep_relative.to_absolute_path(dispatcher.repository.require_path()?);
             if let Some(parent) = dep_absolute.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
+                let _ = lore_io::IoDriver::global().create_dir_all(parent).await;
             }
 
             // Always dispatch with dependency context so the item goes through
@@ -997,7 +996,8 @@ pub async fn clone(
     let filter_view = if let Some(view) = view {
         let mut view_target = dotpath.clone();
         view_target.push(repository::VIEW_FILTER);
-        tokio::fs::copy(view, &view_target)
+        lore_io::IoDriver::global()
+            .copy(view, &view_target)
             .await
             .internal_with(|| {
                 format!(
@@ -1437,7 +1437,7 @@ async fn clone_in_path(
             let node_id = node_link.node;
             let absolute = relative.to_absolute_path(repository.require_path()?);
             if let Some(parent) = absolute.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
+                let _ = lore_io::IoDriver::global().create_dir_all(parent).await;
             }
             dep_ctx.visited.insert(node_id);
             dispatcher.dispatch(BlockDiscoverItem {
@@ -1542,7 +1542,8 @@ async fn clone_discover_link(
             // Discovery no longer pre-creates parent dirs; create the full chain here and cache the link dir in stats so later files under it cache-hit.
             let link_dir_hash = hash_string_bytes(absolute_path.as_os_str().as_encoded_bytes());
             if !stats.created_parents.contains(&link_dir_hash) {
-                tokio::fs::create_dir_all(absolute_path.as_path())
+                lore_io::IoDriver::global()
+                    .create_dir_all(absolute_path.as_path())
                     .await
                     .internal_with(|| {
                         format!("Failed to create directory {}", absolute_path.display())
@@ -1836,6 +1837,7 @@ fn clone_child_node(
 }
 
 /// Ensure the parent directory of `path` exists; second and later files under the same parent hit the `DashSet` cache and skip the syscall.
+/// A parent that already exists but cannot be created over — the clone root on a container bind mount, a drive root, an ACL'd share — counts as success.
 async fn ensure_parent_dir(path: &Path, stats: &CloneStats) -> Result<(), CloneError> {
     let Some(parent) = path.parent() else {
         return Ok(());
@@ -1845,9 +1847,18 @@ async fn ensure_parent_dir(path: &Path, stats: &CloneStats) -> Result<(), CloneE
     if stats.created_parents.contains(&parent_hash) {
         return Ok(());
     }
-    tokio::fs::create_dir_all(parent)
-        .await
-        .internal_with(|| format!("Failed to create directory {}", parent.display()))?;
+    // `create_dir_all` only forgives `AlreadyExists`, so check existence ourselves as `spawn_clone_directory` does.
+    if let Err(err) = lore_io::IoDriver::global().create_dir_all(parent).await
+        && !lore_io::IoDriver::global()
+            .metadata(parent)
+            .await
+            .is_ok_and(|m| m.is_dir())
+    {
+        return Err(CloneError::internal_with_context(
+            err,
+            &format!("Failed to create directory {}", parent.display()),
+        ));
+    }
     stats.created_parents.insert(parent_hash);
     Ok(())
 }
@@ -1863,7 +1874,9 @@ async fn clone_file(
     let context = execution_context();
     let call = context.globals();
     let force = call.force();
-    let metadata = tokio::fs::metadata(absolute_path.as_path()).await;
+    let metadata = lore_io::IoDriver::global()
+        .metadata(absolute_path.as_path())
+        .await;
     if let Ok(metadata) = metadata {
         if options.ignore_existing {
             lore_trace!("Ignore existing file {}", absolute_path.display());
@@ -1944,7 +1957,7 @@ async fn clone_file(
 
         // `read_into_file` returns the file's metadata when its single-fragment
         // path captures it on the open write handle; on that path we skip the
-        // post-write stat entirely. Multi-fragment, mmap, and zero-size paths
+        // post-write stat entirely. Multi-fragment and zero-size paths
         // still need a separate metadata query.
         let captured_metadata = if node.size > 0 {
             let (fragment, metadata) = immutable::read_into_file(
@@ -1969,21 +1982,18 @@ async fn clone_file(
             metadata
         } else {
             // Zero sized file, just create
-            tokio::fs::OpenOptions::new()
-                .read(false)
-                .write(true)
-                .truncate(true)
-                .create(true)
-                .open(absolute_path.as_path())
+            let metadata = lore_io::IoDriver::global()
+                .write_file_bytes(absolute_path.as_path(), bytes::Bytes::new(), false)
                 .await
                 .internal_with(|| format!("Failed to clone file {}", absolute_path.display()))?;
-            None
+            Some(metadata)
         };
 
         let metadata = if let Some(metadata) = captured_metadata {
             metadata
         } else {
-            tokio::fs::metadata(absolute_path.as_path())
+            lore_io::IoDriver::global()
+                .metadata(absolute_path.as_path())
                 .await
                 .internal_with(|| format!("Failed to clone file {}", absolute_path.display()))?
         };
@@ -2114,7 +2124,8 @@ fn spawn_clone_link(
                     linked_repository.id,
                     absolute_path.display()
                 );
-                tokio::fs::create_dir(absolute_path.as_path())
+                lore_io::IoDriver::global()
+                    .create_dir_all(absolute_path.as_path())
                     .await
                     .internal_with(|| {
                         format!("Failed to create directory {}", absolute_path.display())
@@ -2159,7 +2170,9 @@ async fn spawn_clone_directory(
 
     let future = async move {
         if !execution_context().globals().dry_run() {
-            let result = tokio::fs::create_dir(absolute_path.as_path()).await;
+            let result = lore_io::IoDriver::global()
+                .create_dir_all(absolute_path.as_path())
+                .await;
             if result.is_err() && !absolute_path.is_dir() {
                 stats
                     .directory_inflight
@@ -2221,3 +2234,208 @@ urc_repository_clone_module_in_path(urc_repository_t* repository, urc_state_t* s
     return err;
 }
 */
+
+#[cfg(test)]
+// Fixture setup builds and permissions files directly rather than through the driver: what these
+// tests exercise is how clone reacts to a filesystem in a given state, not how that state is
+// reached.
+#[allow(clippy::disallowed_methods)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ensure_parent_dir_creates_missing_ancestors() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let file = temp.path().join("nested/deeper/file.txt");
+        let stats = CloneStats::default();
+
+        ensure_parent_dir(file.as_path(), &stats)
+            .await
+            .expect("missing parent should be created");
+
+        assert!(file.parent().expect("parent").is_dir());
+    }
+
+    /// The clone root already exists and is not ours to create: files at the top of the tree
+    /// take it as their parent, so this must not fail the clone.
+    #[tokio::test]
+    async fn ensure_parent_dir_accepts_existing_parent() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let file = temp.path().join("file.txt");
+        let stats = CloneStats::default();
+
+        ensure_parent_dir(file.as_path(), &stats)
+            .await
+            .expect("existing parent should not fail");
+    }
+
+    #[tokio::test]
+    async fn ensure_parent_dir_caches_parent_once_per_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let stats = CloneStats::default();
+        let first = temp.path().join("dir/a.txt");
+        let second = temp.path().join("dir/b.txt");
+
+        ensure_parent_dir(first.as_path(), &stats)
+            .await
+            .expect("first file should create the parent");
+        ensure_parent_dir(second.as_path(), &stats)
+            .await
+            .expect("sibling should hit the cache");
+
+        assert_eq!(stats.created_parents.len(), 1);
+    }
+
+    /// Tolerating an existing parent must not extend to tolerating a real failure: a file
+    /// sitting where the parent directory belongs still has to abort the clone.
+    #[tokio::test]
+    async fn ensure_parent_dir_rejects_parent_that_is_a_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let blocker = temp.path().join("blocker");
+        tokio::fs::File::create(blocker.as_path())
+            .await
+            .expect("create blocker file");
+        let stats = CloneStats::default();
+
+        let err = ensure_parent_dir(blocker.join("file.txt").as_path(), &stats)
+            .await
+            .expect_err("a file where the parent belongs must fail");
+
+        assert!(err.to_string().contains("Failed to create directory"));
+        assert!(stats.created_parents.is_empty());
+    }
+
+    /// A parent that genuinely cannot be created still has to abort the clone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_parent_dir_rejects_uncreatable_parent() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let locked = temp.path().join("locked");
+        tokio::fs::create_dir(locked.as_path())
+            .await
+            .expect("create locked dir");
+        tokio::fs::set_permissions(locked.as_path(), std::fs::Permissions::from_mode(0o500))
+            .await
+            .expect("drop write permission");
+        let stats = CloneStats::default();
+
+        let result = ensure_parent_dir(locked.join("child/file.txt").as_path(), &stats).await;
+
+        // Restore write permission first so the temp dir can be cleaned up.
+        tokio::fs::set_permissions(locked.as_path(), std::fs::Permissions::from_mode(0o700))
+            .await
+            .expect("restore write permission");
+        let err = result.expect_err("uncreatable parent must fail");
+        assert!(err.to_string().contains("Failed to create directory"));
+        assert!(stats.created_parents.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adversarial_dangling_symlink_parent() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(temp.path().join("nowhere"), link.as_path())
+            .expect("create dangling symlink");
+        let stats = CloneStats::default();
+
+        let result = ensure_parent_dir(link.join("file.txt").as_path(), &stats).await;
+
+        assert!(result.is_err(), "a dangling symlink is not a usable parent");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adversarial_symlink_to_file_parent() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let target = temp.path().join("target");
+        tokio::fs::File::create(target.as_path())
+            .await
+            .expect("create target file");
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(target.as_path(), link.as_path()).expect("create symlink");
+        let stats = CloneStats::default();
+
+        let result = ensure_parent_dir(link.join("file.txt").as_path(), &stats).await;
+
+        assert!(
+            result.is_err(),
+            "a symlink to a file is not a usable parent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adversarial_symlink_to_directory_parent() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let target = temp.path().join("target");
+        tokio::fs::create_dir(target.as_path())
+            .await
+            .expect("create target dir");
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(target.as_path(), link.as_path()).expect("create symlink");
+        let stats = CloneStats::default();
+
+        ensure_parent_dir(link.join("file.txt").as_path(), &stats)
+            .await
+            .expect("a symlink to a directory is a usable parent");
+    }
+
+    #[tokio::test]
+    async fn adversarial_parent_nested_under_a_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let blocker = temp.path().join("blocker");
+        tokio::fs::File::create(blocker.as_path())
+            .await
+            .expect("create blocker file");
+        let stats = CloneStats::default();
+
+        let result = ensure_parent_dir(blocker.join("deep/file.txt").as_path(), &stats).await;
+
+        assert!(result.is_err(), "a file cannot contain a directory");
+    }
+
+    #[tokio::test]
+    async fn adversarial_paths_without_a_usable_parent() {
+        let stats = CloneStats::default();
+
+        // Filesystem root: no parent to create.
+        ensure_parent_dir(Path::new("/"), &stats)
+            .await
+            .expect("root must be a no-op");
+        // Bare relative name: parent is the empty path.
+        ensure_parent_dir(Path::new("file.txt"), &stats)
+            .await
+            .expect("a bare relative name must be a no-op");
+        // Empty path.
+        ensure_parent_dir(Path::new(""), &stats)
+            .await
+            .expect("empty path must be a no-op");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn adversarial_concurrent_calls_same_parent() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let stats = Arc::new(CloneStats::default());
+        let parent = temp.path().join("shared/nested");
+
+        let mut tasks = Vec::new();
+        for index in 0..16 {
+            let stats = stats.clone();
+            let file = parent.join(format!("file-{index}.txt"));
+            tasks.push(lore_spawn!(async move {
+                ensure_parent_dir(file.as_path(), &stats).await
+            }));
+        }
+        for task in tasks {
+            task.await
+                .expect("task must not panic")
+                .expect("concurrent creation of the same parent must not fail");
+        }
+
+        assert!(parent.is_dir());
+        assert_eq!(stats.created_parents.len(), 1);
+    }
+}

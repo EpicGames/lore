@@ -20,6 +20,7 @@ use lore_base::types::Address;
 use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
+use lore_macro::ValidateText;
 use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
@@ -41,7 +42,7 @@ use crate::storage::store::StoreInternal;
 
 /// One obliterate item — the `(partition, address)` to delete.
 #[repr(C)]
-#[derive(Copy, Clone, Default, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Deserialize, Serialize, ValidateText)]
 pub struct LoreStorageObliterateItem {
     /// Caller-chosen id echoed back in `OBLITERATE_ITEM_COMPLETE`
     pub id: u64,

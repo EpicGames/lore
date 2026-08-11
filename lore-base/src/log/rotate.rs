@@ -99,7 +99,7 @@ impl RotatingLogFile {
     fn rotate(&mut self) -> io::Result<()> {
         // Acquire the lock before dropping the file handle. If locking fails, the
         // existing handle remains valid and subsequent writes continue working.
-        let _lock = FSLock::acquire_directory_lock(&self.dir)?;
+        let _lock = FSLock::acquire_directory_lock_blocking(&self.dir)?;
 
         // Drop the file handle before renaming — required on Windows where open
         // handles prevent rename/delete operations.

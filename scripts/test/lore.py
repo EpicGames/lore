@@ -1769,7 +1769,6 @@ class Lore:
         bare: bool = False,
         virtually: bool = False,
         direct_file_write: bool = False,
-        direct_file_io: bool = False,
         flush_file: bool = False,
         layer: str | None = None,
         layer_metadata: str | None = None,
@@ -1805,7 +1804,6 @@ class Lore:
             + (["--bare"] if bare else [])
             + (["--virtually"] if virtually else [])
             + (["--direct-file-write"] if direct_file_write else [])
-            + (["--direct-file-io"] if direct_file_io else [])
             + (["--flush-file"] if flush_file else [])
             + (["--layer", layer] if layer else [])
             + (["--layer-metadata", layer_metadata] if layer_metadata else [])

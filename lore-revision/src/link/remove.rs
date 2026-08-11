@@ -74,7 +74,9 @@ pub async fn remove(
 
     if is_staged_add {
         // Recreate the empty directory so it appears as an unstaged change
-        let _ = tokio::fs::create_dir_all(absolute_path.as_path()).await;
+        let _ = lore_io::IoDriver::global()
+            .create_dir_all(absolute_path.as_path())
+            .await;
 
         // Link was added but never committed — discard the node from the staged tree
         lore_debug!("Link node was staged for add, discarding instead of staging delete");

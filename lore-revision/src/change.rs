@@ -25,6 +25,9 @@ pub enum FileAction {
     Delete = 2,
     Move = 3,
     Copy = 4,
+    /// Adopt a source subtree the target never modified (`base == target`).
+    /// Carries the directory node only. Apply time expands the subtree.
+    Graft = 5,
 }
 
 impl FileAction {
@@ -34,6 +37,7 @@ impl FileAction {
             FileAction::Delete => "D",
             FileAction::Move => "V",
             FileAction::Copy => "C",
+            FileAction::Graft => "G",
             FileAction::Keep => "M",
         }
     }

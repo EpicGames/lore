@@ -63,7 +63,9 @@ s3_endpoint_url = "http://minio:9000"
 s3_region = "us-east-1"
 s3_force_path_style = true
 dynamodb_fragments_table = "lore-fragments-dev"
-dynamodb_metadata_table = "lore-fragment-metadata-dev"
+dynamodb_fragment_state_table = "lore-fragment-state-dev"
+# No objects predate the move of the fragment onto the S3 object here, so no fallback read.
+# dynamodb_fragment_metadata_table = "lore-fragment-metadata-dev"
 dynamodb_endpoint_url = "http://dynamodb:9090"
 dynamodb_region = "us-east-1"
 timeout_millis = 120000

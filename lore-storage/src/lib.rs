@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+pub mod chunker;
 pub mod compress;
 pub mod concurrency;
 pub mod defragment;
@@ -39,9 +40,7 @@ pub use compress::FRAGMENT_COMPRESS_SIZE_LIMIT;
 pub use compress::FRAGMENT_SIZE_THRESHOLD;
 pub use compress::FragmentError;
 pub use compress::compress;
-pub use compress::compress_async;
 pub use compress::decompress;
-pub use compress::decompress_async;
 pub use compress::decompress_into_slice;
 // Re-export concurrency primitives
 pub use concurrency::FILE_COUNT_LIMIT_DEFAULT;
@@ -147,7 +146,10 @@ pub use types::deserialize_hash;
 /// Serde field-level helpers for hex encoding. Use with `#[serde(serialize_with = "...")]`.
 pub use types::serialize_hex;
 pub use write::StoreResult;
+pub use write::content_write_inflight;
+pub use write::content_write_peak;
 pub use write::hash_file;
+pub use write::reset_content_write_peak;
 pub use write::store_fragment;
 pub use write::store_raw_local;
 pub use write::stored_in_flight;

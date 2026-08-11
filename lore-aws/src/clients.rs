@@ -21,6 +21,7 @@ use tracing::warn;
 
 use crate::aws_error::AwsError;
 use crate::dynamodb::DynamoDb;
+use crate::net_http_client::NetHttpClient;
 use crate::s3::S3;
 
 #[derive(Debug, Error, PartialEq)]
@@ -124,7 +125,7 @@ impl AwsClientBuilder<WantsHttpConfig> {
 
         AwsClientBuilder(WantsAwsConfig {
             config: aws_config::defaults(BehaviorVersion::latest())
-                .http_client(http_client)
+                .http_client(NetHttpClient::new(http_client))
                 // We default to disabling HTTP connect timeouts for the time being, hopefully once
                 // we sort out whatever is causing our mysterious network latency we can remove
                 // this. Note: this is override-able in the next phase of the client builder

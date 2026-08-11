@@ -172,6 +172,16 @@ mod tests {
                 &self,
                 kid: &str,
             ) -> Result<(DecodingKey, jsonwebtoken::Algorithm), JWKServiceError>;
+
+            fn get_cached_key(
+                &self,
+                kid: &str,
+            ) -> Option<(DecodingKey, jsonwebtoken::Algorithm)>;
+
+            async fn refresh_key(
+                &self,
+                kid: &str,
+            ) -> Result<Option<(DecodingKey, jsonwebtoken::Algorithm)>, JWKServiceError>;
         }
     }
 

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 pub mod client;
 pub mod command_header;
+pub mod net_runtime;
 mod response_reader;
 pub mod storage_service;
 

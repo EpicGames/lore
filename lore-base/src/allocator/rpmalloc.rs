@@ -24,6 +24,8 @@ pub struct RpmallocGlobalStatistics {
     pub decommitted: usize,
     pub active: usize,
     pub active_peak: usize,
+    pub huge_alloc: usize,
+    pub huge_alloc_peak: usize,
     pub heap_count: usize,
 }
 

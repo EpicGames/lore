@@ -8,16 +8,21 @@ use std::sync::OnceLock;
 use chrono::SecondsFormat;
 use chrono::Utc;
 use lore_base::directories::project_directory;
+use lore_base::error::FileNotFound;
+use lore_base::error::InvalidArguments;
 use lore_base::log::LoreLogLevel;
 use lore_base::log::rotate::RotatingLogFile;
+use lore_base::text::ValidateText;
+use lore_error_set::FfiError;
 use lore_error_set::prelude::*;
+use lore_macro::ValidateText;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::LoreLogEventData;
 use lore_revision::interface::LoreString;
 use lore_revision::lore::try_execution_context;
 
 #[repr(C)]
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, ValidateText)]
 /// Configuration controlling Lore's file and event logging.
 pub struct LoreLogConfig {
     /// Enable logging to a file (disabled by default)
@@ -61,11 +66,20 @@ pub fn log_level() -> LoreLogLevel {
     }
 }
 
-pub fn configure(config: &LoreLogConfig) {
+/// Apply `config`, reporting whether it was applied.
+///
+/// This is the one entry point that takes caller text without going through the
+/// argument wrappers, so it checks its own strings: the paths below read them as
+/// `&str`.
+pub fn configure(config: &LoreLogConfig) -> i32 {
     initialize();
 
+    if let Err(error) = config.validate_text() {
+        return InvalidArguments::from(error).ffi_code();
+    }
+
     if config.file == 0 {
-        return;
+        return 0;
     }
 
     let mut config = config.clone();
@@ -93,12 +107,16 @@ pub fn configure(config: &LoreLogConfig) {
     };
 
     let Ok(log_file) = RotatingLogFile::new(log_dir, prefix, max_count) else {
-        return;
+        return FileNotFound {
+            resource: "log file".into(),
+        }
+        .ffi_code();
     };
 
     LogFileWriter::init(log_file);
 
     *LOG_CONFIG.get_or_init(parking_lot::RwLock::default).write() = config;
+    0
 }
 
 static LOG_FILE_WRITER: OnceLock<std::sync::mpsc::Sender<String>> = OnceLock::new();
@@ -176,5 +194,41 @@ fn get_default_logs_path() -> String {
         path_string.to_owned()
     } else {
         String::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `lore_log_configure` takes caller text without going through the
+    /// argument wrappers, so it is the one entry point that has to check its own
+    /// strings before reading them as a path.
+    #[test]
+    fn configure_rejects_a_file_path_that_is_not_utf8() {
+        let config = LoreLogConfig {
+            file: 1,
+            file_path: LoreString::from_bytes(&[b'/', 0xff, 0xfe]),
+            ..LoreLogConfig::default()
+        };
+
+        let status = configure(&config);
+
+        assert_eq!(
+            status,
+            InvalidArguments {
+                reason: String::new()
+            }
+            .ffi_code(),
+            "a non-UTF-8 log path must be rejected"
+        );
+    }
+
+    /// A configuration that asks for no log file applies without touching the
+    /// filesystem, so the check is the only thing standing between the caller
+    /// and a bad path.
+    #[test]
+    fn configure_accepts_a_configuration_with_no_file_logging() {
+        assert_eq!(configure(&LoreLogConfig::default()), 0);
     }
 }

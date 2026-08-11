@@ -4,14 +4,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use lore_base::lore_spawn_core;
+use lore_base::lore_spawn_net;
 use lore_base::runtime::LORE_CONTEXT;
-use lore_base::runtime::runtime;
 use lore_revision::runtime::execution_context;
+use lore_transport::quic::net_runtime::NetRuntime;
 use opentelemetry::KeyValue;
 use quinn::AckFrequencyConfig;
 use quinn::EndpointConfig;
 use quinn::ServerConfig;
-use quinn::TokioRuntime;
 use quinn::VarInt;
 use quinn::congestion;
 use quinn::crypto::rustls::HandshakeData;
@@ -130,12 +131,19 @@ impl QuinnServer {
 
         socket.bind(&socket2::SockAddr::from(settings.address))?;
 
-        let endpoint = quinn::Endpoint::new(
-            endpoint_config,
-            Some(server_config),
-            socket.into(),
-            Arc::new(TokioRuntime),
-        )?;
+        // `NetRuntime` places every task quinn spawns on net, including the connection driver
+        // created when an `Incoming` is awaited. The guard covers what it cannot: the socket is
+        // handed to `tokio::net::UdpSocket::from_std`, which registers with whichever reactor is
+        // current here. Removing it would register net's socket on core's reactor.
+        let endpoint = {
+            let _guard = lore_base::runtime::net_runtime().enter();
+            quinn::Endpoint::new(
+                endpoint_config,
+                Some(server_config),
+                socket.into(),
+                Arc::new(NetRuntime),
+            )?
+        };
 
         run_loop(endpoint.clone(), settings)?;
 
@@ -170,7 +178,7 @@ fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<
         // the `TaskMonitor` so we need to use a scoped import.
         use tracing::instrument::Instrument;
         let monitor = monitor.clone();
-        runtime().spawn(
+        lore_spawn_core!(
             LORE_CONTEXT.scope(
                 execution_context(),
                 async move {
@@ -180,7 +188,7 @@ fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<
                     }
                 }
                 .in_current_span(),
-            ),
+            )
         );
     }
 
@@ -193,7 +201,7 @@ fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<
         let monitor = monitor.clone();
         let stream_handler_factory = stream_handler_factory.clone();
 
-        runtime().spawn(
+        lore_spawn_net!(
             LORE_CONTEXT.scope(
                 execution_context(),
                 async move {
@@ -204,7 +212,7 @@ fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<
                         let monitor = monitor.clone();
                         let stream_handler_factory = stream_handler_factory.clone();
 
-                        runtime().spawn(
+                        lore_spawn_net!(
                             LORE_CONTEXT.scope(
                                 execution_context(),
                                 async move {
@@ -220,12 +228,12 @@ fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<
                                     }
                                 }
                                 .in_current_span(),
-                            ),
+                            )
                         );
                     }
                 }
                 .in_current_span(),
-            ),
+            )
         );
     }
 
@@ -344,6 +352,8 @@ async fn handle_conn(
             .instrument(info_span!("handle_stream"))
         };
 
-        runtime().spawn(monitor.instrument(LORE_CONTEXT.scope(execution.clone(), handle_future)));
+        // Transport read only: `handle_stream` lifts the request off the wire and
+        // hands processing to core from inside the stream handler.
+        lore_spawn_net!(monitor.instrument(LORE_CONTEXT.scope(execution.clone(), handle_future)));
     }
 }

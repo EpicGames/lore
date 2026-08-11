@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use tokio::fs;
 
 use super::LinkError;
 use crate::error::LoreResultExt;
@@ -53,7 +52,8 @@ pub(crate) async fn reset_staged_add_link(
         // Restore the committed directory: recreate the empty placeholder on
         // disk and clear the staged-delete on its node so it returns to its
         // clean committed state.
-        fs::create_dir_all(absolute_path.as_path())
+        lore_io::IoDriver::global()
+            .create_dir_all(absolute_path.as_path())
             .await
             .emit_map_err(LinkError::internal(
                 "Failed to recreate placeholder directory",
@@ -85,7 +85,11 @@ pub(crate) async fn reset_staged_add_link(
             break;
         }
         let parent_abs = repository.require_path()?.join(current_buf.as_str());
-        if fs::remove_dir(parent_abs.as_path()).await.is_err() {
+        if lore_io::IoDriver::global()
+            .remove_dir(parent_abs.as_path())
+            .await
+            .is_err()
+        {
             break;
         }
     }
@@ -121,7 +125,8 @@ pub(crate) async fn reset_staged_remove_link(
         .forward::<LinkError>("Failed to restore link registry entry")?;
 
     let absolute_path = link_path.to_absolute_path(repository.require_path()?);
-    fs::create_dir_all(absolute_path.as_path())
+    lore_io::IoDriver::global()
+        .create_dir_all(absolute_path.as_path())
         .await
         .emit_map_err(LinkError::internal("Failed to recreate link directory"))?;
 

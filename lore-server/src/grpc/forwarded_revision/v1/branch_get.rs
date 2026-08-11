@@ -125,6 +125,7 @@ mod test {
             repository_id: repository,
             user_id: "alice".into(),
             correlation_id: String::new(),
+            authorization: None,
         }
         .to_forwarded_request(BranchGetRequest { query: Some(query) })
         .expect("CallerContext::to_forwarded_request failed in test")

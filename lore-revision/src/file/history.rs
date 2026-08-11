@@ -249,8 +249,7 @@ async fn history_state(
             .await
             .forward::<FileHistoryError>("Failed to deserialize metadata")?;
 
-        event::metadata::send(&metadata)
-            .forward::<FileHistoryError>("Failed to deserialize metadata")?;
+        event::metadata::send(&metadata);
     }
 
     // File metadata
@@ -259,8 +258,7 @@ async fn history_state(
             .await
             .forward::<FileHistoryError>("Failed to deserialize metadata")?;
 
-        event::metadata::send(&metadata)
-            .forward::<FileHistoryError>("Failed to deserialize metadata")?;
+        event::metadata::send(&metadata);
     }
 
     Ok(())

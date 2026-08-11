@@ -18,7 +18,14 @@ use serde::Deserialize;
 
 use crate::Fragment;
 use crate::FragmentFlags;
+use crate::errors::InefficientCompression;
 use crate::errors::NotSupported;
+
+#[error_set]
+pub enum CompressFragmentError {
+    NotSupported,
+    InefficientCompression,
+}
 
 #[error_set]
 pub enum FragmentError {
@@ -253,7 +260,7 @@ fn compress_scratch_buffer() -> BytesMut {
         return buffer;
     }
 
-    let limit = *SCRATCH_BUFFER_LIMIT.get_or_init(lore_base::runtime::compute_pool_thread_count);
+    let limit = *SCRATCH_BUFFER_LIMIT.get_or_init(lore_base::runtime::default_worker_threads);
     let current = COMPRESS_SCRATCH_BUFFER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
     if current < limit {
         let current =
@@ -288,7 +295,7 @@ fn decompress_scratch_buffer() -> BytesMut {
         return buffer;
     }
 
-    let limit = *SCRATCH_BUFFER_LIMIT.get_or_init(lore_base::runtime::compute_pool_thread_count);
+    let limit = *SCRATCH_BUFFER_LIMIT.get_or_init(lore_base::runtime::default_worker_threads);
     let current = DECOMPRESS_SCRATCH_BUFFER_COUNT.load(std::sync::atomic::Ordering::Relaxed);
     if current < limit {
         let current =
@@ -394,10 +401,11 @@ static ZSTD_DECOMPRESS_CTX_QUEUE: OnceLock<crossbeam::queue::ArrayQueue<ZstdDCtx
     OnceLock::new();
 
 fn zstd_compress_ctx_queue() -> &'static crossbeam::queue::ArrayQueue<ZstdCCtx> {
-    // Queue capacity = thread count. Push is atomic — overflow contexts from bursts
-    // fail to push and drop immediately, so the pool can't grow beyond thread count.
+    // Compression runs inline on tokio workers, so queue capacity = worker
+    // count. Push is atomic — overflow contexts from bursts fail to push and
+    // drop immediately, so the pool can't grow beyond the worker count.
     ZSTD_COMPRESS_CTX_QUEUE.get_or_init(|| {
-        crossbeam::queue::ArrayQueue::new(lore_base::runtime::compute_pool_thread_count())
+        crossbeam::queue::ArrayQueue::new(lore_base::runtime::default_worker_threads())
     })
 }
 
@@ -421,7 +429,7 @@ fn zstd_compress_ctx_done(ctx: ZstdCCtx) {
 
 fn zstd_decompress_ctx_queue() -> &'static crossbeam::queue::ArrayQueue<ZstdDCtx> {
     ZSTD_DECOMPRESS_CTX_QUEUE.get_or_init(|| {
-        crossbeam::queue::ArrayQueue::new(lore_base::runtime::compute_pool_thread_count())
+        crossbeam::queue::ArrayQueue::new(lore_base::runtime::default_worker_threads())
     })
 }
 
@@ -441,11 +449,6 @@ fn zstd_decompress_ctx_done(ctx: ZstdDCtx) {
     let _ = queue.push(ctx);
 }
 
-mod pool;
-
-pub use pool::compress_async;
-pub use pool::decompress_async;
-
 pub fn decompress(
     fragment: Fragment,
     compressed: &[u8],
@@ -458,10 +461,6 @@ pub fn decompress(
 /// buffer's capacity must be at least `fragment.size_content` bytes;
 /// callers that do not want to size the buffer themselves should use
 /// [`decompress`] which allocates it.
-///
-/// Separated from `decompress` so async callers can allocate the output
-/// buffer on the tokio worker thread before dispatching work to a rayon
-/// compute worker, keeping large allocations on the producer's heap.
 fn decompress_into(
     fragment: Fragment,
     compressed: &[u8],
@@ -735,8 +734,7 @@ fn compression_level() -> u32 {
 }
 
 /// Returns the maximum compressed size for the given payload length and
-/// compression mode. Used to pre-allocate an output buffer on the caller's
-/// thread so large allocations stay off the compute-worker heap.
+/// compression mode. Used to pre-allocate the output buffer for [`compress`].
 ///
 /// Returns 0 for modes that will refuse to compress (`NoCompression`;
 /// `Oodle` without the oodle feature). In those cases the compress call
@@ -770,7 +768,7 @@ pub fn compress(
     fragment: Fragment,
     payload: &[u8],
     mode: CompressionMode,
-) -> Result<(Fragment, Bytes), FragmentError> {
+) -> Result<(Fragment, Bytes), CompressFragmentError> {
     let output_buffer =
         BytesMut::with_capacity(compress_bound(fragment.size_payload as usize, mode));
     compress_into(fragment, payload, mode, output_buffer)
@@ -780,18 +778,16 @@ pub fn compress(
 /// capacity must be at least `compress_bound(fragment.size_payload, mode)`;
 /// callers that do not know the correct bound should use [`compress`] which
 /// sizes the buffer itself.
-///
-/// Separated from `compress` so async callers can allocate the output
-/// buffer on the tokio worker thread before dispatching work to a rayon
-/// compute worker, keeping large allocations on the producer's heap.
 fn compress_into(
     fragment: Fragment,
     payload: &[u8],
     mode: CompressionMode,
     output_buffer: BytesMut,
-) -> Result<(Fragment, Bytes), FragmentError> {
+) -> Result<(Fragment, Bytes), CompressFragmentError> {
     if fragment.size_content as usize > FRAGMENT_SIZE_THRESHOLD {
-        return Err(FragmentError::internal("fragment has invalid sizes"));
+        return Err(CompressFragmentError::internal(
+            "fragment has invalid sizes",
+        ));
     }
     // Only try to compress previously uncompressed raw data buffers of more than 32 bytes
     // Fragment lists and below 32 byte buffers are always raw uncompressed
@@ -799,13 +795,15 @@ fn compress_into(
         || (fragment.flags & FragmentFlags::PayloadFragmented) != 0
         || (fragment.size_payload as u64) != fragment.size_content
     {
-        return Err(FragmentError::internal(
+        return Err(CompressFragmentError::internal(
             "fragment incompatible with compression",
         ));
     }
 
     if payload.len() < fragment.size_payload as usize {
-        return Err(FragmentError::internal("fragment has invalid sizes"));
+        return Err(CompressFragmentError::internal(
+            "fragment has invalid sizes",
+        ));
     }
 
     match mode {
@@ -816,14 +814,14 @@ fn compress_into(
         #[cfg(feature = "oodle")]
         CompressionMode::Oodle => compress_oodle_impl(fragment, payload, output_buffer),
         #[cfg(not(feature = "oodle"))]
-        CompressionMode::Oodle => Err(FragmentError::from(NotSupported {
+        CompressionMode::Oodle => Err(CompressFragmentError::from(NotSupported {
             operation:
                 "Oodle compression requested but this client was built without Oodle support"
                     .to_string(),
         })),
-        CompressionMode::NoCompression => {
-            Err(FragmentError::internal("fragment compression disabled"))
-        }
+        CompressionMode::NoCompression => Err(CompressFragmentError::internal(
+            "fragment compression disabled",
+        )),
     }
 }
 
@@ -832,7 +830,7 @@ fn compress_oodle_impl(
     fragment: Fragment,
     payload: &[u8],
     mut compressed_buffer: BytesMut,
-) -> Result<(Fragment, Bytes), FragmentError> {
+) -> Result<(Fragment, Bytes), CompressFragmentError> {
     oodle_initialize();
 
     // Save at least 5% to be worth compressing
@@ -876,7 +874,7 @@ fn compress_oodle_impl(
             compressed_buffer.freeze(),
         ))
     } else {
-        Err(FragmentError::internal("compression was inefficient"))
+        Err(InefficientCompression.into())
     }
 }
 
@@ -884,7 +882,7 @@ fn compress_lz4_impl(
     fragment: Fragment,
     payload: &[u8],
     mut compressed_buffer: BytesMut,
-) -> Result<(Fragment, Bytes), FragmentError> {
+) -> Result<(Fragment, Bytes), CompressFragmentError> {
     // Save at least 5% to be worth compressing
     let compressed_size_threshold = ((fragment.size_payload as usize) * 95) / 100;
 
@@ -912,7 +910,7 @@ fn compress_lz4_impl(
             compressed_buffer.freeze(),
         ))
     } else {
-        Err(FragmentError::internal("compression was inefficient"))
+        Err(InefficientCompression.into())
     }
 }
 
@@ -935,13 +933,15 @@ fn compress_zstd_impl(
     fragment: Fragment,
     payload: &[u8],
     mut compressed_buffer: BytesMut,
-) -> Result<(Fragment, Bytes), FragmentError> {
+) -> Result<(Fragment, Bytes), CompressFragmentError> {
     // Save at least 5% to be worth compressing
     let compressed_size_threshold = ((fragment.size_payload as usize) * 95) / 100;
 
     let ctx = zstd_compress_ctx();
     if ctx.0.is_null() {
-        return Err(FragmentError::internal("failed to allocate zstd context"));
+        return Err(CompressFragmentError::internal(
+            "failed to allocate zstd context",
+        ));
     }
     // Safety: ctx.0 is a valid non-null ZSTD_CCtx. Buffer capacity was sized
     // by the caller via compress_bound(). Input payload length is validated
@@ -975,6 +975,6 @@ fn compress_zstd_impl(
             compressed_buffer.freeze(),
         ))
     } else {
-        Err(FragmentError::internal("compression was inefficient"))
+        Err(InefficientCompression.into())
     }
 }

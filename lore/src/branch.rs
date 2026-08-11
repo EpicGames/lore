@@ -1439,7 +1439,7 @@ async fn metadata_set_impl(
         .iter()
         .zip(args.formats.as_slice().iter())
     {
-        let metadata_type = (*f).into();
+        let metadata_type = *f;
         encoded_values.push(
             Metadata::decode_to_value(v.as_str(), &metadata_type).map_err(|e| {
                 lore_base::error::InvalidArguments {

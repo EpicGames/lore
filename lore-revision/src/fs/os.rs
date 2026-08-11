@@ -3,14 +3,13 @@
 //! OS-backed filesystem provider implementation.
 //!
 //! This module provides a zero-cost filesystem provider that delegates directly to
-//! the operating system via `tokio::fs`.
+//! the operating system via the lore-io driver.
 
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lore_base::lore_spawn_blocking;
 use lore_base::types::Address;
 use lore_base::types::Hash;
 use lore_error_set::WrapInternal;
@@ -101,7 +100,10 @@ impl InstanceOperation for OsOperation {
     }
 
     async fn file_info(&self, path: FilesystemPath<'_>) -> Result<FileInfo, FsError> {
-        match tokio::fs::metadata(self.absolute_path(path)).await {
+        match lore_io::IoDriver::global()
+            .metadata(self.absolute_path(path))
+            .await
+        {
             Ok(metadata) => {
                 let (mtime, size) = crate::util::fs::file_mtime_and_size(&metadata);
                 let executable = crate::util::fs::file_is_executable(&metadata);
@@ -233,11 +235,13 @@ impl InstanceOperation for OsOperation {
         {
             let absolute_path = self.absolute_path(path);
             use std::os::unix::fs::PermissionsExt;
-            let metadata = tokio::fs::metadata(&absolute_path).await?;
+            let metadata = lore_io::IoDriver::global().metadata(&absolute_path).await?;
             let mut permissions = metadata.permissions();
             let mode = permissions.mode();
             permissions.set_mode(mode | 0o111); // Add execute permission for user, group, others
-            tokio::fs::set_permissions(&absolute_path, permissions).await?;
+            lore_io::IoDriver::global()
+                .set_permissions(&absolute_path, permissions)
+                .await?;
         }
 
         // No-op on Windows
@@ -250,17 +254,19 @@ impl InstanceOperation for OsOperation {
     }
 
     async fn create_dir_all(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
-        tokio::fs::create_dir_all(self.absolute_path(path)).await?;
+        lore_io::IoDriver::global()
+            .create_dir_all(self.absolute_path(path))
+            .await?;
         Ok(())
     }
 
     async fn create_file(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
-        tokio::fs::OpenOptions::new()
-            .read(false)
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(self.absolute_path(path).as_path())
+        lore_io::IoDriver::global()
+            .write_file_bytes(
+                self.absolute_path(path).as_path(),
+                bytes::Bytes::new(),
+                false,
+            )
             .await?;
         Ok(())
     }
@@ -272,13 +278,8 @@ impl InstanceOperation for OsOperation {
     ) -> Result<(), FsError> {
         let from_abs = self.absolute_path(from);
         let to_abs = self.absolute_path(to);
-        match lore_spawn_blocking!(move || { util::fs::unify_name_case_rename(&from_abs, &to_abs) })
-            .await
-        {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(err)) => Err(err.into()),
-            Err(_) => Err(FsError::internal("Failed to join task")),
-        }
+        util::fs::unify_name_case_rename(&from_abs, &to_abs).await?;
+        Ok(())
     }
 
     async fn remove(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
@@ -316,7 +317,9 @@ impl InstanceOperation for OsOperation {
         source_path: FilesystemPath<'_>,
         destination_path: impl AsRef<Path> + Send,
     ) -> Result<(), FsError> {
-        tokio::fs::copy(self.absolute_path(source_path), destination_path.as_ref()).await?;
+        lore_io::IoDriver::global()
+            .copy(self.absolute_path(source_path), destination_path.as_ref())
+            .await?;
         Ok(())
     }
 

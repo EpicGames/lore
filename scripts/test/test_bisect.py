@@ -104,7 +104,7 @@ def test_bisect(new_lore_repo):
         merge_back_to_main(repo, branch_name)
 
     # Clone repository
-    cloned_repo = repo.clone(direct_file_io=True)
+    cloned_repo = repo.clone()
 
     log_output = cloned_repo.history(oneline=True)
     trunk_revisions = [int(line.revision) for line in log_output]

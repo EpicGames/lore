@@ -41,7 +41,7 @@ pub async fn list_revision(
     };
 
     if let Some(metadata) = metadata::find::revision(repository.clone(), signature).await? {
-        event::metadata::send(&metadata).internal("sending metadata event")?;
+        event::metadata::send(&metadata);
     }
 
     Ok(())
@@ -80,7 +80,7 @@ pub async fn list_file(
     if let Some(metadata) =
         metadata::find::file(repository.clone(), revision, &relative_path).await?
     {
-        event::metadata::send(&metadata).internal("sending metadata event")?;
+        event::metadata::send(&metadata);
     }
 
     Ok(())

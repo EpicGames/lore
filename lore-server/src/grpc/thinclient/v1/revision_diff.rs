@@ -463,6 +463,8 @@ async fn run_three_way(
             autoresolve,
             Some(config.source_cap),
             config.history_walk_concurrency,
+            // The display diff reports every changed path individually.
+            None,
             producer_tx,
         ))
         .await
@@ -775,7 +777,7 @@ mod test {
         state.set_metadata_hash(metadata_hash);
         for (name, bytes) in files {
             let buffer = bytes::Bytes::copy_from_slice(bytes);
-            let (address, _) = lore_revision::immutable::write(
+            let address = lore_revision::immutable::write(
                 repository.clone(),
                 lore_storage::Context::default(),
                 buffer,

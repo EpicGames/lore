@@ -227,11 +227,13 @@ pub(super) fn node_flags_to_node_type(flags: NodeFlags) -> thin_client_v1::NodeT
 /// Maps internal `FileAction` to the v1 `Action` enum.
 fn file_action_to_v1_action(action: FileAction) -> thin_client_v1::Action {
     match action {
-        FileAction::Keep => thin_client_v1::Action::Keep,
         FileAction::Add => thin_client_v1::Action::Add,
         FileAction::Delete => thin_client_v1::Action::Delete,
         FileAction::Move => thin_client_v1::Action::Move,
         FileAction::Copy => thin_client_v1::Action::Copy,
+        // A graft is internal to the merge walk, so this is unreachable on the
+        // diff paths. Report a modification rather than widen the wire enum.
+        FileAction::Keep | FileAction::Graft => thin_client_v1::Action::Keep,
     }
 }
 

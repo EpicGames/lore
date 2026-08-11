@@ -8,9 +8,6 @@ use std::collections::HashSet;
 use std::io;
 use std::io::ErrorKind;
 use std::io::Read;
-use std::io::Write;
-#[cfg(target_family = "windows")]
-use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 #[cfg(feature = "failure_generator")]
@@ -86,6 +83,11 @@ pub const BUCKET_COUNT: usize = 256;
 pub const DEFAULT_FLUSH_DELAY_SECONDS: u64 = 5;
 
 const DOT_COMPACT: &str = "compact";
+
+/// Head bytes requested by the composite bucket open: one pool buffer
+/// class, covering fan-out-threshold-sized buckets (~100 KiB) entirely so
+/// the common bucket load is a single backend dispatch.
+pub(crate) const BUCKET_HEAD_READ: usize = 256 * 1024;
 
 // 256 u32 makes the u32 growvec chunks 2048 bytes in size
 const CHUNK_SIZE_U32: usize = 256;
@@ -418,6 +420,44 @@ enum DeserializeFileError {
     Corrupt(String),
 }
 
+/// Final-destination segments for a bucket read: one vectored operation
+/// scatters the on-disk sorted-index and entry regions straight into the
+/// bucket's chunk allocations, with no staging buffer.
+struct ImmutableBucketSegments {
+    sorted_index: GrowVec<u32, CHUNK_SIZE_U32>,
+    entry: GrowVec<ImmutableStoreEntry, CHUNK_SIZE_ENTRY>,
+}
+
+impl lore_io::StableBufListMut for ImmutableBucketSegments {
+    fn byte_segments_mut(&mut self) -> impl Iterator<Item = &mut [u8]> {
+        self.sorted_index
+            .byte_segments_mut()
+            .chain(self.entry.byte_segments_mut())
+    }
+}
+
+/// Gather segments for a bucket write: the serialized header plus the
+/// bucket's sorted-index and entry chunks, written with one vectored
+/// operation and no staging copy. Owning the bucket's read guard keeps the
+/// chunk memory alive and unmodified for the operation's whole kernel
+/// flight, which is the stability contract vectored writes require.
+struct ImmutableBucketWriteSegments {
+    /// The serialized header, in a fixed-size allocation rather than a `Vec`: its length is a
+    /// compile-time constant. It stays behind a pointer because [`lore_io::StableBufList`]
+    /// requires a segment to keep its address when the value moves, and the ring backend moves
+    /// the segment list into its operation entry after taking the pointers.
+    header: Box<[u8; size_of::<ImmutableStoreHeader>()]>,
+    bucket: OwnedRwLockReadGuard<ImmutableStoreBucket, ImmutableStoreBucket>,
+}
+
+impl lore_io::StableBufList for ImmutableBucketWriteSegments {
+    fn byte_segments(&self) -> impl Iterator<Item = &[u8]> {
+        std::iter::once(self.header.as_ref().as_slice())
+            .chain(self.bucket.sorted_index.byte_segments())
+            .chain(self.bucket.entry.byte_segments())
+    }
+}
+
 pub struct SerializeFailureGuard<'a> {
     success: bool,
     dirty: &'a AtomicBool,
@@ -457,7 +497,7 @@ impl<'a> Drop for SerializeFailureGuard<'a> {
 }
 
 impl ImmutableStoreBucket {
-    fn deserialize_files(
+    async fn deserialize_files(
         path: PathBuf,
     ) -> Result<
         (
@@ -468,13 +508,15 @@ impl ImmutableStoreBucket {
         ),
         LocalImmutableStoreError,
     > {
-        let mut file = match std::fs::File::options()
-            .read(true)
-            .write(false)
-            .create(false)
-            .open(&path)
+        let (file, metadata, head) = match lore_io::IoDriver::global()
+            .open_read_head(
+                &path,
+                &lore_io::OpenOptions::new().read(true),
+                BUCKET_HEAD_READ,
+            )
+            .await
         {
-            Ok(file) => file,
+            Ok(parts) => parts,
             Err(err) => {
                 if err.kind() == ErrorKind::NotFound {
                     return Ok((GrowVec::new(), GrowVec::new(), false, false));
@@ -489,7 +531,7 @@ impl ImmutableStoreBucket {
         // Recover from corruption (crash mid-flush leaves a half-written file) by
         // resetting the bucket. Future-version sentinels propagate untouched — the file
         // was written by a newer binary and deleting it would destroy newer-format data.
-        match Self::deserialize_files_parse(&path, &mut file) {
+        match Self::deserialize_file_content(&path, &file, metadata.len() as usize, &head).await {
             Ok(result) => Ok(result),
             Err(DeserializeFileError::FutureVersion(version)) => {
                 Err(LocalImmutableStoreError::internal_with_context(
@@ -500,14 +542,22 @@ impl ImmutableStoreBucket {
                 ))
             }
             Err(DeserializeFileError::Corrupt(reason)) => {
-                Self::recover_corrupt_bucket(&path, reason)
+                Self::recover_corrupt_bucket(&path, reason).await
             }
         }
     }
 
-    fn deserialize_files_parse(
+    /// Buckets that fit inside the composite open's head bytes — the
+    /// common case — parse straight from the head with no further
+    /// dispatch. Larger buckets do one vectored read scattering the
+    /// sorted index and entries straight into their final chunk
+    /// allocations. Legacy layouts (before `LastAccessInEntry`) parse the
+    /// remainder with entry conversion.
+    async fn deserialize_file_content(
         path: &Path,
-        file: &mut std::fs::File,
+        file: &lore_io::IoFile,
+        file_size: usize,
+        head: &[u8],
     ) -> Result<
         (
             GrowVec<u32, CHUNK_SIZE_U32>,
@@ -517,9 +567,14 @@ impl ImmutableStoreBucket {
         ),
         DeserializeFileError,
     > {
+        let header_size = size_of::<ImmutableStoreHeader>();
+        if head.len() < header_size {
+            return Err(DeserializeFileError::Corrupt(format!(
+                "file size {file_size} smaller than header size {header_size}"
+            )));
+        }
         let mut header = ImmutableStoreHeader::new_zeroed();
-        file.read_exact(header.as_mut_bytes())
-            .map_err(|err| DeserializeFileError::Corrupt(format!("read header: {err}")))?;
+        header.as_mut_bytes().copy_from_slice(&head[..header_size]);
 
         // Version is validated before any count math — a future format with a different
         // per_entry_size could otherwise produce a spurious count mismatch and trigger
@@ -554,16 +609,6 @@ impl ImmutableStoreBucket {
             }
         };
 
-        let file_size = file
-            .metadata()
-            .map_err(|err| DeserializeFileError::Corrupt(format!("read metadata: {err}")))?
-            .len() as usize;
-        let header_size = size_of::<ImmutableStoreHeader>();
-        if file_size < header_size {
-            return Err(DeserializeFileError::Corrupt(format!(
-                "file size {file_size} smaller than header size {header_size}"
-            )));
-        }
         let expected_count = (file_size - header_size) / per_entry_size;
         if expected_count == 0 {
             return Ok((GrowVec::new(), GrowVec::new(), false, false));
@@ -577,48 +622,76 @@ impl ImmutableStoreBucket {
         }
 
         let upgrade_packfile = header.version < ImmutableStoreVersion::PackfilePerGroup as u32;
-        let mut mark_dirty = false;
-
-        let sorted_index = GrowVec::read_from_file(file, expected_count)
-            .map_err(|err| DeserializeFileError::Corrupt(format!("read sorted index: {err}")))?;
 
         // LazyFanOut keeps the LastAccessInEntry layout, so any version ≥ LastAccessInEntry uses the new entry layout.
-        let entry = if header.version >= ImmutableStoreVersion::LastAccessInEntry as u32 {
-            GrowVec::read_from_file(file, expected_count)
-                .map_err(|err| DeserializeFileError::Corrupt(format!("read entries: {err}")))?
-        } else {
-            let entry_old: GrowVec<ImmutableStoreEntryBeforeLastAccess, CHUNK_SIZE_ENTRY> =
-                GrowVec::read_from_file(file, expected_count).map_err(|err| {
-                    DeserializeFileError::Corrupt(format!("read legacy entries: {err}"))
-                })?;
-
-            let mut entry = GrowVec::new();
-            for entry_old in entry_old.iter() {
-                entry.push(ImmutableStoreEntry {
-                    address: entry_old.address,
-                    partition: entry_old.partition,
-                    data: ImmutableData {
-                        flags: entry_old.data.flags,
-                        size_payload: entry_old.data.size_payload,
-                        size_content: entry_old.data.size_content,
-                        pack_offset: entry_old.data.pack_offset,
-                        pack_file: entry_old.data.pack_file,
-                        last_access: 0,
-                    },
-                });
+        if header.version >= ImmutableStoreVersion::LastAccessInEntry as u32 {
+            if file_size <= head.len() {
+                let mut reader = &head[header_size..];
+                let sorted_index =
+                    GrowVec::read_from(&mut reader, expected_count).map_err(|err| {
+                        DeserializeFileError::Corrupt(format!("read sorted index: {err}"))
+                    })?;
+                let entry = GrowVec::read_from(&mut reader, expected_count)
+                    .map_err(|err| DeserializeFileError::Corrupt(format!("read entries: {err}")))?;
+                return Ok((sorted_index, entry, upgrade_packfile, false));
             }
+            let segments = ImmutableBucketSegments {
+                // SAFETY: the scatter below fills every byte of both vectors or fails, and a
+                // failure drops them here rather than returning them.
+                sorted_index: unsafe { GrowVec::new_unzeroed_with_size(expected_count) },
+                entry: unsafe { GrowVec::new_unzeroed_with_size(expected_count) },
+            };
+            let segments = file
+                .read_exact_vectored_at(segments, header_size as u64)
+                .await
+                .map_err(|err| DeserializeFileError::Corrupt(format!("read bucket data: {err}")))?;
+            return Ok((
+                segments.sorted_index,
+                segments.entry,
+                upgrade_packfile,
+                false,
+            ));
+        }
 
-            mark_dirty = true;
-
-            entry
+        let remainder;
+        let mut reader: &[u8] = if file_size <= head.len() {
+            &head[header_size..]
+        } else {
+            remainder = file
+                .read_exact_at(file_size - header_size, header_size as u64)
+                .await
+                .map_err(|err| DeserializeFileError::Corrupt(format!("read bucket data: {err}")))?;
+            &remainder
         };
+        let sorted_index = GrowVec::read_from(&mut reader, expected_count)
+            .map_err(|err| DeserializeFileError::Corrupt(format!("read sorted index: {err}")))?;
+        let entry_old: GrowVec<ImmutableStoreEntryBeforeLastAccess, CHUNK_SIZE_ENTRY> =
+            GrowVec::read_from(&mut reader, expected_count).map_err(|err| {
+                DeserializeFileError::Corrupt(format!("read legacy entries: {err}"))
+            })?;
 
-        Ok((sorted_index, entry, upgrade_packfile, mark_dirty))
+        let mut entry = GrowVec::new();
+        for entry_old in entry_old.iter() {
+            entry.push(ImmutableStoreEntry {
+                address: entry_old.address,
+                partition: entry_old.partition,
+                data: ImmutableData {
+                    flags: entry_old.data.flags,
+                    size_payload: entry_old.data.size_payload,
+                    size_content: entry_old.data.size_content,
+                    pack_offset: entry_old.data.pack_offset,
+                    pack_file: entry_old.data.pack_file,
+                    last_access: 0,
+                },
+            });
+        }
+
+        Ok((sorted_index, entry, upgrade_packfile, true))
     }
 
     /// Drop the corrupt file and return an empty bucket. Pack file payloads survive
     /// until compaction reclaims the now-orphaned ranges.
-    fn recover_corrupt_bucket(
+    async fn recover_corrupt_bucket(
         path: &Path,
         reason: String,
     ) -> Result<
@@ -634,7 +707,7 @@ impl ImmutableStoreBucket {
             "Resetting corrupt immutable bucket {} after deserialize failure: {reason}. Bucket lookup state lost; pack file payloads remain until compaction.",
             path.display()
         );
-        if let Err(err) = std::fs::remove_file(path)
+        if let Err(err) = lore_io::IoDriver::global().remove_file(path).await
             && err.kind() != std::io::ErrorKind::NotFound
         {
             return Err(LocalImmutableStoreError::internal_with_context(
@@ -645,7 +718,7 @@ impl ImmutableStoreBucket {
         Ok((GrowVec::new(), GrowVec::new(), false, false))
     }
 
-    fn serialize_files(
+    async fn serialize_files(
         bucket: OwnedRwLockReadGuard<ImmutableStoreBucket, ImmutableStoreBucket>,
         group: Arc<ImmutableStoreGroup>,
         bucket_index: usize,
@@ -672,23 +745,10 @@ impl ImmutableStoreBucket {
         if let Some(parent_path) = temporary_path.parent()
             && !parent_path.exists()
         {
-            let _ = std::fs::create_dir_all(parent_path);
+            let _ = lore_io::IoDriver::global()
+                .create_dir_all(parent_path)
+                .await;
         }
-
-        let mut file_options = std::fs::File::options();
-        file_options
-            .read(false)
-            .write(true)
-            .create(true)
-            .truncate(true);
-        #[cfg(target_family = "windows")]
-        {
-            // Prevent any other process from writing the file
-            file_options.share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
-        }
-        let mut file = file_options
-            .open(&temporary_path)
-            .internal("Failed to serialize storage bucket")?;
 
         let count = bucket.entry.len();
         if bucket.sorted_index.len() != count {
@@ -702,39 +762,31 @@ impl ImmutableStoreBucket {
         header.version = group.serialize_version.load(atomic::Ordering::Relaxed);
         header.count = count as u32;
 
-        file.write_all(header.as_bytes())
-            .internal("Failed to serialize storage bucket")?;
-        if count > 0 {
-            bucket
-                .sorted_index
-                .write_to_file(&mut file)
-                .internal("Failed to serialize storage bucket")?;
+        let segments = ImmutableBucketWriteSegments {
+            header: {
+                let mut bytes = Box::new([0u8; size_of::<ImmutableStoreHeader>()]);
+                bytes.copy_from_slice(header.as_bytes());
+                bytes
+            },
+            bucket,
+        };
 
-            bucket
-                .entry
-                .write_to_file(&mut file)
-                .internal("Failed to serialize storage bucket")?;
-        }
-
-        if sync_data {
-            file.sync_all()
-                .internal("Failed to serialize storage bucket")?;
-        }
-
-        drop(file);
-
+        let file_options = lore_io::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true);
         if let Some(mut guard) = temporary_guard.take() {
-            fs_util::rename_file(temporary_path.as_path(), path.as_path())
+            lore_io::IoDriver::global()
+                .write_file_segments_atomic(&temporary_path, &path, &file_options, segments)
+                .await
                 .internal("Failed to serialize storage bucket")?;
 
             guard.success();
-        }
-
-        if sync_data
-            && let Some(parent_path) = temporary_path.parent()
-            && let Err(err) = fs_util::sync_dir(parent_path)
-        {
-            lore_base::lore_debug!("Failed to flush and sync immutable index directory: {err}");
+        } else {
+            lore_io::IoDriver::global()
+                .write_file_segments(&path, &file_options, segments, false)
+                .await
+                .internal("Failed to serialize storage bucket")?;
         }
 
         Ok(())
@@ -762,9 +814,7 @@ impl ImmutableStoreBucket {
         let path = format_bucket_path(path, group_index, bucket_index);
 
         let (sorted_index, entry, upgrade_packfile, mark_dirty) =
-            lore_base::lore_spawn_blocking!(move || Self::deserialize_files(path))
-                .await
-                .internal("Task failed")??;
+            Self::deserialize_files(path).await?;
 
         self.sorted_index = sorted_index;
         self.entry = entry;
@@ -812,11 +862,7 @@ impl ImmutableStoreBucket {
 
         let path = format_bucket_path(path, group_index, bucket_index);
 
-        lore_base::lore_spawn_blocking!(move || {
-            Self::serialize_files(bucket, group, bucket_index, path, sync_data)
-        })
-        .await
-        .internal("Task failed")?
+        Self::serialize_files(bucket, group, bucket_index, path, sync_data).await
     }
 
     /// Serialize the bucket to its `.new` twin during a fan-out commit. Differs from the regular
@@ -847,11 +893,7 @@ impl ImmutableStoreBucket {
             PathBuf::from(p)
         };
 
-        lore_base::lore_spawn_blocking!(move || {
-            Self::serialize_files(bucket, group, bucket_index, new_path, sync_data)
-        })
-        .await
-        .internal("Task failed")?
+        Self::serialize_files(bucket, group, bucket_index, new_path, sync_data).await
     }
 }
 
@@ -946,17 +988,12 @@ impl LocalImmutableStore {
         };
 
         let lock = if let Some(path) = immutable_path.as_deref() {
-            let path = path.clone();
-            let lock = lore_base::lore_spawn_blocking!(|| {
-                if !path.exists() {
-                    let _ = std::fs::create_dir_all(path.as_path());
-                }
-                FSLock::acquire_directory_lock(path)
-            })
-            .await
-            .map_err(|err| io::Error::other(format!("Store lock task failed: {err}")))
-            .flatten()
-            .internal("Failed to acquire store lock")?;
+            if !path.exists() {
+                let _ = lore_io::IoDriver::global().create_dir_all(path).await;
+            }
+            let lock = FSLock::acquire_directory_lock(path)
+                .await
+                .internal("Failed to acquire store lock")?;
             Some(lock)
         } else {
             None
@@ -991,51 +1028,63 @@ impl LocalImmutableStore {
         let index_existed_on_disk = immutable_path
             .as_ref()
             .is_some_and(|p| p.join("index").exists());
+        // Every group is read at once. Each group is one recovery check and one marker read, and
+        // awaiting them in turn puts a whole store open behind `GROUP_COUNT` round trips to the
+        // I/O engine — a cost every process that opens a store pays before it does any work. The
+        // groups are independent directories, so the reads overlap and the engine's thread budget
+        // is what paces them. Completions arrive in whatever order the reads finish, so each task
+        // carries the group it answers for.
+        let initial_fan_out_level = store.settings.initial_fan_out_level;
+        let mut levels = vec![(initial_fan_out_level, 0usize, false); GROUP_COUNT];
+        if let Some(path) = immutable_path.as_deref() {
+            let index_path = path.as_path().join("index");
+            let mut tasks = JoinSet::new();
+            for group_index in 0..GROUP_COUNT {
+                let group_path = index_path.join(format!("{:02x}", group_index as u8));
+                lore_base::lore_spawn!(tasks, async move {
+                    // Roll forward any pending fan-out commit before reading the marker. After this returns the marker reflects the post-recovery state.
+                    if group_path.exists()
+                        && let Err(err) =
+                            crate::local::fan_out::recover_level_transition(&group_path, false)
+                                .await
+                    {
+                        return (
+                            group_index,
+                            Err(LocalImmutableStoreError::internal_with_context(
+                                err,
+                                "Failed to recover pending level transition for group",
+                            )),
+                        );
+                    }
+
+                    let level = match crate::local::fan_out::read_level_marker(&group_path).await {
+                        Ok(Some(level)) => Ok((level, level, true)),
+                        Ok(None) if index_existed_on_disk => Ok((BUCKET_COUNT, 0, false)),
+                        Ok(None) => Ok((initial_fan_out_level, 0, false)),
+                        Err(err) => Err(LocalImmutableStoreError::internal_with_context(
+                            err,
+                            "Failed to read level marker for group",
+                        )),
+                    };
+                    (group_index, level)
+                });
+            }
+
+            while let Some(joined) = tasks.join_next().await {
+                let (group_index, level) = joined.map_err(|err| {
+                    LocalImmutableStoreError::internal_with_context(err, "level marker task")
+                })?;
+                levels[group_index] = level?;
+            }
+        }
+
         let mut bucket_counts: Vec<usize> = Vec::with_capacity(GROUP_COUNT);
         let mut committed_levels: Vec<usize> = Vec::with_capacity(GROUP_COUNT);
         let mut any_marker_seen = false;
-        for group_index in 0..GROUP_COUNT {
-            let (initial, committed) = if let Some(path) = immutable_path.as_deref() {
-                let mut group_path: PathBuf = path.as_path().to_path_buf();
-                group_path.push("index");
-                let group_hex = format!("{:02x}", group_index as u8);
-                group_path.push(&group_hex);
-
-                // Roll forward any pending fan-out commit before reading the marker. After this returns the marker reflects the post-recovery state.
-                if group_path.exists()
-                    && let Err(err) =
-                        crate::local::fan_out::recover_level_transition(&group_path, false)
-                {
-                    return Err(LocalImmutableStoreError::internal_with_context(
-                        err,
-                        "Failed to recover pending level transition for group",
-                    ));
-                }
-
-                match crate::local::fan_out::read_level_marker(&group_path) {
-                    Ok(Some(level)) => {
-                        any_marker_seen = true;
-                        (level, level)
-                    }
-                    Ok(None) => {
-                        if index_existed_on_disk {
-                            (BUCKET_COUNT, 0)
-                        } else {
-                            (store.settings.initial_fan_out_level, 0)
-                        }
-                    }
-                    Err(err) => {
-                        return Err(LocalImmutableStoreError::internal_with_context(
-                            err,
-                            "Failed to read level marker for group",
-                        ));
-                    }
-                }
-            } else {
-                (store.settings.initial_fan_out_level, 0)
-            };
+        for (initial, committed, marker_seen) in levels {
             bucket_counts.push(initial);
             committed_levels.push(committed);
+            any_marker_seen |= marker_seen;
         }
 
         // Determine serialize_version per Decision 8. Fresh stores, stores with markers, and
@@ -2302,9 +2351,15 @@ impl LocalImmutableStore {
         if let Some(path) = self.path.as_ref() {
             let path = path.join(DOT_COMPACT);
             if group_index < GROUP_COUNT {
-                let _ = std::fs::write(path, group_index.to_ne_bytes());
+                let _ = lore_io::IoDriver::global()
+                    .write_file_bytes(
+                        path,
+                        Bytes::copy_from_slice(&group_index.to_ne_bytes()),
+                        false,
+                    )
+                    .await;
             } else {
-                let _ = std::fs::remove_file(path);
+                let _ = lore_io::IoDriver::global().remove_file(path).await;
             }
         }
 
@@ -2814,12 +2869,16 @@ impl LocalImmutableStore {
 
                 if needs_two_phase_commit && first_err.is_none() {
                     // T10 two-phase commit. Every [0..active_buckets] bucket gets a .new file (skipping empties at index >= committed_level since no old file exists there to overwrite). After all .new files are durable, write level.pending as the commit point. Then rename .new -> final, write the level marker, delete level.pending. Recovery on the next store open rolls forward from any pending state.
-                    if let Err(e) = std::fs::create_dir_all(&group_path).map_err(|e| {
-                        LocalImmutableStoreError::internal_with_context(
-                            e,
-                            "Failed to create group directory for fan-out commit",
-                        )
-                    }) {
+                    if let Err(e) = lore_io::IoDriver::global()
+                        .create_dir_all(&group_path)
+                        .await
+                        .map_err(|e| {
+                            LocalImmutableStoreError::internal_with_context(
+                                e,
+                                "Failed to create group directory for fan-out commit",
+                            )
+                        })
+                    {
                         first_err = Some(e);
                     }
 
@@ -2865,6 +2924,7 @@ impl LocalImmutableStore {
                                 active_buckets,
                                 sync_data,
                             )
+                            .await
                             .map_err(|e| {
                                 LocalImmutableStoreError::internal_with_context(
                                     e,
@@ -2887,6 +2947,7 @@ impl LocalImmutableStore {
                                 active_buckets,
                                 sync_data,
                             )
+                            .await
                             .map_err(|e| {
                                 LocalImmutableStoreError::internal_with_context(
                                     e,
@@ -2905,7 +2966,9 @@ impl LocalImmutableStore {
                                 );
                                 let final_path =
                                     crate::local::fan_out::bucket_path(&group_path, bucket_index);
-                                if let Err(err) = std::fs::rename(&new_path, &final_path)
+                                if let Err(err) = lore_io::IoDriver::global()
+                                    .rename(&new_path, &final_path)
+                                    .await
                                     && first_err.is_none()
                                 {
                                     first_err = Some(
@@ -2924,6 +2987,7 @@ impl LocalImmutableStore {
                                 active_buckets,
                                 sync_data,
                             )
+                            .await
                             .map_err(|e| {
                                 LocalImmutableStoreError::internal_with_context(
                                     e,
@@ -2935,15 +2999,15 @@ impl LocalImmutableStore {
                         }
 
                         if first_err.is_none()
-                            && let Err(err) = crate::local::fan_out::delete_level_pending(
-                                &group_path,
-                            )
-                            .map_err(|e| {
-                                LocalImmutableStoreError::internal_with_context(
-                                    e,
-                                    "Failed to delete level.pending",
-                                )
-                            })
+                            && let Err(err) =
+                                crate::local::fan_out::delete_level_pending(&group_path)
+                                    .await
+                                    .map_err(|e| {
+                                        LocalImmutableStoreError::internal_with_context(
+                                            e,
+                                            "Failed to delete level.pending",
+                                        )
+                                    })
                         {
                             first_err = Some(err);
                         }
@@ -3169,6 +3233,16 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             },
             match_made: find.matching,
         })
+    }
+
+    /// This store's `query` reads the fragment it stored, so it already reports the representation
+    /// and there is nothing further to fetch.
+    async fn get_metadata(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+    ) -> Result<StoreQueryResult, StoreError> {
+        self.query(partition, address, StoreMatch::MatchFull).await
     }
 
     async fn get(
@@ -3536,12 +3610,13 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
 
     async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
         if let Some(path) = self.path.as_deref() {
-            tokio::fs::read(path.join(DOT_COMPACT))
+            lore_io::IoDriver::global()
+                .read_file_bytes(path.join(DOT_COMPACT))
                 .await
                 .ok()
                 .and_then(|bytes| {
                     lore_base::lore_debug!("Reading compactor resume point");
-                    bytes.try_into().ok().map(usize::from_ne_bytes)
+                    bytes.as_ref().try_into().ok().map(usize::from_ne_bytes)
                 })
         } else {
             None
@@ -4416,38 +4491,90 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    /// A bucket larger than [`BUCKET_HEAD_READ`] does not fit the head the composite open
+    /// returns, so it is loaded by scattering one vectored read straight into the chunk
+    /// allocations of both `GrowVec`s. Entry contents are distinct per index, so a scatter that
+    /// landed a chunk at the wrong offset would show up as swapped entries rather than as a
+    /// length mismatch.
+    #[tokio::test]
+    async fn deserialize_scatters_a_bucket_larger_than_the_head_read() {
+        let dir = crate::test_util::TempDir::new("is_scatter_");
+        let path = dir.path().join("bucket");
+
+        let per_entry = size_of::<u32>() + size_of::<ImmutableStoreEntry>();
+        let count = (BUCKET_HEAD_READ / per_entry) + 64;
+        assert!(
+            size_of::<ImmutableStoreHeader>() + count * per_entry > BUCKET_HEAD_READ,
+            "the bucket has to exceed the head read for this to test anything"
+        );
+
+        let mut header = ImmutableStoreHeader::new_zeroed();
+        header.version = ImmutableStoreVersion::LazyFanOut as u32;
+        header.count = count as u32;
+
+        let mut bytes = Vec::with_capacity(size_of::<ImmutableStoreHeader>() + count * per_entry);
+        bytes.extend_from_slice(header.as_bytes());
+        for index in 0..count {
+            bytes.extend_from_slice(&(index as u32).to_le_bytes());
+        }
+        for index in 0..count {
+            let mut entry = ImmutableStoreEntry::default();
+            entry.address.hash = Hash::from([index as u8; 32]);
+            entry.data.size_content = index as u64;
+            entry.data.pack_offset = index as u32;
+            bytes.extend_from_slice(entry.as_bytes());
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (sorted_index, entry, _upgrade, _dirty) =
+            ImmutableStoreBucket::deserialize_files(path).await.unwrap();
+
+        assert_eq!(sorted_index.len(), count);
+        assert_eq!(entry.len(), count);
+        for index in 0..count {
+            assert_eq!(sorted_index[index], index as u32, "sorted index at {index}");
+            assert_eq!(
+                entry[index].address.hash,
+                Hash::from([index as u8; 32]),
+                "entry hash at {index}"
+            );
+            assert_eq!(entry[index].data.size_content, index as u64);
+            assert_eq!(entry[index].data.pack_offset, index as u32);
+        }
+    }
+
     #[test]
     fn lazy_fan_out_version_is_five() {
         assert_eq!(ImmutableStoreVersion::LazyFanOut as u32, 5);
     }
 
-    #[test]
-    fn deserialize_accepts_last_access_in_entry_v4() {
+    #[tokio::test]
+    async fn deserialize_accepts_last_access_in_entry_v4() {
         let dir = crate::test_util::TempDir::new("is_v4_");
         let path = dir.path().join("bucket");
         write_bucket_file(&path, ImmutableStoreVersion::LastAccessInEntry as u32);
-        let result = ImmutableStoreBucket::deserialize_files(path);
+        let result = ImmutableStoreBucket::deserialize_files(path).await;
         assert!(
             result.is_ok(),
             "v4 (LastAccessInEntry) bucket should deserialize"
         );
     }
 
-    #[test]
-    fn deserialize_accepts_lazy_fan_out_v5() {
+    #[tokio::test]
+    async fn deserialize_accepts_lazy_fan_out_v5() {
         let dir = crate::test_util::TempDir::new("is_v5_");
         let path = dir.path().join("bucket");
         write_bucket_file(&path, ImmutableStoreVersion::LazyFanOut as u32);
-        let result = ImmutableStoreBucket::deserialize_files(path);
+        let result = ImmutableStoreBucket::deserialize_files(path).await;
         assert!(result.is_ok(), "v5 (LazyFanOut) bucket should deserialize");
     }
 
-    #[test]
-    fn deserialize_rejects_unknown_future_version() {
+    #[tokio::test]
+    async fn deserialize_rejects_unknown_future_version() {
         let dir = crate::test_util::TempDir::new("is_v100_");
         let path = dir.path().join("bucket");
         write_bucket_file(&path, 100);
-        let result = ImmutableStoreBucket::deserialize_files(path.clone());
+        let result = ImmutableStoreBucket::deserialize_files(path.clone()).await;
         assert!(result.is_err(), "v100 bucket should be rejected as too new");
         // Future-version files MUST be preserved on disk — recovery would clobber data
         // written by a newer binary.
@@ -4479,13 +4606,13 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    #[test]
-    fn deserialize_recovers_from_bad_count_header() {
+    #[tokio::test]
+    async fn deserialize_recovers_from_bad_count_header() {
         // Mirrors the production server log shape (header.count > what file fits).
         let dir = crate::test_util::TempDir::new("is_badcount_");
         let path = dir.path().join("bucket");
         write_bucket_file_with_count_mismatch(&path, 670, 518);
-        let result = ImmutableStoreBucket::deserialize_files(path.clone());
+        let result = ImmutableStoreBucket::deserialize_files(path.clone()).await;
         let (sorted_index, entry, _, mark_dirty) =
             result.expect("count-mismatch corruption must recover");
         assert!(sorted_index.is_empty());
@@ -4494,21 +4621,21 @@ mod tests {
         assert!(!path.exists(), "corrupt bucket file must be removed");
     }
 
-    #[test]
-    fn deserialize_recovers_from_invalid_version() {
+    #[tokio::test]
+    async fn deserialize_recovers_from_invalid_version() {
         // 0xFFFF is above the future-version sentinel range, so it's corruption.
         let dir = crate::test_util::TempDir::new("is_badver_");
         let path = dir.path().join("bucket");
         write_bucket_file(&path, 0xFFFF);
-        let result = ImmutableStoreBucket::deserialize_files(path.clone());
+        let result = ImmutableStoreBucket::deserialize_files(path.clone()).await;
         let (sorted_index, entry, _, _) = result.expect("invalid-version corruption must recover");
         assert!(sorted_index.is_empty());
         assert!(entry.is_empty());
         assert!(!path.exists(), "corrupt bucket file must be removed");
     }
 
-    #[test]
-    fn deserialize_recovers_from_truncated_entries() {
+    #[tokio::test]
+    async fn deserialize_recovers_from_truncated_entries() {
         let dir = crate::test_util::TempDir::new("is_trunc_");
         let path = dir.path().join("bucket");
         let mut header = ImmutableStoreHeader::new_zeroed();
@@ -4524,7 +4651,7 @@ mod tests {
         bytes.extend_from_slice(&entry.as_bytes()[..size_of::<ImmutableStoreEntry>() / 2]);
         std::fs::write(&path, bytes).unwrap();
 
-        let result = ImmutableStoreBucket::deserialize_files(path.clone());
+        let result = ImmutableStoreBucket::deserialize_files(path.clone()).await;
         let (sorted_index, entry, _, _) =
             result.expect("truncated-entries corruption must recover");
         assert!(sorted_index.is_empty());
@@ -4532,13 +4659,13 @@ mod tests {
         assert!(!path.exists(), "corrupt bucket file must be removed");
     }
 
-    #[test]
-    fn deserialize_recovers_from_short_header() {
+    #[tokio::test]
+    async fn deserialize_recovers_from_short_header() {
         // File too small to even hold the header.
         let dir = crate::test_util::TempDir::new("is_shorthdr_");
         let path = dir.path().join("bucket");
         std::fs::write(&path, [0u8; 4]).unwrap();
-        let result = ImmutableStoreBucket::deserialize_files(path.clone());
+        let result = ImmutableStoreBucket::deserialize_files(path.clone()).await;
         let (sorted_index, entry, _, _) = result.expect("short-header corruption must recover");
         assert!(sorted_index.is_empty());
         assert!(entry.is_empty());
@@ -4573,12 +4700,13 @@ mod tests {
             .await
             .unwrap();
 
-            let (address, _) = write_content(
+            let address = write_content(
                 store.clone(),
                 partition,
                 context,
                 payload.clone(),
                 WriteOptions::default(),
+                None,
                 None,
                 None,
             )
@@ -4637,12 +4765,13 @@ mod tests {
             "originally stored content must be reported missing after recovery"
         );
 
-        let (new_address, _) = write_content(
+        let new_address = write_content(
             store.clone(),
             partition,
             context,
             payload.clone(),
             WriteOptions::default(),
+            None,
             None,
             None,
         )
@@ -4819,12 +4948,13 @@ mod tests {
         // Prime target (uncompressed).
         let prev_mode =
             COMPRESSION_MODE.swap(CompressionMode::NoCompression as u32, Ordering::AcqRel);
-        let (target_address, _target_fragment) = write_content(
+        let target_address = write_content(
             store.clone(),
             target_partition,
             context,
             Bytes::from(payload.clone()),
             WriteOptions::default(),
+            None,
             None,
             None,
         )
@@ -4833,12 +4963,13 @@ mod tests {
 
         // Prime source (compressed).
         COMPRESSION_MODE.store(CompressionMode::Zstd as u32, Ordering::Release);
-        let (source_address, _source_fragment) = write_content(
+        let source_address = write_content(
             store.clone(),
             source_partition,
             context,
             Bytes::from(payload.clone()),
             WriteOptions::default(),
+            None,
             None,
             None,
         )
@@ -4907,12 +5038,13 @@ mod tests {
         let payload: Vec<u8> = b"in-partition new-context dedup payload".to_vec();
 
         // Seed the source tuple `(partition, hash, source_context)`.
-        let (source_address, _) = write_content(
+        let source_address = write_content(
             store.clone(),
             partition,
             source_context,
             Bytes::from(payload.clone()),
             WriteOptions::default(),
+            None,
             None,
             None,
         )

@@ -16,6 +16,7 @@ use aws_sdk_dynamodb::operation::put_item::PutItemError;
 use aws_sdk_dynamodb::operation::put_item::PutItemOutput;
 use aws_sdk_dynamodb::operation::query::QueryError;
 use aws_sdk_dynamodb::operation::query::QueryOutput;
+use aws_sdk_dynamodb::operation::scan::ScanError;
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsError;
 use aws_sdk_dynamodb::operation::transact_write_items::TransactWriteItemsOutput;
 use aws_sdk_dynamodb::types::AttributeValue;
@@ -110,6 +111,31 @@ pub struct ConditionParts {
     pub condition_expression: String,
     pub expression_names: HashMap<String, String>,
     pub expression_values: HashMap<String, AttributeValue>,
+}
+
+#[derive(Default)]
+pub struct ScanConfig {
+    segment: Option<i32>,
+    total_segments: Option<i32>,
+    limit: Option<i32>,
+}
+
+impl ScanConfig {
+    /// Create a segmented scan config for parallel scanning.
+    pub fn segment(segment: i32, total_segments: i32) -> Self {
+        Self {
+            segment: Some(segment),
+            total_segments: Some(total_segments),
+            limit: None,
+        }
+    }
+}
+
+/// One page of a table scan: the items in the page paired with the `last_evaluated_key` to resume
+/// from, or `None` once the end of the table has been reached.
+pub struct ScanPage {
+    pub items: Vec<HashMap<String, AttributeValue>>,
+    pub last_evaluated_key: Option<HashMap<String, AttributeValue>>,
 }
 
 /// Encapsulate the components of a `DynamoDB` conditional put. See the `DynamoDB` docs for details.
@@ -732,6 +758,51 @@ impl DynamoDbImpl {
         }
     }
 
+    /// Scan a single page of a table. Returns the items in the page along with the
+    /// `last_evaluated_key`, if any, that should be passed back in as
+    /// `exclusive_start_key` to fetch the next page. A `None` (or empty) returned key
+    /// signals that the scan has reached the end of the table.
+    #[tracing::instrument(name = "DynamoDbImpl::scan_page", skip_all)]
+    pub async fn scan_page(
+        &self,
+        table_name: &Arc<str>,
+        exclusive_start_key: Option<HashMap<String, AttributeValue>>,
+        config: &ScanConfig,
+    ) -> Result<ScanPage, AwsError<SdkError<ScanError>>> {
+        let base_labels = {
+            let mut labels = self
+                .instruments
+                .get_labels_for_operation_context("scan_page");
+            labels.push(KeyValue::new(METRICS_TABLE_NAME_KEY, table_name.clone()));
+            labels
+        };
+
+        let output = self
+            .client
+            .scan()
+            .table_name(&**table_name)
+            .set_limit(config.limit)
+            .set_segment(config.segment)
+            .set_total_segments(config.total_segments)
+            .set_exclusive_start_key(exclusive_start_key)
+            .send()
+            .observe(
+                self.instruments.operation_latency_histogram.clone(),
+                base_labels,
+                observe_aws_operation_callback(self.slow_operation_duration),
+            )
+            .await
+            .output
+            .map_err(AwsError::AwsSdkError)?;
+
+        let items = output.items.unwrap_or_default();
+        let last_evaluated_key = output.last_evaluated_key.filter(|key| !key.is_empty());
+        Ok(ScanPage {
+            items,
+            last_evaluated_key,
+        })
+    }
+
     pub fn sdk_client(&self) -> &aws_sdk_dynamodb::Client {
         &self.client
     }
@@ -816,6 +887,14 @@ mock! {
         ) -> Result<QueryOutputAccumulation, AwsError<SdkError<QueryError>>>
         where
             T: DynamoDbQuery + 'static;
+
+        #[tracing::instrument(name = "DynamoDbImpl::scan_page", skip_all)]
+        pub async fn scan_page(
+            &self,
+            table_name: &Arc<str>,
+            exclusive_start_key: Option<HashMap<String, AttributeValue>>,
+            config: &ScanConfig,
+        ) -> Result<ScanPage, AwsError<SdkError<ScanError>>>;
 
         pub fn sdk_client(&self) -> &aws_sdk_dynamodb::Client;
     }

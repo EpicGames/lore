@@ -2,6 +2,15 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
+use lore_base::error::Disconnected;
+use lore_base::error::Maintenance;
+use lore_base::error::NoRemote;
+use lore_base::error::NotAuthenticated;
+use lore_base::error::NotAuthorized;
+use lore_base::error::NotFound;
+use lore_base::error::NotSupported;
+use lore_base::error::Oversized;
+use lore_base::error::SlowDown;
 use lore_base::error::TokenNotFound;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_credential::UserInfo;
@@ -32,6 +41,17 @@ use crate::interface::LoreString;
 #[error_set]
 pub enum AuthStoreError {
     TokenNotFound,
+    // The remaining variants mirror `ProtocolError` so a connect failure can be
+    // forwarded whole, preserving its kind instead of collapsing to `Internal`.
+    Disconnected,
+    SlowDown,
+    NotAuthorized,
+    NotAuthenticated,
+    Maintenance,
+    NotFound,
+    NoRemote,
+    NotSupported,
+    Oversized,
 }
 
 impl EventError for AuthStoreError {
@@ -592,22 +612,27 @@ async fn resolve_auth_endpoint(
         return Ok(auth_endpoint.to_string());
     }
 
-    // Try to get the auth URL from the repository's remote environment
-    if let Some(remote_url) = read_repository_config(repository_path)
-        && let Ok(connection) = lore_revision::protocol::connect(
+    // Forward the connect error instead of discarding it, so the real failure
+    // reaches the caller rather than collapsing into the generic error below.
+    if let Some(remote_url) = read_repository_config(repository_path) {
+        let connection = lore_revision::protocol::connect(
             &remote_url,
             "",
             lore_revision::lore::RepositoryId::default(),
         )
         .await
-    {
+        .forward::<AuthStoreError>("resolving auth endpoint from remote")?;
+
         let auth_url = connection.auth_url().to_string();
         if !auth_url.is_empty() {
             return Ok(auth_url);
         }
     }
 
-    Err(AuthStoreError::internal("No auth endpoint available"))
+    Err(NotSupported {
+        operation: "authentication requires a configured auth endpoint".to_string(),
+    }
+    .into())
 }
 
 async fn local_user_info_impl(
@@ -677,4 +702,38 @@ async fn local_user_info_impl(
             execution_context().dispatcher.complete_result(result).await
         })
         .await
+}
+
+#[cfg(test)]
+mod resolve_auth_endpoint_tests {
+    use lore_base::error::NotSupported;
+    use lore_error_set::FfiError;
+
+    use super::resolve_auth_endpoint;
+
+    // An explicit endpoint is returned verbatim without touching the
+    // repository config or the network.
+    #[tokio::test]
+    async fn returns_explicit_endpoint_verbatim() {
+        let endpoint = resolve_auth_endpoint("ucs-auth://auth.example.com", "/does/not/exist")
+            .await
+            .expect("an explicit endpoint should resolve");
+        assert_eq!(endpoint, "ucs-auth://auth.example.com");
+    }
+
+    // With no explicit endpoint and no resolvable repository remote, the
+    // operation is `NotSupported` (code 18) — there is no URL to key a token
+    // lookup on — rather than an opaque internal error.
+    #[tokio::test]
+    async fn missing_endpoint_is_not_supported() {
+        let err = resolve_auth_endpoint("", "/does/not/exist")
+            .await
+            .expect_err("a missing endpoint must be an error");
+
+        let not_supported_code = NotSupported {
+            operation: String::new(),
+        }
+        .ffi_code();
+        assert_eq!(err.ffi_code(), not_supported_code);
+    }
 }

@@ -3,10 +3,9 @@
 use crate::event;
 use crate::event::LoreMetadataEventData;
 use crate::metadata::Metadata;
-use crate::metadata::MetadataError;
 use crate::metadata::MetadataType;
 
-pub(crate) fn send(metadata: &Metadata) -> Result<(), MetadataError> {
+pub(crate) fn send(metadata: &Metadata) {
     let mut entries = vec![];
 
     metadata.walk(
@@ -17,16 +16,14 @@ pub(crate) fn send(metadata: &Metadata) -> Result<(), MetadataError> {
                 entries.push(entry);
             }
         },
-    )?;
+    );
 
     for entry in entries {
         event::LoreEvent::Metadata(entry).send();
     }
-
-    Ok(())
 }
 
-pub(crate) fn send_keyed(metadata: &Metadata, key: &str) -> Result<(), MetadataError> {
+pub(crate) fn send_keyed(metadata: &Metadata, key: &str) {
     let mut entries = vec![];
 
     // TODO: Need to be able to get an item from Metadata and also know its type!
@@ -39,11 +36,9 @@ pub(crate) fn send_keyed(metadata: &Metadata, key: &str) -> Result<(), MetadataE
                 entries.push(entry);
             }
         },
-    )?;
+    );
 
     for entry in entries {
         event::LoreEvent::Metadata(entry).send();
     }
-
-    Ok(())
 }

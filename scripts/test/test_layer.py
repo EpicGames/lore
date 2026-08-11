@@ -4,6 +4,7 @@ import logging
 import os
 import pytest
 import re
+import tomllib
 from lore import Lore
 from lore_parsers import (
     parse_branch_info,
@@ -1363,4 +1364,86 @@ def test_layer_remove_two_layers_non_overlapping(new_lore_repo):
     # The sec layer is untouched
     assert os.path.isfile(
         os.path.join(repo.path, "sec", "second", "second_repo.txt")
+    )
+
+
+ZERO_HASH = "0" * 64
+
+
+def _layer_config_staged(repo: Lore, target_path: str) -> str:
+    """Return the `staged` pin of the layer at `target_path` from `layer.toml`.
+
+    `lore layer list` only reports the `current` pin. Returns "" when the
+    config has no entry for `target_path`.
+    """
+    for dot_dir in (".lore", ".urc"):
+        config_path = os.path.join(repo.path, dot_dir, "layer.toml")
+        if not os.path.isfile(config_path):
+            continue
+        with open(config_path, "rb") as config_file:
+            config = tomllib.load(config_file)
+        for layer in config.get("layers", []):
+            if layer.get("target_path") == target_path:
+                return layer.get("staged", "")
+        return ""
+    raise AssertionError(f"No layer config found under {repo.path}")
+
+
+@pytest.mark.smoke
+def test_layer_stage_scan_unchanged_layer(new_lore_repo):
+    """`stage . --scan` must not stage a layer whose files are all unchanged.
+
+    A bogus staged pin on the layer makes `commit` abort with `NothingStaged`
+    after the parent has committed, and the leftover pin then makes
+    `branch switch` refuse and skip syncing the layer to the target branch.
+    """
+    repo, _ = _setup_repo_with_layer(new_lore_repo)
+    layer_file = os.path.join("lay", "layer_file.txt")
+
+    # `branch create` switches to the new branch, so go back to main to commit
+    # the layer change on a revision `feature` does not have.
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    with repo.open_file(layer_file, mode="wb") as out:
+        out.write(b"layer content v2")
+    repo.stage(".", scan=True)
+    repo.commit("linked_tag")
+    repo.push()
+
+    repo.branch_switch("feature")
+    with repo.open_file(layer_file, mode="rb") as out:
+        assert out.read() == b"layer content v1", (
+            "Expected the layer to roll back to L1 on the feature branch"
+        )
+
+    # Change only a parent file, nothing inside the layer mount.
+    with repo.open_file("main_file.txt", mode="wb") as out:
+        out.write(b"main content v2")
+
+    repo.stage(".", scan=True)
+
+    status_entries = parse_status_json(repo.status(json=True))
+    paths = sorted(entry.get("path") for entry in status_entries)
+    assert paths == ["main_file.txt"], (
+        f"Expected only ['main_file.txt'] staged, got {paths}: {status_entries}"
+    )
+
+    assert _layer_config_staged(repo, "lay") in ("", ZERO_HASH), (
+        "`stage --scan` wrote a staged pin for a layer with no modified files"
+    )
+
+    repo.commit("Test commit 2")
+
+    assert _layer_config_staged(repo, "lay") in ("", ZERO_HASH), (
+        "Layer staged pin left non-zero in layer.toml after commit"
+    )
+
+    repo.branch_switch("main")
+
+    with repo.open_file(layer_file, mode="rb") as out:
+        content = out.read()
+    assert content == b"layer content v2", (
+        f"Expected the layer to be restored to L2 on main, got: {content}"
     )

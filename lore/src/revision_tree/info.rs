@@ -89,15 +89,14 @@ async fn info_impl(
     callback: LoreEventCallback,
 ) -> i32 {
     let handle = args.handle;
-    let miss_id = args.id;
     revision_tree_call(
         globals,
         callback,
         handle,
         args,
         info,
-        move || {
-            emit_info_error(miss_id, LoreErrorCode::InvalidArguments);
+        |args: &LoreRevisionTreeInfoArgs| {
+            emit_info_error(args.id, LoreErrorCode::InvalidArguments);
         },
         async move |internal, args: LoreRevisionTreeInfoArgs| {
             let id = args.id;
@@ -126,7 +125,7 @@ async fn info_impl(
                 .map(LoreString::from)
                 .unwrap_or_default();
             let mut metadata_key_count = 0u32;
-            let _ = metadata.walk(|_, _, _| metadata_key_count += 1);
+            metadata.walk(|_, _, _| metadata_key_count += 1);
 
             LoreEvent::RevisionTreeInfo(LoreRevisionTreeInfoEventData {
                 id,

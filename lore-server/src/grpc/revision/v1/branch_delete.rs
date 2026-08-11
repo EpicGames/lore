@@ -622,6 +622,14 @@ mod test {
             {
                 unreachable!("branch_get should not be called in branch_delete tests")
             }
+
+            async fn branch_list(
+                &mut self,
+                _request: Request<lore_proto::lore::revision::v1::BranchListRequest>,
+            ) -> ForwardedRequestResult<crate::grpc::revision::v1::branch_list::BranchListStream>
+            {
+                unreachable!("branch_list should not be called in branch_delete tests")
+            }
         }
 
         struct StubForwardedRequests {
@@ -664,6 +672,15 @@ mod test {
                 Box::new(SingleShotClient {
                     response: Arc::clone(&self.response),
                 })
+            }
+
+            fn forwarded_repository_service(
+                &self,
+            ) -> Box<dyn crate::grpc::forwarded_requests::repository_service::ForwardedRepositoryServiceClient>
+{
+                unreachable!(
+                    "forwarded_repository_service should not be called in branch_create tests"
+                )
             }
         }
 

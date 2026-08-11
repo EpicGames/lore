@@ -4,8 +4,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
 
+use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
-use lore_base::runtime::runtime;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Fragment;
@@ -90,7 +90,7 @@ impl ReplicationService for LoreReplicationService {
             Arc::new(self.latency_histogram_ms(METRICS_STREAMING_MESSAGE_HANDLER_LATENCY));
 
         // Spawn task to read from client
-        runtime().spawn(
+        lore_spawn!(
             LORE_CONTEXT.scope(
                 execution,
                 async move {
@@ -115,7 +115,7 @@ impl ReplicationService for LoreReplicationService {
                                 break;
                             }
                         };
-                        runtime().spawn(LORE_CONTEXT.scope(execution_context(), async move {
+                        lore_spawn!(LORE_CONTEXT.scope(execution_context(), async move {
                             let metric_context = create_operation_context_attribute("put");
 
                             // This is building up a tuple of (repository id, address, fragment, payload)

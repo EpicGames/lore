@@ -123,39 +123,41 @@ async fn do_seed_local_store(
 
     let per_task_count = fragment_count / task_count;
 
-    // We split the process up into two phases, first we generate the desired number of payloads
-    // into a channel, then separately we listen for messages on the channel and write to the store.
-    // This allows us to do two things: first, we minimize contention on blocking threads, second we
-    // can subsequently limit the number of tasks in flight at once to tune disk utilization when
-    // writing to the store. All things considered, given we're likely writing to fast NVME drives
-    // anyway, this is all probably overkill, and maybe saves us a few seconds for a non-critical
-    // section of code.
+    // Generation runs on dedicated threads rather than the runtime's pools: filling a buffer with
+    // random bytes has nothing to await, and a capacity tool wants the whole machine rather than a
+    // share of the process thread budget. Writes run on the runtime, bounded separately below, and
+    // the channel between the two is what tunes disk utilization.
 
     lore_info!("Spawning {task_count} threads to generate payloads");
-    for _ in 0..task_count {
+    for index in 0..task_count {
         let tx = tx.clone();
         let in_flight = in_flight.clone();
 
-        tokio::task::spawn_blocking(move || {
-            let mut rng = rand::rng();
-            let mut buffer = BytesMut::with_capacity(FRAGMENT_SIZE_THRESHOLD);
+        std::thread::Builder::new()
+            .name(format!("lore-seed-{index}"))
+            .spawn(move || {
+                let mut rng = rand::rng();
+                let mut buffer = BytesMut::with_capacity(FRAGMENT_SIZE_THRESHOLD);
 
-            for _ in 0..per_task_count {
-                buffer.resize(FRAGMENT_SIZE_THRESHOLD, 0);
-                rng.fill_bytes(&mut buffer);
+                for _ in 0..per_task_count {
+                    buffer.resize(FRAGMENT_SIZE_THRESHOLD, 0);
+                    rng.fill_bytes(&mut buffer);
 
-                if let Err(e) = tx.blocking_send(buffer.split().freeze()) {
-                    // The receiver must've gone away (this shouldn't happen in a real world
-                    // scenario).
-                    lore_warn!("Failed to send fragment data: {e:?}");
-                    return;
+                    if let Err(e) = tx.blocking_send(buffer.split().freeze()) {
+                        // The receiver must've gone away (this shouldn't happen in a real world
+                        // scenario).
+                        lore_warn!("Failed to send fragment data: {e:?}");
+                        return;
+                    }
+
+                    in_flight.fetch_add(1, Ordering::Relaxed);
                 }
-
-                in_flight.fetch_add(1, Ordering::Relaxed);
-            }
-        });
+            })
+            .expect("could not spawn payload generator thread");
     }
 
+    // The generators hold the only remaining senders, so the receive loop below ends when the last
+    // of them finishes.
     drop(tx);
 
     lore_info!("Listening for payloads");

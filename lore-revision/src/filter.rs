@@ -279,6 +279,37 @@ impl FilterInstance {
         }
         excluded
     }
+
+    /// Returns whether every path below `path` is excluded, at any depth.
+    ///
+    /// Excluding a directory node says nothing about the files under it, so two
+    /// conditions must hold:
+    ///
+    /// - No inclusion line exists. Only an inclusion can clear `excluded`, so
+    ///   any of them could re-include part of the subtree.
+    /// - Some exclusion line is `<prefix>/**` where `path` is `<prefix>` or
+    ///   sits below it. Such a rule matches every descendant at every depth.
+    ///
+    /// Returns `false` when either condition fails. `false` is always safe.
+    pub fn excludes_subtree(&self, path: &RelativePath) -> bool {
+        if path.is_empty() || path.as_str() == "." {
+            return false;
+        }
+        if self.lines.iter().any(|line| line.negated) {
+            return false;
+        }
+        let path = path.as_lowercase_str();
+        self.lines.iter().any(|line| {
+            if line.filename || line.directory {
+                return false;
+            }
+            let Some(prefix) = line.glob.strip_suffix("/**") else {
+                return false;
+            };
+            path == prefix
+                || (path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/'))
+        })
+    }
 }
 
 /// Data for the event emitted when a path is excluded by a filter.
@@ -322,6 +353,15 @@ impl Filter {
         false
     }
 
+    /// Whether every path below `path` is excluded, for the slots in `mode`.
+    ///
+    /// See [`FilterInstance::excludes_subtree`]. `excludes` answers only for
+    /// the single path it is given.
+    pub fn excludes_subtree(&self, path: &RelativePath, mode: FilterMode) -> bool {
+        (mode.contains(FilterMode::Ignore) && self.ignore.excludes_subtree(path))
+            || (mode.contains(FilterMode::View) && self.view.excludes_subtree(path))
+    }
+
     pub fn emit_excludes(&self, path: &RelativePath, is_directory: bool, mode: FilterMode) -> bool {
         if path.is_empty() {
             return false;
@@ -343,5 +383,130 @@ impl Filter {
             return true;
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use super::*;
+
+    fn path(value: &str) -> RelativePath {
+        RelativePath::from_str(value).expect("valid relative path")
+    }
+
+    fn view(build: impl FnOnce(&mut FilterInstance)) -> FilterInstance {
+        let mut instance = FilterInstance::default();
+        build(&mut instance);
+        instance
+    }
+
+    #[test]
+    fn excludes_subtree_accepts_a_directory_excluded_at_every_depth() {
+        let view = view(|v| v.add_exclusion("engine/**").expect("exclude"));
+        assert!(view.excludes_subtree(&path("engine")));
+    }
+
+    #[test]
+    fn excludes_subtree_accepts_a_directory_below_an_excluded_root() {
+        let view = view(|v| v.add_exclusion("engine/**").expect("exclude"));
+        assert!(view.excludes_subtree(&path("engine/deep")));
+        assert!(view.excludes_subtree(&path("engine/deep/nested")));
+    }
+
+    #[test]
+    fn excludes_subtree_accepts_a_rooted_exclusion_that_generates_the_subtree_rule() {
+        // A rooted path exclusion generates the matching `engine/**` line.
+        let view = view(|v| v.add_exclusion("/engine").expect("exclude"));
+        assert!(view.excludes_subtree(&path("engine")));
+    }
+
+    #[test]
+    fn excludes_subtree_rejects_a_bare_name_exclusion() {
+        // `engine` with no separator is a filename rule. It excludes the
+        // directory node but leaves every file under it in view.
+        let view = view(|v| v.add_exclusion("engine").expect("exclude"));
+        assert!(view.excludes(&path("engine"), true));
+        assert!(!view.excludes(&path("engine/file.txt"), false));
+        assert!(!view.excludes_subtree(&path("engine")));
+    }
+
+    #[test]
+    fn excludes_subtree_rejects_a_rule_that_stops_at_one_level() {
+        // `engine/*` excludes `engine/file.txt` but leaves
+        // `engine/deep/file.txt` in view.
+        let view = view(|v| v.add_exclusion("engine/*").expect("exclude"));
+        assert!(view.excludes(&path("engine/file.txt"), false));
+        assert!(!view.excludes_subtree(&path("engine")));
+    }
+
+    #[test]
+    fn excludes_subtree_rejects_any_view_holding_a_re_inclusion() {
+        // A re-inclusion puts part of the subtree back in view.
+        let view = view(|v| {
+            v.add_exclusion("engine/**").expect("exclude");
+            v.add_inclusion("engine/keep").expect("re-include");
+        });
+        assert!(!view.excludes_subtree(&path("engine")));
+        assert!(!view.excludes_subtree(&path("engine/other")));
+    }
+
+    #[test]
+    fn excludes_subtree_rejects_an_unrelated_or_partially_matching_path() {
+        let view = view(|v| v.add_exclusion("engine/**").expect("exclude"));
+        assert!(!view.excludes_subtree(&path("game")));
+        // A sibling sharing the excluded prefix as a string is not below it.
+        assert!(!view.excludes_subtree(&path("engineering")));
+    }
+
+    #[test]
+    fn excludes_subtree_ignores_glob_case() {
+        // `add_exclusion` lowercases the glob and `excludes_subtree` lowercases
+        // the path, so the two meet regardless of how either was written.
+        let view = view(|v| v.add_exclusion("Engine/**").expect("exclude"));
+        assert!(view.excludes_subtree(&path("engine")));
+        assert!(view.excludes_subtree(&path("Engine")));
+    }
+
+    #[test]
+    fn excludes_subtree_accepts_a_trailing_separator_exclusion() {
+        // A trailing separator marks the entry as a directory, which also
+        // generates the `engine/**` line that covers the contents.
+        let view = view(|v| v.add_exclusion("engine/").expect("exclude"));
+        assert!(view.excludes_subtree(&path("engine")));
+    }
+
+    #[test]
+    fn excludes_subtree_rejects_a_bare_double_star() {
+        // `**` excludes every path, but it names no prefix, so there is nothing
+        // to compare a subtree against. Refusing costs only the optimization.
+        let view = view(|v| v.add_exclusion("**").expect("exclude"));
+        assert!(view.excludes(&path("engine/file.txt"), false));
+        assert!(!view.excludes_subtree(&path("engine")));
+    }
+
+    #[test]
+    fn excludes_subtree_rejects_a_wildcard_in_the_prefix() {
+        // The prefix is compared as text, so a wildcard in it never matches a
+        // real path. `engine*/**` does exclude the subtree, but proving that
+        // would mean evaluating the glob, so it is refused instead.
+        let view = view(|v| v.add_exclusion("engine*/**").expect("exclude"));
+        assert!(view.excludes(&path("engine1/file.txt"), false));
+        assert!(!view.excludes_subtree(&path("engine1")));
+    }
+
+    #[test]
+    fn excludes_subtree_rejects_a_directory_only_subtree_rule() {
+        // A directory-only line is skipped for files, so it cannot prove the
+        // files below the subtree are excluded.
+        let view = view(|v| v.add_exclusion("engine/**/").expect("exclude"));
+        assert!(!view.excludes_subtree(&path("engine")));
+    }
+
+    #[test]
+    fn excludes_subtree_rejects_the_empty_path() {
+        let view = view(|v| v.add_exclusion("engine/**").expect("exclude"));
+        assert!(!view.excludes_subtree(&RelativePath::new()));
     }
 }

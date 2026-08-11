@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -221,13 +222,15 @@ async fn prepare_repository_call(
     mut globals: LoreGlobalArgs,
     callback: LoreEventCallback,
 ) -> Result<(PathBuf, Arc<ExecutionContext>), i32> {
-    let repository_path =
-        if let Ok(path) = util::path::make_absolute(globals.repository_path.as_str()) {
-            globals.repository_path = path.display().to_string().into();
-            path
-        } else {
-            PathBuf::from(globals.repository_path.as_str())
-        };
+    let repository_path = if let Ok(path) = util::path::make_absolute_from(
+        globals.repository_path.as_str(),
+        globals.working_directory().map(Path::new),
+    ) {
+        globals.repository_path = path.display().to_string().into();
+        path
+    } else {
+        PathBuf::from(globals.repository_path.as_str())
+    };
 
     let execution = setup_execution(globals, callback);
 

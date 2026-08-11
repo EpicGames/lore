@@ -904,7 +904,7 @@ pub async fn store_latest_history(
         previous: old_history_latest,
     };
 
-    let (address, _) = entry
+    let address = entry
         .write_to_immutable(
             repository.clone(),
             Context::default(),
@@ -1048,10 +1048,13 @@ async fn resolve_remote(
     branch: &str,
 ) -> Result<BranchStatus, BranchError> {
     let branch_input = branch;
-    let remote = repository.remote().await.map_err(|_err| {
-        BranchError::from(BranchNotFound {
-            branch: branch_input.to_string(),
-        })
+    let remote = repository.remote().await.map_err(|err| {
+        BranchError::BranchNotFound(
+            BranchNotFound {
+                branch: branch_input.to_string(),
+            }
+            .chain_err_from(err, "remote unavailable for branch lookup"),
+        )
     })?;
     let service = remote
         .revision(repository.id)
@@ -1098,10 +1101,13 @@ async fn resolve_default(
     } else if let Ok(branch) = branch::load_name_to_id(repository.clone(), branch).await {
         branch
     } else {
-        let remote = repository.remote().await.map_err(|_err| {
-            BranchError::from(BranchNotFound {
-                branch: branch_input.to_string(),
-            })
+        let remote = repository.remote().await.map_err(|err| {
+            BranchError::BranchNotFound(
+                BranchNotFound {
+                    branch: branch_input.to_string(),
+                }
+                .chain_err_from(err, "remote unavailable for branch lookup"),
+            )
         })?;
         match remote
             .revision(repository.id)
@@ -1393,25 +1399,23 @@ pub async fn branch_metadata(
     let mut creator = String::default();
     let mut created = 0u64;
     let mut stack = vec![];
-    metadata
-        .walk(|key, value, _value_type| {
-            if key.eq(NAME.as_bytes()) {
-                name = String::from_utf8_lossy(value).to_string();
-            } else if key.eq(CATEGORY.as_bytes()) {
-                category = String::from_utf8_lossy(value).to_string();
-            } else if key.eq(PARENT_DEPRECATED.as_bytes()) {
-                parent = value.into();
-            } else if key.eq(BRANCH_POINT_DEPRECATED.as_bytes()) {
-                branch_point = value.into();
-            } else if key.eq(CREATOR.as_bytes()) {
-                creator = String::from_utf8_lossy(value).to_string();
-            } else if key.eq(CREATED.as_bytes()) {
-                created = u64::from_le_bytes(value.try_into().unwrap_or_default());
-            } else if key.eq(STACK.as_bytes()) {
-                stack = stack_from_bytes(value);
-            }
-        })
-        .forward::<BranchError>("Failed to walk branch metadata")?;
+    metadata.walk(|key, value, _value_type| {
+        if key.eq(NAME.as_bytes()) {
+            name = String::from_utf8_lossy(value).to_string();
+        } else if key.eq(CATEGORY.as_bytes()) {
+            category = String::from_utf8_lossy(value).to_string();
+        } else if key.eq(PARENT_DEPRECATED.as_bytes()) {
+            parent = value.into();
+        } else if key.eq(BRANCH_POINT_DEPRECATED.as_bytes()) {
+            branch_point = value.into();
+        } else if key.eq(CREATOR.as_bytes()) {
+            creator = String::from_utf8_lossy(value).to_string();
+        } else if key.eq(CREATED.as_bytes()) {
+            created = u64::from_le_bytes(value.try_into().unwrap_or_default());
+        } else if key.eq(STACK.as_bytes()) {
+            stack = stack_from_bytes(value);
+        }
+    });
 
     if stack.is_empty() && !parent.is_zero() {
         stack.push(BranchPoint {
@@ -2299,41 +2303,37 @@ impl From<&RevisionListItem> for lore_proto::Revision {
             parent_self_number: revision.parent_self_revision_number,
             parent_other_number: revision.parent_other_revision_number,
         };
-        revision
-            .metadata
-            .walk(|key, value, value_type| {
-                let key = std::str::from_utf8(key).unwrap_or("<binary>");
-                match key {
-                    metadata::MESSAGE => {
-                        proto_revision.commit_message =
-                            std::str::from_utf8(value).unwrap_or("<binary>").to_string();
-                    }
-                    metadata::TIMESTAMP => {
-                        if value.len() == std::mem::size_of::<u64>() {
-                            proto_revision.timestamp =
-                                u64::from_le_bytes(value.try_into().unwrap());
-                        }
-                    }
-                    metadata::CREATED_BY => {
-                        if let Ok(value) = std::str::from_utf8(value) {
-                            proto_revision.created_by = value.to_string();
-                        }
-                    }
-                    metadata::COMMITTED_BY => {
-                        if let Ok(value) = std::str::from_utf8(value) {
-                            proto_revision.committed_by = value.to_string();
-                        }
-                    }
-                    _ => {
-                        let metadata =
-                            as_lore_proto_metadata(String::from(key), value, value_type).ok();
-                        if let Some(metadata) = metadata {
-                            proto_revision.metadata.push(metadata);
-                        }
+        revision.metadata.walk(|key, value, value_type| {
+            let key = std::str::from_utf8(key).unwrap_or("<binary>");
+            match key {
+                metadata::MESSAGE => {
+                    proto_revision.commit_message =
+                        std::str::from_utf8(value).unwrap_or("<binary>").to_string();
+                }
+                metadata::TIMESTAMP => {
+                    if value.len() == std::mem::size_of::<u64>() {
+                        proto_revision.timestamp = u64::from_le_bytes(value.try_into().unwrap());
                     }
                 }
-            })
-            .unwrap_or_default();
+                metadata::CREATED_BY => {
+                    if let Ok(value) = std::str::from_utf8(value) {
+                        proto_revision.created_by = value.to_string();
+                    }
+                }
+                metadata::COMMITTED_BY => {
+                    if let Ok(value) = std::str::from_utf8(value) {
+                        proto_revision.committed_by = value.to_string();
+                    }
+                }
+                _ => {
+                    let metadata =
+                        as_lore_proto_metadata(String::from(key), value, value_type).ok();
+                    if let Some(metadata) = metadata {
+                        proto_revision.metadata.push(metadata);
+                    }
+                }
+            }
+        });
 
         proto_revision
     }
@@ -2499,6 +2499,7 @@ pub async fn diff3(
     path: Option<RelativePath>,
     include_same: bool,
     auto_resolve: bool,
+    graft_view: Option<Arc<crate::filter::Filter>>,
     tx: mpsc::Sender<Result<DiffItem, BranchError>>,
 ) -> Result<Diff3Summary, BranchError> {
     Box::pin(diff3_with_source_cap(
@@ -2512,6 +2513,7 @@ pub async fn diff3(
         auto_resolve,
         None,
         None,
+        graft_view,
         tx,
     ))
     .await
@@ -2529,6 +2531,7 @@ pub async fn diff3_with_source_cap(
     auto_resolve: bool,
     source_cap: Option<usize>,
     history_walk_concurrency: Option<usize>,
+    graft_view: Option<Arc<crate::filter::Filter>>,
     tx: mpsc::Sender<Result<DiffItem, BranchError>>,
 ) -> Result<Diff3Summary, BranchError> {
     lore_info!(
@@ -2564,6 +2567,7 @@ pub async fn diff3_with_source_cap(
         include_same,
         source_cap,
         history_walk_concurrency,
+        graft_view,
         inner_tx,
     ));
     loop {
@@ -2684,11 +2688,8 @@ async fn try_auto_resolve_conflict(
         }
     } else {
         lore_trace!("Change from theirs has no valid to node, empty theirs file");
-        let _ = tokio::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(&theirs_path)
+        let _ = lore_io::IoDriver::global()
+            .write_file_bytes(&theirs_path, bytes::Bytes::new(), false)
             .await;
     }
 
@@ -2732,11 +2733,8 @@ async fn try_auto_resolve_conflict(
         }
     } else {
         lore_trace!("Change from base has no valid to node, empty base file");
-        let _ = tokio::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(&base_path)
+        let _ = lore_io::IoDriver::global()
+            .write_file_bytes(&base_path, bytes::Bytes::new(), false)
             .await;
     }
 
@@ -2772,11 +2770,8 @@ async fn try_auto_resolve_conflict(
         }
     } else {
         lore_trace!("Change to mine has no valid to node, empty mine file");
-        let _ = tokio::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(&mine_path)
+        let _ = lore_io::IoDriver::global()
+            .write_file_bytes(&mine_path, bytes::Bytes::new(), false)
             .await;
     }
 
@@ -3050,6 +3045,36 @@ pub async fn diff3_collect(
     include_same: bool,
     auto_resolve: bool,
 ) -> Result<DiffResult, BranchError> {
+    diff3_collect_with_graft(
+        repository,
+        source_branch,
+        source_revision,
+        target_branch,
+        target_revision,
+        path,
+        include_same,
+        auto_resolve,
+        None,
+    )
+    .await
+}
+
+/// `diff3_collect` that may adopt whole out-of-view subtrees.
+///
+/// `graft_view` decides which subtrees the view excludes. `None` disables
+/// adoption and gives the unmodified walk.
+#[allow(clippy::too_many_arguments)]
+pub async fn diff3_collect_with_graft(
+    repository: Arc<RepositoryContext>,
+    source_branch: BranchId,
+    source_revision: Hash,
+    target_branch: BranchId,
+    target_revision: Hash,
+    path: Option<RelativePath>,
+    include_same: bool,
+    auto_resolve: bool,
+    graft_view: Option<Arc<crate::filter::Filter>>,
+) -> Result<DiffResult, BranchError> {
     let (summary, items) = crate::util::collect_stream::collect_stream_with_summary(|tx| {
         diff3(
             repository,
@@ -3060,6 +3085,7 @@ pub async fn diff3_collect(
             path,
             include_same,
             auto_resolve,
+            graft_view,
             tx,
         )
     })
@@ -3286,6 +3312,10 @@ async fn find_ancestor_walker(
     while revision != Hash::default() {
         if let Ok(state) = state::State::deserialize(repository.clone(), revision).await {
             // Update bookkeeping on revision visits.
+            //
+            // Guard scope is this statement and no arm awaits, so the concurrent
+            // sibling walkers sharing `visited` cannot build a wait cycle.
+            #[allow(clippy::disallowed_methods)]
             let both_visited = match visited.entry(revision) {
                 Entry::Occupied(mut visited) => {
                     let visited = visited.get_mut();

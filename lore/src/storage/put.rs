@@ -25,6 +25,7 @@ use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
+use lore_macro::ValidateText;
 use lore_revision::event::EventError;
 use lore_revision::event::LoreBytes;
 use lore_revision::event::LoreErrorCode;
@@ -47,7 +48,7 @@ use crate::storage::store::StoreInternal;
 
 /// One put item — a buffer to hash and store at `(partition, context)`.
 #[repr(C)]
-#[derive(Copy, Clone, PartialEq, Deserialize, Serialize)]
+#[derive(Copy, Clone, PartialEq, Deserialize, Serialize, ValidateText)]
 pub struct LoreStoragePutItem {
     /// Caller-chosen id echoed back in `PUT_ITEM_COMPLETE`
     pub id: u64,
@@ -222,10 +223,11 @@ async fn resolve_put_item(
         write_options,
         remote_session,
         None,
+        None,
     )
     .await
     {
-        Ok((address, _fragment)) => (address, LoreErrorCode::None),
+        Ok(address) => (address, LoreErrorCode::None),
         Err(err) => (
             Address::default(),
             crate::storage::storage_error_to_code(&err),

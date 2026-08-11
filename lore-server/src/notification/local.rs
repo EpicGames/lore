@@ -35,6 +35,14 @@ pub struct NotificationSender {
 static DEFAULT_CAPACITY: usize = 200;
 
 impl NotificationSender {
+    /// Subscribe to this repository's event stream, creating the channel on
+    /// first use.
+    ///
+    /// The `entry` shard write lock is confined to the `match` below: both arms
+    /// only construct or subscribe to a broadcast channel, neither awaits nor
+    /// touches `sender` again, and the guard is dropped before this function
+    /// returns — so no caller can hold it across a suspension point.
+    #[allow(clippy::disallowed_methods)]
     pub fn register(&self, repository: RepositoryId) -> Receiver {
         match self.sender.entry(repository) {
             Entry::Occupied(sender) => sender.get().subscribe(),

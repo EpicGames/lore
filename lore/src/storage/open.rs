@@ -24,6 +24,7 @@ use std::sync::Arc;
 use lore_base::error::InvalidArguments;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
+use lore_macro::ValidateText;
 use lore_revision::event::EventError;
 use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreError;
@@ -52,7 +53,7 @@ use crate::storage::store::StoreInternal;
 
 /// Remote endpoint configuration for a storage handle.
 #[repr(C)]
-#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, ValidateText)]
 pub struct LoreStorageRemoteConfig {
     /// gRPC endpoint of the peer storage service; authenticated with the open call's `globals.identity`
     pub remote_url: LoreString,

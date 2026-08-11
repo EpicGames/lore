@@ -18,6 +18,7 @@ use axum::middleware;
 use axum::routing;
 use blake3;
 use hex;
+use lore_base::lore_spawn_net;
 use lore_telemetry::http_tower_layer::HttpMetricsLayer;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
 use ring::hmac;
@@ -26,11 +27,13 @@ use tracing::info;
 
 use super::health_check;
 use super::presigned;
+use super::security_headers::ContentTypeAllowlist;
 use super::tracing::lore_http_tracing;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_axum_middleware::jwt_axum_verify_authorization;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::http::repositories;
+use crate::util::core_hop::CoreHopLayer;
 
 #[derive(Clone, Debug)]
 pub struct LoreHttpServer {}
@@ -46,6 +49,10 @@ pub struct PresignConfig {
     pub min_ttl_seconds: u64,
     pub default_ttl_seconds: u64,
     pub max_ttl_seconds: u64,
+    /// Allowlist of `Content-Type` values that redeemed content may be served
+    /// with. Disallowed types are rejected at mint and coerced to
+    /// `application/octet-stream` at redeem. Configured in code (not TOML).
+    pub content_type_allowlist: ContentTypeAllowlist,
 }
 
 #[derive(Clone)]
@@ -147,6 +154,9 @@ pub fn create_router(
         .layer(middleware::from_fn(lore_http_tracing))
         .layer(CorrelationIdLayerBuilder::new().with_http_tracer().build())
         .layer(HttpMetricsLayer::new(settings.user_agent_filter.clone()))
+        // Outermost, so everything inward runs on core: this router is served
+        // from net.
+        .layer(CoreHopLayer)
 }
 
 fn build_presign_config(settings: &PresignSettings) -> Result<Option<PresignConfig>> {
@@ -173,6 +183,7 @@ fn build_presign_config(settings: &PresignSettings) -> Result<Option<PresignConf
         min_ttl_seconds: settings.min_ttl_seconds,
         default_ttl_seconds: settings.default_ttl_seconds,
         max_ttl_seconds: settings.max_ttl_seconds,
+        content_type_allowlist: ContentTypeAllowlist::default(),
     }))
 }
 
@@ -204,14 +215,18 @@ impl LoreHttpServer {
                 "/health_check",
                 routing::get(health_check::handler).with_state(health),
             )
-            .layer(HttpMetricsLayer::new(user_agent_filter));
+            .layer(HttpMetricsLayer::new(user_agent_filter))
+            .layer(CoreHopLayer);
 
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|err| anyhow!("Failed to start maintenance HTTP server: {err}"))?;
-        axum::serve(listener, app)
-            .with_graceful_shutdown(signal)
-            .await?;
+        lore_spawn_net!(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(signal)
+                .await
+        })
+        .await??;
 
         Ok(())
     }
@@ -267,9 +282,12 @@ impl LoreHttpServer {
         let listener = TcpListener::bind(addr)
             .await
             .map_err(|err| anyhow!("Failed to start HTTP server: {err}"))?;
-        axum::serve(listener, app)
-            .with_graceful_shutdown(signal)
-            .await?;
+        lore_spawn_net!(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(signal)
+                .await
+        })
+        .await??;
 
         Ok(())
     }

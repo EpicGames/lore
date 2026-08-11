@@ -5,8 +5,11 @@ use quote::quote;
 use syn::DeriveInput;
 use syn::Path;
 
+use crate::validate_text::get_validate_text_tokens;
+
 pub fn get_lore_args_impl(input: &DeriveInput) -> TokenStream {
     let name = &input.ident;
+    let validate_text = get_validate_text_tokens(input);
 
     let handler_attr = input
         .attrs
@@ -24,6 +27,8 @@ pub fn get_lore_args_impl(input: &DeriveInput) -> TokenStream {
                 self.into()
             }
         }
+
+        #validate_text
 
         impl crate::args::InvokableLoreArgs for #name {
             async fn invoke_local(

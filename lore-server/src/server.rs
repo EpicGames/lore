@@ -96,6 +96,7 @@ use crate::quic::stream_handler::StreamHandler;
 use crate::server_config::ServerConfig;
 use crate::settings::CompositeStoreSettings;
 use crate::settings::CompositeSubStoreSettings;
+use crate::settings::GrpcSettings;
 use crate::settings::LocalImmutableStoreSettings;
 use crate::settings::LocalMutableStoreSettings;
 use crate::settings::NotificationSettings;
@@ -177,11 +178,18 @@ pub fn server_main(config: ServerConfig) -> Result<()> {
 
     lore_base::log::set_log_callback(Some(server_log_dispatch));
 
-    let result = match settings.tokio.as_ref() {
+    // Server default: one net-runtime thread per processor — serving
+    // thousands of concurrent client connections is its normal case. An
+    // explicit `tokio.net_threads` config (seeded first inside
+    // runtime_with_settings) wins over this default.
+    let runtime_handle = match settings.tokio.as_ref() {
         Some(tokio) => runtime_with_settings(Some(tokio.clone())),
         None => runtime(),
-    }
-    .block_on({
+    };
+    let _ = lore_base::runtime::set_net_threads_default(
+        std::thread::available_parallelism().map_or(2, |count| count.get()),
+    );
+    let result = runtime_handle.block_on({
         let execution = setup_execution(module_path!(), String::default(), String::default());
         #[allow(clippy::large_futures)]
         LORE_CONTEXT.scope(execution, async move {
@@ -592,6 +600,7 @@ async fn launch_grpc_internal_server(
             mutable_store,
             notification_sender,
             hook_dispatcher,
+            settings.environment.clone().unwrap_or_default(),
         )?
         .with_tls_config(cert_path, key_path, cert_chain_path)?
         .with_http2_config(
@@ -629,22 +638,27 @@ async fn launch_http_server(
     .await
 }
 
+/// Start a minimal gRPC server in maintenance mode on the address described by
+/// `grpc_settings`.
+///
+/// The server registers only the environment service, which returns
+/// `UNAVAILABLE` to signal that the node is intentionally in a reduced state.
+/// No storage, replication, or admin services are exposed.
+///
+/// Infrastructure health checks (load-balancers, service meshes, deployment controllers) may
+/// probe the internal port to determine whether the node is ready to receive
+/// peer traffic.  Binding the maintenance server on every exposed port ensures those
+/// checks can reach it and observe `UNAVAILABLE`, rather than hitting a refused
+/// connection that a probe might misinterpret as a hard failure.
 async fn launch_maintenance_grpc_server(
-    settings: Settings,
+    grpc_settings: GrpcSettings,
+    environment: EnvironmentConfig,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    let grpc_settings = settings
-        .server
-        .grpc
-        .clone()
-        .ok_or(anyhow!("Missing gRPC settings"))?;
-
     let addr =
         SocketAddr::from_str(format!("{}:{}", grpc_settings.host, grpc_settings.port).as_str())?;
 
     info!("Starting Lore maintenance gRPC Server: {}", &addr);
-
-    let environment = settings.environment.clone().unwrap_or_default();
 
     let (cert_path, key_path, cert_chain_path) =
         if let Some(cert_settings) = grpc_settings.certificate {
@@ -1114,6 +1128,7 @@ async fn configure_local_mutable_store(
             flush_delay_seconds: settings.flush_delay_seconds as u64,
             initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX, /* Server mode, full 256-bucket layout from the start */
             fan_out_threshold: lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
+            authoritative: true, /* Server local store is the source of truth, not a cache */
         },
         immutable_store,
     )
@@ -1232,6 +1247,10 @@ async fn configure_composite_store(
         .await?;
         composite_store_builder =
             composite_store_builder.with_durable(durable_settings.mode.clone(), store)?;
+        if let Some(delay) = settings.durable_store_delay_ms {
+            composite_store_builder =
+                composite_store_builder.with_durable_delay(Duration::from_millis(delay));
+        }
     }
 
     if let Some(replicas) = settings.replica.as_ref() {
@@ -1479,9 +1498,9 @@ async fn seed_local_store(settings: &LocalImmutableStoreSettings) -> Result<(), 
                 .map(|v| v.parse::<usize>().unwrap_or_default())
                 .unwrap_or_default();
 
-            let buffer = std::env::var("LORE_SEEDING_BUFFER")
-                .map(|v| v.parse::<usize>().unwrap_or(DEFAULT_BUFFER_SIZE))
-                .unwrap_or(DEFAULT_BUFFER_SIZE);
+            let buffer = std::env::var("LORE_SEEDING_BUFFER").map_or(DEFAULT_BUFFER_SIZE, |v| {
+                v.parse::<usize>().unwrap_or(DEFAULT_BUFFER_SIZE)
+            });
 
             let result = lore_revision::store::seeder::seed_local_store(
                 local_store,
@@ -1633,16 +1652,26 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     lore_storage::concurrency::LOCAL_ISOLATION.store(true, std::sync::atomic::Ordering::Release);
 
     let execution = execution_context();
-    let runtime_monitor = tokio_metrics::RuntimeMonitor::new(&runtime);
-
-    let metrics_bridge = OtelTokioRuntimeMetrics::new(&lore_telemetry::meter("tokio_runtime"));
     let frequency = Duration::from_millis(metrics_config.export_interval_millis);
-    runtime.spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-        for metrics in runtime_monitor.intervals() {
-            metrics_bridge.record(metrics);
-            tokio::time::sleep(frequency).await;
-        }
-    }));
+    let meter = lore_telemetry::meter("tokio_runtime");
+
+    // Both recorders run on core so monitoring never competes with net's
+    // transport work; each bridge holds its own handle, so that does not skew
+    // what it reports.
+    for (label, handle) in [
+        ("core", lore_base::runtime::core_runtime()),
+        ("net", lore_base::runtime::net_runtime()),
+    ] {
+        let runtime_monitor = tokio_metrics::RuntimeMonitor::new(&handle);
+        let metrics_bridge =
+            OtelTokioRuntimeMetrics::new(&meter, handle, vec![KeyValue::new("runtime", label)]);
+        lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+            for metrics in runtime_monitor.intervals() {
+                metrics_bridge.record(metrics);
+                tokio::time::sleep(frequency).await;
+            }
+        }));
+    }
 
     if let Some(mode) = settings
         .environment
@@ -1869,11 +1898,27 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             });
         }
     } else {
+        let grpc_settings = settings
+            .server
+            .grpc
+            .clone()
+            .ok_or(anyhow!("Missing gRPC settings"))?;
+        let environment = settings.environment.clone().unwrap_or_default();
+
         lore_spawn!(endpoints, {
-            let settings = settings.clone();
             let shutdown_rx = _shutdown_rx.clone();
-            launch_maintenance_grpc_server(settings, shutdown_rx)
+            launch_maintenance_grpc_server(grpc_settings, environment.clone(), shutdown_rx)
         });
+
+        if let Some(grpc_internal) = &settings.server.grpc_internal
+            && grpc_internal.enabled
+        {
+            lore_spawn!(endpoints, {
+                let grpc_settings = grpc_internal.clone();
+                let shutdown_rx = _shutdown_rx.clone();
+                launch_maintenance_grpc_server(grpc_settings, environment, shutdown_rx)
+            });
+        }
     }
 
     // the public facing QUIC server. Authentication is via JWT, so the
@@ -1938,7 +1983,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // blanket storage access with no JWT layer — so the startup-time
     // validator demands mTLS unless verify_client_certs is explicitly
     // disabled.
-    if let Some(quic_internal_settings) = settings.server.quic_internal.as_ref()
+    if !is_maintenance
+        && let Some(quic_internal_settings) = settings.server.quic_internal.as_ref()
         && quic_internal_settings.enabled
     {
         let security = validate_endpoint_security(

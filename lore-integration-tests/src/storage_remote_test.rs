@@ -43,7 +43,11 @@ mod storage_remote_tests {
         _shutdown: tokio::sync::oneshot::Sender<()>,
     }
 
-    async fn start_test_server() -> TestServer {
+    /// Build a fresh in-memory backend pair for a test server to serve.
+    async fn make_backends() -> (
+        Arc<dyn lore_storage::ImmutableStore>,
+        Arc<dyn lore_storage::MutableStore>,
+    ) {
         let backend_immutable = lore_storage::local::immutable_store::create(
             None::<&str>,
             ImmutableStoreCreateOptions::none(),
@@ -65,6 +69,21 @@ mod storage_remote_tests {
         )
         .await
         .unwrap();
+
+        (backend_immutable, backend_mutable)
+    }
+
+    async fn start_test_server() -> TestServer {
+        let (backend_immutable, backend_mutable) = make_backends().await;
+        start_test_server_with(backend_immutable, backend_mutable).await
+    }
+
+    /// Start a server over caller-supplied backends, so a test can wrap the served store in a
+    /// fault-injecting decorator.
+    async fn start_test_server_with(
+        backend_immutable: Arc<dyn lore_storage::ImmutableStore>,
+        backend_mutable: Arc<dyn lore_storage::MutableStore>,
+    ) -> TestServer {
         let backend_for_test = backend_immutable.clone();
         let backend_mutable_for_test: Arc<dyn lore_storage::MutableStore> = backend_mutable.clone();
 
@@ -2994,6 +3013,495 @@ mod storage_remote_tests {
                     complete.lock().unwrap().is_none(),
                     "no per-item terminal event on a pre-dispatch rejection"
                 );
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    // ---------------------------------------------------------------------------
+    // Streaming resilience
+    //
+    // `Get` / `GetMetadata` multiplex every address in a batch onto one bidirectional
+    // stream, and a batch's items share a session, so they share that stream. A per-item
+    // failure is reported in-band on the item's own response, which is what lets the
+    // stream keep serving its siblings. The assertion that discriminates the in-band
+    // behaviour from the old terminal-status behaviour is always the *siblings*: when a
+    // status ended the stream, they failed with a transport error instead of resolving.
+    // ---------------------------------------------------------------------------
+
+    async fn seed_server(
+        server: &TestServer,
+        partition: lore_base::types::Partition,
+        payload: &bytes::Bytes,
+    ) -> lore_base::types::Address {
+        let address = lore_base::types::Address {
+            hash: lore_storage::hash_slice(payload.as_ref()),
+            context: lore_base::types::Context::default(),
+        };
+        let fragment = lore_base::types::Fragment {
+            flags: 0,
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+        server
+            .backend_immutable
+            .clone()
+            .put(partition, address, fragment, Some(payload.clone()), false)
+            .await
+            .expect("seed server with payload");
+        address
+    }
+
+    struct GetBatchResults {
+        codes: HashMap<u64, lore_revision::event::LoreErrorCode>,
+        bytes: HashMap<u64, Vec<u8>>,
+    }
+
+    async fn run_get_batch(
+        handle_id: u64,
+        items: Vec<lore::storage::get::LoreStorageGetItem>,
+    ) -> GetBatchResults {
+        let codes: Arc<Mutex<HashMap<u64, lore_revision::event::LoreErrorCode>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let bytes: Arc<Mutex<HashMap<u64, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let codes_for_cb = codes.clone();
+        let bytes_for_cb = bytes.clone();
+
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::StorageGetData(data) => {
+                let slice = unsafe {
+                    std::slice::from_raw_parts(data.bytes.ptr.cast::<u8>(), data.bytes.len)
+                };
+                bytes_for_cb
+                    .lock()
+                    .unwrap()
+                    .entry(data.id)
+                    .or_default()
+                    .extend_from_slice(slice);
+            }
+            LoreEvent::StorageGetItemComplete(data) => {
+                codes_for_cb
+                    .lock()
+                    .unwrap()
+                    .insert(data.id, data.error_code);
+            }
+            _ => {}
+        }));
+
+        lore::storage::get::get(
+            LoreGlobalArgs::default(),
+            lore::storage::get::LoreStorageGetArgs {
+                handle: lore::storage::handle::LoreStore { handle_id },
+                items: lore_revision::interface::LoreArray::from_vec(items),
+            },
+            callback,
+        )
+        .await;
+
+        let codes = codes.lock().unwrap().clone();
+        let bytes = bytes.lock().unwrap().clone();
+        GetBatchResults { codes, bytes }
+    }
+
+    fn get_item(
+        id: u64,
+        partition: lore_base::types::Partition,
+        address: lore_base::types::Address,
+    ) -> lore::storage::get::LoreStorageGetItem {
+        lore::storage::get::LoreStorageGetItem {
+            id,
+            partition,
+            address,
+            streaming: 0,
+            local_cache: 0,
+        }
+    }
+
+    /// A remote miss must not disturb the other addresses sharing the Get stream.
+    ///
+    /// Previously the miss was a stream trailer, which ended the stream and failed the siblings
+    /// with an opaque transport error. The absent address is never written anywhere, so it
+    /// misses both the handle's local store and the remote, and it is dispatched first so it is
+    /// on the wire before any sibling can have been answered — ordering it last would leave the
+    /// scheduler to decide whether the siblings were ever exposed to it.
+    #[tokio::test]
+    async fn get_batch_survives_missing_address() -> TestResult {
+        use bytes::Bytes;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+
+        let execution = setup_execution("storage-remote-get-miss-batch".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let partition = Partition::from([0xc1u8; 16]);
+
+                let payloads: Vec<Bytes> = (0..3u8)
+                    .map(|i| Bytes::from(format!("in-band miss sibling payload {i}").into_bytes()))
+                    .collect();
+                let missing = Address {
+                    hash: Hash::from([0xdeu8; 32]),
+                    context: Context::default(),
+                };
+                let mut items = vec![get_item(99, partition, missing)];
+                for (index, payload) in payloads.iter().enumerate() {
+                    let address = seed_server(&server, partition, payload).await;
+                    items.push(get_item(index as u64, partition, address));
+                }
+
+                let handle_id = open_remote_handle(&server).await;
+                let results = run_get_batch(handle_id, items).await;
+
+                assert_eq!(
+                    results.codes.get(&99),
+                    Some(&LoreErrorCode::AddressNotFound),
+                    "the absent address must report AddressNotFound, not a transport error",
+                );
+                for (index, payload) in payloads.iter().enumerate() {
+                    let id = index as u64;
+                    assert_eq!(
+                        results.codes.get(&id),
+                        Some(&LoreErrorCode::None),
+                        "item {id} shares the stream with a miss and must still succeed",
+                    );
+                    assert_eq!(
+                        results.bytes.get(&id).map(Vec::as_slice),
+                        Some(payload.as_ref()),
+                        "item {id} must return its full payload",
+                    );
+                }
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    /// The same guarantee on the `GetMetadata` stream, where a miss is most clearly routine:
+    /// `RemoteImmutableStore::get_metadata` maps `NotFound` to `MatchNone`. The miss is
+    /// dispatched first for the same reason as in the Get case.
+    #[tokio::test]
+    async fn get_metadata_batch_survives_missing_address() -> TestResult {
+        use bytes::Bytes;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+
+        let execution = setup_execution("storage-remote-get-metadata-miss-batch".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let partition = Partition::from([0xc2u8; 16]);
+
+                let payloads: Vec<Bytes> = (0..3u8)
+                    .map(|i| Bytes::from(format!("metadata sibling payload {i}").into_bytes()))
+                    .collect();
+                let mut items = vec![lore::storage::get_metadata::LoreStorageGetMetadataItem {
+                    id: 99,
+                    partition,
+                    address: Address {
+                        hash: Hash::from([0xadu8; 32]),
+                        context: Context::default(),
+                    },
+                }];
+                for (index, payload) in payloads.iter().enumerate() {
+                    let address = seed_server(&server, partition, payload).await;
+                    items.push(lore::storage::get_metadata::LoreStorageGetMetadataItem {
+                        id: index as u64,
+                        partition,
+                        address,
+                    });
+                }
+
+                let handle_id = open_remote_handle(&server).await;
+
+                let outcomes: Arc<Mutex<HashMap<u64, (LoreErrorCode, u32)>>> =
+                    Arc::new(Mutex::new(HashMap::new()));
+                let outcomes_for_cb = outcomes.clone();
+                let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                    if let LoreEvent::StorageGetMetadataItemComplete(data) = event {
+                        outcomes_for_cb
+                            .lock()
+                            .unwrap()
+                            .insert(data.id, (data.error_code, data.fragment.size_payload));
+                    }
+                }));
+
+                lore::storage::get_metadata::get_metadata(
+                    LoreGlobalArgs::default(),
+                    lore::storage::get_metadata::LoreStorageGetMetadataArgs {
+                        handle: lore::storage::handle::LoreStore { handle_id },
+                        items: lore_revision::interface::LoreArray::from_vec(items),
+                    },
+                    callback,
+                )
+                .await;
+
+                let outcomes = outcomes.lock().unwrap().clone();
+                assert_eq!(
+                    outcomes.get(&99).map(|(code, _)| *code),
+                    Some(LoreErrorCode::AddressNotFound),
+                    "the absent address must report AddressNotFound",
+                );
+                for (index, payload) in payloads.iter().enumerate() {
+                    let id = index as u64;
+                    assert_eq!(
+                        outcomes.get(&id).map(|(code, _)| *code),
+                        Some(LoreErrorCode::None),
+                        "metadata item {id} shares the stream with a miss and must still succeed",
+                    );
+                    assert_eq!(
+                        outcomes.get(&id).map(|(_, size)| *size),
+                        Some(payload.len() as u32),
+                        "metadata item {id} must report the real payload size",
+                    );
+                }
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Answers `get` with `SlowDown` a bounded number of times for one address, then delegates.
+    ///
+    /// Backpressure is the other routine per-item failure — it maps to `ResourceExhausted`,
+    /// also a stream trailer under the old behaviour. Failing only a bounded number of times
+    /// keeps the test fast, since the client's retry then succeeds.
+    ///
+    /// Seeding goes straight into the backing store, which is then wrapped so the server's own
+    /// `handle_get` observes the injected `SlowDown` for exactly one of the addresses.
+    struct SlowDownOnce {
+        inner: Arc<dyn lore_storage::ImmutableStore>,
+        target: lore_base::types::Address,
+        remaining: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl lore_storage::ImmutableStore for SlowDownOnce {
+        async fn get(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+            match_required: lore_storage::StoreMatch,
+        ) -> Result<(lore_base::types::Fragment, bytes::Bytes), lore_storage::StoreError> {
+            if address == self.target
+                && self
+                    .remaining
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |n| n.checked_sub(1),
+                    )
+                    .is_ok()
+            {
+                return Err(lore_storage::StoreError::from(lore_base::error::SlowDown));
+            }
+            self.inner
+                .clone()
+                .get(partition, address, match_required)
+                .await
+        }
+
+        async fn exist(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+            match_requested: lore_storage::StoreMatch,
+        ) -> Result<lore_storage::StoreMatch, lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .exist(partition, address, match_requested)
+                .await
+        }
+
+        async fn exist_batch(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            addresses: &[lore_base::types::Address],
+            match_requested: lore_storage::StoreMatch,
+        ) -> Result<Vec<lore_storage::StoreMatch>, lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .exist_batch(partition, addresses, match_requested)
+                .await
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+            match_requested: lore_storage::StoreMatch,
+        ) -> Result<lore_storage::StoreQueryResult, lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .query(partition, address, match_requested)
+                .await
+        }
+
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+        ) -> Result<lore_storage::StoreQueryResult, lore_storage::StoreError> {
+            self.inner.clone().get_metadata(partition, address).await
+        }
+
+        async fn put(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+            fragment: lore_base::types::Fragment,
+            payload: Option<bytes::Bytes>,
+            force: bool,
+        ) -> Result<(), lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .put(partition, address, fragment, payload, force)
+                .await
+        }
+
+        async fn obliterate(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+            stats: Arc<lore_storage::StoreObliterateStats>,
+        ) -> Result<(), lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .obliterate(partition, address, stats)
+                .await
+        }
+
+        async fn evict(
+            self: Arc<Self>,
+            max_capacity: usize,
+            sync_data: bool,
+            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+        ) -> Result<usize, lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .evict(max_capacity, sync_data, sink)
+                .await
+        }
+
+        async fn compact(
+            self: Arc<Self>,
+            max_size: usize,
+            at: Option<usize>,
+            sync_data: bool,
+            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+        ) -> Result<Option<usize>, lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .compact(max_size, at, sync_data, sink)
+                .await
+        }
+
+        async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
+            self.inner.clone().compact_resume_at().await
+        }
+
+        async fn compact_stop(self: Arc<Self>) {
+            self.inner.clone().compact_stop().await;
+        }
+
+        fn max_query_batch(&self) -> Option<usize> {
+            self.inner.max_query_batch()
+        }
+
+        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), lore_storage::StoreError> {
+            self.inner.clone().flush(sync_data).await
+        }
+
+        async fn verify(self: Arc<Self>, heal: bool) -> Result<(), lore_storage::StoreError> {
+            self.inner.clone().verify(heal).await
+        }
+    }
+
+    /// A per-item `SlowDown` must not disturb the other addresses sharing the Get stream.
+    #[tokio::test]
+    async fn get_batch_survives_server_side_slow_down() -> TestResult {
+        use bytes::Bytes;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+
+        let execution = setup_execution("storage-remote-get-slowdown-batch".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let partition = Partition::from([0xc3u8; 16]);
+                let (backend_immutable, backend_mutable) = make_backends().await;
+
+                let payloads: Vec<Bytes> = (0..3u8)
+                    .map(|i| Bytes::from(format!("slowdown sibling payload {i}").into_bytes()))
+                    .collect();
+                let slow_payload = Bytes::from_static(b"slowdown target payload");
+
+                let mut addresses = Vec::new();
+                for payload in payloads.iter().chain(std::iter::once(&slow_payload)) {
+                    let address = lore_base::types::Address {
+                        hash: lore_storage::hash_slice(payload.as_ref()),
+                        context: lore_base::types::Context::default(),
+                    };
+                    backend_immutable
+                        .clone()
+                        .put(
+                            partition,
+                            address,
+                            lore_base::types::Fragment {
+                                flags: 0,
+                                size_payload: payload.len() as u32,
+                                size_content: payload.len() as u64,
+                            },
+                            Some(payload.clone()),
+                            false,
+                        )
+                        .await
+                        .expect("seed backing store");
+                    addresses.push(address);
+                }
+                let slow_address = *addresses.last().unwrap();
+
+                let served: Arc<dyn lore_storage::ImmutableStore> = Arc::new(SlowDownOnce {
+                    inner: backend_immutable,
+                    target: slow_address,
+                    remaining: std::sync::atomic::AtomicUsize::new(1),
+                });
+                let server = start_test_server_with(served, backend_mutable).await;
+                let handle_id = open_remote_handle(&server).await;
+
+                let items = addresses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, address)| get_item(index as u64, partition, *address))
+                    .collect();
+                let results = run_get_batch(handle_id, items).await;
+
+                for (index, payload) in payloads
+                    .iter()
+                    .chain(std::iter::once(&slow_payload))
+                    .enumerate()
+                {
+                    let id = index as u64;
+                    assert_eq!(
+                        results.codes.get(&id),
+                        Some(&LoreErrorCode::None),
+                        "item {id} must succeed — a per-item SlowDown is retryable and must \
+                         leave the stream serving its siblings",
+                    );
+                    assert_eq!(
+                        results.bytes.get(&id).map(Vec::as_slice),
+                        Some(payload.as_ref()),
+                        "item {id} must return its full payload",
+                    );
+                }
 
                 close_handle(handle_id).await;
                 Ok(())

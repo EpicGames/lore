@@ -42,8 +42,6 @@ use lore_transport::ProtocolError;
 use lore_transport::RepositoryData;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use toml;
@@ -303,7 +301,6 @@ mod store_config_tests {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileConfig {
     direct_write: Option<bool>,
-    direct_io: Option<bool>,
     flush_write: Option<bool>,
 }
 
@@ -311,7 +308,6 @@ impl Default for FileConfig {
     fn default() -> Self {
         FileConfig {
             direct_write: Some(false),
-            direct_io: Some(false),
             flush_write: Some(false),
         }
     }
@@ -357,8 +353,6 @@ pub struct RepositoryRuntimeSettings {
     pub disable_cache: AtomicBool,
     /// Write directly to target file instead of write to temporary file + move
     pub direct_file_write: AtomicBool,
-    /// Use direct file I/O instead of memory mapping files
-    pub direct_file_io: AtomicBool,
 }
 
 impl Default for RepositoryRuntimeSettings {
@@ -367,7 +361,6 @@ impl Default for RepositoryRuntimeSettings {
             disable_upload: AtomicBool::new(true),
             disable_cache: AtomicBool::new(true),
             direct_file_write: AtomicBool::new(false),
-            direct_file_io: AtomicBool::new(false),
         }
     }
 }
@@ -378,7 +371,6 @@ impl Clone for RepositoryRuntimeSettings {
             disable_upload: AtomicBool::new(self.disable_upload.load(Ordering::Relaxed)),
             disable_cache: AtomicBool::new(self.disable_cache.load(Ordering::Relaxed)),
             direct_file_write: AtomicBool::new(self.direct_file_write.load(Ordering::Relaxed)),
-            direct_file_io: AtomicBool::new(self.direct_file_io.load(Ordering::Relaxed)),
         }
     }
 
@@ -393,10 +385,6 @@ impl Clone for RepositoryRuntimeSettings {
         );
         self.direct_file_write.store(
             source.direct_file_write.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
-        self.direct_file_io.store(
-            source.direct_file_io.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
     }
@@ -1002,16 +990,6 @@ impl RepositoryContext {
             .store(disable, Ordering::Relaxed);
     }
 
-    pub fn direct_file_io(&self) -> bool {
-        self.settings.direct_file_io.load(Ordering::Relaxed)
-    }
-
-    pub fn set_direct_file_io(&self, direct: bool) {
-        self.settings
-            .direct_file_io
-            .store(direct, Ordering::Relaxed);
-    }
-
     pub fn direct_file_write(&self) -> bool {
         self.settings.direct_file_write.load(Ordering::Relaxed)
     }
@@ -1279,22 +1257,10 @@ async fn save_config(
     config_path: impl AsRef<Path>,
     config: &RepositoryConfig,
 ) -> Result<(), RepositoryError> {
-    let mut config_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(config_path)
-        .await
-        .internal("Failed to save config file")?;
-
     let config_string = toml::to_string_pretty(&config).internal("Failed to save config file")?;
 
-    config_file
-        .write_all(config_string.as_bytes())
-        .await
-        .internal("Failed to save config file")?;
-    config_file
-        .flush()
+    lore_io::IoDriver::global()
+        .write_file_bytes(config_path, bytes::Bytes::from(config_string), false)
         .await
         .internal("Failed to save config file")?;
     Ok(())
@@ -1368,13 +1334,10 @@ pub(crate) async fn get_or_create_repository_lock(
         return Ok(holder);
     }
 
-    // Acquire the OS flock on the blocking pool so a slow flock doesn't stall
-    // the runtime.
-    let path_for_lock = dot_path.clone();
-    let lock = lore_base::runtime::runtime()
-        .spawn_blocking(move || FSLock::acquire_directory_lock(path_for_lock))
+    // The OS flock is taken with non-blocking attempts and async retries,
+    // so a contended lock never stalls a runtime thread.
+    let lock = Box::pin(FSLock::acquire_directory_lock(dot_path.clone()))
         .await
-        .internal("Failed to get exclusive access to repository")?
         .internal("Failed to get exclusive access to repository")?;
 
     let holder = Arc::new(RepositoryLock { _lock: lock });
@@ -2075,7 +2038,6 @@ pub async fn load_and_connect_with_token(
 
     let config_file = config.file.unwrap_or_default();
     repository.set_direct_file_write(config_file.direct_write.unwrap_or_default());
-    repository.set_direct_file_io(config_file.direct_io.unwrap_or_default());
     repository.set_disable_cache(!global.cache());
 
     if global.local() {
@@ -2156,13 +2118,19 @@ pub async fn load_and_connect_with_token(
         }
 
         if migrated_current {
-            if let Err(err) = tokio::fs::remove_file(&current_anchor_path).await {
+            if let Err(err) = lore_io::IoDriver::global()
+                .remove_file(&current_anchor_path)
+                .await
+            {
                 lore_warn!("Failed to remove old current anchor file: {err}");
             }
             lore_debug!("Migrated file-based current anchor to mutable store");
         }
         if migrated_staged {
-            if let Err(err) = tokio::fs::remove_file(&staged_anchor_path).await {
+            if let Err(err) = lore_io::IoDriver::global()
+                .remove_file(&staged_anchor_path)
+                .await
+            {
                 lore_warn!("Failed to remove old staged anchor file: {err}");
             }
             lore_debug!("Migrated file-based staged anchor to mutable store");
@@ -2205,15 +2173,20 @@ pub async fn create_local(
     let idpath = dotpath.join(ID);
 
     let dotpath_display = dotpath.display().to_string();
-    tokio::fs::create_dir_all(dotpath.as_path())
+    lore_io::IoDriver::global()
+        .create_dir_all(dotpath.as_path())
         .await
         .internal_with(|| {
             format!("Failed to create repository, unable to create directory {dotpath_display}")
         })?;
 
     let idpath_display = idpath.display().to_string();
-    #[allow(clippy::disallowed_methods)] // Authorized repository ID writer.
-    tokio::fs::write(idpath.as_path(), repository.data())
+    lore_io::IoDriver::global()
+        .write_file_bytes(
+            idpath.as_path(),
+            bytes::Bytes::copy_from_slice(repository.data()),
+            false,
+        )
         .await
         .internal_with(|| {
             format!(
@@ -2799,6 +2772,21 @@ pub async fn branch_switch(
             branch::store_last_sync(repository.clone(), branch.id, branch_latest_local).await;
         }
 
+        // Restore the name-to-id mapping for the branch to ensure it shows up in the local branch list.
+        let mapped = branch::load_name_to_id_local(repository.clone(), branch_name)
+            .await
+            .unwrap_or_default();
+        if mapped != Context::default() && mapped != branch.id && !global.force() {
+            return Err(RepositoryError::internal(
+                "Given branch's name is already used by another branch",
+            ));
+        }
+        if mapped == Context::default() || global.force() {
+            branch::store_name_to_id(repository.clone(), branch.id, &branch_name)
+                .await
+                .forward::<RepositoryError>("restoring name-to-id mapping")?;
+        }
+
         if !options.bare {
             // Switch layers to follow the main branch
             layer_branch_switch(
@@ -2878,19 +2866,23 @@ async fn layer_branch_switch(
         // Check if branch already exists in layer repo
         let branch_exists = branch::exist_local(layer_repository.clone(), branch_id).await;
 
-        if !branch_exists {
-            // Create branch in layer repo - mirrors layer_branch_create pattern
+        let layer_current = if branch_exists {
+            None
+        } else {
             let current_revision =
                 state::State::deserialize(layer_repository.clone(), layer.current)
                     .await
                     .forward::<RepositoryError>("Failed to deserialize repository state")?;
             let current_branch = current_revision.branch(layer_repository.clone()).await;
+            Some((current_revision, current_branch))
+        };
 
-            if current_branch == branch_id {
-                // Already on this branch (by ID), skip
-                continue;
-            }
-
+        // Skip only the branch creation, not the layer: a layer already on this
+        // branch can still be behind the branch latest and needs resolving.
+        if let Some((current_revision, current_branch)) = layer_current
+            && current_branch != branch_id
+        {
+            // Create branch in layer repo - mirrors layer_branch_create pattern
             let parent_metadata = branch::metadata(layer_repository.clone(), current_branch)
                 .await
                 .forward::<RepositoryError>("Failed to load branch metadata")?;

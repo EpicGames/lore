@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use lore_base::lore_drain_tasks;
-use lore_base::lore_spawn;
+use lore_base::lore_spawn_net;
 use lore_base::types::*;
 use parking_lot::Mutex;
 use tokio::sync::Mutex as TokioMutex;
@@ -266,7 +266,7 @@ impl Drop for StorageSession {
         if let SessionInner::Resolved(r) = &self.inner {
             let storage = r.storage.clone();
             let session_id = r.session_id;
-            lore_base::lore_spawn!(async move {
+            lore_base::lore_spawn_net!(async move {
                 let _ = storage.session_stop(session_id).await;
             });
         }
@@ -392,7 +392,7 @@ impl StorageConnector {
         for storage in self.connections.iter().cloned() {
             let correlation_id = correlation_id.to_string();
             let started = started.clone();
-            lore_spawn!(tasks, async move {
+            lore_spawn_net!(tasks, async move {
                 let session_id = storage.session_start(repository, &correlation_id).await?;
                 started.lock().push((storage, session_id));
                 Ok::<_, ProtocolError>(())

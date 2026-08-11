@@ -4,6 +4,21 @@ package lore.storage.v1;
 
 import "lore/model/v1/model.proto";
 
+// Streaming contract for Get / GetMetadata / Put / Copy:
+//
+// These RPCs multiplex many independent item requests onto one long-lived stream,
+// and the server answers out of order. A failure attributable to a single item is
+// therefore reported in-band, via that item's `status` field, and the stream stays
+// open. A terminal gRPC `Status` means the stream itself is unusable — the request
+// stream failed to decode, or the RPC was rejected before any item was read — and
+// every outstanding request on it must be retried on a fresh stream.
+//
+// The per-item fields keep the numbers they had before `status` existed, so a peer that
+// predates it still decodes what it understands. Such a peer reports a per-item failure
+// the only way it can, by ending the stream, which is why an absent status reads as `OK`.
+//
+// A status other than `OK` decides the item on its own: the reader must not consult the
+// other fields, whatever they contain.
 service StorageService {
     rpc Get(stream lore.model.v1.Address) returns (stream GetResponse);
     // GetMetadata: same wire request as Get (just an Address), but the server's response
@@ -19,10 +34,26 @@ service StorageService {
     rpc MutableCompareAndSwap(MutableCompareAndSwapRequest) returns (MutableCompareAndSwapResponse);
 }
 
+// One item's outcome on the Get / GetMetadata response stream.
+//
+// `address` is populated on success and failure alike — it is the key the client
+// demultiplexes on, since the server answers out of order. A per-item failure
+// arrives as `status` rather than as a stream `Status`, so a miss on one address
+// leaves every other request on the stream intact.
 message GetResponse {
     lore.model.v1.Address address = 1;
+    // Meaningful only when `status` is `OK` or absent. `payload` is always empty for
+    // GetMetadata, which carries Fragment only.
     lore.model.v1.Fragment fragment = 2;
     bytes payload = 3;
+    // `OK` for a served fragment, the failure otherwise.
+    //
+    // Absence means `OK`: the field postdates the original response, so a server without it
+    // reports a per-item failure the only way it could, by ending the stream.
+    //
+    // Anything other than `OK` decides the item on its own. A reader must not consult
+    // `fragment` or `payload` in that case, whatever they contain.
+    lore.model.v1.ItemStatus status = 4;
 }
 
 message PutRequest {
@@ -31,8 +62,12 @@ message PutRequest {
     optional bytes payload = 3;
 }
 
+// One item's outcome on the Put response stream, reported the same way as Get.
 message PutResponse {
     lore.model.v1.Address address = 1;
+    // `OK` for a stored fragment, the failure otherwise. Absence means `OK`, and anything
+    // other than `OK` decides the item on its own, both as on Get.
+    lore.model.v1.ItemStatus status = 2;
 }
 
 message QueryRequest {
@@ -68,9 +103,14 @@ message CopyRequest {
     bytes target_context = 3;
 }
 
+// One item's outcome on the Copy response stream, reported the same way as Get.
 message CopyResponse {
     bytes source_repository_id = 1;
     lore.model.v1.Address source_address = 2;
+    // `OK`, or the failure — a missing source fragment is an expected outcome that the
+    // caller's tier-2 fallback pattern-matches on. Absence means `OK`, and anything other
+    // than `OK` decides the item on its own, both as on Get.
+    lore.model.v1.ItemStatus status = 3;
 }
 
 message MutableLoadRequest {

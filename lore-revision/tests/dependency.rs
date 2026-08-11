@@ -824,7 +824,37 @@ mod tests {
     // =========================================================================
 
     use lore_revision::dependency::resolve::check_cycle;
+    use lore_revision::dependency::resolve::resolve_dependency_file_set;
     use lore_revision::dependency::resolve::transitive_closure;
+
+    #[tokio::test]
+    async fn resolve_nonexistent_path_returns_file_not_found() {
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let (repository, state, _, _, _) = setup_test_state().await;
+
+                let result = resolve_dependency_file_set(
+                    repository,
+                    state,
+                    &["nonexistent/path"],
+                    &[],
+                    false,
+                    0,
+                )
+                .await;
+
+                assert!(result.is_err());
+                assert!(
+                    result.unwrap_err().is_file_not_found(),
+                    "expected FileNotFound for a path absent from the state"
+                );
+            }))
+            .await
+            .expect("test task");
+    }
 
     #[tokio::test]
     async fn cycle_detection_self_dependency() {

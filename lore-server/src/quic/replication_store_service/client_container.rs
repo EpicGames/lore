@@ -204,10 +204,8 @@ where
             };
 
             let mut client_write = self.client.write().await;
-            // The concrete QUIC client has some drop logic that blocks the current task on an
-            // async function - draining connections and other slow operations.
-            // We don't want this delay to hold back releasing the write lock,
-            // so avoid dropping the old client until after we have dropped the write lock
+            // Swap the new client in, then release the write lock before the old
+            // client drops so lookups aren't blocked behind the swap.
             let _old_client = std::mem::replace(&mut *client_write, new_client);
             drop(client_write);
 
@@ -282,6 +280,8 @@ mod tests {
             async fn local_exists_batch(&self, request: ExistsBatch) -> Result<ExistsBatchResponse, ReplicationStoreClientError>;
             async fn local_get(&self, request: Get) -> Result<GetResponse, ReplicationStoreClientError>;
             async fn local_query(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError>;
+            async fn get_metadata(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError>;
+            async fn local_get_metadata(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError>;
         }
     }
 
@@ -413,8 +413,8 @@ mod tests {
         use std::net::UdpSocket;
         use std::sync::Arc;
 
+        use lore_base::lore_spawn;
         use lore_base::runtime::LORE_CONTEXT;
-        use lore_base::runtime::runtime;
         use lore_storage::ImmutableStore;
         use lore_storage::MutableStore;
         use lore_transport::quic::client::CertificateSettings;
@@ -479,29 +479,28 @@ mod tests {
             let (immutable_store, mutable_store, execution) =
                 test_store_create().await.expect("Failed to create store");
 
-            runtime()
-                .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                    let (server_addr, _server) = start_test_server(immutable_store, mutable_store);
+            lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+                let (server_addr, _server) = start_test_server(immutable_store, mutable_store);
 
-                    let client = no_tls_factory(server_addr)
-                        .make_client(Some(LARGE_CWND))
-                        .await
-                        .expect("Failed to connect");
+                let client = no_tls_factory(server_addr)
+                    .make_client(Some(LARGE_CWND))
+                    .await
+                    .expect("Failed to connect");
 
-                    let stats = client
-                        .connection_stats()
-                        .await
-                        .expect("Should always have connection stats");
+                let stats = client
+                    .connection_stats()
+                    .await
+                    .expect("Should always have connection stats");
 
-                    assert!(
-                        stats.path.cwnd >= LARGE_CWND,
-                        "cwnd ({}) should be >= configured initial_cwnd ({})",
-                        stats.path.cwnd,
-                        LARGE_CWND,
-                    );
-                }))
-                .await
-                .expect("Test task failed");
+                assert!(
+                    stats.path.cwnd >= LARGE_CWND,
+                    "cwnd ({}) should be >= configured initial_cwnd ({})",
+                    stats.path.cwnd,
+                    LARGE_CWND,
+                );
+            }))
+            .await
+            .expect("Test task failed");
         }
 
         /// Connects without an `initial_cwnd` hint and verifies the resulting window
@@ -512,30 +511,29 @@ mod tests {
             let (immutable_store, mutable_store, execution) =
                 test_store_create().await.expect("Failed to create store");
 
-            runtime()
-                .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                    let (server_addr, _server) = start_test_server(immutable_store, mutable_store);
+            lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+                let (server_addr, _server) = start_test_server(immutable_store, mutable_store);
 
-                    let client = no_tls_factory(server_addr)
-                        .make_client(None)
-                        .await
-                        .expect("Failed to connect");
+                let client = no_tls_factory(server_addr)
+                    .make_client(None)
+                    .await
+                    .expect("Failed to connect");
 
-                    let stats = client
-                        .connection_stats()
-                        .await
-                        .expect("Should always have connection stats");
+                let stats = client
+                    .connection_stats()
+                    .await
+                    .expect("Should always have connection stats");
 
-                    assert!(
-                        stats.path.cwnd < LARGE_CWND,
-                        "default cwnd ({}) should be < large initial_cwnd ({}); \
+                assert!(
+                    stats.path.cwnd < LARGE_CWND,
+                    "default cwnd ({}) should be < large initial_cwnd ({}); \
                          if flaky, BBR grew too fast — increase LARGE_CWND",
-                        stats.path.cwnd,
-                        LARGE_CWND,
-                    );
-                }))
-                .await
-                .expect("Test task failed");
+                    stats.path.cwnd,
+                    LARGE_CWND,
+                );
+            }))
+            .await
+            .expect("Test task failed");
         }
     }
 

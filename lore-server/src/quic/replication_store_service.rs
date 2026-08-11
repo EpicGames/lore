@@ -76,6 +76,8 @@ pub enum Command {
     ImmutableLocalGet = 6,
     ImmutableLocalQuery = 7,
     ImmutableLocalPut = 8,
+    ImmutableGetMetadata = 9,
+    ImmutableLocalGetMetadata = 10,
 }
 
 impl From<Command> for QuicOpCode {
@@ -98,6 +100,10 @@ impl TryFrom<QuicOpCode> for Command {
             v if v == Command::ImmutableLocalGet as u8 => Ok(Command::ImmutableLocalGet),
             v if v == Command::ImmutableLocalQuery as u8 => Ok(Command::ImmutableLocalQuery),
             v if v == Command::ImmutableLocalPut as u8 => Ok(Command::ImmutableLocalPut),
+            v if v == Command::ImmutableGetMetadata as u8 => Ok(Command::ImmutableGetMetadata),
+            v if v == Command::ImmutableLocalGetMetadata as u8 => {
+                Ok(Command::ImmutableLocalGetMetadata)
+            }
             _ => Err(UnknownCommand(value)),
         }
     }

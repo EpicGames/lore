@@ -300,7 +300,7 @@ pub async fn history(
         .send();
 
         if !metadata_hash.is_zero() {
-            event::metadata::send(&metadata).internal("sending metadata event")?;
+            event::metadata::send(&metadata);
         }
 
         if crossed_branch {

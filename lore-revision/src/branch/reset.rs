@@ -114,6 +114,9 @@ pub async fn reset(
     branch: String,
     revision: String,
 ) -> Result<(), ResetError> {
+    let context = execution_context();
+    let global = context.globals();
+
     let (_current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
         .await
         .forward::<ResetError>("loading current anchor")?;
@@ -168,8 +171,8 @@ pub async fn reset(
     let revision = revision::resolve(
         repository.clone(),
         revision.as_str(),
-        execution_context().globals().search_limit(),
-        execution_context().globals().search_location(),
+        global.search_limit(),
+        global.search_location(),
     )
     .await
     .forward::<ResetError>("resolving revision")?;
@@ -183,16 +186,16 @@ pub async fn reset(
         ));
     }
 
+    // Restore the name-to-id mapping for the branch to ensure it shows up in the local branch list.
     let mapped = branch::load_name_to_id_local(repository.clone(), branch_name)
         .await
         .unwrap_or_default();
-    if mapped != Context::default() && mapped != branch.id {
+    if mapped != Context::default() && mapped != branch.id && !global.force() {
         return Err(ResetError::internal(
             "Given branch's name is already used by another branch",
         ));
     }
-    if mapped == Context::default() {
-        // Restore the name-to-id mapping for the branch to ensure it shows up in the local branch list.
+    if mapped == Context::default() || global.force() {
         branch::store_name_to_id(repository.clone(), branch.id, &branch_name)
             .await
             .forward::<ResetError>("restoring name-to-id mapping")?;

@@ -26,6 +26,7 @@ use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
+use lore_macro::ValidateText;
 use lore_revision::event::EventError;
 use lore_revision::event::LoreBytes;
 use lore_revision::event::LoreErrorCode;
@@ -51,7 +52,7 @@ use crate::storage::store::StoreInternal;
 
 /// One get item — the `(partition, address)` to read.
 #[repr(C)]
-#[derive(Copy, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[derive(Copy, Clone, Default, PartialEq, Deserialize, Serialize, ValidateText)]
 pub struct LoreStorageGetItem {
     /// Caller-chosen id echoed back in every event for this item
     pub id: u64,

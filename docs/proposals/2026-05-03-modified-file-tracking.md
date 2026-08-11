@@ -3,7 +3,7 @@ lep: 2026-05-03-modified-file-tracking
 title: Modified file tracking
 authors:
   - Mattias Jansson
-status: Draft
+status: Approved
 created: 2026-05-03
 updated: 2026-05-03
 discussion: https://crowd.urc.internal.epicgames.net/Epic/URC/change-request/new/main/mjansson%2Fmodified-file-tracking-impl

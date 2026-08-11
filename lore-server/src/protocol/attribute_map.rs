@@ -70,6 +70,7 @@ pub fn repository_id_from_context(context: &Arc<AttributeMap>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use lore_base::lore_spawn;
 
     use super::*;
 
@@ -84,7 +85,7 @@ mod tests {
         let map = Arc::new(AttributeMap::default());
 
         let m: Arc<AttributeMap> = Arc::clone(&map);
-        tokio::spawn(async move {
+        lore_spawn!(async move {
             m.insert(42);
         })
         .await
@@ -93,7 +94,7 @@ mod tests {
         assert_eq!(&42, &*map.get::<i32>().unwrap());
 
         let m: Arc<AttributeMap> = Arc::clone(&map);
-        tokio::spawn(async move {
+        lore_spawn!(async move {
             m.insert(834);
         })
         .await
@@ -108,7 +109,7 @@ mod tests {
         let data_clone = data.clone();
 
         let m: Arc<AttributeMap> = Arc::clone(&map);
-        tokio::spawn(async move {
+        lore_spawn!(async move {
             m.insert(data_clone);
         })
         .await

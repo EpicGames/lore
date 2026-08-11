@@ -58,12 +58,11 @@ The **Default** column shows the value `lore repository create` and `lore clone`
 
 ### `[file]` table
 
-The `[file]` table controls how the client writes files into the working tree. All three fields are Boolean and default to `false`.
+The `[file]` table controls how the client writes files into the working tree. Both fields are Boolean and default to `false`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `direct_write` | Boolean | `false` | Write to target files directly instead of writing a temporary file and moving it into place. Writes may not be atomic, so an error can leave a file in an inconsistent state. |
-| `direct_io` | Boolean | `false` | Use direct file read and write calls instead of memory-mapping files. |
 | `flush_write` | Boolean | `false` | Flush file data to disk after each write. Parsed from the config but not currently wired to any write path, so setting it has no effect today. |
 
 ### Shared-store table

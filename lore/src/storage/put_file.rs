@@ -26,6 +26,7 @@ use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
+use lore_macro::ValidateText;
 use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
@@ -49,7 +50,7 @@ use crate::storage::store::StoreInternal;
 /// One `put_file` item — read the file at `path` and store it at
 /// `(partition, context)`.
 #[repr(C)]
-#[derive(Clone, PartialEq, Default, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Default, Deserialize, Serialize, ValidateText)]
 pub struct LoreStoragePutFileItem {
     /// Caller-chosen id echoed back in `PUT_ITEM_COMPLETE`
     pub id: u64,
@@ -225,7 +226,7 @@ async fn resolve_put_file_item(
     )
     .await
     {
-        Ok((address, _fragment)) => (address, LoreErrorCode::None),
+        Ok((address, _size)) => (address, LoreErrorCode::None),
         Err(err) => (
             Address::default(),
             crate::storage::storage_error_to_code(&err),

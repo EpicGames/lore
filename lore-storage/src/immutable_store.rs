@@ -319,6 +319,25 @@ pub trait ImmutableStore: Any + Send + Sync {
         match_requested: StoreMatch,
     ) -> Result<StoreQueryResult, StoreError>;
 
+    /// Query the fragment describing the payload stored for the given address.
+    ///
+    /// Where [`ImmutableStore::query`] answers whether a payload exists and where it is stored,
+    /// this answers *what it is* — its compression and its sizes. The two are separate because a
+    /// store that keeps the fragment beside the payload rather than in an index has to go and read
+    /// it, which costs a round trip that `query` deliberately avoids: `query` sits on the ingress
+    /// write path and runs once per fragment stored.
+    ///
+    /// Required rather than defaulted. A default delegating to `query` is right for a store whose
+    /// `query` already reports the representation, and silently wrong for a wrapper that forwards
+    /// `query` alone — the wrapper's own `query` would answer, the inner store's override would
+    /// never run, and the caller would get a well-formed fragment with no sizes and no error. Every
+    /// implementor decides instead.
+    async fn get_metadata(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+    ) -> Result<StoreQueryResult, StoreError>;
+
     /// Get the immutable data for the given address within the partition.
     /// Match requirement controls cross-partition and cross-context load behavior.
     /// Returns `StoreError::AddressNotFound` if no match is made.

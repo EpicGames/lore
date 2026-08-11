@@ -29,6 +29,7 @@ use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
+use lore_macro::ValidateText;
 use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
@@ -51,7 +52,7 @@ use crate::storage::store::StoreInternal;
 /// One `get_file` item — read content at `(partition, address)` and
 /// write it to the file at `path`.
 #[repr(C)]
-#[derive(Clone, PartialEq, Default, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Default, Deserialize, Serialize, ValidateText)]
 pub struct LoreStorageGetFileItem {
     /// Caller-chosen id echoed back in `GET_ITEM_COMPLETE`
     pub id: u64,

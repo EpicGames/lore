@@ -717,6 +717,7 @@ mod tests {
     use lore_base::error::AddressNotFound;
     use lore_base::error::PluginConfigError;
     use lore_base::error::PluginInitError;
+    use lore_base::lore_spawn;
     use lore_base::types::Address;
     use lore_base::types::Fragment;
     use lore_base::types::Hash;
@@ -753,6 +754,14 @@ mod tests {
 
     #[async_trait]
     impl ImmutableStore for MockImmutableStore {
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreQueryResult, StoreError> {
+            self.query(partition, address, StoreMatch::MatchFull).await
+        }
+
         async fn exist(
             self: Arc<Self>,
             _partition: Partition,
@@ -1996,7 +2005,7 @@ mod tests {
         // Spawn the background receiver and verify it completes successfully
         let mut join_set = tokio::task::JoinSet::new();
         for receiver in output.receivers {
-            join_set.spawn(receiver);
+            lore_spawn!(join_set, receiver);
         }
         let result = join_set
             .join_next()

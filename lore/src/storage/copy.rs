@@ -42,6 +42,7 @@ use lore_base::types::Context;
 use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
+use lore_macro::ValidateText;
 use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
@@ -66,7 +67,7 @@ use crate::storage::store::StoreInternal;
 /// One copy item — relocate content from `(source_partition, source_address)` to
 /// `(target_partition, source_address.hash, target_context)`, preserving the content hash.
 #[repr(C)]
-#[derive(Copy, Clone, Default, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Deserialize, Serialize, ValidateText)]
 pub struct LoreStorageCopyItem {
     /// Caller-chosen id echoed back in `COPY_ITEM_COMPLETE`
     pub id: u64,

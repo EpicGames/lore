@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: MIT
 use std::alloc::Layout;
 use std::io;
-use std::io::Read;
-use std::io::Write;
 use std::marker::PhantomData;
 use std::ops::Deref;
 use std::ops::DerefMut;
@@ -33,6 +31,33 @@ unsafe impl<T: Send> Send for GrowBox<T> {}
 unsafe impl<T: Sync> Sync for GrowBox<T> {}
 
 impl<T> GrowBox<T> {
+    /// Allocates a chunk without zeroing it.
+    ///
+    /// # Safety
+    ///
+    /// Every byte must be written before anything reads the chunk. `T` here is an array of
+    /// `FromBytes` elements, so any bit pattern is a valid value once written, but reading the
+    /// allocation before it is filled reads uninitialised memory.
+    unsafe fn new_uninit() -> Self {
+        let Ok(layout) = Layout::from_size_align(size_of::<T>(), align_of::<T>()) else {
+            panic!("Unable to construct memory layout for heap boxed item");
+        };
+
+        // SAFETY: The allocator is safe, we check return and panic on OOM. The caller fills
+        // every byte before the contents are read.
+        let block = unsafe { super::growvec_allocator().alloc(layout) };
+        let Some(ptr) = NonNull::new(block.cast()) else {
+            panic!("Unable to allocate memory for heap boxed item");
+        };
+
+        GROWVEC_MEMORY_USED.fetch_add(layout.size() as u64, Ordering::Relaxed);
+
+        Self {
+            ptr,
+            _marker: PhantomData,
+        }
+    }
+
     fn new_zeroed() -> Self
     where
         T: FromZeros,
@@ -149,6 +174,39 @@ where
 
         while size >= N {
             let chunk = GrowBox::new_zeroed();
+            vec.chunks.push(chunk);
+            size -= N;
+            vec.partial_len = N;
+        }
+
+        if size > 0 {
+            let chunk = GrowBox::new_zeroed();
+            vec.chunks.push(chunk);
+            vec.partial_len = size;
+        }
+
+        vec
+    }
+
+    /// Allocates room for `size` elements without zeroing the chunks the caller is about to
+    /// fill completely.
+    ///
+    /// The last chunk is zeroed regardless: only its first `size % N` elements are inside the
+    /// vector, and leaving the rest uninitialised would put uninitialised memory in a `[T; N]`.
+    /// Every earlier chunk is written whole by the read this exists for, so zeroing it first
+    /// would write it twice — the same reasoning `lore-io` applies to its own read buffers.
+    ///
+    /// # Safety
+    ///
+    /// Every byte of [`GrowVec::byte_segments_mut`] must be written before any element is read,
+    /// and a read that fills less than all of it must be reported as an error rather than
+    /// returning the vector.
+    pub unsafe fn new_unzeroed_with_size(mut size: usize) -> Self {
+        let mut vec = Self::new();
+
+        while size >= N {
+            // SAFETY: the caller fills every byte of every full chunk before reading it.
+            let chunk = unsafe { GrowBox::new_uninit() };
             vec.chunks.push(chunk);
             size -= N;
             vec.partial_len = N;
@@ -293,15 +351,51 @@ where
         &mut self.chunks[chunk_index].element[element_index]
     }
 
-    pub fn read_from_file(
-        file: &mut std::fs::File,
+    /// The occupied bytes of each chunk, in element order. The chunk
+    /// allocations are stable heap blocks: they do not move when the
+    /// `GrowVec` itself moves, only when elements are inserted or pushed.
+    pub fn byte_segments(&self) -> impl Iterator<Item = &[u8]> {
+        let chunk_count = self.chunks.len();
+        let partial_len = self.partial_len;
+        self.chunks.iter().enumerate().map(move |(index, chunk)| {
+            if index + 1 == chunk_count {
+                chunk.element[..partial_len].as_bytes()
+            } else {
+                chunk.element.as_bytes()
+            }
+        })
+    }
+
+    /// The occupied bytes of each chunk, mutably, in element order. Same
+    /// stability guarantee as [`byte_segments`](Self::byte_segments).
+    pub fn byte_segments_mut(&mut self) -> impl Iterator<Item = &mut [u8]> {
+        let chunk_count = self.chunks.len();
+        let partial_len = self.partial_len;
+        self.chunks
+            .iter_mut()
+            .enumerate()
+            .map(move |(index, chunk)| {
+                if index + 1 == chunk_count {
+                    chunk.element[..partial_len].as_mut_bytes()
+                } else {
+                    chunk.element.as_mut_bytes()
+                }
+            })
+    }
+
+    /// Reads `expected_count` elements from `reader` — a file, a byte
+    /// slice, or any other `Read` source.
+    pub fn read_from(
+        reader: &mut impl io::Read,
         mut expected_count: usize,
     ) -> Result<Self, io::Error> {
         let mut vec = Self::new();
 
         while expected_count >= N {
-            let mut chunk: GrowBox<GrowChunk<T, N>> = GrowBox::new_zeroed();
-            file.read_exact(chunk.element.as_mut_bytes())?;
+            // SAFETY: `read_exact` below writes every byte of the chunk or returns an error, in
+            // which case the vector is dropped here and never read from.
+            let mut chunk: GrowBox<GrowChunk<T, N>> = unsafe { GrowBox::new_uninit() };
+            reader.read_exact(chunk.element.as_mut_bytes())?;
             vec.chunks.push(chunk);
             expected_count -= N;
             vec.partial_len = N;
@@ -309,7 +403,7 @@ where
 
         if expected_count > 0 {
             let mut chunk: GrowBox<GrowChunk<T, N>> = GrowBox::new_zeroed();
-            file.read_exact(chunk.element[..expected_count].as_mut_bytes())?;
+            reader.read_exact(chunk.element[..expected_count].as_mut_bytes())?;
             vec.chunks.push(chunk);
             vec.partial_len = expected_count;
         }
@@ -317,17 +411,19 @@ where
         Ok(vec)
     }
 
-    pub fn write_to_file(&self, file: &mut std::fs::File) -> Result<(), io::Error> {
+    /// Writes all elements to `writer` — a file, a byte-slice cursor, or
+    /// any other `Write` sink.
+    pub fn write_to(&self, writer: &mut impl io::Write) -> Result<(), io::Error> {
         if self.is_empty() {
             return Ok(());
         }
 
         for chunk in self.chunks.iter().take(self.chunks.len() - 1) {
-            file.write_all(chunk.element.as_bytes())?;
+            writer.write_all(chunk.element.as_bytes())?;
         }
 
         if let Some(chunk) = self.chunks.last() {
-            file.write_all(chunk.element[..self.partial_len].as_bytes())?;
+            writer.write_all(chunk.element[..self.partial_len].as_bytes())?;
         }
 
         Ok(())

@@ -3,14 +3,17 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
+use bytes::BytesMut;
 use dashmap::DashMap;
 use dashmap::Entry;
 use lore_error_set::prelude::*;
 use lore_transport::StorageSession;
 use tokio::sync::OwnedSemaphorePermit;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use zerocopy::FromZeros;
 
@@ -166,9 +169,24 @@ pub async fn wait_if_in_flight(partition: Partition, address: Address) {
 }
 
 /// Result of a [`store_fragment`] operation.
+///
+/// The stored representation is deliberately not reported. A dispatched write returns before its
+/// leader has compressed anything, so the only representation available at that point is the one
+/// the caller passed in, and handing that back says nothing the caller did not already know. What
+/// the caller cannot know is where the payload ended up, which is what this carries instead.
+///
+/// The two storage flags describe the state as of this call returning, so a dispatched write
+/// reports both as `false`: its leader has not run yet.
 pub struct StoreResult {
     pub address: Address,
-    pub fragment: Fragment,
+    /// Size of the uncompressed and reassembled content the address stands for. Invariant across
+    /// compression, chunking and deduplication, so it is the one size worth reporting.
+    pub size_content: u64,
+    /// Whether the local store holds the payload.
+    pub stored_local: bool,
+    /// Whether the payload reached durable storage.
+    pub stored_durable: bool,
+    /// Whether the content was already stored, so no upload was needed.
     pub deduplicated: bool,
 }
 
@@ -283,9 +301,26 @@ pub async fn store_fragment(
     };
 
     if let (Some(tracker), Ok(result)) = (observer, &result) {
-        tracker.notify_fragment(&result.fragment, result.deduplicated);
+        tracker.notify_fragment(&observed_fragment(fragment, result), result.deduplicated);
     }
     result
+}
+
+/// The fragment to hand a write observer: the caller's representation, marked with where the
+/// payload ended up.
+///
+/// The representation has to come from the caller. An observer is only installed on a tracker, a
+/// tracker always dispatches, and a dispatched write reports before its leader compresses, so
+/// there is no stored representation to report yet.
+fn observed_fragment(fragment: Fragment, result: &StoreResult) -> Fragment {
+    let mut flags = fragment.flags;
+    if result.stored_local {
+        flags |= FragmentFlags::PayloadStoredLocal;
+    }
+    if result.stored_durable {
+        flags |= FragmentFlags::PayloadStoredDurable;
+    }
+    Fragment { flags, ..fragment }
 }
 
 /// Backward-compatible synchronous fragment store. Acquires the in-flight
@@ -321,7 +356,9 @@ async fn store_fragment_inline(
     ) {
         return Ok(StoreResult {
             address,
-            fragment: query.fragment,
+            size_content: fragment.size_content,
+            stored_local,
+            stored_durable,
             deduplicated: true,
         });
     }
@@ -329,7 +366,7 @@ async fn store_fragment_inline(
     // Local-only fast path: skip STORE_IN_FLIGHT entirely. No follower notification needed,
     // no leader-token rendezvous — just compress+write inline.
     if remote_session.is_none() {
-        let (_, final_fragment) = leader_body(
+        let (stored_local, stored_durable) = leader_body(
             store,
             partition,
             address,
@@ -344,7 +381,9 @@ async fn store_fragment_inline(
         .await?;
         return Ok(StoreResult {
             address,
-            fragment: final_fragment,
+            size_content: fragment.size_content,
+            stored_local,
+            stored_durable,
             deduplicated,
         });
     }
@@ -359,16 +398,14 @@ async fn store_fragment_inline(
         drop(permit);
         return Ok(StoreResult {
             address,
-            fragment: if query.match_made == StoreMatch::MatchFull {
-                query.fragment
-            } else {
-                fragment
-            },
+            size_content: fragment.size_content,
+            stored_local,
+            stored_durable,
             deduplicated: true,
         });
     };
 
-    let (_, final_fragment) = leader_body(
+    let (stored_local, stored_durable) = leader_body(
         store,
         partition,
         address,
@@ -383,7 +420,9 @@ async fn store_fragment_inline(
     .await?;
     Ok(StoreResult {
         address,
-        fragment: final_fragment,
+        size_content: fragment.size_content,
+        stored_local,
+        stored_durable,
         deduplicated,
     })
 }
@@ -411,7 +450,9 @@ async fn store_fragment_dispatched(
             tracker.register_follower(follower_future(store.clone(), partition, address, token));
             return Ok(StoreResult {
                 address,
-                fragment,
+                size_content: fragment.size_content,
+                stored_local: false,
+                stored_durable: false,
                 deduplicated: true,
             });
         }
@@ -432,7 +473,9 @@ async fn store_fragment_dispatched(
         drop(permit);
         return Ok(StoreResult {
             address,
-            fragment: query.fragment,
+            size_content: fragment.size_content,
+            stored_local,
+            stored_durable,
             deduplicated: true,
         });
     }
@@ -453,10 +496,13 @@ async fn store_fragment_dispatched(
             permit,
         )
         .await
+        .map(|_stored| ())
     });
     Ok(StoreResult {
         address,
-        fragment,
+        size_content: fragment.size_content,
+        stored_local: false,
+        stored_durable: false,
         deduplicated,
     })
 }
@@ -499,11 +545,13 @@ fn is_fully_satisfied(
 /// The "work" portion of [`store_fragment`]: optionally load existing local
 /// payload, compress, attempt remote upload, and write the terminal entry.
 ///
+/// Returns where the payload ended up, as `(stored_local, stored_durable)`.
+///
 /// `guard` is the in-flight token the caller acquired before invoking this function. When
 /// `None`, no in-flight machinery is in play (the local-only fast path that bypasses the
 /// dedup token entirely — see [`store_fragment_inline`]). When `Some`, dropping the guard at
 /// the end cancels the token and wakes any followers subscribed to this write.
-#[allow(clippy::too_many_arguments, unused_assignments)]
+#[allow(clippy::too_many_arguments)]
 async fn leader_body(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
@@ -515,7 +563,7 @@ async fn leader_body(
     query: StoreQueryResult,
     guard: Option<StoreInFlightGuard>,
     permit: Option<OwnedSemaphorePermit>,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<(bool, bool), StorageError> {
     let (mut stored_local, mut stored_durable) = stored_flags(&query);
 
     // For a partial match try loading the payload from local store instead of recompressing
@@ -551,10 +599,11 @@ async fn leader_body(
     let mode = crate::compress::CompressionMode::from_u32(COMPRESSION_MODE.load(Ordering::Relaxed));
     if !stored_local && mode != crate::compress::CompressionMode::NoCompression {
         let _compress_permit = crate::concurrency::compress_limit_acquire().await;
-        let compress_buffer = buffer.clone();
-        if let Ok((compressed_fragment, compressed_buffer)) =
-            crate::compress::compress_async(fragment, compress_buffer, mode).await
-        {
+        if let Ok((compressed_fragment, compressed_buffer)) = crate::compress::compress(
+            fragment,
+            &buffer.as_ref()[..fragment.size_payload as usize],
+            mode,
+        ) {
             lore_base::lore_trace!(
                 "Compressed {} bytes to {} bytes",
                 fragment.size_payload,
@@ -578,17 +627,20 @@ async fn leader_body(
         fragment.flags &= !FragmentFlags::PayloadStoredDurable;
     }
 
-    let payload = if !stored_durable || cache_local {
-        Some(buffer)
+    let (payload, permit) = if !stored_durable || cache_local {
+        (Some(buffer), permit)
     } else {
-        None
+        drop(buffer);
+        drop(permit);
+        (None, None)
     };
+    stored_local |= payload.is_some();
 
     write_raw(store, partition, address, fragment, payload).await?;
 
     drop(permit);
     drop(guard);
-    Ok((address, fragment))
+    Ok((stored_local, stored_durable))
 }
 
 /// Store a raw fragment locally (no remote, no event emission).
@@ -600,7 +652,7 @@ pub async fn store_raw_local(
     fragment: Fragment,
     buffer: Bytes,
     cache_local: bool,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<Address, StorageError> {
     let result = store_fragment(
         store,
         partition,
@@ -613,7 +665,47 @@ pub async fn store_raw_local(
         None,
     )
     .await?;
-    Ok((result.address, result.fragment))
+    Ok(result.address)
+}
+
+/// Content writes running now, and the most that have run at once since the peak was reset.
+///
+/// Process-wide across every caller, like `REMOTE_FETCH_INFLIGHT` on the read side: total
+/// pressure rather than one operation's share. Counted per whole content write — one buffer or
+/// one file — not per fragment.
+static CONTENT_WRITE_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+static CONTENT_WRITE_PEAK: AtomicUsize = AtomicUsize::new(0);
+
+/// See [`CONTENT_WRITE_INFLIGHT`].
+pub fn content_write_inflight() -> usize {
+    CONTENT_WRITE_INFLIGHT.load(Ordering::Relaxed)
+}
+
+/// See [`CONTENT_WRITE_PEAK`].
+pub fn content_write_peak() -> usize {
+    CONTENT_WRITE_PEAK.load(Ordering::Relaxed)
+}
+
+/// Drops the peak to the count in flight now, so what follows is measured on its own.
+pub fn reset_content_write_peak() {
+    CONTENT_WRITE_PEAK.store(content_write_inflight(), Ordering::Relaxed);
+}
+
+/// Counts one content write while it runs, so an early return or a panic cannot leak the count.
+struct ContentWriteGuard;
+
+impl ContentWriteGuard {
+    fn new() -> Self {
+        let in_flight = CONTENT_WRITE_INFLIGHT.fetch_add(1, Ordering::Relaxed) + 1;
+        CONTENT_WRITE_PEAK.fetch_max(in_flight, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ContentWriteGuard {
+    fn drop(&mut self) {
+        CONTENT_WRITE_INFLIGHT.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// Write content (fragmenting if needed).
@@ -630,14 +722,11 @@ pub async fn write_content(
     flags: WriteOptions,
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<WriteTracker>>,
-) -> Result<(Address, Fragment), StorageError> {
+    permit: Option<OwnedSemaphorePermit>,
+) -> Result<Address, StorageError> {
+    let _in_flight = ContentWriteGuard::new();
     // Check if data should be a single fragment
     if buffer.len() <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
-        let buffer = if flags.clone_buffer {
-            Bytes::copy_from_slice(buffer.as_ref())
-        } else {
-            buffer
-        };
         let address = Address {
             context,
             hash: hash::hash_slice(buffer.as_ref()),
@@ -647,7 +736,11 @@ pub async fn write_content(
             size_payload: buffer.len() as u32,
             size_content: buffer.len() as u64,
         };
-        let permit = crate::concurrency::acquire_fragment_memory_permit(buffer.len()).await;
+        // Reuse the caller's read reservation if provided, else reserve here.
+        let permit = match permit {
+            Some(permit) => Some(permit),
+            None => crate::concurrency::acquire_fragment_memory_permit(buffer.len()).await,
+        };
         let result = store_fragment(
             store,
             partition,
@@ -660,7 +753,7 @@ pub async fn write_content(
             permit,
         )
         .await?;
-        Ok((result.address, result.fragment))
+        Ok(result.address)
     } else {
         write_fragmented(
             store,
@@ -671,6 +764,7 @@ pub async fn write_content(
             false,
             remote_session,
             tracker,
+            permit,
         )
         .await
     }
@@ -679,6 +773,11 @@ pub async fn write_content(
 /// Write content from a file.
 ///
 /// Takes a store, partition, and optional remote session directly.
+///
+/// Returns the address and the size of the content behind it. The size is reported because a
+/// caller that hands over a path has no other way to learn what was actually written: stating the
+/// file again afterwards answers for the file as it is then, not for the bytes this address
+/// stands for.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_from_file(
     store: Arc<dyn ImmutableStore>,
@@ -688,63 +787,75 @@ pub async fn write_from_file(
     flags: WriteOptions,
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<WriteTracker>>,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<(Address, u64), StorageError> {
+    let _in_flight = ContentWriteGuard::new();
     let _count_permit = file_count_limit_acquire()
         .await
         .forward::<StorageError>("permit failed")?;
-    {
-        let mut retry = crate::retry(10, 10_000, 10);
-        let (buffer, is_mmapped) = loop {
-            match crate::defragment::open_mmap_read(path).await {
-                Ok(result) => break result,
-                Err(err) => {
-                    if !retry.wait().await {
-                        return Err(StorageError::internal_with_context(
-                            err,
-                            &format!("open file: {}", path.display()),
-                        ));
-                    }
+    let mut retry = crate::retry(10, 10_000, 10);
+    let (file, size) = loop {
+        match crate::chunker::open_read(path).await {
+            Ok(result) => break result,
+            Err(err) => {
+                if !retry.wait().await {
+                    return Err(StorageError::internal_with_context(
+                        err,
+                        &format!("open file: {}", path.display()),
+                    ));
                 }
             }
-        };
-
-        lore_base::lore_trace!(
-            "Opened file to read from for immutable data write: {} size {} mmap {}",
-            path.display(),
-            buffer.len(),
-            is_mmapped
-        );
-
-        if !buffer.is_empty() {
-            // Only mmapped buffers need to be cloned for consistent reads — an
-            // owned heap buffer is already a snapshot.
-            let mut flags = flags;
-            if is_mmapped {
-                flags.clone_buffer = true;
-            }
-
-            let (address, fragment) = write_content(
-                store,
-                partition,
-                context,
-                buffer,
-                flags,
-                remote_session,
-                tracker,
-            )
-            .await?;
-
-            Ok((address, fragment))
-        } else {
-            Ok((
-                Address {
-                    context,
-                    hash: Hash::new_zeroed(),
-                },
-                Fragment::new_zeroed(),
-            ))
         }
+    };
+
+    lore_base::lore_trace!(
+        "Opened file to read from for immutable data write: {} size {size}",
+        path.display(),
+    );
+
+    if size == 0 {
+        return Ok((
+            Address {
+                context,
+                hash: Hash::new_zeroed(),
+            },
+            0,
+        ));
     }
+
+    // Anything larger than one fragment streams, so the scan never holds a file resident.
+    let size = size as usize;
+    if size <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
+        let read_permit = crate::concurrency::acquire_fragment_memory_permit(size).await;
+        let buffer = file.read_exact_at(size, 0).await.map_err(|e| {
+            StorageError::internal_with_context(e, &format!("read file: {}", path.display()))
+        })?;
+        let address = write_content(
+            store,
+            partition,
+            context,
+            buffer,
+            flags,
+            remote_session,
+            tracker,
+            read_permit,
+        )
+        .await?;
+        return Ok((address, size as u64));
+    }
+
+    let address = crate::fragment_engine::write_fragmented_from_file(
+        store,
+        partition,
+        context,
+        file,
+        size,
+        flags,
+        false,
+        remote_session,
+        tracker,
+    )
+    .await?;
+    Ok((address, size as u64))
 }
 
 /// Hash a file's content, using previous fragmentation hints when available.
@@ -765,7 +876,7 @@ pub async fn hash_file(
         .forward::<StorageError>("permit failed")?;
 
     let path = path.as_ref();
-    let Ok(metadata) = tokio::fs::metadata(path).await else {
+    let Ok(metadata) = lore_io::IoDriver::global().metadata(path).await else {
         return Err(StorageError::internal(format!(
             "failed to query file metadata: {}",
             path.display()
@@ -781,10 +892,13 @@ pub async fn hash_file(
         return Ok(Hash::new_zeroed());
     }
     if file_size <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
-        let data = tokio::fs::read(path).await.map_err(|e| {
-            StorageError::internal_with_context(e, &format!("read file: {}", path.display()))
-        })?;
-        return Ok(Hash::hash_buffer(data.as_slice()));
+        let data = lore_io::IoDriver::global()
+            .read_file_bytes(path)
+            .await
+            .map_err(|e| {
+                StorageError::internal_with_context(e, &format!("read file: {}", path.display()))
+            })?;
+        return Ok(Hash::hash_buffer(&data));
     }
 
     // Large files: try loading previous fragmentation to compare chunk hashes.
@@ -818,11 +932,16 @@ pub async fn hash_file(
         // Failed to load or size mismatch — fall through to re-fragment
     }
 
-    // Open the file for fragmented hashing (mmap for large files, buffered otherwise)
+    // Chunks are read on demand, so a mismatch early in the list stops after reading only
+    // the chunks it compared.
+    // Opened rather than measured again: the size above is the one the chunker is opened at.
     let mut retry = crate::retry(10, 10_000, 10);
-    let (buffer, _is_mmapped) = loop {
-        match crate::defragment::open_mmap_read(path).await {
-            Ok(result) => break result,
+    let file = loop {
+        match lore_io::IoDriver::global()
+            .open(path, &lore_io::OpenOptions::new().read(true))
+            .await
+        {
+            Ok(file) => break file,
             Err(err) => {
                 if !retry.wait().await {
                     return Err(StorageError::internal_with_context(
@@ -837,111 +956,31 @@ pub async fn hash_file(
     // If we have a non-empty previous fragment list, check if chunks still match
     if let Some(ref frag_bytes) = fragment_list {
         let previous_fragmentation = frag_bytes.as_type_slice::<FragmentReference>();
-        if !previous_fragmentation.is_empty() {
-            let mut previous_fragmentation = previous_fragmentation.to_vec();
-            let mut hash_match = true;
-            let mut index = 0;
-            while index < previous_fragmentation.len() {
-                let current = &previous_fragmentation[index];
-
-                let next_offset = if index < (previous_fragmentation.len() - 1) {
-                    previous_fragmentation[index + 1].offset_content
-                } else {
-                    file_size as u64
-                };
-                let chunk_size = (next_offset - current.offset_content) as usize;
-
-                lore_base::lore_trace!(
-                    "Chunk {index} offset {} to next offset {}, size {} in {}",
-                    current.offset_content,
-                    next_offset,
-                    chunk_size,
-                    path.display()
-                );
-
-                if chunk_size > crate::compress::FRAGMENT_SIZE_THRESHOLD {
-                    // Hash checking if content is recursively fragmented
-                    lore_base::lore_trace!("Hash checking recursively fragmented chunks");
-                    let sub_options = ReadOptions::default().no_decompress().no_verify();
-                    let Ok((sub_fragment, sub_payload)) = load_fragment(
-                        store.clone(),
-                        partition,
-                        Address {
-                            context: previous.context,
-                            hash: current.hash,
-                        },
-                        sub_options,
-                        remote_session.clone(),
-                    )
-                    .await
-                    else {
-                        hash_match = false;
-                        break;
-                    };
-
-                    if sub_fragment.flags & FragmentFlags::PayloadFragmented != 0 {
-                        let sub_payload = sub_payload.to_aligned::<FragmentReference>();
-                        let subfragment_list = sub_payload.as_type_slice::<FragmentReference>();
-                        let mut remain = if index < previous_fragmentation.len() - 1 {
-                            previous_fragmentation.split_off(index + 1)
-                        } else {
-                            vec![]
-                        };
-                        previous_fragmentation.pop();
-                        previous_fragmentation.extend_from_slice(subfragment_list);
-                        previous_fragmentation.append(&mut remain);
-                        lore_base::lore_trace!(
-                            "Added {} chunks for recursive checking",
-                            subfragment_list.len()
-                        );
-                    } else {
-                        lore_base::lore_warn!("Subfragment was not expected fragment list");
-                        hash_match = false;
-                        break;
-                    }
-                } else {
-                    let current_offset = current.offset_content as usize;
-                    let end_offset = current_offset + chunk_size;
-                    if end_offset <= buffer.len() {
-                        let file_hash = Hash::hash_buffer(&buffer[current_offset..end_offset]);
-                        if file_hash != current.hash {
-                            lore_base::lore_trace!(
-                                "Checking previous chunk {index} [{current_offset}..{end_offset}] hash yielded different file hash, abandon {}",
-                                path.display()
-                            );
-                            hash_match = false;
-                            break;
-                        } else {
-                            lore_base::lore_trace!(
-                                "Checking previous chunk {index} [{current_offset}..{end_offset}] hash yielded same file hash, continue {}",
-                                path.display()
-                            );
-                        }
-                    } else {
-                        lore_base::lore_trace!(
-                            "Previous chunk {index} [{current_offset}..{end_offset}] extends beyond buffer end, hash mismatch for {}",
-                            path.display()
-                        );
-                        hash_match = false;
-                        break;
-                    }
-
-                    index += 1;
-                }
-            }
-
-            if hash_match {
-                return Ok(previous.hash);
-            }
+        if !previous_fragmentation.is_empty()
+            && previous_chunks_still_match(
+                SublistSource {
+                    store: &store,
+                    partition,
+                    context: previous.context,
+                    remote_session: &remote_session,
+                },
+                path,
+                &file,
+                file_size as u64,
+                previous_fragmentation,
+            )
+            .await?
+        {
+            return Ok(previous.hash);
         }
     }
 
-    // No usable previous fragmentation or chunks changed — re-fragment and hash
-    let (address, _) = write_fragmented(
+    let address = crate::fragment_engine::write_fragmented_from_file(
         store,
         partition,
         previous.context,
-        buffer,
+        file,
+        file_size,
         WriteOptions::default().no_remote_write(),
         true,
         None,
@@ -952,10 +991,292 @@ pub async fn hash_file(
     Ok(address.hash)
 }
 
+/// One read covering several consecutive chunks. Sized like the chunker's window and for
+/// the same reason: nothing compared against a window exceeds
+/// [`FRAGMENT_SIZE_THRESHOLD`](crate::compress::FRAGMENT_SIZE_THRESHOLD), so a window
+/// starting on a chunk boundary always holds at least one whole chunk and the walk cannot
+/// stall.
+const HASH_WINDOW_SIZE: usize = 2 * crate::compress::FRAGMENT_SIZE_THRESHOLD;
+
+/// Bytes of the file that are resident, and where they start in it.
+struct HashWindow {
+    offset: u64,
+    data: BytesMut,
+}
+
+/// The buffer for a read of `want` bytes: the window just retired, or a fresh one sized to the
+/// largest this file needs. `capacity` bounds every window, so a retired one always fits.
+fn take_window(spare: &mut Option<BytesMut>, capacity: usize, want: usize) -> BytesMut {
+    let mut buffer = spare
+        .take()
+        // SAFETY: the read below fills the buffer before anything reads a byte of it.
+        .unwrap_or_else(|| unsafe { lore_io::uninit_buffer(capacity) });
+    debug_assert!(buffer.capacity() >= want, "window smaller than the read");
+    // SAFETY: capacity covers `want`, and the read fills all of it before it is hashed.
+    unsafe { buffer.set_len(want) };
+    buffer
+}
+
+/// Start a window read without waiting for it, so it overlaps the hashing of the window
+/// already held. The buffer is filled whole, the walk having no headroom to carry, and the read
+/// hands it back. Dropping the handle detaches the read, which the engine completes and then
+/// frees its buffer.
+fn start_window_read(
+    file: &lore_io::IoFile,
+    buffer: BytesMut,
+    offset: u64,
+) -> JoinHandle<std::io::Result<BytesMut>> {
+    let file = file.clone();
+    let want = buffer.len();
+    lore_base::lore_spawn!(async move {
+        let window = file
+            .read_exact_vectored_at(
+                crate::chunker::WindowRead {
+                    buffer,
+                    start: 0,
+                    want,
+                },
+                offset,
+            )
+            .await?;
+        Ok(window.buffer)
+    })
+}
+
+impl HashWindow {
+    /// Whether `[start, end)` is held whole, and so can be hashed without reading.
+    fn holds(&self, start: u64, end: u64) -> bool {
+        start >= self.offset && end <= self.end()
+    }
+
+    fn end(&self) -> u64 {
+        self.offset + self.data.len() as u64
+    }
+
+    fn slice(&self, start: u64, end: u64) -> &[u8] {
+        let base = (start - self.offset) as usize;
+        &self.data[base..base + (end - start) as usize]
+    }
+}
+
+/// Where chunk `index` ends: where the next one starts, or the end of the file for the
+/// last. `None` if the list does not ascend, which means it does not describe this file —
+/// a subtraction that used to underflow instead.
+fn chunk_end(chunks: &[FragmentReference], index: usize, file_size: u64) -> Option<u64> {
+    let end = match chunks.get(index + 1) {
+        Some(next) => next.offset_content,
+        None => file_size,
+    };
+    (end >= chunks[index].offset_content).then_some(end)
+}
+
+/// Where the read after a window ending at `window_end` must start: the first chunk from
+/// `index` on that the window does not hold whole. `None` when the window already reaches
+/// the last chunk, or when that chunk is one this walk will not read — either fragmented
+/// further, so comparing it means loading its sublist, or outside the file, so the walk is
+/// about to stop.
+fn next_window_offset(
+    chunks: &[FragmentReference],
+    index: usize,
+    window_end: u64,
+    file_size: u64,
+) -> Option<u64> {
+    for (position, chunk) in chunks.iter().enumerate().skip(index) {
+        let end = chunk_end(chunks, position, file_size)?;
+        if end <= window_end {
+            continue;
+        }
+        let readable = end <= file_size
+            && end - chunk.offset_content <= crate::compress::FRAGMENT_SIZE_THRESHOLD as u64;
+        return readable.then_some(chunk.offset_content);
+    }
+    None
+}
+
+/// Where a chunk that turns out to be fragmented further has its own list loaded from.
+/// Only the context is taken from the previous address: the walk names each sublist by the
+/// hash recorded for it in the list above.
+struct SublistSource<'a> {
+    store: &'a Arc<dyn ImmutableStore>,
+    partition: Partition,
+    context: Context,
+    remote_session: &'a Option<Arc<StorageSession>>,
+}
+
+/// Whether the file still hashes to `previous_fragmentation` chunk for chunk, i.e. it is
+/// unchanged and its previous address can be reused.
+///
+/// Reads cover as many consecutive chunks as a window holds and run one window ahead of
+/// the hashing, which is then taken in place. This is the *unchanged* file path for
+/// `status` and `commit`, so the cost per chunk is paid on every file that has not
+/// changed: one blocking read per chunk would be ~16,384 sequential dispatches per GiB,
+/// each allocating and filling its own buffer.
+///
+/// A chunk that no longer matches returns immediately. The walk then stops having read at
+/// most one window more than it compared, where reading per chunk stopped exactly at the
+/// mismatch — the cost of not paying a round trip per chunk on every unchanged file.
+async fn previous_chunks_still_match(
+    sublists: SublistSource<'_>,
+    path: &Path,
+    file: &lore_io::IoFile,
+    file_size: u64,
+    previous_fragmentation: &[FragmentReference],
+) -> Result<bool, StorageError> {
+    // Recursive fragmentation is spliced in as it is found, so the list grows.
+    let mut chunks = previous_fragmentation.to_vec();
+
+    // Released here rather than held into the re-fragmentation the caller may fall through
+    // to, which reserves its own windows.
+    let capacity = file_size.min(HASH_WINDOW_SIZE as u64) as usize;
+    let windows = if file_size <= HASH_WINDOW_SIZE as u64 {
+        1
+    } else {
+        2
+    };
+    let _reservation = crate::concurrency::acquire_fragment_memory_permit(windows * capacity).await;
+
+    let window_length = |offset: u64| (file_size - offset).min(HASH_WINDOW_SIZE as u64) as usize;
+
+    let mut window: Option<HashWindow> = None;
+    let mut pending: Option<(JoinHandle<std::io::Result<BytesMut>>, u64)> = None;
+    let mut spare: Option<BytesMut> = None;
+    let mut index = 0;
+
+    while index < chunks.len() {
+        let current = chunks[index];
+        let start = current.offset_content;
+        let Some(end) = chunk_end(&chunks, index, file_size) else {
+            lore_base::lore_trace!(
+                "Previous chunk {index} at offset {start} does not ascend, hash mismatch for {}",
+                path.display()
+            );
+            return Ok(false);
+        };
+        let chunk_size = end - start;
+
+        lore_base::lore_trace!(
+            "Chunk {index} offset {start} to next offset {end}, size {chunk_size} in {}",
+            path.display()
+        );
+
+        if chunk_size > crate::compress::FRAGMENT_SIZE_THRESHOLD as u64 {
+            lore_base::lore_trace!("Hash checking recursively fragmented chunks");
+            let sub_options = ReadOptions::default().no_decompress().no_verify();
+            let Ok((sub_fragment, sub_payload)) = load_fragment(
+                Arc::clone(sublists.store),
+                sublists.partition,
+                Address {
+                    context: sublists.context,
+                    hash: current.hash,
+                },
+                sub_options,
+                sublists.remote_session.clone(),
+            )
+            .await
+            else {
+                return Ok(false);
+            };
+
+            if sub_fragment.flags & FragmentFlags::PayloadFragmented == 0 {
+                lore_base::lore_warn!("Subfragment was not expected fragment list");
+                return Ok(false);
+            }
+
+            // A window already covering these bytes stays usable: the sublist tiles the
+            // range the window was filled with.
+            let sub_payload = sub_payload.to_aligned::<FragmentReference>();
+            let subfragment_list = sub_payload.as_type_slice::<FragmentReference>();
+            let mut remain = if index < chunks.len() - 1 {
+                chunks.split_off(index + 1)
+            } else {
+                vec![]
+            };
+            chunks.pop();
+            chunks.extend_from_slice(subfragment_list);
+            chunks.append(&mut remain);
+            lore_base::lore_trace!(
+                "Added {} chunks for recursive checking",
+                subfragment_list.len()
+            );
+            continue;
+        }
+
+        if end > file_size {
+            lore_base::lore_trace!(
+                "Previous chunk {index} [{start}..{end}] extends beyond file end, hash mismatch for {}",
+                path.display()
+            );
+            return Ok(false);
+        }
+
+        let resident = match window.take() {
+            Some(resident) if resident.holds(start, end) => resident,
+            stale_window => {
+                // The window it held is the one the next read fills.
+                if let Some(stale) = stale_window {
+                    spare = Some(stale.data);
+                }
+                let read = match pending.take() {
+                    Some((task, offset)) if offset == start => task,
+                    other => {
+                        // Unreachable while the list ascends, since a spliced sublist tiles
+                        // the range it replaces. Kept because the failure it would allow is
+                        // silent: "unchanged" for a file never compared. The detached read
+                        // takes its buffer with it, so this one starts from a fresh window.
+                        drop(other);
+                        let buffer = take_window(&mut spare, capacity, window_length(start));
+                        start_window_read(file, buffer, start)
+                    }
+                };
+                let data = read
+                    .await
+                    .map_err(|e| {
+                        StorageError::internal_with_context(e, "hash compare read task failure")
+                    })?
+                    .map_err(|e| {
+                        StorageError::internal_with_context(
+                            e,
+                            &format!("read file: {}", path.display()),
+                        )
+                    })?;
+                let resident = HashWindow {
+                    offset: start,
+                    data,
+                };
+
+                // Started before anything in this window is hashed, so the two overlap.
+                if let Some(offset) = next_window_offset(&chunks, index, resident.end(), file_size)
+                {
+                    let buffer = take_window(&mut spare, capacity, window_length(offset));
+                    pending = Some((start_window_read(file, buffer, offset), offset));
+                }
+                resident
+            }
+        };
+
+        if Hash::hash_buffer(resident.slice(start, end)) != current.hash {
+            lore_base::lore_trace!(
+                "Checking previous chunk {index} [{start}..{end}] hash yielded different file hash, abandon {}",
+                path.display()
+            );
+            return Ok(false);
+        }
+        lore_base::lore_trace!(
+            "Checking previous chunk {index} [{start}..{end}] hash yielded same file hash, continue {}",
+            path.display()
+        );
+
+        window = Some(resident);
+        index += 1;
+    }
+
+    Ok(true)
+}
+
 /// Follower future: waits for the leader token to fire, then observes the
 /// terminal store state for `address`.
 ///
-/// Returns `Ok((address, fragment))` if the store now holds a full-match entry
+/// Returns `Ok(())` if the store now holds a full-match entry
 /// with either [`PayloadStoredDurable`](FragmentFlags::PayloadStoredDurable) or
 /// [`PayloadStoredLocal`](FragmentFlags::PayloadStoredLocal) set. Returns an
 /// internal error if no terminal entry exists — that means the leader errored
@@ -968,7 +1289,7 @@ pub async fn follower_future(
     partition: Partition,
     address: Address,
     token: CancellationToken,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<(), StorageError> {
     token.cancelled().await;
     match store.query(partition, address, StoreMatch::MatchFull).await {
         Ok(result)
@@ -978,7 +1299,7 @@ pub async fn follower_future(
                         | FragmentFlags::PayloadStoredLocal.bits()))
                     != 0 =>
         {
-            Ok((address, result.fragment))
+            Ok(())
         }
         _ => Err(StorageError::internal(format!(
             "leader upload failed for {address}"
@@ -1057,14 +1378,9 @@ mod tests {
 
         let token = CancellationToken::new();
         token.cancel();
-        let result = follower_future(store, partition, address, token).await;
-        let (addr, frag) = result.expect("follower should observe terminal entry");
-        assert_eq!(addr, address);
-        assert_ne!(
-            frag.flags & FragmentFlags::PayloadStoredLocal.bits(),
-            0,
-            "expected PayloadStoredLocal flag"
-        );
+        follower_future(store, partition, address, token)
+            .await
+            .expect("follower should observe terminal entry stored locally");
     }
 
     #[tokio::test]
@@ -1117,16 +1433,10 @@ mod tests {
             .expect("put terminal entry");
         token.cancel();
 
-        let (addr, frag) = follower
+        follower
             .await
             .expect("join follower")
-            .expect("follower observed terminal entry");
-        assert_eq!(addr, address);
-        assert_ne!(
-            frag.flags & FragmentFlags::PayloadStoredDurable.bits(),
-            0,
-            "expected PayloadStoredDurable flag"
-        );
+            .expect("follower observed terminal entry stored durably");
     }
 
     fn make_input(seed: u8) -> (Partition, Address, Fragment, Bytes) {
@@ -1213,10 +1523,9 @@ mod tests {
         .expect("store_fragment against already-durable entry");
 
         assert!(result.deduplicated, "should dedup on already-durable");
-        assert_ne!(
-            result.fragment.flags & FragmentFlags::PayloadStoredDurable.bits(),
-            0,
-            "returned fragment should carry PayloadStoredDurable"
+        assert!(
+            result.stored_durable,
+            "result should report the entry as durable"
         );
         // Tracker should have no outstanding work.
         assert!(tracker.await_all().await.is_ok());
@@ -1307,6 +1616,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ImmutableStore for FailingPutStore {
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreQueryResult, StoreError> {
+            self.query(partition, address, StoreMatch::MatchFull).await
+        }
+
         fn is_local(&self) -> bool {
             self.inner.clone().is_local()
         }
@@ -1601,6 +1918,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ImmutableStore for DelayingPutStore {
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreQueryResult, StoreError> {
+            self.query(partition, address, StoreMatch::MatchFull).await
+        }
+
         fn is_local(&self) -> bool {
             self.inner.clone().is_local()
         }
@@ -1848,6 +2173,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ImmutableStore for CountingPutStore {
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreQueryResult, StoreError> {
+            self.query(partition, address, StoreMatch::MatchFull).await
+        }
+
         fn is_local(&self) -> bool {
             self.inner.clone().is_local()
         }
@@ -2109,6 +2442,317 @@ mod tests {
             semaphore.available_permits(),
             BUDGET_PERMITS,
             "all permits must be released back to the semaphore"
+        );
+    }
+
+    /// Deterministic and non-repeating, so a window read or sliced at the wrong offset
+    /// changes the hash of every chunk it touches instead of comparing equal by accident.
+    fn hash_test_content(length: usize) -> Vec<u8> {
+        (0..length)
+            .map(|index| (index.wrapping_mul(2_654_435_761) >> 11) as u8)
+            .collect()
+    }
+
+    /// The fragment list for `content` cut at `sizes`, hashed the way the compare path
+    /// hashes the file.
+    fn fragment_list_for(content: &[u8], sizes: &[usize]) -> Vec<FragmentReference> {
+        let mut list = Vec::new();
+        let mut offset = 0;
+        for &size in sizes {
+            list.push(FragmentReference {
+                hash: Hash::hash_buffer(&content[offset..offset + size]),
+                offset_content: offset as u64,
+            });
+            offset += size;
+        }
+        assert_eq!(
+            offset,
+            content.len(),
+            "sizes must cover the content exactly"
+        );
+        list
+    }
+
+    /// Chunk sizes covering `length` in `size` steps plus whatever remains. A step that
+    /// does not divide the window is the interesting case: chunks then straddle window
+    /// boundaries, which is what the read-ahead has to stitch together.
+    fn chunk_sizes(length: usize, size: usize) -> Vec<usize> {
+        let mut sizes = vec![size; length / size];
+        if !length.is_multiple_of(size) {
+            sizes.push(length % size);
+        }
+        sizes
+    }
+
+    async fn compare_file(content: &[u8], chunks: &[FragmentReference]) -> bool {
+        let (dir, store) = make_test_store().await;
+        let path = PathBuf::from(dir.as_ref()).join("hash-compare.bin");
+        std::fs::write(&path, content).expect("write test file");
+        let (file, file_size) = crate::chunker::open_read(&path).await.expect("open");
+
+        previous_chunks_still_match(
+            SublistSource {
+                store: &store,
+                partition: Partition::from([7u8; 16]),
+                context: Address::default().context,
+                remote_session: &None,
+            },
+            &path,
+            &file,
+            file_size,
+            chunks,
+        )
+        .await
+        .expect("compare must not error on a readable file")
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_file_matches_across_every_window() {
+        // Five windows' worth, cut so no chunk boundary lands on a window boundary.
+        let content = hash_test_content(5 * HASH_WINDOW_SIZE + 4_321);
+        let chunks = fragment_list_for(&content, &chunk_sizes(content.len(), 100_003));
+        assert!(chunks.len() > 20, "test wants many chunks per window");
+
+        assert!(
+            compare_file(&content, &chunks).await,
+            "unchanged file must match its own fragment list"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_window_file_matches() {
+        let content = hash_test_content(HASH_WINDOW_SIZE - 17);
+        let chunks = fragment_list_for(&content, &chunk_sizes(content.len(), 200_000));
+
+        assert!(
+            compare_file(&content, &chunks).await,
+            "file smaller than one window must match"
+        );
+    }
+
+    /// The chunk is in the third window, so detecting it proves later windows are read at
+    /// the offset their chunks are hashed against — a window off by even one byte here
+    /// mismatches for a file that is in fact unchanged, and every `status` would
+    /// re-fragment it.
+    #[tokio::test]
+    async fn a_byte_changed_in_a_late_chunk_does_not_match() {
+        let content = hash_test_content(5 * HASH_WINDOW_SIZE + 4_321);
+        let chunks = fragment_list_for(&content, &chunk_sizes(content.len(), 100_003));
+
+        let mut changed = content.clone();
+        let victim = 2 * HASH_WINDOW_SIZE + 11;
+        changed[victim] ^= 0xff;
+
+        assert!(
+            !compare_file(&changed, &chunks).await,
+            "a changed byte in the third window must not match"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_list_covering_more_than_the_file_does_not_match() {
+        let content = hash_test_content(3 * HASH_WINDOW_SIZE);
+        let chunks = fragment_list_for(&content, &chunk_sizes(content.len(), 100_003));
+
+        // The same list against a shorter file: the last chunk now runs past the end.
+        assert!(
+            !compare_file(&content[..content.len() - 1_000], &chunks).await,
+            "a list extending beyond the file must not match"
+        );
+    }
+
+    /// A list whose offsets do not ascend describes something other than this file. The
+    /// chunk size used to be an unchecked subtraction, which underflowed on it.
+    #[tokio::test]
+    async fn a_list_that_does_not_ascend_does_not_match() {
+        let content = hash_test_content(3 * HASH_WINDOW_SIZE);
+        let mut chunks = fragment_list_for(&content, &chunk_sizes(content.len(), 100_003));
+        chunks.swap(1, 2);
+
+        assert!(
+            !compare_file(&content, &chunks).await,
+            "a descending offset pair must not match"
+        );
+    }
+
+    /// A chunk over the threshold is itself a fragment list, and the walk compares that
+    /// list's chunks instead. Those bytes are already in the resident window, which is why
+    /// the splice does not invalidate it.
+    #[tokio::test]
+    async fn a_recursively_fragmented_chunk_is_compared_through_its_sublist() {
+        let content = hash_test_content(3 * HASH_WINDOW_SIZE + 4_321);
+        let nested = 300 * 1024;
+        let (chunks, store, partition, path, _dir) =
+            recursive_case(&content, nested, &chunk_sizes(nested, 100 * 1024)).await;
+
+        assert!(
+            compare_recursive(&store, partition, &path, &content, &chunks).await,
+            "unchanged file must match through the sublist"
+        );
+    }
+
+    /// Proves the sublist is genuinely compared rather than accepted because its parent
+    /// entry loaded: the changed byte is only covered by a sub-chunk hash.
+    #[tokio::test]
+    async fn a_byte_changed_inside_a_recursively_fragmented_chunk_does_not_match() {
+        let content = hash_test_content(3 * HASH_WINDOW_SIZE + 4_321);
+        let nested = 300 * 1024;
+        let (chunks, store, partition, path, _dir) =
+            recursive_case(&content, nested, &chunk_sizes(nested, 100 * 1024)).await;
+
+        let mut changed = content.clone();
+        changed[250 * 1024] ^= 0xff;
+        std::fs::write(&path, &changed).expect("rewrite test file");
+
+        assert!(
+            !compare_recursive(&store, partition, &path, &changed, &chunks).await,
+            "a changed byte inside the nested range must not match"
+        );
+    }
+
+    /// A file whose first `nested` bytes are one fragmented chunk, cut into `sub_sizes`,
+    /// with that sublist stored so the walk can load it. Sublist offsets are absolute in
+    /// the whole content, which is what lets the splice produce a flat list.
+    async fn recursive_case(
+        content: &[u8],
+        nested: usize,
+        sub_sizes: &[usize],
+    ) -> (
+        Vec<FragmentReference>,
+        Arc<dyn ImmutableStore>,
+        Partition,
+        PathBuf,
+        TempDir,
+    ) {
+        use zerocopy::IntoBytes;
+
+        let (dir, store) = make_test_store().await;
+        let path = PathBuf::from(dir.as_ref()).join("hash-compare-nested.bin");
+        std::fs::write(&path, content).expect("write test file");
+        let partition = Partition::from([7u8; 16]);
+
+        let sublist = fragment_list_for(&content[..nested], sub_sizes);
+        let payload = Bytes::copy_from_slice(sublist.as_slice().as_bytes());
+        let sublist_hash = crate::hash::hash_slice(&payload);
+        store_fragment(
+            Arc::clone(&store),
+            partition,
+            Address {
+                context: Address::default().context,
+                hash: sublist_hash,
+            },
+            Fragment {
+                flags: FragmentFlags::PayloadFragmented.bits(),
+                size_payload: payload.len() as u32,
+                size_content: nested as u64,
+            },
+            payload,
+            true,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("store sublist");
+
+        // The nested chunk stands in for its whole range, followed by ordinary chunks.
+        let mut chunks = vec![FragmentReference {
+            hash: sublist_hash,
+            offset_content: 0,
+        }];
+        let mut offset = nested;
+        for size in chunk_sizes(content.len() - nested, 100_003) {
+            chunks.push(FragmentReference {
+                hash: Hash::hash_buffer(&content[offset..offset + size]),
+                offset_content: offset as u64,
+            });
+            offset += size;
+        }
+
+        (chunks, store, partition, path, dir)
+    }
+
+    async fn compare_recursive(
+        store: &Arc<dyn ImmutableStore>,
+        partition: Partition,
+        path: &Path,
+        content: &[u8],
+        chunks: &[FragmentReference],
+    ) -> bool {
+        let (file, file_size) = crate::chunker::open_read(path).await.expect("open");
+        assert_eq!(file_size, content.len() as u64);
+
+        previous_chunks_still_match(
+            SublistSource {
+                store,
+                partition,
+                context: Address::default().context,
+                remote_session: &None,
+            },
+            path,
+            &file,
+            file_size,
+            chunks,
+        )
+        .await
+        .expect("compare must not error on a readable file")
+    }
+
+    #[test]
+    fn the_read_ahead_starts_at_the_first_chunk_the_window_does_not_hold() {
+        let content = hash_test_content(3 * HASH_WINDOW_SIZE);
+        let chunks = fragment_list_for(&content, &chunk_sizes(content.len(), 100_003));
+        let file_size = content.len() as u64;
+
+        let offset = next_window_offset(&chunks, 0, HASH_WINDOW_SIZE as u64, file_size)
+            .expect("a chunk must straddle the first window boundary");
+        let straddling = chunks
+            .iter()
+            .position(|chunk| chunk.offset_content == offset)
+            .expect("offset must be a chunk boundary");
+        assert!(
+            offset < HASH_WINDOW_SIZE as u64,
+            "the chunk starts inside the window it is not held by"
+        );
+        assert!(
+            chunk_end(&chunks, straddling, file_size).expect("ascending") > HASH_WINDOW_SIZE as u64,
+            "and ends past it"
+        );
+    }
+
+    #[test]
+    fn there_is_nothing_to_read_ahead_at_the_end_of_the_list() {
+        let content = hash_test_content(HASH_WINDOW_SIZE);
+        let chunks = fragment_list_for(&content, &chunk_sizes(content.len(), 100_003));
+
+        assert_eq!(
+            next_window_offset(&chunks, 0, content.len() as u64, content.len() as u64),
+            None,
+            "a window reaching the end of the file has no successor"
+        );
+    }
+
+    /// A chunk over the threshold is fragmented further, so the walk loads its sublist
+    /// rather than reading those bytes. Reading ahead there would read a window nothing
+    /// asks for.
+    #[test]
+    fn there_is_nothing_to_read_ahead_before_a_recursively_fragmented_chunk() {
+        let content = hash_test_content(2 * HASH_WINDOW_SIZE);
+        let sizes = vec![
+            crate::compress::FRAGMENT_SIZE_THRESHOLD,
+            content.len() - crate::compress::FRAGMENT_SIZE_THRESHOLD,
+        ];
+        let chunks = fragment_list_for(&content, &sizes);
+
+        assert_eq!(
+            next_window_offset(
+                &chunks,
+                0,
+                crate::compress::FRAGMENT_SIZE_THRESHOLD as u64,
+                content.len() as u64
+            ),
+            None,
+            "the next chunk is over the threshold and is not read as bytes"
         );
     }
 }

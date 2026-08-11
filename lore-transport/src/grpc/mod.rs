@@ -27,7 +27,6 @@ use dashmap::DashMap;
 use http::header::AUTHORIZATION;
 use lore_base::lore_debug;
 use lore_base::lore_info;
-use lore_base::lore_spawn;
 use lore_base::lore_trace;
 use lore_base::types::*;
 use lore_base::version::LORE_LIBRARY_VERSION;
@@ -69,6 +68,7 @@ pub const REVISION_LIST_STRATEGY_HEADER: &str = "x-lore-revision-list-strategy";
 const RETRY_START_BACKOFF_MS: u64 = 50;
 const RETRY_MAX_BACKOFF_MS: u64 = 10_000;
 const RETRY_MAX_ATTEMPTS: usize = 60;
+const GRPC_CONNECT_TIMEOUT_SECS: u64 = 5;
 
 fn grpc_retry() -> crate::util::Retry {
     crate::util::retry(
@@ -106,7 +106,7 @@ impl GRPCAuth {
         }));
 
         let auth_ref = Arc::downgrade(&auth);
-        let refresher = Some(lore_spawn!(grpc_auth_refresher(
+        let refresher = Some(lore_base::lore_spawn_net!(grpc_auth_refresher(
             auth_ref,
             auth_url.to_string(),
             remote_domain,
@@ -144,13 +144,15 @@ impl GRPCAuth {
         }));
 
         let auth_ref = Arc::downgrade(&auth);
-        let refresher = Some(lore_spawn!(grpc_auth_refresher_custom_resource(
-            auth_ref,
-            auth_url.to_string(),
-            remote_domain,
-            resolved_identity,
-            resource_id.to_string(),
-        )));
+        let refresher = Some(lore_base::lore_spawn_net!(
+            grpc_auth_refresher_custom_resource(
+                auth_ref,
+                auth_url.to_string(),
+                remote_domain,
+                resolved_identity,
+                resource_id.to_string(),
+            )
+        ));
 
         {
             let mut auth = auth.write();
@@ -370,6 +372,20 @@ pub struct GRPCConnection {
 }
 
 impl GRPCConnection {
+    /// Build a connection around an already-established channel, for tests that drive a
+    /// storage client against a local server without going through the connect path.
+    #[cfg(test)]
+    pub(crate) fn for_test(remote_url: Url, channel: Channel) -> Self {
+        Self {
+            connection: Weak::new(),
+            remote_url,
+            channel: parking_lot::RwLock::new(channel),
+            auth: DashMap::new(),
+            reconnect: AtomicU32::new(1),
+            reconnector: Semaphore::new(1),
+        }
+    }
+
     pub fn channel(&self) -> Channel {
         self.channel.read().clone()
     }
@@ -564,6 +580,7 @@ async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
             .tls_config(
                 ClientTlsConfig::new()
                     .assume_http2(true)
+                    .with_webpki_roots()
                     .with_native_roots(),
             )
             .internal_with(|| format!("configuring TLS for {remote}"))?;
@@ -575,11 +592,30 @@ async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
 
     lore_trace!("Set user agent to {user_agent}");
 
-    // Silent propagation of connection errors
-    let channel = endpoint
-        .connect()
+    endpoint = endpoint.connect_timeout(Duration::from_secs(GRPC_CONNECT_TIMEOUT_SECS));
+
+    // Connect from a net-runtime task so the hyper/h2 driver tasks the
+    // connection spawns are bound to the net runtime, isolated from compute and
+    // file-I/O continuations on the core runtime.
+    let channel = match lore_base::lore_spawn_net!(async move { endpoint.connect().await })
         .await
-        .internal_with(|| format!("gRPC connection to {remote}"))?;
+        .internal_with(|| format!("gRPC connection task to {remote}"))?
+    {
+        Ok(channel) => channel,
+        Err(err) => {
+            // An unreachable server is `Disconnected` so the reconnect paths
+            // engage, but the transport error's detail is kept on the trace
+            // rather than collapsed into a bare variant.
+            let mut disconnected = ProtocolError::from(lore_base::error::Disconnected);
+            disconnected.push_trace(lore_error_set::Location::with_context(
+                file!(),
+                line!(),
+                column!(),
+                Arc::from(format!("gRPC connection to {remote} failed: {err}")),
+            ));
+            return Err(disconnected);
+        }
+    };
 
     let channel = ServiceBuilder::new()
         .layer(RequestLoggerLayer {})
@@ -679,7 +715,7 @@ pub async fn storage_client(
 ) -> Result<Arc<dyn Storage>, ProtocolError> {
     lore_trace!("Connecting gRPC storage client");
 
-    let storage_client = storage_client::StorageService::new(connection.channel());
+    let storage_client = storage_client::StorageService::new(connection.clone());
 
     let storage = GRPCStorage {
         connection,
@@ -940,16 +976,12 @@ impl GRPCAdmin {
 #[async_trait]
 impl Admin for GRPCAdmin {
     async fn obliterate(&self, address: Address) -> Result<(), ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
-        loop {
-            let result = self.client.read().await.obliterate(address).await;
-            match result {
-                Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
-                }
-                result => return result,
-            }
-        }
+        with_reconnect(
+            &self.connection,
+            || async { self.client.read().await.obliterate(address).await },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
     }
 }
 
@@ -965,19 +997,76 @@ struct GRPCStorage {
     session_counter: std::sync::atomic::AtomicU32,
     /// Client-local session map: `session_id` -> context for metadata injection.
     /// Built at `session_start` time with the auth token, reused without lock reads.
-    sessions: DashMap<u32, storage_client::GrpcSessionContext>,
+    sessions: DashMap<u32, Arc<storage_client::GrpcSessionContext>>,
+}
+
+/// Bound on connection-level reconnect attempts for one operation.
+///
+/// `GRPCConnection::reconnect` gives up permanently once its own connect retries are exhausted,
+/// but that only covers a remote it cannot reach. One that accepts connections while every RPC
+/// on them fails reconnects successfully every time, so the driving loop needs its own bound.
+const MAX_RECONNECTS_PER_OP: usize = 3;
+
+/// Run an operation, reconnecting and reissuing if it reports the channel is gone.
+///
+/// The counterpart of the QUIC client's `send_with_reconnect`. Only `Disconnected` provokes a
+/// reconnect: anything else the remote answers is its verdict on this request, and the stream
+/// layer has already reissued whatever was recoverable there.
+///
+/// The epoch is read per attempt, not once. `GRPCConnection::reconnect` treats an epoch older
+/// than the current one as "somebody else already reconnected" and returns without doing
+/// anything — correct for a concurrent caller, but for a *later attempt by the same caller* it
+/// means no reconnect, no backoff, and no route to the permanent give-up that only the connect
+/// loop sets. Bounding the attempts covers the remaining case: a remote that accepts
+/// connections while failing every RPC on them reconnects successfully every round.
+async fn with_reconnect<T, Op, OpFut, Rebuild, RebuildFut>(
+    connection: &GRPCConnection,
+    op: Op,
+    rebuild: Rebuild,
+) -> Result<T, ProtocolError>
+where
+    Op: Fn() -> OpFut,
+    OpFut: Future<Output = Result<T, ProtocolError>>,
+    Rebuild: Fn(u32) -> RebuildFut,
+    RebuildFut: Future<Output = Result<(), ProtocolError>>,
+{
+    for _ in 0..MAX_RECONNECTS_PER_OP {
+        let reconnect_id = connection.reconnect.load(Ordering::Relaxed);
+        match op().await {
+            Err(ProtocolError::Disconnected(_)) => rebuild(reconnect_id).await?,
+            result => return result,
+        }
+    }
+    Err(ProtocolError::from(lore_base::error::Disconnected))
 }
 
 impl GRPCStorage {
-    /// Look up the cached session context. Cheap `DashMap` read, no auth token fetch.
+    /// Look up the cached session context.
+    ///
+    /// Shared rather than cloned: the context carries the session's auth token, and every
+    /// consumer only borrows it, so cloning per operation would copy the token for each fragment
+    /// on a bulk path like clone or sync.
     fn session_context(
         &self,
         session_id: u32,
-    ) -> Result<storage_client::GrpcSessionContext, ProtocolError> {
+    ) -> Result<Arc<storage_client::GrpcSessionContext>, ProtocolError> {
         self.sessions
             .get(&session_id)
             .map(|entry| entry.value().clone())
             .ok_or_else(|| ProtocolError::internal("gRPC session not found"))
+    }
+
+    /// Storage needs no client rebuild: `StorageService` resolves the channel when it opens a
+    /// stream, so a reconnected channel is picked up by the next rotation on its own.
+    async fn with_reconnect<T, Op, Fut>(&self, op: Op) -> Result<T, ProtocolError>
+    where
+        Op: Fn() -> Fut,
+        Fut: Future<Output = Result<T, ProtocolError>>,
+    {
+        with_reconnect(&self.connection, op, |reconnect_id| async move {
+            self.connection.reconnect(reconnect_id).await.map(|_| ())
+        })
+        .await
     }
 }
 
@@ -999,11 +1088,11 @@ impl Storage for GRPCStorage {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.sessions.insert(
             session_id,
-            storage_client::GrpcSessionContext {
+            Arc::new(storage_client::GrpcSessionContext {
                 repository,
                 correlation_id: correlation_id.to_string(),
                 auth_token: token,
-            },
+            }),
         );
         Ok(session_id)
     }
@@ -1020,7 +1109,8 @@ impl Storage for GRPCStorage {
         address: &Address,
     ) -> Result<(Fragment, Bytes), ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.client.get(session_id, &ctx, address).await
+        self.with_reconnect(|| self.client.get(session_id, &ctx, address))
+            .await
     }
 
     async fn get_metadata(
@@ -1029,7 +1119,8 @@ impl Storage for GRPCStorage {
         address: &Address,
     ) -> Result<Fragment, ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.client.get_metadata(session_id, &ctx, address).await
+        self.with_reconnect(|| self.client.get_metadata(session_id, &ctx, address))
+            .await
     }
 
     async fn put(
@@ -1040,14 +1131,17 @@ impl Storage for GRPCStorage {
         payload: Option<Bytes>,
     ) -> Result<(), ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.client
-            .put(session_id, &ctx, address, fragment, payload)
-            .await
+        self.with_reconnect(|| {
+            self.client
+                .put(session_id, &ctx, address, fragment, payload.clone())
+        })
+        .await
     }
 
     async fn query(&self, session_id: u32, address: &[Address]) -> Result<Bytes, ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.client.query(&ctx, address).await
+        self.with_reconnect(|| self.client.query(&ctx, address))
+            .await
     }
 
     async fn verify(
@@ -1057,7 +1151,8 @@ impl Storage for GRPCStorage {
         heal: bool,
     ) -> Result<VerifyResult, ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.client.verify(&ctx, address, heal).await
+        self.with_reconnect(|| self.client.verify(&ctx, address, heal))
+            .await
     }
 
     async fn copy(
@@ -1068,15 +1163,16 @@ impl Storage for GRPCStorage {
         target_context: Context,
     ) -> Result<(), ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.client
-            .copy(
+        self.with_reconnect(|| {
+            self.client.copy(
                 session_id,
                 &ctx,
                 source_repository,
                 source_address,
                 target_context,
             )
-            .await
+        })
+        .await
     }
 
     async fn mutable_load(
@@ -1086,7 +1182,8 @@ impl Storage for GRPCStorage {
         key_type: KeyType,
     ) -> Result<Hash, ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.client.mutable_load(&ctx, key, key_type).await
+        self.with_reconnect(|| self.client.mutable_load(&ctx, key, key_type))
+            .await
     }
 
     async fn mutable_store(
@@ -1097,7 +1194,8 @@ impl Storage for GRPCStorage {
         key_type: KeyType,
     ) -> Result<(), ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.client.mutable_store(&ctx, key, value, key_type).await
+        self.with_reconnect(|| self.client.mutable_store(&ctx, key, value, key_type))
+            .await
     }
 
     async fn mutable_compare_and_swap(
@@ -1109,9 +1207,11 @@ impl Storage for GRPCStorage {
         key_type: KeyType,
     ) -> Result<Hash, ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.client
-            .mutable_compare_and_swap(&ctx, key, expected, value, key_type)
-            .await
+        self.with_reconnect(|| {
+            self.client
+                .mutable_compare_and_swap(&ctx, key, expected, value, key_type)
+        })
+        .await
     }
 }
 
@@ -1155,34 +1255,27 @@ impl Revision for GRPCRevision {
         creator: &str,
         stack: &[BranchPoint],
     ) -> Result<Hash, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
-        loop {
-            let result = self
-                .client
-                .read()
-                .await
-                .branch_create(branch, name, category, creator, stack)
-                .await;
-            match result {
-                Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
-                }
-                result => return result,
-            }
-        }
+        with_reconnect(
+            &self.connection,
+            || async {
+                self.client
+                    .read()
+                    .await
+                    .branch_create(branch, name, category, creator, stack)
+                    .await
+            },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
     }
 
     async fn branch_delete(&self, branch: BranchId) -> Result<(), ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
-        loop {
-            let result = self.client.read().await.branch_delete(branch).await;
-            match result {
-                Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
-                }
-                result => return result,
-            }
-        }
+        with_reconnect(
+            &self.connection,
+            || async { self.client.read().await.branch_delete(branch).await },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
     }
 
     async fn branch_query(
@@ -1190,16 +1283,12 @@ impl Revision for GRPCRevision {
         branch: Option<BranchId>,
         name: Option<&str>,
     ) -> Result<BranchQueryResponse, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
-        loop {
-            let result = self.client.read().await.branch_query(branch, name).await;
-            match result {
-                Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
-                }
-                result => return result,
-            }
-        }
+        with_reconnect(
+            &self.connection,
+            || async { self.client.read().await.branch_query(branch, name).await },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
     }
 
     async fn branch_push(
@@ -1209,68 +1298,54 @@ impl Revision for GRPCRevision {
         force: bool,
         fast_forward_merge: bool,
     ) -> Result<BranchPushResponse, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
-        loop {
-            let result = self
-                .client
-                .read()
-                .await
-                .branch_push(branch, latest, force, fast_forward_merge)
-                .await;
-            match result {
-                Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
-                }
-                result => return result,
-            }
-        }
+        with_reconnect(
+            &self.connection,
+            || async {
+                self.client
+                    .read()
+                    .await
+                    .branch_push(branch, latest, force, fast_forward_merge)
+                    .await
+            },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
     }
 
     async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
-        loop {
-            let result = self.client.read().await.branch_list().await;
-            match result {
-                Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
-                }
-                result => return result,
-            }
-        }
+        with_reconnect(
+            &self.connection,
+            || async { self.client.read().await.branch_list().await },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
     }
 
     async fn revision_list(
         &self,
         signature: RevisionListStart,
     ) -> Result<RevisionListResponse, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
-        loop {
-            let result = self
-                .client
-                .read()
-                .await
-                .revision_list(signature.clone())
-                .await;
-            match result {
-                Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
-                }
-                result => return result,
-            }
-        }
+        with_reconnect(
+            &self.connection,
+            || async {
+                self.client
+                    .read()
+                    .await
+                    .revision_list(signature.clone())
+                    .await
+            },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
     }
 
     async fn branch_metadata_get(&self, branch: BranchId) -> Result<Hash, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
-        loop {
-            let result = self.client.read().await.branch_metadata_get(branch).await;
-            match result {
-                Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
-                }
-                result => return result,
-            }
-        }
+        with_reconnect(
+            &self.connection,
+            || async { self.client.read().await.branch_metadata_get(branch).await },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
     }
 
     async fn branch_metadata_set(
@@ -1279,21 +1354,18 @@ impl Revision for GRPCRevision {
         expected: Hash,
         new: Hash,
     ) -> Result<MetadataSetResult, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
-        loop {
-            let result = self
-                .client
-                .read()
-                .await
-                .branch_metadata_set(branch, expected, new)
-                .await;
-            match result {
-                Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
-                }
-                result => return result,
-            }
-        }
+        with_reconnect(
+            &self.connection,
+            || async {
+                self.client
+                    .read()
+                    .await
+                    .branch_metadata_set(branch, expected, new)
+                    .await
+            },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
     }
 }
 
@@ -1338,42 +1410,35 @@ impl Repository for GRPCRepository {
         creator: &str,
         created: u64,
     ) -> Result<RepositoryData, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
-        loop {
-            let result = self
-                .client
-                .read()
-                .await
-                .create(
-                    id,
-                    name,
-                    description,
-                    default_branch_id,
-                    default_branch_name,
-                    creator,
-                    created,
-                )
-                .await;
-            match result {
-                Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
-                }
-                result => return result,
-            }
-        }
+        with_reconnect(
+            &self.connection,
+            || async {
+                self.client
+                    .read()
+                    .await
+                    .create(
+                        id,
+                        name,
+                        description,
+                        default_branch_id,
+                        default_branch_name,
+                        creator,
+                        created,
+                    )
+                    .await
+            },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
     }
 
     async fn delete(&self, id: RepositoryId) -> Result<(), ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
-        loop {
-            let result = self.client.read().await.delete(id).await;
-            match result {
-                Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
-                }
-                result => return result,
-            }
-        }
+        with_reconnect(
+            &self.connection,
+            || async { self.client.read().await.delete(id).await },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
     }
 
     async fn query(
@@ -1381,42 +1446,30 @@ impl Repository for GRPCRepository {
         id: Option<RepositoryId>,
         name: Option<&str>,
     ) -> Result<RepositoryData, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
-        loop {
-            let result = self.client.read().await.query(id, name).await;
-            match result {
-                Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
-                }
-                result => return result,
-            }
-        }
+        with_reconnect(
+            &self.connection,
+            || async { self.client.read().await.query(id, name).await },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
     }
 
     async fn list(&self) -> Result<Vec<RepositoryData>, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
-        loop {
-            let result = self.client.read().await.list().await;
-            match result {
-                Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
-                }
-                result => return result,
-            }
-        }
+        with_reconnect(
+            &self.connection,
+            || async { self.client.read().await.list().await },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
     }
 
     async fn metadata_get(&self, id: RepositoryId) -> Result<Hash, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
-        loop {
-            let result = self.client.read().await.metadata_get(id).await;
-            match result {
-                Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
-                }
-                result => return result,
-            }
-        }
+        with_reconnect(
+            &self.connection,
+            || async { self.client.read().await.metadata_get(id).await },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
     }
 
     async fn metadata_set(
@@ -1425,21 +1478,18 @@ impl Repository for GRPCRepository {
         expected: Hash,
         new: Hash,
     ) -> Result<MetadataSetResult, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
-        loop {
-            let result = self
-                .client
-                .read()
-                .await
-                .metadata_set(id, expected, new)
-                .await;
-            match result {
-                Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
-                }
-                result => return result,
-            }
-        }
+        with_reconnect(
+            &self.connection,
+            || async {
+                self.client
+                    .read()
+                    .await
+                    .metadata_set(id, expected, new)
+                    .await
+            },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
     }
 }
 
@@ -1480,16 +1530,12 @@ impl Lock for GRPCLock {
         resources: &[LockResource],
         owner: Option<&str>,
     ) -> Result<Vec<LockData>, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
-        loop {
-            let result = self.client.read().await.lock(resources, owner).await;
-            match result {
-                Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
-                }
-                result => return result,
-            }
-        }
+        with_reconnect(
+            &self.connection,
+            || async { self.client.read().await.lock(resources, owner).await },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
     }
 
     async fn query(
@@ -1498,47 +1544,36 @@ impl Lock for GRPCLock {
         owner: Option<&str>,
         description: Option<&str>,
     ) -> Result<Vec<LockData>, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
-        loop {
-            let result = self
-                .client
-                .read()
-                .await
-                .query(branch, owner, description)
-                .await;
-            match result {
-                Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
-                }
-                result => return result,
-            }
-        }
+        with_reconnect(
+            &self.connection,
+            || async {
+                self.client
+                    .read()
+                    .await
+                    .query(branch, owner, description)
+                    .await
+            },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
     }
 
     async fn status(&self, resources: &[LockResource]) -> Result<Vec<LockData>, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
-        loop {
-            let result = self.client.read().await.status(resources).await;
-            match result {
-                Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
-                }
-                result => return result,
-            }
-        }
+        with_reconnect(
+            &self.connection,
+            || async { self.client.read().await.status(resources).await },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
     }
 
     async fn unlock(&self, resources: &[LockResource]) -> Result<Vec<LockResource>, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
-        loop {
-            let result = self.client.read().await.unlock(resources).await;
-            match result {
-                Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
-                }
-                result => return result,
-            }
-        }
+        with_reconnect(
+            &self.connection,
+            || async { self.client.read().await.unlock(resources).await },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
     }
 }
 
@@ -1562,15 +1597,124 @@ impl GRPCEnvironment {
 #[async_trait]
 impl Environment for GRPCEnvironment {
     async fn get(&self) -> Result<EnvironmentConfig, ProtocolError> {
-        let reconnect_id = self.connection.reconnect.load(Ordering::Relaxed);
-        loop {
-            let result = self.client.read().await.get().await;
-            match result {
-                Err(ProtocolError::Disconnected(_)) => {
-                    self.reconnect(reconnect_id).await?;
+        with_reconnect(
+            &self.connection,
+            || async { self.client.read().await.get().await },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use super::*;
+
+    /// A connection that reaches nothing. `with_reconnect` never dials — it only reads the epoch
+    /// and defers to the supplied rebuild — so the tests drive it entirely offline.
+    fn test_connection() -> GRPCConnection {
+        let endpoint = tonic::transport::Endpoint::from_shared("http://127.0.0.1:1".to_string())
+            .expect("test endpoint");
+        let channel = ServiceBuilder::new()
+            .layer(RequestLoggerLayer {})
+            .service(endpoint.connect_lazy());
+        GRPCConnection::for_test("http://127.0.0.1:1".parse().expect("test url"), channel)
+    }
+
+    /// An operation the remote answers is returned as-is, without reconnecting.
+    ///
+    /// Matching the QUIC client, where `NotFound` and friends bubble rather than provoking a
+    /// reconnect: only a lost channel is the transport's business.
+    #[tokio::test]
+    async fn a_server_verdict_is_returned_without_reconnecting() {
+        let connection = test_connection();
+        let rebuilds = AtomicUsize::new(0);
+
+        let result: Result<(), ProtocolError> = with_reconnect(
+            &connection,
+            || async { Err(ProtocolError::from(lore_base::error::NotFound)) },
+            |_| async {
+                rebuilds.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_err_and(|err| err.is_not_found()),
+            "the remote's verdict must reach the caller unchanged",
+        );
+        assert_eq!(
+            rebuilds.load(Ordering::Relaxed),
+            0,
+            "a verdict is not a lost channel, so nothing should reconnect",
+        );
+    }
+
+    /// A remote that keeps reporting a lost channel is given up on rather than retried forever.
+    ///
+    /// `GRPCConnection::reconnect` only gives up permanently when it cannot reach the remote at
+    /// all. One that accepts connections while failing every RPC rebuilds successfully every
+    /// round, so without this bound the loop would never terminate.
+    #[tokio::test]
+    async fn attempts_are_bounded_when_the_channel_never_recovers() {
+        let connection = test_connection();
+        let attempts = AtomicUsize::new(0);
+        let rebuilds = AtomicUsize::new(0);
+
+        let result: Result<(), ProtocolError> = with_reconnect(
+            &connection,
+            || async {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Err(ProtocolError::from(lore_base::error::Disconnected))
+            },
+            |_| async {
+                rebuilds.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_err_and(|err| err.is_disconnected()),
+            "giving up must report a disconnect",
+        );
+        assert_eq!(attempts.load(Ordering::Relaxed), MAX_RECONNECTS_PER_OP);
+        assert_eq!(rebuilds.load(Ordering::Relaxed), MAX_RECONNECTS_PER_OP);
+    }
+
+    /// Each attempt reads the epoch afresh, so a later attempt still drives a real reconnect.
+    ///
+    /// Capturing it once outside the loop is the defect this pins: after the first rebuild the
+    /// epoch has moved, so every later attempt would hand `reconnect` a stale id, which it reads
+    /// as "somebody else already reconnected" and returns from without doing anything — no
+    /// reconnect, no backoff, and no route to giving up.
+    #[tokio::test]
+    async fn the_epoch_is_read_afresh_for_every_attempt() {
+        let connection = test_connection();
+        let seen = parking_lot::Mutex::new(Vec::new());
+
+        let _: Result<(), ProtocolError> = with_reconnect(
+            &connection,
+            || async { Err(ProtocolError::from(lore_base::error::Disconnected)) },
+            |reconnect_id| {
+                let (seen, connection) = (&seen, &connection);
+                async move {
+                    seen.lock().push(reconnect_id);
+                    connection.reconnect.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
                 }
-                result => return result,
-            }
-        }
+            },
+        )
+        .await;
+
+        let seen = seen.lock().clone();
+        assert_eq!(
+            seen,
+            (1..=MAX_RECONNECTS_PER_OP as u32).collect::<Vec<_>>(),
+            "each attempt must observe the epoch left by the previous rebuild",
+        );
     }
 }

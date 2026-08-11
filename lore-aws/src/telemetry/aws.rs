@@ -11,6 +11,8 @@ use opentelemetry_semantic_conventions::resource::CLOUD_PROVIDER;
 use opentelemetry_semantic_conventions::resource::CLOUD_REGION;
 use tokio::runtime::Handle;
 
+use crate::net_http_client::NetHttpClient;
+
 /// Resource detector for AWS cloud environment.
 ///
 /// Detects AWS-specific resource attributes like cloud provider and region
@@ -34,10 +36,13 @@ impl ResourceDetector for AWSResourceDetector {
         let http_client = HttpClientBuilder::new()
             .tls_provider(tls::Provider::Rustls(CryptoMode::Ring))
             .build_https();
+        // `ResourceDetector::detect` is a synchronous trait method. It runs once while telemetry
+        // is built, before the server serves anything, so no other core is waiting on this one.
+        #[allow(clippy::disallowed_methods)]
         let config = tokio::task::block_in_place(|| {
             self.handle.block_on(
                 aws_config::defaults(BehaviorVersion::latest())
-                    .http_client(http_client)
+                    .http_client(NetHttpClient::new(http_client))
                     .load(),
             )
         });

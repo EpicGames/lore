@@ -126,7 +126,7 @@ fn collect_metadata_addresses(metadata: &Metadata, metadata_hash: Hash) -> Vec<A
         context: Context::default(),
     }];
 
-    let _ = metadata.walk(|_key: &[u8], value: &[u8], value_type: MetadataType| {
+    metadata.walk(|_key: &[u8], value: &[u8], value_type: MetadataType| {
         if value_type == MetadataType::Address && value.len() == std::mem::size_of::<Address>() {
             addresses.push(value.into());
         }
@@ -242,9 +242,9 @@ pub async fn get(
         .internal("deserializing repository metadata")?;
 
     if let Some(key) = key {
-        event::metadata::send_keyed(&metadata, key).internal("sending metadata event")?;
+        event::metadata::send_keyed(&metadata, key);
     } else {
-        event::metadata::send(&metadata).internal("sending metadata event")?;
+        event::metadata::send(&metadata);
     }
 
     Ok(())
@@ -310,12 +310,13 @@ pub async fn set(
                     relative_path.to_absolute_path(repo_path)
                 };
 
-                tokio::fs::read(input_path)
+                lore_io::IoDriver::global()
+                    .read_file_bytes(input_path)
                     .await
                     .internal("reading binary metadata file")?
             };
 
-            let (address, _) = immutable::write(
+            let address = immutable::write(
                 repo.clone(),
                 Context::default(),
                 Bytes::from_owner(payload),
@@ -344,7 +345,7 @@ pub async fn set(
 
     commit_metadata_hash(repo, &metadata, old_hash, new_hash).await?;
 
-    let _ = event::metadata::send(&metadata);
+    event::metadata::send(&metadata);
 
     Ok(())
 }
@@ -377,17 +378,15 @@ pub async fn clear(
 
     if keys.is_empty() {
         let mut to_remove = vec![];
-        metadata
-            .walk(
-                |key_slice: &[u8], _value_slice: &[u8], _value_type: MetadataType| {
-                    if let Ok(key) = std::str::from_utf8(key_slice)
-                        && !is_built_in_key(key)
-                    {
-                        to_remove.push(key.to_string());
-                    }
-                },
-            )
-            .internal("walking metadata for clear")?;
+        metadata.walk(
+            |key_slice: &[u8], _value_slice: &[u8], _value_type: MetadataType| {
+                if let Ok(key) = std::str::from_utf8(key_slice)
+                    && !is_built_in_key(key)
+                {
+                    to_remove.push(key.to_string());
+                }
+            },
+        );
         for key in &to_remove {
             metadata.remove_key(key);
         }

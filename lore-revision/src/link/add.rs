@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
-use tokio::fs;
 
 use super::LinkError;
 use crate::branch;
@@ -206,11 +205,15 @@ pub async fn add(
     let absolute_path = link_path.to_absolute_path(repository.require_path()?);
 
     // If a directory already exists, make sure it doesn't have any children
-    let link_path_exists = match fs::read_dir(absolute_path.clone()).await {
+    let link_path_exists = match lore_io::IoDriver::global()
+        .read_dir(absolute_path.as_path())
+        .await
+    {
         Ok(mut entries) => {
             if entries
-                .next_entry()
+                .next()
                 .await
+                .transpose()
                 .internal("Failed to check link path")?
                 .is_some()
             {
@@ -277,12 +280,14 @@ pub async fn add(
     if !parent_path.is_empty() {
         let parent_absolute_path = parent_path.to_absolute_path(repository.require_path()?);
 
-        if !fs::try_exists(parent_absolute_path.as_path())
+        if lore_io::IoDriver::global()
+            .metadata(parent_absolute_path.as_path())
             .await
-            .unwrap_or_default()
+            .is_err()
         {
             lore_debug!("Creating directory {parent_absolute_path:?}");
-            fs::create_dir_all(parent_absolute_path.as_path())
+            lore_io::IoDriver::global()
+                .create_dir_all(parent_absolute_path.as_path())
                 .await
                 .internal_with(|| {
                     format!(
@@ -314,7 +319,8 @@ pub async fn add(
 
     if !link_path_exists {
         lore_debug!("Creating directory {link_path}");
-        fs::create_dir_all(absolute_path.as_path())
+        lore_io::IoDriver::global()
+            .create_dir_all(absolute_path.as_path())
             .await
             .internal_with(|| format!("Failed to create directory {}", absolute_path.display()))?;
     }

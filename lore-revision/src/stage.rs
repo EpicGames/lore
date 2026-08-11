@@ -34,7 +34,6 @@ use crate::lore::RepositoryId;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_error;
-use crate::lore_spawn_blocking;
 use crate::lore_trace;
 use crate::node::Node;
 use crate::node::NodeBlock;
@@ -397,7 +396,10 @@ pub(crate) async fn stage_filesystem_path(
         return Ok(NodeLink::invalid());
     }
 
-    if let Ok(metadata) = tokio::fs::metadata(&full_absolute_path).await {
+    if let Ok(metadata) = lore_io::IoDriver::global()
+        .metadata(&full_absolute_path)
+        .await
+    {
         if metadata.is_dir() {
             lore_debug!(
                 "Stage directory: {}/{}",
@@ -433,7 +435,8 @@ pub(crate) async fn stage_filesystem_path(
                 continue;
             }
 
-            let current_metadata = tokio::fs::metadata(current_absolute_path.join(current_name))
+            let current_metadata = lore_io::IoDriver::global()
+                .metadata(current_absolute_path.join(current_name))
                 .await
                 .internal(&format!(
                     "Failed to query file system metadata for path {}",
@@ -1152,7 +1155,7 @@ async fn resolve_case_variant_collisions(
                         from_path.display(),
                         to_path.display()
                     );
-                    let _ = util::fs::unify_name_case_rename(&from_path, &to_path);
+                    let _ = util::fs::unify_name_case_rename(&from_path, &to_path).await;
                 }
             }
         }
@@ -1225,8 +1228,9 @@ pub(crate) async fn stage_directory(
         children_name.push(current_block.node(node_index).name_hash);
     }
 
-    let mut file_list =
-        util::fs::list_directory(absolute_path.to_path_buf()).internal(&format!(
+    let mut file_list = util::fs::list_directory(absolute_path.to_path_buf())
+        .await
+        .internal(&format!(
             "Failed to list directory files in {}",
             absolute_path.to_string_lossy()
         ))?;
@@ -1237,7 +1241,10 @@ pub(crate) async fn stage_directory(
     // the second to undo the case rename performed by the first, producing a nondeterministic
     // result depending on iteration order.
     let mut items: Vec<util::fs::FileListItem> = Vec::new();
-    while let Some(item) = file_list.recv().await {
+    while let Some(entry) = file_list.next().await {
+        let Some(item) = util::fs::file_list_item(entry) else {
+            continue;
+        };
         if item.metadata.is_dir() || item.metadata.is_file() {
             items.push(item);
         }
@@ -1494,10 +1501,17 @@ pub(crate) async fn stage_directory(
         if failure.is_some() {
             break;
         }
-        let node_name = state
+        let node_name = match state
             .node_name_ref(repository.clone(), child)
             .await
-            .forward::<StageError>("Failed to resolve node name")?;
+            .forward::<StageError>("Failed to resolve node name")
+        {
+            Ok(node_name) => node_name,
+            Err(err) => {
+                failure = Some(err);
+                break;
+            }
+        };
         let mut filter_path = relative_path.clone();
         filter_path.push(node_name);
         if repository
@@ -1849,19 +1863,15 @@ pub(crate) async fn stage_node_from_metadata(
                 name = node_name;
                 let to_path = absolute_path.join(&name);
 
-                lore_spawn_blocking!(move || {
-                    util::fs::unify_name_case_rename(from_path.as_path(), to_path.as_path())
-                        .map_err(|e| {
-                            format!(
-                                "Unable to rename file system path {} to {}: {e}",
-                                from_path.display(),
-                                to_path.display()
-                            )
-                        })
-                })
-                .await
-                .map_err(|e| StageError::internal_with_context(e, "Failed to join task"))?
-                .map_err(StageError::internal)?;
+                util::fs::unify_name_case_rename(from_path.as_path(), to_path.as_path())
+                    .await
+                    .map_err(|e| {
+                        StageError::internal(format!(
+                            "Unable to rename file system path {} to {}: {e}",
+                            from_path.display(),
+                            to_path.display()
+                        ))
+                    })?;
             }
             StageCaseChange::Rename => {
                 // Stage a rename operation, updating the repository to match the file system
@@ -1874,37 +1884,31 @@ pub(crate) async fn stage_node_from_metadata(
                 // the new one (e.g. both "Assets" and "assets" as separate directories).
                 // If so, unify the file system by merging the old into the new so that the
                 // stage picks up contents from both.
-                // Use filesystem_name_exists to check for an exact-case match rather than
-                // Path::exists which is case-insensitive on Windows/macOS.
-                let parent_path = absolute_path.clone();
-                let old_name = node_name.clone();
-                let new_name = name.clone();
-                lore_spawn_blocking!(move || {
-                    let old_path = parent_path.join(&old_name);
-                    let new_path = parent_path.join(&new_name);
-                    if util::fs::filesystem_name_exists(parent_path.as_path(), &old_name)
-                        && util::fs::filesystem_name_exists(parent_path.as_path(), &new_name)
-                    {
-                        lore_debug!(
-                            "Case rename: old path {} still exists alongside {}, unifying file system",
-                            old_path.display(),
-                            new_path.display()
-                        );
-                        util::fs::unify_name_case_rename(old_path.as_path(), new_path.as_path())
-                            .map_err(|e| {
-                                format!(
-                                    "Unable to rename file system path {} to {}: {e}",
-                                    old_path.display(),
-                                    new_path.display()
-                                )
-                            })
-                    } else {
-                        Ok(())
-                    }
-                })
+                // Re-read rather than reused from the parent's listing: staging a sibling renames
+                // entries in this directory, so an earlier snapshot answers a stale question.
+                let old_path = absolute_path.join(&node_name);
+                let new_path = absolute_path.join(&name);
+                if util::fs::filesystem_names_all_exist(
+                    absolute_path.as_path(),
+                    &[node_name.as_str(), name.as_str()],
+                )
                 .await
-                .map_err(|e| StageError::internal_with_context(e, "Failed to join task"))?
-                .map_err(StageError::internal)?;
+                {
+                    lore_debug!(
+                        "Case rename: old path {} still exists alongside {}, unifying file system",
+                        old_path.display(),
+                        new_path.display()
+                    );
+                    util::fs::unify_name_case_rename(old_path.as_path(), new_path.as_path())
+                        .await
+                        .map_err(|e| {
+                            StageError::internal(format!(
+                                "Unable to rename file system path {} to {}: {e}",
+                                old_path.display(),
+                                new_path.display()
+                            ))
+                        })?;
+                }
 
                 // Set updated node name
                 node.name_hash = name_hash;
@@ -2396,214 +2400,145 @@ pub(crate) async fn stage_from_parent_revision(
 
     let stats = Arc::new(StageStats::default());
     let mut tasks = JoinSet::new();
-    for relative_path in resolved_paths {
-        // Re-resolve node link for the file path
-        let node_link = state
-            .find_node_link(repository.clone(), relative_path.as_str())
-            .await
-            .unwrap_or_default();
-        if !node_link.is_valid() {
-            continue;
-        }
+    let dispatch_result: Result<(), StageError> = async {
+        for relative_path in resolved_paths {
+            // Re-resolve node link for the file path
+            let node_link = state
+                .find_node_link(repository.clone(), relative_path.as_str())
+                .await
+                .unwrap_or_default();
+            if !node_link.is_valid() {
+                continue;
+            }
 
-        let block_index = NodeBlock::index(node_link.node);
-        let node_index = Node::index(node_link.node);
-        let block = state
-            .block(repository.clone(), block_index)
-            .await
-            .forward::<StageError>("Failed deserializing state node block")?;
-        let node_staged = block.node(node_index);
+            let block_index = NodeBlock::index(node_link.node);
+            let node_index = Node::index(node_link.node);
+            let block = state
+                .block(repository.clone(), block_index)
+                .await
+                .forward::<StageError>("Failed deserializing state node block")?;
+            let node_staged = block.node(node_index);
 
-        let merge_flags = if node_staged.is_staged_merge() {
-            match merge_parent {
-                MergeParent::Mine => NodeFlags::StagedMerge | NodeFlags::StagedMergeMine,
-                MergeParent::CherryPick | MergeParent::Revert | MergeParent::Theirs => {
-                    NodeFlags::StagedMerge | NodeFlags::StagedMergeTheirs
+            let merge_flags = if node_staged.is_staged_merge() {
+                match merge_parent {
+                    MergeParent::Mine => NodeFlags::StagedMerge | NodeFlags::StagedMergeMine,
+                    MergeParent::CherryPick | MergeParent::Revert | MergeParent::Theirs => {
+                        NodeFlags::StagedMerge | NodeFlags::StagedMergeTheirs
+                    }
                 }
-            }
-        } else {
-            NodeFlags::NoFlags
-        };
-        let merge_conflict_flags = if node_staged.is_staged_merge_conflict() {
-            NodeFlags::StagedMergeConflict | NodeFlags::StagedMergeResolved
-        } else {
-            NodeFlags::NoFlags
-        };
-
-        // Get target and current state node links for merge action detection
-        let target_node_link = state_target
-            .find_node_link(repository.clone(), relative_path.as_str())
-            .await
-            .unwrap_or_default();
-        let current_node_link = state_current
-            .find_node_link(repository.clone(), relative_path.as_str())
-            .await
-            .unwrap_or_default();
-
-        let target_node = state_target
-            .node(repository.clone(), target_node_link.node)
-            .await
-            .unwrap_or_default();
-        let current_node = state_current
-            .node(repository.clone(), current_node_link.node)
-            .await
-            .unwrap_or_default();
-
-        // Determine merge action based on target vs current state
-        let merge_action_flags = determine_merge_action(
-            target_node_link.is_valid(),
-            current_node_link.is_valid(),
-            target_node,
-            current_node,
-        );
-
-        let final_flags = merge_flags | merge_conflict_flags | merge_action_flags;
-
-        lore_debug!(
-            "Stage {} to {} parent revision, node flags {:?}, merge action: {:?}",
-            relative_path.as_str(),
-            if matches!(merge_parent, MergeParent::Mine) {
-                "self"
             } else {
-                "other"
-            },
-            final_flags,
-            merge_action_flags
-        );
+                NodeFlags::NoFlags
+            };
+            let merge_conflict_flags = if node_staged.is_staged_merge_conflict() {
+                NodeFlags::StagedMergeConflict | NodeFlags::StagedMergeResolved
+            } else {
+                NodeFlags::NoFlags
+            };
 
-        let options = StageOptions {
-            case_change: StageCaseChange::Keep,
-            node_flags: final_flags,
-            file_id: Some(node_staged.address.context),
-            no_children: false,
-            scan: true,
-        };
+            // Get target and current state node links for merge action detection
+            let target_node_link = state_target
+                .find_node_link(repository.clone(), relative_path.as_str())
+                .await
+                .unwrap_or_default();
+            let current_node_link = state_current
+                .find_node_link(repository.clone(), relative_path.as_str())
+                .await
+                .unwrap_or_default();
 
-        // Check if conflict files exist before any work is done, so we can
-        // preserve them for potential unresolve. Commit and abort clean them up.
-        let had_conflict_files = sync::exist_merge_mine_theirs_base(
-            relative_path.to_absolute_path(repository.require_path()?),
-        )
-        .await;
+            let target_node = state_target
+                .node(repository.clone(), target_node_link.node)
+                .await
+                .unwrap_or_default();
+            let current_node = state_current
+                .node(repository.clone(), current_node_link.node)
+                .await
+                .unwrap_or_default();
 
-        async fn unlink_and_stage(
-            repository: Arc<RepositoryContext>,
-            relative_path: RelativePath,
-            state: Arc<State>,
-            stats: Arc<StageStats>,
-            options: StageOptions,
-            preserve_conflict_files: bool,
-        ) -> Result<(), StageError> {
-            let absolute_path = relative_path.to_absolute_path(repository.require_path()?);
-            let _ = util::fs::unlink_recursive(absolute_path.as_path()).await;
+            // Determine merge action based on target vs current state
+            let merge_action_flags = determine_merge_action(
+                target_node_link.is_valid(),
+                current_node_link.is_valid(),
+                target_node,
+                current_node,
+            );
 
-            Box::pin(stage_filesystem_path(
-                repository.clone(),
-                state.clone(),
-                repository.require_path()?.to_path_buf(),
-                RelativePathBuf::new(),
-                ROOT_NODE,
-                relative_path.clone(),
-                stats.clone(),
-                options,
-                None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
-                None, // No layer mask
-            ))
-            .await?;
+            let final_flags = merge_flags | merge_conflict_flags | merge_action_flags;
 
-            if !preserve_conflict_files {
-                sync::unlink_merge_mine_theirs_base(absolute_path.as_path()).await;
-            }
-            Ok(())
-        }
-
-        if !target_node_link.is_valid() {
-            // At this point it's known that the node exist in the merged revision and it's known
-            // that it's a staged merge. If the path does not exist in the target state, the merge
-            // involves a deleted file. Bring the filesystem up-to-date and stage the delete.
             lore_debug!(
-                "Stage {} from {} deleted node",
+                "Stage {} to {} parent revision, node flags {:?}, merge action: {:?}",
                 relative_path.as_str(),
                 if matches!(merge_parent, MergeParent::Mine) {
                     "self"
                 } else {
                     "other"
                 },
+                final_flags,
+                merge_action_flags
             );
 
-            Box::pin(unlink_and_stage(
-                repository.clone(),
-                relative_path.clone(),
-                state.clone(),
-                stats.clone(),
-                options,
-                false,
-            ))
-            .await?;
+            let options = StageOptions {
+                case_change: StageCaseChange::Keep,
+                node_flags: final_flags,
+                file_id: Some(node_staged.address.context),
+                no_children: false,
+                scan: true,
+            };
 
-            // If we stage a delete, check parents. If they are also empty in the current state,
-            // and missing in the parent we are staging from, unlink them too.
-            let mut search_path = relative_path.clone();
-            search_path.pop();
+            // Check if conflict files exist before any work is done, so we can
+            // preserve them for potential unresolve. Commit and abort clean them up.
+            let had_conflict_files = sync::exist_merge_mine_theirs_base(
+                relative_path.to_absolute_path(repository.require_path()?),
+            )
+            .await;
 
-            while !search_path.is_empty() {
-                lore_debug!(
-                    "Searching parent directory {} after staging a delete",
-                    search_path.as_str()
-                );
+            async fn unlink_and_stage(
+                repository: Arc<RepositoryContext>,
+                relative_path: RelativePath,
+                state: Arc<State>,
+                stats: Arc<StageStats>,
+                options: StageOptions,
+                preserve_conflict_files: bool,
+            ) -> Result<(), StageError> {
+                let absolute_path = relative_path.to_absolute_path(repository.require_path()?);
+                let _ = util::fs::unlink_recursive(absolute_path.as_path()).await;
 
-                let parent_node_link = state_target
-                    .find_node_link(repository.clone(), search_path.as_str())
-                    .await
-                    .unwrap_or_default();
+                Box::pin(stage_filesystem_path(
+                    repository.clone(),
+                    state.clone(),
+                    repository.require_path()?.to_path_buf(),
+                    RelativePathBuf::new(),
+                    ROOT_NODE,
+                    relative_path.clone(),
+                    stats.clone(),
+                    options,
+                    None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
+                    None, // No layer mask
+                ))
+                .await?;
 
-                if parent_node_link.is_valid() {
-                    // If parent is present in the target state, nothing more to do
-                    break;
+                if !preserve_conflict_files {
+                    sync::unlink_merge_mine_theirs_base(absolute_path.as_path()).await;
                 }
+                Ok(())
+            }
 
-                // Find the count of the still valid child nodes in the currently staged state
-                let current_node_link = state
-                    .find_node_link(repository.clone(), search_path.as_str())
-                    .await
-                    .forward::<StageError>("Failed to find subnode")?;
-                let children = state
-                    .node_children(repository.clone(), current_node_link.node)
-                    .await
-                    .forward::<StageError>("Failed to find subnode")?;
-
-                let mut valid_children = 0;
-
-                for child in children.iter() {
-                    let valid = match state.node(repository.clone(), *child).await {
-                        Ok(node) => !node.is_staged_delete(),
-                        Err(_) => false,
-                    };
-
-                    if valid {
-                        valid_children += 1;
-                    }
-                }
-
-                lore_debug!("Found {} valid children in parent", valid_children);
-                if valid_children != 0 {
-                    break;
-                }
-
-                // No valid children in the currently staged state so remove unlink the parent directory
-                // and stage delete since we also know at this point the parent is missing in the target state
+            if !target_node_link.is_valid() {
+                // At this point it's known that the node exist in the merged revision and it's known
+                // that it's a staged merge. If the path does not exist in the target state, the merge
+                // involves a deleted file. Bring the filesystem up-to-date and stage the delete.
                 lore_debug!(
                     "Stage {} from {} deleted node",
-                    search_path.as_str(),
+                    relative_path.as_str(),
                     if matches!(merge_parent, MergeParent::Mine) {
                         "self"
                     } else {
                         "other"
                     },
                 );
+
                 Box::pin(unlink_and_stage(
                     repository.clone(),
-                    search_path.clone(),
+                    relative_path.clone(),
                     state.clone(),
                     stats.clone(),
                     options,
@@ -2611,107 +2546,174 @@ pub(crate) async fn stage_from_parent_revision(
                 ))
                 .await?;
 
-                // Check parent
+                // If we stage a delete, check parents. If they are also empty in the current state,
+                // and missing in the parent we are staging from, unlink them too.
+                let mut search_path = relative_path.clone();
                 search_path.pop();
-            }
-            continue;
-        }
 
-        if target_node_link.repository != repository.id {
-            // TODO(vri): UCS-17955 - Merging and conflict resolution for links
-            return Err(StageError::internal(
-                "Links not yet implemented, cannot perform actions in other repositories",
-            ));
-        }
+                while !search_path.is_empty() {
+                    lore_debug!(
+                        "Searching parent directory {} after staging a delete",
+                        search_path.as_str()
+                    );
 
-        let block_index = NodeBlock::index(target_node_link.node);
-        let node_index = Node::index(target_node_link.node);
-        let block = state_target
-            .block(repository.clone(), block_index)
-            .await
-            .forward::<StageError>("Failed deserializing state node block")?;
-        let node = block.node(node_index);
+                    let parent_node_link = state_target
+                        .find_node_link(repository.clone(), search_path.as_str())
+                        .await
+                        .unwrap_or_default();
 
-        lore_debug!(
-            "Stage {} from {} node {:?}",
-            relative_path.as_str(),
-            if matches!(merge_parent, MergeParent::Mine) {
-                "self"
-            } else {
-                "other"
-            },
-            node
-        );
+                    if parent_node_link.is_valid() {
+                        // If parent is present in the target state, nothing more to do
+                        break;
+                    }
 
-        if node.is_file() {
-            sync::realize_file(
-                repository.clone(),
-                &relative_path,
-                node,
-                Arc::new(SyncRealizeStats::default()),
-            )
-            .await
-            .forward::<StageError>("Unable to restore path to selected state")?;
+                    // Find the count of the still valid child nodes in the currently staged state
+                    let current_node_link = state
+                        .find_node_link(repository.clone(), search_path.as_str())
+                        .await
+                        .forward::<StageError>("Failed to find subnode")?;
+                    let children = state
+                        .node_children(repository.clone(), current_node_link.node)
+                        .await
+                        .forward::<StageError>("Failed to find subnode")?;
 
-            Box::pin(stage_filesystem_path(
-                repository.clone(),
-                state.clone(),
-                repository.require_path()?.to_path_buf(),
-                RelativePathBuf::new(),
-                ROOT_NODE,
-                relative_path.clone(),
-                stats.clone(),
-                options,
-                None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
-                None, // No layer mask
-            ))
-            .await?;
+                    let mut valid_children = 0;
 
-            if !had_conflict_files {
-                sync::unlink_merge_mine_theirs_base(
-                    relative_path.to_absolute_path(repository.require_path()?),
-                )
-                .await;
-            }
-        } else {
-            lore_spawn!(tasks, {
-                let repository = repository.clone();
-                let state = state.clone();
-                let state_target = state_target.clone();
-                let stats = stats.clone();
-                async move {
-                    stage_from_parent_state(
+                    for child in children.iter() {
+                        let valid = match state.node(repository.clone(), *child).await {
+                            Ok(node) => !node.is_staged_delete(),
+                            Err(_) => false,
+                        };
+
+                        if valid {
+                            valid_children += 1;
+                        }
+                    }
+
+                    lore_debug!("Found {} valid children in parent", valid_children);
+                    if valid_children != 0 {
+                        break;
+                    }
+
+                    // No valid children in the currently staged state so remove unlink the parent directory
+                    // and stage delete since we also know at this point the parent is missing in the target state
+                    lore_debug!(
+                        "Stage {} from {} deleted node",
+                        search_path.as_str(),
+                        if matches!(merge_parent, MergeParent::Mine) {
+                            "self"
+                        } else {
+                            "other"
+                        },
+                    );
+                    Box::pin(unlink_and_stage(
                         repository.clone(),
-                        state,
-                        repository.clone(),
-                        state_target,
-                        relative_path,
-                        target_node_link.node,
+                        search_path.clone(),
+                        state.clone(),
+                        stats.clone(),
                         options,
-                        stats,
-                    )
-                    .await
-                }
-            });
-        }
-    }
+                        false,
+                    ))
+                    .await?;
 
-    let mut final_error = Ok(());
-    let mut task_error = Ok(());
-    while let Some(task) = tasks.join_next().await {
-        if let Ok(result) = task {
-            if result.is_err() {
-                final_error = result;
+                    // Check parent
+                    search_path.pop();
+                }
+                continue;
             }
-        } else {
-            task_error = Err(StageError::internal_with_context(
-                task.unwrap_err(),
-                "Failed to join task",
-            ));
+
+            if target_node_link.repository != repository.id {
+                // TODO(vri): UCS-17955 - Merging and conflict resolution for links
+                return Err(StageError::internal(
+                    "Links not yet implemented, cannot perform actions in other repositories",
+                ));
+            }
+
+            let block_index = NodeBlock::index(target_node_link.node);
+            let node_index = Node::index(target_node_link.node);
+            let block = state_target
+                .block(repository.clone(), block_index)
+                .await
+                .forward::<StageError>("Failed deserializing state node block")?;
+            let node = block.node(node_index);
+
+            lore_debug!(
+                "Stage {} from {} node {:?}",
+                relative_path.as_str(),
+                if matches!(merge_parent, MergeParent::Mine) {
+                    "self"
+                } else {
+                    "other"
+                },
+                node
+            );
+
+            if node.is_file() {
+                sync::realize_file(
+                    repository.clone(),
+                    &relative_path,
+                    node,
+                    Arc::new(SyncRealizeStats::default()),
+                )
+                .await
+                .forward::<StageError>("Unable to restore path to selected state")?;
+
+                Box::pin(stage_filesystem_path(
+                    repository.clone(),
+                    state.clone(),
+                    repository.require_path()?.to_path_buf(),
+                    RelativePathBuf::new(),
+                    ROOT_NODE,
+                    relative_path.clone(),
+                    stats.clone(),
+                    options,
+                    None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
+                    None, // No layer mask
+                ))
+                .await?;
+
+                if !had_conflict_files {
+                    sync::unlink_merge_mine_theirs_base(
+                        relative_path.to_absolute_path(repository.require_path()?),
+                    )
+                    .await;
+                }
+            } else {
+                lore_spawn!(tasks, {
+                    let repository = repository.clone();
+                    let state = state.clone();
+                    let state_target = state_target.clone();
+                    let stats = stats.clone();
+                    async move {
+                        stage_from_parent_state(
+                            repository.clone(),
+                            state,
+                            repository.clone(),
+                            state_target,
+                            relative_path,
+                            target_node_link.node,
+                            options,
+                            stats,
+                        )
+                        .await
+                    }
+                });
+            }
         }
+        Ok::<(), StageError>(())
     }
-    final_error?;
-    task_error?;
+    .await;
+
+    let mut failure = dispatch_result.err();
+    while let Some(task) = tasks.join_next().await {
+        let joined = task
+            .map_err(|e| StageError::internal_with_context(e, "Failed to join task"))
+            .and_then(|result| result);
+        failure = failure.or(joined.err());
+    }
+    if let Some(err) = failure {
+        return Err(err);
+    }
 
     // TODO(vri): UCS-17955 - Merging and conflict resolution for links
     // Serialize all staged links states recursively
@@ -3190,50 +3192,55 @@ pub(crate) async fn stage_from_parent_state(
 
     // Stage the files that were reverted to the given target state
     let mut tasks = JoinSet::new();
-    for change in changes.iter() {
-        let mut relative_path = change.path.clone();
-        let absolute_path = relative_path.to_absolute_path(repository_current.require_path()?);
-        relative_path.pop();
-        let parent_node_link = state_current
-            .find_node_link(repository_current.clone(), relative_path.as_str())
-            .await
-            .forward::<StageError>("Failed to find subnode")?;
-        let file_name = if relative_path.is_empty() {
-            change.path.to_string()
-        } else {
-            change.path.as_str()[(relative_path.len() + 1)..].to_string()
-        };
-
-        let (repository, state) = parent_node_link
-            .resolve(repository_current.clone(), state_current.clone())
-            .await
-            .forward::<StageError>("Failed to resolve node path in state")?;
-        let stats = stats.clone();
-        let relative_path = change.path.clone();
-        lore_spawn!(tasks, async move {
-            let metadata = tokio::fs::metadata(absolute_path.as_path())
+    let dispatch_result: Result<(), StageError> = async {
+        for change in changes.iter() {
+            let mut relative_path = change.path.clone();
+            let absolute_path = relative_path.to_absolute_path(repository_current.require_path()?);
+            relative_path.pop();
+            let parent_node_link = state_current
+                .find_node_link(repository_current.clone(), relative_path.as_str())
                 .await
-                .internal(&format!(
-                    "Failed to query file system metadata for path {}",
-                    absolute_path.display()
-                ))?;
-            stage_node_from_metadata(
-                repository,
-                state,
-                absolute_path.as_path(),
-                relative_path,
-                parent_node_link.node,
-                file_name,
-                metadata,
-                options,
-                stats,
-                None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
-            )
-            .await
-        });
-    }
+                .forward::<StageError>("Failed to find subnode")?;
+            let file_name = if relative_path.is_empty() {
+                change.path.to_string()
+            } else {
+                change.path.as_str()[(relative_path.len() + 1)..].to_string()
+            };
 
-    let mut final_result = Ok(());
+            let (repository, state) = parent_node_link
+                .resolve(repository_current.clone(), state_current.clone())
+                .await
+                .forward::<StageError>("Failed to resolve node path in state")?;
+            let stats = stats.clone();
+            let relative_path = change.path.clone();
+            lore_spawn!(tasks, async move {
+                let metadata = lore_io::IoDriver::global()
+                    .metadata(absolute_path.as_path())
+                    .await
+                    .internal(&format!(
+                        "Failed to query file system metadata for path {}",
+                        absolute_path.display()
+                    ))?;
+                stage_node_from_metadata(
+                    repository,
+                    state,
+                    absolute_path.as_path(),
+                    relative_path,
+                    parent_node_link.node,
+                    file_name,
+                    metadata,
+                    options,
+                    stats,
+                    None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
+                )
+                .await
+            });
+        }
+        Ok::<(), StageError>(())
+    }
+    .await;
+
+    let mut final_result = dispatch_result;
     while let Some(task) = tasks.join_next().await {
         final_result = match task {
             Ok(result) => final_result.and(result.map(|_| ())),

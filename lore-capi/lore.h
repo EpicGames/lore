@@ -27,9 +27,11 @@
 // A string the library produces is a NUL-terminated buffer. A string carried
 // inside an event is valid only while the callback runs; copy its bytes to keep
 // them after the callback returns. A string the caller passes in must be valid
-// UTF-8, which the library does not check. The library copies the bytes, so the
-// caller may free the string once the call returns. See lore_string_t for the
-// layout of the type.
+// UTF-8: the library checks every string an operation carries before it starts
+// the call, and fails the whole call with error code 1 (invalid arguments)
+// naming the offending field if any of them is not. The library copies the
+// bytes, so the caller may free the string once the call returns. See
+// lore_string_t for the layout of the type.
 //
 // Argument lifetime
 //
@@ -48,7 +50,32 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define LORE_INTERFACE_VERSION "0.8.6-nightly"
+#define LORE_INTERFACE_VERSION "0.8.7-nightly"
+
+// The kind of value held by a metadata entry.
+//
+// This is both the tag a caller passes across the API and the tag written into
+// a stored metadata buffer — the same type, so the two cannot drift apart.
+//
+// There is deliberately no zero value: a zero-initialized field has not chosen
+// a type and must not be passed as one.
+typedef enum lore_metadata_type_t {
+  // A content address: 48 bytes, the 32-byte hash followed by the 16-byte
+  // context.
+  LORE_METADATA_TYPE_ADDRESS = 1,
+  // A boolean: exactly one byte, where any non-zero value is true.
+  LORE_METADATA_TYPE_BOOLEAN = 2,
+  // A context identifier: 16 raw bytes.
+  LORE_METADATA_TYPE_CONTEXT = 3,
+  // A content hash: 32 raw bytes.
+  LORE_METADATA_TYPE_HASH = 4,
+  // An unsigned 64-bit integer: 8 bytes, little-endian.
+  LORE_METADATA_TYPE_NUMERIC = 5,
+  // Text: UTF-8 bytes, not terminated.
+  LORE_METADATA_TYPE_STRING = 6,
+  // Raw bytes, stored exactly as supplied and of any length.
+  LORE_METADATA_TYPE_BINARY = 255,
+} lore_metadata_type_t;
 
 // Severity level of a log message.
 typedef enum lore_log_level_t {
@@ -104,8 +131,12 @@ typedef enum lore_node_type_t {
 // Narrower than the general library error code — events emitted per
 // put/get/copy/etc. item embed this code so a caller can branch on the
 // common cases cheaply without parsing the companion `LORE_EVENT_ERROR`
-// detail. Variants overlap with the general library error code where they
-// share a meaning.
+// detail.
+//
+// Numbered independently of the general library error code that a `Complete`
+// event's status carries: `NONE`, `INVALID_ARGUMENTS` and `ADDRESS_NOT_FOUND`
+// happen to share its values, `INTERNAL` (3 against -1) and `SLOW_DOWN`
+// (4 against 5) do not. Compare a code from an event only against this enum.
 //
 typedef enum lore_error_code_t {
   // No error; the operation succeeded.
@@ -119,16 +150,6 @@ typedef enum lore_error_code_t {
   // The backing store is overloaded; the caller should retry later.
   LORE_ERROR_CODE_SLOW_DOWN = 4,
 } lore_error_code_t;
-
-// The kind of value held by a metadata entry.
-typedef enum lore_metadata_type_t {
-  // A block of raw bytes.
-  LORE_METADATA_TYPE_BINARY = 0,
-  // An unsigned integer value.
-  LORE_METADATA_TYPE_NUMERIC = 1,
-  // A string value.
-  LORE_METADATA_TYPE_STRING = 2,
-} lore_metadata_type_t;
 
 // Kind of value a stored key refers to.
 typedef enum lore_key_type_t {
@@ -157,9 +178,11 @@ typedef struct lore_progress_event_data_t {
 // A string described by a pointer to its character data and a length, holding
 // text as a sequence of bytes.
 //
-// The text is UTF-8. The length field counts the bytes before the trailing
-// NUL. An empty string is a NULL pointer with length 0, and a length of 0
-// means the string is empty.
+// The text is UTF-8 by convention, but the bytes are never validated on
+// construction: a string carrying any other encoding is accepted here and
+// rejected by whichever verb needs to read it as text. The length field counts
+// the bytes before the trailing NUL. An empty string is a NULL pointer with
+// length 0, and a length of 0 means the string is empty.
 typedef struct lore_string_t {
   // Pointer to the start of the character data.
   const char *string;
@@ -279,6 +302,11 @@ typedef struct lore_address_t {
 } lore_address_t;
 
 // A block of raw bytes described by a pointer and a length.
+//
+// Owns its payload: [`Self::from_bytes`] copies into a fresh allocation and
+// `Drop` frees it, so a value carried in an event stays valid without the
+// producer having to outlive the dispatch. An empty block is a NULL pointer
+// with length 0.
 typedef struct lore_binary_t {
   // Pointer to the start of the byte block.
   const void *payload;
@@ -287,33 +315,18 @@ typedef struct lore_binary_t {
 } lore_binary_t;
 
 // A metadata value, tagged by the kind of value it holds.
-typedef enum lore_metadata_tag_t {
-  // An address value.
-  LORE_METADATA_ADDRESS,
-  // A boolean value, stored as a byte.
-  LORE_METADATA_BOOLEAN,
-  // A block of raw bytes.
-  LORE_METADATA_BINARY,
-  // A context value.
-  LORE_METADATA_CONTEXT,
-  // A hash value.
-  LORE_METADATA_HASH,
-  // An unsigned integer value.
-  LORE_METADATA_NUMERIC,
-  // A string value.
-  LORE_METADATA_STRING,
-} lore_metadata_tag_t;
+typedef uint32_t lore_metadata_tag_t;
 
 typedef struct lore_metadata_t {
   lore_metadata_tag_t tag;
   union {
     struct lore_address_t address;
     uint8_t boolean;
-    struct lore_binary_t binary;
     struct lore_context_t context;
     struct lore_hash_t hash;
     uint64_t numeric;
     struct lore_string_t string;
+    struct lore_binary_t binary;
   };
 } lore_metadata_t;
 
@@ -2616,64 +2629,68 @@ typedef struct lore_revision_tree_node_path_event_data_t {
   enum lore_error_code_t error_code;
 } lore_revision_tree_node_path_event_data_t;
 
-// Terminal per-call event for `add`. On success `node_id` is the
-// newly-allocated child; on failure `node_id` is undefined.
+// Terminal per-entry event for `add`. On success `node_id` is the
+// newly-allocated child; on failure it is the invalid-node sentinel, since
+// nothing was created. The call as a whole reports separately on
+// `RevisionTreeBatchComplete`.
 typedef struct lore_revision_tree_add_complete_event_data_t {
-  // Correlation id of the originating call.
-  uint64_t id;
+  // Correlation id of the entry this reports, not of the call.
+  uint64_t entry_id;
   // The newly-added node.
   lore_node_id_t node_id;
   // The outcome of the call.
   enum lore_error_code_t error_code;
 } lore_revision_tree_add_complete_event_data_t;
 
-// Terminal per-call event for `delete`.
+// Terminal per-entry event for `delete`. The call as a whole reports
+// separately on `RevisionTreeBatchComplete`.
 typedef struct lore_revision_tree_delete_complete_event_data_t {
-  // Correlation id of the originating call.
-  uint64_t id;
+  // Correlation id of the entry this reports, not of the call.
+  uint64_t entry_id;
   // The outcome of the call.
   enum lore_error_code_t error_code;
 } lore_revision_tree_delete_complete_event_data_t;
 
-// Terminal per-call event for `modify`. `node_id` echoes the modified
-// node so the caller can chain operations without re-resolving.
+// Terminal per-entry event for `modify`. On success `node_id` echoes the
+// rewritten node so the caller can chain operations without re-resolving; on
+// failure it is the invalid-node sentinel, since nothing was rewritten. The
+// call as a whole reports separately on `RevisionTreeBatchComplete`.
 typedef struct lore_revision_tree_modify_complete_event_data_t {
-  // Correlation id of the originating call.
-  uint64_t id;
+  // Correlation id of the entry this reports, not of the call.
+  uint64_t entry_id;
   // The modified node.
   lore_node_id_t node_id;
   // The outcome of the call.
   enum lore_error_code_t error_code;
 } lore_revision_tree_modify_complete_event_data_t;
 
-// Terminal per-call event for `move`. `node_id` echoes the moved node so
-// the caller observes that `file_id` is preserved across the reparent.
+// Terminal per-entry event for `move`. `node_id` echoes the moved node so
+// the caller observes that `file_id` is preserved across the reparent. The
+// call as a whole reports separately on `RevisionTreeBatchComplete`.
 typedef struct lore_revision_tree_move_complete_event_data_t {
-  // Correlation id of the originating call.
-  uint64_t id;
+  // Correlation id of the entry this reports, not of the call.
+  uint64_t entry_id;
   // The moved node.
   lore_node_id_t node_id;
   // The outcome of the call.
   enum lore_error_code_t error_code;
 } lore_revision_tree_move_complete_event_data_t;
 
-// Terminal per-call event for `metadata_set`.
+// Terminal per-entry event for `metadata_set`. The call as a whole reports
+// separately on `RevisionTreeBatchComplete`.
 typedef struct lore_revision_tree_metadata_set_complete_event_data_t {
-  // Correlation id of the originating call.
-  uint64_t id;
+  // Correlation id of the entry this reports, not of the call.
+  uint64_t entry_id;
   // The outcome of the call.
   enum lore_error_code_t error_code;
 } lore_revision_tree_metadata_set_complete_event_data_t;
 
-// Per-call event carrying a metadata value from `metadata_get`. The
+// Per-entry event carrying a metadata value from `metadata_get`. The
 // missing-key case emits no value event and lets the trailing `Complete`
 // fire on its own.
-//
-// No `Debug` derive: the embedded `LoreMetadata` enum does not implement
-// `Debug`. Use `serde_json::to_string` to render this for diagnostics.
 typedef struct lore_revision_tree_metadata_get_complete_event_data_t {
-  // Correlation id of the originating call.
-  uint64_t id;
+  // Correlation id of the entry this reports, not of the call.
+  uint64_t entry_id;
   // The metadata key.
   struct lore_string_t key;
   // The metadata value.
@@ -2834,6 +2851,35 @@ typedef struct lore_compaction_end_event_data_t {
   // Total bytes reclaimed across the pass.
   uint64_t total_compacted_bytes;
 } lore_compaction_end_event_data_t;
+
+// Terminal event for a batch write call as a whole, carrying the `batch_id` the
+// call was submitted under rather than any entry's `entry_id`.
+//
+// Every batch write verb emits exactly one of these, after any per-entry
+// terminals and before `Complete`. The error code is `NONE` when the call did
+// what it was asked; otherwise it names a failure belonging to the call rather
+// than to a single entry, such as an unknown or closed handle. A per-entry
+// failure is reported on that entry's own terminal instead.
+typedef struct lore_revision_tree_batch_complete_event_data_t {
+  // Correlation id the call was submitted under
+  uint64_t batch_id;
+  // The outcome of the call as a whole
+  enum lore_error_code_t error_code;
+} lore_revision_tree_batch_complete_event_data_t;
+
+// Terminal per-entry event for `metadata_clear`. `removed` says whether the key
+// was there to begin with: clearing an absent key is a no-op success, so the
+// error code alone cannot tell the two apart. The call as a whole reports
+// separately on `RevisionTreeBatchComplete`.
+typedef struct lore_revision_tree_metadata_clear_complete_event_data_t {
+  // Correlation id of the entry this reports, not of the call.
+  uint64_t entry_id;
+  // `1` when the key was present and has been removed, `0` when it was absent
+  // and the entry was a no-op.
+  uint8_t removed;
+  // The outcome of the call.
+  enum lore_error_code_t error_code;
+} lore_revision_tree_metadata_clear_complete_event_data_t;
 
 // An event delivered to a callback. Each variant names a kind of event and
 // carries the data for that event.
@@ -3291,6 +3337,10 @@ enum lore_event_id_t {
   LORE_EVENT_COMPACTION_PROGRESS,
   // A store compaction pass ended.
   LORE_EVENT_COMPACTION_END,
+  // A batch write call on a revision tree completed as a whole.
+  LORE_EVENT_REVISION_TREE_BATCH_COMPLETE,
+  // A metadata-clear entry completed.
+  LORE_EVENT_REVISION_TREE_METADATA_CLEAR_COMPLETE,
 };
 typedef uint32_t lore_event_tag_t;
 
@@ -3523,6 +3573,8 @@ typedef struct lore_event_t {
     struct lore_compaction_begin_event_data_t compaction_begin;
     struct lore_compaction_progress_event_data_t compaction_progress;
     struct lore_compaction_end_event_data_t compaction_end;
+    struct lore_revision_tree_batch_complete_event_data_t revision_tree_batch_complete;
+    struct lore_revision_tree_metadata_clear_complete_event_data_t revision_tree_metadata_clear_complete;
   };
 } lore_event_t;
 
@@ -3530,6 +3582,12 @@ typedef struct lore_event_t {
 typedef struct lore_global_args_t {
   // Repository path
   struct lore_string_t repository_path;
+  // Directory that relative paths in this call are resolved against. Set it
+  // when a call may be executed by another process, such as the Lore
+  // service, whose own working directory is unrelated to the caller's. When
+  // empty, relative paths resolve against the working directory of the
+  // process performing the call.
+  struct lore_string_t working_directory;
   // Correlation ID
   struct lore_string_t correlation_id;
   // Identity to use
@@ -4170,8 +4228,6 @@ typedef struct lore_repository_clone_args_t {
   uint8_t virtually;
   // Use direct file write
   uint8_t direct_file_write;
-  // Use direct file I/O instead of memory mapping files
-  uint8_t direct_file_io;
   // (Optional) Layer module
   struct lore_string_t layer;
   // (Optional) Layer metadata key to link revisions with
@@ -5102,25 +5158,166 @@ typedef struct lore_revision_tree_node_path_args_t {
   lore_node_id_t node_id;
 } lore_revision_tree_node_path_args_t;
 
-// Arguments for `lore_revision_tree_add`.
-typedef struct lore_revision_tree_add_args_t {
-  // Per-call correlation id echoed back in events
-  uint64_t id;
-  // Loaded revision-tree handle to mutate
-  struct lore_revision_tree_t handle;
-  // Parent node the new child is added under
+// One node to add. The parent is `parent_node_id`, or the node created by an
+// earlier entry when `parent_node_id` is the invalid-node sentinel.
+typedef struct lore_revision_tree_add_entry_t {
+  // Caller-chosen id echoed back as `entry_id` on this entry's `ADD_COMPLETE`
+  uint64_t entry_id;
+  // Parent for the new node; the invalid-node sentinel selects `parent_entry_index`
   lore_node_id_t parent_node_id;
+  // Index of an earlier entry in this batch whose new node is the parent;
+  // read only when `parent_node_id` is the invalid-node sentinel
+  uint32_t parent_entry_index;
   // UTF-8 name of the new child within its parent
   struct lore_string_t name;
-  // `NodeKind` encoding: FILE=1, DIRECTORY=2, LINK=3
+  // `LoreNodeType` encoding: `DIRECTORY = 0`, `FILE = 1`, `LINK = 2`
   uint32_t kind;
   // POSIX permission bits for the new node
   uint16_t mode;
-  // Content size in bytes (leaf nodes)
+  // Content size in bytes (leaf nodes); `0` for a directory
   uint64_t size;
   // Content address `(hash, file_id context)` of the new node
   struct lore_address_t address;
+} lore_revision_tree_add_entry_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_revision_tree_add_entry_array_t {
+  // Pointer to the first element.
+  const struct lore_revision_tree_add_entry_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_revision_tree_add_entry_array_t;
+
+// Arguments for `lore_revision_tree_add`.
+typedef struct lore_revision_tree_add_args_t {
+  // Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`
+  uint64_t batch_id;
+  // Loaded revision-tree handle to mutate
+  struct lore_revision_tree_t handle;
+  // Nodes to add; each emits its own `ADD_COMPLETE`
+  struct lore_revision_tree_add_entry_array_t entries;
 } lore_revision_tree_add_args_t;
+
+// One node to rewrite. The node must already exist and be a file.
+typedef struct lore_revision_tree_modify_entry_t {
+  // Caller-chosen id echoed back as `entry_id` on this entry's `MODIFY_COMPLETE`
+  uint64_t entry_id;
+  // Leaf node to rewrite; non-leaf targets are rejected
+  lore_node_id_t node_id;
+  // New POSIX permission bits
+  uint16_t mode;
+  // New content size in bytes
+  uint64_t size;
+  // New content address; a zero `context` preserves the node's file id
+  struct lore_address_t address;
+} lore_revision_tree_modify_entry_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_revision_tree_modify_entry_array_t {
+  // Pointer to the first element.
+  const struct lore_revision_tree_modify_entry_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_revision_tree_modify_entry_array_t;
+
+// Arguments for `lore_revision_tree_modify`.
+typedef struct lore_revision_tree_modify_args_t {
+  // Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`
+  uint64_t batch_id;
+  // Loaded revision-tree handle to mutate
+  struct lore_revision_tree_t handle;
+  // Nodes to rewrite; each emits its own `MODIFY_COMPLETE`
+  struct lore_revision_tree_modify_entry_array_t entries;
+} lore_revision_tree_modify_args_t;
+
+// One metadata pair to record. `value` is a typed value that carries its own
+// kind, so there is no separate format tag and nothing to parse.
+typedef struct lore_revision_tree_metadata_set_entry_t {
+  // Caller-chosen id echoed back as `entry_id` on this entry's `METADATA_SET_COMPLETE`
+  uint64_t entry_id;
+  // Metadata key; a later entry naming it overwrites this one
+  struct lore_string_t key;
+  // Value to store, stored under the kind it carries
+  struct lore_metadata_t value;
+} lore_revision_tree_metadata_set_entry_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_revision_tree_metadata_set_entry_array_t {
+  // Pointer to the first element.
+  const struct lore_revision_tree_metadata_set_entry_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_revision_tree_metadata_set_entry_array_t;
+
+// Arguments for `lore_revision_tree_metadata_set`.
+typedef struct lore_revision_tree_metadata_set_args_t {
+  // Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`
+  uint64_t batch_id;
+  // Loaded revision-tree handle to mutate
+  struct lore_revision_tree_t handle;
+  // Pairs to record; each emits its own `METADATA_SET_COMPLETE`
+  struct lore_revision_tree_metadata_set_entry_array_t entries;
+} lore_revision_tree_metadata_set_args_t;
+
+// One metadata key to read.
+typedef struct lore_revision_tree_metadata_get_entry_t {
+  // Caller-chosen id echoed back as `entry_id` on this entry's `METADATA_GET_COMPLETE`
+  uint64_t entry_id;
+  // Metadata key to read
+  struct lore_string_t key;
+} lore_revision_tree_metadata_get_entry_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_revision_tree_metadata_get_entry_array_t {
+  // Pointer to the first element.
+  const struct lore_revision_tree_metadata_get_entry_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_revision_tree_metadata_get_entry_array_t;
+
+// Arguments for `lore_revision_tree_metadata_get`.
+typedef struct lore_revision_tree_metadata_get_args_t {
+  // Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`
+  uint64_t batch_id;
+  // Loaded revision-tree handle to read from
+  struct lore_revision_tree_t handle;
+  // `0` reads only the revision being built; `1` also falls back to the
+  // loaded revision for a key the handle has no entry for
+  uint8_t include_revision;
+  // Keys to read; a key that resolves emits its own `METADATA_GET_COMPLETE`
+  struct lore_revision_tree_metadata_get_entry_array_t entries;
+} lore_revision_tree_metadata_get_args_t;
+
+// One metadata key to remove.
+typedef struct lore_revision_tree_metadata_clear_entry_t {
+  // Caller-chosen id echoed back as `entry_id` on this entry's `METADATA_CLEAR_COMPLETE`
+  uint64_t entry_id;
+  // Metadata key to remove; a key that is not set is a no-op
+  struct lore_string_t key;
+} lore_revision_tree_metadata_clear_entry_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_revision_tree_metadata_clear_entry_array_t {
+  // Pointer to the first element.
+  const struct lore_revision_tree_metadata_clear_entry_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_revision_tree_metadata_clear_entry_array_t;
+
+// Arguments for `lore_revision_tree_metadata_clear`.
+typedef struct lore_revision_tree_metadata_clear_args_t {
+  // Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`
+  uint64_t batch_id;
+  // Loaded revision-tree handle to mutate
+  struct lore_revision_tree_t handle;
+  // Keys to remove; each emits its own `METADATA_CLEAR_COMPLETE`
+  struct lore_revision_tree_metadata_clear_entry_array_t entries;
+} lore_revision_tree_metadata_clear_args_t;
 
 // Arguments for `lore_revision_tree_delete`.
 typedef struct lore_revision_tree_delete_args_t {
@@ -5131,22 +5328,6 @@ typedef struct lore_revision_tree_delete_args_t {
   // Subtree root to mark deleted, including its transitive children
   lore_node_id_t node_id;
 } lore_revision_tree_delete_args_t;
-
-// Arguments for `lore_revision_tree_modify`.
-typedef struct lore_revision_tree_modify_args_t {
-  // Per-call correlation id echoed back in events
-  uint64_t id;
-  // Loaded revision-tree handle to mutate
-  struct lore_revision_tree_t handle;
-  // Leaf node to update; non-leaf targets are rejected
-  lore_node_id_t node_id;
-  // New POSIX permission bits
-  uint16_t mode;
-  // New content size in bytes
-  uint64_t size;
-  // New content address; the existing `file_id` context is preserved
-  struct lore_address_t address;
-} lore_revision_tree_modify_args_t;
 
 // Arguments for `lore_revision_tree_move`.
 typedef struct lore_revision_tree_move_args_t {
@@ -5161,30 +5342,6 @@ typedef struct lore_revision_tree_move_args_t {
   // UTF-8 name the moved node takes at the destination
   struct lore_string_t dst_name;
 } lore_revision_tree_move_args_t;
-
-// Arguments for `lore_revision_tree_metadata_set`.
-typedef struct lore_revision_tree_metadata_set_args_t {
-  // Per-call correlation id echoed back in events
-  uint64_t id;
-  // Loaded revision-tree handle to mutate
-  struct lore_revision_tree_t handle;
-  // Metadata key; re-setting it overwrites the pending value
-  struct lore_string_t key;
-  // Value stored under the key
-  struct lore_string_t value;
-  // Value encoding, matching `LoreRevisionMetadataSetArgs::formats`
-  uint32_t format;
-} lore_revision_tree_metadata_set_args_t;
-
-// Arguments for `lore_revision_tree_metadata_get`.
-typedef struct lore_revision_tree_metadata_get_args_t {
-  // Per-call correlation id echoed back in events
-  uint64_t id;
-  // Loaded revision-tree handle to read from
-  struct lore_revision_tree_t handle;
-  // Metadata key to read; pending edits take precedence over the revision
-  struct lore_string_t key;
-} lore_revision_tree_metadata_get_args_t;
 
 // Tuneables for `lore_revision_tree_commit`.
 typedef struct lore_revision_tree_commit_options_t {
@@ -10594,17 +10751,49 @@ int32_t lore_shutdown(void);
 
 // Limits the total number of threads Lore sizes its pools for.
 //
-// Lore internally decides how many worker, blocking and compute threads to use
-// based on this ceiling and the host's processor count. Pass `0` for "no
-// limit" (the default — pools are sized from the processor count). The
-// `LORE_MAX_THREADS` environment variable overrides this count when set above
-// zero. The `LORE_WORKER_THREADS`, `LORE_BLOCKING_THREADS` and
-// `LORE_COMPUTE_THREADS` environment variables still override the count of
-// their respective pool with an absolute value when set.
+// Pass `0` for "no limit", which is the default and sizes every pool from the
+// host's processor count. The `LORE_MAX_THREADS` environment variable overrides
+// this count when set above zero.
 //
-// Must be called before the first Lore operation, while the runtime and
-// compute pool are still unconstructed. Returns `0` if the limit was applied,
-// `1` if it had already been set (or the runtime was already running).
+// # The pools
+//
+// Four pools share the limit:
+//
+// - **worker** — the async runtime executing Lore's own work. Asks for one
+//   thread per processor.
+// - **blocking** — OS APIs with no async form (keyring, cloud SDK
+//   initialization, service IPC). Asks for 3 regardless of processor count,
+//   two for the async runtime and one for the network runtime, because file
+//   I/O does not run here.
+// - **net** — the network runtime carrying QUIC, TLS and HTTP/2, kept separate
+//   so protocol timers are not delayed by other work. Asks for 2 on a client,
+//   one per processor on a server.
+// - **io** — the syscall pool every file operation dispatches through. Asks for
+//   twice the processor count, capped at 16.
+//
+// # How a limit is divided
+//
+// Each pool states an ideal, as above. Where a pool takes a configuration or
+// environment control (`LORE_NET_THREADS`, `LORE_IO_POOL_THREADS`, the server's
+// thread settings), that control raises the pool's ideal — it never sets the
+// pool's final size, so no knob can lift the process above a limit set here.
+// Retired per-pool variables are ignored outright.
+//
+// With no limit, every pool gets its ideal. With one, the pools are scaled to
+// fit by the largest-remainder method: each is granted its proportional share
+// of the limit, and the threads left over by rounding go to the pools with the
+// largest remainders. A pool never drops below 2 threads, since a starved pool
+// can deadlock work another pool waits on. That floor outranks the limit, so a
+// limit below 8 yields 8.
+//
+// # What is not counted
+//
+// Threads the host application or a linked library creates. Lore accounts only
+// for its own.
+//
+// Must be called before the first Lore operation, while the runtime is still
+// unconstructed. Returns `0` if the limit was applied, `1` if it had already
+// been set (or the runtime was already running).
 int32_t lore_set_thread_limit(uintptr_t count);
 
 // Install the memory allocator the library uses for its own allocations.
@@ -10807,3 +10996,174 @@ int32_t lore_revision_tree_node_path(const struct lore_global_args_t *globals,
 void lore_revision_tree_node_path_async(const struct lore_global_args_t *globals,
                                         const struct lore_revision_tree_node_path_args_t *args,
                                         struct lore_event_callback_config_t callback);
+
+// Add a batch of nodes to a loaded revision tree. An entry parents onto an
+// existing node or onto an earlier entry, so one call builds a subtree. Every
+// entry is checked before any node is created, so one bad entry rejects the
+// call and creates nothing; the reason names the offending entry's batch index,
+// which a caller leaving `entry_id` at zero has no other way to identify. A failure
+// after those checks pass is internal and may leave part of the batch created.
+//
+// A link entry's target revision is not resolved here, so a link naming a
+// revision that cannot be read is accepted and fails only when something later
+// reads through it. Entries under separate parents are created concurrently,
+// but allocating a node slot is serialized per loaded tree.
+//
+// | Terminal event                            | Payload                                          | Notes                                                    |
+// |-------------------------------------------|--------------------------------------------------|----------------------------------------------------------|
+// | `LORE_EVENT_REVISION_TREE_ADD_COMPLETE`   | `lore_revision_tree_add_complete_event_data_t`   | One per entry, carrying its `entry_id`                    |
+// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE` | `lore_revision_tree_batch_complete_event_data_t` | Exactly one, carrying the `batch_id` and the call's outcome |
+int32_t lore_revision_tree_add(const struct lore_global_args_t *globals,
+                               const struct lore_revision_tree_add_args_t *args,
+                               struct lore_event_callback_config_t callback);
+
+// Add a batch of nodes to a loaded revision tree (async variant).
+void lore_revision_tree_add_async(const struct lore_global_args_t *globals,
+                                  const struct lore_revision_tree_add_args_t *args,
+                                  struct lore_event_callback_config_t callback);
+
+// Rewrite a batch of file nodes' `mode`, `size` and `address` in a loaded
+// revision tree. Every entry is checked before any node is rewritten, so one bad
+// entry rejects the call and leaves every target untouched; the reason names the
+// offending entry's batch index, which a caller leaving `entry_id` at zero has no
+// other way to identify. A failure after those checks pass is internal and may
+// leave part of the batch rewritten.
+//
+// Only a file is modifiable: a directory's size and address are derived at
+// commit and a link's address is its target. A zero `address.context` preserves
+// the node's existing file id rather than generating one, which is the opposite
+// of `lore_revision_tree_add` — the node already has an identity, and replacing
+// it would record the edit as a move. Entries touch no parent or sibling chain,
+// so the whole batch applies concurrently.
+//
+// | Terminal event                              | Payload                                           | Notes                                                    |
+// |---------------------------------------------|---------------------------------------------------|----------------------------------------------------------|
+// | `LORE_EVENT_REVISION_TREE_MODIFY_COMPLETE`  | `lore_revision_tree_modify_complete_event_data_t` | One per entry, carrying its `entry_id`                    |
+// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE`   | `lore_revision_tree_batch_complete_event_data_t`  | Exactly one, carrying the `batch_id` and the call's outcome |
+int32_t lore_revision_tree_modify(const struct lore_global_args_t *globals,
+                                  const struct lore_revision_tree_modify_args_t *args,
+                                  struct lore_event_callback_config_t callback);
+
+// Rewrite a batch of file nodes in a loaded revision tree (async variant).
+void lore_revision_tree_modify_async(const struct lore_global_args_t *globals,
+                                     const struct lore_revision_tree_modify_args_t *args,
+                                     struct lore_event_callback_config_t callback);
+
+// Record a batch of `(key, value)` pairs on a loaded revision tree's in-progress
+// metadata.
+//
+// `value` is a `lore_metadata_t`, which carries its own kind — set the union's
+// `tag` and the matching member. There is no separate format field and nothing
+// is parsed, so a value cannot be stored under a kind it is not, and a binary
+// value can hold any bytes rather than only text. This differs from
+// `lore_revision_metadata_set`, which takes text plus a parallel format array.
+// `lore_revision_tree_metadata_get` returns the same union.
+//
+// Every entry is checked before any pair is recorded, so one bad entry rejects
+// the call and records nothing; the reason names the offending entry's batch
+// index, which a caller leaving `entry_id` at zero has no other way to
+// identify.
+//
+// A repeated key is **not** rejected, unlike the duplicate-target rules on the
+// node verbs: entries apply in index order, so the last entry naming a key wins
+// — the same result as sending those pairs as separate calls.
+//
+// Nothing reaches storage here. The pairs live on the handle until
+// `lore_revision_tree_commit` serializes them, so only this handle's
+// `lore_revision_tree_metadata_get` sees them. The whole batch applies under one
+// write lock, which is what makes it atomic and why there is no concurrency to
+// gain: the work is buffer writes, not I/O.
+//
+// A revision's whole metadata is capped at 1 MiB. The cap counts the metadata
+// itself — keys, values and per-entry overhead — and not what a value refers
+// to: a value holding a content address costs the address, not the content
+// behind it.
+//
+// A single entry larger than the whole cap is rejected here, since no amount of
+// removing other keys could make it fit. The running total is not checked here,
+// because what a revision ends up carrying is only known once every set has
+// run: a batch of individually legal entries that together push past the limit
+// is reported as recorded and fails later, at `lore_revision_tree_commit`.
+//
+// | Terminal event                                    | Payload                                                 | Notes                                                       |
+// |---------------------------------------------------|---------------------------------------------------------|-------------------------------------------------------------|
+// | `LORE_EVENT_REVISION_TREE_METADATA_SET_COMPLETE`  | `lore_revision_tree_metadata_set_complete_event_data_t` | One per entry, carrying its `entry_id`                      |
+// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE`         | `lore_revision_tree_batch_complete_event_data_t`        | Exactly one, carrying the `batch_id` and the call's outcome  |
+int32_t lore_revision_tree_metadata_set(const struct lore_global_args_t *globals,
+                                        const struct lore_revision_tree_metadata_set_args_t *args,
+                                        struct lore_event_callback_config_t callback);
+
+// Record a batch of metadata pairs on a loaded revision tree (async variant).
+void lore_revision_tree_metadata_set_async(const struct lore_global_args_t *globals,
+                                           const struct lore_revision_tree_metadata_set_args_t *args,
+                                           struct lore_event_callback_config_t callback);
+
+// Read a batch of metadata values from a loaded revision tree.
+//
+// By default this reads only the **revision being built** — what
+// `lore_revision_tree_metadata_set` recorded on this handle, which is exactly
+// what `lore_revision_tree_commit` will write. Nothing is inherited from the
+// revision the handle was loaded on. Set `include_revision` to `1` to also fall
+// back to that revision for a key the handle has no entry for; a pending entry
+// still wins, so the flag only adds answers.
+//
+// A key present in neither emits **no event at all** and does not fail the call,
+// matching `lore_revision_metadata_get`: detect an absent key by tracking
+// whether a value event arrived for its `entry_id`. This verb is therefore **not
+// all-or-nothing**, unlike the other batch verbs — it mutates nothing, so one
+// unanswerable key costs the others nothing. Bad arguments still reject the
+// whole call.
+//
+// A value comes back as the same `lore_metadata_t` that
+// `lore_revision_tree_metadata_set` takes, so it round-trips without either
+// side encoding it as text. Every kind is returned, raw binary included.
+//
+// A value whose stored bytes do not match the kind they are tagged with, or
+// whose tag this build does not recognize, reports `LORE_ERROR_CODE_INTERNAL`
+// on that entry rather than staying silent, so it is never mistaken for an
+// absent key.
+//
+// The revision's metadata is read once for the whole batch, which is what
+// batching buys here.
+//
+// | Terminal event                                    | Payload                                                 | Notes                                                       |
+// |---------------------------------------------------|---------------------------------------------------------|-------------------------------------------------------------|
+// | `LORE_EVENT_REVISION_TREE_METADATA_GET_COMPLETE`  | `lore_revision_tree_metadata_get_complete_event_data_t` | One per key that resolved, carrying its `entry_id`; none for an absent key |
+// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE`         | `lore_revision_tree_batch_complete_event_data_t`        | Exactly one, carrying the `batch_id` and the call's outcome  |
+int32_t lore_revision_tree_metadata_get(const struct lore_global_args_t *globals,
+                                        const struct lore_revision_tree_metadata_get_args_t *args,
+                                        struct lore_event_callback_config_t callback);
+
+// Read a batch of metadata values from a loaded revision tree (async variant).
+void lore_revision_tree_metadata_get_async(const struct lore_global_args_t *globals,
+                                           const struct lore_revision_tree_metadata_get_args_t *args,
+                                           struct lore_event_callback_config_t callback);
+
+// Remove a batch of keys from a loaded revision tree's in-progress metadata.
+// Every entry is checked before any key is removed, so one bad entry rejects the
+// call and removes nothing; the reason names the offending entry's batch index,
+// which a caller leaving `entry_id` at zero has no other way to identify.
+//
+// **Clearing a key that is not set is a no-op success**, not a failure. The
+// terminal's `removed` field says which happened: `1` when the key was there and
+// is now gone, `0` when there was nothing to remove. A repeated key is likewise
+// not rejected — the second entry naming it reports `removed = 0`.
+//
+// This clears the **pending** metadata that `lore_revision_tree_metadata_set`
+// records and `lore_revision_tree_metadata_get` reads first; a key frozen in the
+// loaded revision is not reachable from here, since clearing edits the revision
+// being built and the one it was loaded from is immutable. The whole batch
+// applies under one write lock, which is what makes it atomic.
+//
+// | Terminal event                                      | Payload                                                   | Notes                                                       |
+// |-----------------------------------------------------|-----------------------------------------------------------|-------------------------------------------------------------|
+// | `LORE_EVENT_REVISION_TREE_METADATA_CLEAR_COMPLETE`  | `lore_revision_tree_metadata_clear_complete_event_data_t` | One per entry, carrying its `entry_id` and `removed`        |
+// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE`           | `lore_revision_tree_batch_complete_event_data_t`          | Exactly one, carrying the `batch_id` and the call's outcome  |
+int32_t lore_revision_tree_metadata_clear(const struct lore_global_args_t *globals,
+                                          const struct lore_revision_tree_metadata_clear_args_t *args,
+                                          struct lore_event_callback_config_t callback);
+
+// Remove a batch of metadata keys from a loaded revision tree (async variant).
+void lore_revision_tree_metadata_clear_async(const struct lore_global_args_t *globals,
+                                             const struct lore_revision_tree_metadata_clear_args_t *args,
+                                             struct lore_event_callback_config_t callback);

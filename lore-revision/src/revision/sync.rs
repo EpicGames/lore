@@ -808,20 +808,16 @@ async fn sync_realize(
     state_target: Arc<State>,
     options: SyncOptions,
 ) -> Result<(), SyncError> {
-    Box::pin(shim_with_operation(
-        repository.file_system(),
-        false,
-        async |operation| {
-            crate::fs::realize::realize_state(
-                repository,
-                operation,
-                state_current,
-                state_target,
-                options,
-            )
-            .await
-        },
-    ))
+    shim_with_operation(repository.file_system(), false, async |operation| {
+        Box::pin(crate::fs::realize::realize_state(
+            repository,
+            operation,
+            state_current,
+            state_target,
+            options,
+        ))
+        .await
+    })
     .await?
 }
 
@@ -994,7 +990,8 @@ pub async fn exist_merge_mine_theirs_base(absolute_path: impl AsRef<Path>) -> bo
 
         let mut absolute_path = absolute_path.as_ref().to_path_buf();
         absolute_path.set_file_name(mine_name);
-        if tokio::fs::metadata(&absolute_path)
+        if lore_io::IoDriver::global()
+            .metadata(&absolute_path)
             .await
             .is_ok_and(|m| m.is_file())
         {
@@ -1005,7 +1002,8 @@ pub async fn exist_merge_mine_theirs_base(absolute_path: impl AsRef<Path>) -> bo
         theirs_name.push(THEIRS_SUFFIX);
 
         absolute_path.set_file_name(theirs_name);
-        if tokio::fs::metadata(&absolute_path)
+        if lore_io::IoDriver::global()
+            .metadata(&absolute_path)
             .await
             .is_ok_and(|m| m.is_file())
         {
@@ -1016,7 +1014,8 @@ pub async fn exist_merge_mine_theirs_base(absolute_path: impl AsRef<Path>) -> bo
         base_name.push(BASE_SUFFIX);
 
         absolute_path.set_file_name(base_name);
-        tokio::fs::metadata(absolute_path)
+        lore_io::IoDriver::global()
+            .metadata(absolute_path)
             .await
             .is_ok_and(|m| m.is_file())
     } else {

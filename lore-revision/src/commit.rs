@@ -15,6 +15,7 @@ use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::task::AbortOnDropHandle;
@@ -30,6 +31,7 @@ use crate::error::LoreResultExt;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
+use crate::filter::FilterMode;
 use crate::immutable;
 use crate::infer;
 use crate::interface::LoreArray;
@@ -41,7 +43,6 @@ use crate::link;
 use crate::lore::Address;
 use crate::lore::BranchId;
 use crate::lore::Context;
-use crate::lore::Fragment;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
 use crate::lore::TypedBytes;
@@ -68,6 +69,7 @@ use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
 use crate::progress::DEFAULT_WORK_CHANNEL_CAPACITY;
 use crate::progress::DiscoveryStats;
+use crate::progress::MAX_CONCURRENT_DIRECTORY_TASKS;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::revision::sync;
@@ -491,7 +493,7 @@ pub async fn commit_impl(
         )
         .await?;
 
-        let _ = event::metadata::send(&metadata);
+        event::metadata::send(&metadata);
     }
 
     if !dry_run && !dirty_paths.is_empty() {
@@ -547,7 +549,7 @@ pub async fn commit_impl(
         } else {
             metadata.clone()
         };
-        let layer_signature = commit_staged_revision(
+        let layer_result = commit_staged_revision(
             layer_repository.clone(),
             token.share(),
             layer_state.state_current.clone(),
@@ -562,13 +564,49 @@ pub async fn commit_impl(
             current_branch,
             stats,
         )
-        .await?;
+        .await;
+
+        let layer_signature = match layer_result {
+            Ok(signature) => signature,
+            Err(err) if err.is_nothing_staged() => {
+                // The parent revision is already committed at this point, so a
+                // layer with nothing to commit must not fail the whole commit.
+                lore_warn!(
+                    "Layer at {} had nothing to commit, clearing its staged state",
+                    layer.target_path
+                );
+                if !dry_run {
+                    layer::store_layer_staged(
+                        repository.clone(),
+                        token,
+                        layer.target_path.as_str(),
+                        layer.repository,
+                        Hash::default(),
+                    )
+                    .await
+                    .forward::<CommitError>("Failed to clear layer staged state")?;
+                }
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         let layer_branch = layer_state
             .state_current
             .branch(layer_repository.clone())
             .await;
 
         if !dry_run {
+            // Without this `layer::latest_revision` cannot reach the new
+            // layer revision.
+            branch::store_latest(
+                layer_repository.clone(),
+                current_branch,
+                layer_signature,
+                BranchLatestStatus::Divergent,
+            )
+            .await
+            .forward::<CommitError>("Failed to store layer branch latest")?;
+
             layer::store_layer_current(
                 repository.clone(),
                 token,
@@ -706,6 +744,15 @@ async fn commit_layer_only(
         .await;
 
     if !globals.dry_run() {
+        branch::store_latest(
+            layer_state.repository.clone(),
+            parent_current_branch,
+            layer_signature,
+            BranchLatestStatus::Divergent,
+        )
+        .await
+        .forward::<CommitError>("Failed to store layer branch latest")?;
+
         layer::store_layer_current(
             repository.clone(),
             &token,
@@ -948,15 +995,7 @@ async fn build_commit_metadata(
         .iter()
         .map(|v| String::from(v.as_str()))
         .collect();
-    let metadata_formats = formats
-        .as_slice()
-        .iter()
-        .map(|format| match format {
-            LoreMetadataType::Binary => MetadataType::Binary,
-            LoreMetadataType::Numeric => MetadataType::Numeric,
-            LoreMetadataType::String => MetadataType::String,
-        })
-        .collect();
+    let metadata_formats = formats.as_slice().to_vec();
 
     let metadata_hash = state_staged.metadata_hash();
     let original_metadata = if metadata_hash.is_zero() {
@@ -1261,6 +1300,7 @@ pub(crate) async fn commit_files_and_rehash(
         let subnodes_to_discard = subnodes_to_discard.clone();
         let stats = stats.clone();
         let tracker = tracker.clone();
+        let dir_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DIRECTORY_TASKS));
         lore_spawn!(async move {
             let result = commit_directory(
                 repository,
@@ -1278,6 +1318,7 @@ pub(crate) async fn commit_files_and_rehash(
                 stats,
                 parent_branch,
                 tracker,
+                dir_semaphore,
             )
             .await;
             discover_stats
@@ -1374,6 +1415,7 @@ async fn commit_directory(
     stats: Arc<CommitStats>,
     parent_branch: BranchId,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+    dir_semaphore: Arc<Semaphore>,
 ) -> Result<(), CommitError> {
     let node_index = Node::index(node_id);
     let block = state
@@ -1448,39 +1490,70 @@ async fn commit_directory(
                     .fetch_add(1, Ordering::Relaxed);
             }
         } else if child_node.is_directory() {
-            lore_spawn!(tasks, {
-                let repository = repository.clone();
-                let token = token.share();
-                let state = state.clone();
-                let delta = delta.clone();
-                let discard = discard.clone();
-                let subnodes_to_discard = subnodes_to_discard.clone();
-                let file_tx = file_tx.clone();
-                let metadata = metadata.clone();
-                let link_messages = link_messages.clone();
-                let stats = stats.clone();
-                let tracker = tracker.clone();
-                async move {
+            // Inline fallback rather than a blocking acquire: a parent awaiting
+            // its children must never block on a permit a descendant needs, or
+            // the bounded fan-out would deadlock.
+            match dir_semaphore.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    lore_spawn!(tasks, {
+                        let repository = repository.clone();
+                        let token = token.share();
+                        let state = state.clone();
+                        let delta = delta.clone();
+                        let discard = discard.clone();
+                        let subnodes_to_discard = subnodes_to_discard.clone();
+                        let file_tx = file_tx.clone();
+                        let metadata = metadata.clone();
+                        let link_messages = link_messages.clone();
+                        let stats = stats.clone();
+                        let tracker = tracker.clone();
+                        let dir_semaphore = dir_semaphore.clone();
+                        async move {
+                            let _permit = permit;
+                            commit_directory_recurse(
+                                repository,
+                                token,
+                                state,
+                                absolute_path,
+                                relative_path,
+                                child_node_id,
+                                delta,
+                                discard,
+                                subnodes_to_discard,
+                                file_tx,
+                                metadata,
+                                link_messages,
+                                stats,
+                                parent_branch,
+                                tracker,
+                                dir_semaphore,
+                            )
+                            .await
+                        }
+                    });
+                }
+                Err(_) => {
                     commit_directory_recurse(
-                        repository,
-                        token,
-                        state,
+                        repository.clone(),
+                        token.share(),
+                        state.clone(),
                         absolute_path,
                         relative_path,
                         child_node_id,
-                        delta,
-                        discard,
-                        subnodes_to_discard,
-                        file_tx,
-                        metadata,
-                        link_messages,
-                        stats,
+                        delta.clone(),
+                        discard.clone(),
+                        subnodes_to_discard.clone(),
+                        file_tx.clone(),
+                        metadata.clone(),
+                        link_messages.clone(),
+                        stats.clone(),
                         parent_branch,
-                        tracker,
+                        tracker.clone(),
+                        dir_semaphore.clone(),
                     )
-                    .await
+                    .await?;
                 }
-            });
+            }
         } else if child_node.is_link() {
             lore_debug!(
                 "Before committing link node, parent node {} address {}",
@@ -1578,6 +1651,7 @@ fn commit_directory_recurse(
     stats: Arc<CommitStats>,
     parent_branch: BranchId,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+    dir_semaphore: Arc<Semaphore>,
 ) -> Pin<Box<dyn Future<Output = Result<(), CommitError>> + Send>> {
     Box::pin(commit_directory(
         repository,
@@ -1595,6 +1669,7 @@ fn commit_directory_recurse(
         stats,
         parent_branch,
         tracker,
+        dir_semaphore,
     ))
 }
 
@@ -1930,47 +2005,69 @@ async fn commit_file(
         node.flags
     );
 
-    if node.address.context.is_zero() {
-        // TODO(mjansson): Optionally find previous identical file content and deduplicate by using same context
-        node.address.context = uuid::Uuid::now_v7().into();
-        lore_trace!(
-            "Generate file ID for file: {} {}",
-            relative_path.as_str(),
-            node.address.context
-        );
-    }
+    // A sparse checkout has no working-tree file for a view-excluded path, so
+    // the staged content hash is the only source. Re-fragmenting would read a
+    // file that is absent or stale.
+    //
+    // This test must stay identical to the one realize gates disk writes on
+    // (`fs/realize.rs`), because that is what decided whether the file was
+    // written.
+    let (address, content_size, mode) =
+        if repository
+            .filter
+            .excludes(&relative_path, false, FilterMode::View)
+        {
+            (node.address, node.size, node.mode)
+        } else {
+            if node.address.context.is_zero() {
+                // TODO(mjansson): Optionally find previous identical file content and deduplicate by using same context
+                node.address.context = uuid::Uuid::now_v7().into();
+                lore_trace!(
+                    "Generate file ID for file: {} {}",
+                    relative_path.as_str(),
+                    node.address.context
+                );
+            }
 
-    let (address, fragment) = immutable::write_from_file_with_tracker(
-        repository.clone(),
-        absolute_path.as_path(),
-        node.address.context,
-        immutable::write_options_from_repository(repository.clone()),
-        Some(tracker),
-    )
-    .await
-    .forward_with::<CommitError, _>(|| {
-        format!(
-            "Failed writing file {} to immutable store",
-            relative_path.as_str()
-        )
-    })?;
+            let (address, size_content) = immutable::write_from_file_with_tracker(
+                repository.clone(),
+                absolute_path.as_path(),
+                node.address.context,
+                immutable::write_options_from_repository(repository.clone()),
+                Some(tracker),
+            )
+            .await
+            .forward_with::<CommitError, _>(|| {
+                format!(
+                    "Failed writing file {} to immutable store",
+                    relative_path.as_str()
+                )
+            })?;
 
-    stats
-        .complete
-        .bytes_transferred
-        .fetch_add(fragment.size_content, Ordering::Relaxed);
+            stats
+                .complete
+                .bytes_transferred
+                .fetch_add(size_content, Ordering::Relaxed);
 
-    let Ok(metadata) = tokio::fs::metadata(absolute_path.as_path()).await else {
-        return Err(CommitError::internal(format!(
-            "Failed to get metadata for file {}",
-            absolute_path.display()
-        )));
-    };
+            let Ok(metadata) = lore_io::IoDriver::global()
+                .metadata(absolute_path.as_path())
+                .await
+            else {
+                return Err(CommitError::internal(format!(
+                    "Failed to get metadata for file {}",
+                    absolute_path.display()
+                )));
+            };
 
-    let mode = util::fs::metadata_to_mode(&metadata, node.mode);
+            (
+                address,
+                size_content,
+                util::fs::metadata_to_mode(&metadata, node.mode),
+            )
+        };
 
     let modified = util::fs::mode_changed(node.mode, mode)
-        || node.size != fragment.size_content
+        || node.size != content_size
         || node.address.hash != address.hash;
 
     if modified
@@ -2002,7 +2099,7 @@ async fn commit_file(
             let node = block_writer.node(node_index);
 
             node.address = address;
-            node.size = fragment.size_content;
+            node.size = content_size;
             node.mode = mode;
             node.child = 0;
 
@@ -2241,6 +2338,8 @@ async fn commit_link(
                 let metadata = metadata.clone();
                 let stats = stats.clone();
                 let tracker = work_tracker.clone();
+                // Own budget per linked sub-repo, isolated from the parent's.
+                let dir_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DIRECTORY_TASKS));
                 lore_spawn!(async move {
                     commit_directory_recurse(
                         repository,
@@ -2260,6 +2359,7 @@ async fn commit_link(
                         stats,
                         link_branch,
                         tracker,
+                        dir_semaphore,
                     )
                     .await
                 })
@@ -2625,7 +2725,7 @@ async fn generate_delta_block(
     };
     let delta_count = delta.count::<NodeDelta>();
 
-    let (address, _fragment) = if !delta.is_empty() {
+    let address = if !delta.is_empty() {
         immutable::write_with_tracker(
             repository.clone(),
             Context::default(),
@@ -2638,7 +2738,7 @@ async fn generate_delta_block(
         .await
         .forward::<CommitError>("Failed writing delta block to immutable store")?
     } else {
-        (Address::default(), Fragment::default())
+        Address::default()
     };
 
     state

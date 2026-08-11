@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 pub mod exists_batch;
 pub mod get;
+pub mod get_metadata;
 pub mod header;
 pub mod obliterate;
 pub mod put;

@@ -228,6 +228,119 @@ def test_dirty_move(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_dirty_move_of_uncommitted_source_stays_add(new_lore_repo):
+    """A `file dirty move` whose source is not in the revision state reports
+    the destination as action=add with no fromPath, in both a plain status and
+    a `status --scan`.
+
+    The source was never recorded in a commit — it exists only as a dirty add —
+    so there is nothing to move from: the destination inherits the add instead
+    of becoming a move, and --scan retains that add.
+    """
+    repo: Lore = new_lore_repo()
+
+    with repo.open_file("base.txt", "w+") as f:
+        f.write("base\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    # old.txt is only ever a dirty add, never recorded in a commit
+    with repo.open_file("old.txt", "w+") as f:
+        f.write("movable content\n")
+    repo.dirty("old.txt", offline=True)
+
+    pre_move = find_status_entry(get_status_files(repo), "old.txt")
+    assert pre_move is not None, "old.txt should appear in status as a dirty add"
+    assert pre_move["action"] == "add", (
+        f"old.txt should be action=add before the move, got {pre_move['action']!r}"
+    )
+
+    # Rename on disk, then notify Lore of the move
+    os.rename(
+        os.path.join(repo.path, "old.txt"),
+        os.path.join(repo.path, "new.txt"),
+    )
+    repo.dirty_move("old.txt", "new.txt", offline=True)
+
+    # Status without --scan: still an add, with no move provenance
+    entries = get_status_files(repo)
+    entry = find_status_entry(entries, "new.txt")
+    assert entry is not None, "new.txt should appear in status before scan"
+    assert entry["action"] == "add", (
+        "moving a source that is not in the revision state keeps it an add; "
+        f"got action={entry['action']!r} for new.txt"
+    )
+    assert entry.get("fromPath", "") == "", (
+        "new.txt should carry no move provenance, "
+        f"got fromPath={entry.get('fromPath')!r}"
+    )
+    assert entry["flagDirty"] is True, "new.txt should be flagDirty before scan"
+    assert find_status_entry(entries, "old.txt") is None, (
+        "the vacated source path must not appear before scan"
+    )
+
+    # Status with --scan: the add is retained
+    scanned = get_status_files(repo, scan=True)
+    scanned_entry = find_status_entry(scanned, "new.txt")
+    assert scanned_entry is not None, "new.txt should appear in status after scan"
+    assert scanned_entry["action"] == "add", (
+        f"--scan must retain the add; got action={scanned_entry['action']!r} for new.txt"
+    )
+    assert scanned_entry.get("fromPath", "") == "", (
+        "--scan must not invent move provenance, "
+        f"got fromPath={scanned_entry.get('fromPath')!r}"
+    )
+    assert scanned_entry["flagDirty"] is True, "new.txt should stay flagDirty after scan"
+    assert find_status_entry(scanned, "old.txt") is None, (
+        "the vacated source path must not reappear after scan"
+    )
+
+
+@pytest.mark.smoke
+def test_dirty_move_scan_without_prior_status(new_lore_repo):
+    """A file committed at its old path, renamed on disk and marked with
+    `file dirty move`, is reported by `status --scan` as action=move with
+    fromPath=source rather than as a delete of the source plus an add of the
+    destination.
+
+    The scan is the first status run on the working tree, so the filesystem
+    reconciliation has to pick the move up from the dirty marking alone
+    instead of from state a preceding plain status already reported.
+    """
+    repo: Lore = new_lore_repo()
+
+    with repo.open_file("old.txt", "w+") as f:
+        f.write("movable content\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    # Rename on disk, then notify Lore of the move
+    os.rename(
+        os.path.join(repo.path, "old.txt"),
+        os.path.join(repo.path, "new.txt"),
+    )
+    repo.dirty_move("old.txt", "new.txt", offline=True)
+
+    # No plain status in between: --scan is the first status of the tree
+    scanned = get_status_files(repo, scan=True)
+    entry = find_status_entry(scanned, "new.txt")
+    assert entry is not None, "new.txt should appear in status after scan"
+    assert entry["action"] == "move", (
+        "--scan must report the dirty move as a move, not an add; "
+        f"got action={entry['action']!r} for new.txt"
+    )
+    assert to_posix(entry.get("fromPath", "")) == "old.txt", (
+        "--scan must preserve the move provenance; "
+        f"got fromPath={entry.get('fromPath')!r} for new.txt"
+    )
+    assert entry["flagDirty"] is True, "new.txt should be flagDirty after scan"
+    assert find_status_entry(scanned, "old.txt") is None, (
+        "--scan must not report the move source as a separate delete entry; "
+        "a move must not degrade into delete + add"
+    )
+
+
+@pytest.mark.smoke
 def test_dirty_copy(new_lore_repo):
     """Mark a file as dirty-copied and verify status."""
     repo: Lore = new_lore_repo()

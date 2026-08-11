@@ -156,6 +156,12 @@ class MissingIdentityError(LoreException):
     identity (no --identity arg, no config.toml identity, no cached auth)."""
 
 
+class NotSupportedError(LoreException):
+    """Raised when an operation is not supported in the current environment,
+    e.g. an auth command run against a server with no auth endpoint
+    configured."""
+
+
 ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Unable to commit", CommitFailed),
     (
@@ -215,6 +221,7 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Failed to connect to remote URL", BadSharedStoreRemoteUrl),
     ("Local modifications prevent synchronization", LocalModificationsError),
     ("No commit identity configured", MissingIdentityError),
+    ("Operation not supported", NotSupportedError),
 ]
 
 

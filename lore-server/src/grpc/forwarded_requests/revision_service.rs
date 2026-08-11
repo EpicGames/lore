@@ -7,6 +7,7 @@ use tonic::Request;
 use tonic::transport::Channel;
 
 use crate::grpc::forwarded_requests::ForwardedRequestResult;
+use crate::grpc::revision::v1::branch_list::BranchListStream;
 
 #[async_trait]
 pub trait ForwardedRevisionServiceClient: Send + Sync {
@@ -24,6 +25,11 @@ pub trait ForwardedRevisionServiceClient: Send + Sync {
         &mut self,
         request: Request<v1::BranchGetRequest>,
     ) -> ForwardedRequestResult<v1::BranchGetResponse>;
+
+    async fn branch_list(
+        &mut self,
+        request: Request<v1::BranchListRequest>,
+    ) -> ForwardedRequestResult<BranchListStream>;
 }
 
 pub struct GrpcForwardedRevisionServiceClient {
@@ -59,5 +65,19 @@ impl ForwardedRevisionServiceClient for GrpcForwardedRevisionServiceClient {
         request: Request<v1::BranchGetRequest>,
     ) -> ForwardedRequestResult<v1::BranchGetResponse> {
         Ok(self.client.branch_get(request).await)
+    }
+
+    async fn branch_list(
+        &mut self,
+        request: Request<v1::BranchListRequest>,
+    ) -> ForwardedRequestResult<BranchListStream> {
+        // The gRPC client returns Response<tonic::Streaming<T>>; box-pin the
+        // inner Streaming so the response carries the BranchListStream type
+        // alias expected by the rest of the forwarding path.
+        let result: Result<tonic::Response<_>, _> = self.client.branch_list(request).await;
+        Ok(result.map(|resp| {
+            let streaming = resp.into_inner();
+            tonic::Response::new(Box::pin(streaming) as BranchListStream)
+        }))
     }
 }

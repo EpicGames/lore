@@ -17,8 +17,6 @@ pub struct WriteOptions {
     pub remote_write: bool,
     /// Fixed size chunking if nonzero
     pub fixed_size_chunk: usize,
-    /// Clone the memory buffer before hashing for consistent reads
-    pub clone_buffer: bool,
 }
 
 impl WriteOptions {
@@ -52,6 +50,17 @@ impl WriteOptions {
     pub fn no_remote_write(mut self) -> Self {
         self.remote_write = false;
         self
+    }
+
+    /// The size to cut fixed-size chunks at, or `None` for content-defined chunking.
+    ///
+    /// The clamp lives here, not only in the builder, because `fixed_size_chunk` is `pub` and a
+    /// struct literal bypasses it. Every cutting path asks this, so none can omit the bound.
+    ///
+    /// An oversized leaf is not just different chunking: `store_fragment` refuses it, and the
+    /// compare walk reads any entry above the threshold as a nested list.
+    pub fn cut_size(&self) -> Option<usize> {
+        (self.fixed_size_chunk > 0).then(|| self.fixed_size_chunk.clamp(1, FRAGMENT_SIZE_THRESHOLD))
     }
 
     pub fn with_fixed_size_chunk(mut self, size: usize) -> Self {
@@ -90,8 +99,6 @@ pub struct ReadOptions {
     pub cache: bool,
     /// Write to file directly
     pub direct_write: bool,
-    /// Use file read/write instead of memory mapping
-    pub direct_file_io: bool,
     /// Force sync data to storage media after write
     pub sync_data: bool,
     /// Priority read hint for stream scheduling (metadata/tree blocks)
@@ -114,7 +121,6 @@ impl Default for ReadOptions {
             remote: true,
             cache: false,
             direct_write: false,
-            direct_file_io: false,
             sync_data: false,
             priority: false,
             max_content_size: None,
@@ -190,11 +196,6 @@ impl ReadOptions {
 
     pub fn with_direct_write(mut self) -> Self {
         self.direct_write = true;
-        self
-    }
-
-    pub fn with_direct_file_io(mut self) -> Self {
-        self.direct_file_io = true;
         self
     }
 

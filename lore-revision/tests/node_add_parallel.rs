@@ -27,6 +27,8 @@ mod tests {
     const SIBLING_COUNT: usize = 128;
     const READER_TASKS: usize = 8;
     const READS_PER_TASK: usize = 10_000;
+    const TREE_INSTALL_TASKS: usize = 16;
+    const TREE_INSTALL_ROUNDS: usize = 64;
 
     /// Regression test for the `node_add` publish-before-init race.
     ///
@@ -168,6 +170,73 @@ mod tests {
                         .find_subnode(repository.clone(), parent, hash_string(name))
                         .await
                         .expect("every concurrently-added sibling must be findable");
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// The lazy tree install is inherently racy: several callers can miss the
+    /// cached value before any of them takes the write lock. Only the first may
+    /// install, because installing also pushes a placeholder onto the block
+    /// vector, and a second placeholder makes `block_count` report a block the
+    /// tree does not have.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_tree_installs_push_one_block_placeholder() {
+        let (_immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = Context::from(uuid::Uuid::now_v7());
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+
+                let immutable_store = LocalImmutableStore::new(
+                    None,
+                    lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("Failed to create store");
+
+                let write_token =
+                    lore_revision::repository::RepositoryWriteToken::acquire(path.as_path()).await;
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        Some(path.clone()),
+                        immutable_store.clone(),
+                        mutable_store.clone(),
+                        repository_id.into(),
+                        lore_revision::instance::InstanceId::default(),
+                        Err(ProtocolError::from(NoRemote)),
+                        Arc::default(),
+                        RepositoryFormat::Lore,
+                    )
+                    .with_write_token(write_token.share()),
+                );
+
+                for round in 0..TREE_INSTALL_ROUNDS {
+                    let state = Arc::new(State::new());
+                    let start = Arc::new(tokio::sync::Barrier::new(TREE_INSTALL_TASKS));
+                    let mut tasks: JoinSet<()> = JoinSet::new();
+                    for _ in 0..TREE_INSTALL_TASKS {
+                        let repo = repository.clone();
+                        let state = state.clone();
+                        let start = start.clone();
+                        lore_spawn!(tasks, async move {
+                            start.wait().await;
+                            assert!(state.tree(repo).await.is_ok(), "tree install must succeed");
+                        });
+                    }
+                    while let Some(joined) = tasks.join_next().await {
+                        joined.expect("tree install task panicked");
+                    }
+
+                    assert_eq!(
+                        state.block_count(),
+                        1,
+                        "round {round}: a raced install must leave one block placeholder"
+                    );
                 }
             }))
             .await

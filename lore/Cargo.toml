@@ -21,6 +21,7 @@ parking_lot = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
+uuid = { workspace = true }
 lore-base = { workspace = true }
 lore-storage = { workspace = true }
 lore-revision = { workspace = true }
@@ -29,6 +30,8 @@ lore-transport = { workspace = true }
 lore-error-set = { workspace = true }
 lore-macro = { workspace = true }
 lore-notification = { workspace = true }
+
+[target.'cfg(target_family = "windows")'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Networking_WinSock"] }
 
 [build-dependencies]

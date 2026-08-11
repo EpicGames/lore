@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
 
-use lore_base::lore_spawn;
+use lore_base::lore_spawn_core;
 use lore_telemetry::InstrumentProvider;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Gauge;
@@ -119,6 +119,10 @@ fn record_stats(service_name: &'static str, connection: &Connection, elapsed: Du
 }
 
 impl ConnectionMetricsGuard<'_> {
+    /// Starts the per-connection stats poller on core.
+    ///
+    /// Pinned rather than following the caller, which is a net task: this is telemetry on a timer,
+    /// and there is one of these per live connection, so net stays for driving sockets.
     fn start(&mut self, interval: Duration) {
         if self.task_handle.is_some() {
             warn!("Attempted to start connection stats tracking, but task handle was already set");
@@ -129,7 +133,7 @@ impl ConnectionMetricsGuard<'_> {
         let service_name = self.service_name;
         let established_at = self.established_at; // Force copy before moving into the task
 
-        self.task_handle = Some(lore_spawn!(async move {
+        self.task_handle = Some(lore_spawn_core!(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 

@@ -7,8 +7,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use lore_base::lore_spawn_net;
+use lore_proto::lore::repository::v1::forwarded_repository_service_server::ForwardedRepositoryServiceServer;
 use lore_proto::lore::revision::v1::forwarded_revision_service_server::ForwardedRevisionServiceServer;
 use lore_proto::rpc::replication_service_server::ReplicationServiceServer;
+use lore_revision::environment::EnvironmentConfig;
 use lore_revision::notification::NotificationSender;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
@@ -23,6 +26,7 @@ use tracing::info;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::correlation::layer::TraceLayerConfig;
 use crate::grpc;
+use crate::grpc::forwarded_repository::v1::service::LoreForwardedRepositoryV1Service;
 use crate::grpc::forwarded_revision::v1::service::LoreForwardedRevisionV1Service;
 use crate::grpc::replication_service::LoreReplicationService;
 use crate::grpc::tower::tracing::LoreTracingLayer;
@@ -51,7 +55,10 @@ type GrpcRouter = tonic::transport::server::Router<
                     >,
                     crate::correlation::layer::CorrelationIdLayer,
                 >,
-                tower::layer::util::Identity,
+                tower::layer::util::Stack<
+                    crate::util::core_hop::CoreHopLayer,
+                    tower::layer::util::Identity,
+                >,
             >,
         >,
     >,
@@ -74,6 +81,7 @@ impl GrpcInternalServerBuilder<WantsComponents> {
         mutable_store: Arc<dyn MutableStore>,
         notification_sender: Arc<dyn NotificationSender>,
         hook_dispatcher: Arc<HookDispatcher>,
+        environment: EnvironmentConfig,
     ) -> anyhow::Result<GrpcInternalServerBuilder<WantsTlsConfig>> {
         if !local_immutable_store.is_local() {
             return Err(anyhow!("Immutable store must be a local store"));
@@ -85,6 +93,7 @@ impl GrpcInternalServerBuilder<WantsComponents> {
             mutable_store,
             notification_sender,
             hook_dispatcher,
+            environment,
         }))
     }
 }
@@ -95,6 +104,7 @@ pub struct WantsTlsConfig {
     mutable_store: Arc<dyn MutableStore>,
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
+    environment: EnvironmentConfig,
 }
 
 impl GrpcInternalServerBuilder<WantsTlsConfig> {
@@ -143,6 +153,7 @@ impl GrpcInternalServerBuilder<WantsTlsConfig> {
             mutable_store: self.0.mutable_store,
             notification_sender: self.0.notification_sender,
             hook_dispatcher: self.0.hook_dispatcher,
+            environment: self.0.environment,
             tls_config,
         }))
     }
@@ -154,6 +165,7 @@ pub struct WantsHttp2Config {
     mutable_store: Arc<dyn MutableStore>,
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
+    environment: EnvironmentConfig,
     tls_config: Option<ServerTlsConfig>,
 }
 
@@ -176,6 +188,9 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
         }
         let tracing_levels = TraceLayerConfig::default();
         let mut router = server
+            // Outermost, so everything inward runs on core: this stack is served
+            // from net.
+            .layer(crate::util::core_hop::CoreHopLayer)
             .layer(
                 CorrelationIdLayerBuilder::new()
                     .with_grpc_tracer(tracing_levels)
@@ -189,9 +204,19 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
 
         router = router.add_service(ForwardedRevisionServiceServer::new(
             LoreForwardedRevisionV1Service::new(
+                self.0.immutable_store.clone(),
+                self.0.mutable_store.clone(),
+                self.0.notification_sender.clone(),
+                self.0.hook_dispatcher.clone(),
+                rpc_timeout,
+            ),
+        ));
+
+        router = router.add_service(ForwardedRepositoryServiceServer::new(
+            LoreForwardedRepositoryV1Service::new(
+                self.0.environment,
                 self.0.immutable_store,
                 self.0.mutable_store,
-                self.0.notification_sender,
                 self.0.hook_dispatcher,
                 rpc_timeout,
             ),
@@ -206,12 +231,14 @@ pub struct WantsAddress {
 }
 
 impl GrpcInternalServerBuilder<WantsAddress> {
+    /// Serves on the net runtime; see [`super::server::GrpcServerBuilder::serve`].
     pub async fn serve(
         self,
         addr: SocketAddr,
-        signal: impl Future<Output = ()>,
+        signal: impl Future<Output = ()> + Send + 'static,
     ) -> anyhow::Result<()> {
-        self.0.router.serve_with_shutdown(addr, signal).await?;
+        lore_spawn_net!(async move { self.0.router.serve_with_shutdown(addr, signal).await })
+            .await??;
         Ok(())
     }
 }

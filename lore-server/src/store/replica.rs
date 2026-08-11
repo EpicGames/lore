@@ -324,6 +324,56 @@ where
     }
 
     #[lore_macro::lore_instrument]
+    #[instrument(name = "QuicReplica::GetMetadata", skip_all)]
+    async fn get_metadata(
+        self: Arc<Self>,
+        repository: Partition,
+        address: Address,
+    ) -> Result<StoreQueryResult, StoreError> {
+        if !self.client_container.is_healthy() {
+            return Err(StoreError::internal("client is unhealthy"));
+        }
+
+        let meta = ServiceRequestMeta {
+            client_epoch: self.client_container.epoch(),
+            address: Some(address),
+        };
+
+        let store = self.clone();
+        let service_result = async move {
+            let context = execution_context();
+            let request = Query(ExistsBatch {
+                header: ReplicationHeader {
+                    correlation_id: uuid::Uuid::try_parse(
+                        context.globals().correlation_id.as_str(),
+                    )
+                    .unwrap_or_default(),
+                    repository: repository.into(),
+                },
+                store_match: StoreMatch::MatchFull,
+                addresses: vec![address],
+            });
+            let client = store.client_container.client().read().await;
+            client.local_get_metadata(request).await
+        }
+        .observe(
+            self.instruments.operation_latency.clone(),
+            self.instruments
+                .provider
+                .get_labels_for_operation_context("get_metadata"),
+            observe_client_interaction(),
+        )
+        .await
+        .output;
+
+        let response = handle_service_response(service_result, self, meta)?;
+        Ok(StoreQueryResult {
+            fragment: response.fragment,
+            match_made: response.match_made,
+        })
+    }
+
+    #[lore_macro::lore_instrument]
     #[instrument(name = "QuicReplica::Get", skip_all)]
     async fn get(
         self: Arc<Self>,
@@ -570,6 +620,16 @@ mod tests {
             async fn local_get(&self, request: Get) -> Result<GetResponse, ReplicationStoreClientError>;
 
             async fn local_query(
+                &self,
+                request: Query,
+            ) -> Result<QueryResponse, ReplicationStoreClientError>;
+
+            async fn get_metadata(
+                &self,
+                request: Query,
+            ) -> Result<QueryResponse, ReplicationStoreClientError>;
+
+            async fn local_get_metadata(
                 &self,
                 request: Query,
             ) -> Result<QueryResponse, ReplicationStoreClientError>;
@@ -1466,6 +1526,148 @@ mod tests {
                         .get(repository.into(), address, StoreMatch::MatchFull)
                         .await
                         .expect_err("get should fail when unhealthy");
+                    assert!(matches!(error, StoreError::Internal(_)));
+                })
+                .await;
+        }
+    }
+
+    mod get_metadata {
+        use super::*;
+
+        #[tokio::test]
+        async fn successful_transform_works() {
+            let correlation_id = uuid::Uuid::new_v4();
+            let execution = crate::util::setup_execution(
+                "test",
+                correlation_id.as_hyphenated().to_string(),
+                String::default(),
+            );
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let repository: Context = random();
+                    let (fragment, address, _) = fragment::generate_random();
+
+                    let (tx, rx) = mpsc::channel(1);
+                    let factory = ChannelFactory { rx: rx.into() };
+
+                    let mut client = make_mock_client();
+                    client
+                        .expect_local_get_metadata()
+                        .with(eq(Query(ExistsBatch {
+                            header: ReplicationHeader {
+                                correlation_id,
+                                repository,
+                            },
+                            store_match: StoreMatch::MatchFull,
+                            addresses: vec![address],
+                        })))
+                        .returning(move |_| {
+                            Ok(QueryResponse {
+                                fragment,
+                                match_made: StoreMatch::MatchFull,
+                            })
+                        });
+
+                    tx.send(Ok(client)).await.unwrap();
+                    let replica = Replica::new(
+                        Arc::new(factory),
+                        make_client_container_config(),
+                        LabelArray::default(),
+                    )
+                    .await
+                    .expect("Creation should work");
+                    let replica = Arc::new(replica);
+
+                    let output = replica
+                        .get_metadata(repository.into(), address)
+                        .await
+                        .expect("get_metadata should work");
+
+                    assert_eq!(output.match_made, StoreMatch::MatchFull);
+                    assert_eq!(output.fragment, fragment);
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn service_error_transformation_works() {
+            let execution =
+                crate::util::setup_execution("test", String::default(), String::default());
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let repository: Context = random();
+                    let (_, address, _) = fragment::generate_random();
+
+                    let (tx, rx) = mpsc::channel(1);
+                    let factory = ChannelFactory { rx: rx.into() };
+
+                    let mut client = make_mock_client();
+                    client.expect_local_get_metadata().returning(|_| {
+                        Err(ReplicationStoreClientError::ServiceError(
+                            ReplicationServiceErrorCode::SlowDown,
+                        ))
+                    });
+
+                    tx.send(Ok(client)).await.unwrap();
+                    let replica = Replica::new(
+                        Arc::new(factory),
+                        make_client_container_config(),
+                        LabelArray::default(),
+                    )
+                    .await
+                    .expect("Creation should work");
+                    let replica = Arc::new(replica);
+
+                    let error = replica
+                        .get_metadata(repository.into(), address)
+                        .await
+                        .expect_err("get_metadata should fail");
+
+                    assert!(matches!(error, StoreError::SlowDown(_)));
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn get_metadata_returns_error_when_unhealthy() {
+            let execution =
+                crate::util::setup_execution("test", String::default(), String::default());
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let (tx, rx) = mpsc::channel(1);
+                    let factory = ChannelFactory { rx: rx.into() };
+
+                    tx.send(Ok(make_mock_client())).await.unwrap();
+                    let replica = Replica::new(
+                        Arc::new(factory),
+                        make_client_container_config(),
+                        LabelArray::default(),
+                    )
+                    .await
+                    .expect("Creation should work");
+                    let replica = Arc::new(replica);
+
+                    {
+                        let regen = replica.client_container.regenerate_client(
+                            replica.client_container.epoch(),
+                            GenerateClientReason::ConnectionFailed,
+                        );
+                        tokio::pin!(regen);
+                        tokio::select! {
+                            _ = &mut regen => { panic!("regen should not finish"); },
+                            _ = tokio::time::sleep(Duration::from_millis(100)) => {},
+                        }
+                    }
+                    assert!(!replica.client_container.is_healthy());
+
+                    let repository: Context = random();
+                    let (_, address, _) = fragment::generate_random();
+
+                    let error = replica
+                        .get_metadata(repository.into(), address)
+                        .await
+                        .expect_err("get_metadata should fail when unhealthy");
                     assert!(matches!(error, StoreError::Internal(_)));
                 })
                 .await;

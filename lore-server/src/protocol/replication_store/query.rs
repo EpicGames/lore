@@ -58,7 +58,7 @@ pub struct QueryResponse {
 }
 
 impl QueryResponse {
-    fn data(self) -> Vec<Bytes> {
+    pub fn data(self) -> Vec<Bytes> {
         let match_made: u8 = self.match_made.into();
         vec![
             Bytes::copy_from_slice(self.fragment.as_bytes()),

@@ -98,15 +98,14 @@ async fn node_path_impl(
     callback: LoreEventCallback,
 ) -> i32 {
     let handle = args.handle;
-    let miss_id = args.id;
     revision_tree_call(
         globals,
         callback,
         handle,
         args,
         node_path,
-        move || {
-            emit_node_path_error(miss_id, LoreErrorCode::InvalidArguments);
+        |args: &LoreRevisionTreeNodePathArgs| {
+            emit_node_path_error(args.id, LoreErrorCode::InvalidArguments);
         },
         async move |internal, args: LoreRevisionTreeNodePathArgs| {
             let id = args.id;

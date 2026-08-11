@@ -1,0 +1,4 @@
+region          = "us-west-2"
+container_image = "123456789012.dkr.ecr.us-west-2.amazonaws.com/loreserver:v0.8.3"  # must support linux/arm64
+allowed_cidrs   = ["10.0.0.0/8"]
+# instance_type = "c8gd.8xlarge"  # default — 32 vCPU, 64 GB, 1.9 TB NVMe, 25 Gbps

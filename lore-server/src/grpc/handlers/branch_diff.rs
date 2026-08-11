@@ -101,39 +101,53 @@ async fn branch_diff_handler(
         })?;
 
     let repository_id = repository.id;
-    branch::diff3_collect(
+    let result = branch::diff3_collect(
         repository,
         branch_source,
         revision_source.unwrap_or(source.latest),
         branch_target,
         revision_target.unwrap_or(target.latest),
-        None, /* No path */
+        None,  /* No path */
         false, /* Do not include identical changes */
         auto_resolve,
     )
-        .await
-        .map(|result| {
+    .await;
+    match result {
+        Ok(result) => {
             debug!("Found {} changes", result.changes.len());
-            Response::new(BranchDiffResponse {
-                diffs: result.changes.iter().filter_map(map_to_path_diff).collect(),
-                conflicts: result.conflicts.iter().filter_map(map_to_conflict).collect(),
+            let mut diffs = Vec::with_capacity(result.changes.len());
+            for change in &result.changes {
+                if let Some(diff) = map_to_path_diff(change, repository_id).await {
+                    diffs.push(diff);
+                }
+            }
+            let mut conflicts = Vec::with_capacity(result.conflicts.len());
+            for conflict in &result.conflicts {
+                if let Some(conflict) = map_to_conflict(conflict, repository_id).await {
+                    conflicts.push(conflict);
+                }
+            }
+            Ok(Response::new(BranchDiffResponse {
+                diffs,
+                conflicts,
                 branch_source: Some(source.into()),
                 branch_target: Some(target.into()),
                 revision_source: result.source.into(),
                 revision_target: result.target.into(),
                 revision_base: result.base.into(),
-            })
-        })
-        .map_err(|err| {
+            }))
+        }
+        Err(err) => {
             warn!({REPOSITORY_ID} = %repository_id, %branch_source, %branch_target, ?err, "Failed to calculate diff");
             if err.is_divergent() {
-                Status::invalid_argument(err.to_string())
+                Err(Status::invalid_argument(err.to_string()))
             } else if err.is_max_history_search_depth() {
-                Status::resource_exhausted(err.to_string())
+                Err(Status::resource_exhausted(err.to_string()))
             } else {
-                Status::internal(err.to_string())
+                Err(Status::internal(err.to_string()))
             }
-        })
+        }
+    }
 }
 
 #[cfg(test)]

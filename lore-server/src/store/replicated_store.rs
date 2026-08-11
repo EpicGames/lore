@@ -359,6 +359,55 @@ where
     }
 
     #[lore_macro::lore_instrument]
+    #[instrument(name = "ReplicatedStore::GetMetadata", skip_all)]
+    async fn get_metadata(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+    ) -> Result<StoreQueryResult, StoreError> {
+        let repository: Context = partition.into();
+        let meta = ServiceRequestMeta {
+            client_epoch: self.client_container.epoch(),
+            address: Some(address),
+        };
+
+        let store = self.clone();
+        let service_result = async move {
+            let context = execution_context();
+            let request = Query(ExistsBatch {
+                header: ReplicationHeader {
+                    correlation_id: uuid::Uuid::try_parse(
+                        context.globals().correlation_id.as_str(),
+                    )
+                    .unwrap_or_default(),
+                    repository,
+                },
+                store_match: StoreMatch::MatchFull,
+                addresses: vec![address],
+            });
+            let client = store.client_container.client().read().await;
+            client.get_metadata(request).await
+        }
+        .observe(
+            self.instruments
+                .immutable_operation_latency_histogram
+                .clone(),
+            self.instruments
+                .provider
+                .get_labels_for_operation_context("get_metadata"),
+            observe_client_interaction(),
+        )
+        .await
+        .output;
+
+        let response = handle_service_response(service_result, self, meta)?;
+        Ok(StoreQueryResult {
+            fragment: response.fragment,
+            match_made: response.match_made,
+        })
+    }
+
+    #[lore_macro::lore_instrument]
     #[instrument(name = "ReplicatedStore::Get", skip_all)]
     async fn get(
         self: Arc<Self>,
@@ -658,6 +707,16 @@ mod tests {
             async fn local_get(&self, request: Get) -> Result<GetResponse, ReplicationStoreClientError>;
 
             async fn local_query(
+                &self,
+                request: Query,
+            ) -> Result<QueryResponse, ReplicationStoreClientError>;
+
+            async fn get_metadata(
+                &self,
+                request: Query,
+            ) -> Result<QueryResponse, ReplicationStoreClientError>;
+
+            async fn local_get_metadata(
                 &self,
                 request: Query,
             ) -> Result<QueryResponse, ReplicationStoreClientError>;
@@ -1587,6 +1646,108 @@ mod tests {
                         .get(repository.into(), address, StoreMatch::MatchFull)
                         .await
                         .expect_err("get should fail");
+                    assert!(matches!(error, StoreError::SlowDown(_)));
+                })
+                .await;
+        }
+    }
+
+    mod get_metadata {
+        use lore_base::runtime::LORE_CONTEXT;
+        use lore_revision::fragment;
+        use mockall::predicate::eq;
+        use rand::random;
+
+        use super::*;
+
+        #[tokio::test]
+        async fn successful_transform_works() {
+            let correlation_id = uuid::Uuid::new_v4();
+            let execution = crate::util::setup_execution(
+                "test",
+                correlation_id.as_hyphenated().to_string(),
+                String::default(),
+            );
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let repository: Context = random();
+                    let (fragment, address, _) = fragment::generate_random();
+
+                    let (tx, rx) = mpsc::channel(1);
+                    let factory = ChannelFactory { rx: rx.into() };
+
+                    let mut client = make_mock_client();
+                    client
+                        .expect_get_metadata()
+                        .with(eq(Query(ExistsBatch {
+                            header: ReplicationHeader {
+                                correlation_id,
+                                repository,
+                            },
+                            store_match: StoreMatch::MatchFull,
+                            addresses: vec![address],
+                        })))
+                        .returning(move |_| {
+                            Ok(QueryResponse {
+                                fragment,
+                                match_made: StoreMatch::MatchFull,
+                            })
+                        });
+
+                    tx.send(Ok(client)).await.unwrap();
+                    let store = ReplicatedStore::new(
+                        Arc::new(factory),
+                        make_client_container_config(),
+                        Duration::from_secs(60),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .expect("Creation should work");
+
+                    let output = store
+                        .get_metadata(repository.into(), address)
+                        .await
+                        .expect("get_metadata should work");
+
+                    assert_eq!(output.match_made, StoreMatch::MatchFull);
+                    assert_eq!(output.fragment, fragment);
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn service_error_transformation_works() {
+            let execution =
+                crate::util::setup_execution("test", String::default(), String::default());
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let repository: Context = random();
+                    let (_, address, _) = fragment::generate_random();
+
+                    let (tx, rx) = mpsc::channel(1);
+                    let factory = ChannelFactory { rx: rx.into() };
+
+                    let mut client = make_mock_client();
+                    client.expect_get_metadata().returning(|_| {
+                        Err(ReplicationStoreClientError::ServiceError(
+                            ReplicationServiceErrorCode::SlowDown,
+                        ))
+                    });
+
+                    tx.send(Ok(client)).await.unwrap();
+                    let store = ReplicatedStore::new(
+                        Arc::new(factory),
+                        make_client_container_config(),
+                        Duration::from_secs(60),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .expect("Creation should work");
+
+                    let error = store
+                        .get_metadata(repository.into(), address)
+                        .await
+                        .expect_err("get_metadata should fail");
                     assert!(matches!(error, StoreError::SlowDown(_)));
                 })
                 .await;

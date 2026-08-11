@@ -10,6 +10,7 @@ use lore_proto::lore::revision::v1::BranchDeleteRequest;
 use lore_proto::lore::revision::v1::BranchDeleteResponse;
 use lore_proto::lore::revision::v1::BranchGetRequest;
 use lore_proto::lore::revision::v1::BranchGetResponse;
+use lore_proto::lore::revision::v1::BranchListRequest;
 use lore_proto::lore::revision::v1::forwarded_revision_service_server::ForwardedRevisionService;
 use lore_revision::notification::NotificationSender;
 use lore_telemetry::InstrumentProvider;
@@ -20,6 +21,8 @@ use tonic::Status;
 use super::branch_create;
 use super::branch_delete;
 use super::branch_get;
+use super::branch_list;
+use crate::grpc::revision::v1::branch_list::BranchListStream;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
 
@@ -112,6 +115,20 @@ impl ForwardedRevisionService for LoreForwardedRevisionV1Service {
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
+        )
+        .await
+    }
+
+    type BranchListStream = BranchListStream;
+
+    async fn branch_list(
+        &self,
+        request: Request<BranchListRequest>,
+    ) -> Result<Response<Self::BranchListStream>, Status> {
+        branch_list::handler(
+            request,
+            self.immutable_store.clone(),
+            self.mutable_store.clone(),
         )
         .await
     }

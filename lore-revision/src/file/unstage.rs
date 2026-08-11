@@ -769,6 +769,9 @@ async fn unstage_node(
                         }
                     }
 
+                    // The `or_default` guard dies at the `;`, so the shard lock is
+                    // not held across the await below.
+                    #[allow(clippy::disallowed_methods)]
                     discard
                         .entry(current_repository.id)
                         .or_default()
@@ -887,7 +890,9 @@ async fn unstage_node(
                 if node.is_dirty() && node.is_file() {
                     let current_repository_root = current_repository.require_path()?;
                     let absolute_path = current_repository_root.join(resolved_node_path.as_str());
-                    if let Ok(file_metadata) = tokio::fs::metadata(&absolute_path).await {
+                    if let Ok(file_metadata) =
+                        lore_io::IoDriver::global().metadata(&absolute_path).await
+                    {
                         let node_path_rel = crate::util::path::RelativePath::new_from_user_path(
                             current_repository_root,
                             absolute_path.to_string_lossy().as_ref(),

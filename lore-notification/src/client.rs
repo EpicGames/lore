@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lore_base::lore_spawn;
+use lore_base::lore_spawn_net;
 use lore_base::types::Hash;
 use lore_error_set::prelude::*;
 use lore_proto::lore::notification;
@@ -134,7 +134,10 @@ impl NotificationClient {
             };
 
             let mut client = client.clone();
-            match client.subscribe(request).await {
+            let result = lore_spawn_net!(async move { client.subscribe(request).await })
+                .await
+                .internal("subscribing to notification stream")?;
+            match result {
                 Ok(response) => {
                     lore_debug!("Subscription to stream successful");
                     return Ok(response.into_inner());
@@ -169,7 +172,7 @@ impl lore_revision::notification::NotificationClient for NotificationClient {
         let stop = cancellation_token.clone();
         let client_ref = client;
         let event_sender = execution_context().dispatcher.sender();
-        let task = lore_spawn!(async move {
+        let task = lore_spawn_net!(async move {
             LoreEvent::NotificationSubscribed(LoreNotificationSubscribedEventData { repository })
                 .send();
 

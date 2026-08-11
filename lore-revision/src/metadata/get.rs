@@ -42,7 +42,7 @@ pub async fn get_revision(
     };
 
     if let Some(metadata) = metadata::find::revision(repository.clone(), revision).await? {
-        event::metadata::send_keyed(&metadata, key).internal("sending metadata event")?;
+        event::metadata::send_keyed(&metadata, key);
     }
 
     Ok(())
@@ -82,7 +82,7 @@ pub async fn get_file(
     if let Some(metadata) =
         metadata::find::file(repository.clone(), revision, &relative_path).await?
     {
-        event::metadata::send_keyed(&metadata, key.as_str()).internal("sending metadata event")?;
+        event::metadata::send_keyed(&metadata, key.as_str());
     }
 
     Ok(())

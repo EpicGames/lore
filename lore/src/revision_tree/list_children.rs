@@ -166,10 +166,10 @@ async fn resolve_listing_target(
 ///
 /// The header is the only id-carrying terminal: a failure that surfaces after a
 /// successful header has fired — a tree-block read error mid-iteration — is
-/// reported on the trailing `Error`/`Complete{status:1}` pair, which carry no
-/// `id`. Such a mid-stream failure is therefore not attributable to this call on
-/// a multiplexed transport; callers treat a non-zero `Complete` after a
-/// successful header as "the listing was truncated".
+/// reported on the trailing `Complete{status:1}`, which carries no `id`. Such a
+/// mid-stream failure is therefore not attributable to this call on a
+/// multiplexed transport; callers treat a non-zero `Complete` after a successful
+/// header as "the listing was truncated".
 pub async fn list_children(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeListChildrenArgs,
@@ -184,16 +184,15 @@ async fn list_children_impl(
     callback: LoreEventCallback,
 ) -> i32 {
     let handle = args.handle;
-    let miss_id = args.id;
     revision_tree_call(
         globals,
         callback,
         handle,
         args,
         list_children,
-        move || {
+        |args: &LoreRevisionTreeListChildrenArgs| {
             emit_begin(
-                miss_id,
+                args.id,
                 RepositoryId::default(),
                 Hash::default(),
                 LoreErrorCode::InvalidArguments,

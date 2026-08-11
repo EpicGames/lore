@@ -122,7 +122,7 @@ pub async fn handle_get_metadata(
     LORE_CONTEXT
         .scope(execution, async move {
             match immutable_store
-                .query(repository, address, StoreMatch::MatchFull)
+                .get_metadata(repository, address)
                 .await
             {
                 Ok(StoreQueryResult {

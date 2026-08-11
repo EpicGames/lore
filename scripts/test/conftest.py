@@ -3,7 +3,10 @@
 import json
 import logging
 import os
+import platform
 import subprocess
+import typing
+
 import sys
 from pathlib import Path
 from time import sleep
@@ -20,6 +23,7 @@ from lore_server import (
     launch_lore_server,
     lore_local_server,
 )
+from service_util import service_supported
 
 logger = logging.getLogger(__name__)
 
@@ -167,6 +171,19 @@ def global_dir_name(tmp_path_factory):
     yield path
 
 
+def _service_unreachable(output):
+    """Whether a probe failed because it could not reach the service.
+
+    On Windows the failure also carries WinSock error 10022, which is kept as a
+    separate marker rather than relying on the wrapping context alone. It is
+    scoped to Windows so that a repository path echoed back in the output cannot
+    match it by accident on the other platforms.
+    """
+    if "connecting to local socket" in output:
+        return True
+    return platform.system() == "Windows" and "10022" in output
+
+
 def _wait_for_service_ready(lore_executable_path, service_process, attempts=30):
     """Block until the background service answers a probe."""
     probe_env = os.environ.copy()
@@ -178,29 +195,88 @@ def _wait_for_service_ready(lore_executable_path, service_process, attempts=30):
                 f"{service_process.returncode}"
             )
         probe = subprocess.run(
-            [lore_executable_path, "repository", "list"],
+            [lore_executable_path, "status"],
             capture_output=True,
             text=True,
             env=probe_env,
         )
         out = probe.stdout + probe.stderr
-        if "connecting to local socket" not in out and "10022" not in out:
+        if not _service_unreachable(out):
             return
         sleep(1)
     pytest.fail("Timed out waiting for Lore background service to accept connections")
 
 
+class TrackedServices(object):
+    def __init__(self, lore_executable_path: str, global_dir_name: str):
+        self.lore_executable_path = lore_executable_path
+        self.global_dir_name = global_dir_name
+        self.service_processes: typing.Dict[str | None, subprocess.Popen | None] = {}
+
+    def start(self, directory: str | None = None):
+        """Starts the service, optionally with a chosen working directory. The service
+        shares the test's isolated global config so shared stores it creates land
+        where the client looks for them."""
+        assert self.service_processes.get(directory) is None
+
+        env = os.environ.copy()
+        env["LORE_GLOBAL_PATH"] = self.global_dir_name
+
+        command_args = [self.lore_executable_path, "service", "run"]
+        logger.info("Executing Lore service command: %s", command_args)
+        process = subprocess.Popen(command_args, cwd=directory, env=env)
+        _wait_for_service_ready(self.lore_executable_path, process)
+        self.service_processes[directory] = process
+
+        return process
+
+    def terminate(self, directory: str | None = None):
+        process = self.service_processes.get(directory)
+        if process is not None:
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                logger.warning("Lore service did not exit on terminate, killing it")
+                process.kill()
+            self.service_processes[directory] = None
+
+    def terminate_all(self):
+        for key in list(self.service_processes.keys()):
+            self.terminate(key)
+
+
+@pytest.fixture(
+    scope="function",
+    params=[
+        pytest.param(
+            None,
+            marks=[
+                pytest.mark.skipif(
+                    not service_supported(),
+                    reason="Service not supported on " + platform.system(),
+                ),
+                pytest.mark.xdist_group("lore_service"),
+            ],
+        )
+    ],
+)
+def lore_service_runner(lore_executable_path, global_dir_name):
+    """Provides a utility able to start the Lore service process, and cleans up any un-terminated service when the test
+    ends.
+    Automatically marks any test using this as skipped if services aren't supported and as part of the lore_service
+    xdist_group"""
+    tracked_services = TrackedServices(lore_executable_path, global_dir_name)
+
+    yield tracked_services
+
+    tracked_services.terminate_all()
+
+
 @pytest.fixture(scope="function")
-def background_lore_service(lore_executable_path):
-    command_args = [lore_executable_path, "service", "run"]
-    logger.info("Executing Lore service command: %s", command_args)
-    service_process = subprocess.Popen(command_args)
-
-    _wait_for_service_ready(lore_executable_path, service_process)
-
-    yield service_process
-
-    service_process.kill()
+def background_lore_service(lore_service_runner):
+    """Automatically starts a Lore service process using the service runner
+    before the test begins"""
+    yield lore_service_runner.start()
 
 
 @pytest.fixture(scope="session")
@@ -253,6 +329,30 @@ def lore_server_executable_path(request):
             )
 
     return executable_path
+
+
+@pytest.fixture(scope="session")
+def lore_library(request):
+    """
+    Loads the public Lore C API library (`liblore`) for tests that need to
+    observe API-level behavior the CLI does not surface. Skips if the library
+    was not built alongside the client binary.
+    """
+    from lore_ffi import LoreLibrary, library_filename
+
+    library_path = os.getenv("LORE_LIBRARY_PATH")
+    if not library_path:
+        binary = request.config.getoption("--lore-client-binary")
+        build = binary if binary in ("release", "debug") else "release"
+        library_path = str(Path.cwd() / "target" / build / library_filename())
+    library_path = str(Path(library_path).resolve())
+    if not os.path.exists(library_path):
+        pytest.skip(
+            f"Lore library not found at {library_path}; "
+            "set LORE_LIBRARY_PATH to run C API tests"
+        )
+
+    return LoreLibrary(library_path)
 
 
 @pytest.fixture(scope="session")
@@ -461,3 +561,24 @@ def pytest_configure(config):
     """Register the xdist controller cleanup plugin early so its
     pytest_sessionfinish hook fires on the controller process."""
     config.pluginmanager.register(_XdistControllerCleanup(), "lore_xdist_cleanup")
+    config.addinivalue_line(
+        "markers", "regression: mark tests that don't run on every CI"
+    )
+    config.addinivalue_line(
+        "markers",
+        "bug_reproduction: mark tests that are known to fail and are a reproduction of a bug",
+    )
+
+
+def pytest_collection_modifyitems(config, items):
+    """A bug_reproduction test reproduces a known, unfixed bug, so it is expected
+    to fail. Mark it xfail(strict): the failure is the known state (reported as
+    xfail, not a suite failure), and if it ever passes the bug is fixed and the
+    strict xpass fails the run so the marker gets removed."""
+    for item in items:
+        if item.get_closest_marker("bug_reproduction"):
+            item.add_marker(
+                pytest.mark.xfail(
+                    reason="bug_reproduction: known unfixed bug", strict=True
+                )
+            )

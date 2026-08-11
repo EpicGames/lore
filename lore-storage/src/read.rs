@@ -3,6 +3,7 @@
 use std::cmp::min;
 use std::ops::Range;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -21,7 +22,6 @@ use crate::defragment::read_defragment;
 use crate::error::StorageError;
 use crate::errors::SlowDown;
 use crate::fragment_flags::FragmentFlags;
-use crate::fs_util;
 use crate::hash;
 use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
@@ -100,8 +100,7 @@ pub async fn decompress_and_verify(
     // Compressed is a group flag, check if any of the flags are set
     if (fragment.flags & FragmentFlags::PayloadCompressed) != 0 {
         let (decompressed_fragment, decompressed_buffer) =
-            compress::decompress_async(fragment, buffer.clone())
-                .await
+            compress::decompress(fragment, buffer.as_ref())
                 .forward::<StorageError>("failed to decompress fragment")?;
         if options.verify {
             content_hash = hash::hash_slice(decompressed_buffer.as_ref());
@@ -150,6 +149,10 @@ impl Drop for RemoteFetchGuard {
 /// reset by a QUIC reconnect; the storage layer mapping turns this into
 /// `StorageError::NotConnected`, which we recover from by invalidating the
 /// cached session and retrying with a fresh `session_start`).
+///
+/// `Disconnected` is deliberately not retried here: on both transports it means the
+/// transport already exhausted its own reconnect-and-reissue and gave up, so the remote
+/// is down rather than the session being stale.
 async fn remote_get_retry(
     session: &StorageSession,
     address: Address,
@@ -546,9 +549,9 @@ pub async fn read_into(
         }
         slice.copy_from_slice(content.as_ref());
     } else if fragment.flags & FragmentFlags::PayloadCompressed != 0 {
-        let (_, decompressed) = compress::decompress_async(fragment, buffer)
-            .await
+        let (_, decompressed) = compress::decompress(fragment, buffer.as_ref())
             .map_err(|e| StorageError::internal_with_context(e, "decompress failed"))?;
+        let decompressed = decompressed.freeze().slice(range);
         if slice.len() != decompressed.len() {
             return Err(StorageError::internal(format!(
                 "unexpected size: slice {} vs decompressed {}",
@@ -558,6 +561,7 @@ pub async fn read_into(
         }
         slice.copy_from_slice(decompressed.as_ref());
     } else {
+        let buffer = buffer.slice(range);
         if slice.len() != buffer.len() {
             return Err(StorageError::internal(format!(
                 "unexpected size: slice {} vs buffer {}",
@@ -619,7 +623,41 @@ pub async fn read_stream(
     }
 }
 
-/// Read content into a file (mmap or direct I/O).
+/// Removes a temporary file that was never renamed into place.
+///
+/// An orphan is a *full-size* file holding a prefix — the target is sized before any content
+/// arrives — and an invisible one, since the staging filters exclude the extension and nothing
+/// else deletes them.
+///
+/// Armed before the open, because a failure part-way through it can leave the file created.
+/// Disarmed after the rename because the path is derived from the destination: a guard outliving
+/// its own rename would delete the next reader's file.
+struct TemporaryFile {
+    path: Option<PathBuf>,
+}
+
+impl TemporaryFile {
+    fn guard(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn renamed(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TemporaryFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take()
+            && let Err(err) = std::fs::remove_file(&path)
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            lore_base::lore_warn!("failed to remove temporary file {}: {err}", path.display());
+        }
+    }
+}
+
+/// Read content into a file.
 ///
 /// Returns the fragment header along with the file's metadata when the write
 /// path captures it on the open handle (single-fragment direct write). Callers
@@ -653,7 +691,6 @@ pub async fn read_into_file(
 
     {
         if fragment.flags & FragmentFlags::PayloadFragmented == FragmentFlags::PayloadFragmented {
-            // Memory map the file and defragment into it
             let mut retry = crate::retry(10, 10_000, 10);
 
             let file_path = if options.direct_write {
@@ -668,58 +705,30 @@ pub async fn read_into_file(
                 temporary_path
             };
 
-            // Keep the mmap alive on the stack until defragment_file completes.
-            let mut _mmap_guard: Option<memmap2::MmapMut> = None;
+            let mut temporary =
+                (!options.direct_write).then(|| TemporaryFile::guard(file_path.clone()));
 
-            let (file, defrag_target) = if options.direct_file_io {
-                let file = loop {
-                    match crate::defragment::open_file_write(
-                        file_path.as_path(),
-                        fragment.size_content as usize,
-                    )
-                    .await
-                    {
-                        Ok(file) => break file,
-                        Err(err) => {
-                            if !retry.wait().await {
-                                return Err(StorageError::internal_with_context(
-                                    err,
-                                    &format!("failed to open file: {}", path.display()),
-                                ));
-                            }
+            let file = loop {
+                match crate::defragment::open_file_write(
+                    file_path.as_path(),
+                    fragment.size_content as usize,
+                )
+                .await
+                {
+                    Ok(file) => break file,
+                    Err(err) => {
+                        if !retry.wait().await {
+                            return Err(StorageError::internal_with_context(
+                                err,
+                                &format!("failed to open file: {}", path.display()),
+                            ));
                         }
                     }
-                };
-
-                let file = Arc::new(tokio::sync::Mutex::new(file));
-                (file.clone(), DefragmentSink::File { file })
-            } else {
-                let (file, mut mmap) = loop {
-                    match crate::defragment::open_mmap_write(
-                        file_path.as_path(),
-                        fragment.size_content as usize,
-                    )
-                    .await
-                    {
-                        Ok(file) => break file,
-                        Err(err) => {
-                            if !retry.wait().await {
-                                return Err(StorageError::internal_with_context(
-                                    err,
-                                    &format!("failed to open file: {}", path.display()),
-                                ));
-                            }
-                        }
-                    }
-                };
-
-                let defrag_target = DefragmentSink::Mmap {
-                    ptr: mmap.as_mut_ptr(),
-                    len: mmap.len(),
-                };
-                _mmap_guard = Some(mmap);
-
-                (Arc::new(tokio::sync::Mutex::new(file)), defrag_target)
+                }
+            };
+            let defrag_target = DefragmentSink::File {
+                file: file.clone(),
+                size: fragment.size_content as usize,
             };
 
             lore_base::lore_trace!(
@@ -741,26 +750,24 @@ pub async fn read_into_file(
             .await?;
 
             if options.sync_data {
-                file.lock()
-                    .await
-                    .sync_data()
+                file.sync_data()
                     .await
                     .map_err(|e| StorageError::internal_with_context(e, "flush file"))?;
             }
-            // tokio::fs::File wraps std::fs::File without a userspace buffer; flush would dispatch to a blocking thread to call a no-op.
+            // The handle holds no userspace buffer, so there is nothing to flush.
             drop(file);
 
             if !options.direct_write {
-                let path_owned = path.to_path_buf();
-                let file_path_clone = file_path.clone();
                 let rename_err_msg =
                     format!("rename {} -> {}", file_path.display(), path.display());
-                lore_base::lore_spawn_blocking!(move || {
-                    fs_util::rename_file(file_path_clone.as_path(), path_owned.as_path())
-                })
-                .await
-                .map_err(|e| StorageError::internal_with_context(e, "rename task join"))?
-                .map_err(|e| StorageError::internal_with_context(e, &rename_err_msg))?;
+                lore_io::IoDriver::global()
+                    .rename(file_path.as_path(), path)
+                    .await
+                    .map_err(|e| StorageError::internal_with_context(e, &rename_err_msg))?;
+
+                if let Some(temporary) = temporary.as_mut() {
+                    temporary.renamed();
+                }
             }
         } else {
             // Write directly into the file
@@ -785,46 +792,36 @@ pub async fn read_into_file(
     Ok((fragment, None))
 }
 
+/// Writes `buffer` as the whole contents of `path` and returns the resulting metadata.
+///
+/// One driver dispatch covers open, write, optional sync and stat, so the caller needs no
+/// separate stat round-trip and the metadata comes off the open handle rather than from a second
+/// path resolve. The whole-file operation refuses anything above `lore_io::WHOLE_FILE_LIMIT`,
+/// which the content written here cannot reach: an unfragmented fragment's content is bounded by
+/// `FRAGMENT_SIZE_THRESHOLD`.
 pub async fn write_all_to_file(
     path: impl AsRef<Path>,
     buffer: Bytes,
     sync_data: bool,
 ) -> Result<std::fs::Metadata, std::io::Error> {
-    // One spawn_blocking trip for open+write+(sync)+stat+close. Saves the caller a separate stat round-trip and keeps the metadata fetch on the open handle (no path resolve, FS cache warm). std::fs::File has no userspace buffer, so flush would be a no-op for unbuffered writes and is omitted in the non-sync path.
-    let path_buf = path.as_ref().to_path_buf();
+    let path = path.as_ref().to_path_buf();
     let buffer_len = buffer.len();
-    let path_display_for_trace = path_buf.clone();
-    let join_result =
-        lore_base::lore_spawn_blocking!(move || -> std::io::Result<std::fs::Metadata> {
-            use std::io::Write;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .read(true)
-                .write(true)
-                .open(&path_buf)?;
-            file.write_all(buffer.as_ref())?;
-            if sync_data {
-                file.sync_data()?;
-            }
-            file.metadata()
-        })
-        .await;
-    let metadata = match join_result {
-        Ok(io_result) => io_result?,
-        Err(join_err) => {
-            return Err(std::io::Error::other(format!(
-                "spawn_blocking join error writing {}: {join_err}",
-                path_display_for_trace.display()
-            )));
-        }
-    };
 
-    lore_base::lore_trace!(
-        "Wrote {} bytes to {}",
-        buffer_len,
-        path_display_for_trace.display()
-    );
+    // Reissued while the open fails transiently: a reader of this path grants no write access
+    // for as long as it is open, so on Windows a write landing on a file being hashed or
+    // fragmented waits for that scan rather than failing the materialization.
+    let metadata = crate::fs_util::retry_transient(|| {
+        let path = path.clone();
+        let buffer = buffer.clone();
+        async move {
+            lore_io::IoDriver::global()
+                .write_file_bytes(path, buffer, sync_data)
+                .await
+        }
+    })
+    .await?;
+
+    lore_base::lore_trace!("Wrote {} bytes to {}", buffer_len, path.display());
 
     Ok(metadata)
 }
@@ -867,6 +864,71 @@ mod tests {
             size_content: payload.len() as u64,
         };
         (partition, address, fragment, Bytes::from(payload))
+    }
+
+    /// A defragment that fails part-way must not leave its temporary behind. The temporary is
+    /// sized to the whole content before any of it arrives and is excluded from staging, so an
+    /// orphan is a full-size file that no `status` will ever mention.
+    #[tokio::test]
+    async fn a_failed_defragment_leaves_no_temporary_file() {
+        use zerocopy::IntoBytes;
+
+        use crate::types::FragmentReference;
+
+        let (dir, store) = make_test_store().await;
+        let partition = Partition::from([0xA1; 16]);
+        let context = Context::from([0xA1; 16]);
+
+        // A list naming content that was never stored: the walk fails once it tries to load it.
+        let missing = FragmentReference {
+            hash: hash::hash_slice(b"never stored"),
+            offset_content: 0,
+        };
+        let refs_payload = Bytes::copy_from_slice([missing].as_bytes());
+        let root_address = Address {
+            hash: hash::hash_slice(refs_payload.as_ref()),
+            context,
+        };
+        store
+            .clone()
+            .put(
+                partition,
+                root_address,
+                Fragment {
+                    flags: FragmentFlags::PayloadFragmented.bits(),
+                    size_payload: refs_payload.len() as u32,
+                    size_content: 64,
+                },
+                Some(refs_payload),
+                false,
+            )
+            .await
+            .expect("put root list");
+
+        let target = PathBuf::from(dir.as_ref()).join("content.bin");
+        let result = read_into_file(
+            store,
+            partition,
+            root_address,
+            target.as_path(),
+            ".~loretemp",
+            ReadOptions::default().no_verify().no_remote(),
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "a list naming missing content cannot read");
+
+        let leftovers: Vec<String> = std::fs::read_dir(dir.as_ref())
+            .expect("read temp dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".~loretemp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "temporary files left behind: {leftovers:?}"
+        );
     }
 
     /// Regression for the tracker-dispatched read-after-write race: a reader
@@ -949,5 +1011,54 @@ mod tests {
             matches!(err, StorageError::AddressNotFound(_)),
             "expected AddressNotFound, got {err:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_into_single_fragment_respects_range() {
+        let (_dir, store) = make_test_store().await;
+
+        let mut payload = vec![0u8; 100];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+
+        let hash_value = hash::hash_slice(&payload);
+        let partition = Partition::from([0; 16]);
+        let address = Address {
+            hash: hash_value,
+            context: Context::from([0; 16]),
+        };
+        let fragment = Fragment {
+            flags: FragmentFlags::PayloadStoredLocal.bits(),
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+
+        store
+            .clone()
+            .put(
+                partition,
+                address,
+                fragment,
+                Some(Bytes::from(payload.clone())),
+                false,
+            )
+            .await
+            .expect("put test data");
+
+        let mut out = [0u8; 40];
+        read_into(
+            store,
+            partition,
+            address,
+            Some(10..50),
+            &mut out,
+            ReadOptions::default().no_verify(),
+            None,
+        )
+        .await
+        .expect("read_into should respect range");
+
+        assert_eq!(&out[..], &payload[10..50]);
     }
 }

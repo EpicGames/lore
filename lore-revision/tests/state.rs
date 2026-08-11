@@ -16,11 +16,9 @@ mod tests {
     use lore_revision::node::*;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryFormat;
-    use lore_revision::state::NodeSource;
     use lore_revision::state::State;
     use lore_revision::state::StateData;
     use lore_revision::state::collect_new_fragments;
-    use lore_revision::state::determine_node_source;
     use lore_storage::hash::hash_string;
     use lore_storage::local::immutable_store::LocalImmutableStore;
     use lore_transport::ProtocolError;
@@ -302,58 +300,50 @@ mod tests {
         assert!(flags.contains(change::Flags::Conflict));
     }
 
-    #[test]
-    fn returns_to_for_add_action_with_valid_to() {
-        let source = determine_node_source(FileAction::Add, false, true);
-        assert_eq!(source, NodeSource::To);
-    }
+    #[tokio::test]
+    async fn deserialize_nonexistent_hash_returns_not_found() {
+        use lore_base::types::Hash;
 
-    #[test]
-    fn returns_to_for_keep_action_with_valid_to() {
-        let source = determine_node_source(FileAction::Keep, true, true);
-        assert_eq!(source, NodeSource::To);
-    }
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = Context::from(uuid::Uuid::now_v7());
 
-    #[test]
-    fn returns_to_for_move_action_with_valid_to() {
-        let source = determine_node_source(FileAction::Move, true, true);
-        assert_eq!(source, NodeSource::To);
-    }
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
 
-    #[test]
-    fn returns_to_for_delete_action_with_valid_from() {
-        let source = determine_node_source(FileAction::Delete, true, true);
-        assert_eq!(source, NodeSource::To);
-    }
+                let immutable_store = LocalImmutableStore::new(
+                    None,
+                    lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("Failed to create immutable store");
 
-    #[test]
-    fn returns_from_for_delete_action_even_with_invalid_to() {
-        let source = determine_node_source(FileAction::Delete, true, false);
-        assert_eq!(source, NodeSource::From);
-    }
+                let repository = Arc::new(RepositoryContext::new(
+                    Some(path),
+                    immutable_store,
+                    mutable_store,
+                    repository_id.into(),
+                    lore_revision::instance::InstanceId::default(),
+                    Err(ProtocolError::from(NoRemote)),
+                    Arc::default(),
+                    RepositoryFormat::Lore,
+                ));
 
-    #[test]
-    fn returns_from_when_to_is_invalid_for_non_delete() {
-        let source = determine_node_source(FileAction::Keep, true, false);
-        assert_eq!(source, NodeSource::From);
-    }
+                // A non-zero hash that was never written to the store.
+                let fake_hash = Hash::from([1u8; 32]);
+                let result = State::deserialize(repository, fake_hash).await;
 
-    #[test]
-    fn returns_invalid_when_to_is_invalid_and_from_is_invalid() {
-        let source = determine_node_source(FileAction::Add, false, false);
-        assert_eq!(source, NodeSource::Invalid);
-    }
-
-    #[test]
-    fn returns_to_for_delete_with_invalid_from() {
-        let source = determine_node_source(FileAction::Delete, false, true);
-        assert_eq!(source, NodeSource::To);
-    }
-
-    #[test]
-    fn returns_to_for_copy_action_with_valid_to() {
-        let source = determine_node_source(FileAction::Copy, true, true);
-        assert_eq!(source, NodeSource::To);
+                assert!(result.is_err());
+                assert!(
+                    result.unwrap_err().is_not_found(),
+                    "expected NotFound for a hash that does not exist in the store"
+                );
+            }))
+            .await
+            .expect("Test task failed");
     }
 }
 
