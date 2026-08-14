@@ -388,8 +388,22 @@ impl GRPCConnection {
             repository.to_string(),
         );
 
-        if let Some(auth) = self.auth.get(&key) {
-            return auth.clone();
+        if let Some(auth_entry) = self.auth.get(&key) {
+            let auth = auth_entry.clone();
+            drop(auth_entry);
+            let (authentication_token, authorization_token, _) = auth_exchange(
+                auth_url,
+                self.remote_url.host_str().unwrap_or_default(),
+                identity,
+                repository,
+            )
+            .await;
+            {
+                let mut current = auth.write();
+                current.authentication_token = authentication_token;
+                current.authorization_token = authorization_token;
+            }
+            return auth;
         }
 
         let auth = GRPCAuth::new(
@@ -420,8 +434,22 @@ impl GRPCConnection {
             resource.to_string(),
         );
 
-        if let Some(auth) = self.auth.get(&key) {
-            return auth.clone();
+        if let Some(auth_entry) = self.auth.get(&key) {
+            let auth = auth_entry.clone();
+            drop(auth_entry);
+            let (authentication_token, authorization_token, _) = auth_exchange_custom_resource(
+                auth_url,
+                self.remote_url.host_str().unwrap_or_default(),
+                identity,
+                resource,
+            )
+            .await;
+            {
+                let mut current = auth.write();
+                current.authentication_token = authentication_token;
+                current.authorization_token = authorization_token;
+            }
+            return auth;
         }
 
         let auth = GRPCAuth::new_for_custom_resource(
