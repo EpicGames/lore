@@ -11,8 +11,10 @@
 //! - `GET_ITEM_COMPLETE { id, address, error_code }`.
 //!
 //! In streaming mode (`streaming=1`) the single `GET_DATA` is replaced by one event per leaf
-//! fragment carrying a running `offset`; the cumulative byte count is verified against the
-//! requested range and a mismatch surfaces as `Internal`.
+//! fragment carrying a running `offset`. A failure partway through the tree ends the data early
+//! and reports its own code on `GET_ITEM_COMPLETE`; as a backstop the cumulative byte count is
+//! verified against the requested range and a shortfall surfaces as `Internal`. A streaming read
+//! therefore never reports success for content it delivered only part of.
 //!
 //! Ranges: `offset` and `length` select part of the content, `length = 0` meaning "to the
 //! end". A zeroed pair is the whole content, so an item that sets neither reads exactly what
@@ -74,7 +76,9 @@ pub struct LoreStorageGetItem {
     /// Content bytes to read from `offset`; `0` reads to the end. A range reaching past the
     /// end is clamped to it, so `GET_DATA` may carry fewer bytes than asked for
     pub length: u64,
-    /// Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer
+    /// Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer. A read
+    /// that fails partway reports the failure on `GET_ITEM_COMPLETE` rather than ending short
+    /// with a success code
     pub streaming: u8,
     /// Cache fetched bytes back to the local store even without the producer's
     /// `PayloadLocalCachePriority` hint
@@ -242,7 +246,7 @@ async fn get_item_streaming(
     effective: crate::storage::store::EffectiveFlags,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(256);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Bytes, lore_storage::StorageError>>(256);
     let mut read_options = effective.read_options(remote_session.is_some());
     if item.local_cache != 0 {
         read_options = read_options.with_cache();
@@ -276,18 +280,26 @@ async fn get_item_streaming(
     emit_header(&item, fragment.size_content);
 
     let mut offset = streamed.start;
+    let mut code = LoreErrorCode::None;
     while let Some(chunk) = rx.recv().await {
-        let len = chunk.len() as u64;
-        emit_data(&item, chunk, offset);
-        offset += len;
+        match chunk {
+            Ok(chunk) => {
+                let len = chunk.len() as u64;
+                emit_data(&item, chunk, offset);
+                offset += len;
+            }
+            Err(err) => {
+                code = crate::storage::storage_error_to_code(&err);
+                break;
+            }
+        }
     }
 
-    if offset != streamed.end {
-        emit_item_complete(&item, LoreErrorCode::Internal);
-        return LoreErrorCode::Internal;
+    if code == LoreErrorCode::None && offset != streamed.end {
+        code = LoreErrorCode::Internal;
     }
-    emit_item_complete(&item, LoreErrorCode::None);
-    LoreErrorCode::None
+    emit_item_complete(&item, code);
+    code
 }
 
 fn emit_header(item: &LoreStorageGetItem, size_content: u64) {

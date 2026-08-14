@@ -321,17 +321,43 @@ pub struct SharedStoreToUseConfig {
     pub shared_store_path: Option<String>,
 }
 
+/// cbindgen:prefix-with-name
+/// cbindgen:rename-all=ScreamingSnakeCase
+#[repr(C)]
+/// Whether a repository being created or cloned should be backed by a shared store.
+///
+/// `Inherit` is zero so a zero-initialized C struct keeps following the machine's
+/// `use_shared_store_automatically` setting, as callers have always relied on. `Disabled` exists
+/// because that inherited setting is otherwise unconditional: without it, a caller on a machine
+/// that opts in automatically has no way to ask for a repository backed by its own store.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LoreSharedStoreMode {
+    /// Follow the machine's `use_shared_store_automatically` global setting.
+    #[default]
+    Inherit = 0,
+    /// Always back the repository with a shared store.
+    Enabled = 1,
+    /// Never back the repository with a shared store, whatever the global config says.
+    Disabled = 2,
+}
+
+lore_base::carries_no_text!(LoreSharedStoreMode);
+
 impl SharedStoreToUseConfig {
     pub fn from_cli_args(
         global_config: &GlobalConfig,
-        use_shared_store: u8,
+        use_shared_store: LoreSharedStoreMode,
         path: &LoreString,
     ) -> Result<Option<SharedStoreToUseConfig>, PathError> {
-        if global_config
-            .use_shared_store_automatically
-            .unwrap_or(false)
-            || use_shared_store != 0
-        {
+        let enabled = match use_shared_store {
+            LoreSharedStoreMode::Disabled => false,
+            LoreSharedStoreMode::Enabled => true,
+            LoreSharedStoreMode::Inherit => global_config
+                .use_shared_store_automatically
+                .unwrap_or(false),
+        };
+        if enabled {
             Ok(Some(SharedStoreToUseConfig {
                 use_shared_store: Some(true),
                 shared_store_path: if let Some(path_string) = Into::<Option<&str>>::into(path) {

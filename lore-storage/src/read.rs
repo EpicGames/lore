@@ -10,6 +10,9 @@ use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use bytes::BytesMut;
+use lore_base::types::Context;
+use lore_base::types::Hash;
+use lore_base::types::KeyType;
 use lore_error_set::prelude::*;
 use lore_transport::StorageSession;
 
@@ -25,6 +28,7 @@ use crate::fragment_flags::FragmentFlags;
 use crate::hash;
 use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
+use crate::mutable_store::MutableStore;
 use crate::options::ReadOptions;
 use crate::store_types::StoreGetData;
 use crate::types::Address;
@@ -589,6 +593,9 @@ pub async fn read_into(
 ///
 /// Ranged reads of a fragmented payload fetch only the leaves the range touches, so the work
 /// is proportional to the range rather than to the content.
+///
+/// The range returns before the leaves flow, so a failure part-way through the tree arrives on
+/// the channel as an `Err`: it is the only route by which the caller learns its content is short.
 #[allow(clippy::too_many_arguments)]
 pub async fn read_stream(
     store: Arc<dyn ImmutableStore>,
@@ -596,7 +603,7 @@ pub async fn read_stream(
     address: Address,
     range: Option<Range<usize>>,
     options: ReadOptions,
-    sender: tokio::sync::mpsc::Sender<Bytes>,
+    sender: tokio::sync::mpsc::Sender<Result<Bytes, StorageError>>,
     remote_session: Option<Arc<StorageSession>>,
 ) -> Result<(Fragment, Range<u64>), StorageError> {
     let options = options.with_decompress();
@@ -618,6 +625,7 @@ pub async fn read_stream(
     if (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented {
         let store = store.clone();
         let pipeline_range = streamed.clone();
+        let report = sender.clone();
         lore_base::lore_spawn!(async move {
             let result = defragment_pipeline(
                 store,
@@ -634,13 +642,14 @@ pub async fn read_stream(
 
             if let Err(err) = result {
                 lore_base::lore_warn!("error while defragmenting during read_stream: {0}", err);
+                let _ = report.send(Err(err)).await;
             }
         });
 
         Ok((fragment, streamed))
     } else {
         sender
-            .send(buffer.slice(range))
+            .send(Ok(buffer.slice(range)))
             .await
             .map_err(|_err| StorageError::internal("stream send failed"))?;
         Ok((fragment, streamed))
@@ -852,6 +861,436 @@ pub async fn write_all_to_file(
     lore_base::lore_trace!("Wrote {} bytes to {}", buffer_len, path.display());
 
     Ok(metadata)
+}
+
+/// The root a key resolved to, plus the session the tail should use for anything the root refers
+/// to. Present whenever the caller supplied one, including on a local hit: the root can be cached
+/// locally while a fragment list's leaves are not.
+struct ResolvedRoot {
+    resolved: Hash,
+    address: Address,
+    fragment: Fragment,
+    buffer: Bytes,
+    session: Option<Arc<StorageSession>>,
+}
+
+/// Local half of [`read_resolved`]: resolve `key` in the local mutable store and load the root it
+/// names from the local store only.
+///
+/// `None` means the caller should ask the remote instead — the mapping is absent, it is a
+/// tombstone, or its root is not cached locally.
+///
+/// A mapping that *is* present is trusted as-is and not revalidated. Because the key is mutable,
+/// that is a weaker guarantee than the immutable [`load_fragment`] path gives: a cached mapping
+/// can name a hash the key has since moved off. Freshness is the caller's choice through the same
+/// flags a `get` uses — `remote` resolves authoritatively, the default prefers whatever is local.
+///
+/// On the fall-through it deliberately does not remote-read the locally cached hash. A remote
+/// `get_resolved` answers the mapping and the root in one round trip, so re-resolving costs
+/// nothing extra and answers against the authoritative mapping.
+async fn load_resolved_local(
+    store: Arc<dyn ImmutableStore>,
+    mutable: Arc<dyn MutableStore>,
+    partition: Partition,
+    key: Hash,
+    context: Context,
+    options: ReadOptions,
+) -> Option<(Hash, Fragment, Bytes)> {
+    let resolved = match mutable.load(partition, key, KeyType::Resolve).await {
+        Ok(resolved) if !resolved.is_zero() => resolved,
+        Ok(_) => return None,
+        Err(err) => {
+            lore_base::lore_trace!("Key {key} failed to resolve from local mutable store: {err:?}");
+            return None;
+        }
+    };
+
+    let address = Address {
+        hash: resolved,
+        context,
+    };
+    match load_fragment(store, partition, address, options.no_remote(), None).await {
+        Ok((fragment, buffer)) => Some((resolved, fragment, buffer)),
+        Err(err) => {
+            lore_base::lore_trace!(
+                "Key {key} resolved locally to {resolved}, whose root is not cached: {err:?}"
+            );
+            None
+        }
+    }
+}
+
+/// Resolve `key` to the root fragment it names, sharing one round trip with the read of that root
+/// whenever the answer is not already local.
+///
+/// The key is always read as [`KeyType::Resolve`], locally and remotely alike.
+///
+/// Local-first like [`read`]: [`load_resolved_local`] tries the local mutable store and the local
+/// copy of the root it names, and only a miss there reaches the remote. A fragment list's leaves
+/// go through [`load_fragment`] either way, so they keep their own local-then-remote fallback and
+/// local caching.
+///
+/// On a remote resolve the key->hash mapping is written back to the local mutable store once the
+/// payload write-back succeeds, under the same gate — so a later call can be served entirely
+/// locally, and the mapping is never left pointing at a root this store does not hold.
+///
+/// A local root travels with the caller's session anyway: a fragment list's leaves may still
+/// exist only remotely.
+///
+/// A verification failure gets one heal attempt then a re-resolve, as [`load_fragment`] does. The
+/// retry re-resolves rather than re-reads, since the heal targets the resolved address and a
+/// fresh resolve costs the same single round trip.
+///
+/// `flags` is a reserved bitmask forwarded to the server; 0 for default behaviour.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_root(
+    store: Arc<dyn ImmutableStore>,
+    mutable: Arc<dyn MutableStore>,
+    partition: Partition,
+    key: Hash,
+    context: Context,
+    flags: u32,
+    options: ReadOptions,
+    session: Option<Arc<StorageSession>>,
+) -> Result<ResolvedRoot, StorageError> {
+    let options = options.with_decompress();
+    let key_address = Address { hash: key, context };
+
+    if options.local
+        && let Some((resolved, fragment, buffer)) = load_resolved_local(
+            store.clone(),
+            mutable.clone(),
+            partition,
+            key,
+            context,
+            options,
+        )
+        .await
+    {
+        return Ok(ResolvedRoot {
+            resolved,
+            address: Address {
+                hash: resolved,
+                context,
+            },
+            fragment,
+            buffer,
+            session,
+        });
+    }
+
+    if !options.remote {
+        return Err(StorageError::from(crate::errors::AddressNotFound::from(
+            key_address,
+        )));
+    }
+    let Some(session) = session else {
+        return Err(StorageError::from(crate::errors::AddressNotFound::from(
+            key_address,
+        )));
+    };
+
+    lore_base::lore_trace!("Resolve key {} from remote", key_address);
+
+    let mut heal_attempted = false;
+    let (resolved, address, fragment, buffer) = loop {
+        let (resolved, mut fragment, buffer) =
+            remote_get_resolved_retry(session.as_ref(), key, context, flags).await?;
+
+        if resolved.is_zero() {
+            return Err(StorageError::from(crate::errors::AddressNotFound::from(
+                key_address,
+            )));
+        }
+
+        let address = Address {
+            hash: resolved,
+            context,
+        };
+
+        fragment.flags |= FragmentFlags::PayloadStoredDurable;
+        let store_fragment = fragment;
+        let raw_payload = buffer.clone();
+
+        match decompress_and_verify(fragment, buffer, address, options).await {
+            Ok((fragment, buffer)) => {
+                let should_store = options.cache
+                    || (fragment.flags & FragmentFlags::PayloadLocalCachePriority) != 0;
+                if should_store
+                    && store
+                        .clone()
+                        .put(partition, address, store_fragment, Some(raw_payload), false)
+                        .await
+                        .is_ok()
+                {
+                    let _ = mutable
+                        .store(partition, key, resolved, KeyType::Resolve)
+                        .await;
+                }
+                break (resolved, address, fragment, buffer);
+            }
+            Err(err) => {
+                if matches!(err, StorageError::NotSupported(_)) {
+                    return Err(err);
+                }
+                if heal_attempted {
+                    lore_base::lore_error!(
+                        "Key {key} resolved to {resolved}, still corrupt after heal: {err}"
+                    );
+                    return Err(err);
+                }
+
+                lore_base::lore_warn!("Key {key} resolved to {resolved}: {err}. Attempting heal.");
+                let healed = session
+                    .verify(&address, true)
+                    .await
+                    .is_ok_and(|r| r.healed == lore_base::types::HealResult::Healed);
+                if !healed {
+                    lore_base::lore_error!("Server did not heal fragment {resolved}");
+                    return Err(err);
+                }
+
+                lore_base::lore_debug!("Server healed fragment {resolved}, resolving again");
+                heal_attempted = true;
+            }
+        }
+    };
+
+    Ok(ResolvedRoot {
+        resolved,
+        address,
+        fragment,
+        buffer,
+        session: Some(session),
+    })
+}
+
+/// `mutable_load(key)` + [`read`] of the resulting address, resolved in one round trip when the
+/// remote answers. Returns the resolved hash alongside the content.
+///
+/// See [`resolve_root`] for how the key is resolved; this reassembles the whole content into one
+/// buffer. [`read_resolved_stream`] delivers it fragment by fragment instead.
+#[allow(clippy::too_many_arguments)]
+pub async fn read_resolved(
+    store: Arc<dyn ImmutableStore>,
+    mutable: Arc<dyn MutableStore>,
+    partition: Partition,
+    key: Hash,
+    context: Context,
+    flags: u32,
+    range: Option<Range<usize>>,
+    options: ReadOptions,
+    session: Option<Arc<StorageSession>>,
+) -> Result<(Hash, Bytes), StorageError> {
+    let root = resolve_root(
+        store.clone(),
+        mutable,
+        partition,
+        key,
+        context,
+        flags,
+        options,
+        session,
+    )
+    .await?;
+
+    let bytes = read_resolved_content(
+        store,
+        partition,
+        root.address,
+        root.fragment,
+        root.buffer,
+        range,
+        options.with_decompress(),
+        root.session,
+    )
+    .await?;
+    Ok((root.resolved, bytes))
+}
+
+/// [`read_resolved`] delivering the content through `sender` one fragment at a time instead of
+/// reassembling it, mirroring what [`read_stream`] does for an address.
+///
+/// Returns the resolved hash and the content's total size; the bytes follow on the channel. Peak
+/// memory is bounded by the channel depth rather than by the content, which is what makes this
+/// usable for a key naming something large.
+#[allow(clippy::too_many_arguments)]
+pub async fn read_resolved_stream(
+    store: Arc<dyn ImmutableStore>,
+    mutable: Arc<dyn MutableStore>,
+    partition: Partition,
+    key: Hash,
+    context: Context,
+    flags: u32,
+    options: ReadOptions,
+    sender: tokio::sync::mpsc::Sender<Result<Bytes, StorageError>>,
+    session: Option<Arc<StorageSession>>,
+) -> Result<(Hash, u64), StorageError> {
+    let options = options.with_decompress();
+    let root = resolve_root(
+        store.clone(),
+        mutable,
+        partition,
+        key,
+        context,
+        flags,
+        options,
+        session,
+    )
+    .await?;
+
+    if let Some(max) = options.max_content_size
+        && root.fragment.size_content > max
+    {
+        return Err(StorageError::from(crate::errors::Oversized {
+            context: format!(
+                "fragment size_content {} exceeds caller-supplied max {max}",
+                root.fragment.size_content
+            ),
+        }));
+    }
+
+    if (root.fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented
+    {
+        let address = root.address;
+        let fragment = root.fragment;
+        let buffer = root.buffer;
+        let remote_session = root.session;
+        let report = sender.clone();
+        let pipeline_range = 0..fragment.size_content;
+        lore_base::lore_spawn!(async move {
+            let result = defragment_pipeline(
+                store,
+                partition,
+                address,
+                fragment,
+                buffer,
+                pipeline_range,
+                DefragmentSink::Stream { sender },
+                options,
+                remote_session,
+            )
+            .await;
+
+            if let Err(err) = result {
+                lore_base::lore_warn!(
+                    "error while defragmenting during read_resolved_stream: {0}",
+                    err
+                );
+                let _ = report.send(Err(err)).await;
+            }
+        });
+    } else {
+        sender
+            .send(Ok(root.buffer))
+            .await
+            .map_err(|_err| StorageError::internal("stream send failed"))?;
+    }
+
+    Ok((root.resolved, root.fragment.size_content))
+}
+
+/// [`remote_get_retry`] for `get_resolved`: back off on `SlowDown`, recover from a stale
+/// session id by invalidating and retrying. `key` supplies error context only.
+async fn remote_get_resolved_retry(
+    session: &StorageSession,
+    key: Hash,
+    context: Context,
+    flags: u32,
+) -> Result<(Hash, Fragment, Bytes), StorageError> {
+    let _guard = RemoteFetchGuard::new();
+    let mut retry = store_retry();
+    let mut stale_session_retries: u32 = 0;
+    let key_address = Address { hash: key, context };
+    loop {
+        debug_assert!(!key.is_zero(), "Cannot resolve zero key from store");
+        match session.get_resolved(&key, &context, flags).await {
+            Ok(resolved) => return Ok(resolved),
+            Err(ref e) if e.is_slow_down() => {
+                if !retry.wait().await {
+                    return Err(StorageError::from(SlowDown));
+                }
+            }
+            Err(err) => {
+                let storage_err = crate::error::protocol_error_to_storage(err, key_address);
+                if matches!(storage_err, StorageError::NotConnected(_))
+                    && stale_session_retries < MAX_STALE_SESSION_RETRIES
+                {
+                    stale_session_retries += 1;
+                    session.invalidate().await;
+                    if !retry.wait().await {
+                        return Err(storage_err);
+                    }
+                    continue;
+                }
+                return Err(storage_err);
+            }
+        }
+    }
+}
+
+/// Shared tail of [`read_resolved`]: enforce `max_content_size`, clamp `range` to the content, and
+/// reassemble a fragment list's leaves through [`load_fragment`], which may fetch them remotely.
+#[allow(clippy::too_many_arguments)]
+async fn read_resolved_content(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    fragment: Fragment,
+    buffer: Bytes,
+    range: Option<Range<usize>>,
+    options: ReadOptions,
+    session: Option<Arc<StorageSession>>,
+) -> Result<Bytes, StorageError> {
+    if let Some(max) = options.max_content_size
+        && fragment.size_content > max
+    {
+        return Err(StorageError::from(crate::errors::Oversized {
+            context: format!(
+                "fragment size_content {} exceeds caller-supplied max {max}",
+                fragment.size_content
+            ),
+        }));
+    }
+
+    let range = match range {
+        Some(range) => {
+            min(range.start, fragment.size_content as usize)
+                ..min(range.end, fragment.size_content as usize)
+        }
+        None => 0..fragment.size_content as usize,
+    };
+    if range.is_empty() {
+        return Ok(Bytes::default());
+    }
+
+    if (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented {
+        let mut target_buffer = BytesMut::with_capacity(range.len());
+        // Safety: the capacity was just reserved, and read_defragment fully writes the range
+        // before the buffer is read back.
+        unsafe {
+            target_buffer.set_len(range.len());
+        }
+        let target_size = target_buffer.len();
+        let target = target_buffer.split();
+        read_defragment(
+            store, partition, address, range, fragment, buffer, target, options, 0, session,
+        )
+        .await?;
+        if !target_buffer.try_reclaim(target_size) {
+            return Err(StorageError::internal(
+                "failed to reclaim buffer after defragmenting",
+            ));
+        }
+        // Safety: try_reclaim just confirmed the split-off target bytes are back in this
+        // buffer's capacity, and read_defragment initialized all of them.
+        unsafe {
+            target_buffer.set_len(target_size);
+        }
+        Ok(target_buffer.freeze())
+    } else {
+        Ok(buffer.slice(range))
+    }
 }
 
 #[cfg(test)]
@@ -1517,7 +1956,7 @@ mod tests {
         let context = Context::from([0x33; 16]);
         let (root, content) = tree::build(&store, partition, context, true).await;
 
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Bytes>(16);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<Bytes, StorageError>>(16);
         let (fragment, streamed) = read_stream(
             store,
             partition,
@@ -1538,6 +1977,7 @@ mod tests {
 
         let mut delivered = Vec::new();
         while let Some(chunk) = receiver.recv().await {
+            let chunk = chunk.expect("stream chunk");
             delivered.extend_from_slice(chunk.as_ref());
         }
         assert_eq!(delivered, content[120..330]);
@@ -1552,7 +1992,7 @@ mod tests {
         let context = Context::from([0x34; 16]);
         let (root, content) = tree::build(&store, partition, context, false).await;
 
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Bytes>(16);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<Bytes, StorageError>>(16);
         let (_fragment, streamed) = read_stream(
             store,
             partition,
@@ -1571,6 +2011,7 @@ mod tests {
 
         let mut delivered = Vec::new();
         while let Some(chunk) = receiver.recv().await {
+            let chunk = chunk.expect("stream chunk");
             delivered.extend_from_slice(chunk.as_ref());
         }
         assert_eq!(delivered, content[0..200]);
@@ -1585,7 +2026,7 @@ mod tests {
         let context = Context::from([0x35; 16]);
         let (root, _content) = tree::build(&store, partition, context, true).await;
 
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Bytes>(16);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<Bytes, StorageError>>(16);
         let (_fragment, streamed) = read_stream(
             store,
             partition,
@@ -1603,6 +2044,7 @@ mod tests {
 
         let mut sizes = Vec::new();
         while let Some(chunk) = receiver.recv().await {
+            let chunk = chunk.expect("stream chunk");
             sizes.push(chunk.len());
         }
         // Leaves are 100 bytes at 0/100/200/300; 50..350 clips the first and last.
@@ -1620,7 +2062,7 @@ mod tests {
         let context = Context::from([0x36; 16]);
         let (root, _content) = tree::build(&store, partition, context, true).await;
 
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Bytes>(16);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<Bytes, StorageError>>(16);
         let (fragment, streamed) = read_stream(
             store,
             partition,
@@ -1772,7 +2214,7 @@ mod tests {
         assert_eq!(fragment.size_content, three_level::CONTENT as u64);
         assert_eq!(bytes.as_ref(), expected);
 
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Bytes>(8);
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Result<Bytes, StorageError>>(8);
         let (_fragment, streamed) = read_stream(
             store.clone(),
             partition,
@@ -1787,6 +2229,7 @@ mod tests {
         assert_eq!(streamed, 250..320);
         let mut delivered = Vec::new();
         while let Some(chunk) = receiver.recv().await {
+            let chunk = chunk.expect("stream chunk");
             delivered.extend_from_slice(chunk.as_ref());
         }
         assert_eq!(delivered, expected);

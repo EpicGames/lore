@@ -13,6 +13,7 @@ mod store_keep_alive_tests {
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
+    use lore_revision::repository::LoreSharedStoreMode;
 
     fn test_dir() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("lore-keep-alive-{}", uuid::Uuid::new_v4()));
@@ -81,7 +82,7 @@ mod store_keep_alive_tests {
                 repository_url: "lore://localhost/test-keep-alive".into(),
                 description: LoreString::default(),
                 id: LoreString::default(),
-                use_shared_store: 0,
+                use_shared_store: LoreSharedStoreMode::Disabled,
                 shared_store_path: LoreString::default(),
             },
             None,

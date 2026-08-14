@@ -230,6 +230,34 @@ impl StorageSession {
         storage.mutable_load(session_id, key, key_type).await
     }
 
+    /// `mutable_load` + `get` in one round trip, always reading the key as
+    /// [`KeyType::Resolve`]. Returns `(resolved_hash, fragment, payload)`.
+    /// `flags` is a `get_resolved_flags` bitmask; 0 for default behaviour.
+    pub async fn get_resolved(
+        &self,
+        key: &Hash,
+        context: &Context,
+        flags: u32,
+    ) -> Result<(Hash, Fragment, Bytes), ProtocolError> {
+        let (storage, session_id) = self.ensure().await?;
+        storage.get_resolved(session_id, key, context, flags).await
+    }
+
+    /// `put` + `mutable_store` in one round trip: store the fragment, then map `key` to
+    /// `address.hash` under [`KeyType::Resolve`]. The write side of [`Self::get_resolved`].
+    pub async fn put_resolved(
+        &self,
+        key: &Hash,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<(), ProtocolError> {
+        let (storage, session_id) = self.ensure().await?;
+        storage
+            .put_resolved(session_id, key, address, fragment, payload)
+            .await
+    }
+
     pub async fn mutable_store(
         &self,
         key: Hash,

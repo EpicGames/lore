@@ -6997,7 +6997,8 @@ pub async fn is_file_content_equal(
     } else {
         // Large file: stream stored content and compare chunk-by-chunk against
         // the file read in matching chunks
-        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Bytes>(4);
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<Result<Bytes, lore_storage::StorageError>>(4);
         let repo_clone = repository.clone();
         let stream_handle = lore_spawn!(async move {
             immutable::read_stream(repo_clone, address, None, options, sender).await
@@ -7030,12 +7031,15 @@ pub async fn is_file_content_equal(
 /// every chunk matches and the loop still ends when the stream does, so the length is the only
 /// thing left that disagrees. A shorter local file fails earlier, on the read.
 async fn stream_matches_file(
-    receiver: &mut tokio::sync::mpsc::Receiver<Bytes>,
+    receiver: &mut tokio::sync::mpsc::Receiver<Result<Bytes, lore_storage::StorageError>>,
     file: &lore_io::IoFile,
     file_size: u64,
 ) -> bool {
     let mut bytes_compared: u64 = 0;
     while let Some(chunk) = receiver.recv().await {
+        let Ok(chunk) = chunk else {
+            return false;
+        };
         match file.read_exact_at(chunk.len(), bytes_compared).await {
             Ok(local) if local == chunk => {
                 bytes_compared += chunk.len() as u64;
@@ -8265,11 +8269,15 @@ mod tests {
     }
 
     /// Feeds `chunks` through a channel the way the stored-content stream does.
-    fn stream_of(chunks: &[&[u8]]) -> tokio::sync::mpsc::Receiver<Bytes> {
-        let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(chunks.len().max(1));
+    fn stream_of(
+        chunks: &[&[u8]],
+    ) -> tokio::sync::mpsc::Receiver<Result<Bytes, lore_storage::StorageError>> {
+        let (sender, receiver) = tokio::sync::mpsc::channel::<
+            Result<Bytes, lore_storage::StorageError>,
+        >(chunks.len().max(1));
         for chunk in chunks {
             sender
-                .try_send(Bytes::copy_from_slice(chunk))
+                .try_send(Ok(Bytes::copy_from_slice(chunk)))
                 .expect("channel sized for the chunks");
         }
         receiver

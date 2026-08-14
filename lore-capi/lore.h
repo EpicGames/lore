@@ -151,6 +151,21 @@ typedef enum lore_error_code_t {
   LORE_ERROR_CODE_SLOW_DOWN = 4,
 } lore_error_code_t;
 
+// Whether a repository being created or cloned should be backed by a shared store.
+//
+// `Inherit` is zero so a zero-initialized C struct keeps following the machine's
+// `use_shared_store_automatically` setting, as callers have always relied on. `Disabled` exists
+// because that inherited setting is otherwise unconditional: without it, a caller on a machine
+// that opts in automatically has no way to ask for a repository backed by its own store.
+typedef enum lore_shared_store_mode_t {
+  // Follow the machine's `use_shared_store_automatically` global setting.
+  LORE_SHARED_STORE_MODE_INHERIT = 0,
+  // Always back the repository with a shared store.
+  LORE_SHARED_STORE_MODE_ENABLED = 1,
+  // Never back the repository with a shared store, whatever the global config says.
+  LORE_SHARED_STORE_MODE_DISABLED = 2,
+} lore_shared_store_mode_t;
+
 // Kind of value a stored key refers to.
 typedef enum lore_key_type_t {
   // Key has no specific type.
@@ -167,6 +182,11 @@ typedef enum lore_key_type_t {
   LORE_KEY_TYPE_REPOSITORY_ID = 5,
   // Key refers to a repository instance.
   LORE_KEY_TYPE_INSTANCE = 6,
+  // Key maps to an immutable content hash, written by `lore_storage_put_resolved` and read by
+  // `lore_storage_get_resolved`. Those two commands do not carry a key type on the wire,
+  // because this is the only one they operate on; a publish large enough to fragment falls
+  // back to an ordinary mutable store write, which does carry it like any other type.
+  LORE_KEY_TYPE_RESOLVE = 7,
 } lore_key_type_t;
 
 // The change staged on a node for the next revision. `None` is a node the
@@ -2451,6 +2471,15 @@ typedef struct lore_storage_put_item_complete_event_data_t {
   struct lore_address_t address;
   // The outcome for the item.
   enum lore_error_code_t error_code;
+  // Non-zero when the local store holds the content. Appended after the original three
+  // fields, so a consumer reading only those is unaffected — `serde(default)` lets an older
+  // payload that lacks the field deserialize, as events cross the IPC boundary.
+  uint8_t stored_local;
+  // Non-zero when the content reached the remote, or was already durable there. A remote
+  // write that fails still reports `error_code = NONE` if the local write succeeded — this is
+  // how a caller tells the two apart. For fragmented content it is the intersection across
+  // every fragment, so it is set only when the whole tree is remote.
+  uint8_t stored_remote;
 } lore_storage_put_item_complete_event_data_t;
 
 // Leading event for each regular `get` item. Reports the total
@@ -4297,8 +4326,9 @@ typedef struct lore_repository_clone_args_t {
   struct lore_string_t layer_metadata;
   // (Optional) File containing list of files to prefetch
   struct lore_string_t prefetch;
-  // Use the shared store instead of a local immutable store
-  uint8_t use_shared_store;
+  // Whether to use the shared store instead of a local immutable store. Zero-initialized
+  // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
+  enum lore_shared_store_mode_t use_shared_store;
   // [Optional] Path to use for the shared store, an empty string means to use the default
   struct lore_string_t shared_store_path;
   // Clone without local repository tracking (memory-only stores)
@@ -4337,8 +4367,9 @@ typedef struct lore_repository_create_args_t {
   struct lore_string_t description;
   // Optional repository ID, set to empty string to generate a new ID
   struct lore_string_t id;
-  // Use the shared store instead of a local immutable store
-  uint8_t use_shared_store;
+  // Whether to use the shared store instead of a local immutable store. Zero-initialized
+  // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
+  enum lore_shared_store_mode_t use_shared_store;
   // [Optional] Path to use for the shared store, an empty string means to use the default
   struct lore_string_t shared_store_path;
 } lore_repository_create_args_t;
@@ -4718,7 +4749,9 @@ typedef struct lore_storage_get_item_t {
   // Content bytes to read from `offset`; `0` reads to the end. A range reaching past the
   // end is clamped to it, so `GET_DATA` may carry fewer bytes than asked for
   uint64_t length;
-  // Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer
+  // Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer. A read
+  // that fails partway reports the failure on `GET_ITEM_COMPLETE` rather than ending short
+  // with a success code
   uint8_t streaming;
   // Cache fetched bytes back to the local store even without the producer's
   // `PayloadLocalCachePriority` hint
@@ -4741,6 +4774,89 @@ typedef struct lore_storage_get_args_t {
   // Addresses to read; each runs independently and emits its own event sequence
   struct lore_storage_get_item_array_t items;
 } lore_storage_get_args_t;
+
+// One get-resolved item — the mutable key to resolve and the context to read it in.
+typedef struct lore_storage_get_resolved_item_t {
+  // Caller-chosen id echoed back in every event for this item
+  uint64_t id;
+  // Partition to resolve and read within; the zero/default partition rejects with
+  // `INVALID_ARGUMENTS`
+  struct lore_partition_t partition;
+  // Mutable key to resolve, always read as `KeyType::Resolve`
+  struct lore_hash_t key;
+  // Paired with the resolved hash to address the immutable read; the mutable store yields
+  // only a hash.
+  struct lore_context_t context;
+  // Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer, as
+  // `lore_storage_get` does. Peak memory then follows the fragment size rather than the
+  // content size, which is what makes a key naming something large usable. A read that fails
+  // partway reports the failure on `GET_ITEM_COMPLETE` rather than ending short with a
+  // success code
+  uint8_t streaming;
+  // Cache fetched bytes back to the local store even without the producer's
+  // `PayloadLocalCachePriority` hint
+  uint8_t local_cache;
+} lore_storage_get_resolved_item_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_storage_get_resolved_item_array_t {
+  // Pointer to the first element.
+  const struct lore_storage_get_resolved_item_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_storage_get_resolved_item_array_t;
+
+// Arguments for `lore_storage_get_resolved`.
+typedef struct lore_storage_get_resolved_args_t {
+  // Open storage handle
+  struct lore_store_t handle;
+  // Keys to resolve and read; each runs independently and emits its own event sequence
+  struct lore_storage_get_resolved_item_array_t items;
+} lore_storage_get_resolved_args_t;
+
+// One put-resolved item — the buffer to store and the mutable key to publish it under.
+typedef struct lore_storage_put_resolved_item_t {
+  // Caller-chosen id echoed back in `PUT_ITEM_COMPLETE`
+  uint64_t id;
+  // Target partition; the zero/default partition rejects with `INVALID_ARGUMENTS`
+  struct lore_partition_t partition;
+  // Mutable key to publish the stored hash under; a zero key rejects with `INVALID_ARGUMENTS`
+  struct lore_hash_t key;
+  // Dedup tag stored alongside the content hash in the resulting address, and the context a
+  // later `get_resolved` must read the key at
+  struct lore_context_t context;
+  // Borrowed view into caller memory; bytes must live until `Complete` fires. A zero-length
+  // buffer removes the key's mapping instead of publishing one
+  struct lore_bytes_t data;
+  // Also publish the content and the mapping to the remote; ignored when the handle has no
+  // remote or the call is offline/local
+  uint8_t remote_write;
+  // Tag the fragment with `PayloadLocalCachePriority` so future remote reads always cache it
+  // locally
+  uint8_t local_cache;
+  // Leaf fragment size cap for large buffers; `0` lets the writer choose. Ignored for buffers
+  // under `FRAGMENT_SIZE_THRESHOLD`
+  uint64_t fixed_size_chunk;
+} lore_storage_put_resolved_item_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_storage_put_resolved_item_array_t {
+  // Pointer to the first element.
+  const struct lore_storage_put_resolved_item_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_storage_put_resolved_item_array_t;
+
+// Arguments for `lore_storage_put_resolved`.
+typedef struct lore_storage_put_resolved_args_t {
+  // Open storage handle
+  struct lore_store_t handle;
+  // Buffers to store and publish; each runs independently and emits its own
+  // `PUT_ITEM_COMPLETE`
+  struct lore_storage_put_resolved_item_array_t items;
+} lore_storage_put_resolved_args_t;
 
 // Arguments for `lore_storage_close`.
 typedef struct lore_storage_close_args_t {
@@ -10409,7 +10525,7 @@ void lore_storage_open_async(const struct lore_global_args_t *globals,
 //
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
-// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item — success or failure |
+// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item — success or failure; `stored_local`/`stored_remote` report where the content landed |
 // | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 // | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 int32_t lore_storage_put(const struct lore_global_args_t *globals,
@@ -10440,6 +10556,87 @@ int32_t lore_storage_get(const struct lore_global_args_t *globals,
 void lore_storage_get_async(const struct lore_global_args_t *globals,
                             const struct lore_storage_get_args_t *args,
                             struct lore_event_callback_config_t callback);
+
+// Resolve one or more mutable keys and read the content they name, in one round trip.
+//
+// `lore_storage_mutable_load` followed by `lore_storage_get`, performed by the server. The keys
+// are read under the `LORE_KEY_TYPE_RESOLVE` key type, which is what `lore_storage_put_resolved`
+// publishes; no other key type is resolvable this way.
+//
+// The `address` in every event is the *resolved* address, so a caller can learn the key-to-hash
+// mapping from the event stream. A key with no mapping, or one naming absent content, reports
+// `error_code = ADDRESS_NOT_FOUND`, and the terminal event then carries a zero address.
+//
+// Set `streaming` to receive one `LORE_EVENT_STORAGE_GET_DATA` per leaf fragment instead of a
+// single reassembled buffer, exactly as `lore_storage_get` does. Without it the whole content is
+// materialised in memory before the first byte reaches the callback, so a key naming something
+// large should set it.
+//
+// # Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_STORAGE_GET_HEADER` | `lore_storage_get_header_event_data_t` | Size of the item's reassembled content, emitted before any DATA events |
+// | `LORE_EVENT_STORAGE_GET_DATA` | `lore_storage_get_data_event_data_t` | Payload bytes — valid only during the callback invocation. One event per item, or one per leaf fragment when `streaming` is set |
+// | `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE` | `lore_storage_get_item_complete_event_data_t` | Terminal per-item event |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
+int32_t lore_storage_get_resolved(const struct lore_global_args_t *globals,
+                                  const struct lore_storage_get_resolved_args_t *args,
+                                  struct lore_event_callback_config_t callback);
+
+// Resolve one or more mutable keys and read the content they name (async variant).
+void lore_storage_get_resolved_async(const struct lore_global_args_t *globals,
+                                     const struct lore_storage_get_resolved_args_t *args,
+                                     struct lore_event_callback_config_t callback);
+
+// Store one or more buffers and publish a mutable key naming each, in one round trip.
+//
+// `lore_storage_put` followed by `lore_storage_mutable_store`, fused into one request when the
+// content fits a single fragment. The key is published under `LORE_KEY_TYPE_RESOLVE`, making it
+// readable by `lore_storage_get_resolved`, and the mapping is written only once the content is
+// stored — so a key published this way never resolves to content that is not there. Writing the
+// same key type directly with `lore_storage_mutable_store` carries no such guarantee.
+//
+// The local store always receives both the content and the mapping. `remote_write = 1` also
+// publishes them remotely, matching `lore_storage_put`; there is no local-then-remote fallback.
+// A zero `key` or a zero `partition` rejects with `INVALID_ARGUMENTS`.
+//
+// A zero-length `data` **removes** the key's mapping rather than publishing one: no content is
+// stored, the key is set to the zero hash, and `lore_storage_get_resolved` then reports
+// `ADDRESS_NOT_FOUND` for it. The terminal event carries the zero content hash and the caller's
+// context.
+//
+// With `remote_write = 0` this evicts only the locally cached mapping. The local mutable store
+// is a cache, not an authority, so a key published remotely resolves again on the next call.
+// Deleting a published key requires `remote_write = 1`.
+//
+// A remote content upload that fails still leaves a successful local write, so the key is not
+// published remotely and `stored_remote` is `0` while `error_code` stays `NONE`. Check
+// `stored_remote`, not `error_code`, to confirm the key is visible to other clients.
+//
+// Publishing is last-writer-wins. Two callers publishing the same key concurrently both
+// succeed, and the key ends up naming whichever content was published second — the first
+// publisher is not told it was overwritten. Callers needing to detect a lost update should
+// store the content with `lore_storage_put` and publish with
+// `lore_storage_mutable_compare_and_swap`, which costs the second round trip this operation
+// exists to avoid.
+//
+// # Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item; `address` is the content the key now resolves to, and `stored_local`/`stored_remote` report where it landed |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
+int32_t lore_storage_put_resolved(const struct lore_global_args_t *globals,
+                                  const struct lore_storage_put_resolved_args_t *args,
+                                  struct lore_event_callback_config_t callback);
+
+// Store one or more buffers and publish a mutable key naming each (async variant).
+void lore_storage_put_resolved_async(const struct lore_global_args_t *globals,
+                                     const struct lore_storage_put_resolved_args_t *args,
+                                     struct lore_event_callback_config_t callback);
 
 // Release a content-addressed storage handle.
 //

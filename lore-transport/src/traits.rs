@@ -165,6 +165,47 @@ pub trait Storage: Send + Sync {
         Err(ProtocolError::internal("unsupported: mutable_load"))
     }
 
+    /// `mutable_load(key)` followed by `get(Address { hash: resolved, context })`, performed
+    /// server-side in one round trip.
+    ///
+    /// The key is always read as [`KeyType::Resolve`], so no key type is sent. `context` is
+    /// required because the mutable store yields only a hash. `flags` is a `get_resolved_flags`
+    /// bitmask; 0 for default behaviour.
+    ///
+    /// Returns `(resolved_hash, fragment, payload)`; the hash permits caching the key->hash
+    /// mapping and verifying the payload.
+    async fn get_resolved(
+        &self,
+        session_id: u32,
+        key: &Hash,
+        context: &Context,
+        flags: u32,
+    ) -> Result<(Hash, Fragment, Bytes), ProtocolError> {
+        let _ = (session_id, key, context, flags);
+        Err(ProtocolError::internal("unsupported: get_resolved"))
+    }
+
+    /// `put(address, fragment, payload)` followed by a `KeyType::Resolve` mapping of `key` to
+    /// `address.hash`, performed server-side in one round trip. The write side of
+    /// [`Storage::get_resolved`].
+    ///
+    /// The mapping lands only once the fragment is durably stored, so a key never resolves to
+    /// content the server does not hold. Only a root fragment is published this way; a fragment
+    /// list's leaves are written with ordinary [`Storage::put`] calls beforehand.
+    ///
+    /// A zero `address.hash` removes the mapping instead; `fragment` and `payload` are ignored.
+    async fn put_resolved(
+        &self,
+        session_id: u32,
+        key: &Hash,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<(), ProtocolError> {
+        let _ = (session_id, key, address, fragment, payload);
+        Err(ProtocolError::internal("unsupported: put_resolved"))
+    }
+
     /// Store a mutable key-value pair.
     async fn mutable_store(
         &self,

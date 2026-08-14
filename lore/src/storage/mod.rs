@@ -48,6 +48,7 @@ pub mod flush;
 pub mod get;
 pub mod get_file;
 pub mod get_metadata;
+pub mod get_resolved;
 pub mod handle;
 pub mod mutable_compare_and_swap;
 pub mod mutable_list;
@@ -57,6 +58,7 @@ pub mod obliterate;
 pub mod open;
 pub mod put;
 pub mod put_file;
+pub mod put_resolved;
 pub(crate) mod remote;
 pub(crate) mod store;
 pub mod upload;
@@ -93,12 +95,17 @@ pub async fn close_all_handles() {
 /// and running the close sequence on each. Client-mode handles (no connection id recorded)
 /// are unaffected. Per-handle drains run in parallel.
 ///
-/// IPC buffer-bearing args policy: `lore_storage_put`, `lore_storage_get`,
-/// `lore_storage_put_file`, `lore_storage_get_file`, and `lore_storage_upload` all carry
-/// `LoreBytes` views into caller memory that have no natural cross-process representation.
-/// Their args fail to deserialize on the server side; the dispatcher must reject them with
-/// `InvalidArguments` rather than attempt to round-trip the payload bytes through IPC.
-/// Service-mode callers route those ops directly against the local backend.
+/// IPC buffer-bearing args policy: `lore_storage_put` and `lore_storage_put_resolved` carry a
+/// `LoreBytes` view into caller memory in their *args*, which has no natural cross-process
+/// representation. `LoreBytes::deserialize` always errors, so those args cannot be reconstructed
+/// on the server side of the IPC boundary.
+///
+/// Two caveats worth knowing before relying on this. Nothing enforces it: every op goes through
+/// `dispatch_call` and is delegated whenever service mode is active, and the failure surfaces as
+/// a message that fails to read — dropping the connection — rather than as the `InvalidArguments`
+/// a caller would expect. And the read ops (`lore_storage_get`, `lore_storage_get_resolved`) are
+/// *not* in this family despite emitting `LoreBytes`: they carry it only in events, whose
+/// lifetime is the callback, so their args round-trip fine.
 pub async fn close_for_connection(connection_id: u64) {
     drain_in_parallel(handle::drain_for_connection(connection_id)).await;
 }

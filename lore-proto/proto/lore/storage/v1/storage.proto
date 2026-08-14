@@ -25,6 +25,15 @@ service StorageService {
     // carries Fragment only — no payload bytes. Used by callers that need fragment metadata
     // (size, flags) for existence/size lookups without paying the payload transfer cost.
     rpc GetMetadata(stream lore.model.v1.Address) returns (stream GetResponse);
+    // GetResolved: mutable key -> immutable blob in one round trip. The key is always read as
+    // KeyType::Resolve, so no key type is carried. Streaming for the same reason Get is: the
+    // storage API resolves keys in batches, so requests pipeline over one long-lived stream
+    // instead of paying per-call setup and metadata injection.
+    rpc GetResolved(stream GetResolvedRequest) returns (stream GetResolvedResponse);
+    // PutResolved: store a fragment and publish a mutable key naming it, in one round trip. The
+    // write side of GetResolved, and the only thing that makes a key resolvable. Shares
+    // GetResolved's correlation and in-band status shape.
+    rpc PutResolved(stream PutResolvedRequest) returns (stream PutResolvedResponse);
     rpc Put(stream PutRequest) returns (stream PutResponse);
     rpc Query(QueryRequest) returns (QueryResponse);
     rpc Verify(VerifyRequest) returns (VerifyResponse);
@@ -54,6 +63,61 @@ message GetResponse {
     // Anything other than `OK` decides the item on its own. A reader must not consult
     // `fragment` or `payload` in that case, whatever they contain.
     lore.model.v1.ItemStatus status = 4;
+}
+
+// One resolve-and-read on the GetResolved request stream.
+message GetResolvedRequest {
+    // Transport-assigned correlation handle, unique per stream, mirroring the QUIC
+    // CommandHeader's `command_id`. Never zero; a zero id cannot be correlated and is the one
+    // malformed-request case the server answers with a stream-level error.
+    uint64 request_id = 1;
+    // `key.hash` is a mutable key, not a content hash; `key.context` is the context the
+    // resolved hash is read at.
+    lore.model.v1.Address key = 2;
+    // Reserved bitmask; unknown bits are rejected rather than ignored.
+    uint32 flags = 3;
+}
+
+// One item's outcome on the GetResolved response stream.
+message GetResolvedResponse {
+    // Echoes the request's `request_id`. Set on every response, success or failure.
+    uint64 request_id = 1;
+    // This item's outcome. Absent or code 0 (OK) means the remaining fields are valid; anything
+    // else means they are unset and the item failed. The stream continues either way.
+    lore.model.v1.ItemStatus status = 2;
+    // What the key resolved to. Addressed at the request's `key.context`.
+    bytes resolved = 3;
+    // Describes the payload below: its encoding, and the content size behind it.
+    lore.model.v1.Fragment fragment = 4;
+    // The stored representation of `resolved`, still encoded as `fragment` describes. A
+    // fragmented root carries the reference list rather than content; its leaves follow
+    // separately over Get.
+    bytes payload = 5;
+}
+
+// One store-and-publish on the PutResolved request stream.
+message PutResolvedRequest {
+    // Transport-assigned correlation handle, unique per stream. Never zero; see GetResolvedRequest.
+    uint64 request_id = 1;
+    // Mutable key to publish `address.hash` under, as KeyType::Resolve.
+    bytes key = 2;
+    // Content address of the fragment being stored. A zero hash removes the key's mapping
+    // instead of publishing one, and then `fragment` and `payload` are ignored.
+    lore.model.v1.Address address = 3;
+    // Describes the payload below, as on Put.
+    lore.model.v1.Fragment fragment = 4;
+    // The fragment's stored representation. Required: publishing a key against a metadata-only
+    // write would map it to content the server does not hold.
+    bytes payload = 5;
+}
+
+// One item's outcome on the PutResolved response stream.
+message PutResolvedResponse {
+    // Echoes the request's `request_id`. Set on every response, success or failure.
+    uint64 request_id = 1;
+    // This item's outcome; absent or code 0 (OK) means the key was published. The stream
+    // continues either way.
+    lore.model.v1.ItemStatus status = 2;
 }
 
 message PutRequest {

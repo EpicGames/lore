@@ -6245,7 +6245,7 @@ pub type LoreStoragePutArgs = crate::storage::put::LoreStoragePutArgs;
 ///
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
-/// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item — success or failure |
+/// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item — success or failure; `stored_local`/`stored_remote` report where the content landed |
 /// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 #[unsafe(no_mangle)]
@@ -6298,6 +6298,137 @@ pub extern "C" fn lore_storage_get_async(
     callback: LoreEventCallbackConfig,
 ) {
     run_asynchronously(globals, args, callback, crate::storage::get::get);
+}
+
+/// Named by `lore_repository_create_args_t::use_shared_store`; re-exported so callers need no
+/// dependency on `lore_revision`.
+pub use lore_revision::repository::LoreSharedStoreMode;
+
+pub type LoreStorageGetResolvedItem = crate::storage::get_resolved::LoreStorageGetResolvedItem;
+pub type LoreStorageGetResolvedArgs = crate::storage::get_resolved::LoreStorageGetResolvedArgs;
+
+/// Resolve one or more mutable keys and read the content they name, in one round trip.
+///
+/// `lore_storage_mutable_load` followed by `lore_storage_get`, performed by the server. The keys
+/// are read under the `LORE_KEY_TYPE_RESOLVE` key type, which is what `lore_storage_put_resolved`
+/// publishes; no other key type is resolvable this way.
+///
+/// The `address` in every event is the *resolved* address, so a caller can learn the key-to-hash
+/// mapping from the event stream. A key with no mapping, or one naming absent content, reports
+/// `error_code = ADDRESS_NOT_FOUND`, and the terminal event then carries a zero address.
+///
+/// Set `streaming` to receive one `LORE_EVENT_STORAGE_GET_DATA` per leaf fragment instead of a
+/// single reassembled buffer, exactly as `lore_storage_get` does. Without it the whole content is
+/// materialised in memory before the first byte reaches the callback, so a key naming something
+/// large should set it.
+///
+/// # Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_STORAGE_GET_HEADER` | `lore_storage_get_header_event_data_t` | Size of the item's reassembled content, emitted before any DATA events |
+/// | `LORE_EVENT_STORAGE_GET_DATA` | `lore_storage_get_data_event_data_t` | Payload bytes — valid only during the callback invocation. One event per item, or one per leaf fragment when `streaming` is set |
+/// | `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE` | `lore_storage_get_item_complete_event_data_t` | Terminal per-item event |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_get_resolved(
+    globals: &LoreGlobalArgs,
+    args: &LoreStorageGetResolvedArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::get_resolved::get_resolved,
+    )
+}
+
+/// Resolve one or more mutable keys and read the content they name (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_get_resolved_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreStorageGetResolvedArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::get_resolved::get_resolved,
+    );
+}
+
+pub type LoreStoragePutResolvedItem = crate::storage::put_resolved::LoreStoragePutResolvedItem;
+pub type LoreStoragePutResolvedArgs = crate::storage::put_resolved::LoreStoragePutResolvedArgs;
+
+/// Store one or more buffers and publish a mutable key naming each, in one round trip.
+///
+/// `lore_storage_put` followed by `lore_storage_mutable_store`, fused into one request when the
+/// content fits a single fragment. The key is published under `LORE_KEY_TYPE_RESOLVE`, making it
+/// readable by `lore_storage_get_resolved`, and the mapping is written only once the content is
+/// stored — so a key published this way never resolves to content that is not there. Writing the
+/// same key type directly with `lore_storage_mutable_store` carries no such guarantee.
+///
+/// The local store always receives both the content and the mapping. `remote_write = 1` also
+/// publishes them remotely, matching `lore_storage_put`; there is no local-then-remote fallback.
+/// A zero `key` or a zero `partition` rejects with `INVALID_ARGUMENTS`.
+///
+/// A zero-length `data` **removes** the key's mapping rather than publishing one: no content is
+/// stored, the key is set to the zero hash, and `lore_storage_get_resolved` then reports
+/// `ADDRESS_NOT_FOUND` for it. The terminal event carries the zero content hash and the caller's
+/// context.
+///
+/// With `remote_write = 0` this evicts only the locally cached mapping. The local mutable store
+/// is a cache, not an authority, so a key published remotely resolves again on the next call.
+/// Deleting a published key requires `remote_write = 1`.
+///
+/// A remote content upload that fails still leaves a successful local write, so the key is not
+/// published remotely and `stored_remote` is `0` while `error_code` stays `NONE`. Check
+/// `stored_remote`, not `error_code`, to confirm the key is visible to other clients.
+///
+/// Publishing is last-writer-wins. Two callers publishing the same key concurrently both
+/// succeed, and the key ends up naming whichever content was published second — the first
+/// publisher is not told it was overwritten. Callers needing to detect a lost update should
+/// store the content with `lore_storage_put` and publish with
+/// `lore_storage_mutable_compare_and_swap`, which costs the second round trip this operation
+/// exists to avoid.
+///
+/// # Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item; `address` is the content the key now resolves to, and `stored_local`/`stored_remote` report where it landed |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_put_resolved(
+    globals: &LoreGlobalArgs,
+    args: &LoreStoragePutResolvedArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::put_resolved::put_resolved,
+    )
+}
+
+/// Store one or more buffers and publish a mutable key naming each (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_put_resolved_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreStoragePutResolvedArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::put_resolved::put_resolved,
+    );
 }
 
 pub type LoreStorageCloseArgs = crate::storage::close::LoreStorageCloseArgs;

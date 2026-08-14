@@ -26,6 +26,7 @@ mod tests {
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreEventCallbackConfig;
     use lore_revision::interface::LoreGlobalArgs;
+    use lore_revision::repository::LoreSharedStoreMode;
     use lore_revision::repository::RepositoryError;
     use rand::Rng;
     use rand::distr::Alphanumeric;
@@ -177,7 +178,7 @@ mod tests {
             repository_url: name.into(),
             id: LoreString::default(),
             description: LoreString::default(),
-            use_shared_store: 0,
+            use_shared_store: LoreSharedStoreMode::Disabled,
             shared_store_path: LoreString::default(),
         }
     }

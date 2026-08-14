@@ -228,7 +228,7 @@ pub async fn read_stream(
     address: Address,
     range: Option<Range<usize>>,
     options: ReadOptions,
-    sender: Sender<Bytes>,
+    sender: Sender<Result<Bytes, lore_storage::StorageError>>,
 ) -> Result<u64, ImmutableError> {
     let store = repository.immutable_store();
     let partition = repository.id;
@@ -392,6 +392,7 @@ pub async fn write_with_tracker(
         None,
     )
     .await
+    .map(|written| written.address)
     .forward("writing immutable content")
 }
 
@@ -429,6 +430,7 @@ pub async fn write_from_file_with_tracker(
         tracker,
     )
     .await
+    .map(|written| (written.address, written.size_content))
     .forward("writing immutable content from file")
 }
 

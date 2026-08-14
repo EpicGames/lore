@@ -35,6 +35,116 @@ impl ::prost::Name for GetResponse {
         "/lore.storage.v1.GetResponse".into()
     }
 }
+/// One resolve-and-read on the GetResolved request stream.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetResolvedRequest {
+    /// Transport-assigned correlation handle, unique per stream, mirroring the QUIC
+    /// CommandHeader's `command_id`. Never zero; a zero id cannot be correlated and is the one
+    /// malformed-request case the server answers with a stream-level error.
+    #[prost(uint64, tag = "1")]
+    pub request_id: u64,
+    /// `key.hash` is a mutable key, not a content hash; `key.context` is the context the
+    /// resolved hash is read at.
+    #[prost(message, optional, tag = "2")]
+    pub key: ::core::option::Option<crate::lore::model::v1::Address>,
+    /// Reserved bitmask; unknown bits are rejected rather than ignored.
+    #[prost(uint32, tag = "3")]
+    pub flags: u32,
+}
+impl ::prost::Name for GetResolvedRequest {
+    const NAME: &'static str = "GetResolvedRequest";
+    const PACKAGE: &'static str = "lore.storage.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.storage.v1.GetResolvedRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.storage.v1.GetResolvedRequest".into()
+    }
+}
+/// One item's outcome on the GetResolved response stream.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GetResolvedResponse {
+    /// Echoes the request's `request_id`. Set on every response, success or failure.
+    #[prost(uint64, tag = "1")]
+    pub request_id: u64,
+    /// This item's outcome. Absent or code 0 (OK) means the remaining fields are valid; anything
+    /// else means they are unset and the item failed. The stream continues either way.
+    #[prost(message, optional, tag = "2")]
+    pub status: ::core::option::Option<crate::lore::model::v1::ItemStatus>,
+    /// What the key resolved to. Addressed at the request's `key.context`.
+    #[prost(bytes = "bytes", tag = "3")]
+    pub resolved: ::prost::bytes::Bytes,
+    /// Describes the payload below: its encoding, and the content size behind it.
+    #[prost(message, optional, tag = "4")]
+    pub fragment: ::core::option::Option<crate::lore::model::v1::Fragment>,
+    /// The stored representation of `resolved`, still encoded as `fragment` describes. A
+    /// fragmented root carries the reference list rather than content; its leaves follow
+    /// separately over Get.
+    #[prost(bytes = "bytes", tag = "5")]
+    pub payload: ::prost::bytes::Bytes,
+}
+impl ::prost::Name for GetResolvedResponse {
+    const NAME: &'static str = "GetResolvedResponse";
+    const PACKAGE: &'static str = "lore.storage.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.storage.v1.GetResolvedResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.storage.v1.GetResolvedResponse".into()
+    }
+}
+/// One store-and-publish on the PutResolved request stream.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PutResolvedRequest {
+    /// Transport-assigned correlation handle, unique per stream. Never zero; see GetResolvedRequest.
+    #[prost(uint64, tag = "1")]
+    pub request_id: u64,
+    /// Mutable key to publish `address.hash` under, as KeyType::Resolve.
+    #[prost(bytes = "bytes", tag = "2")]
+    pub key: ::prost::bytes::Bytes,
+    /// Content address of the fragment being stored. A zero hash removes the key's mapping
+    /// instead of publishing one, and then `fragment` and `payload` are ignored.
+    #[prost(message, optional, tag = "3")]
+    pub address: ::core::option::Option<crate::lore::model::v1::Address>,
+    /// Describes the payload below, as on Put.
+    #[prost(message, optional, tag = "4")]
+    pub fragment: ::core::option::Option<crate::lore::model::v1::Fragment>,
+    /// The fragment's stored representation. Required: publishing a key against a metadata-only
+    /// write would map it to content the server does not hold.
+    #[prost(bytes = "bytes", tag = "5")]
+    pub payload: ::prost::bytes::Bytes,
+}
+impl ::prost::Name for PutResolvedRequest {
+    const NAME: &'static str = "PutResolvedRequest";
+    const PACKAGE: &'static str = "lore.storage.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.storage.v1.PutResolvedRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.storage.v1.PutResolvedRequest".into()
+    }
+}
+/// One item's outcome on the PutResolved response stream.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PutResolvedResponse {
+    /// Echoes the request's `request_id`. Set on every response, success or failure.
+    #[prost(uint64, tag = "1")]
+    pub request_id: u64,
+    /// This item's outcome; absent or code 0 (OK) means the key was published. The stream
+    /// continues either way.
+    #[prost(message, optional, tag = "2")]
+    pub status: ::core::option::Option<crate::lore::model::v1::ItemStatus>,
+}
+impl ::prost::Name for PutResolvedResponse {
+    const NAME: &'static str = "PutResolvedResponse";
+    const PACKAGE: &'static str = "lore.storage.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.storage.v1.PutResolvedResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.storage.v1.PutResolvedResponse".into()
+    }
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PutRequest {
     #[prost(message, optional, tag = "1")]
@@ -474,6 +584,69 @@ pub mod storage_service_client {
                 );
             self.inner.streaming(req, path, codec).await
         }
+        /// GetResolved: mutable key -> immutable blob in one round trip. The key is always read as
+        /// KeyType::Resolve, so no key type is carried. Streaming for the same reason Get is: the
+        /// storage API resolves keys in batches, so requests pipeline over one long-lived stream
+        /// instead of paying per-call setup and metadata injection.
+        pub async fn get_resolved(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<
+                Message = super::GetResolvedRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::GetResolvedResponse>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.storage.v1.StorageService/GetResolved",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("lore.storage.v1.StorageService", "GetResolved"),
+                );
+            self.inner.streaming(req, path, codec).await
+        }
+        /// PutResolved: store a fragment and publish a mutable key naming it, in one round trip. The
+        /// write side of GetResolved, and the only thing that makes a key resolvable. Shares
+        /// GetResolved's correlation and in-band status shape.
+        pub async fn put_resolved(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<
+                Message = super::PutResolvedRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::PutResolvedResponse>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.storage.v1.StorageService/PutResolved",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("lore.storage.v1.StorageService", "PutResolved"),
+                );
+            self.inner.streaming(req, path, codec).await
+        }
         pub async fn put(
             &mut self,
             request: impl tonic::IntoStreamingRequest<Message = super::PutRequest>,
@@ -684,6 +857,39 @@ pub mod storage_service_server {
             request: tonic::Request<tonic::Streaming<crate::lore::model::v1::Address>>,
         ) -> std::result::Result<
             tonic::Response<Self::GetMetadataStream>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the GetResolved method.
+        type GetResolvedStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::GetResolvedResponse, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// GetResolved: mutable key -> immutable blob in one round trip. The key is always read as
+        /// KeyType::Resolve, so no key type is carried. Streaming for the same reason Get is: the
+        /// storage API resolves keys in batches, so requests pipeline over one long-lived stream
+        /// instead of paying per-call setup and metadata injection.
+        async fn get_resolved(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::GetResolvedRequest>>,
+        ) -> std::result::Result<
+            tonic::Response<Self::GetResolvedStream>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the PutResolved method.
+        type PutResolvedStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::PutResolvedResponse, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// PutResolved: store a fragment and publish a mutable key naming it, in one round trip. The
+        /// write side of GetResolved, and the only thing that makes a key resolvable. Shares
+        /// GetResolved's correlation and in-band status shape.
+        async fn put_resolved(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::PutResolvedRequest>>,
+        ) -> std::result::Result<
+            tonic::Response<Self::PutResolvedStream>,
             tonic::Status,
         >;
         /// Server streaming response type for the Put method.
@@ -908,6 +1114,102 @@ pub mod storage_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = GetMetadataSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.storage.v1.StorageService/GetResolved" => {
+                    #[allow(non_camel_case_types)]
+                    struct GetResolvedSvc<T: StorageService>(pub Arc<T>);
+                    impl<
+                        T: StorageService,
+                    > tonic::server::StreamingService<super::GetResolvedRequest>
+                    for GetResolvedSvc<T> {
+                        type Response = super::GetResolvedResponse;
+                        type ResponseStream = T::GetResolvedStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                tonic::Streaming<super::GetResolvedRequest>,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as StorageService>::get_resolved(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = GetResolvedSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.storage.v1.StorageService/PutResolved" => {
+                    #[allow(non_camel_case_types)]
+                    struct PutResolvedSvc<T: StorageService>(pub Arc<T>);
+                    impl<
+                        T: StorageService,
+                    > tonic::server::StreamingService<super::PutResolvedRequest>
+                    for PutResolvedSvc<T> {
+                        type Response = super::PutResolvedResponse;
+                        type ResponseStream = T::PutResolvedStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                tonic::Streaming<super::PutResolvedRequest>,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as StorageService>::put_resolved(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PutResolvedSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

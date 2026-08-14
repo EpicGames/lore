@@ -9,6 +9,7 @@ mod presign_test;
 mod remote_store_test;
 mod replication_service_test;
 mod revision_tree_test;
+mod shared_store_test;
 mod storage_mutable_test;
 mod storage_remote_test;
 mod storage_test;

@@ -9,12 +9,14 @@ pub mod connect;
 pub mod copy;
 pub mod correlate;
 pub mod get;
+pub mod get_resolved;
 pub mod messages;
 pub mod mutable_cas;
 pub mod mutable_load;
 pub mod mutable_store_handler;
 pub mod ping;
 pub mod put;
+pub mod put_resolved;
 pub mod query;
 pub mod session;
 pub mod verify;
@@ -24,11 +26,13 @@ pub mod requests {
     pub use crate::protocol::storage::copy::Copy;
     pub use crate::protocol::storage::correlate::Correlate;
     pub use crate::protocol::storage::get::Get;
+    pub use crate::protocol::storage::get_resolved::GetResolved;
     pub use crate::protocol::storage::mutable_cas::MutableCas;
     pub use crate::protocol::storage::mutable_load::MutableLoad;
     pub use crate::protocol::storage::mutable_store_handler::MutableStoreOp;
     pub use crate::protocol::storage::ping::Ping;
     pub use crate::protocol::storage::put::Put;
+    pub use crate::protocol::storage::put_resolved::PutResolved;
     pub use crate::protocol::storage::query::Query;
     pub use crate::protocol::storage::verify::Verify;
 }
@@ -39,11 +43,13 @@ pub mod responses {
     pub use crate::protocol::storage::copy::CopyResponse;
     pub use crate::protocol::storage::correlate::CorrelateResponse;
     pub use crate::protocol::storage::get::GetResponse;
+    pub use crate::protocol::storage::get_resolved::GetResolvedResponse;
     pub use crate::protocol::storage::mutable_cas::MutableCasResponse;
     pub use crate::protocol::storage::mutable_load::MutableLoadResponse;
     pub use crate::protocol::storage::mutable_store_handler::MutableStoreResponse;
     pub use crate::protocol::storage::ping::PingResponse;
     pub use crate::protocol::storage::put::PutResponse;
+    pub use crate::protocol::storage::put_resolved::PutResolvedResponse;
     pub use crate::protocol::storage::query::QueryResponse;
     pub use crate::protocol::storage::verify::VerifyResponse;
 }

@@ -363,6 +363,56 @@ impl Storage for StorageClient {
         Ok((fragment, payload))
     }
 
+    /// Response framing: resolved `Hash` (32) ++ `Fragment` (16) ++ payload.
+    async fn get_resolved(
+        &self,
+        session_id: u32,
+        key: &Hash,
+        context: &Context,
+        flags: u32,
+    ) -> Result<(Hash, Fragment, Bytes), ProtocolError> {
+        let tail = flags.to_le_bytes();
+
+        let mut payload =
+            send_normal_with_reconnect(self, Command::GetResolved, session_id, || {
+                [
+                    Bytes::default(),
+                    Bytes::from_owner(*key),
+                    Bytes::from_owner(*context),
+                    Bytes::copy_from_slice(&tail),
+                ]
+            })
+            .await?;
+
+        let prefix = size_of::<Hash>() + size_of::<Fragment>();
+        if payload.len() < prefix {
+            return Err(ProtocolError::internal(format!(
+                "get_resolved: Invalid server response, expected at least {prefix} bytes got {}",
+                payload.len()
+            )));
+        }
+
+        let resolved_bytes = payload.split_to(size_of::<Hash>());
+        let resolved = Hash::from(&resolved_bytes[..]);
+
+        let fragment_bytes = payload.split_to(size_of::<Fragment>());
+        let fragment = unsafe { fragment_bytes.as_ptr().cast::<Fragment>().read_unaligned() };
+
+        if let Err(reason) = lore_base::types::validate_fragment_response(&fragment) {
+            return Err(ProtocolError::internal(format!(
+                "get_resolved: invalid fragment {fragment:?}: {reason}"
+            )));
+        }
+        if payload.len() != fragment.size_payload as usize {
+            return Err(ProtocolError::internal(format!(
+                "get_resolved: Invalid server payload for fragment {fragment:?}, got {} bytes",
+                payload.len()
+            )));
+        }
+
+        Ok((resolved, fragment, payload))
+    }
+
     async fn get_metadata(
         &self,
         session_id: u32,
@@ -427,6 +477,29 @@ impl Storage for StorageClient {
         send_normal_with_reconnect(self, Command::Put, session_id, || {
             [
                 Bytes::default(),
+                Bytes::from_owner(address),
+                Bytes::from_owner(fragment),
+                payload.clone().unwrap_or_default(),
+            ]
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Request framing: `put`'s, with the mutable key prepended — key (32) ++ `Address` (48) ++
+    /// `Fragment` (16) ++ payload, keeping the 96-byte header a multiple of four.
+    async fn put_resolved(
+        &self,
+        session_id: u32,
+        key: &Hash,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<(), ProtocolError> {
+        send_normal_with_reconnect(self, Command::PutResolved, session_id, || {
+            [
+                Bytes::default(),
+                Bytes::from_owner(*key),
                 Bytes::from_owner(address),
                 Bytes::from_owner(fragment),
                 payload.clone().unwrap_or_default(),

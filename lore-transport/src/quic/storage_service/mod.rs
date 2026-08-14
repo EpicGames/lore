@@ -31,6 +31,41 @@ pub enum Command {
     /// `Fragment` only — no payload bytes. Used by callers that need fragment metadata for
     /// existence/size lookups without paying for the payload transfer.
     GetMetadata = 11,
+    /// `mutable_load` + `get` performed server-side, saving one round trip. Resolves the key,
+    /// treats the value as an immutable hash, and reads it at the caller-supplied `Context`.
+    ///
+    /// Request:  key `Hash` (32) ++ `Context` (16) ++ `flags` u32 LE (4)
+    /// Response: resolved `Hash` (32) ++ `Fragment` (16) ++ payload (`size_payload`)
+    ///
+    /// The key type is always [`lore_base::types::KeyType::Resolve`] and is therefore not sent;
+    /// the 4-byte `flags` tail keeps the request a multiple of 4. The resolved hash is returned
+    /// so the caller can cache the key->hash mapping and verify the payload.
+    /// Opcodes 4 and 5 are reserved (ping/correlate), hence 12.
+    GetResolved = 12,
+    /// `put` + `mutable_store` performed server-side, saving one round trip. Stores the fragment
+    /// at its content address, then maps the caller's mutable key to that hash under
+    /// `KeyType::Resolve` — the write that makes a key readable by [`Command::GetResolved`].
+    ///
+    /// Request:  key `Hash` (32) ++ `Address` (48) ++ `Fragment` (16) ++ payload (`size_payload`)
+    /// Response: empty
+    ///
+    /// The mapping is written only once the fragment is durably stored, so a key never resolves
+    /// to content the server does not hold. Only the root fragment goes through this command; a
+    /// fragment list's leaves are written with ordinary [`Command::Put`] calls first.
+    ///
+    /// A zero `Address` hash removes the mapping instead of publishing one; the `Fragment` and
+    /// payload are then ignored, since there is nothing to store.
+    PutResolved = 13,
+}
+
+/// `flags` field of a [`Command::GetResolved`] request. Reserved; no bits are defined.
+///
+/// Transmitted as a full `u32`. Unknown bits are rejected, not ignored.
+pub mod get_resolved_flags {
+    /// No optional behaviour.
+    pub const NONE: u32 = 0;
+    /// Bits this build accepts.
+    pub const KNOWN: u32 = 0;
 }
 
 impl From<Command> for QuicOpCode {
@@ -54,6 +89,8 @@ impl TryFrom<QuicOpCode> for Command {
             v if v == Command::MutableStore as u8 => Ok(Command::MutableStore),
             v if v == Command::MutableCas as u8 => Ok(Command::MutableCas),
             v if v == Command::GetMetadata as u8 => Ok(Command::GetMetadata),
+            v if v == Command::GetResolved as u8 => Ok(Command::GetResolved),
+            v if v == Command::PutResolved as u8 => Ok(Command::PutResolved),
             _ => Err(UnknownCommand(value)),
         }
     }
@@ -77,6 +114,8 @@ pub fn command_name(command: &Command) -> &'static str {
         Command::MutableStore => "mutable_store",
         Command::MutableCas => "mutable_cas",
         Command::GetMetadata => "get_metadata",
+        Command::GetResolved => "get_resolved",
+        Command::PutResolved => "put_resolved",
     }
 }
 

@@ -42,7 +42,14 @@ pub enum DefragmentSink {
     /// `size` is the expected content length, used to reject out-of-range offsets.
     File { file: IoFile, size: usize },
     /// Stream buffers in content order to a caller-provided channel.
-    Stream { sender: Sender<Bytes> },
+    /// Stream buffers in content order to a caller-provided channel.
+    ///
+    /// The item is a `Result` so a failure partway through the tree reaches the consumer as the
+    /// final item rather than only the log. Without it the channel simply closes early and a
+    /// truncated read is indistinguishable from a complete one.
+    Stream {
+        sender: Sender<Result<Bytes, StorageError>>,
+    },
 }
 
 /// A fetched payload on its way to the write sink: target offset, bytes, and the
@@ -744,7 +751,7 @@ async fn fetch_ordered_and_stream(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     leaf_rx: Receiver<LeafReference>,
-    sender: Sender<Bytes>,
+    sender: Sender<Result<Bytes, StorageError>>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
 ) -> Result<(), StorageError> {
@@ -765,7 +772,7 @@ async fn fetch_ordered_and_stream_from(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     mut leaf_rx: Receiver<LeafReference>,
-    sender: Sender<Bytes>,
+    sender: Sender<Result<Bytes, StorageError>>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
 ) -> Result<(), StorageError> {
@@ -837,7 +844,7 @@ async fn fetch_ordered_and_stream_from(
             Ok((buffer, permit)) => {
                 if result.is_ok() {
                     result = sender
-                        .send(buffer)
+                        .send(Ok(buffer))
                         .await
                         .map_err(|_err| StorageError::internal("stream send failed"));
                 }
@@ -2458,7 +2465,7 @@ mod tests {
             drop(leaf_tx);
 
             // One slot, so only the first payload leaves the pipeline's accounting.
-            let (data_tx, mut data_rx) = channel::<Bytes>(1);
+            let (data_tx, mut data_rx) = channel::<Result<Bytes, StorageError>>(1);
             let pipeline = lore_base::lore_spawn!(fetch_ordered_and_stream_from(
                 budget,
                 store.clone(),
@@ -2492,7 +2499,11 @@ mod tests {
 
             // Draining releases them in order, and the walk completes.
             for index in 0..LEAVES {
-                let payload = data_rx.recv().await.expect("payload");
+                let payload = data_rx
+                    .recv()
+                    .await
+                    .expect("payload")
+                    .expect("payload must not be an error");
                 assert_eq!(payload.len(), PAYLOAD);
                 assert!(
                     payload.iter().all(|&byte| byte == index as u8),

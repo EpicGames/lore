@@ -118,6 +118,8 @@ pub use read::read;
 pub use read::read_into;
 pub use read::read_into_file;
 pub use read::read_raw;
+pub use read::read_resolved;
+pub use read::read_resolved_stream;
 pub use read::read_stream;
 pub use read::remote_fetch_inflight;
 pub use read::write_all_to_file;
@@ -157,6 +159,7 @@ pub use write::stored_in_flight;
 pub use write::write_content;
 pub use write::write_from_file;
 pub use write::write_raw;
+pub use write::write_resolved;
 
 /// Retry waiter with exponential backoff and jitter.
 pub struct Retry {

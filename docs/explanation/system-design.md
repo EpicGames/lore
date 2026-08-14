@@ -2013,10 +2013,17 @@ pipelining and multiplexing work, and why the wire format differs from the on-di
 The protocol's command set is small and the same on both transports:
 
 - *Authorize* - establish or end a session.
-- *Get*, *Put*, *Query*, *Verify*, *Copy* - operations on the immutable store: read a
-  fragment, write one, query existence, verify content, copy a fragment across partitions.
+- *Get*, *GetMetadata*, *Put*, *Query*, *Verify*, *Copy* - operations on the immutable store:
+  read a fragment, read only its metadata, write one, query existence, verify content, copy a
+  fragment across partitions.
 - *MutableLoad*, *MutableStore*, *MutableCas* - the `load`, `store`, and `cas` operations on
   the mutable store: read a key, write a key, compare-and-swap a key.
+- *GetResolved*, *PutResolved* - span both stores, using the `Resolve` key type. *GetResolved*
+  resolves a mutable key and returns the immutable blob it names, so a key lookup and the read
+  it feeds share one round trip instead of two. *PutResolved* is its write side: it stores a
+  fragment and publishes a key naming it in one round trip. The mapping is published only once
+  the content behind it is stored, which is what distinguishes it from writing the same key type
+  with *MutableStore* directly.
 
 QUIC and gRPC carry these commands with the same arguments and return the same answers.
 The QUIC transport (ALPN `lore-storage/0.4`) is binary and low-overhead, designed for

@@ -46,6 +46,17 @@ pub struct LoreStoragePutItemCompleteEventData {
     pub address: Address,
     /// The outcome for the item.
     pub error_code: LoreErrorCode,
+    /// Non-zero when the local store holds the content. Appended after the original three
+    /// fields, so a consumer reading only those is unaffected — `serde(default)` lets an older
+    /// payload that lacks the field deserialize, as events cross the IPC boundary.
+    #[serde(default)]
+    pub stored_local: u8,
+    /// Non-zero when the content reached the remote, or was already durable there. A remote
+    /// write that fails still reports `error_code = NONE` if the local write succeeded — this is
+    /// how a caller tells the two apart. For fragmented content it is the intersection across
+    /// every fragment, so it is set only when the whole tree is remote.
+    #[serde(default)]
+    pub stored_remote: u8,
 }
 
 /// Leading event for each regular `get` item. Reports the total

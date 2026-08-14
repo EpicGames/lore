@@ -32,9 +32,12 @@ lore-aws = { workspace = true }
 lore-revision = { workspace = true }
 lore-hashicorp = { workspace = true }
 lore-proto = { workspace = true }
-lore-server = { workspace = true, features = ["integration_tests"] }
 uuid = { workspace = true }
 
+[dev-dependencies]
+lore-server = { workspace = true }
+rcgen = { workspace = true }
+
 [features]
-integration_tests = []
+integration_tests = ["lore-server/integration_tests"]
 grpc_integration_tests = ["dep:tokio-stream", "dep:tonic"]
