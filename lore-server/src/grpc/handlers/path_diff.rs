@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use bytes::Bytes;
 use lore_proto::Conflict;
 use lore_proto::Path;
 use lore_proto::PathDiff;
 use lore_proto::PathType;
+use lore_revision::change::FileAction;
 use lore_revision::change::NodeChange;
+use lore_revision::change::NodeChangeState;
+use lore_revision::lore::RepositoryId;
 use lore_revision::node::NodeFlags;
 use tracing::warn;
 
@@ -18,38 +22,85 @@ pub fn node_flags_to_type(flags: NodeFlags) -> i32 {
     }
 }
 
-pub fn map_to_path_diff(change: &NodeChange) -> Option<PathDiff> {
+/// The side the change resolves to: `from` for a delete, `to` otherwise.
+fn resolved_side(change: &NodeChange) -> &NodeChangeState {
     match change.action {
-        lore_revision::change::FileAction::Delete => Some(PathDiff {
+        FileAction::Delete => &change.from,
+        _ => &change.to,
+    }
+}
+
+/// The linked repository a change resolves under (empty when it is the
+/// request's own repository), and whether a link tracks its parent branch.
+async fn link_partition_and_tracking(
+    change: &NodeChange,
+    parent_repository_id: RepositoryId,
+) -> (Bytes, bool) {
+    let side = resolved_side(change);
+    if !side.flags.contains(NodeFlags::Link) {
+        return (Bytes::new(), false);
+    }
+    let target: RepositoryId = side.address.context.into();
+    let link_partition = if target == parent_repository_id {
+        Bytes::new()
+    } else {
+        Bytes::from(target)
+    };
+    let tracking = side
+        .state
+        .link_find(side.repository.clone(), target, side.node)
+        .await
+        .is_ok_and(|link_ref| link_ref.is_tracking());
+    (link_partition, tracking)
+}
+
+pub async fn map_to_path_diff(
+    change: &NodeChange,
+    parent_repository_id: RepositoryId,
+) -> Option<PathDiff> {
+    let (link_partition, tracking) =
+        link_partition_and_tracking(change, parent_repository_id).await;
+    match change.action {
+        FileAction::Delete => Some(PathDiff {
             from: Some(Path {
                 path: change.path.to_string(),
                 address: change.from.address.into(),
                 r#type: node_flags_to_type(change.from.flags),
+                tracking,
             }),
             to: None,
             automerged: change.flags.is_conflict_automerged(),
+            link_partition,
+            tracking,
         }),
-        lore_revision::change::FileAction::Add => Some(PathDiff {
+        FileAction::Add => Some(PathDiff {
             from: None,
             to: Some(Path {
                 path: change.path.to_string(),
                 address: change.to.address.into(),
                 r#type: node_flags_to_type(change.to.flags),
+                tracking,
             }),
             automerged: change.flags.is_conflict_automerged(),
+            link_partition,
+            tracking,
         }),
-        lore_revision::change::FileAction::Keep => Some(PathDiff {
+        FileAction::Keep => Some(PathDiff {
             from: Some(Path {
                 path: change.path.to_string(),
                 address: change.from.address.into(),
                 r#type: node_flags_to_type(change.from.flags),
+                tracking,
             }),
             to: Some(Path {
                 path: change.path.to_string(),
                 address: change.to.address.into(),
                 r#type: node_flags_to_type(change.to.flags),
+                tracking,
             }),
             automerged: change.flags.is_conflict_automerged(),
+            link_partition,
+            tracking,
         }),
         _ => {
             // TODO(mjansson): handle MOVE, for which we need to have 2 paths, so the existing NodeChange doesn't work
@@ -60,10 +111,13 @@ pub fn map_to_path_diff(change: &NodeChange) -> Option<PathDiff> {
     }
 }
 
-pub fn map_to_conflict(conflict: &(NodeChange, NodeChange)) -> Option<Conflict> {
+pub async fn map_to_conflict(
+    conflict: &(NodeChange, NodeChange),
+    parent_repository_id: RepositoryId,
+) -> Option<Conflict> {
     Some(Conflict {
-        diff_base: map_to_path_diff(&conflict.0),
-        diff_compare: map_to_path_diff(&conflict.1),
+        diff_base: map_to_path_diff(&conflict.0, parent_repository_id).await,
+        diff_compare: map_to_path_diff(&conflict.1, parent_repository_id).await,
     })
 }
 
@@ -72,6 +126,7 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
+    use bytes::Bytes;
     use lore_base::types::Address;
     use lore_base::types::Context;
     use lore_base::types::Hash;
@@ -81,6 +136,7 @@ mod tests {
     use lore_revision::change::Flags;
     use lore_revision::change::NodeChange;
     use lore_revision::change::NodeChangeState;
+    use lore_revision::lore::RepositoryId;
     use lore_revision::node::NodeFlags;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryFormat;
@@ -150,7 +206,7 @@ mod tests {
                 flags: NodeFlags::File,
             },
         };
-        let mapped = map_to_path_diff(&addition);
+        let mapped = map_to_path_diff(&addition, repository.id).await;
         assert_eq!(
             mapped,
             Some(PathDiff {
@@ -159,8 +215,11 @@ mod tests {
                     path: "Samples/Content/file.uasset".to_string(),
                     address: address_to.into(),
                     r#type: PathType::File as i32,
+                    tracking: false,
                 }),
                 automerged: false,
+                link_partition: Bytes::new(),
+                tracking: false,
             })
         );
     }
@@ -197,7 +256,7 @@ mod tests {
                 flags: NodeFlags::File,
             },
         };
-        let mapped = map_to_path_diff(&deletion);
+        let mapped = map_to_path_diff(&deletion, repository.id).await;
         assert_eq!(
             mapped,
             Some(PathDiff {
@@ -205,9 +264,12 @@ mod tests {
                     path: "Samples/Content/file.uasset".to_string(),
                     address: address_from.into(),
                     r#type: PathType::File as i32,
+                    tracking: false,
                 }),
                 to: None,
                 automerged: false,
+                link_partition: Bytes::new(),
+                tracking: false,
             })
         );
     }
@@ -248,7 +310,7 @@ mod tests {
                 flags: NodeFlags::File,
             },
         };
-        let mapped = map_to_path_diff(&modification);
+        let mapped = map_to_path_diff(&modification, repository.id).await;
         assert_eq!(
             mapped,
             Some(PathDiff {
@@ -256,13 +318,17 @@ mod tests {
                     path: "Samples/Content/file.uasset".to_string(),
                     address: address_from.into(),
                     r#type: PathType::File as i32,
+                    tracking: false,
                 }),
                 to: Some(Path {
                     path: "Samples/Content/file.uasset".to_string(),
                     address: address_to.into(),
                     r#type: PathType::File as i32,
+                    tracking: false,
                 }),
                 automerged: false,
+                link_partition: Bytes::new(),
+                tracking: false,
             })
         );
     }
@@ -299,7 +365,7 @@ mod tests {
                 flags: NodeFlags::File,
             },
         };
-        let mapped = map_to_path_diff(&addition);
+        let mapped = map_to_path_diff(&addition, repository.id).await;
         assert_eq!(
             mapped,
             Some(PathDiff {
@@ -308,8 +374,11 @@ mod tests {
                     path: "Samples/Content/file.uasset".to_string(),
                     address: address_to.into(),
                     r#type: PathType::File as i32,
+                    tracking: false,
                 }),
                 automerged: false,
+                link_partition: Bytes::new(),
+                tracking: false,
             })
         );
     }
@@ -346,7 +415,7 @@ mod tests {
                 flags: NodeFlags::Link,
             },
         };
-        let mapped = map_to_path_diff(&link_addition);
+        let mapped = map_to_path_diff(&link_addition, repository.id).await;
         assert_eq!(
             mapped,
             Some(PathDiff {
@@ -355,8 +424,11 @@ mod tests {
                     path: "Samples/Content/submodule".to_string(),
                     address: address_to.into(),
                     r#type: PathType::Link as i32,
+                    tracking: false,
                 }),
                 automerged: false,
+                link_partition: Bytes::new(),
+                tracking: false,
             })
         );
     }
@@ -393,7 +465,7 @@ mod tests {
                 flags: NodeFlags::Link,
             },
         };
-        let mapped = map_to_path_diff(&link_deletion);
+        let mapped = map_to_path_diff(&link_deletion, repository.id).await;
         assert_eq!(
             mapped,
             Some(PathDiff {
@@ -401,9 +473,12 @@ mod tests {
                     path: "Samples/Content/submodule".to_string(),
                     address: address_from.into(),
                     r#type: PathType::Link as i32,
+                    tracking: false,
                 }),
                 to: None,
                 automerged: false,
+                link_partition: Bytes::new(),
+                tracking: false,
             })
         );
     }
@@ -445,7 +520,7 @@ mod tests {
                 flags: NodeFlags::Link,
             },
         };
-        let mapped = map_to_path_diff(&link_modification);
+        let mapped = map_to_path_diff(&link_modification, repository.id).await;
         assert_eq!(
             mapped,
             Some(PathDiff {
@@ -453,13 +528,17 @@ mod tests {
                     path: "Samples/Content/submodule".to_string(),
                     address: address_from.into(),
                     r#type: PathType::Link as i32,
+                    tracking: false,
                 }),
                 to: Some(Path {
                     path: "Samples/Content/submodule".to_string(),
                     address: address_to.into(),
                     r#type: PathType::Link as i32,
+                    tracking: false,
                 }),
                 automerged: false,
+                link_partition: Bytes::new(),
+                tracking: false,
             })
         );
     }
@@ -501,7 +580,7 @@ mod tests {
                 flags: NodeFlags::File,
             },
         };
-        let mapped = map_to_path_diff(&automerged_change);
+        let mapped = map_to_path_diff(&automerged_change, repository.id).await;
         assert_eq!(
             mapped,
             Some(PathDiff {
@@ -509,14 +588,109 @@ mod tests {
                     path: "Samples/Content/merged.txt".to_string(),
                     address: address_from.into(),
                     r#type: PathType::File as i32,
+                    tracking: false,
                 }),
                 to: Some(Path {
                     path: "Samples/Content/merged.txt".to_string(),
                     address: address_to.into(),
                     r#type: PathType::File as i32,
+                    tracking: false,
                 }),
                 automerged: true,
+                link_partition: Bytes::new(),
+                tracking: false,
             })
         );
+    }
+
+    /// A link into a different repository stamps `link_partition` with that
+    /// target repository id.
+    #[tokio::test]
+    async fn test_mapping_cross_link_sets_partition() {
+        let repository = new_test_context().await;
+        let state = Arc::new(state::State::new());
+
+        let target_repository = RepositoryId::from(uuid::Uuid::now_v7());
+        let a_hash = Hash::hash_buffer(&[30, 31, 32, 33]);
+        let address_to = Address {
+            hash: a_hash,
+            context: target_repository.into(),
+        };
+
+        let link_addition = NodeChange {
+            action: lore_revision::change::FileAction::Add,
+            path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
+            from_path: None,
+            flags: Flags::None,
+            from: NodeChangeState {
+                node: 1,
+                repository: repository.clone(),
+                state: state.clone(),
+                address: Address::default(),
+                flags: NodeFlags::NoFlags,
+            },
+            to: NodeChangeState {
+                node: 2,
+                repository: repository.clone(),
+                state: state.clone(),
+                address: address_to,
+                flags: NodeFlags::Link,
+            },
+        };
+
+        let mapped = map_to_path_diff(&link_addition, repository.id)
+            .await
+            .expect("link addition maps to a diff");
+        assert_eq!(
+            mapped.link_partition,
+            Bytes::from(target_repository),
+            "cross-repository link change carries the target repository partition",
+        );
+        // No link reference is recorded, so tracking falls back to pinned.
+        assert!(!mapped.tracking);
+    }
+
+    /// A link into the request's own repository leaves `link_partition` empty.
+    #[tokio::test]
+    async fn test_mapping_same_repo_partition_empty() {
+        let repository = new_test_context().await;
+        let state = Arc::new(state::State::new());
+
+        let a_hash = Hash::hash_buffer(&[40, 41, 42, 43]);
+        let address_to = Address {
+            hash: a_hash,
+            // new_test_context uses the default context as its repository id.
+            context: Context::default(),
+        };
+
+        let link_addition = NodeChange {
+            action: lore_revision::change::FileAction::Add,
+            path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
+            from_path: None,
+            flags: Flags::None,
+            from: NodeChangeState {
+                node: 1,
+                repository: repository.clone(),
+                state: state.clone(),
+                address: Address::default(),
+                flags: NodeFlags::NoFlags,
+            },
+            to: NodeChangeState {
+                node: 2,
+                repository: repository.clone(),
+                state: state.clone(),
+                address: address_to,
+                flags: NodeFlags::Link,
+            },
+        };
+
+        let mapped = map_to_path_diff(&link_addition, repository.id)
+            .await
+            .expect("link addition maps to a diff");
+        assert!(
+            mapped.link_partition.is_empty(),
+            "same-repository change leaves the partition empty",
+        );
+        assert!(!mapped.tracking);
     }
 }

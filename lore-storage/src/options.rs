@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::sync::atomic;
 
 use crate::compress::FRAGMENT_SIZE_THRESHOLD;
-use crate::concurrency::LOCAL_ISOLATION;
 use crate::fragment_flags::FragmentFlags;
 
 /// Options controlling how a fragment is written to storage.
@@ -83,8 +81,6 @@ impl From<WriteOptions> for u32 {
 /// Options controlling how a fragment is read from storage.
 #[derive(Copy, Clone, Debug)]
 pub struct ReadOptions {
-    /// Enforce repository isolation
-    pub isolate: bool,
     /// Decompress data
     pub decompress: bool,
     /// Verify data
@@ -114,7 +110,6 @@ pub struct ReadOptions {
 impl Default for ReadOptions {
     fn default() -> Self {
         ReadOptions {
-            isolate: LOCAL_ISOLATION.load(atomic::Ordering::Relaxed),
             decompress: true,
             verify: true,
             local: true,
@@ -181,16 +176,6 @@ impl ReadOptions {
 
     pub fn no_cache(mut self) -> Self {
         self.cache = false;
-        self
-    }
-
-    pub fn with_isolation(mut self) -> Self {
-        self.isolate = true;
-        self
-    }
-
-    pub fn no_isolation(mut self) -> Self {
-        self.isolate = false;
         self
     }
 

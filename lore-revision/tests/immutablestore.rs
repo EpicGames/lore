@@ -134,7 +134,7 @@ mod tests {
                     .await
                     .expect("Failed to store entry");
                 let entry = store
-                    .find(repository, address, StoreMatch::MatchFull)
+                    .find(repository, address)
                     .await
                     .expect("Failed query after store");
                 assert_eq!(
@@ -198,7 +198,7 @@ mod tests {
                         .expect("Failed to store entry");
 
                     let entry = store
-                        .find(repository, address, StoreMatch::MatchFull)
+                        .find(repository, address)
                         .await
                         .expect("Failed query after store");
                     assert_eq!(
@@ -231,7 +231,7 @@ mod tests {
                         .await
                         .expect("Failed to store entry");
                     let entry = store
-                        .find(repository, address, StoreMatch::MatchFull)
+                        .find(repository, address)
                         .await
                         .expect("Failed query after second store");
                     assert_eq!(
@@ -284,7 +284,7 @@ mod tests {
                         size_content: (1000 + i) as u64,
                     };
                     let entry = store
-                        .find(repository, address, StoreMatch::MatchFull)
+                        .find(repository, address)
                         .await
                         .expect("Failed query after store");
                     assert_eq!(
@@ -331,7 +331,7 @@ mod tests {
                     "Repeated store with different repository and no payload did not give expected payload needed error");
 
                     let entry = store
-                        .find(other_repository, address, StoreMatch::MatchFull)
+                        .find(other_repository, address)
                         .await
                         .expect("Failed query after store");
                     assert_eq!(
@@ -371,7 +371,7 @@ mod tests {
                     };
 
                     let entry = store
-                        .find(other_repository, address, StoreMatch::MatchFull)
+                        .find(other_repository, address)
                         .await
                         .expect("Failed query after store");
                     assert_eq!(
@@ -478,13 +478,14 @@ mod tests {
                         .expect("Failed to store entry");
                 }
 
-                // Try various query combinations
+                // The level is the one found, so what varies is which partition and context the
+                // address is asked about rather than which level is requested.
                 let address = Address {
                     context: context[0],
                     hash: rand::random::<Hash>(),
                 };
                 let entry = store
-                    .find(repository, address, StoreMatch::MatchFull)
+                    .find(repository, address)
                     .await
                     .expect("Failed to query store entry");
                 assert_eq!(
@@ -498,7 +499,7 @@ mod tests {
                     hash: hash[8],
                 };
                 let entry = store
-                    .find(repository, address, StoreMatch::MatchFull)
+                    .find(repository, address)
                     .await
                     .expect("Failed to query store entry");
                 assert_eq!(
@@ -517,13 +518,13 @@ mod tests {
                     hash: hash[0],
                 };
                 let entry = store
-                    .find(repository, address, StoreMatch::MatchHash)
+                    .find(repository, address)
                     .await
                     .expect("Failed to query store entry");
                 assert_eq!(
                     entry.matching,
-                    StoreMatch::MatchHash,
-                    "Query did not match expected hash"
+                    StoreMatch::MatchFull,
+                    "the storing partition and context is a full match"
                 );
 
                 let address = Address {
@@ -531,13 +532,13 @@ mod tests {
                     hash: hash[1],
                 };
                 let entry = store
-                    .find(repository, address, StoreMatch::MatchPartition)
+                    .find(repository, address)
                     .await
                     .expect("Failed to query store entry");
                 assert_eq!(
                     entry.matching,
-                    StoreMatch::MatchPartition,
-                    "Query did not match expected hash"
+                    StoreMatch::MatchFull,
+                    "the storing partition and context is a full match"
                 );
 
                 let address = Address {
@@ -545,7 +546,7 @@ mod tests {
                     hash: hash[7],
                 };
                 let entry = store
-                    .find(repository_other, address, StoreMatch::MatchFull)
+                    .find(repository_other, address)
                     .await
                     .expect("Failed to query store entry");
                 assert_eq!(
@@ -559,41 +560,23 @@ mod tests {
                     hash: hash[1],
                 };
                 let entry = store
-                    .find(repository, address, StoreMatch::MatchHash)
-                    .await
-                    .expect("Failed to query store entry");
-                assert_eq!(
-                    entry.matching,
-                    StoreMatch::MatchHash,
-                    "Query did not match expected hash"
-                );
-
-                let address = Address {
-                    context: context[0],
-                    hash: hash[1],
-                };
-                let entry = store
-                    .find(repository_other, address, StoreMatch::MatchPartition)
-                    .await
-                    .expect("Failed to query store entry");
-                assert_eq!(
-                    entry.matching,
-                    StoreMatch::MatchHash,
-                    "Query did not match expected hash"
-                );
-
-                let address = Address {
-                    context: context[0],
-                    hash: hash[1],
-                };
-                let entry = store
-                    .find(repository, address, StoreMatch::MatchFull)
+                    .find(repository, address)
                     .await
                     .expect("Failed to query store entry");
                 assert_eq!(
                     entry.matching,
                     StoreMatch::MatchPartition,
-                    "Query did not match expected hash"
+                    "a sibling context in the storing partition is a partition match"
+                );
+
+                let entry = store
+                    .find(repository_other, address)
+                    .await
+                    .expect("Failed to query store entry");
+                assert_eq!(
+                    entry.matching,
+                    StoreMatch::MatchHash,
+                    "the same hash from another partition is a hash match"
                 );
             })
             .await;
@@ -660,7 +643,7 @@ mod tests {
                         hash: hash[i],
                     };
                     let entry = store
-                        .find(repository, address, StoreMatch::MatchFull)
+                        .find(repository, address)
                         .await
                         .expect("Failed to query store entry");
 
@@ -686,7 +669,7 @@ mod tests {
                     };
                     let repository = random::<RepositoryId>();
                     let entry = store
-                        .find(repository, address, StoreMatch::MatchHash)
+                        .find(repository, address)
                         .await
                         .expect("Failed to query store entry");
 
@@ -707,7 +690,7 @@ mod tests {
 
                     // Should fail, repository don't match
                     let entry = store
-                        .find(repository, address, StoreMatch::MatchPartition)
+                        .find(repository, address)
                         .await
                         .expect("Failed to query store entry");
                     assert_eq!(
@@ -797,7 +780,7 @@ mod tests {
                             hash: hash[i],
                         };
                         let entry = store
-                            .find(repository, address, StoreMatch::MatchFull)
+                            .find(repository, address)
                             .await
                             .expect("Failed to query store entry");
                         assert_eq!(
@@ -900,7 +883,7 @@ mod tests {
                             hash: hash[i],
                         };
                         let entry = store
-                            .find(repository, address, StoreMatch::MatchFull)
+                            .find(repository, address)
                             .await
                             .expect("Failed to query store entry");
                         assert_eq!(
@@ -946,7 +929,7 @@ mod tests {
                             hash: hash[i],
                         };
                         let entry = store
-                            .find(repository, address, StoreMatch::MatchFull)
+                            .find(repository, address)
                             .await
                             .expect("Failed to query store entry");
                         assert_eq!(
@@ -1047,26 +1030,20 @@ mod tests {
                     .expect("Failed to store full fragment");
 
                 // Lookup using the previous address with full match and ensure we got the full thing
-                let (_fragment_found, payload_found) = ImmutableStoreTrait::get(
-                    store.clone(),
-                    repository,
-                    address,
-                    StoreMatch::MatchFull,
-                )
-                .await
-                .expect("Failed to get back first fragment on full match");
+                let (_fragment_found, payload_found) =
+                    ImmutableStoreTrait::get(store.clone(), repository, address)
+                        .await
+                        .and_then(lore_storage::StoreGetData::into_payload)
+                        .expect("Failed to get back first fragment on full match");
 
                 assert_eq!(payload_found.as_bytes(), payload.as_bytes());
 
                 // Lookup using the previous address with hash match and ensure we got the full thing
-                let (_fragment_found, payload_found) = ImmutableStoreTrait::get(
-                    store.clone(),
-                    repository,
-                    address,
-                    StoreMatch::MatchHash,
-                )
-                .await
-                .expect("Failed to get back first fragment on hash match");
+                let (_fragment_found, payload_found) =
+                    ImmutableStoreTrait::get(store.clone(), repository, address)
+                        .await
+                        .and_then(lore_storage::StoreGetData::into_payload)
+                        .expect("Failed to get back first fragment on hash match");
 
                 assert_eq!(payload_found.as_bytes(), payload.as_bytes());
             })
@@ -1120,8 +1097,9 @@ mod tests {
                 // Fragment must be retrievable from repo B
                 let (retrieved_fragment, retrieved_payload) = store
                     .clone()
-                    .get(repo_b, address, StoreMatch::MatchFull)
+                    .get(repo_b, address)
                     .await
+                    .and_then(lore_storage::StoreGetData::into_payload)
                     .expect("Failed to get fragment from repo B after copy");
 
                 assert_eq!(
@@ -1137,8 +1115,9 @@ mod tests {
                 // Source in repo A must still be retrievable
                 let (_, src_payload) = store
                     .clone()
-                    .get(repo_a, address, StoreMatch::MatchFull)
+                    .get(repo_a, address)
                     .await
+                    .and_then(lore_storage::StoreGetData::into_payload)
                     .expect("Fragment in repo A should still be accessible after copy");
                 assert_eq!(
                     src_payload.as_ref(),

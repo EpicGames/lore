@@ -119,8 +119,14 @@ pub struct TreeNode {
     /// Signature of the revision in the requested repository that most recently
     /// changed this entry. Empty for directories. Descendants of a linked
     /// repository inherit the revision that last changed the link pin.
-    #[prost(bytes = "bytes", tag = "4")]
+    #[prost(bytes = "bytes", tag = "6")]
     pub last_changed_revision_signature: ::prost::bytes::Bytes,
+    /// Original size in bytes. For DIRECTORY entries, this is the cumulative size of its descendant files.
+    #[prost(uint64, tag = "4")]
+    pub size: u64,
+    /// File mode for this entry. For possible flags and values, see enum FileMode.
+    #[prost(uint64, tag = "5")]
+    pub mode: u64,
 }
 impl ::prost::Name for TreeNode {
     const NAME: &'static str = "TreeNode";
@@ -392,6 +398,35 @@ impl NodeType {
             "DIRECTORY" => Some(Self::Directory),
             "FILE" => Some(Self::File),
             "LINK" => Some(Self::Link),
+            _ => None,
+        }
+    }
+}
+/// File mode for a file-system entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FileMode {
+    /// No special file mode.
+    None = 0,
+    /// File is executable.
+    Executable = 1,
+}
+impl FileMode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::None => "NONE",
+            Self::Executable => "EXECUTABLE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "NONE" => Some(Self::None),
+            "EXECUTABLE" => Some(Self::Executable),
             _ => None,
         }
     }

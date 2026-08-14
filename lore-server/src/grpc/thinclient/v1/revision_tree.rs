@@ -165,6 +165,8 @@ async fn stream_tree(
                 .last_changed_revision
                 .map(Into::into)
                 .unwrap_or_default(),
+            size: tree_path.size,
+            mode: tree_path.mode,
         };
         if tx
             .send(Ok(RevisionTreeResponse {

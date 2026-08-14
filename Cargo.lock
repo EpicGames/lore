@@ -2281,6 +2281,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9080b15e63775b9a2ac7dca720f7050a8b955e092ea0f6020a4a80f69998cdc0"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2539,6 +2550,7 @@ version = "0.8.7-nightly"
 dependencies = [
  "anyhow",
  "backtrace",
+ "bitcode",
  "bitflags",
  "blake3",
  "bytes",
@@ -2548,6 +2560,7 @@ dependencies = [
  "hex",
  "libc",
  "lore-error-set",
+ "lore-io",
  "parking_lot",
  "pin-project",
  "rand 0.9.4",
@@ -2591,9 +2604,6 @@ dependencies = [
  "clap_complete",
  "libc",
  "lore",
- "lore-base",
- "lore-error-set",
- "lore-revision",
  "parking_lot",
  "serde",
  "serde_json",
@@ -2699,6 +2709,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "lore-io"
+version = "0.8.7-nightly"
+dependencies = [
+ "bytes",
+ "futures",
+ "io-uring",
+ "libc",
+ "lore-base",
+ "parking_lot",
+ "tokio",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "lore-macro"
 version = "0.8.7-nightly"
 dependencies = [
@@ -2725,7 +2749,7 @@ dependencies = [
 
 [[package]]
 name = "lore-proto"
-version = "0.1.60"
+version = "0.1.61"
 dependencies = [
  "lore-base",
  "prost",
@@ -2742,6 +2766,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "base64 0.22.1",
+ "bitcode",
  "bitflags",
  "blake3",
  "bytes",
@@ -2762,6 +2787,7 @@ dependencies = [
  "lore-base",
  "lore-credential",
  "lore-error-set",
+ "lore-io",
  "lore-macro",
  "lore-proto",
  "lore-storage",
@@ -2777,6 +2803,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "serde",
+ "serde_bytes",
  "serde_json",
  "serde_with",
  "smallvec",
@@ -2894,6 +2921,7 @@ dependencies = [
  "libc",
  "lore-base",
  "lore-error-set",
+ "lore-io",
  "lore-telemetry",
  "lore-transport",
  "lz4-sys",
@@ -2965,6 +2993,7 @@ dependencies = [
  "tonic",
  "tower",
  "url",
+ "webpki-roots",
  "zerocopy",
 ]
 
@@ -3958,6 +3987,7 @@ dependencies = [
  "pin-project-lite",
  "quinn",
  "rustls",
+ "rustls-native-certs",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -4952,6 +4982,7 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "tracing",
+ "webpki-roots",
 ]
 
 [[package]]

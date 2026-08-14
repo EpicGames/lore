@@ -23,7 +23,12 @@ pub mod storage;
 mod util;
 
 use interface::LoreString;
+pub use lore_base::lore_spawn;
+pub use lore_base::lore_spawn_blocking;
 pub use lore_base::version::LORE_LIBRARY_VERSION;
+/// Whole crate rather than a prelude: `#[error_set]` expands to paths rooted at the crate, so a
+/// consumer aliases this into scope as `lore_error_set`.
+pub use lore_error_set as error_set;
 
 /// Time allowed for each stage of shutdown that has to be driven from a synchronous
 /// caller. Matches the runtime shutdown timeout in `lore_revision::interface::shutdown`,

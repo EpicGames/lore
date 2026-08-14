@@ -337,7 +337,7 @@ mod tests {
                 v0_set_inline_name(&mut block_v0.node[3], "nested_file.rs");
 
                 // Serialize V0 block to the immutable store
-                let (address, _fragment) = block_v0
+                let address = block_v0
                     .write_to_immutable(
                         repository.clone(),
                         Context::default(),
@@ -593,7 +593,7 @@ mod tests {
                 block_v2.node[3].child = 0;
 
                 // Serialize V2 block to the immutable store
-                let (address, _fragment) = block_v2
+                let address = block_v2
                     .write_to_immutable(
                         repository.clone(),
                         Context::default(),

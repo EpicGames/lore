@@ -143,10 +143,13 @@ pub async fn diff(
             execution_context().globals().search_location(),
         )
         .await
-        .map_err(|_err| {
-            DiffError::from(RevisionNotFound {
-                revision: signature.clone(),
-            })
+        .map_err(|err| {
+            DiffError::RevisionNotFound(
+                RevisionNotFound {
+                    revision: signature.clone(),
+                }
+                .chain_err_from(err, "source revision not found"),
+            )
         })?
     } else {
         let (current_revision, _current_branch) = crate::instance::load_current_anchor(&repository)
@@ -165,10 +168,13 @@ pub async fn diff(
                 execution_context().globals().search_location(),
             )
             .await
-            .map_err(|_err| {
-                DiffError::from(RevisionNotFound {
-                    revision: signature.clone(),
-                })
+            .map_err(|err| {
+                DiffError::RevisionNotFound(
+                    RevisionNotFound {
+                        revision: signature.clone(),
+                    }
+                    .chain_err_from(err, "target revision not found"),
+                )
             })?,
         )
     } else {
@@ -692,7 +698,8 @@ async fn emit_unified_diffs(
             change.to.flags.contains(NodeFlags::File)
         } else {
             let check_absolute_path = change.path.to_absolute_path(repository.require_path()?);
-            tokio::fs::metadata(check_absolute_path)
+            lore_io::IoDriver::global()
+                .metadata(check_absolute_path)
                 .await
                 .is_ok_and(|m| m.is_file())
         };
@@ -1116,7 +1123,8 @@ async fn diff_read_file(
 ) -> Result<DiffContent, DiffError> {
     let Some(state) = state else {
         let path = relative_path.to_absolute_path(repository.require_path()?);
-        let content = tokio::fs::read(path.as_path())
+        let content = lore_io::IoDriver::global()
+            .read_file_bytes(path.as_path())
             .await
             .internal(&format!("Failed reading file for diff: {}", path.display()))?;
         return Ok(make_diff_content(&content));

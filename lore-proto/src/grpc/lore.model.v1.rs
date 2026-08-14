@@ -43,6 +43,38 @@ impl ::prost::Name for Address {
         "/lore.model.v1.Address".into()
     }
 }
+/// Outcome of a single item within a streaming storage operation.
+///
+/// Streaming RPCs report a per-item failure in-band, as a field on the response
+/// message, rather than as a gRPC `Status`. A `Status` yielded from a server
+/// response stream is written as HTTP/2 trailers and ends the stream, which would
+/// take down every other request multiplexed onto it — and for `Get`/`GetMetadata`
+/// a missing fragment is routine control flow, not a fault. A terminal `Status` is
+/// reserved for stream-fatal conditions, where no per-item attribution is possible
+/// (e.g. a corrupt request stream).
+/// A code other than `OK` decides the item on its own: the rest of the response carries no
+/// meaning in that case and a reader must not consult it. A response that omits the status
+/// entirely predates the field and is read as `OK`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ItemStatus {
+    /// gRPC status code, as the numeric `google.rpc.Code` value. `OK` on a successful item,
+    /// so every streaming response reports its outcome the same way.
+    #[prost(uint32, tag = "1")]
+    pub code: u32,
+    /// Human-readable detail, used for log lines and surfaced error text.
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
+impl ::prost::Name for ItemStatus {
+    const NAME: &'static str = "ItemStatus";
+    const PACKAGE: &'static str = "lore.model.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.model.v1.ItemStatus".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.model.v1.ItemStatus".into()
+    }
+}
 /// Anchor identifying a specific revision on a specific branch by content
 /// signature. Used in Branch.stack (ancestry chain) and in any context where
 /// the revision must be concrete (e.g. BranchCreate's caller-supplied stack).

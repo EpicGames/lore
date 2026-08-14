@@ -64,6 +64,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let contents = contents.replace("_t_Tag;", "_tag_t;");
     let contents = contents.replace("_t_Tag tag;", "_tag_t tag;");
     let contents = contents.replace("enum lore_event_tag_t {", "enum lore_event_id_t {");
+    // A metadata value's discriminant is the same set of kinds `lore_metadata_type_t`
+    // already names, so drop the synthesised copy of them and keep the tag's own
+    // width.
+    let metadata_tag = Regex::new(r"(?s)enum lore_metadata_tag_t \{.*?\n\};\n")
+        .expect("Failed to create regex to drop the synthesised metadata tag enum");
+    let contents = metadata_tag.replace(contents.as_str(), "").to_string();
     // Fill out empty structs with a dummy field
     let contents = contents.replace("{\n\n} lore_", "{\n  int _unused;\n} lore_");
 

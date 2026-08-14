@@ -110,8 +110,6 @@ where
 
             log_command_done(&caller, time_start);
             let status = execution_context().dispatcher.complete(detail).await;
-            // Explicit drop after Complete: a closer waiting on the in-flight counter must
-            // not be woken before Complete has fired.
             drop(guard);
             status
         })
@@ -163,13 +161,10 @@ mod tests {
         let completes = completes(&events);
         assert_eq!(completes.len(), 1, "exactly one Complete event");
 
-        // The status holds the handle-miss error's real error code and the detail
-        // carries the same code and message.
         let expected = DispatchError::from(InvalidArguments {
             reason: "revision tree handle is unknown or has been closed".into(),
         });
         let expected_code = expected.ffi_code();
-        // The synchronous return equals the error code, matching `Complete.status`.
         assert_eq!(status, expected_code);
         let data = &completes[0];
         assert_eq!(data.status, expected_code);
@@ -266,13 +261,10 @@ mod tests {
         let completes = completes(&events);
         assert_eq!(completes.len(), 1, "exactly one Complete event");
 
-        // The status holds the verb error's real error code and the detail carries
-        // the same code and message.
         let expected = DispatchError::from(InvalidArguments {
             reason: "simulated verb error".into(),
         });
         let expected_code = expected.ffi_code();
-        // The synchronous return equals the error code, matching `Complete.status`.
         assert_eq!(status, expected_code);
         let data = &completes[0];
         assert_eq!(data.status, expected_code);

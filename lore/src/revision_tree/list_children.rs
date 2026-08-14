@@ -80,6 +80,7 @@ fn emit_child(id: u64, node_id: NodeID, name: &str, parent_id: NodeID, node: &No
         name: LoreString::from(name),
         parent_id,
         kind,
+        staged_action: node.staged_action() as u32,
         mode: node.mode,
         size: node.size,
         address: node.address,
@@ -244,7 +245,6 @@ async fn list_children_impl(
                 }
             };
 
-            // Capture the target's identity before the iterator consumes the state/context.
             let begin_repository = list_repository.id;
             let begin_revision = list_state.revision();
 

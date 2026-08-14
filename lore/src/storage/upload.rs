@@ -19,7 +19,6 @@ use std::sync::Arc;
 use lore_base::error::InvalidArguments;
 use lore_base::lore_spawn;
 use lore_base::types::Address;
-use lore_base::types::FragmentFlags;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_error_set::prelude::*;
@@ -161,17 +160,14 @@ async fn upload_item(
 
     // Anything weaker than `MatchFull` means the local entry is incomplete and must be
     // treated as a missing payload for upload purposes.
-    let query = store
-        .immutable
-        .clone()
-        .query(item.partition, item.address, StoreMatch::MatchFull)
-        .await;
+    let resolved =
+        lore_storage::immutable_store::query_one(&store.immutable, item.partition, item.address)
+            .await;
 
-    let (already_durable, has_local_payload) = match &query {
-        Ok(qr) if qr.match_made == StoreMatch::MatchFull => (
-            qr.fragment.flags & FragmentFlags::PayloadStoredDurable != 0,
-            qr.fragment.flags & FragmentFlags::PayloadStoredLocal != 0,
-        ),
+    let (already_durable, has_local_payload) = match &resolved {
+        Ok(resolved) if resolved.match_made == StoreMatch::MatchFull => {
+            (resolved.stored_durable, resolved.stored_local)
+        }
         _ => (false, false),
     };
 

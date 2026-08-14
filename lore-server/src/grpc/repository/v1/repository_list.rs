@@ -25,6 +25,7 @@ use tracing::debug;
 
 use super::record::build_repository;
 use crate::grpc::ServerResultExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::grpc::handlers::repository_list::lookup_authorized_repositories;
@@ -51,11 +52,7 @@ pub async fn handler(
 ) -> Result<Response<ListStream>, Status> {
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-    let authorization = request
-        .metadata()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .map(|s| s.to_string());
+    let authorization = extract_authorization_header(&request);
     let req = request.into_inner();
     let creator_filter = req.creator;
 

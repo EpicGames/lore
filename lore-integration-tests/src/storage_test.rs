@@ -921,6 +921,7 @@ mod open_tests {
             address: Address::default(),
             streaming: 0,
             local_cache: 0,
+            ..Default::default()
         };
 
         let (sink, callback) = make_get_sink();
@@ -983,6 +984,7 @@ mod open_tests {
             address,
             streaming: 0,
             local_cache: 0,
+            ..Default::default()
         };
 
         let (sink, callback) = make_get_sink();
@@ -1051,6 +1053,7 @@ mod open_tests {
             address,
             streaming: 0,
             local_cache: 0,
+            ..Default::default()
         };
 
         let (sink, callback) = make_get_sink();
@@ -1159,6 +1162,7 @@ mod open_tests {
             address,
             streaming: 0,
             local_cache: 0,
+            ..Default::default()
         };
         let (sink, callback) = make_get_sink();
         let status = lore::storage::get::get(
@@ -1286,6 +1290,7 @@ mod open_tests {
             address,
             streaming: 0,
             local_cache: 0,
+            ..Default::default()
         };
         let status = lore::storage::get::get(
             globals(),
@@ -1401,6 +1406,7 @@ mod open_tests {
                 address,
                 streaming: 0,
                 local_cache: 0,
+                ..Default::default()
             }],
         )
         .await;
@@ -1487,6 +1493,7 @@ mod open_tests {
                     address: addr_red,
                     streaming: 0,
                     local_cache: 0,
+                    ..Default::default()
                 },
                 lore::storage::get::LoreStorageGetItem {
                     id: 200,
@@ -1494,6 +1501,7 @@ mod open_tests {
                     address: addr_blue,
                     streaming: 0,
                     local_cache: 0,
+                    ..Default::default()
                 },
             ],
         )
@@ -1516,91 +1524,6 @@ mod open_tests {
             .expect("blue DATA missing");
         assert_eq!(data_red, b"red partition payload");
         assert_eq!(data_blue, b"blue partition payload");
-    }
-
-    /// Serializes the tests that toggle the process-wide `LOCAL_ISOLATION` flag. Cargo runs
-    /// tests in parallel; the flag's only writer of `false` is `IsolationGuard::drop`, so two
-    /// overlapping guard windows let one test's drop clear the flag mid-`get` of the other.
-    /// Held for the lifetime of an [`IsolationGuard`], the two windows can never overlap.
-    static ISOLATION_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    /// Save/restore guard for the process-wide `LOCAL_ISOLATION` flag so a test can toggle it
-    /// without leaking the change to parallel tests. Acquiring [`ISOLATION_SERIAL`] keeps the
-    /// isolation-sensitive tests from running their toggle windows concurrently. Other storage
-    /// tests target matching `(partition, address)` pairs, so the flag being set does not change
-    /// their outcome.
-    struct IsolationGuard {
-        previous: bool,
-        _serial: tokio::sync::MutexGuard<'static, ()>,
-    }
-
-    impl IsolationGuard {
-        async fn force_on() -> Self {
-            let serial = ISOLATION_SERIAL.lock().await;
-            let previous =
-                lore_storage::LOCAL_ISOLATION.swap(true, std::sync::atomic::Ordering::AcqRel);
-            Self {
-                previous,
-                _serial: serial,
-            }
-        }
-    }
-
-    impl Drop for IsolationGuard {
-        fn drop(&mut self) {
-            // Runs before `_serial` is dropped, so the flag is restored while the serial lock is
-            // still held — the next guard observes a settled flag.
-            lore_storage::LOCAL_ISOLATION
-                .store(self.previous, std::sync::atomic::Ordering::Release);
-        }
-    }
-
-    #[tokio::test]
-    async fn cross_partition_read_fails_when_local_isolation_enabled() {
-        // Partitions are content namespacing: with `LOCAL_ISOLATION` on,
-        // reading an address stored under partition X via partition Y
-        // must yield AddressNotFound. lore-server enables this flag at
-        // startup (server.rs:1294); the storage API honors it through
-        // `ReadOptions::default()`.
-        use lore_base::types::Context;
-        use lore_base::types::Partition;
-
-        let _guard = IsolationGuard::force_on().await;
-
-        let (open_sink, open_cb) = make_sink();
-        assert_eq!(open_in_memory(open_cb).await, 0);
-        let id = take_opened(&open_sink.lock().unwrap()).unwrap();
-        let handle = lore::storage::handle::LoreStore { handle_id: id };
-
-        let part_x = Partition::from([0x01u8; 16]);
-        let part_y = Partition::from([0x02u8; 16]);
-        let ctx = Context::from([0x03u8; 16]);
-        let payload = b"isolated to partition X".to_vec();
-        let address = put_once(handle, part_x, ctx, &payload).await;
-
-        let (status, events) = get_items_capture(
-            handle,
-            vec![lore::storage::get::LoreStorageGetItem {
-                id: 9,
-                partition: part_y,
-                address,
-                streaming: 0,
-                local_cache: 0,
-            }],
-        )
-        .await;
-        assert_eq!(status, -1);
-        let complete = events
-            .iter()
-            .find_map(|e| match e {
-                GetCaptured::ItemComplete { id, error_code, .. } => Some((*id, *error_code)),
-                _ => None,
-            })
-            .expect("expected GET_ITEM_COMPLETE");
-        assert_eq!(
-            complete,
-            (9, lore_revision::event::LoreErrorCode::AddressNotFound),
-        );
     }
 
     #[tokio::test]
@@ -1653,6 +1576,7 @@ mod open_tests {
                 address: addr,
                 streaming: 0,
                 local_cache: 0,
+                ..Default::default()
             })
             .collect();
         let (get_status, events) = get_items_capture(handle, get_items_vec).await;
@@ -1714,6 +1638,7 @@ mod open_tests {
                 address: real_addr,
                 streaming: 0,
                 local_cache: 0,
+                ..Default::default()
             },
             lore::storage::get::LoreStorageGetItem {
                 id: 2,
@@ -1721,6 +1646,7 @@ mod open_tests {
                 address: zero_hash_addr,
                 streaming: 0,
                 local_cache: 0,
+                ..Default::default()
             },
             lore::storage::get::LoreStorageGetItem {
                 id: 3,
@@ -1728,6 +1654,7 @@ mod open_tests {
                 address: missing_addr,
                 streaming: 0,
                 local_cache: 0,
+                ..Default::default()
             },
         ];
         let (status, events) = get_items_capture(handle, items).await;
@@ -1829,6 +1756,7 @@ mod open_tests {
                 address: *addr,
                 streaming: 0,
                 local_cache: 0,
+                ..Default::default()
             })
             .collect();
         let (status, events) = get_items_capture(handle, items).await;
@@ -1890,6 +1818,7 @@ mod open_tests {
             },
             streaming: 0,
             local_cache: 0,
+            ..Default::default()
         };
         let missing_item = lore::storage::get::LoreStorageGetItem {
             id: 2,
@@ -1900,6 +1829,7 @@ mod open_tests {
             },
             streaming: 0,
             local_cache: 0,
+            ..Default::default()
         };
 
         let sink: Arc<Mutex<Vec<LoreEvent>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1964,6 +1894,7 @@ mod open_tests {
             },
             streaming: 0,
             local_cache: 0,
+            ..Default::default()
         };
 
         let sink: Arc<Mutex<Vec<LoreEvent>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2032,6 +1963,7 @@ mod open_tests {
                 address,
                 streaming: 0,
                 local_cache: 0,
+                ..Default::default()
             }],
         )
         .await;
@@ -2078,6 +2010,7 @@ mod open_tests {
                 address,
                 streaming: 0,
                 local_cache: 0,
+                ..Default::default()
             }],
         )
         .await;
@@ -2165,6 +2098,7 @@ mod open_tests {
                 address,
                 streaming: 0,
                 local_cache: 0,
+                ..Default::default()
             }],
         )
         .await;
@@ -2515,9 +2449,11 @@ mod open_tests {
             (1, 1, 0, 0, 1, lore_revision::event::LoreErrorCode::None),
         );
 
-        // Tombstone observable via get_metadata: entry still matches, but the
-        // fragment flag set says the payload is gone.
-        let (q_status, q_events) = get_metadata_items(
+        // Obliterated content matches nothing, through every path. The entry survives in the
+        // index carrying its tombstone, but nothing describes it: `get_metadata` answers as it
+        // would for an address the store never held, rather than handing back a fragment whose
+        // flags say the payload is gone. With no remote configured there is nowhere else to ask.
+        let (_q_status, q_events) = get_metadata_items(
             handle,
             vec![lore::storage::get_metadata::LoreStorageGetMetadataItem {
                 id: 99,
@@ -2526,22 +2462,26 @@ mod open_tests {
             }],
         )
         .await;
-        assert_eq!(q_status, 0);
-        let fragment = q_events
+        let (fragment, error_code) = q_events
             .iter()
             .find_map(|e| match e {
-                GetMetadataCaptured::Complete { fragment, .. } => Some(*fragment),
+                GetMetadataCaptured::Complete {
+                    fragment,
+                    error_code,
+                    ..
+                } => Some((*fragment, *error_code)),
                 _ => None,
             })
             .expect("post-obliterate get_metadata event missing");
-        let flags = FragmentFlags::from_bits_truncate(fragment.flags);
-        assert!(
-            flags.contains(FragmentFlags::PayloadObliterated),
-            "obliterated entry must carry PayloadObliterated, got {flags:?}",
+        assert_eq!(
+            error_code,
+            lore_revision::event::LoreErrorCode::AddressNotFound,
+            "an obliterated address must resolve to nothing, not to a tombstoned fragment",
         );
-        assert!(
-            !flags.contains(FragmentFlags::PayloadStoredLocal),
-            "obliterated entry must drop PayloadStoredLocal, got {flags:?}",
+        assert_eq!(
+            FragmentFlags::from_bits_truncate(fragment.flags),
+            FragmentFlags::empty(),
+            "a miss carries no fragment",
         );
     }
 
@@ -2721,7 +2661,6 @@ mod open_tests {
         assert_eq!(complete.5, address.context);
 
         // Verify the target carries the payload locally without Durable.
-        let _guard = IsolationGuard::force_on().await;
         let (q_status, q_events) = get_metadata_items(
             handle,
             vec![lore::storage::get_metadata::LoreStorageGetMetadataItem {
@@ -2896,6 +2835,7 @@ mod open_tests {
                 address: destination_address,
                 streaming: 0,
                 local_cache: 0,
+                ..Default::default()
             }],
         )
         .await;
@@ -2919,6 +2859,7 @@ mod open_tests {
                 address: source_address,
                 streaming: 0,
                 local_cache: 0,
+                ..Default::default()
             }],
         )
         .await;
@@ -3096,6 +3037,7 @@ mod open_tests {
                 address,
                 streaming: 0,
                 local_cache: 0,
+                ..Default::default()
             }],
         )
         .await;
@@ -3160,6 +3102,7 @@ mod open_tests {
                 address,
                 streaming: 1,
                 local_cache: 0,
+                ..Default::default()
             }],
         )
         .await;
@@ -3207,6 +3150,496 @@ mod open_tests {
             "sum of data.len must equal size_content",
         );
         assert_eq!(reassembled, payload, "reassembled bytes must match input");
+    }
+
+    // -----------------------------------------------------------------------
+    // Ranged get / get_file
+    //
+    // `offset` and `length` are inert when zeroed, so each test below is about what setting
+    // them changes. The header always reports the whole content's size, never the size of
+    // what came back — a ranged reader needs both, and only one of them can be derived.
+    // -----------------------------------------------------------------------
+
+    fn header_size(events: &[GetCaptured]) -> Option<u64> {
+        events.iter().find_map(|e| match e {
+            GetCaptured::Header { size_content, .. } => Some(*size_content),
+            _ => None,
+        })
+    }
+
+    fn data_chunks(events: &[GetCaptured]) -> Vec<(u64, Vec<u8>)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                GetCaptured::Data { offset, bytes, .. } => Some((*offset, bytes.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn item_code(events: &[GetCaptured]) -> Option<lore_revision::event::LoreErrorCode> {
+        events.iter().find_map(|e| match e {
+            GetCaptured::ItemComplete { error_code, .. } => Some(*error_code),
+            _ => None,
+        })
+    }
+
+    /// Open a handle and store `payload`, returning the handle and its address.
+    async fn store_for_range_test(
+        partition: lore_base::types::Partition,
+        context: lore_base::types::Context,
+        payload: &[u8],
+        fixed_size_chunk: u64,
+    ) -> (lore::storage::handle::LoreStore, lore_base::types::Address) {
+        let (open_sink, open_cb) = make_sink();
+        assert_eq!(open_in_memory(open_cb).await, 0);
+        let id = take_opened(&open_sink.lock().unwrap()).unwrap();
+        let handle = lore::storage::handle::LoreStore { handle_id: id };
+
+        let item = lore::storage::put::LoreStoragePutItem {
+            id: 1,
+            partition,
+            context,
+            data: lore_revision::event::LoreBytes {
+                ptr: payload.as_ptr().cast(),
+                len: payload.len(),
+            },
+            remote_write: 0,
+            local_cache: 0,
+            fixed_size_chunk,
+        };
+        let (put_status, completes) = put_items(handle, vec![item]).await;
+        assert_eq!(put_status, 0);
+        let address = completes.iter().find(|c| c.id == 1).unwrap().address;
+        (handle, address)
+    }
+
+    #[tokio::test]
+    async fn get_with_a_range_returns_the_slice_and_the_whole_size() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let payload: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let partition = Partition::from([0xD1u8; 16]);
+        let context = Context::from([0xD2u8; 16]);
+        let (handle, address) = store_for_range_test(partition, context, &payload, 0).await;
+
+        let (status, events) = get_items_capture(
+            handle,
+            vec![lore::storage::get::LoreStorageGetItem {
+                id: 1,
+                partition,
+                address,
+                offset: 40,
+                length: 60,
+                ..Default::default()
+            }],
+        )
+        .await;
+        assert_eq!(status, 0);
+
+        assert_eq!(header_size(&events), Some(payload.len() as u64));
+        assert_eq!(data_chunks(&events), vec![(40, payload[40..100].to_vec())]);
+        assert_eq!(
+            item_code(&events),
+            Some(lore_revision::event::LoreErrorCode::None)
+        );
+    }
+
+    /// A zeroed pair is the whole content, which is what keeps every caller written before
+    /// ranges existed reading exactly what it used to.
+    #[tokio::test]
+    async fn get_with_zeroed_range_fields_reads_the_whole_content() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let payload: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let partition = Partition::from([0xD3u8; 16]);
+        let context = Context::from([0xD4u8; 16]);
+        let (handle, address) = store_for_range_test(partition, context, &payload, 0).await;
+
+        let (status, events) = get_items_capture(
+            handle,
+            vec![lore::storage::get::LoreStorageGetItem {
+                id: 1,
+                partition,
+                address,
+                offset: 0,
+                length: 0,
+                ..Default::default()
+            }],
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert_eq!(header_size(&events), Some(payload.len() as u64));
+        assert_eq!(data_chunks(&events), vec![(0, payload.clone())]);
+    }
+
+    #[tokio::test]
+    async fn get_with_a_length_of_zero_reads_to_the_end() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let payload: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let partition = Partition::from([0xD5u8; 16]);
+        let context = Context::from([0xD6u8; 16]);
+        let (handle, address) = store_for_range_test(partition, context, &payload, 0).await;
+
+        let (status, events) = get_items_capture(
+            handle,
+            vec![lore::storage::get::LoreStorageGetItem {
+                id: 1,
+                partition,
+                address,
+                offset: 150,
+                length: 0,
+                ..Default::default()
+            }],
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert_eq!(data_chunks(&events), vec![(150, payload[150..].to_vec())]);
+    }
+
+    /// Reading part of what is there is a short read, not an error — the caller learns how
+    /// much it got from the data event and how much exists from the header.
+    #[tokio::test]
+    async fn get_with_a_length_past_the_end_is_clamped() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let payload: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let partition = Partition::from([0xD7u8; 16]);
+        let context = Context::from([0xD8u8; 16]);
+        let (handle, address) = store_for_range_test(partition, context, &payload, 0).await;
+
+        let (status, events) = get_items_capture(
+            handle,
+            vec![lore::storage::get::LoreStorageGetItem {
+                id: 1,
+                partition,
+                address,
+                offset: 180,
+                length: 10_000,
+                ..Default::default()
+            }],
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert_eq!(header_size(&events), Some(200));
+        assert_eq!(data_chunks(&events), vec![(180, payload[180..].to_vec())]);
+        assert_eq!(
+            item_code(&events),
+            Some(lore_revision::event::LoreErrorCode::None)
+        );
+    }
+
+    /// Reading from where nothing is is a caller mistake. Clamping it to empty would be
+    /// indistinguishable from reading content that is genuinely empty.
+    #[tokio::test]
+    async fn get_with_an_offset_past_the_end_rejects_invalid_args() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let payload: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let partition = Partition::from([0xD9u8; 16]);
+        let context = Context::from([0xDAu8; 16]);
+        let (handle, address) = store_for_range_test(partition, context, &payload, 0).await;
+
+        for streaming in [0u8, 1u8] {
+            let (status, events) = get_items_capture(
+                handle,
+                vec![lore::storage::get::LoreStorageGetItem {
+                    id: 1,
+                    partition,
+                    address,
+                    offset: 201,
+                    length: 10,
+                    streaming,
+                    ..Default::default()
+                }],
+            )
+            .await;
+            assert_ne!(status, 0, "streaming={streaming}");
+            assert_eq!(
+                item_code(&events),
+                Some(lore_revision::event::LoreErrorCode::InvalidArguments),
+                "streaming={streaming}",
+            );
+            assert!(
+                data_chunks(&events).is_empty(),
+                "no data may be emitted for a rejected range, streaming={streaming}",
+            );
+        }
+    }
+
+    /// The offset landing exactly on the end is the empty tail, not a mistake — the same
+    /// answer a zero-length file gives.
+    #[tokio::test]
+    async fn get_with_an_offset_at_the_end_reads_empty() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let payload: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let partition = Partition::from([0xDBu8; 16]);
+        let context = Context::from([0xDCu8; 16]);
+        let (handle, address) = store_for_range_test(partition, context, &payload, 0).await;
+
+        let (status, events) = get_items_capture(
+            handle,
+            vec![lore::storage::get::LoreStorageGetItem {
+                id: 1,
+                partition,
+                address,
+                offset: 200,
+                length: 0,
+                ..Default::default()
+            }],
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert_eq!(header_size(&events), Some(200));
+        assert_eq!(data_chunks(&events), vec![(200, Vec::new())]);
+        assert_eq!(
+            item_code(&events),
+            Some(lore_revision::event::LoreErrorCode::None)
+        );
+    }
+
+    /// The zero hash answers an empty buffer whatever range was asked for: there is no content
+    /// for a range to be out of.
+    #[tokio::test]
+    async fn get_zero_hash_ignores_the_range() {
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let (open_sink, open_cb) = make_sink();
+        assert_eq!(open_in_memory(open_cb).await, 0);
+        let id = take_opened(&open_sink.lock().unwrap()).unwrap();
+        let handle = lore::storage::handle::LoreStore { handle_id: id };
+
+        let (status, events) = get_items_capture(
+            handle,
+            vec![lore::storage::get::LoreStorageGetItem {
+                id: 1,
+                partition: Partition::from([0xDDu8; 16]),
+                address: Address {
+                    hash: Hash::default(),
+                    context: Context::from([0xDEu8; 16]),
+                },
+                offset: 500,
+                length: 100,
+                ..Default::default()
+            }],
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert_eq!(header_size(&events), Some(0));
+        assert_eq!(
+            item_code(&events),
+            Some(lore_revision::event::LoreErrorCode::None)
+        );
+    }
+
+    /// Streaming a range out of multi-fragment content: chunks arrive in content order,
+    /// carry offsets counted in the content, and cover the range exactly once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_ranged_streaming_delivers_only_the_range() {
+        use lore_base::types::Context;
+        use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
+        use lore_base::types::Partition;
+
+        let len = 4 * FRAGMENT_SIZE_THRESHOLD;
+        let payload: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(13)).collect();
+        let partition = Partition::from([0xDFu8; 16]);
+        let context = Context::from([0xE0u8; 16]);
+        let (handle, address) = store_for_range_test(partition, context, &payload, 64 * 1024).await;
+
+        // Starts and ends inside a leaf, so both ends are clipped.
+        let start = 100_000u64;
+        let length = 300_000u64;
+        let (status, events) = get_items_capture(
+            handle,
+            vec![lore::storage::get::LoreStorageGetItem {
+                id: 9,
+                partition,
+                address,
+                offset: start,
+                length,
+                streaming: 1,
+                ..Default::default()
+            }],
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert_eq!(
+            item_code(&events),
+            Some(lore_revision::event::LoreErrorCode::None)
+        );
+
+        assert_eq!(header_size(&events), Some(len as u64));
+
+        let chunks = data_chunks(&events);
+        assert!(
+            chunks.len() >= 2,
+            "a range spanning leaves should stream more than one chunk, got {}",
+            chunks.len(),
+        );
+
+        let mut expected_offset = start;
+        let mut reassembled = Vec::new();
+        for (offset, bytes) in &chunks {
+            assert_eq!(
+                *offset, expected_offset,
+                "chunks must tile the range from its own start",
+            );
+            reassembled.extend_from_slice(bytes);
+            expected_offset += bytes.len() as u64;
+        }
+        assert_eq!(expected_offset, start + length);
+        assert_eq!(
+            reassembled,
+            payload[start as usize..(start + length) as usize],
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_ranged_buffered_reassembles_across_fragments() {
+        use lore_base::types::Context;
+        use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
+        use lore_base::types::Partition;
+
+        let len = 4 * FRAGMENT_SIZE_THRESHOLD;
+        let payload: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(7)).collect();
+        let partition = Partition::from([0xE1u8; 16]);
+        let context = Context::from([0xE2u8; 16]);
+        let (handle, address) = store_for_range_test(partition, context, &payload, 64 * 1024).await;
+
+        let start = 100_000u64;
+        let length = 300_000u64;
+        let (status, events) = get_items_capture(
+            handle,
+            vec![lore::storage::get::LoreStorageGetItem {
+                id: 1,
+                partition,
+                address,
+                offset: start,
+                length,
+                ..Default::default()
+            }],
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert_eq!(header_size(&events), Some(len as u64));
+        assert_eq!(
+            data_chunks(&events),
+            vec![(
+                start,
+                payload[start as usize..(start + length) as usize].to_vec(),
+            )],
+        );
+    }
+
+    #[tokio::test]
+    async fn get_file_with_a_range_writes_only_the_range() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let payload: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let partition = Partition::from([0xE3u8; 16]);
+        let context = Context::from([0xE4u8; 16]);
+        let (handle, address) = store_for_range_test(partition, context, &payload, 0).await;
+
+        let (_target_guard, target) = temp_file_path("get-file-ranged");
+        let (status, events) = get_file_items(
+            handle,
+            vec![lore::storage::get_file::LoreStorageGetFileItem {
+                id: 1,
+                partition,
+                address,
+                path: LoreString::from(target.display().to_string().as_str()),
+                offset: 40,
+                length: 60,
+                ..Default::default()
+            }],
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert_eq!(
+            item_code(&events),
+            Some(lore_revision::event::LoreErrorCode::None)
+        );
+
+        let on_disk = std::fs::read(&target).unwrap();
+        assert_eq!(on_disk, payload[40..100]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn get_file_with_a_range_writes_only_the_range_across_fragments() {
+        use lore_base::types::Context;
+        use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
+        use lore_base::types::Partition;
+
+        let len = 4 * FRAGMENT_SIZE_THRESHOLD;
+        let payload: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(11)).collect();
+        let partition = Partition::from([0xE5u8; 16]);
+        let context = Context::from([0xE6u8; 16]);
+        let (handle, address) = store_for_range_test(partition, context, &payload, 64 * 1024).await;
+
+        let (_target_guard, target) = temp_file_path("get-file-ranged-multi");
+        let start = 100_000usize;
+        let length = 300_000usize;
+        let (status, _events) = get_file_items(
+            handle,
+            vec![lore::storage::get_file::LoreStorageGetFileItem {
+                id: 1,
+                partition,
+                address,
+                path: LoreString::from(target.display().to_string().as_str()),
+                offset: start as u64,
+                length: length as u64,
+                ..Default::default()
+            }],
+        )
+        .await;
+        assert_eq!(status, 0);
+
+        let on_disk = std::fs::read(&target).unwrap();
+        assert_eq!(on_disk.len(), length);
+        assert_eq!(on_disk, payload[start..start + length]);
+    }
+
+    #[tokio::test]
+    async fn get_file_with_an_offset_past_the_end_rejects_invalid_args() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let payload: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let partition = Partition::from([0xE7u8; 16]);
+        let context = Context::from([0xE8u8; 16]);
+        let (handle, address) = store_for_range_test(partition, context, &payload, 0).await;
+
+        let (_target_guard, target) = temp_file_path("get-file-past-end");
+        let (status, events) = get_file_items(
+            handle,
+            vec![lore::storage::get_file::LoreStorageGetFileItem {
+                id: 1,
+                partition,
+                address,
+                path: LoreString::from(target.display().to_string().as_str()),
+                offset: 201,
+                length: 10,
+                ..Default::default()
+            }],
+        )
+        .await;
+        assert_ne!(status, 0);
+        assert_eq!(
+            item_code(&events),
+            Some(lore_revision::event::LoreErrorCode::InvalidArguments)
+        );
     }
 
     /// Create a `tempfile::NamedTempFile` populated with `contents`. The returned guard
@@ -3309,6 +3742,7 @@ mod open_tests {
                 address,
                 streaming: 0,
                 local_cache: 0,
+                ..Default::default()
             }],
         )
         .await;
@@ -3472,6 +3906,7 @@ mod open_tests {
                 address,
                 streaming: 0,
                 local_cache: 0,
+                ..Default::default()
             }],
         )
         .await;
@@ -3530,6 +3965,7 @@ mod open_tests {
                 address,
                 path: LoreString::from(target.display().to_string().as_str()),
                 local_cache: 0,
+                ..Default::default()
             }],
         )
         .await;
@@ -3585,6 +4021,7 @@ mod open_tests {
                 address: zero_addr,
                 path: LoreString::from(target.display().to_string().as_str()),
                 local_cache: 0,
+                ..Default::default()
             }],
         )
         .await;
@@ -3619,6 +4056,7 @@ mod open_tests {
                 address: absent,
                 path: LoreString::from(target.display().to_string().as_str()),
                 local_cache: 0,
+                ..Default::default()
             }],
         )
         .await;
@@ -3652,6 +4090,7 @@ mod open_tests {
                 address: Address::default(),
                 path: LoreString::from(target.display().to_string().as_str()),
                 local_cache: 0,
+                ..Default::default()
             }],
         )
         .await;
@@ -3715,6 +4154,7 @@ mod open_tests {
                 address,
                 streaming: 0,
                 local_cache: 0,
+                ..Default::default()
             }],
         )
         .await;
@@ -3833,6 +4273,7 @@ mod open_tests {
                         address,
                         streaming: 0,
                         local_cache: 0,
+                        ..Default::default()
                     }],
                 )
                 .await;
@@ -4120,6 +4561,7 @@ mod open_tests {
                     address: addr_get,
                     streaming: 0,
                     local_cache: 0,
+                    ..Default::default()
                 }],
             )
             .await;

@@ -472,3 +472,176 @@ fn trace_display_format_with_context() {
         "trace display should contain context pattern, got: {display}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// chain_err — convert between discrete types, preserving trace
+// ---------------------------------------------------------------------------
+
+/// `chain_err` takes a `Traced<E>` extracted from an error set variant and
+/// chains a new discrete error onto its trace. The result is a `Traced<NewError>`
+/// whose trace contains every location from the original plus a new entry at
+/// the chain call site.
+#[test]
+fn chain_err_carries_originating_trace() {
+    // Create a NotFound in SetA — From<NotFound> captures the creation site.
+    let source: SetA = NotFound {
+        resource: "db.json".into(),
+    }
+    .into();
+    let source_len = source.trace().len(); // 1: the From<> call above
+
+    // Destructure to get the Traced<NotFound> directly.
+    let SetA::NotFound(traced_nf) = source else {
+        unreachable!()
+    };
+
+    // Chain a Timeout onto the existing trace.
+    let chained: Traced<Timeout> = Timeout {
+        duration_ms: 30_000,
+    }
+    .chain_err(traced_nf, "reading config file");
+
+    let trace = chained.trace();
+    // The chain adds exactly one entry.
+    assert_eq!(trace.len(), source_len + 1);
+
+    // The new entry carries the context and points to this file.
+    let last = trace.locations().last().unwrap();
+    assert_eq!(last.context(), Some("reading config file"));
+    assert!(
+        last.file.contains("tracing.rs"),
+        "chain site should be in this file, got: {}",
+        last.file
+    );
+}
+
+#[test]
+fn chain_err_display_shows_originating_and_chain_sites() {
+    let source: SetA = NotFound {
+        resource: "config.toml".into(),
+    }
+    .into();
+    let SetA::NotFound(traced_nf) = source else {
+        unreachable!()
+    };
+
+    let chained: Traced<Timeout> =
+        Timeout { duration_ms: 1_000 }.chain_err(traced_nf, "loading settings");
+
+    let display = format!("{}", chained.trace());
+    // Emit the full trace so it is visible under `cargo test -- --nocapture`.
+    println!("chain_err trace output:\n{display}");
+
+    // Two entries: original creation site + chain site.
+    assert_eq!(
+        display.matches("  at ").count(),
+        2,
+        "expected 2 trace entries, got:\n{display}"
+    );
+    // Both entries reference this file.
+    let at_lines: Vec<&str> = display.lines().filter(|l| l.contains("  at ")).collect();
+    for line in &at_lines {
+        assert!(
+            line.contains("tracing.rs"),
+            "entry should reference tracing.rs: {line}"
+        );
+    }
+    // The chain entry carries its context.
+    assert!(
+        display.contains("loading settings"),
+        "chain context missing from display:\n{display}"
+    );
+    // The creation entry has no context — it is formatted as file:line:col.
+    assert!(
+        !at_lines[0].contains(" - "),
+        "creation entry should have no context, got: {}",
+        at_lines[0]
+    );
+    // The chain entry has a context after " - ".
+    assert!(
+        at_lines[1].contains(" - loading settings"),
+        "chain entry should show context, got: {}",
+        at_lines[1]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// chain_err_from — same as chain_err but accepts an error-set enum directly
+// ---------------------------------------------------------------------------
+
+/// `chain_err_from` accepts the error-set enum itself (anything implementing
+/// `HasTrace`) so the caller does not need to pattern-match first.
+#[test]
+fn chain_err_from_carries_trace_from_error_set() {
+    let source: SetA = NotFound {
+        resource: "users.db".into(),
+    }
+    .into();
+    let source_len = source.trace().len(); // 1
+
+    // chain_err_from takes the enum directly — no destructuring.
+    let chained: Traced<Timeout> =
+        Timeout { duration_ms: 5_000 }.chain_err_from(source, "querying database");
+
+    let trace = chained.trace();
+    assert_eq!(trace.len(), source_len + 1);
+
+    let last = trace.locations().last().unwrap();
+    assert_eq!(last.context(), Some("querying database"));
+    assert!(last.file.contains("tracing.rs"));
+}
+
+#[test]
+fn chain_err_from_display_shows_originating_and_chain_sites() {
+    let source: SetA = NotFound {
+        resource: "cache".into(),
+    }
+    .into();
+
+    let chained: Traced<Timeout> =
+        Timeout { duration_ms: 200 }.chain_err_from(source, "warming cache");
+
+    let display = format!("{}", chained.trace());
+    println!("chain_err_from trace output:\n{display}");
+
+    assert_eq!(
+        display.matches("  at ").count(),
+        2,
+        "expected 2 trace entries, got:\n{display}"
+    );
+    assert!(display.contains("tracing.rs"));
+    assert!(display.contains("warming cache"));
+}
+
+/// When the source error set already carries a multi-hop trace (e.g. from a
+/// prior `forward`), `chain_err_from` accumulates onto it rather than
+/// starting fresh.
+#[test]
+fn chain_err_from_accumulates_onto_multi_hop_trace() {
+    // Build a 2-entry trace: creation + forward.
+    let result_a: Result<(), SetA> = Err(NotFound {
+        resource: "x".into(),
+    }
+    .into());
+    let result_b: Result<(), SetB> = result_a.forward("hop 1");
+    let source = result_b.unwrap_err(); // trace len == 2
+
+    assert_eq!(source.trace().len(), 2);
+
+    let chained: Traced<Timeout> = Timeout { duration_ms: 100 }.chain_err_from(source, "hop 2");
+
+    let trace = chained.trace();
+    assert_eq!(trace.len(), 3, "creation + hop1 + hop2");
+
+    let locs = trace.locations();
+    assert_eq!(locs[0].context(), None, "creation has no context");
+    assert_eq!(locs[1].context(), Some("hop 1"));
+    assert_eq!(locs[2].context(), Some("hop 2"));
+
+    let display = format!("{trace}");
+    println!("multi-hop chain_err_from trace:\n{display}");
+
+    assert_eq!(display.matches("  at ").count(), 3);
+    assert!(display.contains("hop 1"));
+    assert!(display.contains("hop 2"));
+}

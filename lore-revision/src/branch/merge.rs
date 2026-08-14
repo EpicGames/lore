@@ -403,11 +403,20 @@ pub struct MergeStartOptions {
     pub path_merge_rules: Vec<PathMergeRule>,
 }
 
+/// The revisions a merge's three-way diff ran between, other than the target.
+#[derive(Clone, Copy)]
+pub struct MergeDiffEndpoints {
+    pub base: Hash,
+    pub source: Hash,
+}
+
 /// Result of merging a single repository (main or linked).
 pub struct MergeRepositoryResult {
     pub signature: Hash,
     pub has_conflicts: bool,
     pub state_staged: Arc<State>,
+    /// Endpoints for reconciling state the diff does not carry, such as link pins.
+    pub endpoints: MergeDiffEndpoints,
     /// Conflict-realization context: the 3-way merge inputs and the conflict
     /// pairs from the diff. Surfaced so `merge_start_all` can remap paths
     /// onto the link's mount and call `realize_conflicts` without re-running
@@ -704,6 +713,10 @@ async fn merge_repository(
         signature,
         has_conflicts,
         state_staged,
+        endpoints: MergeDiffEndpoints {
+            base: diff_base,
+            source: diff_source,
+        },
         conflict_context,
     })
 }
@@ -760,6 +773,8 @@ pub async fn merge_start(
             let MergeRepositoryResult {
                 mut signature,
                 has_conflicts,
+                state_staged,
+                endpoints,
                 ..
             } = merge_repository(
                 repository.clone(),
@@ -773,6 +788,26 @@ pub async fn merge_start(
             .await?;
 
             let dry_run = execution_context().globals().dry_run();
+
+            // The parent's link list is parent state, so `--ignore-links` skips
+            // merging the linked repositories, not the comparison. Carrying a
+            // row would realize linked content, which the flag does suppress.
+            let state_base = state::State::deserialize(repository.clone(), endpoints.base)
+                .await
+                .forward::<MergeError>("deserializing diff base state")?;
+            let state_source = state::State::deserialize(repository.clone(), endpoints.source)
+                .await
+                .forward::<MergeError>("deserializing diff source state")?;
+            Box::pin(link::classify_link_pins(
+                repository.clone(),
+                &state_staged,
+                &state_source,
+                link::LinkPinResolution::ThreeWay(state_base),
+                &[],
+            ))
+            .await
+            .forward::<MergeError>("comparing link pins")?;
+
             if !has_conflicts && !dry_run && !options.no_commit {
                 signature = auto_commit_merge(repository, token, options.message).await?;
             }
@@ -853,6 +888,7 @@ async fn merge_start_link(
         link_node,
         link_context,
         link_reference,
+        ..
     } = link::resolve_link_at_path(&state, repository.clone(), &link_path)
         .await
         .forward_with::<MergeError, _>(|| format!("link not found: {link_path}"))?;
@@ -958,6 +994,7 @@ async fn merge_start_link(
         link_reference.signature,
         result.signature,
         link_reference.branch,
+        link::LinkPinRealize::WorkingTree,
     )
     .await
     .forward_with::<MergeError, _>(|| format!("staging link pin for {link_path}"))?;
@@ -1416,6 +1453,7 @@ async fn finalize_link_conflict_state(
             merged.link_reference.signature,
             merged.new_signature,
             merged.link_reference.branch,
+            link::LinkPinRealize::WorkingTree,
         )
         .await
         .forward_with::<MergeError, _>(|| {
@@ -1515,6 +1553,7 @@ async fn finalize_main_merge(
         signature: _,
         has_conflicts,
         state_staged,
+        endpoints,
         ..
     } = merge_repository(
         repository.clone(),
@@ -1538,12 +1577,47 @@ async fn finalize_main_merge(
                 merged.link_reference.signature,
                 merged.new_signature,
                 merged.link_reference.branch,
+                link::LinkPinRealize::WorkingTree,
             )
             .await
             .forward_with::<MergeError, _>(|| {
                 format!("staging merged link pin for {}", merged.link_path)
             })?;
         }
+    }
+
+    // Links merged above already carry the pin their own merge produced. The
+    // comparison runs on a dry run too, so `--dry-run` reports a row the real
+    // merge would refuse.
+    let merged_nodes: Vec<NodeID> = merged_links
+        .iter()
+        .map(|merged| merged.link_reference.local_node)
+        .collect();
+    let state_base = state::State::deserialize(repository.clone(), endpoints.base)
+        .await
+        .forward::<MergeError>("deserializing diff base state")?;
+    let state_source = state::State::deserialize(repository.clone(), endpoints.source)
+        .await
+        .forward::<MergeError>("deserializing diff source state")?;
+    let planned = Box::pin(link::classify_link_pins(
+        repository.clone(),
+        &state_staged,
+        &state_source,
+        link::LinkPinResolution::ThreeWay(state_base),
+        &merged_nodes,
+    ))
+    .await
+    .forward::<MergeError>("comparing link pins with the merged branch")?;
+
+    if !dry_run {
+        Box::pin(link::apply_link_pins(
+            repository.clone(),
+            &state_staged,
+            planned,
+            link::LinkPinRealize::WorkingTree,
+        ))
+        .await
+        .forward::<MergeError>("carrying link pins from the merged branch")?;
 
         if !link_merge_entries.is_empty() {
             state_staged
@@ -2455,6 +2529,7 @@ async fn resolve_abort_entries(
             link_node,
             link_context,
             link_reference,
+            ..
         } = link::resolve_link_at_path(state_staged, repository.clone(), &link_path)
             .await
             .forward_with::<MergeError, _>(|| format!("link not found: {link_path}"))?;
@@ -2537,6 +2612,7 @@ pub async fn branch_merge_abort(
                 r.link_reference.signature,
                 entry.base.signature,
                 entry.base.branch,
+                link::LinkPinRealize::WorkingTree,
             )
             .await
             .forward_with::<MergeError, _>(|| format!("staging link pin for {}", r.link_path))?;
@@ -2626,6 +2702,7 @@ async fn merge_abort_link(
         link_node,
         link_context,
         link_reference,
+        ..
     } = link::resolve_link_at_path(&state_staged, repository.clone(), &link_path)
         .await
         .forward_with::<MergeError, _>(|| format!("link not found: {link_path}"))?;
@@ -2646,6 +2723,7 @@ async fn merge_abort_link(
         link_reference.signature,
         entry.base.signature,
         entry.base.branch,
+        link::LinkPinRealize::WorkingTree,
     )
     .await
     .forward_with::<MergeError, _>(|| format!("staging link pin for {link_path}"))?;
@@ -2724,6 +2802,7 @@ async fn merge_abort_ignore_links(
                 current_ref.signature,
                 r.link_reference.signature,
                 r.link_reference.branch,
+                link::LinkPinRealize::WorkingTree,
             )
             .await
             .forward_with::<MergeError, _>(|| format!("restoring link pin for {}", r.link_path))?;
@@ -4118,13 +4197,10 @@ pub async fn merge_into(
     .await
     .forward::<MergeError>("running diff")?;
 
-    // `state::diff` recurses into links when pin hashes differ; for
-    // `--ignore-links` we want a parent-only changeset, so drop those.
-    // The link pin itself remains whatever `state_branch` has on the
-    // target side.
-    if options.ignore_links {
-        changes.retain(|c| c.to.repository.id == repository.id);
-    }
+    // Realizing a linked repository's changes against the parent state attaches
+    // its file nodes under the parent's link node and overwrites
+    // `link_node.child`. Link contents go through `merge into --link`.
+    changes.retain(|c| c.to.repository.id == repository.id);
 
     change::sort_by_path(&mut changes);
 
@@ -4200,6 +4276,22 @@ pub async fn merge_into(
     .await
     .forward::<MergeError>("realizing changes")?;
     lore_debug!("Realized changes on state");
+
+    // The target branch is required to be merged into this one already, so this
+    // branch's rows are the newer ones. The working tree stays on the current
+    // branch, so nothing is realized on disk.
+    if !options.ignore_links {
+        Box::pin(link::merge_link_pins(
+            repository.clone(),
+            &state_staged,
+            &state_current,
+            link::LinkPinResolution::Incoming,
+            link::LinkPinRealize::StateOnly,
+            &[],
+        ))
+        .await
+        .forward::<MergeError>("carrying link pins into the target branch")?;
+    }
 
     LoreEvent::BranchMergeIntoSyncEnd(LoreBranchMergeIntoSyncEndEventData {
         count: changes_count,

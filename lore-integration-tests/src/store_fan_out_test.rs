@@ -194,7 +194,7 @@ mod tests {
         // All 100k addresses must be findable.
         for address in &addresses {
             let result = store
-                .find(partition, *address, lore_storage::StoreMatch::MatchFull)
+                .find(partition, *address)
                 .await
                 .expect("find returned an error");
             assert_eq!(
@@ -265,7 +265,8 @@ mod tests {
         {
             let path = entry.path();
             if path.is_dir()
-                && let Ok(Some(level)) = lore_storage::local::fan_out::read_level_marker(&path)
+                && let Ok(Some(level)) =
+                    lore_storage::local::fan_out::read_level_marker(&path).await
             {
                 assert_eq!(level, 1, "Marker should record initial level 1");
                 found_marker = true;
@@ -327,7 +328,8 @@ mod tests {
         {
             let path = entry.path();
             if path.is_dir()
-                && let Ok(Some(level)) = lore_storage::local::fan_out::read_level_marker(&path)
+                && let Ok(Some(level)) =
+                    lore_storage::local::fan_out::read_level_marker(&path).await
             {
                 assert_eq!(level, 256, "Marker should record level 256");
                 found_marker_at_256 = true;
@@ -788,6 +790,7 @@ mod tests {
             .join("index")
             .join(format!("{group_index:02x}"));
         let marker_level = lore_storage::local::fan_out::read_level_marker(&marker_path)
+            .await
             .unwrap()
             .expect("Marker should exist after fan-out");
         assert_eq!(marker_level, 32, "Marker level mismatches in-memory level");
@@ -866,15 +869,13 @@ mod tests {
             .join("index")
             .join(format!("{group_index:02x}"));
         let marker_level = lore_storage::local::fan_out::read_level_marker(&marker_path)
+            .await
             .unwrap()
             .expect("Marker should exist after fan-out");
         assert_eq!(marker_level, 32, "Marker level mismatches in-memory level");
 
         for address in &addresses {
-            let result = store
-                .find(partition, *address, lore_storage::StoreMatch::MatchFull)
-                .await
-                .unwrap();
+            let result = store.find(partition, *address).await.unwrap();
             assert_eq!(
                 result.matching,
                 lore_storage::StoreMatch::MatchFull,
@@ -1463,7 +1464,9 @@ mod tests {
                 std::fs::copy(&path, &new_path).unwrap();
             }
         }
-        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false).unwrap();
+        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false)
+            .await
+            .unwrap();
 
         verify_all_keys_findable_and_drop(&store_path, &keys).await;
 
@@ -1482,7 +1485,9 @@ mod tests {
             );
         }
         assert_eq!(
-            lore_storage::local::fan_out::read_level_marker(&group_dir).unwrap(),
+            lore_storage::local::fan_out::read_level_marker(&group_dir)
+                .await
+                .unwrap(),
             Some(32)
         );
 
@@ -1511,7 +1516,9 @@ mod tests {
                 }
             }
         }
-        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false).unwrap();
+        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false)
+            .await
+            .unwrap();
 
         verify_all_keys_findable_and_drop(&store_path, &keys).await;
 
@@ -1530,7 +1537,9 @@ mod tests {
                 .exists()
         );
         assert_eq!(
-            lore_storage::local::fan_out::read_level_marker(&group_dir).unwrap(),
+            lore_storage::local::fan_out::read_level_marker(&group_dir)
+                .await
+                .unwrap(),
             Some(32)
         );
 
@@ -1546,7 +1555,9 @@ mod tests {
         let (store_path, group_dir, keys) = setup_post_fan_out_to_level_32(0xAA04, 200).await;
 
         // Construct: write pending=32, leave everything else alone (final files at level-32, marker=32).
-        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false).unwrap();
+        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false)
+            .await
+            .unwrap();
 
         verify_all_keys_findable_and_drop(&store_path, &keys).await;
 
@@ -1557,7 +1568,9 @@ mod tests {
                 .exists()
         );
         assert_eq!(
-            lore_storage::local::fan_out::read_level_marker(&group_dir).unwrap(),
+            lore_storage::local::fan_out::read_level_marker(&group_dir)
+                .await
+                .unwrap(),
             Some(32)
         );
 
@@ -1647,7 +1660,9 @@ mod tests {
                 std::fs::copy(&path, &new_path).unwrap();
             }
         }
-        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false).unwrap();
+        lore_storage::local::fan_out::write_level_pending(&group_dir, 32, false)
+            .await
+            .unwrap();
 
         // First open: recovery runs.
         verify_all_keys_findable_and_drop(&store_path, &keys).await;

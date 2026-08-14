@@ -21,7 +21,6 @@ use super::path::RelativePath;
 use super::path::RelativePathBuf;
 use crate::hash::hash_string;
 use crate::lore_debug;
-use crate::lore_spawn_blocking;
 use crate::lore_trace;
 #[cfg(not(target_family = "windows"))]
 use crate::lore_warn;
@@ -61,7 +60,8 @@ pub async fn metadata_set_executable(
     };
     permissions.set_mode(mode);
 
-    let _ = tokio::fs::set_permissions(path, permissions)
+    let _ = lore_io::IoDriver::global()
+        .set_permissions(path, permissions)
         .await
         .map_err(|err| {
             lore_warn!(
@@ -128,15 +128,44 @@ pub fn file_is_executable(metadata: &Metadata) -> bool {
     (metadata.permissions().mode() & FILE_MODE_USER_EXEC) != 0
 }
 
-/// Check if an entry with the given exact name exists in the directory.
-/// Unlike `Path::exists()`, this performs a case-sensitive check on all platforms
-/// by reading the directory entries and comparing names exactly.
-pub fn filesystem_name_exists(parent: &Path, name: &str) -> bool {
-    let Ok(reader) = std::fs::read_dir(parent) else {
+/// Whether every one of `names` is present in `parent`, compared exactly rather than by the
+/// filesystem's own rules — `Path::exists` is case-insensitive on Windows and macOS, which is
+/// the distinction a caller resolving a case collision is asking about.
+///
+/// One listing answers for all of them, and it stops as soon as they are all accounted for: a
+/// caller asking about several names in a directory is asking one question about it. Asking
+/// about no names is answered without reading anything.
+///
+/// Matches are tracked in a bitmask, so at most 64 names can be asked about at once.
+pub async fn filesystem_names_all_exist(parent: &Path, names: &[&str]) -> bool {
+    assert!(
+        names.len() <= u64::BITS as usize,
+        "filesystem_names_all_exist takes at most {} names",
+        u64::BITS
+    );
+    if names.is_empty() {
+        return true;
+    }
+
+    let Ok(mut listing) = lore_io::IoDriver::global().read_dir(parent).await else {
         return false;
     };
-    for entry in reader.flatten() {
-        if entry.file_name() == name {
+    let wanted = if names.len() == u64::BITS as usize {
+        u64::MAX
+    } else {
+        (1u64 << names.len()) - 1
+    };
+    let mut found = 0u64;
+    while let Some(entry) = listing.next().await {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        for (index, name) in names.iter().enumerate() {
+            if entry.file_name == *name {
+                found |= 1u64 << index;
+            }
+        }
+        if found == wanted {
             return true;
         }
     }
@@ -157,16 +186,20 @@ pub async fn filesystem_names(
     #[cfg(target_os = "linux")]
     {
         let initial_path = path.join(name);
-        if tokio::fs::metadata(initial_path.as_path()).await.is_ok() {
+        if lore_io::IoDriver::global()
+            .metadata(initial_path.as_path())
+            .await
+            .is_ok()
+        {
             return Ok(vec![name.to_string()]);
         }
     }
 
     let mut matches = vec![];
     let match_name = name.to_lowercase();
-    let mut reader = tokio::fs::read_dir(path).await?;
-    while let Some(entry) = reader.next_entry().await? {
-        let entry_file_name = entry.file_name();
+    let mut listing = lore_io::IoDriver::global().read_dir(path).await?;
+    while let Some(entry) = listing.next().await {
+        let entry_file_name = entry?.file_name;
         let entry_name = entry_file_name.to_string_lossy();
         if entry_name == name {
             // Exact match
@@ -219,7 +252,11 @@ pub async fn filesystem_path(
     #[cfg(target_os = "linux")]
     {
         let initial_path = base_path.join(find_path.as_str());
-        if tokio::fs::metadata(initial_path.as_path()).await.is_ok() {
+        if lore_io::IoDriver::global()
+            .metadata(initial_path.as_path())
+            .await
+            .is_ok()
+        {
             return Ok(find_path.as_str().to_string());
         }
     }
@@ -324,12 +361,9 @@ pub struct FileListItem {
 pub enum PathListingResult {
     /// The path was a directory.
     ///
-    /// The receiver yields `FileListItem` for each child in the directory.
-    /// Each item's `name` is relative to the directory (just the filename,
-    /// not the full path).
-    Directory {
-        receiver: tokio::sync::mpsc::UnboundedReceiver<FileListItem>,
-    },
+    /// The listing yields an entry per child, named relative to the directory (just the
+    /// filename, not the full path). [`file_list_item`] turns one into a [`FileListItem`].
+    Directory { listing: lore_io::DirStream },
 
     /// The path was a regular file.
     ///
@@ -359,19 +393,20 @@ impl PathListingResult {
     }
 }
 
-/// Resolve metadata for a directory entry, following symlinks.
-///
-/// `DirEntry::metadata()` on Linux returns the symlink's own metadata
-/// rather than the target's. When the entry is a symlink, this falls
-/// back to `std::fs::metadata()` which follows the link and returns
-/// the target's metadata. Broken symlinks (dead target) return `None`.
-fn resolve_entry_metadata(entry: &std::fs::DirEntry) -> Option<std::fs::Metadata> {
-    let metadata = entry.metadata().ok()?;
-    if metadata.is_symlink() {
-        std::fs::metadata(entry.path()).ok()
-    } else {
-        Some(metadata)
-    }
+/// Describes one listing entry, or `None` for one that says nothing about what is there: a name
+/// the walk could not read, or one whose metadata would not resolve — a broken link, or a name
+/// unlinked while the walk was running. A caller enumerating what is present skips those; one
+/// unreadable name says nothing about the rest of the directory.
+pub fn file_list_item(entry: std::io::Result<lore_io::DirEntry>) -> Option<FileListItem> {
+    let entry = entry.ok()?;
+    let metadata = entry.metadata?;
+    let name = entry.file_name.to_string_lossy().to_string();
+    let name_hash = hash_string(name.as_str());
+    Some(FileListItem {
+        name,
+        metadata,
+        name_hash,
+    })
 }
 
 /// Lists a filesystem path, automatically handling both file and directory cases.
@@ -380,42 +415,28 @@ fn resolve_entry_metadata(entry: &std::fs::DirEntry) -> Option<std::fs::Metadata
 /// * `path` - The filesystem path to list
 ///
 /// # Returns
-/// * `PathListingResult::Directory` - If path is a directory, with channel for children
+/// * `PathListingResult::Directory` - If path is a directory, with a listing of its children
 /// * `PathListingResult::File` - If path is a single file, with its metadata
 /// * `PathListingResult::NotFound` - If path doesn't exist or isn't accessible
 ///
 /// # Path Semantics
 /// - For directories: Each item's `name` is the child filename (e.g., "file.txt")
 /// - For files: The item's `name` is the filename component (e.g., "file.txt" for "/foo/file.txt")
-pub fn list_path(path: PathBuf) -> PathListingResult {
-    // Check what kind of path we have first (synchronous check)
-    let metadata = match std::fs::metadata(path.as_path()) {
-        Ok(m) => m,
-        Err(_) => return PathListingResult::NotFound,
+///
+/// Listing is attempted before the path is described, since a caller walking a tree reaches this
+/// with a directory almost every time — the walk recurses into those and compares files in place.
+pub async fn list_path(path: PathBuf) -> PathListingResult {
+    let driver = lore_io::IoDriver::global();
+
+    if let Ok(listing) = driver.read_dir(path.as_path()).await {
+        return PathListingResult::Directory { listing };
+    }
+
+    let Ok(metadata) = driver.metadata(path.as_path()).await else {
+        return PathListingResult::NotFound;
     };
 
-    if metadata.is_dir() {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-
-        lore_spawn_blocking!(move || {
-            if let Ok(reader) = std::fs::read_dir(path.as_path()) {
-                for entry in reader.flatten() {
-                    let file_name = entry.file_name();
-                    if let Some(entry_metadata) = resolve_entry_metadata(&entry) {
-                        let name = file_name.to_string_lossy().to_string();
-                        let name_hash = hash_string(name.as_str());
-                        let _ = sender.send(FileListItem {
-                            name,
-                            metadata: entry_metadata,
-                            name_hash,
-                        });
-                    }
-                }
-            }
-        });
-
-        PathListingResult::Directory { receiver }
-    } else if metadata.is_file() {
+    if metadata.is_file() {
         let file_name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -442,29 +463,10 @@ pub fn list_path(path: PathBuf) -> PathListingResult {
 /// * `path` - The filesystem path to list (must be a directory)
 ///
 /// # Returns
-/// * `Ok(receiver)` - Channel that yields `FileListItem` for each child
+/// * `Ok(listing)` - Yields an entry for each child; [`file_list_item`] describes one
 /// * `Err(_)` - If path doesn't exist, isn't accessible, or isn't a directory
-pub fn list_directory(
-    path: PathBuf,
-) -> std::io::Result<tokio::sync::mpsc::UnboundedReceiver<FileListItem>> {
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
-    lore_spawn_blocking!(move || {
-        if let Ok(reader) = std::fs::read_dir(path.as_path()) {
-            for entry in reader.flatten() {
-                let file_name = entry.file_name();
-                if let Some(metadata) = resolve_entry_metadata(&entry) {
-                    let name = file_name.to_string_lossy().to_string();
-                    let name_hash = hash_string(name.as_str());
-                    let _ = sender.send(FileListItem {
-                        name,
-                        metadata,
-                        name_hash,
-                    });
-                }
-            }
-        }
-    });
-    Ok(receiver)
+pub async fn list_directory(path: PathBuf) -> std::io::Result<lore_io::DirStream> {
+    lore_io::IoDriver::global().read_dir(path.as_path()).await
 }
 
 /// Helper function to rename files during name case unification handling. Will try to rename
@@ -475,82 +477,84 @@ pub fn list_directory(
 /// - if the "from"/"to" is a directory it will recurse and call `unify_name_case_rename` on each
 ///   child item in the "from" directory to move it to the "to" directory, applying the same
 ///   rules to each subitem (replacing files, recursing directories).
-pub fn unify_name_case_rename(from_path: &Path, to_path: &Path) -> std::io::Result<()> {
-    lore_debug!(
-        "Try rename {} -> {}",
-        from_path.display(),
-        to_path.display()
-    );
-    let result = lore_storage::fs_util::rename_file(from_path, to_path);
-    if result.is_ok() {
-        lore_debug!("Renamed {} -> {}", from_path.display(), to_path.display());
-        return Ok(());
-    }
-
-    let from_metadata = std::fs::metadata(from_path)?;
-    let to_metadata = std::fs::metadata(to_path)?;
-
-    if from_metadata.is_dir() != to_metadata.is_dir() {
-        return Err(tokio::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "Unable to rename, file/directory mismatch",
-        ));
-    }
-
-    if from_metadata.is_file() {
+pub fn unify_name_case_rename<'a>(
+    from_path: &'a Path,
+    to_path: &'a Path,
+) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        let driver = lore_io::IoDriver::global();
         lore_debug!(
-            "Failed rename {} -> {}, replacing",
+            "Try rename {} -> {}",
             from_path.display(),
             to_path.display()
         );
-        #[allow(clippy::disallowed_methods)]
-        // Authorized fs helper for case-insensitive rename fallback.
-        std::fs::remove_file(to_path)?;
-        if let Err(err) = lore_storage::fs_util::rename_file(from_path, to_path) {
+        if driver.rename(from_path, to_path).await.is_ok() {
+            lore_debug!("Renamed {} -> {}", from_path.display(), to_path.display());
+            return Ok(());
+        }
+
+        let from_metadata = driver.metadata(from_path).await?;
+        let to_metadata = driver.metadata(to_path).await?;
+
+        if from_metadata.is_dir() != to_metadata.is_dir() {
+            return Err(tokio::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Unable to rename, file/directory mismatch",
+            ));
+        }
+
+        if from_metadata.is_file() {
             lore_debug!(
-                "Failed rename {} -> {}, try copy and delete: {err}",
+                "Failed rename {} -> {}, replacing",
                 from_path.display(),
-                to_path.display(),
+                to_path.display()
             );
-            std::fs::copy(from_path, to_path)?;
-            #[allow(clippy::disallowed_methods)]
-            // Authorized fs helper for case-insensitive rename fallback.
-            std::fs::remove_file(from_path)?;
-        }
-    } else {
-        lore_debug!(
-            "Failed rename {} -> {}, try recursive directory unification",
-            from_path.display(),
-            to_path.display()
-        );
-        // Make sure reader runs out of scope before removing directory
-        {
-            let reader = std::fs::read_dir(from_path)?;
-            for entry in reader.flatten() {
-                let entry_file_name = entry.file_name();
-                let file_name = entry_file_name.to_string_lossy();
-                let from_path = from_path.join(file_name.as_ref());
-                let to_path = to_path.join(file_name.as_ref());
-                unify_name_case_rename(&from_path, &to_path)?;
+            driver.remove_file(to_path).await?;
+            if let Err(err) = driver.rename(from_path, to_path).await {
+                lore_debug!(
+                    "Failed rename {} -> {}, try copy and delete: {err}",
+                    from_path.display(),
+                    to_path.display(),
+                );
+                driver.copy(from_path, to_path).await?;
+                driver.remove_file(from_path).await?;
             }
+        } else {
+            lore_debug!(
+                "Failed rename {} -> {}, try recursive directory unification",
+                from_path.display(),
+                to_path.display()
+            );
+            // The listing is drained before the directory goes, so nothing is still walking it.
+            let names = {
+                let mut listing = driver.read_dir(from_path).await?;
+                let mut names = Vec::new();
+                while let Some(entry) = listing.next().await {
+                    names.push(entry?.file_name);
+                }
+                names
+            };
+            for name in names {
+                let from_path = from_path.join(&name);
+                let to_path = to_path.join(&name);
+                unify_name_case_rename(&from_path, &to_path).await?;
+            }
+            driver.remove_dir_all(from_path).await?;
         }
-        #[allow(clippy::disallowed_methods)]
-        // Authorized fs helper for case-insensitive rename fallback.
-        std::fs::remove_dir_all(from_path)?;
-    }
 
-    lore_debug!("Renamed {} -> {}", from_path.display(), to_path.display());
-    Ok(())
+        lore_debug!("Renamed {} -> {}", from_path.display(), to_path.display());
+        Ok(())
+    })
 }
 
 pub async fn unlink<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Result<()> {
     let absolute_path = absolute_path.as_ref();
     lore_trace!("Deleting {}", absolute_path.display());
-    let metadata = tokio::fs::metadata(absolute_path).await;
+    let metadata = lore_io::IoDriver::global().metadata(absolute_path).await;
 
     if let Ok(metadata) = metadata {
         if metadata.is_dir() {
-            if let Err(err) = tokio::fs::remove_dir(absolute_path).await {
+            if let Err(err) = lore_io::IoDriver::global().remove_dir(absolute_path).await {
                 if err.kind() == tokio::io::ErrorKind::NotFound {
                     lore_trace!(
                         "Path does not exist anymore after removing recursively {}: {}",
@@ -568,8 +572,10 @@ pub async fn unlink<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Result<()> {
                 let mut permissions = metadata.permissions();
                 #[allow(clippy::permissions_set_readonly_false)]
                 permissions.set_readonly(false);
-                let _ = tokio::fs::set_permissions(absolute_path, permissions).await;
-                if let Err(err) = tokio::fs::remove_dir(absolute_path).await {
+                let _ = lore_io::IoDriver::global()
+                    .set_permissions(absolute_path, permissions)
+                    .await;
+                if let Err(err) = lore_io::IoDriver::global().remove_dir(absolute_path).await {
                     if err.kind() == tokio::io::ErrorKind::NotFound {
                         lore_trace!(
                             "Path does not exist anymore after trying remove recursively with write permissions: {}",
@@ -587,7 +593,7 @@ pub async fn unlink<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Result<()> {
                 }
             }
         } else {
-            if let Err(err) = tokio::fs::remove_file(absolute_path).await {
+            if let Err(err) = lore_io::IoDriver::global().remove_file(absolute_path).await {
                 if err.kind() == tokio::io::ErrorKind::NotFound {
                     lore_trace!(
                         "Path does not exist anymore after removing file with write permissions: {}",
@@ -604,8 +610,10 @@ pub async fn unlink<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Result<()> {
                 let mut permissions = metadata.permissions();
                 #[allow(clippy::permissions_set_readonly_false)]
                 permissions.set_readonly(false);
-                let _ = tokio::fs::set_permissions(absolute_path, permissions).await;
-                if let Err(err) = tokio::fs::remove_file(absolute_path).await {
+                let _ = lore_io::IoDriver::global()
+                    .set_permissions(absolute_path, permissions)
+                    .await;
+                if let Err(err) = lore_io::IoDriver::global().remove_file(absolute_path).await {
                     if err.kind() == tokio::io::ErrorKind::NotFound {
                         lore_trace!(
                             "Path does not exist anymore after trying remove file with write permissions: {}",
@@ -645,7 +653,7 @@ pub async fn unlink<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Result<()> {
 pub async fn unlink_recursive<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Result<()> {
     let absolute_path = absolute_path.as_ref();
     lore_trace!("Deleting {}", absolute_path.display());
-    let metadata = tokio::fs::metadata(absolute_path).await;
+    let metadata = lore_io::IoDriver::global().metadata(absolute_path).await;
 
     if let Err(err) = metadata {
         if err.kind() == tokio::io::ErrorKind::NotFound {
@@ -666,7 +674,10 @@ pub async fn unlink_recursive<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Re
 
     let metadata = metadata.unwrap();
     if metadata.is_dir() {
-        if let Err(err) = tokio::fs::remove_dir_all(absolute_path).await {
+        if let Err(err) = lore_io::IoDriver::global()
+            .remove_dir_all(absolute_path)
+            .await
+        {
             if err.kind() == tokio::io::ErrorKind::NotFound {
                 lore_trace!(
                     "Path does not exist anymore after removing recursively {}: {}",
@@ -684,8 +695,13 @@ pub async fn unlink_recursive<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Re
             let mut permissions = metadata.permissions();
             #[allow(clippy::permissions_set_readonly_false)]
             permissions.set_readonly(false);
-            let _ = tokio::fs::set_permissions(absolute_path, permissions).await;
-            if let Err(err) = tokio::fs::remove_dir_all(absolute_path).await {
+            let _ = lore_io::IoDriver::global()
+                .set_permissions(absolute_path, permissions)
+                .await;
+            if let Err(err) = lore_io::IoDriver::global()
+                .remove_dir_all(absolute_path)
+                .await
+            {
                 if err.kind() == tokio::io::ErrorKind::NotFound {
                     lore_trace!(
                         "Path does not exist anymore after trying remove recursively with write permissions: {}",
@@ -704,7 +720,7 @@ pub async fn unlink_recursive<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Re
         }
         lore_trace!("Recursively deleted directory {}", absolute_path.display(),);
     } else {
-        if let Err(err) = tokio::fs::remove_file(absolute_path).await {
+        if let Err(err) = lore_io::IoDriver::global().remove_file(absolute_path).await {
             if err.kind() == tokio::io::ErrorKind::NotFound {
                 lore_trace!(
                     "Path does not exist anymore after removing file with write permissions: {}",
@@ -721,8 +737,10 @@ pub async fn unlink_recursive<P: AsRef<Path>>(absolute_path: P) -> tokio::io::Re
             let mut permissions = metadata.permissions();
             #[allow(clippy::permissions_set_readonly_false)]
             permissions.set_readonly(false);
-            let _ = tokio::fs::set_permissions(absolute_path, permissions).await;
-            if let Err(err) = tokio::fs::remove_file(absolute_path).await {
+            let _ = lore_io::IoDriver::global()
+                .set_permissions(absolute_path, permissions)
+                .await;
+            if let Err(err) = lore_io::IoDriver::global().remove_file(absolute_path).await {
                 if err.kind() == tokio::io::ErrorKind::NotFound {
                     lore_trace!(
                         "Path does not exist anymore after trying remove file with write permissions: {}",
@@ -786,4 +804,93 @@ pub fn generate_temppath(prefix: &str) -> std::path::PathBuf {
     let mut path = std::env::temp_dir();
     path.push(name);
     path
+}
+
+#[cfg(test)]
+// Fixtures build filesystem state directly; what these test is how the helpers read it.
+#[allow(clippy::disallowed_methods)]
+mod tests {
+    use super::*;
+
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("temp dir")
+    }
+
+    #[tokio::test]
+    async fn list_path_yields_a_directory_listing() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("child"), b"data").expect("write child");
+
+        let PathListingResult::Directory { mut listing } =
+            list_path(dir.path().to_path_buf()).await
+        else {
+            panic!("a directory must list");
+        };
+        let mut names = Vec::new();
+        while let Some(entry) = listing.next().await {
+            if let Some(item) = file_list_item(entry) {
+                names.push(item.name);
+            }
+        }
+        assert_eq!(names, vec!["child".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_path_describes_a_file_by_its_own_name() {
+        let dir = temp_dir();
+        let path = dir.path().join("lonely.txt");
+        std::fs::write(&path, b"data").expect("write file");
+
+        let PathListingResult::File { item } = list_path(path).await else {
+            panic!("a file must be described, not listed");
+        };
+        assert_eq!(item.name, "lonely.txt");
+        assert_eq!(item.metadata.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn list_path_reports_a_missing_path() {
+        let dir = temp_dir();
+        assert!(
+            list_path(dir.path().join("absent")).await.is_not_found(),
+            "a missing path is neither a file nor a directory"
+        );
+    }
+
+    /// Asking about no names is satisfied by any directory, including an empty one — the check
+    /// is over the names given, and there are none to be missing.
+    #[tokio::test]
+    async fn all_names_exist_is_true_for_no_names() {
+        let dir = temp_dir();
+        assert!(filesystem_names_all_exist(dir.path(), &[]).await);
+    }
+
+    #[tokio::test]
+    async fn all_names_exist_requires_every_name() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("one"), b"").expect("write one");
+        std::fs::write(dir.path().join("two"), b"").expect("write two");
+
+        assert!(filesystem_names_all_exist(dir.path(), &["one", "two"]).await);
+        assert!(!filesystem_names_all_exist(dir.path(), &["one", "three"]).await);
+        assert!(!filesystem_names_all_exist(dir.path(), &["three"]).await);
+    }
+
+    /// The comparison is exact, which is the whole reason this exists rather than `Path::exists`:
+    /// on a case-insensitive filesystem that would answer for a name that is not the one asked
+    /// about.
+    #[tokio::test]
+    async fn all_names_exist_compares_exactly() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("Assets"), b"").expect("write Assets");
+
+        assert!(filesystem_names_all_exist(dir.path(), &["Assets"]).await);
+        assert!(!filesystem_names_all_exist(dir.path(), &["assets"]).await);
+    }
+
+    #[tokio::test]
+    async fn all_names_exist_is_false_for_an_unreadable_directory() {
+        let dir = temp_dir();
+        assert!(!filesystem_names_all_exist(&dir.path().join("absent"), &["any"]).await);
+    }
 }

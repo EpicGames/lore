@@ -154,7 +154,7 @@ pub struct ProtocolErrorInfo {
     pub is_appropriate_for_logging: bool,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "integration_tests"))]
 pub mod tests {
     use std::env;
     use std::path::PathBuf;

@@ -8,6 +8,7 @@ disallowed-methods = [
     { path = "tokio::spawn", reason = "Use lore_base::lore_spawn! so LORE_CONTEXT is propagated to the spawned task." },
     { path = "tokio::task::spawn", reason = "Use lore_base::lore_spawn! so LORE_CONTEXT is propagated to the spawned task." },
     { path = "tokio::task::spawn_blocking", reason = "Use lore_base::lore_spawn_blocking! (or lore_spawn_blocking_nocontext!) so LORE_CONTEXT is propagated and the work lands on the core blocking pool." },
+    { path = "tokio::task::block_in_place", reason = "Hands this worker's core to a replacement thread taken from the blocking pool, so it spends the same small budget as spawn_blocking while reading as though it costs no thread. Once that budget is gone the replacement is queued instead of spawned, and the core it holds stops running tasks until a slot frees. Await an async form instead; where none exists, add #[allow(clippy::disallowed_methods)] with a comment on why the call cannot stall a core." },
     { path = "tokio::task::spawn_local", reason = "Use lore_base::lore_spawn! so LORE_CONTEXT is propagated to the spawned task." },
     { path = "tokio::runtime::Handle::spawn", reason = "Use lore_base::lore_spawn! so LORE_CONTEXT is propagated and the task runs on the shared lore runtime." },
     { path = "tokio::runtime::Handle::spawn_blocking", reason = "Use lore_base::lore_spawn_blocking! so LORE_CONTEXT is propagated and the work lands on the core blocking pool." },

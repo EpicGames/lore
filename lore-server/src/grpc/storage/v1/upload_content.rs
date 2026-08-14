@@ -213,7 +213,7 @@ mod tests {
 
             let address = Address::from(first.address.expect("address"));
             assert_eq!(address.context, Context::from(file_id));
-            let restored = lore_storage::read(
+            let (_, restored) = lore_storage::read(
                 immutable,
                 repository,
                 address,

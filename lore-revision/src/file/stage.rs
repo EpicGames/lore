@@ -432,6 +432,17 @@ pub async fn stage(
     for (layer, layer_state) in layer_staged {
         let state = layer_state.state_staged.clone();
 
+        // A staged state never hashes equal to the committed current, so
+        // pinning an unmutated layer pins a staged revision with nothing in it.
+        if !state.is_dirty() {
+            lore_debug!(
+                "Layer at {} has no staged modifications, leaving staged state {} untouched",
+                layer.target_path,
+                layer.staged
+            );
+            continue;
+        }
+
         state.set_revision_number(0);
 
         state.set_parent_self(layer_state.state_current.revision());
@@ -753,7 +764,8 @@ pub async fn stage_move(
 
     // Get target file/directory metadata
     let to_absolute_path = to_path.to_absolute_path(repository.require_path()?);
-    let to_metadata = tokio::fs::metadata(to_absolute_path)
+    let to_metadata = lore_io::IoDriver::global()
+        .metadata(to_absolute_path)
         .await
         .internal(&format!("Path {to_path} does not exist in repository "))?;
 

@@ -34,7 +34,6 @@ use crate::lore::RepositoryId;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_error;
-use crate::lore_spawn_blocking;
 use crate::lore_trace;
 use crate::node::Node;
 use crate::node::NodeBlock;
@@ -292,60 +291,9 @@ pub(crate) async fn process_link_updates(
     state: Arc<State>,
     link_tracker: Arc<link::LinkTracker>,
 ) -> Result<(), StageError> {
-    if !link_tracker.has_modifications() {
-        return Ok(());
-    }
-
-    let links_needing_rehash = link_tracker.get_links_needing_rehash();
-
-    for link_context in links_needing_rehash {
-        // Get the current branch from existing link metadata
-        let link_reference = state
-            .link_find(
-                repository.clone(),
-                link_context.link_repository_id,
-                link_context.link_node_id,
-            )
-            .await
-            .forward::<StageError>("Link not found for update")?;
-
-        let current_link_reference = state_current
-            .link_find(
-                repository.clone(),
-                link_context.link_repository_id,
-                link_context.link_node_id,
-            )
-            .await
-            .forward::<StageError>("Link not found for update")?;
-
-        lore_debug!(
-            "Setting link parent to {}",
-            current_link_reference.signature
-        );
-
-        link::reserialize_tracked_link(
-            &state,
-            repository.clone(),
-            token,
-            &link_context,
-            current_link_reference.signature,
-            link_reference.branch,
-        )
+    link::drain_link_tracker(repository, token, state_current, state, &link_tracker, true)
         .await
-        .forward::<StageError>("Failed to update link")?;
-
-        // Mark the link node as staged
-        state
-            .node_mark(
-                repository.clone(),
-                link_context.link_node_id,
-                NodeFlags::Staged,
-                true,
-            )
-            .await
-            .forward::<StageError>("Failed to mark node as staged")?;
-    }
-    Ok(())
+        .forward::<StageError>("Failed to update link")
 }
 
 /// Stage changes from filesystem into the given state
@@ -397,7 +345,10 @@ pub(crate) async fn stage_filesystem_path(
         return Ok(NodeLink::invalid());
     }
 
-    if let Ok(metadata) = tokio::fs::metadata(&full_absolute_path).await {
+    if let Ok(metadata) = lore_io::IoDriver::global()
+        .metadata(&full_absolute_path)
+        .await
+    {
         if metadata.is_dir() {
             lore_debug!(
                 "Stage directory: {}/{}",
@@ -433,7 +384,8 @@ pub(crate) async fn stage_filesystem_path(
                 continue;
             }
 
-            let current_metadata = tokio::fs::metadata(current_absolute_path.join(current_name))
+            let current_metadata = lore_io::IoDriver::global()
+                .metadata(current_absolute_path.join(current_name))
                 .await
                 .internal(&format!(
                     "Failed to query file system metadata for path {}",
@@ -578,27 +530,22 @@ pub(crate) async fn stage_filesystem_path(
         if let Some(ref tracker) = link_tracker
             && node_link.repository != repository.id
         {
-            let link_path = relative_path.clone().into_buf();
+            // Record a tracker context for every link crossed to reach the
+            // deleted path, so a delete nested two or more levels deep folds
+            // its pin up through all intermediate links (not just one level).
+            let chain = crate::link::resolve_link_chain(
+                repository.clone(),
+                state.clone(),
+                state.clone(),
+                relative_path.clone(),
+                BranchId::default(),
+            )
+            .await
+            .forward::<StageError>("Failed to resolve link chain")?;
 
-            // Find the parent repository's link node
-            let parent_link_node_id = state
-                .find_link_parent_node(
-                    repository.clone(),
-                    relative_path.as_str(),
-                    node_link.repository,
-                )
-                .await
-                .forward::<StageError>("Failed to find subnode")?;
-
-            let link_context = crate::link::LinkContext {
-                link_repository_id: node_link.repository,
-                link_node_id: parent_link_node_id,
-                parent_repository_id: repository.id,
-                link_path,
-                link_state: node_state.clone(),
-            };
-
-            tracker.add_link(link_context);
+            chain
+                .record_tracker_contexts(tracker, &node_state, relative_path.as_str())
+                .await;
         }
 
         let node_path = node_state
@@ -1152,7 +1099,7 @@ async fn resolve_case_variant_collisions(
                         from_path.display(),
                         to_path.display()
                     );
-                    let _ = util::fs::unify_name_case_rename(&from_path, &to_path);
+                    let _ = util::fs::unify_name_case_rename(&from_path, &to_path).await;
                 }
             }
         }
@@ -1225,8 +1172,9 @@ pub(crate) async fn stage_directory(
         children_name.push(current_block.node(node_index).name_hash);
     }
 
-    let mut file_list =
-        util::fs::list_directory(absolute_path.to_path_buf()).internal(&format!(
+    let mut file_list = util::fs::list_directory(absolute_path.to_path_buf())
+        .await
+        .internal(&format!(
             "Failed to list directory files in {}",
             absolute_path.to_string_lossy()
         ))?;
@@ -1237,7 +1185,10 @@ pub(crate) async fn stage_directory(
     // the second to undo the case rename performed by the first, producing a nondeterministic
     // result depending on iteration order.
     let mut items: Vec<util::fs::FileListItem> = Vec::new();
-    while let Some(item) = file_list.recv().await {
+    while let Some(entry) = file_list.next().await {
+        let Some(item) = util::fs::file_list_item(entry) else {
+            continue;
+        };
         if item.metadata.is_dir() || item.metadata.is_file() {
             items.push(item);
         }
@@ -1856,19 +1807,15 @@ pub(crate) async fn stage_node_from_metadata(
                 name = node_name;
                 let to_path = absolute_path.join(&name);
 
-                lore_spawn_blocking!(move || {
-                    util::fs::unify_name_case_rename(from_path.as_path(), to_path.as_path())
-                        .map_err(|e| {
-                            format!(
-                                "Unable to rename file system path {} to {}: {e}",
-                                from_path.display(),
-                                to_path.display()
-                            )
-                        })
-                })
-                .await
-                .map_err(|e| StageError::internal_with_context(e, "Failed to join task"))?
-                .map_err(StageError::internal)?;
+                util::fs::unify_name_case_rename(from_path.as_path(), to_path.as_path())
+                    .await
+                    .map_err(|e| {
+                        StageError::internal(format!(
+                            "Unable to rename file system path {} to {}: {e}",
+                            from_path.display(),
+                            to_path.display()
+                        ))
+                    })?;
             }
             StageCaseChange::Rename => {
                 // Stage a rename operation, updating the repository to match the file system
@@ -1881,37 +1828,31 @@ pub(crate) async fn stage_node_from_metadata(
                 // the new one (e.g. both "Assets" and "assets" as separate directories).
                 // If so, unify the file system by merging the old into the new so that the
                 // stage picks up contents from both.
-                // Use filesystem_name_exists to check for an exact-case match rather than
-                // Path::exists which is case-insensitive on Windows/macOS.
-                let parent_path = absolute_path.clone();
-                let old_name = node_name.clone();
-                let new_name = name.clone();
-                lore_spawn_blocking!(move || {
-                    let old_path = parent_path.join(&old_name);
-                    let new_path = parent_path.join(&new_name);
-                    if util::fs::filesystem_name_exists(parent_path.as_path(), &old_name)
-                        && util::fs::filesystem_name_exists(parent_path.as_path(), &new_name)
-                    {
-                        lore_debug!(
-                            "Case rename: old path {} still exists alongside {}, unifying file system",
-                            old_path.display(),
-                            new_path.display()
-                        );
-                        util::fs::unify_name_case_rename(old_path.as_path(), new_path.as_path())
-                            .map_err(|e| {
-                                format!(
-                                    "Unable to rename file system path {} to {}: {e}",
-                                    old_path.display(),
-                                    new_path.display()
-                                )
-                            })
-                    } else {
-                        Ok(())
-                    }
-                })
+                // Re-read rather than reused from the parent's listing: staging a sibling renames
+                // entries in this directory, so an earlier snapshot answers a stale question.
+                let old_path = absolute_path.join(&node_name);
+                let new_path = absolute_path.join(&name);
+                if util::fs::filesystem_names_all_exist(
+                    absolute_path.as_path(),
+                    &[node_name.as_str(), name.as_str()],
+                )
                 .await
-                .map_err(|e| StageError::internal_with_context(e, "Failed to join task"))?
-                .map_err(StageError::internal)?;
+                {
+                    lore_debug!(
+                        "Case rename: old path {} still exists alongside {}, unifying file system",
+                        old_path.display(),
+                        new_path.display()
+                    );
+                    util::fs::unify_name_case_rename(old_path.as_path(), new_path.as_path())
+                        .await
+                        .map_err(|e| {
+                            StageError::internal(format!(
+                                "Unable to rename file system path {} to {}: {e}",
+                                old_path.display(),
+                                new_path.display()
+                            ))
+                        })?;
+                }
 
                 // Set updated node name
                 node.name_hash = name_hash;
@@ -3217,7 +3158,8 @@ pub(crate) async fn stage_from_parent_state(
             let stats = stats.clone();
             let relative_path = change.path.clone();
             lore_spawn!(tasks, async move {
-                let metadata = tokio::fs::metadata(absolute_path.as_path())
+                let metadata = lore_io::IoDriver::global()
+                    .metadata(absolute_path.as_path())
                     .await
                     .internal(&format!(
                         "Failed to query file system metadata for path {}",

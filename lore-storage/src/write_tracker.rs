@@ -20,11 +20,13 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use crate::error::StorageError;
-use crate::types::Address;
 use crate::types::Fragment;
 
 /// Result type every leader / follower task yields.
-pub type TrackedResult = Result<(Address, Fragment), StorageError>;
+///
+/// Success carries nothing: the tracker only ever asks whether the write landed, and the caller
+/// that dispatched it already has the address.
+pub type TrackedResult = Result<(), StorageError>;
 
 /// Callback invoked per stored fragment with its header and dedup status.
 pub type FragmentObserver = Arc<dyn Fn(&Fragment, bool) + Send + Sync>;
@@ -210,24 +212,10 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
-    use zerocopy::FromZeros;
-
     use super::*;
-    use crate::types::Context;
-    use crate::types::Hash;
 
     fn ok_result() -> TrackedResult {
-        Ok((
-            Address {
-                context: Context::new_zeroed(),
-                hash: Hash::new_zeroed(),
-            },
-            Fragment {
-                flags: 0,
-                size_payload: 1,
-                size_content: 1,
-            },
-        ))
+        Ok(())
     }
 
     #[tokio::test]
@@ -282,11 +270,11 @@ mod tests {
         let tracker = Arc::new(WriteTracker::new());
         tracker.spawn_leader(async {
             tokio::time::sleep(Duration::from_millis(5)).await;
-            Err::<(Address, Fragment), _>(StorageError::internal("first"))
+            Err::<(), _>(StorageError::internal("first"))
         });
         tracker.spawn_leader(async {
             tokio::time::sleep(Duration::from_millis(30)).await;
-            Err::<(Address, Fragment), _>(StorageError::internal("second"))
+            Err::<(), _>(StorageError::internal("second"))
         });
         let err = tracker
             .await_all()

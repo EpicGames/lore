@@ -28,6 +28,7 @@ use crate::hash;
 use crate::immutable;
 use crate::immutable::ImmutableError;
 use crate::immutable::ReadBoxFromImmutable;
+use crate::interface::LoreNodeStagedAction;
 use crate::lore::Address;
 use crate::lore::CloneHeapAlloc;
 use crate::lore::Hash;
@@ -341,6 +342,31 @@ impl Node {
     /// Check if node is staged for inclusion in a commit
     pub fn is_staged(&self) -> bool {
         (self.flags & NodeFlags::Staged) == NodeFlags::Staged.bits()
+    }
+
+    /// The staged change this node carries, as the API surface names it.
+    ///
+    /// Reports [`LoreNodeStagedAction::None`] for a node with no staging bits,
+    /// which is every node of a freshly loaded revision — commit clears the
+    /// change flags on what it writes. Delete is tested before add so a node
+    /// staged for addition and then staged for deletion reports the deletion.
+    pub fn staged_action(&self) -> LoreNodeStagedAction {
+        if !self.is_staged() {
+            return LoreNodeStagedAction::None;
+        }
+        if self.is_staged_delete() {
+            LoreNodeStagedAction::Delete
+        } else if self.is_staged_add() {
+            LoreNodeStagedAction::Add
+        } else if self.is_staged_move() {
+            LoreNodeStagedAction::Move
+        } else if self.is_staged_copy() {
+            LoreNodeStagedAction::Copy
+        } else if self.is_staged_modify() {
+            LoreNodeStagedAction::Modify
+        } else {
+            LoreNodeStagedAction::None
+        }
     }
 
     /// Check if node is staged for deletion

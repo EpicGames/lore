@@ -192,11 +192,8 @@ mod tests {
 
                 // Rename a directory
                 // - dir_untouched -> dir_renamed
-                lore_storage::fs_util::rename_file(
-                    path.join("dir_untouched"),
-                    path.join("dir_renamed"),
-                )
-                .expect("Failed to rename dir_untouched directory");
+                std::fs::rename(path.join("dir_untouched"), path.join("dir_renamed"))
+                    .expect("Failed to rename dir_untouched directory");
 
                 // Modify a file
                 // - dir_modified/file_modified.txt

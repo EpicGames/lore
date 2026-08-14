@@ -29,7 +29,6 @@ use crate::link;
 use crate::lore::BranchId;
 use crate::lore::Hash;
 use crate::lore_debug;
-use crate::lore_spawn_blocking;
 use crate::lore_trace;
 use crate::node;
 use crate::node::Node;
@@ -297,10 +296,13 @@ pub async fn reset(
             execution_context().globals().search_location(),
         )
         .await
-        .map_err(|_err| {
-            ResetError::from(RevisionNotFound {
-                revision: revision_spec,
-            })
+        .map_err(|err| {
+            ResetError::RevisionNotFound(
+                RevisionNotFound {
+                    revision: revision_spec,
+                }
+                .chain_err_from(err, "target revision not found"),
+            )
         })?;
         state::State::deserialize(repository.clone(), resolved)
             .await
@@ -470,10 +472,13 @@ pub async fn reset_to_last_merged(
     let branch_name = branch.to_string();
     let branch = branch::resolve(repository.clone(), branch.as_str())
         .await
-        .map_err(|_err| {
-            ResetError::from(BranchNotFound {
-                branch: branch_name.clone(),
-            })
+        .map_err(|err| {
+            ResetError::BranchNotFound(
+                BranchNotFound {
+                    branch: branch_name.clone(),
+                }
+                .chain_err_from(err, "branch for last-merged reset not found"),
+            )
         })?;
 
     let branch_current = current_branch;
@@ -687,7 +692,7 @@ async fn wrap_path_error(
 ) -> Result<(), ResetError> {
     let absolute = relative_path.to_absolute_path(repository.require_path()?);
     let wrapped: Result<(), ResetError> = Err(err);
-    match tokio::fs::metadata(&absolute).await {
+    match lore_io::IoDriver::global().metadata(&absolute).await {
         Ok(_) => wrapped
             .forward::<ResetError>(&format!("Failed resetting an existing path: {user_path}")),
         _ => wrapped.forward::<ResetError>(&format!(
@@ -877,7 +882,7 @@ async fn find_merge_state(
         let node_link = state
             .find_node_link(repository.clone(), relative_path.as_str())
             .await
-            .map_err(|_err| ResetError::internal("Failed to find node"))?;
+            .map_err(|err| ResetError::internal_with_context(err, "Failed to find node"))?;
 
         let node_id = node_link.node;
 
@@ -1131,26 +1136,33 @@ async fn reset_walk_path(ctx: ResetContext, relative_path: RelativePath) -> Resu
             }
 
             if delete_path {
-                lore_trace!("Reset removing path {}", relative_path.as_str());
-                stats.file_delete_count.fetch_add(1, Ordering::Relaxed);
-                event::LoreEvent::FileResetFile(LoreFileResetFileEventData {
-                    path: LoreString::from(&relative_path),
-                    action: LoreFileAction::Delete,
-                    from_path: LoreString::default(),
-                })
-                .send();
-
-                util::fs::unlink_recursive(
-                    relative_path.to_absolute_path(repository.require_path()?),
-                )
-                .await
-                .internal("Failed to remove path")?;
+                reset_delete_path(&repository, &stats, relative_path).await?;
             }
 
             Ok(())
         }
         Err(err) => Err(err).forward::<ResetError>("Failed to find node"),
     }
+}
+
+async fn reset_delete_path(
+    repository: &Arc<RepositoryContext>,
+    stats: &Arc<ResetStats>,
+    relative_path: RelativePath,
+) -> Result<(), ResetError> {
+    lore_trace!("Reset removing path {}", relative_path.as_str());
+    stats.file_delete_count.fetch_add(1, Ordering::Relaxed);
+    event::LoreEvent::FileResetFile(LoreFileResetFileEventData {
+        path: LoreString::from(&relative_path),
+        action: LoreFileAction::Delete,
+        from_path: LoreString::default(),
+    })
+    .send();
+
+    util::fs::unlink_recursive(relative_path.to_absolute_path(repository.require_path()?))
+        .await
+        .internal("Failed to remove path")?;
+    Ok(())
 }
 
 /// Apply view/ignore filter, staged check, and dispatch a single child node
@@ -1361,14 +1373,19 @@ async fn reset_walk_directory(
     if child_node_iter.is_none() {
         if !directory_path.is_empty() {
             let absolute_path = directory_path.to_absolute_path(repository.require_path()?);
-            match tokio::fs::create_dir(absolute_path.as_path()).await {
+            match lore_io::IoDriver::global()
+                .create_dir_all(absolute_path.as_path())
+                .await
+            {
                 Ok(_) => {
                     lore_trace!("Created empty directory: {}", directory_path.as_str());
                 }
                 Err(err) => {
                     if err.kind() == std::io::ErrorKind::AlreadyExists {
                         lore_trace!("Directory already exists: {}", directory_path.as_str());
-                    } else if let Ok(metadata) = tokio::fs::metadata(absolute_path.as_path()).await
+                    } else if let Ok(metadata) = lore_io::IoDriver::global()
+                        .metadata(absolute_path.as_path())
+                        .await
                     {
                         if metadata.is_dir() {
                             lore_trace!("Directory already exists: {}", directory_path.as_str());
@@ -1494,17 +1511,27 @@ async fn reset_walk_directory(
     // its tracked children were filter-excluded — nothing to purge in that
     // case.
     let absolute_dir = directory_path.to_absolute_path(repository.require_path()?);
-    if tokio::fs::metadata(&absolute_dir).await.is_err() {
+    if lore_io::IoDriver::global()
+        .metadata(&absolute_dir)
+        .await
+        .is_err()
+    {
         return Ok(());
     }
-    let mut filesystem_children = util::fs::list_directory(absolute_dir).internal(&format!(
-        "Failed to list directory files in {}",
-        directory_path.as_str()
-    ))?;
+    let mut filesystem_children =
+        util::fs::list_directory(absolute_dir)
+            .await
+            .internal(&format!(
+                "Failed to list directory files in {}",
+                directory_path.as_str()
+            ))?;
 
     let force = execution_context().globals().force();
     let mut tasks = JoinSet::new();
-    while let Some(filesystem_child) = filesystem_children.recv().await {
+    while let Some(entry) = filesystem_children.next().await {
+        let Some(filesystem_child) = util::fs::file_list_item(entry) else {
+            continue;
+        };
         if filesystem_child.name == DOT_URC || filesystem_child.name == DOT_LORE {
             continue;
         }
@@ -1631,15 +1658,15 @@ async fn reset_file_realize(
     } = item;
 
     let node_path = relative_path.to_absolute_path(repository.require_path()?);
-    let metadata = tokio::fs::metadata(&node_path).await;
+    let metadata = lore_io::IoDriver::global().metadata(&node_path).await;
 
     let force = execution_context().globals().force();
 
     let block_index = NodeBlock::index(node_id);
     let node_index = Node::index(node_id);
 
-    if !force && let Ok(file_metadata) = metadata {
-        let (mtime, size) = crate::util::fs::file_mtime_and_size(&file_metadata);
+    if !force && let Ok(file_metadata) = metadata.as_ref() {
+        let (mtime, size) = crate::util::fs::file_mtime_and_size(file_metadata);
         let (file_modified, _) = state::is_file_modified(
             repository.clone(),
             &node,
@@ -1678,13 +1705,9 @@ async fn reset_file_realize(
                 .send();
 
                 let to_path = to_path.to_absolute_path(repository.require_path()?);
-                lore_spawn_blocking!(move || {
-                    util::fs::unify_name_case_rename(node_path.as_path(), to_path.as_path())
-                })
-                .await
-                .map_err(std::io::Error::other)
-                .flatten()
-                .internal("Failed renaming file")?;
+                util::fs::unify_name_case_rename(node_path.as_path(), to_path.as_path())
+                    .await
+                    .internal("Failed renaming file")?;
             } else {
                 lore_trace!("File {relative_path} is not modified, no reset");
             }
@@ -1696,6 +1719,14 @@ async fn reset_file_realize(
         "Recovering node {name} with path {}",
         relative_path.as_str()
     );
+
+    // If being reset from a directory to a file the directory must be deleted before the file is
+    // created.
+    if let Ok(metadata) = metadata
+        && metadata.is_dir()
+    {
+        reset_delete_path(&repository, &stats, relative_path.clone()).await?;
+    }
 
     stats.file_reset_count.fetch_add(1, Ordering::Relaxed);
     event::LoreEvent::FileResetFile(LoreFileResetFileEventData {

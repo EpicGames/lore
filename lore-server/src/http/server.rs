@@ -107,6 +107,20 @@ pub struct LoreHttpServerSettings {
     pub user_agent_filter: Arc<UserAgentFilter>,
 }
 
+impl LoreHttpServerSettings {
+    /// Settings suitable for unit tests: generous timeouts so a zero-duration
+    /// `TimeoutLayer` (the result of `u64::default() == 0`) does not race
+    /// against async handlers
+    #[cfg(test)]
+    pub fn test_default() -> Self {
+        Self {
+            request_timeout_seconds: 30,
+            request_body_timeout_seconds: 30,
+            ..Self::default()
+        }
+    }
+}
+
 // Expose a testable router factory
 pub fn create_router(
     shared_state: ServerState,

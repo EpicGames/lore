@@ -58,7 +58,7 @@ pub struct LoreRevisionTreeMoveArgs {
 
 fn emit_move_complete(id: u64, node_id: NodeID, error_code: LoreErrorCode) {
     LoreEvent::RevisionTreeMoveComplete(LoreRevisionTreeMoveCompleteEventData {
-        id,
+        entry_id: id,
         node_id,
         error_code,
     })
@@ -162,7 +162,7 @@ mod tests {
                 LoreEvent::Complete(data) => Self::Complete(data.status),
                 LoreEvent::RevisionTreeLoaded(data) => Self::RevisionTreeLoaded(data.handle_id),
                 LoreEvent::RevisionTreeMoveComplete(data) => {
-                    Self::MoveComplete(data.id, data.node_id, data.error_code)
+                    Self::MoveComplete(data.entry_id, data.node_id, data.error_code)
                 }
                 other => Self::Other(other.discriminant()),
             }

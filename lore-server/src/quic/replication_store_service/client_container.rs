@@ -244,6 +244,7 @@ mod tests {
 
     use async_trait::async_trait;
     use lore_revision::util::time::RetryPolicy;
+    use lore_storage::StoreGetData;
     use lore_transport::ProtocolError;
     use lore_transport::quic::client::ConnectionStats;
     use lore_transport::quic::client::FrameStats;
@@ -253,10 +254,8 @@ mod tests {
     use tokio::sync::mpsc::Receiver;
 
     use super::*;
-    use crate::protocol::replication_store::exists_batch::ExistsBatch;
-    use crate::protocol::replication_store::exists_batch::ExistsBatchResponse;
     use crate::protocol::replication_store::get::Get;
-    use crate::protocol::replication_store::get::GetResponse;
+    use crate::protocol::replication_store::get_metadata::GetMetadata;
     use crate::protocol::replication_store::obliterate::Obliterate;
     use crate::protocol::replication_store::obliterate::ObliterateResponse;
     use crate::protocol::replication_store::put::Put;
@@ -272,13 +271,13 @@ mod tests {
         impl StoreClient for Client {
             async fn connection_stats(&self) -> Option<ConnectionStats>;
             async fn put(&self, request: Put) -> Result<(), ReplicationStoreClientError>;
-            async fn exists_batch(&self, request: ExistsBatch) -> Result<ExistsBatchResponse, ReplicationStoreClientError>;
             async fn obliterate(&self, request: Obliterate) -> Result<ObliterateResponse, ReplicationStoreClientError>;
-            async fn get(&self, request: Get) -> Result<GetResponse, ReplicationStoreClientError>;
-            async fn query(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError>;
+            async fn get(&self, request: Get) -> Result<StoreGetData, ReplicationStoreClientError>;
+            async fn get_metadata(&self, request: GetMetadata) -> Result<StoreGetData, ReplicationStoreClientError>;
             async fn local_put(&self, request: Put) -> Result<(), ReplicationStoreClientError>;
-            async fn local_exists_batch(&self, request: ExistsBatch) -> Result<ExistsBatchResponse, ReplicationStoreClientError>;
-            async fn local_get(&self, request: Get) -> Result<GetResponse, ReplicationStoreClientError>;
+            async fn local_get(&self, request: Get) -> Result<StoreGetData, ReplicationStoreClientError>;
+            async fn local_get_metadata(&self, request: GetMetadata) -> Result<StoreGetData, ReplicationStoreClientError>;
+            async fn query(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError>;
             async fn local_query(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError>;
         }
     }

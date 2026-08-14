@@ -5,25 +5,26 @@
 //! options struct carries the `remote_write` flag (`u8`, 0 or 1, not
 //! `bool`) selecting between local-only and remote-uploading commits.
 
-use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use lore_base::error::InvalidArguments;
 use lore_base::types::BranchId;
 use lore_base::types::Hash;
+use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
-use lore_revision::branch;
 use lore_revision::commit::CommitError;
-use lore_revision::commit::commit_tree;
+use lore_revision::commit::LoreRevisionCommitRevisionEventData;
+use lore_revision::commit::commit_in_memory_revision;
+use lore_revision::commit::resolve_commit_branch;
+use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_tree::LoreRevisionTreeCommitCompleteEventData;
-use lore_revision::lore::execution_context;
+use lore_revision::interface::LoreError;
 use lore_revision::metadata::Metadata;
-use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
-use lore_revision::state::State;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -31,8 +32,10 @@ use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
 use crate::revision_tree::call::revision_tree_call;
+use crate::revision_tree::handle::IN_MEMORY_MARKER;
 use crate::revision_tree::handle::LoreRevisionTree;
-use crate::revision_tree::handle::synth_repository_write_context;
+use crate::revision_tree::handle::RevisionTreeInternal;
+use crate::storage::store::PerCallFlags;
 
 /// Tuneables for `lore_revision_tree_commit`.
 #[repr(C)]
@@ -51,23 +54,43 @@ pub struct LoreRevisionTreeCommitArgs {
     pub id: u64,
     /// Loaded revision-tree handle to freeze and commit
     pub handle: LoreRevisionTree,
-    /// Branch whose tip is atomically advanced to the new revision
-    pub branch: BranchId,
     /// Commit tuneables (local-only vs remote-uploading)
     pub options: LoreRevisionTreeCommitOptions,
 }
 
-/// Map a commit failure to the per-call event's error code. The full ffi
-/// error code (branch-advanced, nothing-staged, …) still travels on the
-/// trailing `Complete` detail; the event code is the coarse discriminator
-/// the caller branches on.
-fn error_code_for(error: &CommitError) -> LoreErrorCode {
-    match error {
-        CommitError::BranchAdvanced(_) => LoreErrorCode::BranchAdvanced,
-        CommitError::InvalidArguments(_) | CommitError::NothingStaged(_) => {
-            LoreErrorCode::InvalidArguments
+/// Two variants on purpose: every one a caller can act on through the arguments is
+/// `InvalidArguments`, and everything else is `Internal` with the reason in the
+/// error detail — which is what `CommitError::translated()` does for the
+/// file-system commit, so the same failure reports the same code on both surfaces.
+///
+/// Nothing finer is worth adding. `LoreErrorCode` has five values and neither a tip
+/// collision nor an empty commit is among them, so a third variant here would make
+/// the completion status and the terminal's `error_code` disagree about one failure
+/// while telling a caller nothing new.
+#[error_set]
+enum CommitVerbError {
+    InvalidArguments,
+}
+
+impl EventError for CommitVerbError {
+    fn translated(&self) -> LoreError {
+        match self {
+            CommitVerbError::InvalidArguments(_) => LoreError::InvalidArguments,
+            CommitVerbError::Internal(_) => LoreError::Internal,
         }
-        _ => LoreErrorCode::Internal,
+    }
+
+    fn inner(&self) -> String {
+        self.to_string()
+    }
+}
+
+/// The code the terminal reports for a finished call, matching what the completion
+/// status carries.
+fn commit_error_code(error: &CommitVerbError) -> LoreErrorCode {
+    match error {
+        CommitVerbError::InvalidArguments(_) => LoreErrorCode::InvalidArguments,
+        CommitVerbError::Internal(_) => LoreErrorCode::Internal,
     }
 }
 
@@ -86,75 +109,61 @@ fn emit_commit_complete(
     .send();
 }
 
-/// Publish a locally constructed revision through the remote branch gate.
+/// Freeze the handle's tree into a new revision and advance its branch tip.
 ///
-/// A transport error can happen after the server accepted the push but before
-/// the response reached us. Querying the remote branch makes that case
-/// retry-safe: observing `revision_hash` as the remote latest is success;
-/// observing a tip other than the expected base is a real tip collision; an
-/// unchanged base preserves non-tip rejections (for example protection) as
-/// their generic commit failure.
-async fn push_remote_revision(
-    repository: std::sync::Arc<RepositoryContext>,
-    branch_id: BranchId,
-    expected_remote_tip: Hash,
-    revision_hash: Hash,
-) -> Result<(), (CommitError, Hash)> {
-    let remote = repository.remote().await.map_err(|error| {
-        (
-            CommitError::internal_with_context(error, "connecting to revision remote"),
-            Hash::default(),
-        )
-    })?;
-    let revision = remote.revision(repository.id).await.map_err(|error| {
-        (
-            CommitError::internal_with_context(error, "connecting to remote revision service"),
-            Hash::default(),
-        )
-    })?;
-
-    match revision
-        .branch_push(branch_id, revision_hash, false, false)
-        .await
-    {
-        Ok(response) if response.revision == revision_hash => Ok(()),
-        Ok(response) => Err((
-            CommitError::from(lore_base::error::BranchAdvanced),
-            response.revision,
-        )),
-        Err(push_error) => match revision.branch_query(Some(branch_id), None).await {
-            Ok(branch) if branch.latest == revision_hash => Ok(()),
-            Ok(branch) if branch.latest != expected_remote_tip => Err((
-                CommitError::from(lore_base::error::BranchAdvanced),
-                branch.latest,
-            )),
-            Ok(_) | Err(_) => Err((
-                CommitError::internal_with_context(push_error, "pushing revision branch to remote"),
-                Hash::default(),
-            )),
-        },
-    }
-}
-
-/// Freeze the handle's tree and commit it as a new revision on `branch`.
+/// The branch is the revision's own, not an argument: `metadata_set("branch", …)`
+/// names it, and a key that is set must be either the loaded revision's branch —
+/// continuing it — or a branch whose branch point is exactly the loaded revision,
+/// which is the first revision on a branch created from it. Unset, it resolves to
+/// the loaded revision's branch. A handle loaded from the zero revision has no
+/// parent to read one from and must set the key.
 ///
-/// On success the caller receives `LORE_EVENT_REVISION_TREE_COMMIT_COMPLETE`
-/// carrying the newly-committed revision hash and `error_code = NONE`,
-/// before `Complete {status: 0}`; the handle then behaves as if freshly
-/// loaded from the new revision — no pending edits, reads reflect the new
-/// tree. The commit shares the file-system-based path's branch semantics:
-/// the tip-collision check, the branch-advance write, and the remote-write
-/// contract (`options.remote_write` uploads through the storage handle's
-/// remote when one is configured and the session is neither local nor
-/// offline).
+/// The commit writes exactly the metadata set on the handle and inherits nothing
+/// from the revision it was loaded on, plus the three facts about the commit act
+/// the caller did not supply: the branch, the timestamp if unset, and
+/// `created-by` / `committed-by` if unset. A message is caller metadata like any
+/// other — set it with `metadata_set("message", …)` before committing.
 ///
-/// When the branch tip advanced past the handle's loaded revision the
-/// terminal event reports `error_code = BRANCH_ADVANCED` with the observed
-/// tip in `new_tip_hash`, so the caller can reload against it without an
-/// extra round-trip. Any commit failure marks the handle invalid — the
-/// in-memory state may hold a partially frozen tree — so the caller closes
-/// it and reloads; subsequent operations on the handle fail with
-/// `INVALID_ARGUMENTS`.
+/// On success `LORE_EVENT_REVISION_TREE_COMMIT_COMPLETE` carries the new revision
+/// and `error_code = NONE`, the handle's pending metadata is emptied, and the
+/// handle stays usable: the state now *is* the new revision, so previously
+/// captured node ids still resolve and further edits commit on top.
+///
+/// A failure the call is rejected on — nothing staged, an unusable branch, a tree
+/// the validator refuses, or a branch tip that has already moved — writes nothing
+/// and leaves the handle usable, so a caller can fix the call and retry. A failure
+/// once the freeze has begun leaves the tree part-frozen and **poisons the
+/// handle**: every subsequent call returns `LORE_ERROR_CODE_INVALID_ARGUMENTS`,
+/// and the recovery path is to close it, load a fresh handle against the new tip,
+/// re-apply the edits and commit again.
+///
+/// Neither a tip collision nor an empty commit has a `LoreErrorCode` of its own, so
+/// both report `INTERNAL` with the reason in the completion detail — the same codes
+/// the file-system commit returns. **A non-zero `new_tip_hash` on the terminal is
+/// what identifies a tip collision**, and it carries the tip to reload from so the
+/// recovery needs no extra query.
+///
+/// `options.remote_write = 1` uploads the revision within the call. It is a
+/// request, not a guarantee: a handle whose store is bound offline or local-only,
+/// or a call passing `globals.local`, silently commits local-only. So does a store
+/// opened without a remote configuration — the upload is resolved as requested and
+/// there is simply nothing to send it to, and the commit still reports success.
+/// Per-call flags that contradict the store's bound flags reject the call.
+///
+/// **Two commits in flight on one handle must agree about `remote_write`.** The
+/// resolved value is applied to the handle's shared repository context, so
+/// concurrent calls that disagree can each observe the other's — one uploading when
+/// it asked not to, or not uploading when it asked to, with neither call failing.
+/// Unlike the tip race below there is no compare-and-swap to decide it. Serialize
+/// such commits, or give them separate handles. The value also outlives the call:
+/// the handle carries whatever the last commit resolved.
+///
+/// Concurrent commits on one handle are not serialized against each other; the tip
+/// compare-and-swap decides which one publishes and the loser fails with the tip
+/// the winner set, having possibly left orphan tree blocks behind. They are
+/// content-addressed and no revision references them. Do not call `metadata_set`
+/// while a commit is in flight on the same handle: edits arriving between the
+/// commit's metadata clone and its post-success reset are lost.
 pub async fn commit(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeCommitArgs,
@@ -169,199 +178,209 @@ async fn commit_impl(
     callback: LoreEventCallback,
 ) -> i32 {
     let handle = args.handle;
-    let miss_id = args.id;
     revision_tree_call(
         globals,
         callback,
         handle,
         args,
         commit,
-        move |_| {
+        |args: &LoreRevisionTreeCommitArgs| {
             emit_commit_complete(
-                miss_id,
+                args.id,
                 Hash::default(),
                 Hash::default(),
                 LoreErrorCode::InvalidArguments,
             );
         },
         async move |internal, args: LoreRevisionTreeCommitArgs| {
-            let id = args.id;
-
-            if args.branch.is_zero() {
-                emit_commit_complete(
-                    id,
-                    Hash::default(),
-                    Hash::default(),
-                    LoreErrorCode::InvalidArguments,
-                );
-                return Err(CommitError::from(InvalidArguments {
-                    reason: "branch id is zero".into(),
-                }));
-            }
-
-            // There is no working-tree path to key the write token on;
-            // keying on the repository id serializes memory-based commits
-            // to the same repository in-process. The mutable store's own
-            // lock keeps the branch advance atomic beyond that.
-            let token_key = format!("revision-tree/{}", internal.repository);
-            let token = RepositoryWriteToken::acquire(Path::new(&token_key)).await;
-
-            // The handle's own context is read-only; the commit runs on a
-            // write-capable sibling minted around the held token.
-            let write_context = synth_repository_write_context(
-                &internal.store_internal,
-                internal.repository,
-                &token,
-            )
-            .await;
-
-            // Remote gating mirrors the file-system-based commit verb: the
-            // caller's remote_write option opts in, the session's local /
-            // offline switches veto.
-            let context = execution_context();
-            let globals = context.globals();
-            let upload = args.options.remote_write != 0 && !globals.local() && !globals.offline();
-            write_context.set_disable_upload(!upload);
-
-            let pending_metadata = internal.pending_metadata.read().clone();
-            let deleted = internal.pending_delta.read().clone();
-            let state = internal.state();
-            let expected_remote_tip = state.revision();
-
-            match commit_tree(
-                write_context.clone(),
-                &token,
-                state,
-                pending_metadata,
-                args.branch,
-                deleted,
-            )
-            .await
-            {
-                Ok(revision_hash) => {
-                    if upload
-                        && let Err((error, remote_tip)) = push_remote_revision(
-                            write_context,
-                            args.branch,
-                            expected_remote_tip,
-                            revision_hash,
-                        )
-                        .await
-                    {
-                        internal.invalid.store(true, Ordering::Release);
-                        emit_commit_complete(id, revision_hash, remote_tip, error_code_for(&error));
-                        return Err(error);
-                    }
-
-                    // The handle now behaves as freshly loaded from the new
-                    // revision: swap in a state deserialized from it and drop
-                    // the pending edits it just committed. The committed
-                    // state's in-memory serialization bookkeeping is spent —
-                    // a fresh deserialize is the "freshly loaded" contract.
-                    match State::deserialize(internal.repository_context.clone(), revision_hash)
-                        .await
-                    {
-                        Ok(fresh_state) => {
-                            *internal.state.write() = fresh_state;
-                            *internal.pending_metadata.write() = Metadata::default();
-                            internal.pending_delta.write().clear();
-                            emit_commit_complete(
-                                id,
-                                revision_hash,
-                                Hash::default(),
-                                LoreErrorCode::None,
-                            );
-                            Ok(())
-                        }
-                        Err(error) => {
-                            internal.invalid.store(true, Ordering::Release);
-                            emit_commit_complete(
-                                id,
-                                revision_hash,
-                                Hash::default(),
-                                LoreErrorCode::Internal,
-                            );
-                            Err(CommitError::internal_with_context(
-                                error,
-                                "State::deserialize after commit",
-                            ))
-                        }
-                    }
-                }
-                Err(error) => {
-                    // Any commit failure invalidates the handle — the freeze
-                    // may have partially cleared staged flags, so the
-                    // in-memory state no longer round-trips (see the handle
-                    // contract). The caller closes and reloads.
-                    internal.invalid.store(true, Ordering::Release);
-                    let new_tip_hash = if matches!(error, CommitError::BranchAdvanced(_)) {
-                        branch::load_latest(internal.repository_context.clone(), args.branch)
-                            .await
-                            .unwrap_or_default()
-                    } else {
-                        Hash::default()
-                    };
-                    emit_commit_complete(id, Hash::default(), new_tip_hash, error_code_for(&error));
-                    Err(error)
-                }
-            }
+            commit_revision(internal, args).await
         },
     )
     .await
 }
 
+/// Reject a call whose per-call flags contradict the store's bound flags, and
+/// otherwise report whether the commit may upload.
+fn resolve_upload(
+    internal: &RevisionTreeInternal,
+    remote_write: u8,
+) -> Result<bool, CommitVerbError> {
+    let per_call = PerCallFlags::from_globals(lore_revision::lore::execution_context().globals());
+    let effective = internal.store_internal.effective_flags(per_call)?;
+    Ok(remote_write != 0 && !effective.no_remote)
+}
+
+async fn commit_revision(
+    internal: Arc<RevisionTreeInternal>,
+    args: LoreRevisionTreeCommitArgs,
+) -> Result<(), CommitVerbError> {
+    let id = args.id;
+
+    let upload = match resolve_upload(&internal, args.options.remote_write) {
+        Ok(upload) => upload,
+        Err(error) => {
+            emit_commit_complete(
+                id,
+                Hash::default(),
+                Hash::default(),
+                LoreErrorCode::InvalidArguments,
+            );
+            return Err(error);
+        }
+    };
+    internal.repository_context.set_disable_upload(!upload);
+
+    let repository_context = internal.repository_context.clone();
+    let current_revision = internal.state.revision();
+    let metadata = internal.pending_metadata.read().clone();
+
+    let branch = match resolve_commit_branch(
+        repository_context.clone(),
+        internal.state.clone(),
+        &metadata,
+        current_revision,
+    )
+    .await
+    {
+        Ok(branch) => branch,
+        Err(error) => {
+            emit_commit_complete(
+                id,
+                Hash::default(),
+                Hash::default(),
+                LoreErrorCode::InvalidArguments,
+            );
+            return Err(CommitVerbError::from(InvalidArguments {
+                reason: error.to_string(),
+            }));
+        }
+    };
+
+    let token = RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER);
+    match commit_in_memory_revision(
+        repository_context.clone(),
+        &token,
+        internal.state.clone(),
+        metadata,
+        current_revision,
+        branch,
+    )
+    .await
+    {
+        Ok(revision) => {
+            *internal.pending_metadata.write() = Metadata::default();
+            emit_commit_complete(id, revision, Hash::default(), LoreErrorCode::None);
+            emit_commit_telemetry(&internal, branch, revision, current_revision);
+            Ok(())
+        }
+        Err(failure) => {
+            if failure.tree_mutated {
+                internal.invalid.store(true, Ordering::Release);
+            }
+            let branch_advanced = failure.error.is_branch_advanced();
+            let new_tip_hash = if branch_advanced {
+                lore_revision::branch::load_latest(repository_context, branch)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                Hash::default()
+            };
+            let error = map_commit_error(failure.error);
+            emit_commit_complete(id, Hash::default(), new_tip_hash, commit_error_code(&error));
+            Err(error)
+        }
+    }
+}
+
+/// Emit the revision event file-system commit consumers already subscribe to, so a
+/// pipeline watching `RevisionCommit*` sees revisions from this surface too.
+fn emit_commit_telemetry(
+    internal: &RevisionTreeInternal,
+    branch: BranchId,
+    revision: Hash,
+    parent: Hash,
+) {
+    LoreEvent::RevisionCommitRevision(LoreRevisionCommitRevisionEventData {
+        repository: internal.repository,
+        branch,
+        revision,
+        revision_number: internal.state.revision_number(),
+        parent,
+        parent_other: Hash::default(),
+    })
+    .send();
+}
+
+/// Carry a commit failure into the verb's error set: what a caller can fix through
+/// the arguments stays `InvalidArguments`, everything else becomes `Internal` with
+/// the reason attached. An oversized metadata buffer lands in the latter — the
+/// reason names the size, which is what a caller needs to shed keys and retry.
+///
+/// The `Internal` arm keeps the source error so its trace reaches the completion
+/// detail. This is the deepest chain in the namespace — the freeze walks a tree,
+/// `rehash_directory` fans out, `serialize` spawns a task per dirty block — so the
+/// locations are worth more here than anywhere else. The `InvalidArguments` arm
+/// carries a reason rather than a source by construction, which is enough: those
+/// are shallow rejections raised before any of that runs.
+fn map_commit_error(error: CommitError) -> CommitVerbError {
+    if error.is_invalid_arguments() {
+        return CommitVerbError::from(InvalidArguments {
+            reason: error.to_string(),
+        });
+    }
+    CommitVerbError::internal_with_context(error, "commit_in_memory_revision")
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::sync::Mutex;
+    use std::sync::atomic::Ordering as AtomicOrdering;
 
     use lore_base::types::Address;
     use lore_base::types::Context;
     use lore_base::types::Partition;
-    use lore_error_set::FfiError;
-    use lore_revision::commit::construct_tree_revision;
     use lore_revision::interface::LoreArray;
-    use lore_revision::interface::LoreMetadataType;
+    use lore_revision::interface::LoreMetadata;
     use lore_revision::interface::LoreNodeType;
     use lore_revision::interface::LoreString;
+    use lore_revision::metadata::BRANCH;
     use lore_revision::node::NodeID;
-    use lore_revision::node::NodeIDExt;
     use lore_revision::node::ROOT_NODE;
-    use lore_storage::hash::hash_string;
+    use lore_revision::state::State;
 
     use super::*;
     use crate::revision_tree::add::LoreRevisionTreeAddArgs;
     use crate::revision_tree::add::LoreRevisionTreeAddEntry;
     use crate::revision_tree::add::add;
-    use crate::revision_tree::delete::LoreRevisionTreeDeleteArgs;
-    use crate::revision_tree::delete::delete;
     use crate::revision_tree::handle as rt_handle;
     use crate::revision_tree::load::LoreRevisionTreeLoadArgs;
     use crate::revision_tree::load::load;
     use crate::revision_tree::metadata_set::LoreRevisionTreeMetadataSetArgs;
+    use crate::revision_tree::metadata_set::LoreRevisionTreeMetadataSetEntry;
     use crate::revision_tree::metadata_set::metadata_set;
     use crate::storage::handle as storage_handle;
-    use crate::storage::handle::LoreStore;
     use crate::storage::store::in_memory_for_tests;
 
     #[derive(Debug, Clone, PartialEq)]
-    enum CapturedEvent {
-        Error(u32),
+    enum Captured {
         Complete(i32),
-        RevisionTreeLoaded(u64),
+        Loaded(u64),
         AddComplete(u64, NodeID, LoreErrorCode),
         CommitComplete(u64, Hash, Hash, LoreErrorCode),
+        CommitRevision(Hash, Hash, BranchId, u64),
+        CommitBegin,
+        CommitProgress,
+        CommitEnd,
         Other(u32),
     }
 
-    impl CapturedEvent {
+    impl Captured {
         fn from_event(event: &LoreEvent) -> Self {
             match event {
-                LoreEvent::Error(data) => Self::Error(data.error_type),
                 LoreEvent::Complete(data) => Self::Complete(data.status),
-                LoreEvent::RevisionTreeLoaded(data) => Self::RevisionTreeLoaded(data.handle_id),
+                LoreEvent::RevisionTreeLoaded(data) => Self::Loaded(data.handle_id),
                 LoreEvent::RevisionTreeAddComplete(data) => {
-                    Self::AddComplete(data.id, data.node_id, data.error_code)
+                    Self::AddComplete(data.entry_id, data.node_id, data.error_code)
                 }
                 LoreEvent::RevisionTreeCommitComplete(data) => Self::CommitComplete(
                     data.id,
@@ -369,44 +388,54 @@ mod tests {
                     data.new_tip_hash,
                     data.error_code,
                 ),
+                LoreEvent::RevisionCommitRevision(data) => Self::CommitRevision(
+                    data.revision,
+                    data.parent,
+                    data.branch,
+                    data.revision_number,
+                ),
+                LoreEvent::RevisionCommitBegin(_) => Self::CommitBegin,
+                LoreEvent::RevisionCommitProgress(_) => Self::CommitProgress,
+                LoreEvent::RevisionCommitEnd(_) => Self::CommitEnd,
                 other => Self::Other(other.discriminant()),
             }
         }
     }
 
-    fn make_callback(sink: Arc<Mutex<Vec<CapturedEvent>>>) -> LoreEventCallback {
+    type Sink = Arc<Mutex<Vec<Captured>>>;
+
+    fn make_sink() -> Sink {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
+    fn make_callback(sink: Sink) -> LoreEventCallback {
         Some(Box::new(move |event: &LoreEvent| {
-            sink.lock().unwrap().push(CapturedEvent::from_event(event));
+            sink.lock().unwrap().push(Captured::from_event(event));
         }))
     }
 
-    fn commit_outcome(events: &[CapturedEvent], id: u64) -> Option<(Hash, Hash, LoreErrorCode)> {
-        events.iter().find_map(|event| match event {
-            CapturedEvent::CommitComplete(event_id, revision, new_tip, error_code)
-                if *event_id == id =>
-            {
-                Some((*revision, *new_tip, *error_code))
-            }
-            _ => None,
-        })
+    /// One partition per test. The in-memory store fixtures are process-global, so
+    /// two tests sharing a partition race each other's branch pointers and tree
+    /// blocks — which is what the rest of the namespace's tests avoid the same way.
+    async fn load_handle(label: &str, repository: Partition) -> (LoreRevisionTree, u64) {
+        let store = in_memory_for_tests(label).await;
+        let store_handle = storage_handle::register(store);
+        let handle = load_on(store_handle.handle_id, repository).await;
+        (handle, store_handle.handle_id)
     }
 
-    async fn open_store(label: &str) -> LoreStore {
-        storage_handle::register(in_memory_for_tests(label).await)
-    }
-
-    async fn load_tree(
-        store: LoreStore,
-        repository: Partition,
-        revision: Hash,
-    ) -> LoreRevisionTree {
-        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    /// Load another revision tree against an already-open storage handle, so two
+    /// handles share one store and one branch.
+    async fn load_on(store_handle_id: u64, repository: Partition) -> LoreRevisionTree {
+        let sink = make_sink();
         let status = load(
             LoreGlobalArgs::default(),
             LoreRevisionTreeLoadArgs {
-                store,
+                store: crate::storage::handle::LoreStore {
+                    handle_id: store_handle_id,
+                },
                 repository,
-                revision_hash: revision,
+                revision_hash: Hash::default(),
             },
             make_callback(sink.clone()),
         )
@@ -417,99 +446,111 @@ mod tests {
             .unwrap()
             .iter()
             .find_map(|event| match event {
-                CapturedEvent::RevisionTreeLoaded(id) => Some(*id),
+                Captured::Loaded(id) => Some(*id),
                 _ => None,
             })
             .expect("load fixture must emit RevisionTreeLoaded");
         LoreRevisionTree { handle_id: id }
     }
 
-    async fn add_file(handle: LoreRevisionTree, name: &str, payload: u8) -> NodeID {
-        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    fn release(handle: LoreRevisionTree, store_handle_id: u64) {
+        rt_handle::unregister(handle);
+        storage_handle::unregister(crate::storage::handle::LoreStore {
+            handle_id: store_handle_id,
+        });
+    }
+
+    fn handle_state(handle: LoreRevisionTree) -> Arc<State> {
+        rt_handle::REGISTRY
+            .get(&handle.handle_id)
+            .expect("handle registered")
+            .state
+            .clone()
+    }
+
+    fn is_poisoned(handle: LoreRevisionTree) -> bool {
+        rt_handle::REGISTRY
+            .get(&handle.handle_id)
+            .expect("handle registered")
+            .invalid
+            .load(AtomicOrdering::Acquire)
+    }
+
+    /// Add one file under the root. `content_hash` of zero produces the node
+    /// `rehash_directory` refuses, which is the reachable post-freeze failure.
+    async fn add_file(handle: LoreRevisionTree, entry_id: u64, name: &str, content_hash: u64) {
+        let sink = make_sink();
         let status = add(
             LoreGlobalArgs::default(),
             LoreRevisionTreeAddArgs {
-                id: 1000,
+                batch_id: 900 + entry_id,
                 handle,
                 entries: LoreArray::from_vec(vec![LoreRevisionTreeAddEntry {
-                    id: 1000,
+                    entry_id,
                     parent_node_id: ROOT_NODE,
+                    parent_entry_index: 0,
                     name: LoreString::from_str(name),
                     kind: LoreNodeType::File as u32,
                     mode: 0o644,
-                    size: 16,
+                    size: 12,
                     address: Address {
-                        hash: Hash::from([payload; 32]),
-                        context: Context::from([payload; 16]),
+                        hash: Hash::from_u64(content_hash),
+                        context: Context::from(uuid::Uuid::now_v7()),
                     },
-                    ..Default::default()
                 }]),
             },
             make_callback(sink.clone()),
         )
         .await;
-        assert_eq!(status, 0, "add fixture must succeed");
         let events = sink.lock().unwrap().clone();
-        events
-            .iter()
-            .find_map(|event| match event {
-                CapturedEvent::AddComplete(_, node_id, LoreErrorCode::None) => Some(*node_id),
-                _ => None,
-            })
-            .expect("add fixture must emit AddComplete")
+        assert_eq!(status, 0, "adding {name} must succeed, got {events:?}");
     }
 
-    async fn add_directory(handle: LoreRevisionTree, parent_node_id: NodeID, name: &str) -> NodeID {
-        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let status = add(
+    async fn set_branch(handle: LoreRevisionTree, branch: BranchId) {
+        let sink = make_sink();
+        let status = metadata_set(
             LoreGlobalArgs::default(),
-            LoreRevisionTreeAddArgs {
-                id: 1001,
+            LoreRevisionTreeMetadataSetArgs {
+                batch_id: 800,
                 handle,
-                entries: LoreArray::from_vec(vec![LoreRevisionTreeAddEntry {
-                    id: 1001,
-                    parent_node_id,
-                    name: LoreString::from_str(name),
-                    kind: LoreNodeType::Directory as u32,
-                    mode: 0o755,
-                    ..Default::default()
+                entries: LoreArray::from_vec(vec![LoreRevisionTreeMetadataSetEntry {
+                    entry_id: 1,
+                    key: LoreString::from_str(BRANCH),
+                    value: LoreMetadata::Context(branch),
                 }]),
             },
             make_callback(sink.clone()),
         )
         .await;
-        assert_eq!(status, 0, "add directory fixture must succeed");
         let events = sink.lock().unwrap().clone();
-        events
-            .iter()
-            .find_map(|event| match event {
-                CapturedEvent::AddComplete(_, node_id, LoreErrorCode::None) => Some(*node_id),
-                _ => None,
-            })
-            .expect("add directory fixture must emit AddComplete")
+        assert_eq!(status, 0, "setting the branch must succeed, got {events:?}");
     }
 
-    async fn run_commit(
-        handle: LoreRevisionTree,
-        id: u64,
-        branch: BranchId,
-    ) -> (i32, Vec<CapturedEvent>) {
-        run_commit_with_options(handle, id, branch, LoreRevisionTreeCommitOptions::default()).await
-    }
-
-    async fn run_commit_with_options(
-        handle: LoreRevisionTree,
-        id: u64,
-        branch: BranchId,
-        options: LoreRevisionTreeCommitOptions,
-    ) -> (i32, Vec<CapturedEvent>) {
-        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let status = commit(
+    async fn run_commit(handle: LoreRevisionTree, id: u64) -> (i32, Vec<Captured>) {
+        run_commit_with(
+            handle,
+            id,
             LoreGlobalArgs::default(),
+            LoreRevisionTreeCommitOptions::default(),
+        )
+        .await
+    }
+
+    /// Commit with chosen globals and options. `resolve_upload` reads the globals
+    /// from the execution context, which `revision_tree_call` installs from the
+    /// ones passed here.
+    async fn run_commit_with(
+        handle: LoreRevisionTree,
+        id: u64,
+        globals: LoreGlobalArgs,
+        options: LoreRevisionTreeCommitOptions,
+    ) -> (i32, Vec<Captured>) {
+        let sink = make_sink();
+        let status = commit(
+            globals,
             LoreRevisionTreeCommitArgs {
                 id,
                 handle,
-                branch,
                 options,
             },
             make_callback(sink.clone()),
@@ -519,477 +560,429 @@ mod tests {
         (status, events)
     }
 
-    fn release(handle: LoreRevisionTree, store: LoreStore) {
-        rt_handle::unregister(handle);
-        storage_handle::unregister(store);
+    /// Whether the handle's context will upload what it writes. Defaults to
+    /// disabled, so only a commit that resolved an upload clears it.
+    fn upload_disabled(handle: LoreRevisionTree) -> bool {
+        rt_handle::REGISTRY
+            .get(&handle.handle_id)
+            .expect("handle registered")
+            .repository_context
+            .disable_upload()
     }
 
-    /// Scope an execution context around direct store reads the way the
-    /// dispatch helpers do — the verification reads below run outside any
-    /// verb, and a freshly swapped-in state faults its blocks from the store.
-    async fn scoped<T>(future: impl Future<Output = T>) -> T {
-        let execution = crate::call::setup_execution(LoreGlobalArgs::default(), None);
-        lore_base::runtime::LORE_CONTEXT
-            .scope(execution, future)
-            .await
+    fn commit_outcome(events: &[Captured], id: u64) -> (Hash, Hash, LoreErrorCode) {
+        events
+            .iter()
+            .find_map(|event| match event {
+                Captured::CommitComplete(event_id, revision, new_tip, code) if *event_id == id => {
+                    Some((*revision, *new_tip, *code))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("CommitComplete must fire for {id}, got {events:?}"))
     }
 
     #[tokio::test]
-    async fn commit_added_file_advances_branch_and_keeps_the_handle_live() {
-        let store = open_store("ct-basic").await;
-        let repository = Partition::from([0x11u8; 16]);
-        let branch = BranchId::from([0x01u8; 16]);
-        let handle = load_tree(store, repository, Hash::default()).await;
-        add_file(handle, "doc.md", 0x42).await;
+    async fn commit_publishes_the_tree_and_reports_the_revision() {
+        let (handle, store_handle_id) =
+            load_handle("commit-publish", Partition::from([0x41u8; 16])).await;
+        let branch = Context::from(uuid::Uuid::now_v7());
+        add_file(handle, 1, "a.bin", 0x11).await;
+        set_branch(handle, branch).await;
 
-        let (status, events) = run_commit(handle, 1, branch).await;
+        let (status, events) = run_commit(handle, 5).await;
 
-        assert_eq!(
-            status, 0,
-            "committing an added file must succeed, got {events:?}"
+        assert_eq!(status, 0, "committing must succeed, got {events:?}");
+        let (revision, new_tip, code) = commit_outcome(&events, 5);
+        assert_eq!(code, LoreErrorCode::None, "got {events:?}");
+        assert!(!revision.is_zero(), "got {events:?}");
+        assert!(
+            new_tip.is_zero(),
+            "a successful commit reports no advanced tip, got {events:?}"
         );
-        let (revision, new_tip, error_code) =
-            commit_outcome(&events, 1).expect("CommitComplete must fire");
-        assert_eq!(error_code, LoreErrorCode::None);
-        assert!(!revision.is_zero(), "a real revision hash must be reported");
         assert_eq!(
-            new_tip,
-            Hash::default(),
-            "new_tip_hash is only populated on BranchAdvanced"
-        );
-        assert!(events.contains(&CapturedEvent::Complete(0)));
-
-        let entry = rt_handle::REGISTRY
-            .get(&handle.handle_id)
-            .expect("handle registered");
-        let (state, repository_context) = (entry.state(), entry.repository_context.clone());
-        drop(entry);
-        assert_eq!(
-            state.revision(),
+            handle_state(handle).revision(),
             revision,
-            "the handle must behave as freshly loaded from the new revision"
-        );
-        let latest = scoped(branch::load_latest(repository_context.clone(), branch))
-            .await
-            .expect("branch tip must be readable");
-        assert_eq!(
-            latest, revision,
-            "the branch tip must advance to the commit"
+            "the handle must be left on the revision it published"
         );
         assert!(
-            scoped(state.find_subnode(repository_context, ROOT_NODE, hash_string("doc.md")))
-                .await
-                .is_ok(),
-            "reads after commit must reflect the committed tree"
+            events.contains(&Captured::CommitRevision(
+                revision,
+                Hash::default(),
+                branch,
+                1
+            )),
+            "the revision event file-system consumers watch must fire, got {events:?}"
         );
-
-        release(handle, store);
-    }
-
-    #[tokio::test]
-    async fn construct_tree_revision_does_not_advance_branch_latest() {
-        let store = open_store("ct-construct-only").await;
-        let repository = Partition::from([0x19u8; 16]);
-        let branch = BranchId::from([0x09u8; 16]);
-        let handle = load_tree(store, repository, Hash::default()).await;
-        add_file(handle, "unpublished.md", 0x51).await;
-
-        let entry = rt_handle::REGISTRY
-            .get(&handle.handle_id)
-            .expect("handle registered");
-        let state = entry.state();
-        let store_internal = entry.store_internal.clone();
-        drop(entry);
-
-        let token_key = format!("revision-tree/{repository}");
-        let token = RepositoryWriteToken::acquire(Path::new(&token_key)).await;
-        let write_context =
-            synth_repository_write_context(&store_internal, repository, &token).await;
-        let signature = scoped(construct_tree_revision(
-            write_context.clone(),
-            &token,
-            state,
-            Metadata::default(),
-            branch,
-            Vec::new(),
-        ))
-        .await
-        .expect("constructing the immutable revision must succeed");
-        assert!(!signature.is_zero());
-
-        let latest = scoped(branch::load_latest(write_context, branch))
-            .await
-            .unwrap_or_default();
+        let commit_pos = events
+            .iter()
+            .position(|event| matches!(event, Captured::CommitComplete(..)))
+            .expect("CommitComplete must fire");
+        let complete_pos = events
+            .iter()
+            .position(|event| matches!(event, Captured::Complete(_)))
+            .expect("Complete must fire");
         assert!(
-            latest.is_zero(),
-            "construction must leave branch publication to the server push path"
+            commit_pos < complete_pos,
+            "CommitComplete must fire before Complete, got {events:?}"
         );
 
-        release(handle, store);
-    }
-
-    #[tokio::test]
-    async fn commit_and_reload_preserves_nested_empty_directory() {
-        let store = open_store("ct-empty-directory").await;
-        let repository = Partition::from([0x18u8; 16]);
-        let branch = BranchId::from([0x08u8; 16]);
-        let handle = load_tree(store, repository, Hash::default()).await;
-        let docs = add_directory(handle, ROOT_NODE, "docs").await;
-        add_directory(handle, docs, "empty").await;
-
-        let (status, events) = run_commit(handle, 15, branch).await;
-        assert_eq!(
-            status, 0,
-            "committing nested empty directories must succeed, got {events:?}"
-        );
-        let (revision, _, error_code) =
-            commit_outcome(&events, 15).expect("CommitComplete must fire");
-        assert_eq!(error_code, LoreErrorCode::None);
-
-        let reloaded = load_tree(store, repository, revision).await;
-        let entry = rt_handle::REGISTRY
-            .get(&reloaded.handle_id)
-            .expect("reloaded handle registered");
-        let (state, repository_context) = (entry.state(), entry.repository_context.clone());
-        drop(entry);
-
-        let docs =
-            scoped(state.find_subnode(repository_context.clone(), ROOT_NODE, hash_string("docs")))
-                .await
-                .expect("top-level empty directory must survive reload");
-        let empty =
-            scoped(state.find_subnode(repository_context.clone(), docs, hash_string("empty")))
-                .await
-                .expect("nested empty directory must survive reload");
-        let node = scoped(state.node(repository_context, empty))
-            .await
-            .expect("empty directory node must be readable");
-        assert!(node.is_directory());
-        assert!(
-            !node.child.is_valid_node_id(),
-            "directory must remain empty"
-        );
-        assert_eq!(node.size, 0);
-        assert!(
-            !node.address.hash.is_zero(),
-            "empty directory must be hashed"
-        );
-
-        rt_handle::unregister(handle);
-        rt_handle::unregister(reloaded);
-        storage_handle::unregister(store);
-    }
-
-    #[tokio::test]
-    async fn commit_chain_links_the_second_revision_to_the_first() {
-        let store = open_store("ct-chain").await;
-        let repository = Partition::from([0x22u8; 16]);
-        let branch = BranchId::from([0x02u8; 16]);
-        let handle = load_tree(store, repository, Hash::default()).await;
-
-        add_file(handle, "a.md", 0x41).await;
-        let (status, events) = run_commit(handle, 2, branch).await;
-        assert_eq!(status, 0, "first commit must succeed, got {events:?}");
-        let (first, _, _) = commit_outcome(&events, 2).expect("CommitComplete must fire");
-
-        add_file(handle, "b.md", 0x43).await;
-        let (status, events) = run_commit(handle, 3, branch).await;
-        assert_eq!(status, 0, "second commit must succeed, got {events:?}");
-        let (second, _, error_code) = commit_outcome(&events, 3).expect("CommitComplete must fire");
-        assert_eq!(error_code, LoreErrorCode::None);
-        assert_ne!(second, first, "each commit must produce a new revision");
-
-        let entry = rt_handle::REGISTRY
-            .get(&handle.handle_id)
-            .expect("handle registered");
-        let (state, repository_context) = (entry.state(), entry.repository_context.clone());
-        drop(entry);
-        assert_eq!(
-            state.parent_self(),
-            first,
-            "the second revision must record the first as its parent"
-        );
-        assert_eq!(state.revision_number(), 2, "revision numbers must chain");
-        let latest = branch::load_latest(repository_context, branch)
-            .await
-            .expect("branch tip must be readable");
-        assert_eq!(latest, second);
-
-        release(handle, store);
-    }
-
-    #[tokio::test]
-    async fn commit_with_nothing_staged_fails_and_invalidates_the_handle() {
-        let store = open_store("ct-nothing").await;
-        let repository = Partition::from([0x33u8; 16]);
-        let branch = BranchId::from([0x03u8; 16]);
-        let handle = load_tree(store, repository, Hash::default()).await;
-
-        let (status, events) = run_commit(handle, 4, branch).await;
-
-        let expected = CommitError::from(lore_base::error::NothingStaged).ffi_code();
-        assert_eq!(
-            status, expected,
-            "an empty commit must report NothingStaged"
-        );
-        let (revision, _, error_code) =
-            commit_outcome(&events, 4).expect("CommitComplete must fire");
-        assert_eq!(
-            error_code,
-            LoreErrorCode::InvalidArguments,
-            "got {events:?}"
-        );
-        assert!(revision.is_zero());
-        assert!(events.contains(&CapturedEvent::Complete(expected)));
-
-        // The failed commit poisons the handle: subsequent ops miss.
-        let (status, events) = run_commit(handle, 5, branch).await;
-        assert_eq!(status, 1, "a poisoned handle must reject new ops");
-        let (_, _, error_code) = commit_outcome(&events, 5).expect("CommitComplete must fire");
-        assert_eq!(error_code, LoreErrorCode::InvalidArguments);
-
-        release(handle, store);
-    }
-
-    #[tokio::test]
-    async fn remote_write_without_a_remote_reports_failure_and_invalidates_the_handle() {
-        let store = open_store("ct-remote-required").await;
-        let repository = Partition::from([0x39u8; 16]);
-        let branch = BranchId::from([0x09u8; 16]);
-        let handle = load_tree(store, repository, Hash::default()).await;
-        add_file(handle, "remote.md", 0x52).await;
-
-        let (status, events) = run_commit_with_options(
-            handle,
-            16,
-            branch,
-            LoreRevisionTreeCommitOptions { remote_write: 1 },
-        )
-        .await;
-
-        assert_ne!(
-            status, 0,
-            "remote_write must require a remote, got {events:?}"
-        );
-        let (revision, remote_tip, error_code) =
-            commit_outcome(&events, 16).expect("CommitComplete must fire");
-        assert!(
-            !revision.is_zero(),
-            "the locally constructed revision must be reported"
-        );
-        assert!(remote_tip.is_zero());
-        assert_eq!(error_code, LoreErrorCode::Internal);
-
-        let (status, _) = run_commit(handle, 17, branch).await;
-        assert_eq!(
-            status, 1,
-            "a failed remote publication must poison the handle"
-        );
-
-        release(handle, store);
-    }
-
-    #[tokio::test]
-    async fn commit_against_an_advanced_branch_reports_the_observed_tip() {
-        let store = open_store("ct-advanced").await;
-        let repository = Partition::from([0x44u8; 16]);
-        let branch = BranchId::from([0x04u8; 16]);
-
-        // Two handles derive from the same (empty) revision; the first
-        // commit wins the tip.
-        let winner = load_tree(store, repository, Hash::default()).await;
-        let loser = load_tree(store, repository, Hash::default()).await;
-
-        add_file(winner, "won.md", 0x45).await;
-        let (status, events) = run_commit(winner, 6, branch).await;
-        assert_eq!(status, 0, "the winning commit must succeed, got {events:?}");
-        let (winning_revision, _, _) =
-            commit_outcome(&events, 6).expect("CommitComplete must fire");
-
-        add_file(loser, "lost.md", 0x46).await;
-        let (status, events) = run_commit(loser, 7, branch).await;
-        let expected = CommitError::from(lore_base::error::BranchAdvanced).ffi_code();
-        assert_eq!(
-            status, expected,
-            "the losing commit must report BranchAdvanced, got {events:?}"
-        );
-        let (revision, new_tip, error_code) =
-            commit_outcome(&events, 7).expect("CommitComplete must fire");
-        assert_eq!(error_code, LoreErrorCode::BranchAdvanced, "got {events:?}");
-        assert!(revision.is_zero());
-        assert_eq!(
-            new_tip, winning_revision,
-            "the observed tip must ride the terminal event so the caller can reload"
-        );
-
-        release(winner, store);
-        release(loser, store);
-    }
-
-    #[tokio::test]
-    async fn commit_records_pending_metadata_on_the_revision() {
-        let store = open_store("ct-metadata").await;
-        let repository = Partition::from([0x55u8; 16]);
-        let branch = BranchId::from([0x05u8; 16]);
-        let handle = load_tree(store, repository, Hash::default()).await;
-
-        let set_status = metadata_set(
-            LoreGlobalArgs::default(),
-            LoreRevisionTreeMetadataSetArgs {
-                id: 8,
-                handle,
-                key: LoreString::from_str("message"),
-                value: LoreString::from_str("import nightly assets"),
-                format: LoreMetadataType::String as u32,
-            },
-            None,
-        )
-        .await;
-        assert_eq!(set_status, 0, "the metadata_set fixture must succeed");
-        add_file(handle, "doc.md", 0x47).await;
-
-        let (status, events) = run_commit(handle, 9, branch).await;
-        assert_eq!(status, 0, "the commit must succeed, got {events:?}");
-
-        let entry = rt_handle::REGISTRY
-            .get(&handle.handle_id)
-            .expect("handle registered");
-        let (state, repository_context) = (entry.state(), entry.repository_context.clone());
-        assert!(
-            entry.pending_metadata.read().is_empty(),
-            "a successful commit must drain the pending metadata"
-        );
-        drop(entry);
-        let metadata = scoped(lore_revision::metadata::Metadata::deserialize(
-            repository_context,
-            state.metadata_hash(),
-        ))
-        .await
-        .expect("the committed revision must carry a metadata fragment");
-        assert_eq!(
-            metadata.get_string("message").expect("message key"),
-            "import nightly assets",
-            "the caller-set message must survive the commit metadata preparation"
-        );
-        assert_eq!(
-            metadata.get_branch().expect("branch key"),
-            branch,
-            "the commit must record the branch"
-        );
-        assert!(
-            metadata.get_timestamp().expect("timestamp key") > 0,
-            "the commit must record a timestamp"
-        );
-
-        release(handle, store);
-    }
-
-    #[tokio::test]
-    async fn commit_after_delete_drops_the_node_from_the_new_revision() {
-        let store = open_store("ct-delete").await;
-        let repository = Partition::from([0x66u8; 16]);
-        let branch = BranchId::from([0x06u8; 16]);
-        let handle = load_tree(store, repository, Hash::default()).await;
-
-        add_file(handle, "keep.md", 0x48).await;
-        let gone = add_file(handle, "gone.md", 0x49).await;
-        let (status, _) = run_commit(handle, 10, branch).await;
-        assert_eq!(status, 0, "the base commit must succeed");
-
-        let delete_status = delete(
-            LoreGlobalArgs::default(),
-            LoreRevisionTreeDeleteArgs {
-                id: 11,
-                handle,
-                node_id: gone,
-            },
-            None,
-        )
-        .await;
-        assert_eq!(delete_status, 0, "the delete must succeed");
-
-        let (status, events) = run_commit(handle, 12, branch).await;
-        assert_eq!(status, 0, "the delete commit must succeed, got {events:?}");
-        let (revision, _, _) = commit_outcome(&events, 12).expect("CommitComplete must fire");
-
-        let entry = rt_handle::REGISTRY
-            .get(&handle.handle_id)
-            .expect("handle registered");
-        let (state, repository_context) = (entry.state(), entry.repository_context.clone());
-        assert!(
-            entry.pending_delta.read().is_empty(),
-            "a successful commit must drain the carried delete entries"
-        );
-        drop(entry);
-        assert_eq!(state.revision(), revision);
-        assert!(
-            scoped(state.find_subnode(
-                repository_context.clone(),
-                ROOT_NODE,
-                hash_string("gone.md")
-            ))
-            .await
-            .is_err(),
-            "the deleted file must not exist in the new revision"
-        );
-        assert!(
-            scoped(state.find_subnode(repository_context, ROOT_NODE, hash_string("keep.md")))
-                .await
-                .is_ok(),
-            "the untouched file must survive"
-        );
-
-        release(handle, store);
-    }
-
-    #[tokio::test]
-    async fn commit_with_a_zero_branch_fails_without_poisoning_the_handle() {
-        let store = open_store("ct-zero-branch").await;
-        let repository = Partition::from([0x77u8; 16]);
-        let handle = load_tree(store, repository, Hash::default()).await;
-        add_file(handle, "doc.md", 0x4A).await;
-
-        let (status, events) = run_commit(handle, 13, BranchId::default()).await;
-        assert_eq!(status, 1, "a zero branch id must fail, got {events:?}");
-        let (_, _, error_code) = commit_outcome(&events, 13).expect("CommitComplete must fire");
-        assert_eq!(error_code, LoreErrorCode::InvalidArguments);
-
-        // Argument validation happens before any state is touched, so the
-        // handle stays usable and the commit succeeds on a real branch.
-        let (status, events) = run_commit(handle, 14, BranchId::from([0x07u8; 16])).await;
-        assert_eq!(
-            status, 0,
-            "the handle must survive the rejected call, got {events:?}"
-        );
-
-        release(handle, store);
+        release(handle, store_handle_id);
     }
 
     #[tokio::test]
     async fn commit_on_unknown_handle_emits_commit_complete_with_invalid_arguments() {
-        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let status = commit(
-            LoreGlobalArgs::default(),
-            LoreRevisionTreeCommitArgs {
-                id: 15,
-                handle: LoreRevisionTree::INVALID,
-                branch: BranchId::from([0x08u8; 16]),
-                options: LoreRevisionTreeCommitOptions::default(),
-            },
-            make_callback(sink.clone()),
+        let (status, events) = run_commit(LoreRevisionTree::INVALID, 6).await;
+
+        assert_eq!(status, 1, "committing an unknown handle must fail");
+        let (revision, new_tip, code) = commit_outcome(&events, 6);
+        assert_eq!(code, LoreErrorCode::InvalidArguments, "got {events:?}");
+        assert!(revision.is_zero() && new_tip.is_zero(), "got {events:?}");
+    }
+
+    /// A handle nobody edited is a caller mistake, not a corrupted tree, so the
+    /// handle survives it and a following commit can succeed.
+    ///
+    /// Setting the branch is itself a metadata edit, so the first commit clears
+    /// that and the second is the one running against a genuinely empty handle.
+    #[tokio::test]
+    async fn commit_with_no_edits_leaves_the_handle_usable() {
+        let (handle, store_handle_id) =
+            load_handle("commit-no-edits", Partition::from([0x42u8; 16])).await;
+        let branch = Context::from(uuid::Uuid::now_v7());
+        set_branch(handle, branch).await;
+        let (first_status, _) = run_commit(handle, 7).await;
+        assert_eq!(first_status, 0, "the metadata-only revision must commit");
+
+        let (status, events) = run_commit(handle, 8).await;
+
+        assert_eq!(
+            status, -1,
+            "an unedited handle must not commit, got {events:?}"
+        );
+        let (revision, new_tip, code) = commit_outcome(&events, 8);
+        assert_eq!(code, LoreErrorCode::Internal, "got {events:?}");
+        assert!(revision.is_zero() && new_tip.is_zero(), "got {events:?}");
+        assert!(
+            !is_poisoned(handle),
+            "a rejection before any write must not poison the handle"
+        );
+
+        add_file(handle, 2, "a.bin", 0x22).await;
+        let (retry_status, retry_events) = run_commit(handle, 9).await;
+        assert_eq!(
+            retry_status, 0,
+            "the handle must still commit after a no-op, got {retry_events:?}"
+        );
+
+        release(handle, store_handle_id);
+    }
+
+    #[tokio::test]
+    async fn commit_without_a_branch_on_an_empty_handle_is_rejected() {
+        let (handle, store_handle_id) =
+            load_handle("commit-no-branch", Partition::from([0x43u8; 16])).await;
+        add_file(handle, 1, "a.bin", 0x33).await;
+
+        let (status, events) = run_commit(handle, 10).await;
+
+        assert_eq!(
+            status, 1,
+            "an initial revision needs a branch, got {events:?}"
+        );
+        let (_revision, _new_tip, code) = commit_outcome(&events, 10);
+        assert_eq!(code, LoreErrorCode::InvalidArguments, "got {events:?}");
+        assert!(
+            !is_poisoned(handle),
+            "a rejected argument must not poison the handle"
+        );
+
+        release(handle, store_handle_id);
+    }
+
+    /// A file whose content address is zero is a tree the push-side validator
+    /// refuses. It gets that far only after the freeze has cleared flags and
+    /// discarded, so the tree can no longer be trusted and the handle is poisoned.
+    #[tokio::test]
+    async fn a_tree_the_rehash_refuses_poisons_the_handle() {
+        let (handle, store_handle_id) =
+            load_handle("commit-poison", Partition::from([0x44u8; 16])).await;
+        let branch = Context::from(uuid::Uuid::now_v7());
+        add_file(handle, 1, "a.bin", 0).await;
+        set_branch(handle, branch).await;
+
+        let (status, events) = run_commit(handle, 11).await;
+
+        assert_eq!(
+            status, -1,
+            "a tree with a zero content hash must not commit, got {events:?}"
+        );
+        let (revision, _new_tip, code) = commit_outcome(&events, 11);
+        assert_eq!(code, LoreErrorCode::Internal, "got {events:?}");
+        assert!(revision.is_zero(), "got {events:?}");
+        assert!(
+            is_poisoned(handle),
+            "a failure past the freeze must poison the handle"
+        );
+
+        let (retry_status, retry_events) = run_commit(handle, 12).await;
+        assert_eq!(
+            retry_status, 1,
+            "a poisoned handle must reject every call, got {retry_events:?}"
+        );
+
+        release(handle, store_handle_id);
+    }
+
+    /// Two handles on one store racing the same branch: the loser is told which tip
+    /// to reload from rather than having to ask.
+    #[tokio::test]
+    async fn commit_reports_the_new_tip_when_the_branch_advanced() {
+        let (winner, store_handle_id) =
+            load_handle("commit-advanced", Partition::from([0x45u8; 16])).await;
+        let loser = load_on(store_handle_id, Partition::from([0x45u8; 16])).await;
+        let branch = Context::from(uuid::Uuid::now_v7());
+
+        add_file(winner, 1, "a.bin", 0x44).await;
+        set_branch(winner, branch).await;
+        let (winner_status, winner_events) = run_commit(winner, 13).await;
+        assert_eq!(
+            winner_status, 0,
+            "the first commit must publish, got {winner_events:?}"
+        );
+        let (published, _, _) = commit_outcome(&winner_events, 13);
+
+        add_file(loser, 2, "b.bin", 0x45).await;
+        set_branch(loser, branch).await;
+        let (status, events) = run_commit(loser, 14).await;
+
+        assert_eq!(status, -1, "a branch that moved must reject the commit");
+        let (revision, new_tip, code) = commit_outcome(&events, 14);
+        assert_eq!(code, LoreErrorCode::Internal, "got {events:?}");
+        assert!(revision.is_zero(), "got {events:?}");
+        assert_eq!(
+            new_tip, published,
+            "the terminal must carry the tip to reload from, got {events:?}"
+        );
+        assert!(
+            !is_poisoned(loser),
+            "a tip collision is caught before any write, so the handle survives"
+        );
+
+        rt_handle::unregister(loser);
+        release(winner, store_handle_id);
+    }
+
+    /// Pending metadata is per revision: the second commit must not re-record the
+    /// first's keys.
+    #[tokio::test]
+    async fn commit_empties_the_pending_metadata() {
+        let (handle, store_handle_id) =
+            load_handle("commit-metadata-reset", Partition::from([0x46u8; 16])).await;
+        let branch = Context::from(uuid::Uuid::now_v7());
+        add_file(handle, 1, "a.bin", 0x55).await;
+        set_branch(handle, branch).await;
+
+        let (status, events) = run_commit(handle, 14).await;
+        assert_eq!(status, 0, "the first revision must commit, got {events:?}");
+
+        let pending_keys = {
+            let entry = rt_handle::REGISTRY
+                .get(&handle.handle_id)
+                .expect("handle registered");
+            let pending = entry.pending_metadata.read();
+            let mut count = 0usize;
+            pending.walk(|_, _, _| count += 1);
+            count
+        };
+        assert_eq!(
+            pending_keys, 0,
+            "a successful commit must leave the next revision's metadata empty"
+        );
+
+        release(handle, store_handle_id);
+    }
+
+    /// The branch key was consumed by the first commit, so the second has to derive
+    /// the branch from the parent revision — which is the whole point of resolving it
+    /// from the tree rather than taking it as an argument.
+    #[tokio::test]
+    async fn a_second_commit_chains_onto_the_first_without_restating_the_branch() {
+        let (handle, store_handle_id) =
+            load_handle("commit-chain", Partition::from([0x47u8; 16])).await;
+        let branch = Context::from(uuid::Uuid::now_v7());
+        add_file(handle, 1, "a.bin", 0x66).await;
+        set_branch(handle, branch).await;
+        let (first_status, first_events) = run_commit(handle, 15).await;
+        assert_eq!(
+            first_status, 0,
+            "the first revision must commit, got {first_events:?}"
+        );
+        let (first, _, _) = commit_outcome(&first_events, 15);
+
+        add_file(handle, 2, "b.bin", 0x77).await;
+        let (status, events) = run_commit(handle, 16).await;
+
+        assert_eq!(status, 0, "the second revision must commit, got {events:?}");
+        let (second, _, code) = commit_outcome(&events, 16);
+        assert_eq!(code, LoreErrorCode::None, "got {events:?}");
+        assert!(
+            events.contains(&Captured::CommitRevision(second, first, branch, 2)),
+            "the second revision must record the first as its parent on the same branch, \
+             got {events:?}"
+        );
+
+        release(handle, store_handle_id);
+    }
+
+    /// Per-call flags that contradict each other are refused before the commit
+    /// reads the tree, and the caller learns which call failed from the terminal
+    /// rather than only from the status. Nothing is written, so the handle survives.
+    #[tokio::test]
+    async fn commit_with_contradictory_flags_is_rejected_before_any_write() {
+        let (handle, store_handle_id) =
+            load_handle("commit-flag-clash", Partition::from([0x48u8; 16])).await;
+        let branch = Context::from(uuid::Uuid::now_v7());
+        add_file(handle, 1, "a.bin", 0x88).await;
+        set_branch(handle, branch).await;
+
+        let globals = LoreGlobalArgs {
+            local: 1,
+            remote: 1,
+            ..Default::default()
+        };
+        let (status, events) = run_commit_with(
+            handle,
+            17,
+            globals,
+            LoreRevisionTreeCommitOptions { remote_write: 1 },
         )
         .await;
 
-        assert_eq!(status, 1, "committing against an unknown handle must fail");
-        let events = sink.lock().unwrap().clone();
-        let (revision, _, error_code) = commit_outcome(&events, 15)
-            .expect("a handle miss must still emit CommitComplete carrying the caller id");
         assert_eq!(
-            error_code,
-            LoreErrorCode::InvalidArguments,
-            "got {events:?}"
+            status, 1,
+            "local=1 with remote=1 must reject the commit, got {events:?}"
         );
-        assert!(revision.is_zero());
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        let (revision, new_tip, code) = commit_outcome(&events, 17);
+        assert_eq!(code, LoreErrorCode::InvalidArguments, "got {events:?}");
+        assert!(revision.is_zero() && new_tip.is_zero(), "got {events:?}");
+        assert!(
+            !is_poisoned(handle),
+            "a rejection before the freeze must not poison the handle"
+        );
+
+        let (retry_status, retry_events) = run_commit(handle, 18).await;
+        assert_eq!(
+            retry_status, 0,
+            "the same tree must commit once the flags agree, got {retry_events:?}"
+        );
+
+        release(handle, store_handle_id);
+    }
+
+    /// `remote_write` is a request, not a guarantee: a call that is local-only
+    /// commits local-only and still succeeds, rather than failing on a contradiction
+    /// the caller did not state in the options.
+    #[tokio::test]
+    async fn remote_write_is_demoted_when_the_call_is_local_only() {
+        let (handle, store_handle_id) =
+            load_handle("commit-demoted", Partition::from([0x49u8; 16])).await;
+        let branch = Context::from(uuid::Uuid::now_v7());
+        add_file(handle, 1, "a.bin", 0x99).await;
+        set_branch(handle, branch).await;
+
+        let globals = LoreGlobalArgs {
+            local: 1,
+            ..Default::default()
+        };
+        let (status, events) = run_commit_with(
+            handle,
+            19,
+            globals,
+            LoreRevisionTreeCommitOptions { remote_write: 1 },
+        )
+        .await;
+
+        assert_eq!(
+            status, 0,
+            "a local-only call must still commit, got {events:?}"
+        );
+        let (revision, _new_tip, code) = commit_outcome(&events, 19);
+        assert_eq!(code, LoreErrorCode::None, "got {events:?}");
+        assert!(!revision.is_zero(), "got {events:?}");
+        assert!(
+            upload_disabled(handle),
+            "globals.local must demote remote_write=1 to a local-only commit"
+        );
+
+        release(handle, store_handle_id);
+    }
+
+    /// A pipeline subscribed to `RevisionCommit*` must see the same telemetry from
+    /// this surface as from the file-system commit. Three of the four events come
+    /// from the freeze in `lore-revision`, so without this nothing on either side
+    /// notices if that stops sending them.
+    ///
+    /// Positions rather than an exact stream: a freeze that reports progress more
+    /// than once stays valid, while a dropped or reordered event does not.
+    #[tokio::test]
+    async fn commit_emits_the_revision_commit_telemetry_in_order() {
+        let (handle, store_handle_id) =
+            load_handle("commit-telemetry", Partition::from([0x4bu8; 16])).await;
+        let branch = Context::from(uuid::Uuid::now_v7());
+        add_file(handle, 1, "a.bin", 0xbb).await;
+        set_branch(handle, branch).await;
+
+        let (status, events) = run_commit(handle, 21).await;
+        assert_eq!(status, 0, "the commit must succeed, got {events:?}");
+
+        let first = |wanted: &Captured| {
+            events
+                .iter()
+                .position(|event| event == wanted)
+                .unwrap_or_else(|| panic!("{wanted:?} must be emitted, got {events:?}"))
+        };
+        let begin = first(&Captured::CommitBegin);
+        let progress = first(&Captured::CommitProgress);
+        let end = first(&Captured::CommitEnd);
+        let revision = events
+            .iter()
+            .position(|event| matches!(event, Captured::CommitRevision(..)))
+            .unwrap_or_else(|| panic!("the revision event must be emitted, got {events:?}"));
+
+        assert!(
+            begin < progress && progress < end && end < revision,
+            "telemetry must run begin -> progress -> end -> revision, got {events:?}"
+        );
+
+        release(handle, store_handle_id);
+    }
+
+    /// The other side of the demotion: nothing forbidding a remote leaves
+    /// `remote_write = 1` asking for the upload, which is what makes the demotion
+    /// above an observable decision rather than the default doing nothing.
+    #[tokio::test]
+    async fn remote_write_requests_the_upload_when_nothing_forbids_a_remote() {
+        let (handle, store_handle_id) =
+            load_handle("commit-upload", Partition::from([0x4au8; 16])).await;
+        let branch = Context::from(uuid::Uuid::now_v7());
+        add_file(handle, 1, "a.bin", 0xaa).await;
+        set_branch(handle, branch).await;
+
+        let (status, events) = run_commit_with(
+            handle,
+            20,
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeCommitOptions { remote_write: 1 },
+        )
+        .await;
+
+        assert!(
+            !upload_disabled(handle),
+            "remote_write=1 on an unrestricted call must ask for the upload"
+        );
+        assert_eq!(status, 0, "the commit must succeed, got {events:?}");
+
+        release(handle, store_handle_id);
     }
 }

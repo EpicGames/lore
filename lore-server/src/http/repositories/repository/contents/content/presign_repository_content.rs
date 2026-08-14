@@ -178,16 +178,15 @@ pub async fn handler(
             // Verify the exact repository/context association and retain the
             // logical length so redemption can serve byte ranges without a
             // separate metadata round trip.
-            let query_result = immutable_store
-                .clone()
-                .query(repository, parsed_address, StoreMatch::MatchFull)
+            let match_result = immutable_store
+                .get_metadata(repository, parsed_address)
                 .await
                 .map_err(|e| {
-                    warn!(%e, "Presign exist check failed");
+                    warn!(%e, "Presign resolve check failed");
                     PresignError::StoreError
                 })?;
 
-            if query_result.match_made != StoreMatch::MatchFull {
+            if match_result.match_made != StoreMatch::MatchFull {
                 return Err(PresignError::NotFound);
             }
 
@@ -215,7 +214,7 @@ pub async fn handler(
                 content_type: body.content_type,
                 content_encoding: body.content_encoding,
                 content_disposition: body.content_disposition,
-                content_length: Some(query_result.fragment.size_content),
+                content_length: Some(match_result.fragment.size_content),
             };
 
             let token_str = sign(&payload, &presign_config.hmac_key);
@@ -314,7 +313,7 @@ mod tests {
                     max_file_size: 100,
                     presign_config: Some(test_presign_config()),
                 };
-                let settings = LoreHttpServerSettings::default();
+                let settings = LoreHttpServerSettings::test_default();
                 let server =
                     TestServer::new(create_router(state, test_health, &settings)).unwrap();
 
@@ -329,6 +328,14 @@ mod tests {
     #[tokio::test]
     async fn returns_404_when_address_not_found() {
         let response = mint(json!({"ttl_seconds": 3600})).await;
+        assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+    }
+
+    /// The S3 default type passes the allowlist, so it reaches the existence
+    /// check and returns 404 rather than 400.
+    #[tokio::test]
+    async fn accepts_s3_binary_octet_stream() {
+        let response = mint(json!({"content_type": "binary/octet-stream"})).await;
         assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
     }
 

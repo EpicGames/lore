@@ -1,7 +1,7 @@
 [package]
 name = "lore-proto"
 # Crate version is used for proto-artifactory workflow
-version = "0.1.60"
+version = "0.1.61"
 edition = "2024"
 publish = false
 

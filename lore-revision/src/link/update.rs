@@ -37,8 +37,24 @@ pub async fn update(
 
     lore_debug!("Resolve link to update at path {link_path}");
 
-    let node_link = state_staged
-        .find_node_link(repository.clone(), link_path.as_str())
+    // Resolve through any parent links so mutations target the owning repo.
+    let chain = link::resolve_link_chain(
+        repository.clone(),
+        state_staged.clone(),
+        state_current.clone(),
+        link_path.clone(),
+        parent_branch,
+    )
+    .await?;
+    let inner_repository = chain.innermost_repository.clone();
+    let inner_state = chain.innermost_state.clone();
+
+    let node_link = inner_state
+        .find_relative_node_link(
+            inner_repository.clone(),
+            chain.innermost_base_node,
+            chain.remainder_path.as_str(),
+        )
         .await
         .forward::<LinkError>("Invalid path")?;
 
@@ -50,8 +66,8 @@ pub async fn update(
         .into());
     }
 
-    let link_node = state_staged
-        .node(repository.clone(), node_link.node)
+    let link_node = inner_state
+        .node(inner_repository.clone(), node_link.node)
         .await
         .forward::<LinkError>("Failed deserializing state")?;
 
@@ -69,12 +85,13 @@ pub async fn update(
     let linked_node = link_node.child;
 
     // TODO(vri): Verify filesystem in any case for local modifications
+    // Tree roots at the innermost node; filesystem path is the full link path.
     if state_current.revision() != state_staged.revision() {
         let (linked_changes, _changes_stats) = state::diff_filesystem_subtree(
-            repository.clone(),
-            state_staged.clone(),
-            repository.clone(),
-            state_current.clone(),
+            inner_repository.clone(),
+            inner_state.clone(),
+            inner_repository.clone(),
+            inner_state.clone(),
             link_path.clone(),
             node_link.node,
             node_link.node,
@@ -95,8 +112,8 @@ pub async fn update(
             .await,
     );
     let link_remote = link.remote().await.forward::<LinkError>("Not connected")?;
-    let link_reference = state_staged
-        .link_find(repository.clone(), link.id, node_link.node)
+    let link_reference = inner_state
+        .link_find(inner_repository.clone(), link.id, node_link.node)
         .await
         .forward::<LinkError>("Failed to find link")?;
 
@@ -137,9 +154,9 @@ pub async fn update(
 
     lore_debug!("Staging link node");
     let link_node = stage::stage_single_node(
-        repository.clone(),
-        state_staged.clone(),
-        link_path.clone(),
+        inner_repository.clone(),
+        inner_state.clone(),
+        chain.remainder_path.clone().freeze(),
         node,
         Arc::default(),
         None, // No link tracking when updating links
@@ -148,9 +165,9 @@ pub async fn update(
     .await
     .forward::<LinkError>("Failed staging the link node")?;
 
-    state_staged
+    inner_state
         .link_update(
-            repository.clone(),
+            inner_repository.clone(),
             link.id,
             link_branch,
             link_revision,
@@ -159,6 +176,7 @@ pub async fn update(
         .await
         .forward::<LinkError>("Failed to update link")?;
 
+    // Filesystem realize uses the full mount path.
     link::realize_link_pin_change(
         repository.clone(),
         link.clone(),
@@ -168,6 +186,9 @@ pub async fn update(
         linked_node,
     )
     .await?;
+
+    // Fold nested link revisions up into the top-level state (no-op if flat).
+    link::propagate_link_chain(&chain, token).await?;
 
     state_staged.set_parent_self(state_current.revision());
 

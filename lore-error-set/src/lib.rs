@@ -16,6 +16,11 @@
 //! - **`Traced<E>`** — a wrapper that pairs errors with source location traces
 //!   (feature-gated via `track-locations`).
 //!
+//! - **`ChainError`** — trait for converting between discrete error types across
+//!   error-set boundaries while preserving the originating trace. Use
+//!   `chain_err` when you hold an extracted `Traced<E>`, or `chain_err_from`
+//!   when you hold the error-set enum directly.
+//!
 //! - **`ResultExt`** — extension trait on `Result` providing `.try_match()`
 //!   and `.map_matched_err()` for ergonomic error mapping with mandatory
 //!   context. Propagation uses the per-source-set strict `.forward()`

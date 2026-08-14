@@ -529,7 +529,6 @@ mod tests {
         )
         .await
         .expect("write content")
-        .0
     }
 
     fn put(path: &str, address: Address) -> revision_v1::RevisionCreateOperation {

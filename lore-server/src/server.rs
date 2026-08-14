@@ -97,6 +97,7 @@ use crate::quic::stream_handler::StreamHandler;
 use crate::server_config::ServerConfig;
 use crate::settings::CompositeStoreSettings;
 use crate::settings::CompositeSubStoreSettings;
+use crate::settings::GrpcSettings;
 use crate::settings::LocalImmutableStoreSettings;
 use crate::settings::LocalMutableStoreSettings;
 use crate::settings::NotificationSettings;
@@ -648,22 +649,27 @@ async fn launch_http_server(
     .await
 }
 
+/// Start a minimal gRPC server in maintenance mode on the address described by
+/// `grpc_settings`.
+///
+/// The server registers only the environment service, which returns
+/// `UNAVAILABLE` to signal that the node is intentionally in a reduced state.
+/// No storage, replication, or admin services are exposed.
+///
+/// Infrastructure health checks (load-balancers, service meshes, deployment controllers) may
+/// probe the internal port to determine whether the node is ready to receive
+/// peer traffic.  Binding the maintenance server on every exposed port ensures those
+/// checks can reach it and observe `UNAVAILABLE`, rather than hitting a refused
+/// connection that a probe might misinterpret as a hard failure.
 async fn launch_maintenance_grpc_server(
-    settings: Settings,
+    grpc_settings: GrpcSettings,
+    environment: EnvironmentConfig,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
-    let grpc_settings = settings
-        .server
-        .grpc
-        .clone()
-        .ok_or(anyhow!("Missing gRPC settings"))?;
-
     let addr =
         SocketAddr::from_str(format!("{}:{}", grpc_settings.host, grpc_settings.port).as_str())?;
 
     info!("Starting Lore maintenance gRPC Server: {}", &addr);
-
-    let environment = settings.environment.clone().unwrap_or_default();
 
     let (cert_path, key_path, cert_chain_path) =
         if let Some(cert_settings) = grpc_settings.certificate {
@@ -1081,6 +1087,7 @@ async fn create_local_store(
             allow_partial_fragment: false, /* Server mode, partial fragments not allowed */
             protect_local_fragment: false, /* Server mode, no need to try protect local fragments from eviction */
             implicit_durable_stored: true, /* Server mode, consider all fragments as durably stored */
+            isolate_partitions: true, /* Server mode, one process holds content for every tenant */
             flush_background,
             flush_delay_seconds: settings.flush_delay_seconds as u64,
             target_capacity_percentage: settings.target_capacity_percentage.unwrap_or(default_settings.target_capacity_percentage),
@@ -1133,6 +1140,7 @@ async fn configure_local_mutable_store(
             flush_delay_seconds: settings.flush_delay_seconds as u64,
             initial_fan_out_level: lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX, /* Server mode, full 256-bucket layout from the start */
             fan_out_threshold: lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT,
+            authoritative: true, /* Server local store is the source of truth, not a cache */
         },
         immutable_store,
     )
@@ -1228,8 +1236,10 @@ async fn configure_composite_store(
 ) -> Result<Arc<dyn ImmutableStore>> {
     info!("Wiring up Composite store");
 
-    let mut composite_store_builder = CompositeStoreBuilder::default()
-        .with_cache_query_results(settings.should_cache_query_results.unwrap_or_default());
+    let mut composite_store_builder = CompositeStoreBuilder::default().with_cache_metadata(
+        settings.cache_metadata.unwrap_or_default(),
+        settings.cache_metadata_semaphore_size,
+    );
 
     let store = Box::pin(configure_composite_substore(
         registry,
@@ -1502,9 +1512,9 @@ async fn seed_local_store(settings: &LocalImmutableStoreSettings) -> Result<(), 
                 .map(|v| v.parse::<usize>().unwrap_or_default())
                 .unwrap_or_default();
 
-            let buffer = std::env::var("LORE_SEEDING_BUFFER")
-                .map(|v| v.parse::<usize>().unwrap_or(DEFAULT_BUFFER_SIZE))
-                .unwrap_or(DEFAULT_BUFFER_SIZE);
+            let buffer = std::env::var("LORE_SEEDING_BUFFER").map_or(DEFAULT_BUFFER_SIZE, |v| {
+                v.parse::<usize>().unwrap_or(DEFAULT_BUFFER_SIZE)
+            });
 
             let result = lore_revision::store::seeder::seed_local_store(
                 local_store,
@@ -1651,9 +1661,6 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // Linux.
     #[cfg(target_os = "linux")]
     log_base_address().await;
-
-    // Enforce repository isolation in local store by default
-    lore_storage::concurrency::LOCAL_ISOLATION.store(true, std::sync::atomic::Ordering::Release);
 
     let execution = execution_context();
     let frequency = Duration::from_millis(metrics_config.export_interval_millis);
@@ -1902,11 +1909,27 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             });
         }
     } else {
+        let grpc_settings = settings
+            .server
+            .grpc
+            .clone()
+            .ok_or(anyhow!("Missing gRPC settings"))?;
+        let environment = settings.environment.clone().unwrap_or_default();
+
         lore_spawn!(endpoints, {
-            let settings = settings.clone();
             let shutdown_rx = _shutdown_rx.clone();
-            launch_maintenance_grpc_server(settings, shutdown_rx)
+            launch_maintenance_grpc_server(grpc_settings, environment.clone(), shutdown_rx)
         });
+
+        if let Some(grpc_internal) = &settings.server.grpc_internal
+            && grpc_internal.enabled
+        {
+            lore_spawn!(endpoints, {
+                let grpc_settings = grpc_internal.clone();
+                let shutdown_rx = _shutdown_rx.clone();
+                launch_maintenance_grpc_server(grpc_settings, environment, shutdown_rx)
+            });
+        }
     }
 
     // the public facing QUIC server. Authentication is via JWT, so the
@@ -1971,7 +1994,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // blanket storage access with no JWT layer — so the startup-time
     // validator demands mTLS unless verify_client_certs is explicitly
     // disabled.
-    if let Some(quic_internal_settings) = settings.server.quic_internal.as_ref()
+    if !is_maintenance
+        && let Some(quic_internal_settings) = settings.server.quic_internal.as_ref()
         && quic_internal_settings.enabled
     {
         let security = validate_endpoint_security(

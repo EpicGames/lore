@@ -126,7 +126,7 @@ async fn info_impl(
                 .map(LoreString::from)
                 .unwrap_or_default();
             let mut metadata_key_count = 0u32;
-            let _ = metadata.walk(|_, _, _| metadata_key_count += 1);
+            metadata.walk(|_, _, _| metadata_key_count += 1);
 
             LoreEvent::RevisionTreeInfo(LoreRevisionTreeInfoEventData {
                 id,
@@ -334,7 +334,6 @@ mod tests {
         let (handle, store_handle_id) =
             load_handle("info-corrupt", Partition::from([0x44u8; 16])).await;
         let (state, _repository_context) = handle_state(handle);
-        // Point the revision at a metadata fragment that was never written to the store.
         state.set_metadata_hash(Hash::from([0x7Eu8; 32]));
 
         let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));

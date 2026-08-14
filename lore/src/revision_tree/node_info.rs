@@ -162,8 +162,6 @@ async fn node_info_impl(
                 }
             };
 
-            // Every non-root node has a non-empty name, so an empty name means the
-            // id landed on an unallocated slot rather than a real node.
             if node_id != ROOT_NODE && name.is_empty() {
                 emit_node_info_error(id, LoreErrorCode::InvalidArguments);
                 return Err(invalid("node id does not resolve to a named node"));
@@ -185,6 +183,7 @@ async fn node_info_impl(
                 name: LoreString::from(name.as_str()),
                 parent_id: node.parent,
                 kind,
+                staged_action: node.staged_action() as u32,
                 mode: node.mode,
                 size: node.size,
                 address: node.address,
@@ -552,13 +551,13 @@ mod tests {
         release(handle, store_handle_id);
     }
 
+    /// Nothing is added to the handle, so id 1 is an in-range but unallocated
+    /// slot, which reads back as a zeroed record with an empty name.
     #[tokio::test]
     async fn node_info_unallocated_node_returns_invalid_arguments() {
         let (handle, store_handle_id) =
             load_handle("ni-unallocated", Partition::from([0x88u8; 16])).await;
 
-        // No nodes added: id 1 is an in-range but unallocated slot, which reads
-        // back as a zeroed record with an empty name.
         let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let status = node_info(
             LoreGlobalArgs::default(),

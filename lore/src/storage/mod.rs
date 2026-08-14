@@ -122,6 +122,29 @@ pub(crate) async fn drain_in_parallel(entries: Vec<(u64, std::sync::Arc<store::S
     while tasks.join_next().await.is_some() {}
 }
 
+/// The content range an item asks for, or `None` for the whole content.
+///
+/// `length == 0` reads to the end of the content, which makes a zeroed pair — what a caller
+/// that has never heard of ranges passes, and what `Default` gives — mean the whole content.
+/// So the range fields are inert until someone sets them.
+///
+/// Both fields are `u64` because content is: `Fragment::size_content` is a `u64` and a
+/// repository may hold blobs past 4 GiB. Saturating rather than wrapping on the way down to
+/// `usize` keeps a 32-bit target reading to the end of what it can address instead of wrapping
+/// to a short read; the storage layer clamps to the content that exists either way.
+pub(crate) fn item_content_range(offset: u64, length: u64) -> Option<std::ops::Range<usize>> {
+    if offset == 0 && length == 0 {
+        return None;
+    }
+    let start = usize::try_from(offset).unwrap_or(usize::MAX);
+    let end = if length == 0 {
+        usize::MAX
+    } else {
+        start.saturating_add(usize::try_from(length).unwrap_or(usize::MAX))
+    };
+    Some(start..end)
+}
+
 /// Map a `StorageError` to the external `LoreErrorCode` surface used by per-item completion
 /// events. Shared by every op that goes through the higher-level storage pipeline so the
 /// translation stays consistent. `SlowDown` surfaces back-pressure; oversized writes are

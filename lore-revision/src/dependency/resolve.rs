@@ -221,10 +221,13 @@ pub async fn resolve_dependency_file_set(
         let node_link = state
             .find_node_link(repository.clone(), path)
             .await
-            .map_err(|_err| {
-                DependencyError::from(FileNotFound {
-                    resource: (*path).to_string(),
-                })
+            .map_err(|err| {
+                DependencyError::FileNotFound(
+                    FileNotFound {
+                        resource: (*path).to_string(),
+                    }
+                    .chain_err_from(err, "root path not found in state"),
+                )
             })?;
         if !node_link.is_valid() {
             return Err(FileNotFound {

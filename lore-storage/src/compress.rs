@@ -18,7 +18,14 @@ use serde::Deserialize;
 
 use crate::Fragment;
 use crate::FragmentFlags;
+use crate::errors::InefficientCompression;
 use crate::errors::NotSupported;
+
+#[error_set]
+pub enum CompressFragmentError {
+    NotSupported,
+    InefficientCompression,
+}
 
 #[error_set]
 pub enum FragmentError {
@@ -761,7 +768,7 @@ pub fn compress(
     fragment: Fragment,
     payload: &[u8],
     mode: CompressionMode,
-) -> Result<(Fragment, Bytes), FragmentError> {
+) -> Result<(Fragment, Bytes), CompressFragmentError> {
     let output_buffer =
         BytesMut::with_capacity(compress_bound(fragment.size_payload as usize, mode));
     compress_into(fragment, payload, mode, output_buffer)
@@ -776,9 +783,11 @@ fn compress_into(
     payload: &[u8],
     mode: CompressionMode,
     output_buffer: BytesMut,
-) -> Result<(Fragment, Bytes), FragmentError> {
+) -> Result<(Fragment, Bytes), CompressFragmentError> {
     if fragment.size_content as usize > FRAGMENT_SIZE_THRESHOLD {
-        return Err(FragmentError::internal("fragment has invalid sizes"));
+        return Err(CompressFragmentError::internal(
+            "fragment has invalid sizes",
+        ));
     }
     // Only try to compress previously uncompressed raw data buffers of more than 32 bytes
     // Fragment lists and below 32 byte buffers are always raw uncompressed
@@ -786,13 +795,15 @@ fn compress_into(
         || (fragment.flags & FragmentFlags::PayloadFragmented) != 0
         || (fragment.size_payload as u64) != fragment.size_content
     {
-        return Err(FragmentError::internal(
+        return Err(CompressFragmentError::internal(
             "fragment incompatible with compression",
         ));
     }
 
     if payload.len() < fragment.size_payload as usize {
-        return Err(FragmentError::internal("fragment has invalid sizes"));
+        return Err(CompressFragmentError::internal(
+            "fragment has invalid sizes",
+        ));
     }
 
     match mode {
@@ -803,14 +814,14 @@ fn compress_into(
         #[cfg(feature = "oodle")]
         CompressionMode::Oodle => compress_oodle_impl(fragment, payload, output_buffer),
         #[cfg(not(feature = "oodle"))]
-        CompressionMode::Oodle => Err(FragmentError::from(NotSupported {
+        CompressionMode::Oodle => Err(CompressFragmentError::from(NotSupported {
             operation:
                 "Oodle compression requested but this client was built without Oodle support"
                     .to_string(),
         })),
-        CompressionMode::NoCompression => {
-            Err(FragmentError::internal("fragment compression disabled"))
-        }
+        CompressionMode::NoCompression => Err(CompressFragmentError::internal(
+            "fragment compression disabled",
+        )),
     }
 }
 
@@ -819,7 +830,7 @@ fn compress_oodle_impl(
     fragment: Fragment,
     payload: &[u8],
     mut compressed_buffer: BytesMut,
-) -> Result<(Fragment, Bytes), FragmentError> {
+) -> Result<(Fragment, Bytes), CompressFragmentError> {
     oodle_initialize();
 
     // Save at least 5% to be worth compressing
@@ -863,7 +874,7 @@ fn compress_oodle_impl(
             compressed_buffer.freeze(),
         ))
     } else {
-        Err(FragmentError::internal("compression was inefficient"))
+        Err(InefficientCompression.into())
     }
 }
 
@@ -871,7 +882,7 @@ fn compress_lz4_impl(
     fragment: Fragment,
     payload: &[u8],
     mut compressed_buffer: BytesMut,
-) -> Result<(Fragment, Bytes), FragmentError> {
+) -> Result<(Fragment, Bytes), CompressFragmentError> {
     // Save at least 5% to be worth compressing
     let compressed_size_threshold = ((fragment.size_payload as usize) * 95) / 100;
 
@@ -899,7 +910,7 @@ fn compress_lz4_impl(
             compressed_buffer.freeze(),
         ))
     } else {
-        Err(FragmentError::internal("compression was inefficient"))
+        Err(InefficientCompression.into())
     }
 }
 
@@ -922,13 +933,15 @@ fn compress_zstd_impl(
     fragment: Fragment,
     payload: &[u8],
     mut compressed_buffer: BytesMut,
-) -> Result<(Fragment, Bytes), FragmentError> {
+) -> Result<(Fragment, Bytes), CompressFragmentError> {
     // Save at least 5% to be worth compressing
     let compressed_size_threshold = ((fragment.size_payload as usize) * 95) / 100;
 
     let ctx = zstd_compress_ctx();
     if ctx.0.is_null() {
-        return Err(FragmentError::internal("failed to allocate zstd context"));
+        return Err(CompressFragmentError::internal(
+            "failed to allocate zstd context",
+        ));
     }
     // Safety: ctx.0 is a valid non-null ZSTD_CCtx. Buffer capacity was sized
     // by the caller via compress_bound(). Input payload length is validated
@@ -962,6 +975,6 @@ fn compress_zstd_impl(
             compressed_buffer.freeze(),
         ))
     } else {
-        Err(FragmentError::internal("compression was inefficient"))
+        Err(InefficientCompression.into())
     }
 }

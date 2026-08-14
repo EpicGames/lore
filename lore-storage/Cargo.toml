@@ -19,6 +19,7 @@ futures = { workspace = true }
 lore-base = { workspace = true }
 hex = { workspace = true }
 libc = { workspace = true }
+lore-io = { workspace = true }
 lore-transport = { workspace = true }
 lz4-sys = { workspace = true }
 zstd-sys = { workspace = true }
@@ -44,4 +45,10 @@ oodle = []
 trace_log = []
 
 [target.'cfg(target_family = "windows")'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Storage_FileSystem"] }
+# `Win32_Storage_FileSystem` does not imply `Win32_Foundation`, and the packstore reads its error
+# constants from the latter, so both are named here rather than relying on another crate in the
+# build enabling it.
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }

@@ -22,23 +22,20 @@
 //! Peak residency is therefore the windows themselves, which is exactly what the
 //! reservation in [`FileChunker::open`] covers.
 //!
-//! Each read is one blocking call, keeping the whole scan off the async workers: the
-//! previous whole-file approach mapped the file and faulted every page in
-//! synchronously from a core worker. Phase 2 of the async file I/O proposal replaces
-//! the read with the owned-buffer positional API; the windowing, pipelining and cut
-//! logic above it is unaffected.
+//! Each read is one `lore-io` scatter into the window it fills, so the whole scan goes
+//! through the file I/O engine and no thread is held across it on a completion backend.
+//! The window travels into the operation and comes back with it, which is what the
+//! owned-buffer contract requires; the windowing, pipelining and cut logic above it is
+//! unchanged by that, as is every cut boundary.
 
 use std::collections::VecDeque;
-use std::fs::File;
-#[cfg(target_family = "unix")]
-use std::os::unix::fs::FileExt;
-#[cfg(target_family = "windows")]
-use std::os::windows::fs::FileExt;
 use std::path::Path;
-use std::sync::Arc;
 
 use bytes::Bytes;
 use bytes::BytesMut;
+use lore_io::IoDriver;
+use lore_io::IoFile;
+use lore_io::OpenOptions;
 use tokio::task::JoinHandle;
 
 use crate::compress::FRAGMENT_SIZE_THRESHOLD;
@@ -56,74 +53,13 @@ pub struct Chunk {
     pub data: Bytes,
 }
 
-/// Positional read. On Windows `seek_read` also moves the file cursor, which is
-/// harmless here because the chunker owns the handle and never reads sequentially.
-fn read_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
-    #[cfg(target_family = "unix")]
-    {
-        file.read_at(buffer, offset)
-    }
-    #[cfg(target_family = "windows")]
-    {
-        file.seek_read(buffer, offset)
-    }
-}
-
 /// Open `path` for reading, returning the shared handle and its size.
-pub async fn open_read(path: &Path) -> std::io::Result<(Arc<File>, u64)> {
-    let path = path.to_path_buf();
-    lore_base::lore_spawn_blocking!(move || -> std::io::Result<(Arc<File>, u64)> {
-        let file = File::options()
-            .create(false)
-            .truncate(false)
-            .read(true)
-            .write(false)
-            .open(&path)?;
-        let size = file.metadata()?.len();
-        Ok((Arc::new(file), size))
-    })
-    .await
-    .map_err(std::io::Error::other)?
-}
-
-/// Read exactly `length` bytes at `offset`. Short of that is an error: the caller is
-/// reading a range it already believes to be within the file.
-pub async fn read_range(file: Arc<File>, offset: u64, length: usize) -> std::io::Result<Bytes> {
-    start_read_range(file, offset, length)
-        .await
-        .map_err(std::io::Error::other)?
-}
-
-/// Start a [`read_range`] without waiting for it, so the caller can overlap it with work
-/// on bytes it already holds. Dropping the handle detaches the read; the blocking call
-/// runs to completion and frees its buffer.
-pub fn start_read_range(
-    file: Arc<File>,
-    offset: u64,
-    length: usize,
-) -> JoinHandle<std::io::Result<Bytes>> {
-    lore_base::lore_spawn_blocking!(move || -> std::io::Result<Bytes> {
-        let mut buffer = BytesMut::with_capacity(length);
-        // SAFETY: `with_capacity` guarantees the allocation; every byte up to `length` is
-        // initialised by the reads below, and a short read is rejected rather than
-        // exposing the tail.
-        unsafe { buffer.set_len(length) };
-        let mut read = 0;
-        while read < length {
-            match read_at(&file, &mut buffer[read..], offset + read as u64) {
-                Ok(0) => break,
-                Ok(count) => read += count,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        }
-        if read != length {
-            return Err(std::io::Error::other(format!(
-                "read {read} of {length} bytes at offset {offset}"
-            )));
-        }
-        Ok(buffer.freeze())
-    })
+pub async fn open_read(path: &Path) -> std::io::Result<(IoFile, u64)> {
+    let file = IoDriver::global()
+        .open(path, &OpenOptions::new().read(true))
+        .await?;
+    let size = file.metadata().await?.len();
+    Ok((file, size))
 }
 
 /// How the chunker picks cut points.
@@ -135,18 +71,35 @@ enum CutMode {
     FixedSize(usize),
 }
 
-/// A read in flight into the window that is not being cut: the task, plus how many
-/// bytes it asked for, so a short read is recognised as the end of the file.
+/// The window a read fills, owned by the operation for its whole flight and handed back
+/// with it. A single segment: the read lands in `buffer[start..start + want]`, leaving
+/// anything in front of it as headroom for bytes the caller carries over itself.
+pub(crate) struct WindowRead {
+    pub(crate) buffer: BytesMut,
+    pub(crate) start: usize,
+    pub(crate) want: usize,
+}
+
+impl lore_io::StableBufListMut for WindowRead {
+    fn byte_segments_mut(&mut self) -> impl Iterator<Item = &mut [u8]> {
+        std::iter::once(&mut self.buffer[self.start..self.start + self.want])
+    }
+}
+
+/// A read in flight into the window that is not being cut.
 struct PendingRead {
-    task: JoinHandle<std::io::Result<(Vec<u8>, usize)>>,
+    task: JoinHandle<std::io::Result<BytesMut>>,
+    /// The exact count the read fills, from the clamp in `start_read`. The driver reports
+    /// no count of its own: an exact read either fills the request or fails.
     want: usize,
 }
 
 /// Cuts a file into chunks a window at a time.
 pub struct FileChunker {
-    file: Arc<File>,
-    /// Unconsumed bytes live in `window[head..head + length]`.
-    window: Vec<u8>,
+    file: IoFile,
+    /// Unconsumed bytes live in `window[head..head + length]`. Everything outside that
+    /// range is uninitialised until a read or a carry-over writes it.
+    window: BytesMut,
     head: usize,
     length: usize,
     /// Where a read lands in a window, and so how much room the undecided remainder
@@ -165,7 +118,7 @@ pub struct FileChunker {
     /// The read filling the other window while this one is handed out.
     pending: Option<PendingRead>,
     /// The other window, parked here whenever no read is in flight.
-    spare: Option<Vec<u8>>,
+    spare: Option<BytesMut>,
     /// Absolute file offset of `window[head]`.
     base: u64,
     /// Absolute file offset the next read starts at.
@@ -181,13 +134,13 @@ pub struct FileChunker {
 
 impl FileChunker {
     /// Cut on content, matching [`fastcdc::v2020::FastCDC`] over the whole file.
-    pub async fn content_defined(file: Arc<File>, file_size: u64) -> Self {
+    pub async fn content_defined(file: IoFile, file_size: u64) -> Self {
         Self::open(file, file_size, CutMode::ContentDefined).await
     }
 
     /// Cut every `chunk_size` bytes, clamped to a whole fragment and at least one byte
     /// so a caller passing zero cannot stall the cut loop.
-    pub async fn fixed_size(file: Arc<File>, file_size: u64, chunk_size: usize) -> Self {
+    pub async fn fixed_size(file: IoFile, file_size: u64, chunk_size: usize) -> Self {
         let mode = CutMode::FixedSize(chunk_size.clamp(1, FRAGMENT_SIZE_THRESHOLD));
         Self::open(file, file_size, mode).await
     }
@@ -206,7 +159,7 @@ impl FileChunker {
     /// Every term is bounded by the file: nothing larger than the file is ever
     /// buffered or cut from it, and a file that fits in one read gets a single window
     /// with no headroom and no read-ahead.
-    async fn open(file: Arc<File>, file_size: u64, mode: CutMode) -> Self {
+    async fn open(file: IoFile, file_size: u64, mode: CutMode) -> Self {
         let capacity = file_size.min(WINDOW_SIZE as u64) as usize;
         let single_read = file_size <= WINDOW_SIZE as u64;
         let headroom = if single_read {
@@ -222,7 +175,10 @@ impl FileChunker {
 
         Self {
             file,
-            window: vec![0u8; capacity],
+            // SAFETY: no byte is read before it is written. The cut only ever looks at
+            // `window[head..head + length]`, which is the region the read filled plus the
+            // remainder `swap_in` carries into the headroom in front of it.
+            window: unsafe { lore_io::uninit_buffer(capacity) },
             head: headroom,
             length: 0,
             headroom,
@@ -230,7 +186,8 @@ impl FileChunker {
             ready: VecDeque::new(),
             pending: None,
             failed: false,
-            spare: (!single_read).then(|| vec![0u8; capacity]),
+            // SAFETY: as above; the two windows are used interchangeably.
+            spare: (!single_read).then(|| unsafe { lore_io::uninit_buffer(capacity) }),
             base: 0,
             read_offset: 0,
             file_size,
@@ -281,7 +238,7 @@ impl FileChunker {
     /// Make `buffer` the window, moving the undecided remainder into the headroom in
     /// front of the bytes just read so the two are contiguous — the cut logic never
     /// sees the seam between one read and the next.
-    fn swap_in(&mut self, mut buffer: Vec<u8>, read: usize) {
+    fn swap_in(&mut self, mut buffer: BytesMut, read: usize) {
         let remainder = self.length - self.decided;
         debug_assert!(
             remainder <= self.headroom,
@@ -303,7 +260,7 @@ impl FileChunker {
     /// The bytes of the next read: from the task started while the last batch was
     /// handed out, or from one started and awaited here — which is the first read of a
     /// file, and any round where the previous cut decided nothing.
-    async fn take_read(&mut self) -> Result<(Vec<u8>, usize), StorageError> {
+    async fn take_read(&mut self) -> Result<(BytesMut, usize), StorageError> {
         let pending = if let Some(pending) = self.pending.take() {
             pending
         } else {
@@ -316,18 +273,18 @@ impl FileChunker {
             self.start_read(target)
         };
 
-        let (buffer, read) = pending
+        let buffer = pending
             .task
             .await
             .map_err(|e| StorageError::internal_with_context(e, "chunker read task failure"))?
             .map_err(|e| StorageError::internal_with_context(e, "read file for chunking"))?;
 
-        self.read_offset += read as u64;
-        if read < pending.want || self.read_offset >= self.file_size {
+        self.read_offset += pending.want as u64;
+        if self.read_offset >= self.file_size {
             self.eof = true;
         }
 
-        Ok((buffer, read))
+        Ok((buffer, pending.want))
     }
 
     /// Start filling the other window, so the read overlaps cutting and handing out the
@@ -341,33 +298,32 @@ impl FileChunker {
         }
     }
 
-    /// One blocking positional read into `buffer[headroom..]`, keeping the scan off the
-    /// async workers.
-    fn start_read(&self, mut buffer: Vec<u8>) -> PendingRead {
+    /// One scatter into `buffer[headroom..]`, spawned so it overlaps the cutting and
+    /// handing out of the batch already in the other window.
+    ///
+    /// The length is clamped to what the file held when it was opened, so the read is an
+    /// exact one: a file that shrank underneath is an error rather than a silent early
+    /// end, and one appended to mid-write cannot yield a chunk list covering more bytes
+    /// than the root fragment records, which readers trust.
+    fn start_read(&self, buffer: BytesMut) -> PendingRead {
         let file = self.file.clone();
         let start = self.headroom;
         let offset = self.read_offset;
-
-        // A file appended to mid-write would otherwise yield a chunk list covering more
-        // bytes than the root fragment records, which readers trust.
         let remaining = self.file_size.saturating_sub(offset);
         let want = (buffer.len() - start).min(remaining as usize);
 
-        let task = lore_base::lore_spawn_blocking!(move || -> std::io::Result<(Vec<u8>, usize)> {
-            let mut read = 0;
-            while read < want {
-                match read_at(
-                    &file,
-                    &mut buffer[start + read..start + want],
-                    offset + read as u64,
-                ) {
-                    Ok(0) => break,
-                    Ok(count) => read += count,
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(e) => return Err(e),
-                }
-            }
-            Ok((buffer, read))
+        let task = lore_base::lore_spawn!(async move {
+            let window = file
+                .read_exact_vectored_at(
+                    WindowRead {
+                        buffer,
+                        start,
+                        want,
+                    },
+                    offset,
+                )
+                .await?;
+            Ok(window.buffer)
         });
 
         PendingRead { task, want }
@@ -474,8 +430,7 @@ mod tests {
         file.sync_all().expect("sync test file");
         drop(file);
 
-        let file = Arc::new(std::fs::File::open(&path).expect("open test file"));
-        let file_size = content.len() as u64;
+        let (file, file_size) = open_read(&path).await.expect("open test file");
         let mut chunker = if fixed_size > 0 {
             FileChunker::fixed_size(file, file_size, fixed_size).await
         } else {
@@ -616,7 +571,7 @@ mod tests {
     async fn open_chunker(dir: &TempDir, name: &str, size: usize) -> FileChunker {
         let path = dir.path().join(name);
         std::fs::write(&path, random_buffer(size)).expect("write test file");
-        let file = Arc::new(std::fs::File::open(&path).expect("open test file"));
+        let (file, _) = open_read(&path).await.expect("open test file");
 
         FileChunker::content_defined(file, size as u64).await
     }
@@ -680,7 +635,7 @@ mod tests {
         let declared = 3 * WINDOW_SIZE + 517;
         std::fs::write(&path, random_buffer(declared)).expect("write test file");
 
-        let file = Arc::new(std::fs::File::open(&path).expect("open test file"));
+        let (file, _) = open_read(&path).await.expect("open test file");
         let mut chunker = FileChunker::content_defined(file, declared as u64).await;
 
         // Grow the file behind the chunker, as an appender would.
@@ -703,6 +658,46 @@ mod tests {
         );
     }
 
+    /// A file holding less than the size it was measured at is rejected at the read that
+    /// crosses the end, part-way through a scan that was succeeding: the chunk list would
+    /// otherwise cover fewer bytes than the root fragment records, and readers trust that
+    /// count.
+    ///
+    /// The short file stands in for one truncated behind the chunker, which cannot be staged
+    /// portably — truncation needs a second, writing handle, and the reader may hold a share
+    /// mode that denies one.
+    #[tokio::test]
+    async fn a_file_shorter_than_its_measured_size_fails() {
+        let dir = TempDir::new("lore-storage-chunker-shrink-");
+        let path = dir.path().join("short");
+        let declared = 4 * WINDOW_SIZE;
+        std::fs::write(&path, random_buffer(2 * WINDOW_SIZE)).expect("write test file");
+
+        let (file, _) = open_read(&path).await.expect("open test file");
+        let mut chunker = FileChunker::content_defined(file, declared as u64).await;
+        chunker
+            .next_chunk()
+            .await
+            .expect("first chunk")
+            .expect("a chunk");
+
+        let err = loop {
+            match chunker.next_chunk().await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("a shrunk file must not report a complete scan"),
+                Err(err) => break err,
+            }
+        };
+        assert!(
+            format!("{err}").contains("read file for chunking"),
+            "expected the read itself to fail: {err}"
+        );
+
+        let Err(_) = chunker.next_chunk().await else {
+            panic!("a failed chunker stays failed");
+        };
+    }
+
     #[tokio::test]
     async fn empty_file_yields_no_chunks() {
         let dir = TempDir::new("lore-storage-chunker-test-");
@@ -722,7 +717,10 @@ mod tests {
         let path = dir.path().join("write-only");
         std::fs::write(&path, vec![7u8; 4 * FRAGMENT_SIZE_THRESHOLD]).expect("seed file");
         // Write-only handle: every positional read fails.
-        let file = Arc::new(std::fs::File::create(&path).expect("open write-only"));
+        let file = lore_io::IoDriver::global()
+            .open(&path, &OpenOptions::new().write(true))
+            .await
+            .expect("open write-only");
 
         let mut chunker =
             FileChunker::content_defined(file, 4 * FRAGMENT_SIZE_THRESHOLD as u64).await;

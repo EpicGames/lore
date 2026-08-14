@@ -189,7 +189,11 @@ static RE: Lazy<Regex> = Lazy::new(|| {
 
 - **lore-server** — Uses `tracing`; errors become gRPC/HTTP status codes.
 - **lore-aws** — AWS-specific errors with a generic type parameter.
-- **lore-base**, **lore-client**, **lore-credential**, **lore-error-set**, **lore-storage**, **lore-telemetry**, **lore-transport**.
+- **lore-base**, **lore-client**, **lore-credential**, **lore-storage**, **lore-telemetry**, **lore-transport**.
+
+### lore-error-set
+
+The error framework itself. Provides `#[error_set]`, `Traced<E>`, `ChainError`, `Internal`, and `FfiError`. Not a consumer of `thiserror`.
 
 ### No custom error types
 
@@ -231,3 +235,4 @@ Don't use them for expected, user-caused errors (for example, `NotFound`, `Inval
 5. **Use emit_map_err** for unexpected failures.
 6. **Use debug_map_err** for expected/recoverable conditions.
 7. **Use tracing** in server code, Lore macros in library code.
+8. **Don't discard originating error traces** — When constructing a new discrete error from a caught one, use `chain_err_from` (or `chain_err` if you've already destructured the variant) to carry the originating trace forward. Using `internal_with_context` is correct when collapsing to `Internal`; using `internal()` without context silently drops the source. Prefer `chain_err_from(source_err, "context")` over `Err(NewError { ... }.into())`.

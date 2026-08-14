@@ -88,6 +88,7 @@ use crate::event::revision_tree::LoreRevisionTreeDeleteCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeInfoEventData;
 use crate::event::revision_tree::LoreRevisionTreeListChildrenBeginEventData;
 use crate::event::revision_tree::LoreRevisionTreeLoadedEventData;
+use crate::event::revision_tree::LoreRevisionTreeMetadataClearCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeMetadataGetCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeMetadataSetCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeModifyCompleteEventData;
@@ -117,6 +118,7 @@ use crate::immutable::LoreFragmentWriteEventData;
 use crate::instance::LoreBranchMultipleInstanceEventData;
 use crate::instance::LoreRepositoryInstanceEventData;
 use crate::interface::LoreArray;
+use crate::interface::LoreBinary;
 use crate::interface::LoreError;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreEventCallbackConfig;
@@ -126,6 +128,7 @@ use crate::layer::LoreLayerAddEventData;
 use crate::layer::LoreLayerEntryEventData;
 use crate::layer::LoreLayerRemoveEventData;
 use crate::layer::LoreLayerStagedEntryEventData;
+use crate::link::LoreLinkBranchCreateEventData;
 use crate::link::LoreLinkChangeEventData;
 use crate::link::LoreLinkEntryEventData;
 use crate::link::list::LoreLinkStagedEntryEventData;
@@ -421,9 +424,9 @@ impl LoreMetadataEventData {
             MetadataType::Hash => LoreMetadata::Hash(Metadata::to_hash(value)?),
             MetadataType::Numeric => LoreMetadata::Numeric(Metadata::to_u64(value)?),
             MetadataType::String => {
-                LoreMetadata::String(LoreString::from(Metadata::to_string(value).ok()))
+                LoreMetadata::String(LoreString::from(Metadata::to_string(value)?))
             }
-            MetadataType::Binary => return Err(MetadataError::internal("metadata type mismatch")),
+            MetadataType::Binary => LoreMetadata::Binary(LoreBinary::from_bytes(value)),
         };
 
         Ok(LoreMetadataEventData { key, value })
@@ -916,6 +919,8 @@ pub enum LoreEvent {
     LayerRemove(LoreLayerRemoveEventData),
     /// One staged entry in a layer listing.
     LayerStagedEntry(LoreLayerStagedEntryEventData),
+    /// A link's branch in the linked repository was created or reused.
+    LinkBranchCreate(LoreLinkBranchCreateEventData),
     /// A link was changed.
     LinkChange(LoreLinkChangeEventData),
     /// One entry in a link listing.
@@ -1139,6 +1144,8 @@ pub enum LoreEvent {
     CompactionEnd(LoreCompactionEndEventData),
     /// A batch write call on a revision tree completed as a whole.
     RevisionTreeBatchComplete(LoreRevisionTreeBatchCompleteEventData),
+    /// A metadata-clear entry completed.
+    RevisionTreeMetadataClearComplete(LoreRevisionTreeMetadataClearCompleteEventData),
 }
 
 impl LoreEvent {
@@ -1455,5 +1462,31 @@ mod complete_event_tests {
             error: LoreErrorDetail::default(),
         };
         assert_eq!(by_position.status, status);
+    }
+}
+
+#[cfg(test)]
+mod metadata_event_tests {
+    use super::LoreMetadataEventData;
+    use crate::interface::LoreMetadata;
+    use crate::metadata::MetadataType;
+
+    /// Bytes stored under the string tag that are not text cannot be delivered
+    /// as a string, so the decode fails rather than reporting an empty value:
+    /// an empty string is a value a key can legitimately hold, and a caller
+    /// cannot tell the two apart. Argument text is checked at the entry point,
+    /// but a value read back out of a stored buffer never passed through it.
+    #[test]
+    fn a_string_value_that_is_not_text_fails_to_decode() {
+        assert!(
+            LoreMetadataEventData::new("key", b"\xff\xfe", MetadataType::String).is_err(),
+            "bytes that are not text must not decode to an empty string"
+        );
+        let decoded = LoreMetadataEventData::new("key", b"text", MetadataType::String)
+            .expect("valid text must decode");
+        assert_eq!(
+            decoded.value,
+            LoreMetadata::String(crate::interface::LoreString::from("text"))
+        );
     }
 }

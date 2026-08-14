@@ -8,9 +8,6 @@ use std::collections::HashSet;
 use std::io;
 use std::io::ErrorKind;
 use std::io::Read;
-use std::io::Write;
-#[cfg(target_family = "windows")]
-use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 use std::path::PathBuf;
 #[cfg(feature = "failure_generator")]
@@ -69,9 +66,10 @@ use crate::fs_util;
 use crate::hash;
 use crate::immutable_store::StoreError;
 use crate::immutable_store::sanitise_fragment_behavior_flags;
+use crate::store_types::StoreGetData;
 use crate::store_types::StoreMatch;
+use crate::store_types::StoreMatchResult;
 use crate::store_types::StoreObliterateStats;
-use crate::store_types::StoreQueryResult;
 
 #[error_set]
 pub enum LocalImmutableStoreError {
@@ -86,6 +84,11 @@ pub const BUCKET_COUNT: usize = 256;
 pub const DEFAULT_FLUSH_DELAY_SECONDS: u64 = 5;
 
 const DOT_COMPACT: &str = "compact";
+
+/// Head bytes requested by the composite bucket open: one pool buffer
+/// class, covering fan-out-threshold-sized buckets (~100 KiB) entirely so
+/// the common bucket load is a single backend dispatch.
+pub(crate) const BUCKET_HEAD_READ: usize = 256 * 1024;
 
 // 256 u32 makes the u32 growvec chunks 2048 bytes in size
 const CHUNK_SIZE_U32: usize = 256;
@@ -159,6 +162,9 @@ pub struct ImmutableStoreFindResult {
     pub group: usize,
     pub data: ImmutableData,
     pub matching: StoreMatch,
+    /// The partition the matched entry belongs to. The one searched for whenever it holds the hash,
+    /// since `lookup` prefers it; another only when it does not.
+    pub partition: Partition,
 }
 
 #[repr(C)]
@@ -280,6 +286,10 @@ pub struct ImmutableStoreSettings {
     pub protect_local_fragment: bool,
     /// Consider all fragments durably stored (false for clients, generally true for server)
     pub implicit_durable_stored: bool,
+    /// Refuse to serve a payload found under a different partition (false for clients, true for
+    /// server). Partitions are the unit access is granted on, so a process holding content for
+    /// several tenants must not let one of them read another's bytes by hash alone.
+    pub isolate_partitions: bool,
     /// Flush in the background
     pub flush_background: bool,
     /// Flush delay in seconds
@@ -309,6 +319,7 @@ impl Default for ImmutableStoreSettings {
             allow_partial_fragment: true,
             protect_local_fragment: true,
             implicit_durable_stored: false,
+            isolate_partitions: false,
             flush_background: false,
             flush_delay_seconds: DEFAULT_FLUSH_DELAY_SECONDS,
             target_capacity_percentage: 70,
@@ -418,6 +429,44 @@ enum DeserializeFileError {
     Corrupt(String),
 }
 
+/// Final-destination segments for a bucket read: one vectored operation
+/// scatters the on-disk sorted-index and entry regions straight into the
+/// bucket's chunk allocations, with no staging buffer.
+struct ImmutableBucketSegments {
+    sorted_index: GrowVec<u32, CHUNK_SIZE_U32>,
+    entry: GrowVec<ImmutableStoreEntry, CHUNK_SIZE_ENTRY>,
+}
+
+impl lore_io::StableBufListMut for ImmutableBucketSegments {
+    fn byte_segments_mut(&mut self) -> impl Iterator<Item = &mut [u8]> {
+        self.sorted_index
+            .byte_segments_mut()
+            .chain(self.entry.byte_segments_mut())
+    }
+}
+
+/// Gather segments for a bucket write: the serialized header plus the
+/// bucket's sorted-index and entry chunks, written with one vectored
+/// operation and no staging copy. Owning the bucket's read guard keeps the
+/// chunk memory alive and unmodified for the operation's whole kernel
+/// flight, which is the stability contract vectored writes require.
+struct ImmutableBucketWriteSegments {
+    /// The serialized header, in a fixed-size allocation rather than a `Vec`: its length is a
+    /// compile-time constant. It stays behind a pointer because [`lore_io::StableBufList`]
+    /// requires a segment to keep its address when the value moves, and the ring backend moves
+    /// the segment list into its operation entry after taking the pointers.
+    header: Box<[u8; size_of::<ImmutableStoreHeader>()]>,
+    bucket: OwnedRwLockReadGuard<ImmutableStoreBucket, ImmutableStoreBucket>,
+}
+
+impl lore_io::StableBufList for ImmutableBucketWriteSegments {
+    fn byte_segments(&self) -> impl Iterator<Item = &[u8]> {
+        std::iter::once(self.header.as_ref().as_slice())
+            .chain(self.bucket.sorted_index.byte_segments())
+            .chain(self.bucket.entry.byte_segments())
+    }
+}
+
 pub struct SerializeFailureGuard<'a> {
     success: bool,
     dirty: &'a AtomicBool,
@@ -457,7 +506,7 @@ impl<'a> Drop for SerializeFailureGuard<'a> {
 }
 
 impl ImmutableStoreBucket {
-    fn deserialize_files(
+    async fn deserialize_files(
         path: PathBuf,
     ) -> Result<
         (
@@ -468,13 +517,15 @@ impl ImmutableStoreBucket {
         ),
         LocalImmutableStoreError,
     > {
-        let mut file = match std::fs::File::options()
-            .read(true)
-            .write(false)
-            .create(false)
-            .open(&path)
+        let (file, metadata, head) = match lore_io::IoDriver::global()
+            .open_read_head(
+                &path,
+                &lore_io::OpenOptions::new().read(true),
+                BUCKET_HEAD_READ,
+            )
+            .await
         {
-            Ok(file) => file,
+            Ok(parts) => parts,
             Err(err) => {
                 if err.kind() == ErrorKind::NotFound {
                     return Ok((GrowVec::new(), GrowVec::new(), false, false));
@@ -489,7 +540,7 @@ impl ImmutableStoreBucket {
         // Recover from corruption (crash mid-flush leaves a half-written file) by
         // resetting the bucket. Future-version sentinels propagate untouched — the file
         // was written by a newer binary and deleting it would destroy newer-format data.
-        match Self::deserialize_files_parse(&path, &mut file) {
+        match Self::deserialize_file_content(&path, &file, metadata.len() as usize, &head).await {
             Ok(result) => Ok(result),
             Err(DeserializeFileError::FutureVersion(version)) => {
                 Err(LocalImmutableStoreError::internal_with_context(
@@ -500,14 +551,22 @@ impl ImmutableStoreBucket {
                 ))
             }
             Err(DeserializeFileError::Corrupt(reason)) => {
-                Self::recover_corrupt_bucket(&path, reason)
+                Self::recover_corrupt_bucket(&path, reason).await
             }
         }
     }
 
-    fn deserialize_files_parse(
+    /// Buckets that fit inside the composite open's head bytes — the
+    /// common case — parse straight from the head with no further
+    /// dispatch. Larger buckets do one vectored read scattering the
+    /// sorted index and entries straight into their final chunk
+    /// allocations. Legacy layouts (before `LastAccessInEntry`) parse the
+    /// remainder with entry conversion.
+    async fn deserialize_file_content(
         path: &Path,
-        file: &mut std::fs::File,
+        file: &lore_io::IoFile,
+        file_size: usize,
+        head: &[u8],
     ) -> Result<
         (
             GrowVec<u32, CHUNK_SIZE_U32>,
@@ -517,9 +576,14 @@ impl ImmutableStoreBucket {
         ),
         DeserializeFileError,
     > {
+        let header_size = size_of::<ImmutableStoreHeader>();
+        if head.len() < header_size {
+            return Err(DeserializeFileError::Corrupt(format!(
+                "file size {file_size} smaller than header size {header_size}"
+            )));
+        }
         let mut header = ImmutableStoreHeader::new_zeroed();
-        file.read_exact(header.as_mut_bytes())
-            .map_err(|err| DeserializeFileError::Corrupt(format!("read header: {err}")))?;
+        header.as_mut_bytes().copy_from_slice(&head[..header_size]);
 
         // Version is validated before any count math — a future format with a different
         // per_entry_size could otherwise produce a spurious count mismatch and trigger
@@ -554,16 +618,6 @@ impl ImmutableStoreBucket {
             }
         };
 
-        let file_size = file
-            .metadata()
-            .map_err(|err| DeserializeFileError::Corrupt(format!("read metadata: {err}")))?
-            .len() as usize;
-        let header_size = size_of::<ImmutableStoreHeader>();
-        if file_size < header_size {
-            return Err(DeserializeFileError::Corrupt(format!(
-                "file size {file_size} smaller than header size {header_size}"
-            )));
-        }
         let expected_count = (file_size - header_size) / per_entry_size;
         if expected_count == 0 {
             return Ok((GrowVec::new(), GrowVec::new(), false, false));
@@ -577,48 +631,76 @@ impl ImmutableStoreBucket {
         }
 
         let upgrade_packfile = header.version < ImmutableStoreVersion::PackfilePerGroup as u32;
-        let mut mark_dirty = false;
-
-        let sorted_index = GrowVec::read_from_file(file, expected_count)
-            .map_err(|err| DeserializeFileError::Corrupt(format!("read sorted index: {err}")))?;
 
         // LazyFanOut keeps the LastAccessInEntry layout, so any version ≥ LastAccessInEntry uses the new entry layout.
-        let entry = if header.version >= ImmutableStoreVersion::LastAccessInEntry as u32 {
-            GrowVec::read_from_file(file, expected_count)
-                .map_err(|err| DeserializeFileError::Corrupt(format!("read entries: {err}")))?
-        } else {
-            let entry_old: GrowVec<ImmutableStoreEntryBeforeLastAccess, CHUNK_SIZE_ENTRY> =
-                GrowVec::read_from_file(file, expected_count).map_err(|err| {
-                    DeserializeFileError::Corrupt(format!("read legacy entries: {err}"))
-                })?;
-
-            let mut entry = GrowVec::new();
-            for entry_old in entry_old.iter() {
-                entry.push(ImmutableStoreEntry {
-                    address: entry_old.address,
-                    partition: entry_old.partition,
-                    data: ImmutableData {
-                        flags: entry_old.data.flags,
-                        size_payload: entry_old.data.size_payload,
-                        size_content: entry_old.data.size_content,
-                        pack_offset: entry_old.data.pack_offset,
-                        pack_file: entry_old.data.pack_file,
-                        last_access: 0,
-                    },
-                });
+        if header.version >= ImmutableStoreVersion::LastAccessInEntry as u32 {
+            if file_size <= head.len() {
+                let mut reader = &head[header_size..];
+                let sorted_index =
+                    GrowVec::read_from(&mut reader, expected_count).map_err(|err| {
+                        DeserializeFileError::Corrupt(format!("read sorted index: {err}"))
+                    })?;
+                let entry = GrowVec::read_from(&mut reader, expected_count)
+                    .map_err(|err| DeserializeFileError::Corrupt(format!("read entries: {err}")))?;
+                return Ok((sorted_index, entry, upgrade_packfile, false));
             }
+            let segments = ImmutableBucketSegments {
+                // SAFETY: the scatter below fills every byte of both vectors or fails, and a
+                // failure drops them here rather than returning them.
+                sorted_index: unsafe { GrowVec::new_unzeroed_with_size(expected_count) },
+                entry: unsafe { GrowVec::new_unzeroed_with_size(expected_count) },
+            };
+            let segments = file
+                .read_exact_vectored_at(segments, header_size as u64)
+                .await
+                .map_err(|err| DeserializeFileError::Corrupt(format!("read bucket data: {err}")))?;
+            return Ok((
+                segments.sorted_index,
+                segments.entry,
+                upgrade_packfile,
+                false,
+            ));
+        }
 
-            mark_dirty = true;
-
-            entry
+        let remainder;
+        let mut reader: &[u8] = if file_size <= head.len() {
+            &head[header_size..]
+        } else {
+            remainder = file
+                .read_exact_at(file_size - header_size, header_size as u64)
+                .await
+                .map_err(|err| DeserializeFileError::Corrupt(format!("read bucket data: {err}")))?;
+            &remainder
         };
+        let sorted_index = GrowVec::read_from(&mut reader, expected_count)
+            .map_err(|err| DeserializeFileError::Corrupt(format!("read sorted index: {err}")))?;
+        let entry_old: GrowVec<ImmutableStoreEntryBeforeLastAccess, CHUNK_SIZE_ENTRY> =
+            GrowVec::read_from(&mut reader, expected_count).map_err(|err| {
+                DeserializeFileError::Corrupt(format!("read legacy entries: {err}"))
+            })?;
 
-        Ok((sorted_index, entry, upgrade_packfile, mark_dirty))
+        let mut entry = GrowVec::new();
+        for entry_old in entry_old.iter() {
+            entry.push(ImmutableStoreEntry {
+                address: entry_old.address,
+                partition: entry_old.partition,
+                data: ImmutableData {
+                    flags: entry_old.data.flags,
+                    size_payload: entry_old.data.size_payload,
+                    size_content: entry_old.data.size_content,
+                    pack_offset: entry_old.data.pack_offset,
+                    pack_file: entry_old.data.pack_file,
+                    last_access: 0,
+                },
+            });
+        }
+
+        Ok((sorted_index, entry, upgrade_packfile, true))
     }
 
     /// Drop the corrupt file and return an empty bucket. Pack file payloads survive
     /// until compaction reclaims the now-orphaned ranges.
-    fn recover_corrupt_bucket(
+    async fn recover_corrupt_bucket(
         path: &Path,
         reason: String,
     ) -> Result<
@@ -634,7 +716,7 @@ impl ImmutableStoreBucket {
             "Resetting corrupt immutable bucket {} after deserialize failure: {reason}. Bucket lookup state lost; pack file payloads remain until compaction.",
             path.display()
         );
-        if let Err(err) = std::fs::remove_file(path)
+        if let Err(err) = lore_io::IoDriver::global().remove_file(path).await
             && err.kind() != std::io::ErrorKind::NotFound
         {
             return Err(LocalImmutableStoreError::internal_with_context(
@@ -645,7 +727,7 @@ impl ImmutableStoreBucket {
         Ok((GrowVec::new(), GrowVec::new(), false, false))
     }
 
-    fn serialize_files(
+    async fn serialize_files(
         bucket: OwnedRwLockReadGuard<ImmutableStoreBucket, ImmutableStoreBucket>,
         group: Arc<ImmutableStoreGroup>,
         bucket_index: usize,
@@ -672,23 +754,10 @@ impl ImmutableStoreBucket {
         if let Some(parent_path) = temporary_path.parent()
             && !parent_path.exists()
         {
-            let _ = std::fs::create_dir_all(parent_path);
+            let _ = lore_io::IoDriver::global()
+                .create_dir_all(parent_path)
+                .await;
         }
-
-        let mut file_options = std::fs::File::options();
-        file_options
-            .read(false)
-            .write(true)
-            .create(true)
-            .truncate(true);
-        #[cfg(target_family = "windows")]
-        {
-            // Prevent any other process from writing the file
-            file_options.share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
-        }
-        let mut file = file_options
-            .open(&temporary_path)
-            .internal("Failed to serialize storage bucket")?;
 
         let count = bucket.entry.len();
         if bucket.sorted_index.len() != count {
@@ -702,39 +771,31 @@ impl ImmutableStoreBucket {
         header.version = group.serialize_version.load(atomic::Ordering::Relaxed);
         header.count = count as u32;
 
-        file.write_all(header.as_bytes())
-            .internal("Failed to serialize storage bucket")?;
-        if count > 0 {
-            bucket
-                .sorted_index
-                .write_to_file(&mut file)
-                .internal("Failed to serialize storage bucket")?;
+        let segments = ImmutableBucketWriteSegments {
+            header: {
+                let mut bytes = Box::new([0u8; size_of::<ImmutableStoreHeader>()]);
+                bytes.copy_from_slice(header.as_bytes());
+                bytes
+            },
+            bucket,
+        };
 
-            bucket
-                .entry
-                .write_to_file(&mut file)
-                .internal("Failed to serialize storage bucket")?;
-        }
-
-        if sync_data {
-            file.sync_all()
-                .internal("Failed to serialize storage bucket")?;
-        }
-
-        drop(file);
-
+        let file_options = lore_io::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true);
         if let Some(mut guard) = temporary_guard.take() {
-            fs_util::rename_file(temporary_path.as_path(), path.as_path())
+            lore_io::IoDriver::global()
+                .write_file_segments_atomic(&temporary_path, &path, &file_options, segments)
+                .await
                 .internal("Failed to serialize storage bucket")?;
 
             guard.success();
-        }
-
-        if sync_data
-            && let Some(parent_path) = temporary_path.parent()
-            && let Err(err) = fs_util::sync_dir(parent_path)
-        {
-            lore_base::lore_debug!("Failed to flush and sync immutable index directory: {err}");
+        } else {
+            lore_io::IoDriver::global()
+                .write_file_segments(&path, &file_options, segments, false)
+                .await
+                .internal("Failed to serialize storage bucket")?;
         }
 
         Ok(())
@@ -762,9 +823,7 @@ impl ImmutableStoreBucket {
         let path = format_bucket_path(path, group_index, bucket_index);
 
         let (sorted_index, entry, upgrade_packfile, mark_dirty) =
-            lore_base::lore_spawn_blocking!(move || Self::deserialize_files(path))
-                .await
-                .internal("Task failed")??;
+            Self::deserialize_files(path).await?;
 
         self.sorted_index = sorted_index;
         self.entry = entry;
@@ -812,11 +871,7 @@ impl ImmutableStoreBucket {
 
         let path = format_bucket_path(path, group_index, bucket_index);
 
-        lore_base::lore_spawn_blocking!(move || {
-            Self::serialize_files(bucket, group, bucket_index, path, sync_data)
-        })
-        .await
-        .internal("Task failed")?
+        Self::serialize_files(bucket, group, bucket_index, path, sync_data).await
     }
 
     /// Serialize the bucket to its `.new` twin during a fan-out commit. Differs from the regular
@@ -847,11 +902,7 @@ impl ImmutableStoreBucket {
             PathBuf::from(p)
         };
 
-        lore_base::lore_spawn_blocking!(move || {
-            Self::serialize_files(bucket, group, bucket_index, new_path, sync_data)
-        })
-        .await
-        .internal("Task failed")?
+        Self::serialize_files(bucket, group, bucket_index, new_path, sync_data).await
     }
 }
 
@@ -946,17 +997,12 @@ impl LocalImmutableStore {
         };
 
         let lock = if let Some(path) = immutable_path.as_deref() {
-            let path = path.clone();
-            let lock = lore_base::lore_spawn_blocking!(|| {
-                if !path.exists() {
-                    let _ = std::fs::create_dir_all(path.as_path());
-                }
-                FSLock::acquire_directory_lock(path)
-            })
-            .await
-            .map_err(|err| io::Error::other(format!("Store lock task failed: {err}")))
-            .flatten()
-            .internal("Failed to acquire store lock")?;
+            if !path.exists() {
+                let _ = lore_io::IoDriver::global().create_dir_all(path).await;
+            }
+            let lock = FSLock::acquire_directory_lock(path)
+                .await
+                .internal("Failed to acquire store lock")?;
             Some(lock)
         } else {
             None
@@ -991,51 +1037,63 @@ impl LocalImmutableStore {
         let index_existed_on_disk = immutable_path
             .as_ref()
             .is_some_and(|p| p.join("index").exists());
+        // Every group is read at once. Each group is one recovery check and one marker read, and
+        // awaiting them in turn puts a whole store open behind `GROUP_COUNT` round trips to the
+        // I/O engine — a cost every process that opens a store pays before it does any work. The
+        // groups are independent directories, so the reads overlap and the engine's thread budget
+        // is what paces them. Completions arrive in whatever order the reads finish, so each task
+        // carries the group it answers for.
+        let initial_fan_out_level = store.settings.initial_fan_out_level;
+        let mut levels = vec![(initial_fan_out_level, 0usize, false); GROUP_COUNT];
+        if let Some(path) = immutable_path.as_deref() {
+            let index_path = path.as_path().join("index");
+            let mut tasks = JoinSet::new();
+            for group_index in 0..GROUP_COUNT {
+                let group_path = index_path.join(format!("{:02x}", group_index as u8));
+                lore_base::lore_spawn!(tasks, async move {
+                    // Roll forward any pending fan-out commit before reading the marker. After this returns the marker reflects the post-recovery state.
+                    if group_path.exists()
+                        && let Err(err) =
+                            crate::local::fan_out::recover_level_transition(&group_path, false)
+                                .await
+                    {
+                        return (
+                            group_index,
+                            Err(LocalImmutableStoreError::internal_with_context(
+                                err,
+                                "Failed to recover pending level transition for group",
+                            )),
+                        );
+                    }
+
+                    let level = match crate::local::fan_out::read_level_marker(&group_path).await {
+                        Ok(Some(level)) => Ok((level, level, true)),
+                        Ok(None) if index_existed_on_disk => Ok((BUCKET_COUNT, 0, false)),
+                        Ok(None) => Ok((initial_fan_out_level, 0, false)),
+                        Err(err) => Err(LocalImmutableStoreError::internal_with_context(
+                            err,
+                            "Failed to read level marker for group",
+                        )),
+                    };
+                    (group_index, level)
+                });
+            }
+
+            while let Some(joined) = tasks.join_next().await {
+                let (group_index, level) = joined.map_err(|err| {
+                    LocalImmutableStoreError::internal_with_context(err, "level marker task")
+                })?;
+                levels[group_index] = level?;
+            }
+        }
+
         let mut bucket_counts: Vec<usize> = Vec::with_capacity(GROUP_COUNT);
         let mut committed_levels: Vec<usize> = Vec::with_capacity(GROUP_COUNT);
         let mut any_marker_seen = false;
-        for group_index in 0..GROUP_COUNT {
-            let (initial, committed) = if let Some(path) = immutable_path.as_deref() {
-                let mut group_path: PathBuf = path.as_path().to_path_buf();
-                group_path.push("index");
-                let group_hex = format!("{:02x}", group_index as u8);
-                group_path.push(&group_hex);
-
-                // Roll forward any pending fan-out commit before reading the marker. After this returns the marker reflects the post-recovery state.
-                if group_path.exists()
-                    && let Err(err) =
-                        crate::local::fan_out::recover_level_transition(&group_path, false)
-                {
-                    return Err(LocalImmutableStoreError::internal_with_context(
-                        err,
-                        "Failed to recover pending level transition for group",
-                    ));
-                }
-
-                match crate::local::fan_out::read_level_marker(&group_path) {
-                    Ok(Some(level)) => {
-                        any_marker_seen = true;
-                        (level, level)
-                    }
-                    Ok(None) => {
-                        if index_existed_on_disk {
-                            (BUCKET_COUNT, 0)
-                        } else {
-                            (store.settings.initial_fan_out_level, 0)
-                        }
-                    }
-                    Err(err) => {
-                        return Err(LocalImmutableStoreError::internal_with_context(
-                            err,
-                            "Failed to read level marker for group",
-                        ));
-                    }
-                }
-            } else {
-                (store.settings.initial_fan_out_level, 0)
-            };
+        for (initial, committed, marker_seen) in levels {
             bucket_counts.push(initial);
             committed_levels.push(committed);
+            any_marker_seen |= marker_seen;
         }
 
         // Determine serialize_version per Decision 8. Fresh stores, stores with markers, and
@@ -1630,7 +1688,7 @@ impl LocalImmutableStore {
         {
             let find = self
                 .clone()
-                .find(partition, address, StoreMatch::MatchFull)
+                .find(partition, address)
                 .await
                 .inspect_err(|err| {
                     lore_base::lore_warn!(
@@ -1679,16 +1737,14 @@ impl LocalImmutableStore {
         Ok(())
     }
 
+    /// Resolve an address to the best match the bucket holds, at full strength. Callers gate the
+    /// answer afterwards against the scope they serve or report at; searching at a scope instead
+    /// would cap the level and lose the distinction the caller is asking for.
     pub async fn find(
         &self,
         partition: Partition,
         address: Address,
-        match_request: StoreMatch,
     ) -> Result<ImmutableStoreFindResult, LocalImmutableStoreError> {
-        if match_request == StoreMatch::MatchNone {
-            return Err(LocalImmutableStoreError::internal("Invalid query"));
-        }
-
         let group_index = address.hash.data()[0] as usize;
         let group = &self.group[group_index];
 
@@ -1735,7 +1791,8 @@ impl LocalImmutableStore {
         };
 
         // Binary search the bucket
-        let (match_slot, _, match_made) = Self::lookup(&bucket, partition, address, match_request);
+        let (match_slot, _, match_made) =
+            Self::lookup(&bucket, partition, address, StoreMatch::MatchFull);
 
         if match_made == StoreMatch::MatchNone {
             Ok(ImmutableStoreFindResult {
@@ -1744,6 +1801,7 @@ impl LocalImmutableStore {
             })
         } else {
             let index = bucket.sorted_index[match_slot] as usize;
+            let matched_partition = bucket.entry[index].partition;
             let data = &bucket.entry[index].data;
 
             let data = if data.flags & FragmentFlags::PayloadObliterated
@@ -1772,6 +1830,7 @@ impl LocalImmutableStore {
                 group: group_index,
                 data,
                 matching: match_made,
+                partition: matched_partition,
             })
         }
     }
@@ -2302,9 +2361,15 @@ impl LocalImmutableStore {
         if let Some(path) = self.path.as_ref() {
             let path = path.join(DOT_COMPACT);
             if group_index < GROUP_COUNT {
-                let _ = std::fs::write(path, group_index.to_ne_bytes());
+                let _ = lore_io::IoDriver::global()
+                    .write_file_bytes(
+                        path,
+                        Bytes::copy_from_slice(&group_index.to_ne_bytes()),
+                        false,
+                    )
+                    .await;
             } else {
-                let _ = std::fs::remove_file(path);
+                let _ = lore_io::IoDriver::global().remove_file(path).await;
             }
         }
 
@@ -2814,12 +2879,16 @@ impl LocalImmutableStore {
 
                 if needs_two_phase_commit && first_err.is_none() {
                     // T10 two-phase commit. Every [0..active_buckets] bucket gets a .new file (skipping empties at index >= committed_level since no old file exists there to overwrite). After all .new files are durable, write level.pending as the commit point. Then rename .new -> final, write the level marker, delete level.pending. Recovery on the next store open rolls forward from any pending state.
-                    if let Err(e) = std::fs::create_dir_all(&group_path).map_err(|e| {
-                        LocalImmutableStoreError::internal_with_context(
-                            e,
-                            "Failed to create group directory for fan-out commit",
-                        )
-                    }) {
+                    if let Err(e) = lore_io::IoDriver::global()
+                        .create_dir_all(&group_path)
+                        .await
+                        .map_err(|e| {
+                            LocalImmutableStoreError::internal_with_context(
+                                e,
+                                "Failed to create group directory for fan-out commit",
+                            )
+                        })
+                    {
                         first_err = Some(e);
                     }
 
@@ -2865,6 +2934,7 @@ impl LocalImmutableStore {
                                 active_buckets,
                                 sync_data,
                             )
+                            .await
                             .map_err(|e| {
                                 LocalImmutableStoreError::internal_with_context(
                                     e,
@@ -2887,6 +2957,7 @@ impl LocalImmutableStore {
                                 active_buckets,
                                 sync_data,
                             )
+                            .await
                             .map_err(|e| {
                                 LocalImmutableStoreError::internal_with_context(
                                     e,
@@ -2905,7 +2976,9 @@ impl LocalImmutableStore {
                                 );
                                 let final_path =
                                     crate::local::fan_out::bucket_path(&group_path, bucket_index);
-                                if let Err(err) = std::fs::rename(&new_path, &final_path)
+                                if let Err(err) = lore_io::IoDriver::global()
+                                    .rename(&new_path, &final_path)
+                                    .await
                                     && first_err.is_none()
                                 {
                                     first_err = Some(
@@ -2924,6 +2997,7 @@ impl LocalImmutableStore {
                                 active_buckets,
                                 sync_data,
                             )
+                            .await
                             .map_err(|e| {
                                 LocalImmutableStoreError::internal_with_context(
                                     e,
@@ -2935,15 +3009,15 @@ impl LocalImmutableStore {
                         }
 
                         if first_err.is_none()
-                            && let Err(err) = crate::local::fan_out::delete_level_pending(
-                                &group_path,
-                            )
-                            .map_err(|e| {
-                                LocalImmutableStoreError::internal_with_context(
-                                    e,
-                                    "Failed to delete level.pending",
-                                )
-                            })
+                            && let Err(err) =
+                                crate::local::fan_out::delete_level_pending(&group_path)
+                                    .await
+                                    .map_err(|e| {
+                                        LocalImmutableStoreError::internal_with_context(
+                                            e,
+                                            "Failed to delete level.pending",
+                                        )
+                                    })
                         {
                             first_err = Some(err);
                         }
@@ -3076,6 +3150,10 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         true
     }
 
+    fn isolates_partitions(&self) -> bool {
+        self.settings.isolate_partitions
+    }
+
     async fn is_available(self: Arc<Self>, timeout: Duration) -> bool {
         let mut checks = JoinSet::new();
         for group_index in 0..GROUP_COUNT {
@@ -3106,52 +3184,78 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         true
     }
 
-    async fn exist(
-        self: Arc<Self>,
-        partition: Partition,
-        address: Address,
-        match_requested: StoreMatch,
-    ) -> Result<StoreMatch, StoreError> {
-        Ok(self
-            .find(partition, address, match_requested)
-            .await
-            .forward_with::<StoreError, _>(|| {
-                format!("Failed to query immutable store {}.", address.hash)
-            })?
-            .matching)
-    }
-
-    async fn exist_batch(
-        self: Arc<Self>,
-        partition: Partition,
-        addresses: &[Address],
-        match_requested: StoreMatch,
-    ) -> Result<Vec<StoreMatch>, StoreError> {
-        let mut output = vec![];
-
-        for address in addresses {
-            output.push(
-                self.clone()
-                    .exist(partition, *address, match_requested)
-                    .await?,
-            );
-        }
-
-        Ok(output)
-    }
-
+    /// One bucket pass per address establishes the best match, so this store never has a reason to
+    /// under-report: it does not cost more to learn that the hash is in the partition than to learn
+    /// that it exists at all.
+    ///
+    /// A tombstone resolves to no match. `obliterate` leaves the entry in the index — the
+    /// last-reference scan needs to see it — so this is the one place that has to know the
+    /// difference between an entry and a live one. Where the best match is a tombstone and a weaker
+    /// live match exists elsewhere, this reports nothing rather than the weaker level; that is
+    /// under-reporting, which the contract permits, and it keeps the obliteration rule absolute
+    /// rather than conditional on what else happens to be stored.
+    ///
+    /// Durability is only ever read off a fragment this store actually holds — either recorded on
+    /// it when it was cached, or implied for every entry by a store configured durable. An address
+    /// that did not match carries no claim at all.
     async fn query(
         self: Arc<Self>,
         partition: Partition,
+        addresses: &[Address],
+        results: &mut [StoreMatchResult],
+    ) -> Result<(), StoreError> {
+        debug_assert_eq!(addresses.len(), results.len());
+
+        for (address, result) in addresses.iter().zip(results.iter_mut()) {
+            let found = self
+                .find(partition, *address)
+                .await
+                .forward_with::<StoreError, _>(|| {
+                    format!("Failed to resolve immutable store {}.", address.hash)
+                })?;
+
+            let obliterated = found.data.flags & FragmentFlags::PayloadObliterated.bits() != 0;
+
+            *result = if obliterated || found.matching < self.query_scope() {
+                StoreMatchResult::default()
+            } else {
+                StoreMatchResult {
+                    match_made: found.matching,
+                    partition: found.partition,
+                    stored_local: found.data.pack_file != 0,
+                    stored_durable: found.data.flags & FragmentFlags::PayloadStoredDurable.bits()
+                        != 0
+                        || self.settings.implicit_durable_stored,
+                }
+            };
+        }
+
+        Ok(())
+    }
+
+    /// This store holds the fragment it was given, so the representation comes straight off the
+    /// entry and there is nothing further to fetch.
+    async fn get_metadata(
+        self: Arc<Self>,
+        partition: Partition,
         address: Address,
-        match_requested: StoreMatch,
-    ) -> Result<StoreQueryResult, StoreError> {
+    ) -> Result<StoreGetData, StoreError> {
+        // Resolved at the strongest level so the caller learns whether the association is its own,
+        // then gated on scope: asking `find` for the scope directly would cap the answer there and
+        // a full match would come back indistinguishable from a partition one.
         let find = self
-            .find(partition, address, match_requested)
+            .find(partition, address)
             .await
             .forward_with::<StoreError, _>(|| {
-                format!("Failed to query immutable store {}.", address.hash)
+                format!("Failed to read immutable store metadata {}.", address.hash)
             })?;
+
+        // `find` matches on address alone, so a tombstoned entry still resolves.
+        let obliterated = find.data.flags & FragmentFlags::PayloadObliterated.bits() != 0;
+
+        if obliterated || find.matching < self.read_scope() {
+            return Ok(StoreGetData::default());
+        }
 
         let mut local_flags = 0;
         if find.data.pack_file != 0 {
@@ -3161,22 +3265,22 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             local_flags |= FragmentFlags::PayloadStoredDurable.bits();
         }
 
-        Ok(StoreQueryResult {
-            fragment: Fragment {
+        Ok(StoreGetData::metadata(
+            Fragment {
                 flags: find.data.flags | local_flags,
                 size_payload: find.data.size_payload,
                 size_content: find.data.size_content,
             },
-            match_made: find.matching,
-        })
+            find.matching,
+            find.partition,
+        ))
     }
 
     async fn get(
         self: Arc<Self>,
         partition: Partition,
         address: Address,
-        match_required: StoreMatch,
-    ) -> Result<(Fragment, Bytes), StoreError> {
+    ) -> Result<StoreGetData, StoreError> {
         #[cfg(feature = "failure_generator")]
         if self.failure_generator.retry_rate > 0.0
             && rand::random::<f32>() < self.failure_generator.retry_rate
@@ -3184,37 +3288,50 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             return Err(StoreError::from(SlowDown));
         }
 
+        // Resolved at full strength and then gated on scope, the same way `get_metadata` does it,
+        // so the level reported back is the one actually found rather than the one searched at.
         let find = self
-            .find(partition, address, match_required)
+            .find(partition, address)
             .await
             .forward_with::<StoreError, _>(|| {
                 format!("Failed to query immutable store for get {}.", address.hash)
             })?;
 
-        if find.matching == match_required {
-            let mut local_flags = 0;
-            if self.settings.implicit_durable_stored {
-                local_flags |= FragmentFlags::PayloadStoredDurable.bits();
-            }
+        // Not covered by the pack file check below: that one catches this only because obliterate
+        // happens to clear the pack file.
+        let obliterated = find.data.flags & FragmentFlags::PayloadObliterated.bits() != 0;
 
-            let fragment = Fragment {
-                flags: find.data.flags | local_flags,
-                size_payload: find.data.size_payload,
-                size_content: find.data.size_content,
-            };
-            if find.data.pack_file != 0 {
-                crate::validate_fragment_payload(&fragment, find.data.size_payload as usize)?;
-                let payload = Self::load(&self.group[find.group].packstore, find.data)
-                    .await
-                    .forward::<StoreError>("Failed to load payload from local storage.")?;
-                crate::validate_fragment_payload(&fragment, payload.len())?;
-                Ok((fragment, payload))
-            } else {
-                Err(StoreError::from(PayloadNotFound::from(address.hash)))
-            }
-        } else {
-            Err(StoreError::from(AddressNotFound::from(address)))
+        if obliterated || find.matching < self.read_scope() {
+            return Err(StoreError::from(AddressNotFound::from(address)));
         }
+
+        let mut local_flags = 0;
+        if self.settings.implicit_durable_stored {
+            local_flags |= FragmentFlags::PayloadStoredDurable.bits();
+        }
+
+        let fragment = Fragment {
+            flags: find.data.flags | local_flags,
+            size_payload: find.data.size_payload,
+            size_content: find.data.size_content,
+        };
+
+        if find.data.pack_file == 0 {
+            return Err(StoreError::from(PayloadNotFound::from(address.hash)));
+        }
+
+        crate::validate_fragment_payload(&fragment, find.data.size_payload as usize)?;
+        let payload = Self::load(&self.group[find.group].packstore, find.data)
+            .await
+            .forward::<StoreError>("Failed to load payload from local storage.")?;
+        crate::validate_fragment_payload(&fragment, payload.len())?;
+
+        Ok(StoreGetData {
+            fragment,
+            match_made: find.matching,
+            partition: find.partition,
+            payload: Some(payload),
+        })
     }
 
     async fn put(
@@ -3272,7 +3389,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         }
 
         let find = self
-            .find(partition, address, StoreMatch::MatchFull)
+            .find(partition, address)
             .await
             .forward_with::<StoreError, _>(|| {
                 format!(
@@ -3536,12 +3653,13 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
 
     async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
         if let Some(path) = self.path.as_deref() {
-            tokio::fs::read(path.join(DOT_COMPACT))
+            lore_io::IoDriver::global()
+                .read_file_bytes(path.join(DOT_COMPACT))
                 .await
                 .ok()
                 .and_then(|bytes| {
                     lore_base::lore_debug!("Reading compactor resume point");
-                    bytes.try_into().ok().map(usize::from_ne_bytes)
+                    bytes.as_ref().try_into().ok().map(usize::from_ne_bytes)
                 })
         } else {
             None
@@ -4416,38 +4534,90 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    /// A bucket larger than [`BUCKET_HEAD_READ`] does not fit the head the composite open
+    /// returns, so it is loaded by scattering one vectored read straight into the chunk
+    /// allocations of both `GrowVec`s. Entry contents are distinct per index, so a scatter that
+    /// landed a chunk at the wrong offset would show up as swapped entries rather than as a
+    /// length mismatch.
+    #[tokio::test]
+    async fn deserialize_scatters_a_bucket_larger_than_the_head_read() {
+        let dir = crate::test_util::TempDir::new("is_scatter_");
+        let path = dir.path().join("bucket");
+
+        let per_entry = size_of::<u32>() + size_of::<ImmutableStoreEntry>();
+        let count = (BUCKET_HEAD_READ / per_entry) + 64;
+        assert!(
+            size_of::<ImmutableStoreHeader>() + count * per_entry > BUCKET_HEAD_READ,
+            "the bucket has to exceed the head read for this to test anything"
+        );
+
+        let mut header = ImmutableStoreHeader::new_zeroed();
+        header.version = ImmutableStoreVersion::LazyFanOut as u32;
+        header.count = count as u32;
+
+        let mut bytes = Vec::with_capacity(size_of::<ImmutableStoreHeader>() + count * per_entry);
+        bytes.extend_from_slice(header.as_bytes());
+        for index in 0..count {
+            bytes.extend_from_slice(&(index as u32).to_le_bytes());
+        }
+        for index in 0..count {
+            let mut entry = ImmutableStoreEntry::default();
+            entry.address.hash = Hash::from([index as u8; 32]);
+            entry.data.size_content = index as u64;
+            entry.data.pack_offset = index as u32;
+            bytes.extend_from_slice(entry.as_bytes());
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        let (sorted_index, entry, _upgrade, _dirty) =
+            ImmutableStoreBucket::deserialize_files(path).await.unwrap();
+
+        assert_eq!(sorted_index.len(), count);
+        assert_eq!(entry.len(), count);
+        for index in 0..count {
+            assert_eq!(sorted_index[index], index as u32, "sorted index at {index}");
+            assert_eq!(
+                entry[index].address.hash,
+                Hash::from([index as u8; 32]),
+                "entry hash at {index}"
+            );
+            assert_eq!(entry[index].data.size_content, index as u64);
+            assert_eq!(entry[index].data.pack_offset, index as u32);
+        }
+    }
+
     #[test]
     fn lazy_fan_out_version_is_five() {
         assert_eq!(ImmutableStoreVersion::LazyFanOut as u32, 5);
     }
 
-    #[test]
-    fn deserialize_accepts_last_access_in_entry_v4() {
+    #[tokio::test]
+    async fn deserialize_accepts_last_access_in_entry_v4() {
         let dir = crate::test_util::TempDir::new("is_v4_");
         let path = dir.path().join("bucket");
         write_bucket_file(&path, ImmutableStoreVersion::LastAccessInEntry as u32);
-        let result = ImmutableStoreBucket::deserialize_files(path);
+        let result = ImmutableStoreBucket::deserialize_files(path).await;
         assert!(
             result.is_ok(),
             "v4 (LastAccessInEntry) bucket should deserialize"
         );
     }
 
-    #[test]
-    fn deserialize_accepts_lazy_fan_out_v5() {
+    #[tokio::test]
+    async fn deserialize_accepts_lazy_fan_out_v5() {
         let dir = crate::test_util::TempDir::new("is_v5_");
         let path = dir.path().join("bucket");
         write_bucket_file(&path, ImmutableStoreVersion::LazyFanOut as u32);
-        let result = ImmutableStoreBucket::deserialize_files(path);
+        let result = ImmutableStoreBucket::deserialize_files(path).await;
         assert!(result.is_ok(), "v5 (LazyFanOut) bucket should deserialize");
     }
 
-    #[test]
-    fn deserialize_rejects_unknown_future_version() {
+    #[tokio::test]
+    async fn deserialize_rejects_unknown_future_version() {
         let dir = crate::test_util::TempDir::new("is_v100_");
         let path = dir.path().join("bucket");
         write_bucket_file(&path, 100);
-        let result = ImmutableStoreBucket::deserialize_files(path.clone());
+        let result = ImmutableStoreBucket::deserialize_files(path.clone()).await;
         assert!(result.is_err(), "v100 bucket should be rejected as too new");
         // Future-version files MUST be preserved on disk — recovery would clobber data
         // written by a newer binary.
@@ -4479,13 +4649,13 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
-    #[test]
-    fn deserialize_recovers_from_bad_count_header() {
+    #[tokio::test]
+    async fn deserialize_recovers_from_bad_count_header() {
         // Mirrors the production server log shape (header.count > what file fits).
         let dir = crate::test_util::TempDir::new("is_badcount_");
         let path = dir.path().join("bucket");
         write_bucket_file_with_count_mismatch(&path, 670, 518);
-        let result = ImmutableStoreBucket::deserialize_files(path.clone());
+        let result = ImmutableStoreBucket::deserialize_files(path.clone()).await;
         let (sorted_index, entry, _, mark_dirty) =
             result.expect("count-mismatch corruption must recover");
         assert!(sorted_index.is_empty());
@@ -4494,21 +4664,21 @@ mod tests {
         assert!(!path.exists(), "corrupt bucket file must be removed");
     }
 
-    #[test]
-    fn deserialize_recovers_from_invalid_version() {
+    #[tokio::test]
+    async fn deserialize_recovers_from_invalid_version() {
         // 0xFFFF is above the future-version sentinel range, so it's corruption.
         let dir = crate::test_util::TempDir::new("is_badver_");
         let path = dir.path().join("bucket");
         write_bucket_file(&path, 0xFFFF);
-        let result = ImmutableStoreBucket::deserialize_files(path.clone());
+        let result = ImmutableStoreBucket::deserialize_files(path.clone()).await;
         let (sorted_index, entry, _, _) = result.expect("invalid-version corruption must recover");
         assert!(sorted_index.is_empty());
         assert!(entry.is_empty());
         assert!(!path.exists(), "corrupt bucket file must be removed");
     }
 
-    #[test]
-    fn deserialize_recovers_from_truncated_entries() {
+    #[tokio::test]
+    async fn deserialize_recovers_from_truncated_entries() {
         let dir = crate::test_util::TempDir::new("is_trunc_");
         let path = dir.path().join("bucket");
         let mut header = ImmutableStoreHeader::new_zeroed();
@@ -4524,7 +4694,7 @@ mod tests {
         bytes.extend_from_slice(&entry.as_bytes()[..size_of::<ImmutableStoreEntry>() / 2]);
         std::fs::write(&path, bytes).unwrap();
 
-        let result = ImmutableStoreBucket::deserialize_files(path.clone());
+        let result = ImmutableStoreBucket::deserialize_files(path.clone()).await;
         let (sorted_index, entry, _, _) =
             result.expect("truncated-entries corruption must recover");
         assert!(sorted_index.is_empty());
@@ -4532,13 +4702,13 @@ mod tests {
         assert!(!path.exists(), "corrupt bucket file must be removed");
     }
 
-    #[test]
-    fn deserialize_recovers_from_short_header() {
+    #[tokio::test]
+    async fn deserialize_recovers_from_short_header() {
         // File too small to even hold the header.
         let dir = crate::test_util::TempDir::new("is_shorthdr_");
         let path = dir.path().join("bucket");
         std::fs::write(&path, [0u8; 4]).unwrap();
-        let result = ImmutableStoreBucket::deserialize_files(path.clone());
+        let result = ImmutableStoreBucket::deserialize_files(path.clone()).await;
         let (sorted_index, entry, _, _) = result.expect("short-header corruption must recover");
         assert!(sorted_index.is_empty());
         assert!(entry.is_empty());
@@ -4573,7 +4743,7 @@ mod tests {
             .await
             .unwrap();
 
-            let (address, _) = write_content(
+            let address = write_content(
                 store.clone(),
                 partition,
                 context,
@@ -4638,7 +4808,7 @@ mod tests {
             "originally stored content must be reported missing after recovery"
         );
 
-        let (new_address, _) = write_content(
+        let new_address = write_content(
             store.clone(),
             partition,
             context,
@@ -4652,7 +4822,7 @@ mod tests {
         .unwrap();
         assert_eq!(new_address, address);
 
-        let bytes = read(
+        let (_fragment, bytes) = read(
             store.clone(),
             partition,
             new_address,
@@ -4821,7 +4991,7 @@ mod tests {
         // Prime target (uncompressed).
         let prev_mode =
             COMPRESSION_MODE.swap(CompressionMode::NoCompression as u32, Ordering::AcqRel);
-        let (target_address, _target_fragment) = write_content(
+        let target_address = write_content(
             store.clone(),
             target_partition,
             context,
@@ -4836,7 +5006,7 @@ mod tests {
 
         // Prime source (compressed).
         COMPRESSION_MODE.store(CompressionMode::Zstd as u32, Ordering::Release);
-        let (source_address, _source_fragment) = write_content(
+        let source_address = write_content(
             store.clone(),
             source_partition,
             context,
@@ -4872,7 +5042,7 @@ mod tests {
         // must have adopted source's pack pointer AND encoding flag together — if encoding
         // and bytes were ever desynchronized, decompression in `read` would fail or return
         // garbage.
-        let bytes = read(
+        let (_fragment, bytes) = read(
             store.clone(),
             target_partition,
             target_address,
@@ -4911,7 +5081,7 @@ mod tests {
         let payload: Vec<u8> = b"in-partition new-context dedup payload".to_vec();
 
         // Seed the source tuple `(partition, hash, source_context)`.
-        let (source_address, _) = write_content(
+        let source_address = write_content(
             store.clone(),
             partition,
             source_context,
@@ -4940,7 +5110,7 @@ mod tests {
             context: target_context,
         };
 
-        let bytes = read(
+        let (_fragment, bytes) = read(
             store.clone(),
             partition,
             destination_address,
@@ -4954,7 +5124,7 @@ mod tests {
 
         // Source tuple must remain readable independently — copy creates a new entry, it does
         // not consume or repoint the source.
-        let bytes = read(
+        let (_fragment, bytes) = read(
             store.clone(),
             partition,
             source_address,
@@ -4965,5 +5135,101 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(bytes.as_ref(), payload.as_slice());
+    }
+
+    /// The local store is the reference implementation of the store contract: it resolves an
+    /// address in a single bucket pass, so it can establish every level at no extra cost and has
+    /// no reason to under-report any of them.
+    #[tokio::test]
+    async fn satisfies_the_immutable_store_contract() {
+        let dir = crate::test_util::TempDir::new("is_conformance_");
+        let store = LocalImmutableStore::new(
+            Some(std::path::PathBuf::from(dir.as_ref())),
+            ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("create store");
+
+        crate::conformance::verify_immutable_store(
+            store,
+            crate::conformance::Capabilities::new("LocalImmutableStore").stores_metadata_only(),
+        )
+        .await;
+    }
+
+    /// A store that isolates partitions reports further than it reads, and this is the only
+    /// implementation of that split.
+    ///
+    /// A sibling context in the same partition is a partition match, which `query` reports so a
+    /// caller can duplicate the association with a copy, and which `get` refuses so that nothing
+    /// crossing a wire without its level is mistaken for an association of the caller's own. The
+    /// battery bounds the reported level from above and cannot assert this, because a store that
+    /// resolves associations alone is entitled to answer `MatchNone` here instead.
+    #[tokio::test]
+    async fn an_isolating_store_reports_further_than_it_reads() {
+        use crate::immutable_store::ImmutableStore;
+
+        let dir = crate::test_util::TempDir::new("is_scope_split_");
+        let store = LocalImmutableStore::new(
+            Some(std::path::PathBuf::from(dir.as_ref())),
+            ImmutableStoreSettings {
+                isolate_partitions: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create store");
+
+        let partition = Partition::from([0x51u8; 16]);
+        let payload = Bytes::from_static(b"one hash, two contexts, one partition");
+        let stored = Address {
+            hash: crate::hash::hash_slice(payload.as_ref()),
+            context: Context::from([0x52u8; 16]),
+        };
+        let fragment = Fragment {
+            flags: FragmentFlags::PayloadStoredLocal.bits(),
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+
+        store
+            .clone()
+            .put(partition, stored, fragment, Some(payload), false)
+            .await
+            .expect("put under the storing context");
+
+        let sibling = Address {
+            hash: stored.hash,
+            context: Context::from([0x53u8; 16]),
+        };
+
+        let resolved = crate::immutable_store::query_one(
+            &(store.clone() as Arc<dyn ImmutableStore>),
+            partition,
+            sibling,
+        )
+        .await
+        .expect("query a sibling context");
+        assert_eq!(
+            resolved.match_made,
+            StoreMatch::MatchPartition,
+            "an isolating store must still report the partition match a copy would act on"
+        );
+        assert_eq!(resolved.partition, partition);
+
+        assert!(
+            store
+                .clone()
+                .get_metadata(partition, sibling)
+                .await
+                .expect("get_metadata answers rather than failing")
+                .match_made
+                == StoreMatch::MatchNone,
+            "an isolating store described an association it does not hold"
+        );
+        assert!(
+            store.clone().get(partition, sibling).await.is_err(),
+            "an isolating store served a sibling context's payload"
+        );
     }
 }

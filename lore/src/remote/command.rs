@@ -156,5 +156,8 @@ pub enum LoreCommand {
     RevisionTreeMove(crate::revision_tree::move_node::LoreRevisionTreeMoveArgs),
     RevisionTreeMetadataSet(crate::revision_tree::metadata_set::LoreRevisionTreeMetadataSetArgs),
     RevisionTreeMetadataGet(crate::revision_tree::metadata_get::LoreRevisionTreeMetadataGetArgs),
+    RevisionTreeMetadataClear(
+        crate::revision_tree::metadata_clear::LoreRevisionTreeMetadataClearArgs,
+    ),
     RevisionTreeCommit(crate::revision_tree::commit::LoreRevisionTreeCommitArgs),
 }

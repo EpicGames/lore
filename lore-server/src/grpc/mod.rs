@@ -348,6 +348,14 @@ pub fn extract_correlation_id<B>(request: &tonic::Request<B>) -> Option<String> 
     }
 }
 
+pub fn extract_authorization_header<B>(request: &tonic::Request<B>) -> Option<String> {
+    request
+        .metadata()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(|s| s.to_string())
+}
+
 pub fn rpc_code_to_str(code: &Code) -> &'static str {
     match code {
         Code::Ok => "Ok",
@@ -433,6 +441,10 @@ pub fn hook_error_to_status(error: HookError) -> Status {
         },
         _ => Status::internal(error.to_string()),
     }
+}
+
+pub fn no_repository_access_status() -> Status {
+    Status::permission_denied("Unauthorized")
 }
 
 pub fn timeout_grpc<T>(

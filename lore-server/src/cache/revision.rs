@@ -211,7 +211,7 @@ pub(crate) async fn store_cached_list(
     buffer.extend_from_slice(items_bytes);
     let buffer = buffer.freeze();
 
-    let Ok((address, _fragment)) = immutable::write(
+    let Ok(address) = immutable::write(
         repository.clone(),
         Context::default(),
         buffer,

@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::io;
-use std::io::Read;
 use std::path::Path;
 
 use lore_error_set::prelude::*;
@@ -15,7 +14,6 @@ use crate::event::EventError;
 use crate::interface::LoreError;
 use crate::lore::BranchId;
 use crate::lore::Hash;
-use crate::lore_spawn_blocking;
 
 #[error_set]
 pub enum AnchorError {
@@ -53,12 +51,15 @@ pub async fn deserialize_migrate_old(
         branch: BranchId,
     }
 
-    lore_spawn_blocking!(move || {
-        let mut anchor = OldAnchor::default();
-        std::fs::File::open(path)?.read_exact(anchor.as_mut_bytes())?;
-        Ok((anchor.signature, anchor.branch))
-    })
-    .await
-    .map_err(io::Error::other)
-    .flatten()
+    let bytes = lore_io::IoDriver::global().read_file_bytes(&path).await?;
+    let mut anchor = OldAnchor::default();
+    let length = anchor.as_bytes().len();
+    let Some(data) = bytes.get(..length) else {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "anchor file ended before the anchor length",
+        ));
+    };
+    anchor.as_mut_bytes().copy_from_slice(data);
+    Ok((anchor.signature, anchor.branch))
 }

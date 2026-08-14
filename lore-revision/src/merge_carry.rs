@@ -97,7 +97,7 @@ pub async fn store(
         bytes.extend_from_slice(s.as_bytes());
     }
 
-    let (address, _fragment) = immutable::write(
+    let address = immutable::write(
         repository.clone(),
         Context::default(),
         Bytes::from(bytes),

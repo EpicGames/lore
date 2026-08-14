@@ -18,7 +18,6 @@ use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::runtime;
 use parking_lot::Mutex;
-use tokio::io::AsyncReadExt;
 use tokio::time::Instant;
 use windows_sys::Win32;
 use windows_sys::Win32::Storage::ProjectedFileSystem;
@@ -1186,16 +1185,10 @@ async fn prefetch_files(
                     }
                 }
 
-                if let Ok(mut file) = tokio::fs::OpenOptions::new()
-                    .read(true)
-                    .write(false)
-                    .truncate(false)
-                    .create(false)
-                    .open(path)
+                if let Ok((_file, _metadata, _head)) = lore_io::IoDriver::global()
+                    .open_read_head(path, &lore_io::OpenOptions::new().read(true), 32)
                     .await
                 {
-                    let mut buffer = [0u8; 32];
-                    let _ = file.read(&mut buffer).await;
                     file_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     /*
                     if let Ok(metadata) = file.metadata().await {

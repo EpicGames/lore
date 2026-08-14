@@ -35,6 +35,7 @@ tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tower = { workspace = true }
 url = { workspace = true }
+webpki-roots = { workspace = true }
 zerocopy = { workspace = true }
 
 [features]

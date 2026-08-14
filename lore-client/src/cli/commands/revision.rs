@@ -12,6 +12,7 @@ use lore::auth;
 use lore::auth::LoreAuthUserInfoArgs;
 use lore::branch;
 use lore::interface::Context;
+use lore::interface::FRAGMENT_SIZE_THRESHOLD;
 use lore::interface::FragmentFlags;
 use lore::interface::Hash;
 use lore::interface::LoreArray;
@@ -885,11 +886,9 @@ impl FragmentStats {
         let max_count = self.size_count.iter().max().cloned().unwrap_or_default();
         for (bucket, count) in self.size_count.iter().enumerate() {
             let start_size = (((bucket as f64) / (bucket_count as f64))
-                * (lore_base::types::FRAGMENT_SIZE_THRESHOLD as f64))
-                as usize;
+                * (FRAGMENT_SIZE_THRESHOLD as f64)) as usize;
             let end_size = ((((bucket + 1) as f64) / (bucket_count as f64))
-                * (lore_base::types::FRAGMENT_SIZE_THRESHOLD as f64))
-                as usize;
+                * (FRAGMENT_SIZE_THRESHOLD as f64)) as usize;
 
             let count_len = if max_count == 0 {
                 0
@@ -927,8 +926,8 @@ impl FragmentStats {
             self.total_written_raw += data.fragment.size_content as usize;
             self.total_written_payload += data.fragment.size_payload as usize;
 
-            let size_bucket = (data.fragment.size_content as f64)
-                / (lore_base::types::FRAGMENT_SIZE_THRESHOLD as f64);
+            let size_bucket =
+                (data.fragment.size_content as f64) / (FRAGMENT_SIZE_THRESHOLD as f64);
             let size_bucket = std::cmp::min(
                 (size_bucket * (self.size_count.len() as f64)) as usize,
                 self.size_count.len() - 1,

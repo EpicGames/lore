@@ -28,11 +28,15 @@ use crate::types::Fragment;
 use crate::types::FragmentReference;
 use crate::types::Hash;
 use crate::types::Partition;
-use crate::write::StoreResult;
 use crate::write::store_fragment;
 use crate::write_tracker::WriteTracker;
 
 const MAX_FRAGMENT_TREE_DEPTH: usize = 8;
+
+struct StoredFragment {
+    address: Address,
+    fragment: Fragment,
+}
 
 /// Errors specific to raw stream framing/integrity, plus failures from the
 /// underlying immutable fragment store.
@@ -129,7 +133,7 @@ where
     let chunks = chunker.as_stream();
     tokio::pin!(chunks);
 
-    let mut first: Option<(StoreResult, u64)> = None;
+    let mut first: Option<(StoredFragment, u64)> = None;
     let mut builder = FragmentListBuilder::new(
         store.clone(),
         partition,
@@ -241,7 +245,7 @@ async fn store_leaf(
     flags: WriteOptions,
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<WriteTracker>>,
-) -> Result<StoreResult, StorageError> {
+) -> Result<StoredFragment, StorageError> {
     let address = Address {
         context,
         hash: hash::hash_slice(buffer.as_ref()),
@@ -252,7 +256,7 @@ async fn store_leaf(
         size_content: buffer.len() as u64,
     };
     let permit = crate::concurrency::acquire_fragment_memory_permit(buffer.len()).await;
-    store_fragment(
+    let stored = store_fragment(
         store,
         partition,
         address,
@@ -263,7 +267,11 @@ async fn store_leaf(
         tracker,
         permit,
     )
-    .await
+    .await?;
+    Ok(StoredFragment {
+        address: stored.address,
+        fragment,
+    })
 }
 
 struct FragmentListBuilder {
@@ -342,7 +350,7 @@ impl FragmentListBuilder {
         }
     }
 
-    async fn finish(mut self, content_size: u64) -> Result<StoreResult, StorageError> {
+    async fn finish(mut self, content_size: u64) -> Result<StoredFragment, StorageError> {
         let mut level = 0usize;
         loop {
             let has_higher = self
@@ -423,7 +431,7 @@ impl FragmentListBuilder {
         start_offset: u64,
         end_offset: u64,
         root: bool,
-    ) -> Result<StoreResult, StorageError> {
+    ) -> Result<StoredFragment, StorageError> {
         let size_content = end_offset
             .checked_sub(start_offset)
             .ok_or_else(|| StorageError::internal("fragment page offsets are not monotonic"))?;
@@ -451,7 +459,7 @@ impl FragmentListBuilder {
             size_content,
         };
         let permit = crate::concurrency::acquire_fragment_memory_permit(payload.len()).await;
-        store_fragment(
+        let stored = store_fragment(
             self.store.clone(),
             self.partition,
             address,
@@ -462,7 +470,11 @@ impl FragmentListBuilder {
             self.tracker.clone(),
             permit,
         )
-        .await
+        .await?;
+        Ok(StoredFragment {
+            address: stored.address,
+            fragment,
+        })
     }
 }
 
@@ -520,8 +532,8 @@ mod tests {
         )
         .await
         .expect("stream write");
-        let (buffer_address, buffer_fragment) = crate::write_content(
-            store,
+        let buffer_address = crate::write_content(
+            store.clone(),
             partition,
             context,
             Bytes::from(payload),
@@ -532,6 +544,12 @@ mod tests {
         )
         .await
         .expect("buffer write");
+        let buffer_fragment = store
+            .clone()
+            .get_metadata(partition, buffer_address)
+            .await
+            .expect("buffer metadata")
+            .fragment;
 
         assert_eq!(size, buffer_fragment.size_content);
         assert_eq!(stream_address, buffer_address);
@@ -569,7 +587,7 @@ mod tests {
             .expect("boundary stream write");
             assert_eq!(actual, size as u64);
             assert_eq!(fragment.size_content, size as u64);
-            let restored = crate::read(
+            let (_, restored) = crate::read(
                 store.clone(),
                 partition,
                 address,
@@ -607,7 +625,7 @@ mod tests {
         assert_ne!(fragment.flags & FragmentFlags::PayloadFragmented.bits(), 0);
         assert_eq!(size, payload.len() as u64);
 
-        let restored = crate::read(
+        let (_, restored) = crate::read(
             store,
             partition,
             address,

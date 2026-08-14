@@ -375,7 +375,8 @@ pub struct CompositeStoreSettings {
     pub local: CompositeSubStoreSettings,
     pub replica: Option<Vec<CompositeSubStoreSettings>>,
     pub replica_factory: Option<ReplicaFactorySettings>,
-    pub should_cache_query_results: Option<bool>,
+    pub cache_metadata: Option<bool>,
+    pub cache_metadata_semaphore_size: Option<usize>,
     pub durable_store_delay_ms: Option<u64>,
 }
 

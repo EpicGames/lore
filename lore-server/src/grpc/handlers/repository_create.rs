@@ -30,6 +30,7 @@ use crate::authnz::common::create_request_with_authorization;
 use crate::authnz::rebac::RebacApiClient;
 use crate::authnz::rebac::grpc_get_rebac_client;
 use crate::grpc::ServerResultExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
@@ -51,11 +52,7 @@ pub async fn handler(
 ) -> Result<Response<RepositoryCreateResponse>, Status> {
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-    let authorization = request
-        .metadata()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .map(|s| s.to_string());
+    let authorization = extract_authorization_header(&request);
     let req = request.into_inner();
 
     let id: RepositoryId = Context::from(req.id).into();

@@ -130,13 +130,16 @@ pub async fn set_revision(
                     }
                 };
 
-                tokio::fs::read(input_path).await.internal("Invalid path")?
+                lore_io::IoDriver::global()
+                    .read_file_bytes(input_path)
+                    .await
+                    .internal("Invalid path")?
             };
 
             // When storing binary data, put it in the immutable store
             // Use a zero context to avoid creating extra entries if multiple
             // revisions use the same metadata blob
-            let (address, _) = {
+            let address = {
                 immutable::write(
                     repository.clone(),
                     Context::default(),
@@ -184,7 +187,7 @@ pub async fn set_revision(
             .internal("Failed to serialize staged revision anchor")?;
     }
 
-    let _ = event::metadata::send(&metadata);
+    event::metadata::send(&metadata);
 
     Ok(())
 }
@@ -259,13 +262,16 @@ async fn set_file_task(
                         }
                     };
 
-                    tokio::fs::read(input_path).await.internal("Invalid path")?
+                    lore_io::IoDriver::global()
+                        .read_file_bytes(input_path)
+                        .await
+                        .internal("Invalid path")?
                 };
 
                 // When storing binary data, put it in the immutable store
                 // Use a zero context to avoid creating extra entries if multiple
                 // files use the same metadata blob
-                let (address, _) = {
+                let address = {
                     immutable::write(
                         repository.clone(),
                         Context::default(),
@@ -320,7 +326,7 @@ async fn set_file_task(
     }
 
     if events {
-        let _ = event::metadata::send(&metadata);
+        event::metadata::send(&metadata);
     }
 
     Ok(())

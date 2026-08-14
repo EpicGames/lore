@@ -90,7 +90,7 @@ async fn store_record(
 ) -> Result<Hash, Status> {
     let bytes = serde_json::to_vec(record)
         .map_err(|error| Status::internal(format!("serialize idempotency record: {error}")))?;
-    let (address, _) = lore_storage::write_content(
+    let address = lore_storage::write_content(
         immutable_store,
         repository,
         request_id,
@@ -111,7 +111,7 @@ async fn load_record(
     request_id: Context,
     record_hash: Hash,
 ) -> Result<Record, Status> {
-    let bytes = lore_storage::read(
+    let (_, bytes) = lore_storage::read(
         immutable_store,
         repository,
         Address {

@@ -264,7 +264,7 @@ async fn validate_content_address(
     }
 
     let query = immutable_store
-        .query(repository, address, StoreMatch::MatchFull)
+        .get_metadata(repository, address)
         .await
         .map_err(|error| {
             warn!(
@@ -405,7 +405,7 @@ mod tests {
         .await
         .expect("create branch");
 
-        let (address, _) = lore_storage::write_content(
+        let address = lore_storage::write_content(
             immutable_store,
             repository.id,
             Context::from(uuid::Uuid::now_v7()),

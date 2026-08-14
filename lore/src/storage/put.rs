@@ -227,7 +227,7 @@ async fn resolve_put_item(
     )
     .await
     {
-        Ok((address, _fragment)) => (address, LoreErrorCode::None),
+        Ok(address) => (address, LoreErrorCode::None),
         Err(err) => (
             Address::default(),
             crate::storage::storage_error_to_code(&err),

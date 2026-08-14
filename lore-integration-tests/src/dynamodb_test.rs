@@ -447,4 +447,132 @@ mod dynamo_tests {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn scan_page_with_total_segments_one_returns_all_items() -> TestResult {
+        use lore_aws::dynamodb::ScanConfig;
+
+        let execution = setup_execution("test".to_string());
+        let dynamo = LORE_CONTEXT
+            .scope(execution.clone(), async {
+                dynamodb_client(
+                    "http://127.0.0.1:9090".to_string(),
+                    vec![FRAGMENTS_TABLE_NAME],
+                )
+                .await
+            })
+            .await?;
+
+        // Insert a known set of items
+        let hashes: Vec<Hash> = (0..12).map(|_| random::<Hash>()).collect();
+        for hash in &hashes {
+            let repo_ctx: [u8; 64] = random();
+            let item = HashMap::from([
+                (
+                    FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
+                    AttributeValue::B(Blob::from(hash.as_bytes())),
+                ),
+                (
+                    FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE.to_string(),
+                    AttributeValue::B(Blob::from(repo_ctx.to_vec())),
+                ),
+            ]);
+            dynamo
+                .put_item(&Arc::from(FRAGMENTS_TABLE_NAME), item)
+                .await?;
+        }
+
+        // Scan with TotalSegments=1, segment=0 until exhausted
+        let table: Arc<str> = Arc::from(FRAGMENTS_TABLE_NAME);
+        let mut start_key = None;
+        let mut found_hashes: HashSet<Vec<u8>> = HashSet::new();
+        loop {
+            let page = dynamo
+                .scan_page(&table, start_key, &ScanConfig::segment(0, 1))
+                .await?;
+            for item in page.items {
+                if let Some(AttributeValue::B(b)) =
+                    item.get(FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE)
+                {
+                    found_hashes.insert(b.as_ref().to_vec());
+                }
+            }
+            match page.last_evaluated_key {
+                Some(k) => start_key = Some(k),
+                None => break,
+            }
+        }
+
+        for hash in &hashes {
+            assert!(
+                found_hashes.contains(hash.as_bytes()),
+                "hash should appear in single-segment scan"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_page_with_multiple_segments_covers_all_items_exactly_once() -> TestResult {
+        use lore_aws::dynamodb::ScanConfig;
+
+        let execution = setup_execution("test".to_string());
+        let dynamo = LORE_CONTEXT
+            .scope(execution.clone(), async {
+                dynamodb_client(
+                    "http://127.0.0.1:9090".to_string(),
+                    vec![FRAGMENTS_TABLE_NAME],
+                )
+                .await
+            })
+            .await?;
+
+        let total_segments = 4i32;
+        let hashes: Vec<Hash> = (0..20).map(|_| random::<Hash>()).collect();
+        for hash in &hashes {
+            let repo_ctx: [u8; 64] = random();
+            let item = HashMap::from([
+                (
+                    FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
+                    AttributeValue::B(Blob::from(hash.as_bytes())),
+                ),
+                (
+                    FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE.to_string(),
+                    AttributeValue::B(Blob::from(repo_ctx.to_vec())),
+                ),
+            ]);
+            dynamo
+                .put_item(&Arc::from(FRAGMENTS_TABLE_NAME), item)
+                .await?;
+        }
+
+        let table: Arc<str> = Arc::from(FRAGMENTS_TABLE_NAME);
+        let mut seen: HashMap<Vec<u8>, usize> = HashMap::new();
+
+        for seg in 0..total_segments {
+            let mut start_key = None;
+            loop {
+                let page = dynamo
+                    .scan_page(&table, start_key, &ScanConfig::segment(seg, total_segments))
+                    .await?;
+                for item in page.items {
+                    if let Some(AttributeValue::B(b)) =
+                        item.get(FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE)
+                    {
+                        *seen.entry(b.as_ref().to_vec()).or_insert(0) += 1;
+                    }
+                }
+                match page.last_evaluated_key {
+                    Some(k) => start_key = Some(k),
+                    None => break,
+                }
+            }
+        }
+
+        for hash in &hashes {
+            let count = seen.get(hash.as_bytes()).copied().unwrap_or(0);
+            assert_eq!(count, 1, "each item should appear in exactly one segment");
+        }
+        Ok(())
+    }
 }

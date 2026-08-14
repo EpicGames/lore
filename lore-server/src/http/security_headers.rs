@@ -62,6 +62,12 @@ impl Default for ContentTypeAllowlist {
         Self::new(
             [
                 "application/octet-stream",
+                // S3 sets this on objects uploaded without a Content-Type, so
+                // callers that forward S3 metadata send it here. It is not a
+                // registered type but means the same as application/octet-stream.
+                // Kept as-is, not rewritten, so callers read back what they sent.
+                // Browsers do not render it, and every response sets nosniff.
+                "binary/octet-stream",
                 "image/png",
                 "image/jpeg",
                 "image/gif",
@@ -105,6 +111,32 @@ mod tests {
         assert!(allowlist.is_allowed("image/jpeg"));
         assert!(allowlist.is_allowed("application/pdf"));
         assert!(allowlist.is_allowed("application/octet-stream"));
+    }
+
+    /// The S3 default type is allowed and served verbatim, in the same
+    /// case- and parameter-insensitive way as every other entry.
+    #[test]
+    fn default_allows_s3_binary_octet_stream() {
+        let allowlist = ContentTypeAllowlist::default();
+        assert!(allowlist.is_allowed("binary/octet-stream"));
+        assert!(allowlist.is_allowed("BINARY/OCTET-STREAM"));
+        assert!(allowlist.is_allowed("binary/octet-stream; charset=utf-8"));
+        assert_eq!(
+            allowlist.coerce(Some("binary/octet-stream".to_string())),
+            "binary/octet-stream"
+        );
+    }
+
+    /// Allowing one `binary/*` subtype must not admit any other.
+    #[test]
+    fn binary_top_level_type_is_not_wildcarded() {
+        let allowlist = ContentTypeAllowlist::default();
+        assert!(!allowlist.is_allowed("binary/html"));
+        assert!(!allowlist.is_allowed("binary/octet-stream,text/html"));
+        assert_eq!(
+            allowlist.coerce(Some("binary/octet-stream,text/html".to_string())),
+            "application/octet-stream"
+        );
     }
 
     #[test]

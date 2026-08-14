@@ -6,6 +6,10 @@ Implementation-detail reference: how Lore is built under the hood.
 
 Precise technical descriptions of Lore's source: byte layouts, struct formats, serialization specs, internal protocols. Austere, authoritative, descriptive only. No instruction or explanation; just how the machinery is built.
 
+## What you'll find here
+
+- [File I/O engine](file-io-engine.md) — the `lore-io` driver, buffer ownership, syscall pool, and the plan for replacing `std::fs` and `tokio::fs`.
+
 ## Suggested starting points
 
 - **Writing a new Internals page?** Start at the [doc-standards walkthrough](../doc-standards/writing-a-doc.md).

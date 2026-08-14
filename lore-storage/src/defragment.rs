@@ -1,15 +1,14 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::ops::Range;
-#[cfg(target_family = "unix")]
-use std::os::unix::fs::FileExt;
-#[cfg(target_family = "windows")]
-use std::os::windows::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use bytes::BytesMut;
+use lore_io::IoDriver;
+use lore_io::IoFile;
+use lore_io::OpenOptions;
 use lore_transport::StorageSession;
 use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
@@ -41,15 +40,10 @@ use crate::types::Partition;
 pub enum DefragmentSink {
     /// Write at offset to a file (unordered, concurrent positional writes).
     /// `size` is the expected content length, used to reject out-of-range offsets.
-    File {
-        file: Arc<std::fs::File>,
-        size: usize,
-    },
-    /// Stream buffers in content order to a caller-provided channel. The
-    /// range is expressed in global logical-content offsets.
+    File { file: IoFile, size: usize },
+    /// Stream buffers in content order to a caller-provided channel.
     Stream {
         sender: Sender<Result<Bytes, StorageError>>,
-        range: Range<u64>,
     },
 }
 
@@ -64,11 +58,21 @@ type DataReceiver = Receiver<DataMessage>;
 #[cfg_attr(test, derive(Debug))]
 struct LeafReference {
     hash: Hash,
-    offset_content: u64,
+    /// Where this leaf's delivered bytes belong in the output, counted from the start of the
+    /// range that was asked for. Equal to the leaf's content offset for a whole-content read,
+    /// which is the only thing the file sink ever wrote before ranges existed.
+    target_offset: u64,
+    /// The leaf's whole content size, as its parent list claims it. The fetch checks the
+    /// loaded payload against this rather than against `clip`: a payload is verified against
+    /// the hash that names it, so the whole leaf is what gets loaded and checked whatever
+    /// part of it the caller wants.
     expected_size: u64,
+    /// The part of this leaf the read asked for, relative to the leaf's own start. Whole
+    /// leaves carry `0..expected_size`; only the first and last leaf of a ranged read carry
+    /// anything narrower. Applied after the payload is verified, so it narrows what is
+    /// delivered rather than what is read.
+    clip: Range<u64>,
     context: Context,
-    /// Portion of the decompressed leaf to emit for a ranged stream.
-    emit_range: Range<usize>,
 }
 
 /// Channel capacity for leaf references from walker to fetch pool.
@@ -90,6 +94,11 @@ const MAX_FRAGMENT_TREE_DEPTH: usize = 8;
 
 /// Walks the fragment tree depth-first with prefetch pipelining, yielding leaf
 /// fragment references into the provided channel.
+///
+/// `range` is the content the caller asked for, counted from the start of the content and
+/// already clamped to it. Offsets inside a fragment tree are absolute within the content,
+/// so the range is rebased onto the root list's own first offset once here and every level
+/// below compares against it directly.
 #[allow(clippy::too_many_arguments)]
 async fn walk_fragment_tree(
     store: Arc<dyn ImmutableStore>,
@@ -97,10 +106,10 @@ async fn walk_fragment_tree(
     address: Address,
     fragment: Fragment,
     source_buffer: Bytes,
+    range: Range<u64>,
     leaf_tx: Sender<LeafReference>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
-    stream_range: Range<u64>,
 ) -> Result<(), StorageError> {
     debug_assert!(
         (fragment.flags & FragmentFlags::PayloadFragmented) == FragmentFlags::PayloadFragmented
@@ -115,23 +124,104 @@ async fn walk_fragment_tree(
     let fragment_list = source_buffer.as_type_slice::<FragmentReference>();
     let total_content_size = fragment.size_content as usize;
 
+    if fragment_list.is_empty() {
+        return Err(StorageError::internal(format!(
+            "fragment list is empty, claiming {total_content_size} bytes of content"
+        )));
+    }
+
+    let base_offset = fragment_list[0].offset_content;
+    let window = base_offset
+        .checked_add(range.start)
+        .zip(base_offset.checked_add(range.end))
+        .map(|(start, end)| start..end)
+        .ok_or_else(|| StorageError::internal("content range offset overflow"))?;
+
     walk_fragment_level(
         store,
         partition,
         address.context,
         fragment_list,
         total_content_size,
+        &window,
         &leaf_tx,
         options,
         remote_session,
         0,
-        &stream_range,
     )
     .await
 }
 
+/// The absolute content window one entry of a fragment list stands for: from its own offset
+/// to where the next entry starts, and for the last entry to the end of the level.
+///
+/// Derived from the list alone rather than from the fragment the entry names, which is what
+/// lets a ranged walk decide an entry is not wanted before paying to load it.
+fn entry_window(
+    fragment_list: &[FragmentReference],
+    index: usize,
+    level_end: u64,
+) -> Result<Range<u64>, StorageError> {
+    let start = fragment_list[index].offset_content;
+    let end = if index + 1 < fragment_list.len() {
+        fragment_list[index + 1].offset_content
+    } else {
+        level_end
+    };
+    let size = end.checked_sub(start).ok_or_else(|| {
+        StorageError::internal(
+            "fragment list offset_content is not strictly increasing inside content window",
+        )
+    })?;
+    if size == 0 {
+        return Err(StorageError::internal("fragment list chunk has zero size"));
+    }
+    Ok(start..end)
+}
+
+/// The part of `entry` that `window` asks for, relative to the entry's own start, or `None`
+/// when the two do not overlap.
+fn clip_to_window(entry: &Range<u64>, window: &Range<u64>) -> Option<Range<u64>> {
+    let start = entry.start.max(window.start);
+    let end = entry.end.min(window.end);
+    (start < end).then(|| (start - entry.start)..(end - entry.start))
+}
+
+/// The entries of a level whose content the read asked for, or `None` when the level holds
+/// none of it.
+///
+/// One contiguous index range, because entries are strictly increasing and tile the level
+/// while the window is itself contiguous — so the entries a window reaches cannot have a gap.
+/// That is what lets the caller size its work from the ends alone.
+///
+/// Walks the whole list rather than stopping at the last hit: an entry's arithmetic is checked
+/// whether or not its content is wanted, so reading one part of a malformed list cannot
+/// succeed where reading another part fails.
+fn wanted_entries(
+    fragment_list: &[FragmentReference],
+    level_end: u64,
+    window: &Range<u64>,
+) -> Result<Option<Range<usize>>, StorageError> {
+    let mut wanted: Option<Range<usize>> = None;
+    for index in 0..fragment_list.len() {
+        let entry = entry_window(fragment_list, index, level_end)?;
+        if clip_to_window(&entry, window).is_some() {
+            wanted = Some(match wanted {
+                Some(range) => range.start..index + 1,
+                None => index..index + 1,
+            });
+        }
+    }
+    Ok(wanted)
+}
+
 /// Walks one level of the tree, dispatching to the leaf or intermediate walker by peeking at
-/// the first entry.
+/// the first entry the read reaches.
+///
+/// The peek lands on the first *wanted* entry rather than on entry zero. Every entry at a
+/// level is the same tier, so any of them answers the question, and choosing a wanted one
+/// keeps a read of the tail of the content from loading the head of every level on the way
+/// down.
 ///
 /// An empty list is invalid at every level, whatever its parent claims and including a parent
 /// claiming zero: zero-length content is addressed by the zero hash, never by a fragment whose
@@ -145,11 +235,11 @@ async fn walk_fragment_level(
     context: Context,
     fragment_list: &[FragmentReference],
     total_content_size: usize,
+    window: &Range<u64>,
     leaf_tx: &Sender<LeafReference>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
     depth: usize,
-    stream_range: &Range<u64>,
 ) -> Result<(), StorageError> {
     if depth > MAX_FRAGMENT_TREE_DEPTH {
         return Err(StorageError::internal(format!(
@@ -162,32 +252,22 @@ async fn walk_fragment_level(
             "fragment list is empty, claiming {total_content_size} bytes of content"
         )));
     }
-    let content_start = fragment_list[0].offset_content;
-    let content_end = content_start
-        .checked_add(total_content_size as u64)
-        .ok_or_else(|| StorageError::internal("fragment content window overflows u64"))?;
-    let (window, selected_content_size) =
-        if stream_range.start <= content_start && stream_range.end >= content_end {
-            // Preserve the full-read validation path: the intermediate walker
-            // diagnoses malformed child lists before parent offset ordering.
-            (0..fragment_list.len(), total_content_size)
-        } else {
-            let Some(selected) =
-                overlapping_fragment_window(fragment_list, total_content_size, stream_range)?
-            else {
-                return Ok(());
-            };
-            selected
-        };
-    let fragment_list = &fragment_list[window];
-    let total_content_size = selected_content_size;
-
     let base_offset = fragment_list[0].offset_content;
+    let level_end = base_offset
+        .checked_add(total_content_size as u64)
+        .ok_or_else(|| {
+            StorageError::internal("fragment list base_offset + total_content_size overflows u64")
+        })?;
 
-    // Peek at the first entry to determine if this level is intermediate or leaf
+    // Validates the whole list on the way, so an unwanted level is still a well-formed one.
+    let Some(wanted) = wanted_entries(fragment_list, level_end, window)? else {
+        return Ok(());
+    };
+    let first_index = wanted.start;
+
     let first_address = Address {
         context,
-        hash: fragment_list[0].hash,
+        hash: fragment_list[first_index].hash,
     };
     let (first_frag, first_buf) = load_fragment(
         store.clone(),
@@ -204,14 +284,15 @@ async fn walk_fragment_level(
             partition,
             context,
             fragment_list,
-            total_content_size,
+            level_end,
+            window,
+            wanted,
             first_frag,
             first_buf,
             leaf_tx,
             options,
             remote_session,
             depth,
-            stream_range,
         )
         .await
     } else {
@@ -220,85 +301,33 @@ async fn walk_fragment_level(
             fragment_list,
             total_content_size,
             base_offset,
+            window,
             context,
             leaf_tx,
-            stream_range,
         )
         .await
     }
 }
 
-/// Select the consecutive fragment references whose content spans overlap a
-/// requested global logical range. The returned size is relative to the first
-/// selected reference, matching `Fragment::size_content` semantics expected by
-/// the lower-level walker.
-fn overlapping_fragment_window(
-    fragment_list: &[FragmentReference],
-    total_content_size: usize,
-    requested: &Range<u64>,
-) -> Result<Option<(Range<usize>, usize)>, StorageError> {
-    if fragment_list.is_empty() || requested.is_empty() {
-        return Ok(None);
-    }
-    let base = fragment_list[0].offset_content;
-    let content_end = base
-        .checked_add(total_content_size as u64)
-        .ok_or_else(|| StorageError::internal("fragment content window overflows u64"))?;
-
-    let mut first = None;
-    let mut last = 0;
-    let mut previous = None;
-    for (index, reference) in fragment_list.iter().enumerate() {
-        if let Some(previous) = previous
-            && reference.offset_content <= previous
-        {
-            return Err(StorageError::internal(
-                "fragment list offsets are not strictly increasing",
-            ));
-        }
-        previous = Some(reference.offset_content);
-        let end = fragment_list
-            .get(index + 1)
-            .map_or(content_end, |next| next.offset_content);
-        if reference.offset_content >= content_end || end > content_end {
-            return Err(StorageError::internal(
-                "fragment list offset is outside its content window",
-            ));
-        }
-        if reference.offset_content < requested.end && end > requested.start {
-            first.get_or_insert(index);
-            last = index + 1;
-        }
-    }
-
-    let Some(first) = first else {
-        return Ok(None);
-    };
-    let selected_start = fragment_list[first].offset_content;
-    let selected_end = fragment_list
-        .get(last)
-        .map_or(content_end, |next| next.offset_content);
-    let selected_size = selected_end
-        .checked_sub(selected_start)
-        .and_then(|size| usize::try_from(size).ok())
-        .ok_or_else(|| StorageError::internal("selected fragment window is too large"))?;
-    Ok(Some((first..last, selected_size)))
-}
-
-/// Yields all entries in a leaf-level fragment list as `LeafReference`.
+/// Yields the entries of a leaf-level fragment list that `window` reaches, as `LeafReference`.
 ///
 /// Uses checked arithmetic on `offset_content` so a peer-supplied list with
 /// non-increasing offsets, offsets outside the content window, or a total
 /// span that overflows u64 fails with a clear error rather than producing a
 /// wrapped `expected_size` that would blow up downstream permit accounting
 /// or file writes.
+///
+/// Every entry is checked, including the ones outside the window; only the sending is
+/// narrowed. The checks read a list already in hand and cost no I/O, so there is nothing to
+/// save by skipping them and a malformed list would otherwise be accepted or rejected
+/// depending on which part of the content a caller happened to ask for.
 async fn walk_leaf_level(
     fragment_list: &[FragmentReference],
     total_content_size: usize,
     base_offset: u64,
+    window: &Range<u64>,
     context: Context,
     leaf_tx: &Sender<LeafReference>,
-    stream_range: &Range<u64>,
 ) -> Result<(), StorageError> {
     let content_end = base_offset
         .checked_add(total_content_size as u64)
@@ -307,26 +336,13 @@ async fn walk_leaf_level(
         })?;
 
     for (i, frag_ref) in fragment_list.iter().enumerate() {
-        let next_offset = if i + 1 < fragment_list.len() {
-            fragment_list[i + 1].offset_content
-        } else {
-            content_end
-        };
-        let expected_content_size = next_offset
-            .checked_sub(frag_ref.offset_content)
-            .ok_or_else(|| {
-                StorageError::internal(
-                    "fragment list offset_content is not strictly increasing inside content window",
-                )
-            })?;
+        let entry = entry_window(fragment_list, i, content_end)?;
+        let expected_content_size = entry.end - entry.start;
         if expected_content_size > crate::FRAGMENT_SIZE_THRESHOLD as u64 {
             return Err(StorageError::internal(format!(
                 "fragment list chunk size {expected_content_size} exceeds FRAGMENT_SIZE_THRESHOLD {}",
                 crate::FRAGMENT_SIZE_THRESHOLD
             )));
-        }
-        if expected_content_size == 0 {
-            return Err(StorageError::internal("fragment list chunk has zero size"));
         }
         if frag_ref.hash.is_zero() {
             return Err(StorageError::internal(format!(
@@ -335,21 +351,16 @@ async fn walk_leaf_level(
             )));
         }
 
-        let overlap_start = frag_ref.offset_content.max(stream_range.start);
-        let overlap_end = next_offset.min(stream_range.end);
-        if overlap_start >= overlap_end {
+        let Some(clip) = clip_to_window(&entry, window) else {
             continue;
-        }
-        let emit_start = usize::try_from(overlap_start - frag_ref.offset_content)
-            .map_err(|_| StorageError::internal("leaf stream range start is too large"))?;
-        let emit_end = usize::try_from(overlap_end - frag_ref.offset_content)
-            .map_err(|_| StorageError::internal("leaf stream range end is too large"))?;
+        };
+
         let leaf = LeafReference {
             hash: frag_ref.hash,
-            offset_content: frag_ref.offset_content,
+            target_offset: entry.start + clip.start - window.start,
             expected_size: expected_content_size,
+            clip,
             context,
-            emit_range: emit_start..emit_end,
         };
         if leaf_tx.send(leaf).await.is_err() {
             break;
@@ -358,16 +369,20 @@ async fn walk_leaf_level(
     Ok(())
 }
 
-/// Verifies that one sublist covers exactly the range its parent entry claims, returning
-/// the content offset the next sibling has to start at.
+/// Verifies that one sublist covers exactly the window its parent's list gives it.
 ///
 /// Sublist offsets are absolute in the whole content, so in a well-formed tree a parent
-/// entry's `offset_content` equals its sublist's own first offset, and consecutive siblings
-/// tile the parent's range end to end. A gap between siblings is not a read error on its own:
-/// the output file is `set_len` to its full size before the walk starts, so a range no leaf
-/// ever writes reads back as zeros and the file is renamed into place as complete. An overlap
-/// is the same fault from the other side, which is why this compares offsets rather than only
-/// summing sizes.
+/// entry's `offset_content` equals its sublist's own first offset, and the sublist expands to
+/// exactly the distance to the next sibling — or, for the last entry, to the end of the level.
+/// A sublist that falls short leaves a gap: the output is sized to the whole range before the
+/// walk starts, so a range no leaf ever writes reads back as zeros and the file is renamed
+/// into place as complete. One that overruns is the same fault from the other side, which is
+/// why this compares against the window rather than only bounding it.
+///
+/// Checked against the window the parent's list derives rather than against a running total of
+/// what previous siblings covered. The two say the same thing for a whole-content read — a
+/// sibling's window ends where the next one begins — but only the window form survives a
+/// ranged read, which visits some siblings and not others.
 ///
 /// A sublist that is empty or expands to zero bytes is invalid outright: zero-length content
 /// is addressed by the zero hash, so no valid tree contains a list standing in for nothing.
@@ -379,28 +394,24 @@ fn sublist_coverage(
     parent: &FragmentReference,
     sub_list: &[FragmentReference],
     sub_content_size: usize,
-    expected_offset: u64,
-    level_end: u64,
-) -> Result<u64, StorageError> {
-    if parent.offset_content != expected_offset {
-        return Err(StorageError::internal(format!(
-            "fragment sublist starts at {} but the previous sibling ends at {expected_offset}",
-            parent.offset_content
-        )));
-    }
+    window: &Range<u64>,
+) -> Result<(), StorageError> {
     if parent.hash.is_zero() {
         return Err(StorageError::internal(format!(
-            "fragment list entry at content offset {expected_offset} has a zero hash"
+            "fragment list entry at content offset {} has a zero hash",
+            window.start
         )));
     }
     if sub_list.is_empty() {
         return Err(StorageError::internal(format!(
-            "fragment sublist at offset {expected_offset} is empty"
+            "fragment sublist at offset {} is empty",
+            window.start
         )));
     }
     if sub_content_size == 0 {
         return Err(StorageError::internal(format!(
-            "fragment sublist at offset {expected_offset} expands to zero bytes"
+            "fragment sublist at offset {} expands to zero bytes",
+            window.start
         )));
     }
     if sub_list[0].offset_content != parent.offset_content {
@@ -415,41 +426,40 @@ fn sublist_coverage(
         .ok_or_else(|| {
             StorageError::internal("fragment sublist offset + content size overflows u64")
         })?;
-    if end > level_end {
+    if end != window.end {
         return Err(StorageError::internal(format!(
-            "fragment sublist ends at {end}, past its parent's content end {level_end}"
-        )));
-    }
-    Ok(end)
-}
-
-/// The sublists of one level have to reach the end of their parent's content range, not
-/// merely stay inside it. Stopping short leaves the tail of the file uncovered.
-fn level_fully_covered(covered: u64, level_end: u64) -> Result<(), StorageError> {
-    if covered != level_end {
-        return Err(StorageError::internal(format!(
-            "fragment sublists cover up to {covered} but their parent's content ends at {level_end}"
+            "fragment sublist at content offset {} expands to {sub_content_size} bytes but its \
+             parent's list gives it {}",
+            window.start,
+            window.end - window.start
         )));
     }
     Ok(())
 }
 
+/// Walks the entries of an intermediate level that `window` reaches, recursing into each.
+///
+/// Entries the window misses are never loaded. That is the whole of what a ranged read saves
+/// on a large tree: an entry's window comes from its parent's list, so the walk can rule out a
+/// subtree — and everything under it — without a single fetch. `wanted` is the index range the
+/// window reaches, whose first entry the caller's tier peek has already loaded.
 #[allow(clippy::too_many_arguments)]
 async fn walk_intermediate_level(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     context: Context,
     fragment_list: &[FragmentReference],
-    total_content_size: usize,
+    level_end: u64,
+    window: &Range<u64>,
+    wanted: Range<usize>,
     first_frag: Fragment,
     first_buf: Bytes,
     leaf_tx: &Sender<LeafReference>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
     depth: usize,
-    stream_range: &Range<u64>,
 ) -> Result<(), StorageError> {
-    // Parse the already-loaded first entry
+    let first_index = wanted.start;
     let first_content_size = first_frag.size_content as usize;
     let first_payload_size = first_frag.size_payload as usize;
     if first_buf.len() < first_payload_size {
@@ -458,24 +468,25 @@ async fn walk_intermediate_level(
     let first_buffer = first_buf.to_aligned::<FragmentReference>();
     let first_list = first_buffer.as_type_slice::<FragmentReference>();
 
-    let base_offset = fragment_list[0].offset_content;
-    let level_end = base_offset
-        .checked_add(total_content_size as u64)
-        .ok_or_else(|| {
-            StorageError::internal("fragment list base_offset + total_content_size overflows u64")
-        })?;
-    let mut covered = sublist_coverage(
-        &fragment_list[0],
+    let first_entry = entry_window(fragment_list, first_index, level_end)?;
+    sublist_coverage(
+        &fragment_list[first_index],
         first_list,
         first_content_size,
-        base_offset,
-        level_end,
+        &first_entry,
     )?;
 
-    // Determine sub-level type by peeking at the first child
+    // Every child at this level is the same tier, so peeking at a wanted one settles it
+    // without loading content the read did not ask for.
+    let Some(peek) = wanted_entries(first_list, first_entry.end, window)? else {
+        return Err(StorageError::internal(format!(
+            "fragment sublist at content offset {} holds none of the range it was entered for",
+            first_entry.start
+        )));
+    };
     let peek_address = Address {
         context,
-        hash: first_list[0].hash,
+        hash: first_list[peek.start].hash,
     };
     let (peek_frag, peek_buf) = load_fragment(
         store.clone(),
@@ -489,16 +500,15 @@ async fn walk_intermediate_level(
         (peek_frag.flags & FragmentFlags::PayloadFragmented) != FragmentFlags::PayloadFragmented;
     drop(peek_buf);
 
-    // Process first entry
     let first_base_offset = first_list[0].offset_content;
     let mut result = if children_are_leaves {
         walk_leaf_level(
             first_list,
             first_content_size,
             first_base_offset,
+            window,
             context,
             leaf_tx,
-            stream_range,
         )
         .await
     } else {
@@ -508,33 +518,35 @@ async fn walk_intermediate_level(
             context,
             first_list,
             first_content_size,
+            window,
             leaf_tx,
             options,
             remote_session.clone(),
             depth + 1,
-            stream_range,
         ))
         .await
     };
 
-    if fragment_list.len() <= 1 || result.is_err() {
-        return result.and(level_fully_covered(covered, level_end));
+    let remaining = &fragment_list[first_index + 1..wanted.end];
+    if result.is_err() || remaining.is_empty() {
+        return result;
     }
 
-    // Prefetch remaining intermediate entries
-    let (prefetch_tx, mut prefetch_rx) =
-        channel::<JoinHandle<Result<(Fragment, Bytes), StorageError>>>(PIPELINE_WALKER_LOOKAHEAD);
+    // The launcher outlives this borrow of `fragment_list`, so the hashes it needs are copied
+    // out. Sized exactly, which the contiguity of `wanted` is what makes possible.
+    let hashes: Vec<Hash> = remaining.iter().map(|entry| entry.hash).collect();
+
+    type PrefetchMessage = (usize, JoinHandle<Result<(Fragment, Bytes), StorageError>>);
+    let (prefetch_tx, mut prefetch_rx) = channel::<PrefetchMessage>(PIPELINE_WALKER_LOOKAHEAD);
 
     let launcher: JoinHandle<Result<(), StorageError>> = {
         let store = store.clone();
         let remote_session = remote_session.clone();
-        let remaining: Vec<FragmentReference> = fragment_list[1..].to_vec();
+        let base_index = first_index + 1;
         lore_base::lore_spawn!(async move {
-            for frag_ref in &remaining {
-                let subaddress = Address {
-                    context,
-                    hash: frag_ref.hash,
-                };
+            for (offset, hash) in hashes.into_iter().enumerate() {
+                let index = base_index + offset;
+                let subaddress = Address { context, hash };
                 let store = store.clone();
                 let remote_session = remote_session.clone();
                 let handle: JoinHandle<Result<(Fragment, Bytes), StorageError>> =
@@ -542,7 +554,7 @@ async fn walk_intermediate_level(
                         load_fragment(store, partition, subaddress, options, remote_session).await
                     });
 
-                if prefetch_tx.send(handle).await.is_err() {
+                if prefetch_tx.send((index, handle)).await.is_err() {
                     break;
                 }
             }
@@ -550,11 +562,9 @@ async fn walk_intermediate_level(
         })
     };
 
-    // Advances on every iteration, bail-outs included, or a later sublist checks against
-    // the wrong parent.
-    let mut index = 0usize;
-    while let Some(handle) = prefetch_rx.recv().await {
-        index += 1;
+    // The index travels with its handle so the sublist that arrives is checked against the
+    // parent entry it actually came from, rather than against a position recounted here.
+    while let Some((index, handle)) = prefetch_rx.recv().await {
         let (sub_frag, sub_buf) = match handle
             .await
             .map_err(|e| StorageError::internal_with_context(e, "load task join"))
@@ -580,18 +590,18 @@ async fn walk_intermediate_level(
         let sub_list = sub_buffer.as_type_slice::<FragmentReference>();
         let sub_content_size = sub_frag.size_content as usize;
 
-        let Some(parent) = fragment_list.get(index) else {
-            result = result.and(Err(StorageError::internal(
-                "more prefetched sublists than fragment list entries",
-            )));
-            continue;
-        };
-        match sublist_coverage(parent, sub_list, sub_content_size, covered, level_end) {
-            Ok(end) => covered = end,
+        let entry = match entry_window(fragment_list, index, level_end) {
+            Ok(entry) => entry,
             Err(err) => {
                 result = result.and(Err(err));
                 continue;
             }
+        };
+        if let Err(err) =
+            sublist_coverage(&fragment_list[index], sub_list, sub_content_size, &entry)
+        {
+            result = result.and(Err(err));
+            continue;
         }
 
         let subresult = if children_are_leaves {
@@ -599,9 +609,9 @@ async fn walk_intermediate_level(
                 sub_list,
                 sub_content_size,
                 sub_list[0].offset_content,
+                window,
                 context,
                 leaf_tx,
-                stream_range,
             )
             .await
         } else {
@@ -611,11 +621,11 @@ async fn walk_intermediate_level(
                 context,
                 sub_list,
                 sub_content_size,
+                window,
                 leaf_tx,
                 options,
                 remote_session.clone(),
                 depth + 1,
-                stream_range,
             ))
             .await
         };
@@ -627,9 +637,7 @@ async fn walk_intermediate_level(
         .map_err(|e| StorageError::internal_with_context(e, "stream queue join"))
         .and_then(|r| r);
 
-    result
-        .and(level_fully_covered(covered, level_end))
-        .and(launcher_result)
+    result.and(launcher_result)
 }
 
 /// Unordered fetch pool for file targets.
@@ -665,7 +673,7 @@ async fn fetch_unordered(
             .map_err(|e| StorageError::internal_with_context(e, "permit"))?;
 
         let tx = data_tx.clone();
-        let offset = leaf.offset_content as usize;
+        let offset = leaf.target_offset as usize;
         let subaddress = Address {
             context: leaf.context,
             hash: leaf.hash,
@@ -674,6 +682,7 @@ async fn fetch_unordered(
         let remote_session = remote_session.clone();
 
         let expected_size = leaf.expected_size;
+        let clip = leaf.clip.clone();
         lore_base::lore_spawn!(tasks, async move {
             let (loaded_fragment, buffer) =
                 load_fragment(store, partition, subaddress, options, remote_session).await?;
@@ -697,6 +706,9 @@ async fn fetch_unordered(
                     buffer.len()
                 )));
             }
+            // Narrowed only after the whole leaf has been loaded and checked. `slice` is a
+            // view onto the same allocation, so a clipped leaf costs no copy.
+            let buffer = buffer.slice(clip.start as usize..clip.end as usize);
             tx.send((offset, buffer, permit))
                 .await
                 .map_err(|_err| StorageError::internal("stream send failed"))
@@ -764,7 +776,7 @@ async fn fetch_ordered_and_stream_from(
 
     // Sized so it never binds before the budget does; every payload in it holds a permit.
     let max_tasks = FRAGMENT_BUDGET_KIB / FRAGMENT_MINIMUM_COST_KIB as usize;
-    type FetchResult = Result<(Bytes, Range<usize>, SemaphorePermit<'static>), StorageError>;
+    type FetchResult = Result<(Bytes, SemaphorePermit<'static>), StorageError>;
     let (fetch_queue_tx, mut fetch_queue_rx) = channel::<JoinHandle<FetchResult>>(max_tasks);
 
     // Launcher: read leaf refs from walker, spawn fetch tasks, push handles
@@ -786,7 +798,7 @@ async fn fetch_ordered_and_stream_from(
                 let store = store.clone();
                 let remote_session = remote_session.clone();
                 let expected_size = leaf.expected_size;
-                let emit_range = leaf.emit_range;
+                let clip = leaf.clip.clone();
 
                 let handle: JoinHandle<FetchResult> = lore_base::lore_spawn!(async move {
                     let (loaded_fragment, buffer) =
@@ -803,14 +815,9 @@ async fn fetch_ordered_and_stream_from(
                             buffer.len()
                         )));
                     }
-                    if emit_range.end > buffer.len() {
-                        return Err(StorageError::internal(format!(
-                            "leaf emit range {:?} exceeds content size {}",
-                            emit_range,
-                            buffer.len()
-                        )));
-                    }
-                    Ok((buffer, emit_range, permit))
+                    // See `fetch_unordered`: clipped after the whole leaf is checked, and a
+                    // view rather than a copy.
+                    Ok((buffer.slice(clip.start as usize..clip.end as usize), permit))
                 });
 
                 if fetch_queue_tx.send(handle).await.is_err() {
@@ -829,9 +836,8 @@ async fn fetch_ordered_and_stream_from(
             .map_err(|e| StorageError::internal_with_context(e, "load task join"))
             .and_then(|r| r)
         {
-            Ok((buffer, emit_range, permit)) => {
+            Ok((buffer, permit)) => {
                 if result.is_ok() {
-                    let buffer = buffer.slice(emit_range);
                     result = sender
                         .send(Ok(buffer))
                         .await
@@ -870,10 +876,10 @@ async fn write_to_sink(sink: DefragmentSink, data_rx: DataReceiver) -> Result<()
 ///
 /// Positional writes carry their own offset, so concurrent writes to disjoint ranges
 /// need no lock — the previous seek-plus-write sink had to serialize behind a mutex
-/// because the pair is not atomic. Each write is one blocking task, so the syscall
-/// never stalls a runtime worker and independent writes overlap. Completed writes are
-/// reaped each iteration; the rest are joined after the channel closes, including
-/// after an early error break.
+/// because the pair is not atomic. Each write is one task awaiting a driver operation,
+/// so no runtime worker blocks on the syscall and independent writes overlap. Completed
+/// writes are reaped each iteration; the rest are joined after the channel closes,
+/// including after an early error break.
 ///
 /// Each message carries the fragment memory permit for its payload, released only when
 /// the write task ends. That keeps the payload accounted for its whole life rather than
@@ -895,7 +901,7 @@ async fn write_to_sink(sink: DefragmentSink, data_rx: DataReceiver) -> Result<()
 /// passes through here, which makes this the one place that can see the total. The walker's
 /// tiling checks mean it should never fire, which is the point of having it.
 async fn write_to_sink_file(
-    file: Arc<std::fs::File>,
+    file: IoFile,
     size: usize,
     mut data_rx: DataReceiver,
 ) -> Result<(), StorageError> {
@@ -921,9 +927,11 @@ async fn write_to_sink_file(
         written += payload.len();
 
         let file = file.clone();
-        lore_base::lore_spawn_blocking!(tasks, move || {
+        lore_base::lore_spawn!(tasks, async move {
             let _permit = permit;
-            write_all_at(&file, payload.as_ref(), offset as u64)
+            file.write_all_at(payload, offset as u64)
+                .await
+                .map(|_returned| ())
                 .map_err(|e| StorageError::internal_with_context(e, "write to file"))
         });
 
@@ -956,61 +964,14 @@ async fn write_to_sink_file(
     result
 }
 
-/// Read the whole file into `buffer`, returning the byte count. Test-only readback for
-/// the write sink.
-#[cfg(test)]
-fn read_all_at_for_test(file: &std::fs::File, buffer: &mut [u8]) -> usize {
-    let mut read = 0;
-    while read < buffer.len() {
-        #[cfg(target_family = "unix")]
-        let count = file
-            .read_at(&mut buffer[read..], read as u64)
-            .expect("read");
-        #[cfg(target_family = "windows")]
-        let count = file
-            .seek_read(&mut buffer[read..], read as u64)
-            .expect("read");
-        if count == 0 {
-            break;
-        }
-        read += count;
-    }
-    read
-}
-
-/// Write every byte at `offset`, retrying interrupted calls. On Windows `seek_write`
-/// also moves the file cursor, which is harmless because no caller of this sink reads
-/// the cursor; note the handle is not opened overlapped, so concurrent writes to it are
-/// serialized by the kernel there even though each carries its own offset.
-fn write_all_at(file: &std::fs::File, buffer: &[u8], offset: u64) -> std::io::Result<()> {
-    #[cfg(target_family = "unix")]
-    {
-        file.write_all_at(buffer, offset)
-    }
-    #[cfg(target_family = "windows")]
-    {
-        let mut written = 0;
-        while written < buffer.len() {
-            match file.seek_write(&buffer[written..], offset + written as u64) {
-                Ok(0) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        format!(
-                            "wrote {written} of {} bytes at offset {offset}",
-                            buffer.len()
-                        ),
-                    ));
-                }
-                Ok(count) => written += count,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
-}
-
 /// Unified streaming defragmentation pipeline.
+///
+/// `range` is the content the caller asked for, counted from the start of the content and
+/// already clamped to it — see [`crate::read::resolve_content_range`]. Leaves outside it are
+/// never fetched and the subtrees holding none of it are never walked, so the work is
+/// proportional to the range rather than to the content. Everything delivered is positioned
+/// relative to `range.start`, which for a whole-content read leaves offsets exactly where
+/// they were.
 #[allow(clippy::too_many_arguments)]
 pub async fn defragment_pipeline(
     store: Arc<dyn ImmutableStore>,
@@ -1018,15 +979,12 @@ pub async fn defragment_pipeline(
     address: Address,
     fragment: Fragment,
     source_buffer: Bytes,
+    range: Range<u64>,
     sink: DefragmentSink,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
 ) -> Result<(), StorageError> {
     let (leaf_tx, leaf_rx) = channel::<LeafReference>(PIPELINE_LEAF_CHANNEL_SIZE);
-    let stream_range = match &sink {
-        DefragmentSink::Stream { range, .. } => range.clone(),
-        DefragmentSink::File { .. } => 0..fragment.size_content,
-    };
 
     // Stage 1: Tree walker
     let store_walker = store.clone();
@@ -1037,13 +995,13 @@ pub async fn defragment_pipeline(
         address,
         fragment,
         source_buffer,
+        range,
         leaf_tx,
         options,
         session_walker,
-        stream_range,
     ));
 
-    if let DefragmentSink::Stream { sender, .. } = sink {
+    if let DefragmentSink::Stream { sender } = sink {
         // Ordered fetch -> stream directly to caller's channel
         let store_fetch = store.clone();
         let session_fetch = remote_session.clone();
@@ -1286,33 +1244,25 @@ fn read_defragment_subread(
     })
 }
 
-/// Open (creating if needed) and size a file for positional writes. The handle is
-/// shared: positional writes carry their own offset, so concurrent writers to disjoint
-/// ranges need no exclusion.
 /// Opens a file for positional writing and sizes it to the whole content up front.
 ///
-/// On Windows the handle is deliberately **not** overlapped. `seek_write` issues a synchronous
-/// `WriteFile` with the offset in an `OVERLAPPED` and no event, which is only defined for a
-/// synchronous handle; against an overlapped one it can report `ERROR_IO_PENDING` while the
-/// kernel still holds the buffer. So `FILE_FLAG_OVERLAPPED` is not a way to parallelise these
-/// writes, even though the handle being synchronous is what serializes them.
+/// The handle is shared: positional writes carry their own offset, so concurrent writers to
+/// disjoint ranges need no exclusion. Clones of the returned handle share it.
+///
+/// The size is set rather than the file truncated, so a range no payload covers reads as zeros
+/// instead of shortening the file — which is what the sink's byte-count check exists to catch.
 pub async fn open_file_write(
     path: impl AsRef<Path>,
     size: usize,
-) -> Result<Arc<std::fs::File>, std::io::Error> {
-    let path = path.as_ref().to_path_buf();
-    lore_base::lore_spawn_blocking!(move || -> std::io::Result<Arc<std::fs::File>> {
-        let file = std::fs::File::options()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&path)?;
-        file.set_len(size as u64)?;
-        Ok(Arc::new(file))
-    })
-    .await
-    .map_err(std::io::Error::other)?
+) -> Result<IoFile, std::io::Error> {
+    let file = IoDriver::global()
+        .open(
+            path,
+            &OpenOptions::new().read(true).write(true).create(true),
+        )
+        .await?;
+    file.set_len(size as u64).await?;
+    Ok(file)
 }
 
 #[cfg(test)]
@@ -1335,25 +1285,39 @@ mod tests {
                 .collect()
         }
 
-        /// Drive `walk_leaf_level` to completion and collect emitted leaves.
+        /// Drive `walk_leaf_level` over the whole level and collect emitted leaves.
         async fn run(
             fragment_list: &[FragmentReference],
             total_content_size: usize,
             base_offset: u64,
         ) -> Result<Vec<LeafReference>, StorageError> {
+            // Saturating: the overflow cases below hand this a base that cannot legally be
+            // added to, and it is the walker's job to say so rather than the harness's.
+            run_windowed(
+                fragment_list,
+                total_content_size,
+                base_offset,
+                base_offset..base_offset.saturating_add(total_content_size as u64),
+            )
+            .await
+        }
+
+        /// Drive `walk_leaf_level` over `window` and collect emitted leaves.
+        async fn run_windowed(
+            fragment_list: &[FragmentReference],
+            total_content_size: usize,
+            base_offset: u64,
+            window: Range<u64>,
+        ) -> Result<Vec<LeafReference>, StorageError> {
             let (tx, mut rx) = channel::<LeafReference>(32);
             let context = Context::default();
-            let stream_end = base_offset
-                .checked_add(total_content_size as u64)
-                .unwrap_or(u64::MAX);
-            let stream_range = base_offset..stream_end;
             let walk_result = walk_leaf_level(
                 fragment_list,
                 total_content_size,
                 base_offset,
+                &window,
                 context,
                 &tx,
-                &stream_range,
             )
             .await;
             drop(tx);
@@ -1442,6 +1406,85 @@ mod tests {
             assert_eq!(leaves.len(), 1);
             assert_eq!(leaves[0].expected_size, 500);
         }
+
+        /// A window inside one leaf yields that leaf alone, clipped to the window and
+        /// positioned at the start of the output. The leaf's own size is unchanged: the
+        /// payload is verified whole, and only what is delivered is narrowed.
+        #[tokio::test]
+        async fn a_window_inside_one_leaf_yields_only_that_leaf() {
+            let list = refs(&[0, 500, 1500]);
+            let leaves = run_windowed(&list, 2000, 0, 600..700)
+                .await
+                .expect("windowed");
+            assert_eq!(leaves.len(), 1);
+            assert_eq!(leaves[0].expected_size, 1000);
+            assert_eq!(leaves[0].clip, 100..200);
+            assert_eq!(leaves[0].target_offset, 0);
+        }
+
+        /// A window spanning three leaves clips only the ends. Targets tile the output from
+        /// zero, which is what makes the file sink's coverage check add up for a range.
+        #[tokio::test]
+        async fn a_window_spanning_leaves_clips_only_the_ends() {
+            let list = refs(&[0, 500, 1500]);
+            let leaves = run_windowed(&list, 2000, 0, 400..1600)
+                .await
+                .expect("windowed");
+            assert_eq!(leaves.len(), 3);
+            assert_eq!(
+                (leaves[0].clip.clone(), leaves[0].target_offset),
+                (400..500, 0)
+            );
+            assert_eq!(
+                (leaves[1].clip.clone(), leaves[1].target_offset),
+                (0..1000, 100)
+            );
+            assert_eq!(
+                (leaves[2].clip.clone(), leaves[2].target_offset),
+                (0..100, 1100)
+            );
+
+            let delivered: u64 = leaves
+                .iter()
+                .map(|leaf| leaf.clip.end - leaf.clip.start)
+                .sum();
+            assert_eq!(delivered, 1200, "the clips must cover the window exactly");
+        }
+
+        /// A window touching no entry yields nothing while still checking the list: a
+        /// malformed list is malformed whichever part of the content a caller asks for.
+        #[tokio::test]
+        async fn a_window_past_the_level_yields_nothing() {
+            let list = refs(&[0, 500, 1500]);
+            let leaves = run_windowed(&list, 2000, 0, 2000..2500)
+                .await
+                .expect("past the end is empty, not an error");
+            assert!(leaves.is_empty());
+
+            let bad = refs(&[0, 1000, 500]);
+            run_windowed(&bad, 2000, 0, 2000..2500)
+                .await
+                .expect_err("a list outside the window is still validated");
+        }
+
+        /// Interior levels carry absolute offsets, so a window has to be compared in the
+        /// same coordinates rather than rebased per level.
+        #[tokio::test]
+        async fn a_window_on_an_interior_level_uses_absolute_offsets() {
+            let list = refs(&[10_000, 10_500, 11_000]);
+            let leaves = run_windowed(&list, 2000, 10_000, 10_400..10_600)
+                .await
+                .expect("interior windowed");
+            assert_eq!(leaves.len(), 2);
+            assert_eq!(
+                (leaves[0].clip.clone(), leaves[0].target_offset),
+                (400..500, 0)
+            );
+            assert_eq!(
+                (leaves[1].clip.clone(), leaves[1].target_offset),
+                (0..100, 100)
+            );
+        }
     }
 
     mod write_to_sink_file {
@@ -1458,18 +1501,11 @@ mod tests {
 
         const SIZE: usize = 100;
 
-        /// A sized target file plus a channel wired to the sink.
-        fn target(dir: &TempDir, name: &str) -> Arc<std::fs::File> {
-            let path = dir.path().join(name);
-            let file = std::fs::File::options()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(&path)
-                .expect("create target file");
-            file.set_len(SIZE as u64).expect("size target file");
-            Arc::new(file)
+        /// A sized target file, opened the way the materialization path opens one.
+        async fn target(dir: &TempDir, name: &str) -> IoFile {
+            super::super::open_file_write(dir.path().join(name), SIZE)
+                .await
+                .expect("create target file")
         }
 
         /// Send one message carrying a permit, as the fetch pool does.
@@ -1484,7 +1520,7 @@ mod tests {
         #[tokio::test]
         async fn accepts_in_bounds_write() {
             let dir = TempDir::new("lore-storage-sink-test-");
-            let file = target(&dir, "in-bounds");
+            let file = target(&dir, "in-bounds").await;
             let (tx, rx) = channel::<DataMessage>(4);
             send_one(&tx, 0, Bytes::from(vec![0xCD; 10])).await;
             send_one(&tx, 10, Bytes::from(vec![0xAB; 20])).await;
@@ -1495,10 +1531,8 @@ mod tests {
                 .await
                 .expect("in-bounds write");
 
-            let mut buf = vec![0u8; SIZE];
-            let read = super::super::read_all_at_for_test(&file, &mut buf);
-            assert_eq!(read, SIZE);
-            assert_eq!(&buf[10..30], &[0xAB; 20]);
+            let contents = file.read_exact_at(SIZE, 0).await.expect("read back");
+            assert_eq!(&contents[10..30], &[0xAB; 20]);
         }
 
         /// Payloads that stay in bounds but do not add up to the file: the target is
@@ -1507,7 +1541,7 @@ mod tests {
         #[tokio::test]
         async fn rejects_payloads_that_do_not_cover_the_file() {
             let dir = TempDir::new("lore-storage-sink-test-");
-            let file = target(&dir, "hole");
+            let file = target(&dir, "hole").await;
             let (tx, rx) = channel::<DataMessage>(4);
             send_one(&tx, 0, Bytes::from(vec![0xAB; 20])).await;
             send_one(&tx, 40, Bytes::from(vec![0xAB; SIZE - 40])).await;
@@ -1525,7 +1559,7 @@ mod tests {
         #[tokio::test]
         async fn rejects_offset_plus_length_past_end() {
             let dir = TempDir::new("lore-storage-sink-test-");
-            let file = target(&dir, "past-end");
+            let file = target(&dir, "past-end").await;
             let (tx, rx) = channel::<DataMessage>(4);
             send_one(&tx, 95, Bytes::from(vec![0u8; 10])).await; // 95 + 10 > 100
             drop(tx);
@@ -1542,7 +1576,7 @@ mod tests {
         #[tokio::test]
         async fn rejects_offset_at_exact_end_with_nonzero_length() {
             let dir = TempDir::new("lore-storage-sink-test-");
-            let file = target(&dir, "exact-end");
+            let file = target(&dir, "exact-end").await;
             let (tx, rx) = channel::<DataMessage>(4);
             send_one(&tx, SIZE, Bytes::from(vec![0u8; 1])).await;
             drop(tx);
@@ -1555,7 +1589,7 @@ mod tests {
         #[tokio::test]
         async fn rejects_arithmetic_overflow() {
             let dir = TempDir::new("lore-storage-sink-test-");
-            let file = target(&dir, "overflow");
+            let file = target(&dir, "overflow").await;
             let (tx, rx) = channel::<DataMessage>(4);
             send_one(&tx, usize::MAX - 5, Bytes::from(vec![0u8; 10])).await;
             drop(tx);
@@ -1701,6 +1735,7 @@ mod tests {
                 root_address,
                 &out_path,
                 ".tmp",
+                None,
                 ReadOptions::default().no_verify(),
                 None,
             )
@@ -1742,6 +1777,7 @@ mod tests {
                 root_address,
                 &out_path,
                 ".tmp",
+                None,
                 ReadOptions::default().no_verify(),
                 None,
             )
@@ -1827,6 +1863,7 @@ mod tests {
                 root_address,
                 &out_path,
                 ".tmp",
+                None,
                 ReadOptions::default().no_verify(),
                 None,
             )
@@ -1852,26 +1889,20 @@ mod tests {
             // Bottom leaf (depth = 0 of the actual data)
             let (leaf_addr, _) = put_leaf(&store, partition, context, vec![0xCC; 64]).await;
 
-            // Build a chain of intermediate lists wrapping the leaf.
-            // Each intermediate holds two references to the same hash so
-            // the walker sees a valid list structure at every level.
+            // Build a chain of intermediate lists wrapping the leaf. Each intermediate holds a
+            // single reference covering its parent's whole window, which is the only shape a
+            // deep chain can take: sublist offsets are absolute, so one child hash cannot sit
+            // at two offsets, and a list whose entries disagree with the sizes their parent
+            // allots them is rejected on the way down before the depth is ever reached.
             //
-            // walk_intermediate_level peeks two levels ahead to distinguish
-            // leaf from intermediate children, so N wrapping levels reach
-            // max walk_fragment_level depth N-2. We need depth > 8 to fire
-            // MAX_FRAGMENT_TREE_DEPTH, so at least 11 wraps.
+            // Every wrap adds one level of walk_fragment_level recursion, and
+            // MAX_FRAGMENT_TREE_DEPTH is 8, so a dozen wraps is comfortably past it.
             let mut current_hash = leaf_addr.hash;
             for _ in 0..12 {
-                let refs = [
-                    FragmentReference {
-                        hash: current_hash,
-                        offset_content: 0,
-                    },
-                    FragmentReference {
-                        hash: current_hash,
-                        offset_content: 32,
-                    },
-                ];
+                let refs = [FragmentReference {
+                    hash: current_hash,
+                    offset_content: 0,
+                }];
                 let payload = Bytes::copy_from_slice(refs.as_bytes());
                 let h = hash::hash_slice(payload.as_ref());
                 let addr = Address { hash: h, context };
@@ -1899,6 +1930,7 @@ mod tests {
                 root_address,
                 &out_path,
                 ".tmp",
+                None,
                 ReadOptions::default().no_verify(),
                 None,
             )
@@ -1942,6 +1974,7 @@ mod tests {
                 root,
                 &out_path,
                 ".tmp",
+                None,
                 ReadOptions::default().no_verify(),
                 None,
             )
@@ -1984,6 +2017,7 @@ mod tests {
                 root,
                 &out_path,
                 ".tmp",
+                None,
                 ReadOptions::default().no_verify(),
                 None,
             )
@@ -1991,7 +2025,8 @@ mod tests {
             .expect_err("a gap between siblings should be rejected");
 
             assert!(
-                err.to_string().contains("previous sibling ends at 100"),
+                err.to_string()
+                    .contains("expands to 100 bytes but its parent's list gives it 200"),
                 "unexpected error: {err}"
             );
         }
@@ -2026,6 +2061,7 @@ mod tests {
                 root,
                 &out_path,
                 ".tmp",
+                None,
                 ReadOptions::default().no_verify(),
                 None,
             )
@@ -2033,7 +2069,9 @@ mod tests {
             .expect_err("a short tail should be rejected");
 
             assert!(
-                err.to_string().contains("cover up to 200"),
+                err.to_string().contains(
+                    "at content offset 100 expands to 100 bytes but its parent's list gives it 200"
+                ),
                 "unexpected error: {err}"
             );
         }
@@ -2090,6 +2128,7 @@ mod tests {
                 root,
                 &out_path,
                 ".tmp",
+                None,
                 ReadOptions::default().no_verify(),
                 None,
             )
@@ -2115,14 +2154,18 @@ mod tests {
 
             // Distinct payloads: two lists differing only in `size_content` hash the same
             // and the store rejects the second as a collision.
+            //
+            // The root's own entries are strictly increasing, so the only fault in this tree is
+            // the one under test. A root placing both sublists at the same offset would be
+            // rejected for that instead, before either is ever loaded.
             let sub_zero = put_list(&store, partition, context, &refs_at(&[(leaf_b, 0)]), 0).await;
-            let sub_a = put_list(&store, partition, context, &refs_at(&[(leaf_a, 0)]), 100).await;
+            let sub_a = put_list(&store, partition, context, &refs_at(&[(leaf_a, 100)]), 100).await;
             let root = put_list(
                 &store,
                 partition,
                 context,
-                &refs_at(&[(sub_zero, 0), (sub_a, 0)]),
-                100,
+                &refs_at(&[(sub_zero, 0), (sub_a, 100)]),
+                200,
             )
             .await;
 
@@ -2133,6 +2176,7 @@ mod tests {
                 root,
                 &out_path,
                 ".tmp",
+                None,
                 ReadOptions::default().no_verify(),
                 None,
             )
@@ -2175,6 +2219,7 @@ mod tests {
                 root,
                 &out_path,
                 ".tmp",
+                None,
                 ReadOptions::default().no_verify(),
                 None,
             )
@@ -2220,6 +2265,7 @@ mod tests {
                 root,
                 &out_path,
                 ".tmp",
+                None,
                 ReadOptions::default().no_verify(),
                 None,
             )
@@ -2266,6 +2312,7 @@ mod tests {
                 root,
                 &out_path,
                 ".tmp",
+                None,
                 ReadOptions::default().no_verify(),
                 None,
             )
@@ -2315,6 +2362,7 @@ mod tests {
                 root,
                 &out_path,
                 ".tmp",
+                None,
                 ReadOptions::default().no_verify(),
                 None,
             )
@@ -2358,6 +2406,7 @@ mod tests {
                 root,
                 &out_path,
                 ".tmp",
+                None,
                 ReadOptions::default().no_verify(),
                 None,
             )
@@ -2400,10 +2449,10 @@ mod tests {
                 leaf_tx
                     .send(LeafReference {
                         hash: address.hash,
-                        offset_content: (index * PAYLOAD) as u64,
+                        target_offset: (index * PAYLOAD) as u64,
                         expected_size: PAYLOAD as u64,
+                        clip: 0..PAYLOAD as u64,
                         context,
-                        emit_range: 0..PAYLOAD,
                     })
                     .await
                     .expect("queue leaf");

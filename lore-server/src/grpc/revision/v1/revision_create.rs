@@ -296,7 +296,7 @@ async fn address_sizes(
                     return Ok((address, 0));
                 }
                 let query = store
-                    .query(repository, address, StoreMatch::MatchFull)
+                    .get_metadata(repository, address)
                     .await
                     .map_err(|error| {
                         Status::internal(format!("failed to query PutFile address: {error}"))
@@ -997,7 +997,7 @@ mod tests {
                 repository_id,
             ));
             create_root_branch(&repository, branch_id).await;
-            let (old_address, _) = lore_storage::write_content(
+            let old_address = lore_storage::write_content(
                 immutable_store.clone(),
                 repository_id,
                 Context::from(uuid::Uuid::now_v7()),
@@ -1009,7 +1009,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let (new_address, new_fragment) = lore_storage::write_content(
+            let new_address = lore_storage::write_content(
                 immutable_store.clone(),
                 repository_id,
                 old_address.context,
@@ -1021,6 +1021,12 @@ mod tests {
             )
             .await
             .unwrap();
+            let new_fragment = immutable_store
+                .clone()
+                .get_metadata(repository_id, new_address)
+                .await
+                .unwrap()
+                .fragment;
 
             let first = handler(
                 request(

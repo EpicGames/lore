@@ -9,9 +9,6 @@ use lore_base::types::BranchPoint;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
 
 use crate::branch;
 use crate::change;
@@ -194,22 +191,9 @@ struct LayerConfig {
 }
 
 async fn load_config(config_path: impl AsRef<Path>) -> Result<LayerConfig, LayerError> {
-    if let Ok(mut config_file) = OpenOptions::new()
-        .create(false)
-        .read(true)
-        .open(config_path)
+    Ok(crate::global::load_config(config_path)
         .await
-    {
-        let mut config = String::default();
-        config_file
-            .read_to_string(&mut config)
-            .await
-            .internal("Failed to load configuration")?;
-        let config = toml::from_str(config.as_str()).internal("Failed to load configuration")?;
-        Ok(config)
-    } else {
-        Ok(LayerConfig::default())
-    }
+        .internal("Failed to load configuration")?)
 }
 
 async fn save_config(
@@ -217,22 +201,10 @@ async fn save_config(
     config_path: impl AsRef<Path>,
     config: &LayerConfig,
 ) -> Result<(), LayerError> {
-    let mut config_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(config_path)
-        .await
-        .internal("Failed to save configuration")?;
-
     let config_string = toml::to_string_pretty(&config).internal("Failed to save configuration")?;
 
-    config_file
-        .write_all(config_string.as_bytes())
-        .await
-        .internal("Failed to save configuration")?;
-    config_file
-        .flush()
+    lore_io::IoDriver::global()
+        .write_file_bytes(config_path, bytes::Bytes::from(config_string), false)
         .await
         .internal("Failed to save configuration")?;
     Ok(())
@@ -453,7 +425,8 @@ pub async fn add(
     .send();
 
     // Ensure the target path exist to clone into
-    tokio::fs::create_dir_all(&absolute_path)
+    lore_io::IoDriver::global()
+        .create_dir_all(&absolute_path)
         .await
         .internal("Failed to create the target directory for layer")?;
 
@@ -598,7 +571,7 @@ pub async fn remove(
         tracked_directories.sort_by_key(|p| std::cmp::Reverse(p.as_str().split('/').count()));
         for dir in &tracked_directories {
             let absolute = dir.to_absolute_path(repository.require_path()?);
-            if let Err(err) = tokio::fs::remove_dir(&absolute).await
+            if let Err(err) = lore_io::IoDriver::global().remove_dir(&absolute).await
                 && err.kind() != tokio::io::ErrorKind::NotFound
             {
                 lore_debug!(
@@ -609,7 +582,7 @@ pub async fn remove(
         }
 
         if !target_path.is_empty()
-            && let Err(err) = tokio::fs::remove_dir(&absolute_root).await
+            && let Err(err) = lore_io::IoDriver::global().remove_dir(&absolute_root).await
             && err.kind() != tokio::io::ErrorKind::NotFound
         {
             lore_debug!(
@@ -682,7 +655,7 @@ fn walk_layer_subtree<'a>(
                 .await?;
             } else {
                 let absolute = child_path.to_absolute_path(layer_repository.require_path()?);
-                match tokio::fs::metadata(&absolute).await {
+                match lore_io::IoDriver::global().metadata(&absolute).await {
                     Ok(metadata) if metadata.is_file() => {
                         let (file_mtime, file_size) =
                             crate::util::fs::file_mtime_and_size(&metadata);

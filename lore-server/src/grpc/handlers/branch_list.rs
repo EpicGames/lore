@@ -227,6 +227,7 @@ mod tests {
                 branch::store_latest(
                     repository.clone(),
                     main,
+                    Hash::default(),
                     hash_main,
                     BranchLatestStatus::Convergent,
                 )
@@ -237,6 +238,7 @@ mod tests {
                 branch::store_latest(
                     repository.clone(),
                     branch1,
+                    Hash::default(),
                     hash_branch1,
                     BranchLatestStatus::Convergent,
                 )

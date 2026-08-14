@@ -31,7 +31,6 @@ use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lore::BranchId;
 use crate::lore_debug;
-use crate::lore_spawn_blocking;
 use crate::metadata::Metadata;
 use crate::repository::RepositoryContext;
 
@@ -92,13 +91,10 @@ impl InstanceId {
 
     /// Write an instance ID to the `.lore/instance` file.
     pub async fn write_to_file(&self, path: PathBuf) -> io::Result<()> {
-        let data = *self;
-        lore_spawn_blocking!(move || {
-            std::io::Write::write_all(&mut std::fs::File::create(path)?, data.as_bytes())
-        })
-        .await
-        .map_err(io::Error::other)
-        .flatten()
+        lore_io::IoDriver::global()
+            .write_file_bytes(path, bytes::Bytes::copy_from_slice(self.as_bytes()), false)
+            .await?;
+        Ok(())
     }
 }
 
@@ -547,7 +543,7 @@ impl EventError for InstanceError {
 /// An empty path is not considered stale — it indicates corrupt or missing metadata
 /// rather than a removed instance directory.
 async fn is_instance_stale(path: &str) -> bool {
-    !path.is_empty() && !tokio::fs::try_exists(path).await.unwrap_or(false)
+    !path.is_empty() && lore_io::IoDriver::global().metadata(path).await.is_err()
 }
 
 use crate::event::LoreEvent;
