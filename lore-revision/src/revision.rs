@@ -82,7 +82,7 @@ pub struct RevisionMetadata {
 impl RevisionMetadata {
     pub fn from_metadata(metadata: Metadata) -> Self {
         let mut revision_metadata = RevisionMetadata::default();
-        let _ = metadata.walk(|key, value, _value_type| {
+        metadata.walk(|key, value, _value_type| {
             let key = std::str::from_utf8(key).unwrap_or("<binary>");
             match key {
                 metadata::MESSAGE => {

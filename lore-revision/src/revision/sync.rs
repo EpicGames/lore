@@ -497,6 +497,10 @@ pub async fn sync(
         return Ok(());
     }
 
+    if !force && !options.reset {
+        sync_reject_staged_layers(repository.clone(), &layer_revisions).await?;
+    }
+
     if !state_current.revision().is_zero() && !force {
         // Check if we have diverged and need to resort to a merge flow
         if location == LoreBranchLocation::Remote
@@ -630,9 +634,13 @@ pub async fn sync(
         // If we synced to a local revision keep the branch LATEST to not lose
         // any local history when going backwards
         if location == LoreBranchLocation::Remote {
+            let local_latest = branch::load_latest(repository.clone(), branch_id)
+                .await
+                .unwrap_or_default();
             branch::store_latest(
                 repository.clone(),
                 branch_id,
+                local_latest,
                 revision,
                 BranchLatestStatus::Convergent,
             )
@@ -724,6 +732,44 @@ async fn sync_load_layer_list(
     Ok((layer_revisions, nearest_revision))
 }
 
+/// Reject a sync that would discard actually-staged content held by a layer.
+///
+/// Layer staged pins live in the layer config, not the instance anchor that the
+/// check in [`sync`] reads, so a layer-only stage is invisible to it.
+async fn sync_reject_staged_layers(
+    repository: Arc<RepositoryContext>,
+    layer_revisions: &[(Layer, Hash)],
+) -> Result<(), SyncError> {
+    for (layer, layer_revision) in layer_revisions {
+        if layer.staged.is_zero()
+            || layer.staged == layer.current
+            || *layer_revision == layer.current
+        {
+            continue;
+        }
+
+        let layer_repository = Arc::new(repository.to_layer_context(layer.repository).await);
+        let state_staged = state::State::deserialize(layer_repository.clone(), layer.staged)
+            .await
+            .forward::<SyncError>("Failed to deserialize layer staged state")?;
+        if state_staged
+            .node_has_staged_children(layer_repository, crate::node::ROOT_NODE)
+            .await
+            .forward::<SyncError>("Failed to check staged nodes")?
+        {
+            return Err(InvalidArguments {
+                reason: format!(
+                    "Unable to sync when layer {} has a staged state",
+                    layer.target_path
+                ),
+            }
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
 async fn sync_layers(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -766,7 +812,7 @@ async fn sync_layers(
 
         // TODO(mjansson): Sync disjoint layers in parallel
         Box::pin(layer::sync(
-            layer_repository,
+            layer_repository.clone(),
             layer_current,
             layer_target,
             target_path.clone(),
@@ -776,13 +822,29 @@ async fn sync_layers(
         .await
         .forward::<SyncError>("Failed to synchornize a layer")?;
 
+        // Rebasing a layer that did not move would drop its staged content: a
+        // purely staged state has no dirty children, so the rebase finds nothing
+        // to carry forward and clears the pin.
+        let staged = if execution_context().globals().dry_run() || layer_revision == layer.current {
+            None
+        } else if layer.staged.is_zero() || layer.staged == layer.current {
+            Some(Hash::default())
+        } else {
+            Some(
+                state::rebase_staged_state(layer_repository, layer.staged, layer_revision)
+                    .await
+                    .forward::<SyncError>("Failed to rebase layer staged state")?
+                    .unwrap_or_default(),
+            )
+        };
+
         layer::store_layer_current(
             repository.clone(),
             token,
             target_path.as_str(),
             layer.repository,
             layer_revision,
-            None,
+            staged,
         )
         .await
         .forward::<SyncError>("Failed to synchornize a layer")?;
@@ -990,7 +1052,8 @@ pub async fn exist_merge_mine_theirs_base(absolute_path: impl AsRef<Path>) -> bo
 
         let mut absolute_path = absolute_path.as_ref().to_path_buf();
         absolute_path.set_file_name(mine_name);
-        if tokio::fs::metadata(&absolute_path)
+        if lore_io::IoDriver::global()
+            .metadata(&absolute_path)
             .await
             .is_ok_and(|m| m.is_file())
         {
@@ -1001,7 +1064,8 @@ pub async fn exist_merge_mine_theirs_base(absolute_path: impl AsRef<Path>) -> bo
         theirs_name.push(THEIRS_SUFFIX);
 
         absolute_path.set_file_name(theirs_name);
-        if tokio::fs::metadata(&absolute_path)
+        if lore_io::IoDriver::global()
+            .metadata(&absolute_path)
             .await
             .is_ok_and(|m| m.is_file())
         {
@@ -1012,7 +1076,8 @@ pub async fn exist_merge_mine_theirs_base(absolute_path: impl AsRef<Path>) -> bo
         base_name.push(BASE_SUFFIX);
 
         absolute_path.set_file_name(base_name);
-        tokio::fs::metadata(absolute_path)
+        lore_io::IoDriver::global()
+            .metadata(absolute_path)
             .await
             .is_ok_and(|m| m.is_file())
     } else {

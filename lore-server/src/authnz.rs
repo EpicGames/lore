@@ -3,3 +3,4 @@
 pub mod auth;
 pub mod common;
 pub mod rebac;
+pub mod repository_authorizer;

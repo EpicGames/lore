@@ -534,21 +534,25 @@ static NET_THREADS_DEFAULT: OnceLock<usize> = OnceLock::new();
 /// of QUIC streams and gRPC channels.
 const DEFAULT_NET_THREADS: usize = 2;
 
-/// Sets the process-default net-runtime thread count — the server sets one
-/// per processor, since serving thousands of concurrent client connections
-/// is its normal case. Must run before the net runtime is first used;
-/// returns false if a default was already set.
+/// Requests a process-default net-runtime thread count — the server asks for one
+/// per processor, since serving thousands of concurrent client connections is its
+/// normal case. A thread limit still bounds the count granted. Must run before
+/// the net runtime is first used; returns false if a default was already set.
 pub fn set_net_threads_default(count: usize) -> bool {
     NET_THREADS_DEFAULT.set(count.max(1)).is_ok()
 }
 
-/// Net runtime worker threads: `LORE_NET_THREADS` if set, else the
-/// process-configured default (e.g. the server's one-per-processor), else the
-/// net share of the client thread budget (see [`thread_counts`]).
+/// An explicit net-thread request: `LORE_NET_THREADS` if set, else the
+/// process-configured default (e.g. the server's one-per-processor). `None`
+/// leaves the net pool at [`DEFAULT_NET_THREADS`].
+fn requested_net_threads() -> Option<usize> {
+    env_thread_override("LORE_NET_THREADS").or_else(|| NET_THREADS_DEFAULT.get().copied())
+}
+
+/// Net runtime worker threads: the net share of the thread budget, which an
+/// explicit request raises (see [`thread_counts`]).
 pub fn default_net_threads() -> usize {
-    env_thread_override("LORE_NET_THREADS")
-        .or_else(|| NET_THREADS_DEFAULT.get().copied())
-        .unwrap_or_else(|| budget_thread_counts().net)
+    budget_thread_counts().net
 }
 
 /// Handle to the dedicated network runtime, created lazily on first use.
@@ -576,7 +580,7 @@ fn build_net_runtime() -> tokio::runtime::Runtime {
     builder
         .enable_all()
         .worker_threads(default_net_threads())
-        .max_blocking_threads(1)
+        .max_blocking_threads(NET_BLOCKING_THREADS)
         .thread_keep_alive(Duration::from_secs(default_thread_keep_alive()))
         .thread_name_fn(|| {
             static ID: AtomicUsize = AtomicUsize::new(0);
@@ -624,6 +628,11 @@ static THREAD_LIMIT: OnceLock<usize> = OnceLock::new();
 /// for "no limit". Must be called before the runtime is first constructed.
 /// Overridden by `LORE_MAX_THREADS` when that is set above zero.
 ///
+/// A set limit binds every pool: environment and configuration knobs raise a
+/// pool's ideal, never the granted total. The one exception is
+/// [`MIN_THREADS_PER_POOL`], which a pool keeps even under a smaller limit, so
+/// the least this can achieve is `3 * MIN_THREADS_PER_POOL`.
+///
 /// Returns `true` if applied, `false` if a limit was already set.
 pub fn set_thread_limit(count: usize) -> bool {
     THREAD_LIMIT.set(count).is_ok()
@@ -642,38 +651,76 @@ fn thread_limit() -> Option<usize> {
 pub struct ThreadCounts {
     /// Tokio async worker threads.
     pub worker: usize,
-    /// Tokio blocking (`spawn_blocking`) threads.
+    /// Tokio blocking (`spawn_blocking`) threads, across both runtimes: the core
+    /// runtime's pool plus the net runtime's [`NET_BLOCKING_THREADS`].
     pub blocking: usize,
-    /// Net runtime worker threads (client budget; the server sizes its net
-    /// runtime explicitly via [`set_net_threads_default`] and is not budgeted).
+    /// Net runtime worker threads. [`set_net_threads_default`] and
+    /// `LORE_NET_THREADS` raise this pool's ideal — the server asks for one per
+    /// processor — but a thread limit still bounds what it is granted.
     pub net: usize,
+    /// The lore-io syscall pool, which every file operation dispatches through.
+    /// `LORE_IO_POOL_THREADS` raises its ideal.
+    pub io: usize,
 }
+
+/// Pools the budget divides between.
+const POOL_COUNT: usize = 4;
 
 impl ThreadCounts {
     /// Total threads across all pools.
     pub fn total(&self) -> usize {
-        self.worker + self.blocking + self.net
+        self.worker + self.blocking + self.net + self.io
+    }
+
+    /// The pools in apportionment order.
+    fn as_array(&self) -> [usize; POOL_COUNT] {
+        [self.worker, self.blocking, self.net, self.io]
+    }
+
+    fn from_array(pools: [usize; POOL_COUNT]) -> ThreadCounts {
+        ThreadCounts {
+            worker: pools[0],
+            blocking: pools[1],
+            net: pools[2],
+            io: pools[3],
+        }
     }
 }
 
 /// Minimum threads per pool, even under a tight limit — a starved pool can
 /// deadlock work another pool blocks on (e.g. blocking calls awaited by
 /// workers). Takes precedence over the limit, so the smallest achievable
-/// total is `3 * MIN`.
+/// total is `POOL_COUNT * MIN`.
 const MIN_THREADS_PER_POOL: usize = 2;
 
-/// Lore's unconstrained per-pool counts, used when no thread limit is set.
-fn default_thread_counts(cores: usize) -> ThreadCounts {
+/// The core runtime's blocking pool: file I/O runs on the lore-io driver, so
+/// this serves only genuinely blocking OS APIs with no async form (OS keyring
+/// access, AWS SDK initialization, service IPC pipe reads). Fixed and
+/// processor-count-independent by design — see the async file I/O enhancement
+/// proposal's thread budget.
+const CORE_BLOCKING_THREADS: usize = 2;
+
+/// The net runtime's blocking pool, pinned to one thread so that a stray
+/// `spawn_blocking` there cannot grow it and starve the protocol timers.
+/// Budgeted with the core runtime's pool rather than beside it, since both
+/// hold threads for the same reason.
+const NET_BLOCKING_THREADS: usize = 1;
+
+/// Lore's unconstrained per-pool counts, used when no thread limit is set. `io`
+/// is the syscall pool's own request, which `lore-io` derives from the core count
+/// and `LORE_IO_POOL_THREADS`.
+fn default_thread_counts(cores: usize, io: usize) -> ThreadCounts {
     ThreadCounts {
         worker: cores.max(MIN_THREADS_PER_POOL),
-        blocking: std::cmp::min(2 * (cores + 1), 128).max(MIN_THREADS_PER_POOL),
+        blocking: CORE_BLOCKING_THREADS + NET_BLOCKING_THREADS,
         net: DEFAULT_NET_THREADS.max(MIN_THREADS_PER_POOL),
+        io: io.max(MIN_THREADS_PER_POOL),
     }
 }
 
 /// Scales the per-pool defaults down to fit a total `limit`, preserving their
 /// relative shape via the largest-remainder method. Each pool keeps at least
-/// [`MIN_THREADS_PER_POOL`], so a `limit` below `3 * MIN_THREADS_PER_POOL`
+/// [`MIN_THREADS_PER_POOL`], so a `limit` below `POOL_COUNT * MIN_THREADS_PER_POOL`
 /// floors there. Defaults that already fit are returned unchanged.
 fn apportion_thread_counts(defaults: ThreadCounts, limit: usize) -> ThreadCounts {
     let total = defaults.total();
@@ -681,10 +728,10 @@ fn apportion_thread_counts(defaults: ThreadCounts, limit: usize) -> ThreadCounts
         return defaults;
     }
 
-    let ideal = [defaults.worker, defaults.blocking, defaults.net];
-    let mut alloc = [0usize; 3];
-    let mut remainder = [0usize; 3];
-    for i in 0..3 {
+    let ideal = defaults.as_array();
+    let mut alloc = [0usize; POOL_COUNT];
+    let mut remainder = [0usize; POOL_COUNT];
+    for i in 0..POOL_COUNT {
         let scaled = ideal[i] * limit;
         alloc[i] = std::cmp::max(scaled / total, MIN_THREADS_PER_POOL);
         remainder[i] = scaled % total;
@@ -692,7 +739,7 @@ fn apportion_thread_counts(defaults: ThreadCounts, limit: usize) -> ThreadCounts
 
     let mut sum: usize = alloc.iter().sum();
     while sum > limit {
-        let Some(i) = (0..3)
+        let Some(i) = (0..POOL_COUNT)
             .filter(|&i| alloc[i] > MIN_THREADS_PER_POOL)
             .max_by_key(|&i| alloc[i])
         else {
@@ -702,7 +749,7 @@ fn apportion_thread_counts(defaults: ThreadCounts, limit: usize) -> ThreadCounts
         sum -= 1;
     }
     while sum < limit {
-        let i = (0..3).max_by_key(|&i| remainder[i]).unwrap();
+        let i = (0..POOL_COUNT).max_by_key(|&i| remainder[i]).unwrap();
         if remainder[i] == 0 {
             break;
         }
@@ -711,11 +758,7 @@ fn apportion_thread_counts(defaults: ThreadCounts, limit: usize) -> ThreadCounts
         sum += 1;
     }
 
-    ThreadCounts {
-        worker: alloc[0],
-        blocking: alloc[1],
-        net: alloc[2],
-    }
+    ThreadCounts::from_array(alloc)
 }
 
 /// Reads a positive-integer per-pool thread override from `var`, returning
@@ -727,43 +770,74 @@ fn env_thread_override(var: &str) -> Option<usize> {
         .filter(|&val| val > 0)
 }
 
-/// Per-pool counts from the core count and optional limit, before env overrides.
-fn budget_thread_counts() -> ThreadCounts {
-    let defaults = default_thread_counts(processor_count());
+/// Applies the total limit to per-pool requests, returning them unchanged when
+/// none is set.
+///
+/// Every path that sizes a pool ends here, so that a limit bounds the process
+/// whatever asked for the threads. A request is an ideal, not a final count.
+fn apply_thread_limit(requested: ThreadCounts) -> ThreadCounts {
     match thread_limit() {
-        Some(limit) => apportion_thread_counts(defaults, limit),
-        None => defaults,
+        Some(limit) => apportion_thread_counts(requested, limit),
+        None => requested,
     }
 }
 
-/// Per-pool thread counts Lore sizes its runtime for: the budget-derived counts
-/// with per-pool env overrides applied. The `LORE_*_THREADS` overrides are
-/// absolute and bypass the limit, so they can push the total back above it.
+/// Per-pool sizes before any limit: the core-count defaults with an explicit net
+/// request substituted.
+fn requested_thread_counts() -> ThreadCounts {
+    let mut counts = default_thread_counts(processor_count(), lore_io::requested_max_threads());
+    if let Some(net) = requested_net_threads() {
+        counts.net = net;
+    }
+    counts
+}
+
+/// Per-pool counts from the core count, an explicit net request, and the limit.
+fn budget_thread_counts() -> ThreadCounts {
+    apply_thread_limit(requested_thread_counts())
+}
+
+/// Per-pool thread counts Lore sizes its runtime for.
+///
+/// `LORE_NET_THREADS` and [`set_net_threads_default`] raise the net pool's ideal,
+/// and `LORE_IO_POOL_THREADS` the syscall pool's; worker follows the core count
+/// and blocking is a small fixed count. Whatever the ideals, a thread limit is a
+/// ceiling on their total rather than a starting point to negotiate from: the
+/// pools are scaled to fit it, down to [`MIN_THREADS_PER_POOL`] each.
 pub fn thread_counts() -> ThreadCounts {
-    ThreadCounts {
-        worker: default_worker_threads(),
-        blocking: default_blocking_threads(),
-        net: default_net_threads(),
-    }
+    budget_thread_counts()
 }
 
-/// Blocking threads for the tokio runtime: `LORE_BLOCKING_THREADS` if set,
-/// else the blocking share of the budget (see [`thread_counts`]).
+/// Blocking threads across both runtimes: the blocking share of the budget
+/// (see [`thread_counts`]).
 pub fn default_blocking_threads() -> usize {
-    env_thread_override("LORE_BLOCKING_THREADS").unwrap_or_else(|| budget_thread_counts().blocking)
+    budget_thread_counts().blocking
 }
 
 fn default_thread_keep_alive() -> u64 {
     DEFAULT_THREAD_KEEP_ALIVE_SECONDS
 }
 
+/// The blocking pool a configuration that sets no size asks for.
+///
+/// Deliberately the pre-limit ideal rather than [`default_blocking_threads`]:
+/// the configured size and this default reach [`core_thread_counts`] as the same
+/// kind of value, so the limit is applied to them exactly once.
+fn requested_blocking_threads() -> usize {
+    CORE_BLOCKING_THREADS
+}
+
 /// Configuration for the tokio runtime.
 ///
 /// Controls the number of blocking threads, thread keep-alive duration,
 /// and optionally the number of worker threads.
+///
+/// The thread counts here are requests. A thread limit scales them to fit,
+/// so configuring a pool cannot raise the process above a ceiling an embedder
+/// asked for.
 #[derive(Clone, Debug, Deserialize)]
 pub struct TokioSettings {
-    #[serde(default = "default_blocking_threads")]
+    #[serde(default = "requested_blocking_threads")]
     pub max_blocking_threads: usize,
     #[serde(default = "default_thread_keep_alive")]
     pub thread_keep_alive_seconds: u64,
@@ -777,7 +851,7 @@ pub struct TokioSettings {
 impl Default for TokioSettings {
     fn default() -> Self {
         TokioSettings {
-            max_blocking_threads: default_blocking_threads(),
+            max_blocking_threads: requested_blocking_threads(),
             thread_keep_alive_seconds: default_thread_keep_alive(),
             worker_threads: None,
             net_threads: None,
@@ -828,7 +902,11 @@ fn core_runtime_with_settings(settings: Option<TokioSettings>) -> Handle {
 /// Removing the knob silently would lose whatever tuning a caller had configured without telling
 /// them; `LORE_MAX_THREADS` is what replaces it.
 fn warn_retired_thread_vars() {
-    for var in ["LORE_WORKER_THREADS", "LORE_COMPUTE_THREADS"] {
+    for var in [
+        "LORE_WORKER_THREADS",
+        "LORE_BLOCKING_THREADS",
+        "LORE_COMPUTE_THREADS",
+    ] {
         if std::env::var_os(var).is_some() {
             crate::lore_warn!("{var} is no longer used, size the runtime with LORE_MAX_THREADS");
         }
@@ -841,23 +919,46 @@ fn build_core_runtime(settings: Option<TokioSettings>) -> tokio::runtime::Runtim
     if let Some(net_threads) = settings.net_threads.filter(|&count| count > 0) {
         let _ = NET_THREADS_DEFAULT.set(net_threads);
     }
+    let counts = core_thread_counts(&settings);
+    // The syscall pool builds itself on the first file operation, which in every Lore process
+    // happens on this runtime and so after this point.
+    lore_io::set_max_threads(counts.io);
     let mut builder = tokio::runtime::Builder::new_multi_thread();
     builder
         .enable_all()
-        .max_blocking_threads(settings.max_blocking_threads)
+        .max_blocking_threads(core_blocking_threads(counts))
         .thread_keep_alive(Duration::from_secs(settings.thread_keep_alive_seconds))
         .thread_name_fn(|| {
             static ID: AtomicUsize = AtomicUsize::new(0);
             format!("lore-tokio-{}", ID.fetch_add(1, Ordering::Relaxed))
         });
-    // Always set an explicit count, else tokio would default to the raw core count and ignore
-    // the thread limit. Precedence: explicit setting, then budget-derived default.
-    let worker_threads = match settings.worker_threads {
-        Some(val) if val > 0 => val,
-        _ => default_worker_threads(),
-    };
-    builder.worker_threads(worker_threads);
+    // Tokio would otherwise default to the raw core count and ignore the thread limit.
+    builder.worker_threads(counts.worker);
     builder.build().expect("Failed to create runtime")
+}
+
+/// The counts the core runtime is built with: the configured sizes over the
+/// defaults, then scaled to fit any thread limit.
+///
+/// Configuration reaches the pools through here rather than the builder directly,
+/// so a configured pool cannot push the process past a limit either. A configured
+/// `max_blocking_threads` sizes the core runtime's own pool, so the net runtime's
+/// thread is added to reach the budgeted total.
+fn core_thread_counts(settings: &TokioSettings) -> ThreadCounts {
+    let mut requested = requested_thread_counts();
+    if let Some(worker) = settings.worker_threads.filter(|&count| count > 0) {
+        requested.worker = worker;
+    }
+    if settings.max_blocking_threads > 0 {
+        requested.blocking = settings.max_blocking_threads + NET_BLOCKING_THREADS;
+    }
+    apply_thread_limit(requested)
+}
+
+/// The core runtime's blocking pool: the budgeted blocking threads less the one
+/// the net runtime holds, and never zero — a pool of none runs nothing.
+fn core_blocking_threads(counts: ThreadCounts) -> usize {
+    counts.blocking.saturating_sub(NET_BLOCKING_THREADS).max(1)
 }
 
 /// Tokio worker threads: the worker share of the budget (see [`thread_counts`]). Exposed so
@@ -865,7 +966,8 @@ fn build_core_runtime(settings: Option<TokioSettings>) -> tokio::runtime::Runtim
 /// bound the runtime uses.
 ///
 /// There is no per-pool environment override. `LORE_MAX_THREADS` is the one knob, and a var that
-/// bypassed it could raise the total above the ceiling an embedder asked for.
+/// bypassed it could raise the total above the ceiling an embedder asked for. A configuration that
+/// sets `worker_threads` moves the runtime alone, since this is read before any is supplied.
 pub fn default_worker_threads() -> usize {
     budget_thread_counts().worker
 }
@@ -935,6 +1037,9 @@ where
 
     match Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            // The caller is shutting the process down, so a core it hands off has nothing left to
+            // run, and `wait_timeout` bounds how long the handoff can last either way.
+            #[allow(clippy::disallowed_methods)]
             tokio::task::block_in_place(move || handle.block_on(bounded))
         }
         Ok(_) => {
@@ -1134,17 +1239,25 @@ mod tests {
         });
     }
 
+    /// The syscall pool's request on a host with this many cores, so the cases
+    /// below do not depend on the machine running them.
+    const IO_REQUEST: usize = 16;
+
     #[test]
-    fn default_thread_counts_match_historic_formulas() {
-        let counts = default_thread_counts(8);
+    fn default_thread_counts_match_design_formulas() {
+        let counts = default_thread_counts(8, IO_REQUEST);
         assert_eq!(counts.worker, 8);
-        assert_eq!(counts.blocking, std::cmp::min(2 * (8 + 1), 128));
+        assert_eq!(
+            counts.blocking,
+            CORE_BLOCKING_THREADS + NET_BLOCKING_THREADS
+        );
         assert_eq!(counts.net, DEFAULT_NET_THREADS);
+        assert_eq!(counts.io, IO_REQUEST);
     }
 
     #[test]
     fn apportion_returns_defaults_when_within_limit() {
-        let defaults = default_thread_counts(8);
+        let defaults = default_thread_counts(8, IO_REQUEST);
         let total = defaults.total();
         assert_eq!(apportion_thread_counts(defaults, total), defaults);
         assert_eq!(apportion_thread_counts(defaults, total + 100), defaults);
@@ -1152,33 +1265,91 @@ mod tests {
 
     #[test]
     fn apportion_fills_budget_exactly_above_the_floor() {
-        let defaults = default_thread_counts(64);
-        for limit in (3 * MIN_THREADS_PER_POOL)..=defaults.total() {
+        let defaults = default_thread_counts(64, IO_REQUEST);
+        for limit in (POOL_COUNT * MIN_THREADS_PER_POOL)..=defaults.total() {
             let counts = apportion_thread_counts(defaults, limit);
             assert_eq!(counts.total(), limit, "limit {limit} not used exactly");
-            assert!(counts.worker >= MIN_THREADS_PER_POOL);
-            assert!(counts.blocking >= MIN_THREADS_PER_POOL);
-            assert!(counts.net >= MIN_THREADS_PER_POOL);
+            for pool in counts.as_array() {
+                assert!(pool >= MIN_THREADS_PER_POOL);
+            }
         }
     }
 
     #[test]
     fn apportion_floors_below_min_total() {
-        let counts = apportion_thread_counts(default_thread_counts(64), 1);
-        assert_eq!(counts.worker, MIN_THREADS_PER_POOL);
-        assert_eq!(counts.blocking, MIN_THREADS_PER_POOL);
-        assert_eq!(counts.net, MIN_THREADS_PER_POOL);
+        let counts = apportion_thread_counts(default_thread_counts(64, IO_REQUEST), 1);
+        assert_eq!(counts.as_array(), [MIN_THREADS_PER_POOL; POOL_COUNT]);
     }
 
     #[test]
     fn apportion_at_limit_64_on_64_core_host() {
-        let defaults = default_thread_counts(64);
-        assert_eq!(defaults.total(), 194);
+        let defaults = default_thread_counts(64, IO_REQUEST);
+        assert_eq!(defaults.total(), 85);
         let counts = apportion_thread_counts(defaults, 64);
-        assert_eq!(counts.worker, 21);
-        assert_eq!(counts.blocking, 41);
+        assert_eq!(counts.worker, 48);
+        assert_eq!(counts.blocking, MIN_THREADS_PER_POOL);
         assert_eq!(counts.net, MIN_THREADS_PER_POOL);
+        assert_eq!(counts.io, 12);
         assert_eq!(counts.total(), 64);
+    }
+
+    /// A net request raises the pool's ideal, and the limit still binds the total —
+    /// asking for 64 net threads under a 64-thread ceiling cannot buy 64 of them
+    /// on top of the worker and blocking pools.
+    #[test]
+    fn a_net_request_is_scaled_by_the_limit() {
+        let requested = ThreadCounts {
+            worker: 20,
+            blocking: CORE_BLOCKING_THREADS + NET_BLOCKING_THREADS,
+            net: 64,
+            io: IO_REQUEST,
+        };
+        let counts = apportion_thread_counts(requested, 64);
+        assert_eq!(counts.total(), 64);
+        assert!(counts.net < requested.net);
+        assert!(
+            counts.net > counts.worker,
+            "the largest request keeps the largest share"
+        );
+    }
+
+    /// The limit is a ceiling on the total whatever the per-pool requests are, so
+    /// no knob can raise the process above what an embedder asked for. The
+    /// per-pool floor is a property of scaling down rather than of every result:
+    /// a request that already fits is honoured as written, including one below it.
+    #[test]
+    fn the_limit_bounds_the_total_for_any_request() {
+        for worker in [2, 8, 64, 256] {
+            for blocking in [1, 2, 128] {
+                for net in [1, 2, 64, 512] {
+                    for io in [1, 16, 128] {
+                        let requested = ThreadCounts {
+                            worker,
+                            blocking,
+                            net,
+                            io,
+                        };
+                        for limit in [POOL_COUNT * MIN_THREADS_PER_POOL, 16, 64, 1024] {
+                            let counts = apportion_thread_counts(requested, limit);
+                            assert!(
+                                counts.total() <= limit,
+                                "{requested:?} at limit {limit} gave {counts:?}"
+                            );
+                            if requested.total() <= limit {
+                                assert_eq!(counts, requested, "a request that fits is untouched");
+                                continue;
+                            }
+                            for pool in counts.as_array() {
+                                assert!(
+                                    pool >= MIN_THREADS_PER_POOL,
+                                    "{requested:?} at limit {limit} starved a pool: {counts:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]

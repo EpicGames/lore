@@ -57,6 +57,7 @@ pub struct LoreLinkAddArgs {
 /// |-------|-------------|
 /// | [`LoreEvent::RepositoryCloneBegin`](crate::interface::LoreEvent::RepositoryCloneBegin) | Emitted when cloning a linked repository begins |
 /// | [`LoreEvent::RepositoryCloneEnd`](crate::interface::LoreEvent::RepositoryCloneEnd) | Emitted when cloning a linked repository completes |
+/// | [`LoreEvent::LinkBranchCreate`](crate::interface::LoreEvent::LinkBranchCreate) | Emitted when branching is enabled, reporting whether the link's branch was created or an existing one reused |
 /// | [`LoreEvent::LinkChange`](crate::interface::LoreEvent::LinkChange) | Emitted when the link has been added and saved |
 pub async fn add(
     globals: LoreGlobalArgs,

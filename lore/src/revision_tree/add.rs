@@ -15,7 +15,6 @@ use lore_base::types::Address;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_macro::ValidateText;
-use lore_revision::errors::StateErrors;
 use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
@@ -52,13 +51,13 @@ use crate::revision_tree::handle::RevisionTreeInternal;
 #[repr(C)]
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, ValidateText)]
 pub struct LoreRevisionTreeAddEntry {
-    /// Caller-chosen id echoed back in this entry's `ADD_COMPLETE`
-    pub id: u64,
-    /// Parent for the new node; the invalid-node sentinel selects `parent_entry`
+    /// Caller-chosen id echoed back as `entry_id` on this entry's `ADD_COMPLETE`
+    pub entry_id: u64,
+    /// Parent for the new node; the invalid-node sentinel selects `parent_entry_index`
     pub parent_node_id: NodeID,
     /// Index of an earlier entry in this batch whose new node is the parent;
     /// read only when `parent_node_id` is the invalid-node sentinel
-    pub parent_entry: u32,
+    pub parent_entry_index: u32,
     /// UTF-8 name of the new child within its parent
     pub name: LoreString,
     /// `LoreNodeType` encoding: `DIRECTORY = 0`, `FILE = 1`, `LINK = 2`
@@ -76,8 +75,8 @@ pub struct LoreRevisionTreeAddEntry {
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, LoreArgs)]
 #[handler(add_impl)]
 pub struct LoreRevisionTreeAddArgs {
-    /// Per-call correlation id echoed back in `BATCH_COMPLETE`
-    pub id: u64,
+    /// Caller-chosen id echoed back as `batch_id` on `BATCH_COMPLETE`
+    pub batch_id: u64,
     /// Loaded revision-tree handle to mutate
     pub handle: LoreRevisionTree,
     /// Nodes to add; each emits its own `ADD_COMPLETE`
@@ -87,6 +86,16 @@ pub struct LoreRevisionTreeAddArgs {
 #[error_set]
 enum AddError {
     InvalidArguments,
+}
+
+impl AddError {
+    /// A rejection the arguments earned, alongside the generated `internal`
+    /// constructor for a failure of ours.
+    fn invalid(reason: impl Into<String>) -> Self {
+        Self::from(InvalidArguments {
+            reason: reason.into(),
+        })
+    }
 }
 
 impl EventError for AddError {
@@ -102,30 +111,27 @@ impl EventError for AddError {
     }
 }
 
-fn invalid(reason: &str) -> AddError {
-    AddError::from(InvalidArguments {
-        reason: reason.into(),
-    })
-}
-
-fn emit_add_complete(id: u64, node_id: NodeID, error_code: LoreErrorCode) {
+fn emit_add_complete(entry_id: u64, node_id: NodeID, error_code: LoreErrorCode) {
     LoreEvent::RevisionTreeAddComplete(LoreRevisionTreeAddCompleteEventData {
-        id,
+        entry_id,
         node_id,
         error_code,
     })
     .send();
 }
 
-/// Emit the id-carrying terminal for a failed entry.
-fn emit_add_error(id: u64, error_code: LoreErrorCode) {
-    emit_add_complete(id, INVALID_NODE, error_code);
+/// Emit the `entry_id`-carrying terminal for a failed entry.
+fn emit_add_error(entry_id: u64, error_code: LoreErrorCode) {
+    emit_add_complete(entry_id, INVALID_NODE, error_code);
 }
 
-/// Emit the terminal for the call as a whole, carrying the call's own id.
-fn emit_batch_complete(id: u64, error_code: LoreErrorCode) {
-    LoreEvent::RevisionTreeBatchComplete(LoreRevisionTreeBatchCompleteEventData { id, error_code })
-        .send();
+/// Emit the terminal for the call as a whole, carrying its `batch_id`.
+fn emit_batch_complete(batch_id: u64, error_code: LoreErrorCode) {
+    LoreEvent::RevisionTreeBatchComplete(LoreRevisionTreeBatchCompleteEventData {
+        batch_id,
+        error_code,
+    })
+    .send();
 }
 
 /// The code the batch terminal reports for a finished call.
@@ -137,12 +143,11 @@ fn batch_error_code(result: &Result<(), AddError>) -> LoreErrorCode {
     }
 }
 
-/// Zero the fields a kind does not carry, and assign a file id where one is due.
+/// Zero the fields a kind does not carry.
 ///
 /// A directory's size and address are derived when the revision is committed and
 /// a link has no content of its own, so a value supplied for either is dropped
-/// rather than stored. A file arriving without a file id is given a generated one
-/// so it has a stable identity before commit.
+/// rather than stored.
 fn fields_for_kind(flags: NodeFlags, size: u64, address: Address) -> (u64, Address) {
     if flags.is_directory() {
         return (0, Address::default());
@@ -150,11 +155,23 @@ fn fields_for_kind(flags: NodeFlags, size: u64, address: Address) -> (u64, Addre
     if flags.contains(NodeFlags::Link) {
         return (0, address);
     }
-    let mut address = address;
-    if address.context.is_zero() {
-        address.context = uuid::Uuid::now_v7().into();
-    }
     (size, address)
+}
+
+/// Give a file arriving without a file id a generated one, so it has a stable
+/// identity before commit.
+///
+/// Only for a node being created. A node being restored already has an identity,
+/// and generating one here would leave the restore unable to keep it — the zero
+/// context that means "preserve" would never reach [`State::node_undelete`].
+fn with_generated_file_id(flags: NodeFlags, address: Address) -> Address {
+    if flags.is_directory() || flags.contains(NodeFlags::Link) || !address.context.is_zero() {
+        return address;
+    }
+    Address {
+        context: uuid::Uuid::now_v7().into(),
+        ..address
+    }
 }
 
 /// Map a `LoreNodeType` `kind` to its node flags; `None` if unsupported.
@@ -179,19 +196,23 @@ enum ParentRef {
 }
 
 /// A validated entry, ready to apply without further checks. The name is not
-/// copied here: `entry` indexes the batch arguments, which own it and outlive
-/// the apply phase.
+/// copied here: `entry_index` indexes the batch arguments, which own it and
+/// outlive the apply phase.
 #[derive(Clone, Copy)]
 struct Planned {
-    id: u64,
-    entry: usize,
+    entry_id: u64,
+    entry_index: usize,
     parent: ParentRef,
+    /// An existing node staged for deletion that this entry takes back into the
+    /// revision instead of creating one. Set only when the name is held by a
+    /// deleted child of the same kind.
+    restore: Option<NodeID>,
     node: Node,
 }
 
 /// The name of a planned entry, borrowed from the batch arguments.
-fn entry_name(args: &LoreRevisionTreeAddArgs, entry: usize) -> &str {
-    args.entries.as_slice()[entry].name.as_str()
+fn entry_name(args: &LoreRevisionTreeAddArgs, entry_index: usize) -> &str {
+    args.entries.as_slice()[entry_index].name.as_str()
 }
 
 fn resolve_parent(parent: ParentRef, created: &[NodeID]) -> NodeID {
@@ -201,45 +222,160 @@ fn resolve_parent(parent: ParentRef, created: &[NodeID]) -> NodeID {
     }
 }
 
-/// Reject the whole batch as a bad argument, attributing it to `id`.
+/// Reject the whole batch as a bad argument, attributing it to `entry_id`.
 ///
-/// The batch index goes into the reason as well, because a caller may leave `id`
-/// at zero — which any number of entries may share — so the id on its own need
-/// not say which entry was at fault.
-fn reject(id: u64, entry: usize, reason: &str) -> AddError {
-    emit_add_error(id, LoreErrorCode::InvalidArguments);
-    invalid(&format!("entry {entry}: {reason}"))
+/// The batch index goes into the reason as well, because a caller may leave
+/// `entry_id` at zero — which any number of entries may share — so the id on its
+/// own need not say which entry was at fault.
+fn reject(entry_id: u64, entry_index: usize, reason: &str) -> AddError {
+    emit_add_error(entry_id, LoreErrorCode::InvalidArguments);
+    AddError::invalid(format!("entry {entry_index}: {reason}"))
 }
 
 /// Reject the whole batch because the tree could not be read, keeping the
 /// underlying failure as context.
-fn reject_internal(id: u64, entry: usize, error: StateError, context: &str) -> AddError {
-    emit_add_error(id, LoreErrorCode::Internal);
-    AddError::internal_with_context(error, &format!("entry {entry}: {context}"))
+fn reject_internal(
+    entry_id: u64,
+    entry_index: usize,
+    error: StateError,
+    context: &str,
+) -> AddError {
+    emit_add_error(entry_id, LoreErrorCode::Internal);
+    AddError::internal_with_context(error, &format!("entry {entry_index}: {context}"))
 }
 
-/// Name hashes of every existing child of `parent`, collected in one walk of the
-/// sibling chain and sorted for lookup.
-///
-/// A sorted `Vec` rather than a set: the values are already hashes, so a hash set
-/// would run each of them through the hasher a second time, and would carry
-/// bucket overhead on a collection whose size is the parent's child count rather
-/// than anything the batch chose.
-async fn child_name_hashes(
+/// A child staged for deletion, which a matching name may restore rather than
+/// collide with.
+#[derive(Clone, Copy)]
+struct DeletedChild {
+    name_hash: u64,
+    node_id: NodeID,
+    /// The node's own type flags, so a restore only happens for the same kind.
+    kind: NodeFlags,
+}
+
+/// The existing children of one parent, split by whether they still belong to
+/// the revision.
+struct ChildNames {
+    /// Name hashes of the children a name would collide with, sorted for lookup.
+    ///
+    /// A sorted `Vec` rather than a set: the values are already hashes, so a hash
+    /// set would run each of them through the hasher a second time, and would
+    /// carry bucket overhead on a collection whose size is the parent's child
+    /// count rather than anything the batch chose.
+    live: Vec<u64>,
+    /// The children staged for deletion. A name matching one of these restores it
+    /// instead of creating a node, so this keeps the node id and the kind the
+    /// direct lookup would otherwise have to fetch again. Scanned rather than
+    /// searched: it is empty unless something in this parent has been deleted.
+    deleted: Vec<DeletedChild>,
+}
+
+/// What an existing parent already holds under a name.
+enum NameLookup {
+    /// Nothing holds the name.
+    Vacant,
+    /// A child that belongs to the revision holds it.
+    Live,
+    /// Only a child staged for deletion holds it, and it can be restored.
+    Deleted(DeletedChild),
+}
+
+impl ChildNames {
+    /// What this parent holds under `name_hash`, for a node of `kind`.
+    ///
+    /// A live child wins over a deleted one: the name is genuinely taken, and a
+    /// deleted namesake alongside it is the remains of an earlier replacement. A
+    /// deleted child of a different kind does not answer the name either — the
+    /// caller is replacing the node rather than restoring it.
+    fn lookup(&self, name_hash: u64, kind: NodeFlags) -> NameLookup {
+        if self.live.binary_search(&name_hash).is_ok() {
+            return NameLookup::Live;
+        }
+        match self
+            .deleted
+            .iter()
+            .find(|child| child.name_hash == name_hash && child.kind == kind)
+        {
+            Some(child) => NameLookup::Deleted(*child),
+            None => NameLookup::Vacant,
+        }
+    }
+}
+
+/// Every existing child of `parent`, collected in one walk of the sibling chain.
+async fn child_names(
     state: &Arc<State>,
     context: &Arc<RepositoryContext>,
     parent: NodeID,
     parent_node: &Node,
-) -> Result<Vec<u64>, StateError> {
+) -> Result<ChildNames, StateError> {
     let mut children =
         StateNodeChildrenIterator::from_parent(state.clone(), context.clone(), parent, parent_node)
             .await?;
-    let mut hashes = Vec::new();
-    while let Some((_, node)) = children.next().await? {
-        hashes.push(node.name_hash);
+    let mut live = Vec::new();
+    let mut deleted = Vec::new();
+    while let Some((node_id, node)) = children.next().await? {
+        if node.is_staged_delete() {
+            deleted.push(DeletedChild {
+                name_hash: node.name_hash,
+                node_id,
+                kind: node_kind_flags(&node),
+            });
+        } else {
+            live.push(node.name_hash);
+        }
     }
-    hashes.sort_unstable();
-    Ok(hashes)
+    live.sort_unstable();
+    Ok(ChildNames { live, deleted })
+}
+
+/// The type flags of an existing node, with everything else masked off, so two
+/// nodes' kinds compare without their staging state getting in the way.
+fn node_kind_flags(node: &Node) -> NodeFlags {
+    if node.is_file() {
+        NodeFlags::File
+    } else if node.is_link() {
+        NodeFlags::Link
+    } else {
+        NodeFlags::NoFlags
+    }
+}
+
+/// Walk one parent's chain looking for a single name, for the first entry to land
+/// under that parent — the case where snapshotting every child to check one name
+/// would be a loss.
+async fn find_name_in_parent(
+    state: &Arc<State>,
+    context: &Arc<RepositoryContext>,
+    parent: NodeID,
+    parent_node: &Node,
+    name_hash: u64,
+    kind: NodeFlags,
+) -> Result<NameLookup, StateError> {
+    let mut children =
+        StateNodeChildrenIterator::from_parent(state.clone(), context.clone(), parent, parent_node)
+            .await?;
+    let mut restorable = None;
+    while let Some((node_id, node)) = children.next().await? {
+        if node.name_hash != name_hash {
+            continue;
+        }
+        if !node.is_staged_delete() {
+            return Ok(NameLookup::Live);
+        }
+        if restorable.is_none() && node_kind_flags(&node) == kind {
+            restorable = Some(DeletedChild {
+                name_hash,
+                node_id,
+                kind,
+            });
+        }
+    }
+    Ok(match restorable {
+        Some(child) => NameLookup::Deleted(child),
+        None => NameLookup::Vacant,
+    })
 }
 
 /// How far a batch has got with the checks it runs once per existing parent.
@@ -259,48 +395,63 @@ struct ParentState {
     /// The parent as it read when it was checked, so neither a name lookup nor
     /// the snapshot walk has to fetch it again.
     node: Node,
-    /// Its child name hashes, sorted, collected once a second entry named it.
-    names: Option<Vec<u64>>,
+    /// Its children, collected once a second entry named it.
+    names: Option<ChildNames>,
 }
 
 /// Check that an existing node can take children, attributing any failure to
-/// `id`. Runs once per parent per batch, for the first entry that names it.
+/// `entry_id`. Runs once per parent per batch, for the first entry that names it.
 ///
 /// Returns the parent it read, which the caller keeps: every later lookup under
 /// this parent starts from the child chain it holds.
+///
+/// A discarded slot and a slot the allocator never handed out both read back as
+/// ordinary directories, so each is refused on its own terms: a child hung off a
+/// discarded slot is orphaned once the allocator reuses it, and since every
+/// non-root node has a non-empty name, a zero name length is what separates an
+/// unallocated slot from a real node.
 async fn check_existing_parent(
     state: &Arc<State>,
     context: &Arc<RepositoryContext>,
     parent: NodeID,
-    id: u64,
-    entry: usize,
+    entry_id: u64,
+    entry_index: usize,
 ) -> Result<Node, AddError> {
     let Ok(parent_node) = state.node(context.clone(), parent).await else {
-        return Err(reject(id, entry, "parent node id is unknown"));
+        return Err(reject(entry_id, entry_index, "parent node id is unknown"));
     };
-    // A discarded slot keeps its name and carries neither the file nor the link
-    // flag, so it reads back as a perfectly ordinary directory. Nothing below
-    // would catch it, and a child hung off one is orphaned as soon as the
-    // allocator hands the slot out again.
     if parent_node.is_discarded() {
-        return Err(reject(id, entry, "parent node has been deleted"));
+        return Err(reject(
+            entry_id,
+            entry_index,
+            "parent node has been deleted",
+        ));
+    }
+    if parent_node.is_staged_delete() {
+        return Err(reject(
+            entry_id,
+            entry_index,
+            "parent node is staged for deletion, so a child added under it would go with it",
+        ));
     }
     if parent_node.is_link() {
         return Err(reject(
-            id,
-            entry,
+            entry_id,
+            entry_index,
             "parent node is a link, which addresses a revision this handle does not mutate",
         ));
     }
     if !parent_node.is_directory() {
-        return Err(reject(id, entry, "parent node is not a directory"));
+        return Err(reject(
+            entry_id,
+            entry_index,
+            "parent node is not a directory",
+        ));
     }
-    // Every non-root node has a non-empty name, so a zero name length means the
-    // parent id landed on an unallocated slot rather than a real node.
     if parent != ROOT_NODE && parent_node.name_length == 0 {
         return Err(reject(
-            id,
-            entry,
+            entry_id,
+            entry_index,
             "parent node id does not resolve to a named node",
         ));
     }
@@ -309,7 +460,9 @@ async fn check_existing_parent(
 
 /// Check every entry against the tree and against the rest of the batch,
 /// producing the apply plan. Mutates nothing; the first invalid entry rejects
-/// the batch.
+/// the batch. Names are held to the rules the name table applies on write, so a
+/// name it would refuse fails here rather than part-way through the apply phase
+/// with earlier nodes already created.
 ///
 /// An existing parent is checked once per batch. Its names are looked up
 /// directly for the first entry that lands under it and, from the second entry
@@ -327,39 +480,34 @@ async fn plan_entries(
     let mut ids: HashSet<u64> = HashSet::with_capacity(entries.len());
 
     for (index, entry) in entries.iter().enumerate() {
-        let id = entry.id;
-        if id != 0 && !ids.insert(id) {
-            return Err(reject(id, index, "two entries share one caller id"));
+        let entry_id = entry.entry_id;
+        if entry_id != 0 && !ids.insert(entry_id) {
+            return Err(reject(entry_id, index, "two entries share one caller id"));
         }
 
-        // Sound because the entry point checked every string the call carries
-        // before dispatching it.
         let name = entry.name.as_str();
         if name.is_empty() {
-            return Err(reject(id, index, "name must not be empty"));
+            return Err(reject(entry_id, index, "name must not be empty"));
         }
-        // The same rules the name table applies when the node is written, run
-        // here so a name it would refuse fails the batch cleanly instead of
-        // surfacing part-way through the apply phase with nodes already created.
         if let Err(error) = validate_node_name_for_store(name) {
-            return Err(reject(id, index, &error.to_string()));
+            return Err(reject(entry_id, index, &error.to_string()));
         }
 
         let Some(flags) = node_flags_for_kind(entry.kind) else {
-            return Err(reject(id, index, "kind is not a supported node type"));
+            return Err(reject(entry_id, index, "kind is not a supported node type"));
         };
 
         let parent = if entry.parent_node_id == INVALID_NODE {
-            let target = entry.parent_entry as usize;
+            let target = entry.parent_entry_index as usize;
             if target >= index {
                 return Err(reject(
-                    id,
+                    entry_id,
                     index,
                     "parent entry must refer to an earlier entry in the batch",
                 ));
             }
             if !planned[target].node.is_directory() {
-                return Err(reject(id, index, "parent entry is not a directory"));
+                return Err(reject(entry_id, index, "parent entry is not a directory"));
             }
             ParentRef::Entry(target)
         } else {
@@ -372,24 +520,25 @@ async fn plan_entries(
             match progress {
                 ParentProgress::Unchecked => {
                     let node =
-                        check_existing_parent(state, context, parent_node_id, id, index).await?;
+                        check_existing_parent(state, context, parent_node_id, entry_id, index)
+                            .await?;
                     existing.insert(parent_node_id, ParentState { node, names: None });
                 }
                 ParentProgress::Checked => {
                     let node = existing[&parent_node_id].node;
-                    match child_name_hashes(state, context, parent_node_id, &node).await {
-                        Ok(hashes) => {
+                    match child_names(state, context, parent_node_id, &node).await {
+                        Ok(names) => {
                             existing.insert(
                                 parent_node_id,
                                 ParentState {
                                     node,
-                                    names: Some(hashes),
+                                    names: Some(names),
                                 },
                             );
                         }
                         Err(error) => {
                             return Err(reject_internal(
-                                id,
+                                entry_id,
                                 index,
                                 error,
                                 "collect existing child names",
@@ -405,42 +554,67 @@ async fn plan_entries(
         let name_hash = hash_string(name);
         if !taken.insert((parent, name_hash)) {
             return Err(reject(
-                id,
+                entry_id,
                 index,
                 "two entries add the same name under one parent",
             ));
         }
+        let mut restore = None;
         if let ParentRef::Existing(parent_node_id) = parent {
             let snapshot_hit = existing
                 .get(&parent_node_id)
                 .and_then(|parent| parent.names.as_ref())
-                .map(|hashes| hashes.binary_search(&name_hash).is_ok());
-            let occupied = if let Some(occupied) = snapshot_hit {
-                occupied
+                .map(|names| names.lookup(name_hash, flags));
+            let held = if let Some(held) = snapshot_hit {
+                held
             } else {
                 let parent_node = existing[&parent_node_id].node;
-                match state
-                    .find_subnode_of(context.clone(), parent_node_id, &parent_node, name_hash)
-                    .await
+                match find_name_in_parent(
+                    state,
+                    context,
+                    parent_node_id,
+                    &parent_node,
+                    name_hash,
+                    flags,
+                )
+                .await
                 {
-                    Ok(_) => true,
-                    Err(StateErrors::NodeNotFound(_)) => false,
+                    Ok(held) => held,
                     Err(error) => {
-                        return Err(reject_internal(id, index, error, "State::find_subnode"));
+                        return Err(reject_internal(
+                            entry_id,
+                            index,
+                            error,
+                            "search a parent's children for the name",
+                        ));
                     }
                 }
             };
-            if occupied {
-                return Err(reject(id, index, "a child with this name already exists"));
+            match held {
+                NameLookup::Live => {
+                    return Err(reject(
+                        entry_id,
+                        index,
+                        "a child with this name already exists",
+                    ));
+                }
+                NameLookup::Deleted(child) => restore = Some(child.node_id),
+                NameLookup::Vacant => {}
             }
         }
 
         let (size, address) = fields_for_kind(flags, entry.size, entry.address);
+        let address = if restore.is_some() {
+            address
+        } else {
+            with_generated_file_id(flags, address)
+        };
 
         planned.push(Planned {
-            id,
-            entry: index,
+            entry_id,
+            entry_index: index,
             parent,
+            restore,
             node: Node {
                 flags: flags.bits(),
                 mode: entry.mode,
@@ -488,7 +662,7 @@ fn take_wave(planned: &[Planned], created: &[NodeID], level: &[usize]) -> Vec<(u
     for &index in level {
         let parent = resolve_parent(planned[index].parent, created);
         if parent == INVALID_NODE {
-            emit_add_error(planned[index].id, LoreErrorCode::Internal);
+            emit_add_error(planned[index].entry_id, LoreErrorCode::Internal);
             continue;
         }
         wave.push((index, parent));
@@ -542,16 +716,40 @@ async fn apply_wave(
             for (parent, group) in bucket {
                 for index in group {
                     let item = planned[index];
-                    let name = entry_name(&args, item.entry);
-                    match state
-                        .node_add(context.clone(), parent, item.node, name)
-                        .await
-                    {
+                    let name = entry_name(&args, item.entry_index);
+                    let outcome = match item.restore {
+                        Some(node_id) => state
+                            .node_undelete(
+                                context.clone(),
+                                node_id,
+                                item.node.mode,
+                                item.node.size,
+                                item.node.address,
+                            )
+                            .await
+                            .map(|()| node_id),
+                        None => match state
+                            .node_add(context.clone(), parent, item.node, name)
+                            .await
+                        {
+                            Ok(node_id) => state
+                                .node_mark_staged(
+                                    context.clone(),
+                                    node_id,
+                                    NodeFlags::StagedAdd,
+                                    NodeFlags::DirtyAdd,
+                                )
+                                .await
+                                .map(|()| node_id),
+                            Err(error) => Err(error),
+                        },
+                    };
+                    match outcome {
                         Ok(node_id) => {
-                            emit_add_complete(item.id, node_id, LoreErrorCode::None);
+                            emit_add_complete(item.entry_id, node_id, LoreErrorCode::None);
                             landed.push((index, node_id));
                         }
-                        Err(_) => emit_add_error(item.id, LoreErrorCode::Internal),
+                        Err(_) => emit_add_error(item.entry_id, LoreErrorCode::Internal),
                     }
                 }
             }
@@ -561,8 +759,6 @@ async fn apply_wave(
 
     let mut applied = 0;
     while let Some(result) = tasks.join_next().await {
-        // A task that died mid-group returns nothing; its entries simply do not
-        // count as applied, which is what the caller's shortfall measures.
         if let Ok(landed) = result {
             applied += landed.len();
             for (index, node_id) in landed {
@@ -616,32 +812,32 @@ async fn apply_plan(
 
 /// Add a batch of nodes to the tree.
 ///
-/// Each added entry emits `RevisionTreeAddComplete` carrying its own `id` and
-/// the new `node_id`, before the call's `Complete`. An entry parents onto
+/// Each added entry emits `RevisionTreeAddComplete` carrying its own `entry_id`
+/// and the new `node_id`, before the call's `Complete`. An entry parents onto
 /// `parent_node_id`, or onto the node created by an earlier entry when
-/// `parent_node_id` is the invalid-node sentinel and `parent_entry` is that
-/// entry's index — so one call builds a subtree. Forward references only, which
-/// keeps the batch acyclic. `kind` is a `LoreNodeType` (`DIRECTORY = 0`,
-/// `FILE = 1`, `LINK = 2`); a `LINK` entry's `address` is its target
+/// `parent_node_id` is the invalid-node sentinel and `parent_entry_index` is
+/// that entry's position in the batch — so one call builds a subtree. Forward
+/// references only, which keeps the batch acyclic. `kind` is a `LoreNodeType`
+/// (`DIRECTORY = 0`, `FILE = 1`, `LINK = 2`); a `LINK` entry's `address` is its target
 /// `(revision, repository)` and resolves to that revision's root. A file with a
 /// zero `address.context` is assigned a generated file id, readable via
 /// `node_info`. An empty batch succeeds.
 ///
 /// The call as a whole reports on `RevisionTreeBatchComplete`, carrying the
-/// call's own `id` and firing exactly once — after any per-entry terminals and
-/// before `Complete`. A failure that belongs to the call rather than to one
-/// entry is reported only there: an unknown or closed handle, and an apply task
-/// that died without reporting the entries it still held.
+/// call's own `batch_id` and firing exactly once — after any per-entry
+/// terminals and before `Complete`. A failure that belongs to the call rather
+/// than to one entry is reported only there: an unknown or closed handle, and an
+/// apply task that died without reporting the entries it still held.
 ///
 /// Every entry is checked before any node is created, and a single bad entry
-/// rejects the whole call with `INVALID_ARGUMENTS` on that entry's id, leaving
-/// the tree untouched. The reason names the entry's batch index, since `id` may
-/// be `0` on several entries at once. Rejected are a name that is empty or that
-/// the node name table would refuse — one holding `/` or `\`,
+/// rejects the whole call with `INVALID_ARGUMENTS` on that entry's `entry_id`,
+/// leaving the tree untouched. The reason names the entry's batch index, since
+/// `entry_id` may be `0` on several entries at once. Rejected are a name that is
+/// empty or that the node name table would refuse — one holding `/` or `\`,
 /// exactly `..`, a leading NUL, or over a thousand bytes; an unsupported `kind`;
 /// a parent that is unknown, deleted, a link, not a directory, or not an earlier
 /// entry; a name already taken under the parent, whether by an existing child or
-/// another entry (case-insensitive); and a non-zero caller `id` used by another
+/// another entry (case-insensitive); and a non-zero `entry_id` used by another
 /// entry — `0` means "not correlating this entry" and may repeat. Fields a kind
 /// does not carry are normalised rather than rejected: a directory stores no size
 /// and no address, and a link stores no size. A link's target is not resolved
@@ -707,10 +903,10 @@ async fn add_impl(
         args,
         add,
         |args: &LoreRevisionTreeAddArgs| {
-            emit_batch_complete(args.id, LoreErrorCode::InvalidArguments);
+            emit_batch_complete(args.batch_id, LoreErrorCode::InvalidArguments);
         },
         async move |internal: Arc<RevisionTreeInternal>, args: LoreRevisionTreeAddArgs| {
-            let call_id = args.id;
+            let call_id = args.batch_id;
             let result = add_batch(internal, args).await;
             emit_batch_complete(call_id, batch_error_code(&result));
             result
@@ -765,10 +961,10 @@ mod tests {
                 LoreEvent::Complete(data) => Self::Complete(data.status),
                 LoreEvent::RevisionTreeLoaded(data) => Self::RevisionTreeLoaded(data.handle_id),
                 LoreEvent::RevisionTreeAddComplete(data) => {
-                    Self::AddComplete(data.id, data.node_id, data.error_code)
+                    Self::AddComplete(data.entry_id, data.node_id, data.error_code)
                 }
                 LoreEvent::RevisionTreeBatchComplete(data) => {
-                    Self::BatchComplete(data.id, data.error_code)
+                    Self::BatchComplete(data.batch_id, data.error_code)
                 }
                 LoreEvent::RevisionTreeNodeInfo(data) => Self::NodeInfo(Box::new(data.clone())),
                 LoreEvent::RevisionTreeChild(data) => {
@@ -815,15 +1011,15 @@ mod tests {
 
     /// An entry adding `name` under `parent_node_id`.
     fn entry(
-        id: u64,
+        entry_id: u64,
         parent_node_id: NodeID,
         name: &str,
         kind: LoreNodeType,
     ) -> LoreRevisionTreeAddEntry {
         LoreRevisionTreeAddEntry {
-            id,
+            entry_id,
             parent_node_id,
-            parent_entry: 0,
+            parent_entry_index: 0,
             name: LoreString::from_str(name),
             kind: kind as u32,
             mode: 0o644,
@@ -832,16 +1028,17 @@ mod tests {
         }
     }
 
-    /// An entry adding `name` under the node entry `parent_entry` creates.
+    /// An entry adding `name` under the node the entry at `parent_entry_index`
+    /// creates.
     fn nested_entry(
         id: u64,
-        parent_entry: u32,
+        parent_entry_index: u32,
         name: &str,
         kind: LoreNodeType,
     ) -> LoreRevisionTreeAddEntry {
         LoreRevisionTreeAddEntry {
             parent_node_id: INVALID_NODE,
-            parent_entry,
+            parent_entry_index,
             ..entry(id, ROOT_NODE, name, kind)
         }
     }
@@ -888,7 +1085,7 @@ mod tests {
         let status = add(
             LoreGlobalArgs::default(),
             LoreRevisionTreeAddArgs {
-                id: CALL_ID,
+                batch_id: CALL_ID,
                 handle,
                 entries: LoreArray::from_vec(entries),
             },
@@ -1257,7 +1454,7 @@ mod tests {
         release(handle, store_handle_id);
     }
 
-    /// A caller id of zero says the entry is not being correlated, so several
+    /// An `entry_id` of zero says the entry is not being correlated, so several
     /// entries may share it while any other repeated id is still a mistake.
     #[tokio::test]
     async fn add_accepts_repeated_zero_caller_ids() {
@@ -1387,9 +1584,6 @@ mod tests {
         let partition = Partition::from([0xbbu8; 16]);
         let (handle, store_handle_id) = load_handle("add-dup-snapshot", partition).await;
 
-        // Enough existing children that the snapshot has to be genuinely ordered
-        // to be searchable: with only a couple, an unordered probe finds the
-        // collision often enough to pass by luck.
         let seeded: Vec<String> = (0..SNAPSHOT_SEED_CHILDREN)
             .map(|index| format!("seed-{index:02}"))
             .collect();

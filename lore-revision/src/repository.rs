@@ -35,7 +35,6 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use futures::future::Shared;
 use lore_base::lore_spawn;
-use lore_base::lore_spawn_blocking;
 use lore_base::lore_spawn_guarded;
 use lore_error_set::prelude::*;
 use lore_transport::Connection;
@@ -43,8 +42,6 @@ use lore_transport::ProtocolError;
 use lore_transport::RepositoryData;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use toml;
@@ -410,6 +407,11 @@ impl Clone for RepositoryRuntimeSettings {
 ///   mutex is not the concurrency boundary; the token exists purely as
 ///   type-level proof of write authorization for the handle API. Gated by
 ///   [`ServerContext`].
+/// - [`InMemory`](Self::InMemory): carries nothing, for the same reason as
+///   `Server` — a path-less context has no per-path mutex to take, and the
+///   only writes it makes are content-addressed store writes and the branch
+///   tip, which the tip compare-and-swap serializes. Gated by
+///   [`InMemoryContext`].
 ///
 /// Tokens are stored as `Option<…>` on `RepositoryContext`; leaf write
 /// sites fetch via `repository.try_write_token().ok_or(WriteRequired)?`.
@@ -417,6 +419,7 @@ impl Clone for RepositoryRuntimeSettings {
 pub enum RepositoryWriteToken {
     Client(Arc<tokio::sync::OwnedMutexGuard<()>>),
     Server,
+    InMemory,
 }
 
 impl RepositoryWriteToken {
@@ -440,6 +443,17 @@ impl RepositoryWriteToken {
         Self::Server
     }
 
+    /// Mint a token for a path-less in-memory context. No mutex is taken —
+    /// there is no working-tree path to key one on.
+    ///
+    /// Gated by [`InMemoryContext`] on the same principle as
+    /// [`server`](Self::server): a crate opts in by implementing the marker
+    /// for one of its own types, so skipping the per-path mutex is a
+    /// compile-time decision rather than a call-site one.
+    pub fn in_memory<C: InMemoryContext>(_: &C) -> Self {
+        Self::InMemory
+    }
+
     /// Produce a sibling token. For [`Client`](Self::Client), the sibling
     /// refcounts the same underlying mutex guard so multi-context commands
     /// keep the mutex held until every sibling drops. For
@@ -456,9 +470,17 @@ impl RepositoryWriteToken {
         match self {
             Self::Client(guard) => Self::Client(guard.clone()),
             Self::Server => Self::Server,
+            Self::InMemory => Self::InMemory,
         }
     }
 }
+
+/// Marker trait that gates [`RepositoryWriteToken::in_memory`].
+///
+/// The counterpart to [`ServerContext`] for path-less in-memory contexts. The
+/// trait body is empty — it exists purely to make "I am an in-memory context" a
+/// compile-time prerequisite for skipping the per-path write mutex.
+pub trait InMemoryContext {}
 
 /// Marker trait that gates [`RepositoryWriteToken::server`].
 ///
@@ -1260,22 +1282,10 @@ async fn save_config(
     config_path: impl AsRef<Path>,
     config: &RepositoryConfig,
 ) -> Result<(), RepositoryError> {
-    let mut config_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(config_path)
-        .await
-        .internal("Failed to save config file")?;
-
     let config_string = toml::to_string_pretty(&config).internal("Failed to save config file")?;
 
-    config_file
-        .write_all(config_string.as_bytes())
-        .await
-        .internal("Failed to save config file")?;
-    config_file
-        .flush()
+    lore_io::IoDriver::global()
+        .write_file_bytes(config_path, bytes::Bytes::from(config_string), false)
         .await
         .internal("Failed to save config file")?;
     Ok(())
@@ -1349,12 +1359,10 @@ pub(crate) async fn get_or_create_repository_lock(
         return Ok(holder);
     }
 
-    // Pin to core: `runtime()` follows the current runtime, and an untimed flock
-    // on net would occupy its single blocking thread.
-    let path_for_lock = dot_path.clone();
-    let lock = lore_spawn_blocking!(move || FSLock::acquire_directory_lock(path_for_lock))
+    // The OS flock is taken with non-blocking attempts and async retries,
+    // so a contended lock never stalls a runtime thread.
+    let lock = Box::pin(FSLock::acquire_directory_lock(dot_path.clone()))
         .await
-        .internal("Failed to get exclusive access to repository")?
         .internal("Failed to get exclusive access to repository")?;
 
     let holder = Arc::new(RepositoryLock { _lock: lock });
@@ -1803,6 +1811,7 @@ pub async fn load_and_connect_with_token(
             None => "None",
             Some(RepositoryWriteToken::Client(_)) => "Some(Client)",
             Some(RepositoryWriteToken::Server) => "Some(Server)",
+            Some(RepositoryWriteToken::InMemory) => "Some(InMemory)",
         },
     );
 
@@ -2135,13 +2144,19 @@ pub async fn load_and_connect_with_token(
         }
 
         if migrated_current {
-            if let Err(err) = tokio::fs::remove_file(&current_anchor_path).await {
+            if let Err(err) = lore_io::IoDriver::global()
+                .remove_file(&current_anchor_path)
+                .await
+            {
                 lore_warn!("Failed to remove old current anchor file: {err}");
             }
             lore_debug!("Migrated file-based current anchor to mutable store");
         }
         if migrated_staged {
-            if let Err(err) = tokio::fs::remove_file(&staged_anchor_path).await {
+            if let Err(err) = lore_io::IoDriver::global()
+                .remove_file(&staged_anchor_path)
+                .await
+            {
                 lore_warn!("Failed to remove old staged anchor file: {err}");
             }
             lore_debug!("Migrated file-based staged anchor to mutable store");
@@ -2184,15 +2199,20 @@ pub async fn create_local(
     let idpath = dotpath.join(ID);
 
     let dotpath_display = dotpath.display().to_string();
-    tokio::fs::create_dir_all(dotpath.as_path())
+    lore_io::IoDriver::global()
+        .create_dir_all(dotpath.as_path())
         .await
         .internal_with(|| {
             format!("Failed to create repository, unable to create directory {dotpath_display}")
         })?;
 
     let idpath_display = idpath.display().to_string();
-    #[allow(clippy::disallowed_methods)] // Authorized repository ID writer.
-    tokio::fs::write(idpath.as_path(), repository.data())
+    lore_io::IoDriver::global()
+        .write_file_bytes(
+            idpath.as_path(),
+            bytes::Bytes::copy_from_slice(repository.data()),
+            false,
+        )
         .await
         .internal_with(|| {
             format!(
@@ -2388,9 +2408,15 @@ async fn branch_switch_create(
     .await
     .forward::<RepositoryError>("Failed to create branch")?;
 
+    // `branch::create` has just seeded the pointer with the branch point; move it
+    // on to the tip the remote reports.
+    let created_at = branch::load_latest(repository.clone(), branch)
+        .await
+        .unwrap_or_default();
     branch::store_latest(
         repository.clone(),
         branch,
+        created_at,
         latest,
         BranchLatestStatus::Divergent,
     )
@@ -2743,9 +2769,15 @@ pub async fn branch_switch(
     }
 
     if !global.dry_run() {
+        // A switch republishes the branch's own local tip; the sync above may have
+        // moved the pointer, so compare against what it holds now.
+        let stored_latest = branch::load_latest(repository.clone(), branch.id)
+            .await
+            .unwrap_or_default();
         branch::store_latest(
             repository.clone(),
             branch.id,
+            stored_latest,
             branch_latest_local,
             if branch_location == LoreBranchLocation::Local {
                 BranchLatestStatus::Divergent
@@ -2872,19 +2904,23 @@ async fn layer_branch_switch(
         // Check if branch already exists in layer repo
         let branch_exists = branch::exist_local(layer_repository.clone(), branch_id).await;
 
-        if !branch_exists {
-            // Create branch in layer repo - mirrors layer_branch_create pattern
+        let layer_current = if branch_exists {
+            None
+        } else {
             let current_revision =
                 state::State::deserialize(layer_repository.clone(), layer.current)
                     .await
                     .forward::<RepositoryError>("Failed to deserialize repository state")?;
             let current_branch = current_revision.branch(layer_repository.clone()).await;
+            Some((current_revision, current_branch))
+        };
 
-            if current_branch == branch_id {
-                // Already on this branch (by ID), skip
-                continue;
-            }
-
+        // Skip only the branch creation, not the layer: a layer already on this
+        // branch can still be behind the branch latest and needs resolving.
+        if let Some((current_revision, current_branch)) = layer_current
+            && current_branch != branch_id
+        {
+            // Create branch in layer repo - mirrors layer_branch_create pattern
             let parent_metadata = branch::metadata(layer_repository.clone(), current_branch)
                 .await
                 .forward::<RepositoryError>("Failed to load branch metadata")?;

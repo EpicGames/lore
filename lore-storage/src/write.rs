@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -8,6 +7,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
+use bytes::BytesMut;
 use dashmap::DashMap;
 use dashmap::Entry;
 use lore_error_set::prelude::*;
@@ -27,11 +27,13 @@ use crate::fragment_flags::FragmentFlags;
 use crate::hash;
 use crate::immutable_store::ImmutableStore;
 use crate::immutable_store::StoreError;
+use crate::immutable_store::query_one;
 use crate::options::ReadOptions;
 use crate::options::WriteOptions;
 use crate::read::load_fragment;
+use crate::store_types::StoreGetData;
 use crate::store_types::StoreMatch;
-use crate::store_types::StoreQueryResult;
+use crate::store_types::StoreMatchResult;
 use crate::typed_bytes::TypedBytes;
 use crate::types::Address;
 use crate::types::Context;
@@ -169,9 +171,24 @@ pub async fn wait_if_in_flight(partition: Partition, address: Address) {
 }
 
 /// Result of a [`store_fragment`] operation.
+///
+/// The stored representation is deliberately not reported. A dispatched write returns before its
+/// leader has compressed anything, so the only representation available at that point is the one
+/// the caller passed in, and handing that back says nothing the caller did not already know. What
+/// the caller cannot know is where the payload ended up, which is what this carries instead.
+///
+/// The two storage flags describe the state as of this call returning, so a dispatched write
+/// reports both as `false`: its leader has not run yet.
 pub struct StoreResult {
     pub address: Address,
-    pub fragment: Fragment,
+    /// Size of the uncompressed and reassembled content the address stands for. Invariant across
+    /// compression, chunking and deduplication, so it is the one size worth reporting.
+    pub size_content: u64,
+    /// Whether the local store holds the payload.
+    pub stored_local: bool,
+    /// Whether the payload reached durable storage.
+    pub stored_durable: bool,
+    /// Whether the content was already stored, so no upload was needed.
     pub deduplicated: bool,
 }
 
@@ -286,9 +303,26 @@ pub async fn store_fragment(
     };
 
     if let (Some(tracker), Ok(result)) = (observer, &result) {
-        tracker.notify_fragment(&result.fragment, result.deduplicated);
+        tracker.notify_fragment(&observed_fragment(fragment, result), result.deduplicated);
     }
     result
+}
+
+/// The fragment to hand a write observer: the caller's representation, marked with where the
+/// payload ended up.
+///
+/// The representation has to come from the caller. An observer is only installed on a tracker, a
+/// tracker always dispatches, and a dispatched write reports before its leader compresses, so
+/// there is no stored representation to report yet.
+fn observed_fragment(fragment: Fragment, result: &StoreResult) -> Fragment {
+    let mut flags = fragment.flags;
+    if result.stored_local {
+        flags |= FragmentFlags::PayloadStoredLocal;
+    }
+    if result.stored_durable {
+        flags |= FragmentFlags::PayloadStoredDurable;
+    }
+    Fragment { flags, ..fragment }
 }
 
 /// Backward-compatible synchronous fragment store. Acquires the in-flight
@@ -311,7 +345,7 @@ async fn store_fragment_inline(
     remote_session: Option<Arc<StorageSession>>,
     permit: Option<OwnedSemaphorePermit>,
 ) -> Result<StoreResult, StorageError> {
-    let query = query_match_full(&store, partition, address).await;
+    let query = resolve_or_absent(&store, partition, address).await;
     let deduplicated = query.match_made != StoreMatch::MatchNone;
     let (stored_local, stored_durable) = stored_flags(&query);
 
@@ -324,7 +358,9 @@ async fn store_fragment_inline(
     ) {
         return Ok(StoreResult {
             address,
-            fragment: query.fragment,
+            size_content: fragment.size_content,
+            stored_local,
+            stored_durable,
             deduplicated: true,
         });
     }
@@ -332,7 +368,7 @@ async fn store_fragment_inline(
     // Local-only fast path: skip STORE_IN_FLIGHT entirely. No follower notification needed,
     // no leader-token rendezvous — just compress+write inline.
     if remote_session.is_none() {
-        let (_, final_fragment) = leader_body(
+        let (stored_local, stored_durable) = leader_body(
             store,
             partition,
             address,
@@ -347,7 +383,9 @@ async fn store_fragment_inline(
         .await?;
         return Ok(StoreResult {
             address,
-            fragment: final_fragment,
+            size_content: fragment.size_content,
+            stored_local,
+            stored_durable,
             deduplicated,
         });
     }
@@ -362,16 +400,14 @@ async fn store_fragment_inline(
         drop(permit);
         return Ok(StoreResult {
             address,
-            fragment: if query.match_made == StoreMatch::MatchFull {
-                query.fragment
-            } else {
-                fragment
-            },
+            size_content: fragment.size_content,
+            stored_local,
+            stored_durable,
             deduplicated: true,
         });
     };
 
-    let (_, final_fragment) = leader_body(
+    let (stored_local, stored_durable) = leader_body(
         store,
         partition,
         address,
@@ -386,7 +422,9 @@ async fn store_fragment_inline(
     .await?;
     Ok(StoreResult {
         address,
-        fragment: final_fragment,
+        size_content: fragment.size_content,
+        stored_local,
+        stored_durable,
         deduplicated,
     })
 }
@@ -414,13 +452,15 @@ async fn store_fragment_dispatched(
             tracker.register_follower(follower_future(store.clone(), partition, address, token));
             return Ok(StoreResult {
                 address,
-                fragment,
+                size_content: fragment.size_content,
+                stored_local: false,
+                stored_durable: false,
                 deduplicated: true,
             });
         }
     };
 
-    let query = query_match_full(&store, partition, address).await;
+    let query = resolve_or_absent(&store, partition, address).await;
     let (stored_local, stored_durable) = stored_flags(&query);
 
     if is_fully_satisfied(
@@ -435,7 +475,9 @@ async fn store_fragment_dispatched(
         drop(permit);
         return Ok(StoreResult {
             address,
-            fragment: query.fragment,
+            size_content: fragment.size_content,
+            stored_local,
+            stored_durable,
             deduplicated: true,
         });
     }
@@ -456,45 +498,43 @@ async fn store_fragment_dispatched(
             permit,
         )
         .await
+        .map(|_stored| ())
     });
     Ok(StoreResult {
         address,
-        fragment,
+        size_content: fragment.size_content,
+        stored_local: false,
+        stored_durable: false,
         deduplicated,
     })
 }
 
-async fn query_match_full(
+async fn resolve_or_absent(
     store: &Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
-) -> StoreQueryResult {
-    store
-        .clone()
-        .query(partition, address, StoreMatch::MatchFull)
+) -> StoreMatchResult {
+    query_one(store, partition, address)
         .await
-        .unwrap_or(StoreQueryResult {
-            fragment: Fragment::default(),
-            match_made: StoreMatch::MatchNone,
-        })
+        .unwrap_or_default()
 }
 
-fn stored_flags(query: &StoreQueryResult) -> (bool, bool) {
-    let stored_local = query.match_made != StoreMatch::MatchNone
-        && query.fragment.flags & FragmentFlags::PayloadStoredLocal != 0;
-    let stored_durable = query.match_made == StoreMatch::MatchFull
-        && query.fragment.flags & FragmentFlags::PayloadStoredDurable != 0;
-    (stored_local, stored_durable)
+/// Durability only counts for this address when this address is what matched. The same content
+/// under another partition is durable without our association being, and an upload skipped on that
+/// basis would leave the address registered nowhere.
+fn stored_flags(resolved: &StoreMatchResult) -> (bool, bool) {
+    let stored_durable = resolved.match_made == StoreMatch::MatchFull && resolved.stored_durable;
+    (resolved.stored_local, stored_durable)
 }
 
 fn is_fully_satisfied(
-    query: &StoreQueryResult,
+    resolved: &StoreMatchResult,
     cache_local: bool,
     stored_local: bool,
     remote_session: &Option<Arc<StorageSession>>,
     stored_durable: bool,
 ) -> bool {
-    query.match_made == StoreMatch::MatchFull
+    resolved.match_made == StoreMatch::MatchFull
         && (!cache_local || stored_local)
         && (remote_session.is_none() || stored_durable)
 }
@@ -502,11 +542,13 @@ fn is_fully_satisfied(
 /// The "work" portion of [`store_fragment`]: optionally load existing local
 /// payload, compress, attempt remote upload, and write the terminal entry.
 ///
+/// Returns where the payload ended up, as `(stored_local, stored_durable)`.
+///
 /// `guard` is the in-flight token the caller acquired before invoking this function. When
 /// `None`, no in-flight machinery is in play (the local-only fast path that bypasses the
 /// dedup token entirely — see [`store_fragment_inline`]). When `Some`, dropping the guard at
 /// the end cancels the token and wakes any followers subscribed to this write.
-#[allow(clippy::too_many_arguments, unused_assignments)]
+#[allow(clippy::too_many_arguments)]
 async fn leader_body(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
@@ -515,18 +557,19 @@ async fn leader_body(
     mut buffer: Bytes,
     cache_local: bool,
     remote_session: Option<Arc<StorageSession>>,
-    query: StoreQueryResult,
+    query: StoreMatchResult,
     guard: Option<StoreInFlightGuard>,
     permit: Option<OwnedSemaphorePermit>,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<(bool, bool), StorageError> {
     let (mut stored_local, mut stored_durable) = stored_flags(&query);
 
     // For a partial match try loading the payload from local store instead of recompressing
     if stored_local {
         if let Ok((stored_fragment, stored_buffer)) = store
             .clone()
-            .get(partition, address, StoreMatch::MatchHash)
+            .get(partition, address)
             .await
+            .and_then(StoreGetData::into_payload)
         {
             let loaded_hash =
                 hash::hash_fragment(stored_fragment, stored_buffer.as_ref()).unwrap_or_default();
@@ -589,12 +632,13 @@ async fn leader_body(
         drop(permit);
         (None, None)
     };
+    stored_local |= payload.is_some();
 
     write_raw(store, partition, address, fragment, payload).await?;
 
     drop(permit);
     drop(guard);
-    Ok((address, fragment))
+    Ok((stored_local, stored_durable))
 }
 
 /// Store a raw fragment locally (no remote, no event emission).
@@ -606,7 +650,7 @@ pub async fn store_raw_local(
     fragment: Fragment,
     buffer: Bytes,
     cache_local: bool,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<Address, StorageError> {
     let result = store_fragment(
         store,
         partition,
@@ -619,7 +663,7 @@ pub async fn store_raw_local(
         None,
     )
     .await?;
-    Ok((result.address, result.fragment))
+    Ok(result.address)
 }
 
 /// Content writes running now, and the most that have run at once since the peak was reset.
@@ -677,7 +721,7 @@ pub async fn write_content(
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<WriteTracker>>,
     permit: Option<OwnedSemaphorePermit>,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<Address, StorageError> {
     let _in_flight = ContentWriteGuard::new();
     // Check if data should be a single fragment
     if buffer.len() <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
@@ -707,7 +751,7 @@ pub async fn write_content(
             permit,
         )
         .await?;
-        Ok((result.address, result.fragment))
+        Ok(result.address)
     } else {
         write_fragmented(
             store,
@@ -727,6 +771,11 @@ pub async fn write_content(
 /// Write content from a file.
 ///
 /// Takes a store, partition, and optional remote session directly.
+///
+/// Returns the address and the size of the content behind it. The size is reported because a
+/// caller that hands over a path has no other way to learn what was actually written: stating the
+/// file again afterwards answers for the file as it is then, not for the bytes this address
+/// stands for.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_from_file(
     store: Arc<dyn ImmutableStore>,
@@ -736,7 +785,7 @@ pub async fn write_from_file(
     flags: WriteOptions,
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<WriteTracker>>,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<(Address, u64), StorageError> {
     let _in_flight = ContentWriteGuard::new();
     let _count_permit = file_count_limit_acquire()
         .await
@@ -767,7 +816,7 @@ pub async fn write_from_file(
                 context,
                 hash: Hash::new_zeroed(),
             },
-            Fragment::new_zeroed(),
+            0,
         ));
     }
 
@@ -775,12 +824,10 @@ pub async fn write_from_file(
     let size = size as usize;
     if size <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
         let read_permit = crate::concurrency::acquire_fragment_memory_permit(size).await;
-        let buffer = crate::chunker::read_range(file, 0, size)
-            .await
-            .map_err(|e| {
-                StorageError::internal_with_context(e, &format!("read file: {}", path.display()))
-            })?;
-        return write_content(
+        let buffer = file.read_exact_at(size, 0).await.map_err(|e| {
+            StorageError::internal_with_context(e, &format!("read file: {}", path.display()))
+        })?;
+        let address = write_content(
             store,
             partition,
             context,
@@ -790,10 +837,11 @@ pub async fn write_from_file(
             tracker,
             read_permit,
         )
-        .await;
+        .await?;
+        return Ok((address, size as u64));
     }
 
-    crate::fragment_engine::write_fragmented_from_file(
+    let address = crate::fragment_engine::write_fragmented_from_file(
         store,
         partition,
         context,
@@ -804,7 +852,8 @@ pub async fn write_from_file(
         remote_session,
         tracker,
     )
-    .await
+    .await?;
+    Ok((address, size as u64))
 }
 
 /// Hash a file's content, using previous fragmentation hints when available.
@@ -825,7 +874,7 @@ pub async fn hash_file(
         .forward::<StorageError>("permit failed")?;
 
     let path = path.as_ref();
-    let Ok(metadata) = tokio::fs::metadata(path).await else {
+    let Ok(metadata) = lore_io::IoDriver::global().metadata(path).await else {
         return Err(StorageError::internal(format!(
             "failed to query file metadata: {}",
             path.display()
@@ -841,10 +890,13 @@ pub async fn hash_file(
         return Ok(Hash::new_zeroed());
     }
     if file_size <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
-        let data = tokio::fs::read(path).await.map_err(|e| {
-            StorageError::internal_with_context(e, &format!("read file: {}", path.display()))
-        })?;
-        return Ok(Hash::hash_buffer(data.as_slice()));
+        let data = lore_io::IoDriver::global()
+            .read_file_bytes(path)
+            .await
+            .map_err(|e| {
+                StorageError::internal_with_context(e, &format!("read file: {}", path.display()))
+            })?;
+        return Ok(Hash::hash_buffer(&data));
     }
 
     // Large files: try loading previous fragmentation to compare chunk hashes.
@@ -880,10 +932,14 @@ pub async fn hash_file(
 
     // Chunks are read on demand, so a mismatch early in the list stops after reading only
     // the chunks it compared.
+    // Opened rather than measured again: the size above is the one the chunker is opened at.
     let mut retry = crate::retry(10, 10_000, 10);
-    let (file, _size) = loop {
-        match crate::chunker::open_read(path).await {
-            Ok(result) => break result,
+    let file = loop {
+        match lore_io::IoDriver::global()
+            .open(path, &lore_io::OpenOptions::new().read(true))
+            .await
+        {
+            Ok(file) => break file,
             Err(err) => {
                 if !retry.wait().await {
                     return Err(StorageError::internal_with_context(
@@ -917,7 +973,7 @@ pub async fn hash_file(
         }
     }
 
-    let (address, _) = crate::fragment_engine::write_fragmented_from_file(
+    let address = crate::fragment_engine::write_fragmented_from_file(
         store,
         partition,
         previous.context,
@@ -943,7 +999,46 @@ const HASH_WINDOW_SIZE: usize = 2 * crate::compress::FRAGMENT_SIZE_THRESHOLD;
 /// Bytes of the file that are resident, and where they start in it.
 struct HashWindow {
     offset: u64,
-    data: Bytes,
+    data: BytesMut,
+}
+
+/// The buffer for a read of `want` bytes: the window just retired, or a fresh one sized to the
+/// largest this file needs. `capacity` bounds every window, so a retired one always fits.
+fn take_window(spare: &mut Option<BytesMut>, capacity: usize, want: usize) -> BytesMut {
+    let mut buffer = spare
+        .take()
+        // SAFETY: the read below fills the buffer before anything reads a byte of it.
+        .unwrap_or_else(|| unsafe { lore_io::uninit_buffer(capacity) });
+    debug_assert!(buffer.capacity() >= want, "window smaller than the read");
+    // SAFETY: capacity covers `want`, and the read fills all of it before it is hashed.
+    unsafe { buffer.set_len(want) };
+    buffer
+}
+
+/// Start a window read without waiting for it, so it overlaps the hashing of the window
+/// already held. The buffer is filled whole, the walk having no headroom to carry, and the read
+/// hands it back. Dropping the handle detaches the read, which the engine completes and then
+/// frees its buffer.
+fn start_window_read(
+    file: &lore_io::IoFile,
+    buffer: BytesMut,
+    offset: u64,
+) -> JoinHandle<std::io::Result<BytesMut>> {
+    let file = file.clone();
+    let want = buffer.len();
+    lore_base::lore_spawn!(async move {
+        let window = file
+            .read_exact_vectored_at(
+                crate::chunker::WindowRead {
+                    buffer,
+                    start: 0,
+                    want,
+                },
+                offset,
+            )
+            .await?;
+        Ok(window.buffer)
+    })
 }
 
 impl HashWindow {
@@ -1021,7 +1116,7 @@ struct SublistSource<'a> {
 async fn previous_chunks_still_match(
     sublists: SublistSource<'_>,
     path: &Path,
-    file: &Arc<File>,
+    file: &lore_io::IoFile,
     file_size: u64,
     previous_fragmentation: &[FragmentReference],
 ) -> Result<bool, StorageError> {
@@ -1038,16 +1133,11 @@ async fn previous_chunks_still_match(
     };
     let _reservation = crate::concurrency::acquire_fragment_memory_permit(windows * capacity).await;
 
-    let read_at = |offset: u64| {
-        crate::chunker::start_read_range(
-            Arc::clone(file),
-            offset,
-            (file_size - offset).min(HASH_WINDOW_SIZE as u64) as usize,
-        )
-    };
+    let window_length = |offset: u64| (file_size - offset).min(HASH_WINDOW_SIZE as u64) as usize;
 
     let mut window: Option<HashWindow> = None;
-    let mut pending: Option<(JoinHandle<std::io::Result<Bytes>>, u64)> = None;
+    let mut pending: Option<(JoinHandle<std::io::Result<BytesMut>>, u64)> = None;
+    let mut spare: Option<BytesMut> = None;
     let mut index = 0;
 
     while index < chunks.len() {
@@ -1120,15 +1210,20 @@ async fn previous_chunks_still_match(
         let resident = match window.take() {
             Some(resident) if resident.holds(start, end) => resident,
             stale_window => {
-                drop(stale_window);
+                // The window it held is the one the next read fills.
+                if let Some(stale) = stale_window {
+                    spare = Some(stale.data);
+                }
                 let read = match pending.take() {
                     Some((task, offset)) if offset == start => task,
                     other => {
                         // Unreachable while the list ascends, since a spliced sublist tiles
                         // the range it replaces. Kept because the failure it would allow is
-                        // silent: "unchanged" for a file never compared.
+                        // silent: "unchanged" for a file never compared. The detached read
+                        // takes its buffer with it, so this one starts from a fresh window.
                         drop(other);
-                        read_at(start)
+                        let buffer = take_window(&mut spare, capacity, window_length(start));
+                        start_window_read(file, buffer, start)
                     }
                 };
                 let data = read
@@ -1150,7 +1245,8 @@ async fn previous_chunks_still_match(
                 // Started before anything in this window is hashed, so the two overlap.
                 if let Some(offset) = next_window_offset(&chunks, index, resident.end(), file_size)
                 {
-                    pending = Some((read_at(offset), offset));
+                    let buffer = take_window(&mut spare, capacity, window_length(offset));
+                    pending = Some((start_window_read(file, buffer, offset), offset));
                 }
                 resident
             }
@@ -1178,7 +1274,7 @@ async fn previous_chunks_still_match(
 /// Follower future: waits for the leader token to fire, then observes the
 /// terminal store state for `address`.
 ///
-/// Returns `Ok((address, fragment))` if the store now holds a full-match entry
+/// Returns `Ok(())` if the store now holds a full-match entry
 /// with either [`PayloadStoredDurable`](FragmentFlags::PayloadStoredDurable) or
 /// [`PayloadStoredLocal`](FragmentFlags::PayloadStoredLocal) set. Returns an
 /// internal error if no terminal entry exists — that means the leader errored
@@ -1191,17 +1287,14 @@ pub async fn follower_future(
     partition: Partition,
     address: Address,
     token: CancellationToken,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<(), StorageError> {
     token.cancelled().await;
-    match store.query(partition, address, StoreMatch::MatchFull).await {
-        Ok(result)
-            if result.match_made == StoreMatch::MatchFull
-                && (result.fragment.flags
-                    & (FragmentFlags::PayloadStoredDurable.bits()
-                        | FragmentFlags::PayloadStoredLocal.bits()))
-                    != 0 =>
+    match query_one(&store, partition, address).await {
+        Ok(resolved)
+            if resolved.match_made == StoreMatch::MatchFull
+                && (resolved.stored_local || resolved.stored_durable) =>
         {
-            Ok((address, result.fragment))
+            Ok(())
         }
         _ => Err(StorageError::internal(format!(
             "leader upload failed for {address}"
@@ -1280,14 +1373,9 @@ mod tests {
 
         let token = CancellationToken::new();
         token.cancel();
-        let result = follower_future(store, partition, address, token).await;
-        let (addr, frag) = result.expect("follower should observe terminal entry");
-        assert_eq!(addr, address);
-        assert_ne!(
-            frag.flags & FragmentFlags::PayloadStoredLocal.bits(),
-            0,
-            "expected PayloadStoredLocal flag"
-        );
+        follower_future(store, partition, address, token)
+            .await
+            .expect("follower should observe terminal entry stored locally");
     }
 
     #[tokio::test]
@@ -1340,16 +1428,10 @@ mod tests {
             .expect("put terminal entry");
         token.cancel();
 
-        let (addr, frag) = follower
+        follower
             .await
             .expect("join follower")
-            .expect("follower observed terminal entry");
-        assert_eq!(addr, address);
-        assert_ne!(
-            frag.flags & FragmentFlags::PayloadStoredDurable.bits(),
-            0,
-            "expected PayloadStoredDurable flag"
-        );
+            .expect("follower observed terminal entry stored durably");
     }
 
     fn make_input(seed: u8) -> (Partition, Address, Fragment, Bytes) {
@@ -1392,7 +1474,7 @@ mod tests {
 
         // Entry should be present in the store after the call returns.
         let query = store
-            .query(partition, address, StoreMatch::MatchFull)
+            .get_metadata(partition, address)
             .await
             .expect("query after sync write");
         assert_eq!(query.match_made, StoreMatch::MatchFull);
@@ -1436,10 +1518,9 @@ mod tests {
         .expect("store_fragment against already-durable entry");
 
         assert!(result.deduplicated, "should dedup on already-durable");
-        assert_ne!(
-            result.fragment.flags & FragmentFlags::PayloadStoredDurable.bits(),
-            0,
-            "returned fragment should carry PayloadStoredDurable"
+        assert!(
+            result.stored_durable,
+            "result should report the entry as durable"
         );
         // Tracker should have no outstanding work.
         assert!(tracker.await_all().await.is_ok());
@@ -1509,7 +1590,7 @@ mod tests {
 
         // After await_all, the entry should be in the store.
         let query = store
-            .query(partition, address, StoreMatch::MatchFull)
+            .get_metadata(partition, address)
             .await
             .expect("query after leader completed");
         assert_eq!(query.match_made, StoreMatch::MatchFull);
@@ -1530,43 +1611,27 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ImmutableStore for FailingPutStore {
-        fn is_local(&self) -> bool {
-            self.inner.clone().is_local()
-        }
-
-        async fn exist(
+        async fn get_metadata(
             self: Arc<Self>,
             partition: Partition,
             address: Address,
-            match_requested: crate::store_types::StoreMatch,
-        ) -> Result<crate::store_types::StoreMatch, StoreError> {
-            self.inner
-                .clone()
-                .exist(partition, address, match_requested)
-                .await
+        ) -> Result<StoreGetData, StoreError> {
+            self.inner.clone().get_metadata(partition, address).await
         }
 
-        async fn exist_batch(
-            self: Arc<Self>,
-            partition: Partition,
-            addresses: &[Address],
-            match_requested: crate::store_types::StoreMatch,
-        ) -> Result<Vec<crate::store_types::StoreMatch>, StoreError> {
-            self.inner
-                .clone()
-                .exist_batch(partition, addresses, match_requested)
-                .await
+        fn is_local(&self) -> bool {
+            self.inner.clone().is_local()
         }
 
         async fn query(
             self: Arc<Self>,
             partition: Partition,
-            address: Address,
-            match_requested: StoreMatch,
-        ) -> Result<StoreQueryResult, StoreError> {
+            addresses: &[Address],
+            results: &mut [StoreMatchResult],
+        ) -> Result<(), StoreError> {
             self.inner
                 .clone()
-                .query(partition, address, match_requested)
+                .query(partition, addresses, results)
                 .await
         }
 
@@ -1574,12 +1639,8 @@ mod tests {
             self: Arc<Self>,
             partition: Partition,
             address: Address,
-            match_required: StoreMatch,
-        ) -> Result<(Fragment, Bytes), StoreError> {
-            self.inner
-                .clone()
-                .get(partition, address, match_required)
-                .await
+        ) -> Result<StoreGetData, StoreError> {
+            self.inner.clone().get(partition, address).await
         }
 
         async fn put(
@@ -1689,11 +1750,10 @@ mod tests {
 
         // After await_all returns, no terminal entry exists — confirming the
         // leader's failure left the store in its original empty state.
-        let query = failing
-            .query(partition, address, StoreMatch::MatchFull)
+        let resolved = query_one(&(failing as Arc<dyn ImmutableStore>), partition, address)
             .await
-            .expect("query on empty store");
-        assert_eq!(query.match_made, StoreMatch::MatchNone);
+            .expect("resolve on empty store");
+        assert_eq!(resolved.match_made, StoreMatch::MatchNone);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1751,7 +1811,7 @@ mod tests {
 
         // Exactly one terminal entry exists in the store.
         let query = store
-            .query(partition, address, StoreMatch::MatchFull)
+            .get_metadata(partition, address)
             .await
             .expect("query after concurrent writers");
         assert_eq!(query.match_made, StoreMatch::MatchFull);
@@ -1805,10 +1865,7 @@ mod tests {
             .await
             .expect("tracker await_all succeeds");
 
-        let query = store
-            .query(partition, address, StoreMatch::MatchFull)
-            .await
-            .expect("query");
+        let query = store.get_metadata(partition, address).await.expect("query");
         assert_eq!(query.match_made, StoreMatch::MatchFull);
     }
 
@@ -1824,43 +1881,27 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ImmutableStore for DelayingPutStore {
-        fn is_local(&self) -> bool {
-            self.inner.clone().is_local()
-        }
-
-        async fn exist(
+        async fn get_metadata(
             self: Arc<Self>,
             partition: Partition,
             address: Address,
-            match_requested: crate::store_types::StoreMatch,
-        ) -> Result<crate::store_types::StoreMatch, StoreError> {
-            self.inner
-                .clone()
-                .exist(partition, address, match_requested)
-                .await
+        ) -> Result<StoreGetData, StoreError> {
+            self.inner.clone().get_metadata(partition, address).await
         }
 
-        async fn exist_batch(
-            self: Arc<Self>,
-            partition: Partition,
-            addresses: &[Address],
-            match_requested: crate::store_types::StoreMatch,
-        ) -> Result<Vec<crate::store_types::StoreMatch>, StoreError> {
-            self.inner
-                .clone()
-                .exist_batch(partition, addresses, match_requested)
-                .await
+        fn is_local(&self) -> bool {
+            self.inner.clone().is_local()
         }
 
         async fn query(
             self: Arc<Self>,
             partition: Partition,
-            address: Address,
-            match_requested: StoreMatch,
-        ) -> Result<StoreQueryResult, StoreError> {
+            addresses: &[Address],
+            results: &mut [StoreMatchResult],
+        ) -> Result<(), StoreError> {
             self.inner
                 .clone()
-                .query(partition, address, match_requested)
+                .query(partition, addresses, results)
                 .await
         }
 
@@ -1868,12 +1909,8 @@ mod tests {
             self: Arc<Self>,
             partition: Partition,
             address: Address,
-            match_required: StoreMatch,
-        ) -> Result<(Fragment, Bytes), StoreError> {
-            self.inner
-                .clone()
-                .get(partition, address, match_required)
-                .await
+        ) -> Result<StoreGetData, StoreError> {
+            self.inner.clone().get(partition, address).await
         }
 
         async fn put(
@@ -2071,43 +2108,27 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ImmutableStore for CountingPutStore {
-        fn is_local(&self) -> bool {
-            self.inner.clone().is_local()
-        }
-
-        async fn exist(
+        async fn get_metadata(
             self: Arc<Self>,
             partition: Partition,
             address: Address,
-            match_requested: StoreMatch,
-        ) -> Result<StoreMatch, StoreError> {
-            self.inner
-                .clone()
-                .exist(partition, address, match_requested)
-                .await
+        ) -> Result<StoreGetData, StoreError> {
+            self.inner.clone().get_metadata(partition, address).await
         }
 
-        async fn exist_batch(
-            self: Arc<Self>,
-            partition: Partition,
-            addresses: &[Address],
-            match_requested: StoreMatch,
-        ) -> Result<Vec<StoreMatch>, StoreError> {
-            self.inner
-                .clone()
-                .exist_batch(partition, addresses, match_requested)
-                .await
+        fn is_local(&self) -> bool {
+            self.inner.clone().is_local()
         }
 
         async fn query(
             self: Arc<Self>,
             partition: Partition,
-            address: Address,
-            match_requested: StoreMatch,
-        ) -> Result<StoreQueryResult, StoreError> {
+            addresses: &[Address],
+            results: &mut [StoreMatchResult],
+        ) -> Result<(), StoreError> {
             self.inner
                 .clone()
-                .query(partition, address, match_requested)
+                .query(partition, addresses, results)
                 .await
         }
 
@@ -2115,12 +2136,8 @@ mod tests {
             self: Arc<Self>,
             partition: Partition,
             address: Address,
-            match_required: StoreMatch,
-        ) -> Result<(Fragment, Bytes), StoreError> {
-            self.inner
-                .clone()
-                .get(partition, address, match_required)
-                .await
+        ) -> Result<StoreGetData, StoreError> {
+            self.inner.clone().get(partition, address).await
         }
 
         async fn put(

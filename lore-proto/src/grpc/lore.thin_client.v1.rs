@@ -111,6 +111,12 @@ pub struct TreeNode {
     /// Content address for FILE / LINK entries; unused for DIRECTORY.
     #[prost(message, optional, tag = "3")]
     pub address: ::core::option::Option<crate::lore::model::v1::Address>,
+    /// Original size in bytes. For DIRECTORY entries, this is the cumulative size of its descendant files.
+    #[prost(uint64, tag = "4")]
+    pub size: u64,
+    /// File mode for this entry. For possible flags and values, see enum FileMode.
+    #[prost(uint64, tag = "5")]
+    pub mode: u64,
 }
 impl ::prost::Name for TreeNode {
     const NAME: &'static str = "TreeNode";
@@ -382,6 +388,35 @@ impl NodeType {
             "DIRECTORY" => Some(Self::Directory),
             "FILE" => Some(Self::File),
             "LINK" => Some(Self::Link),
+            _ => None,
+        }
+    }
+}
+/// File mode for a file-system entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FileMode {
+    /// No special file mode.
+    None = 0,
+    /// File is executable.
+    Executable = 1,
+}
+impl FileMode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::None => "NONE",
+            Self::Executable => "EXECUTABLE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "NONE" => Some(Self::None),
+            "EXECUTABLE" => Some(Self::Executable),
             _ => None,
         }
     }

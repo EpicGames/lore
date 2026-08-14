@@ -138,42 +138,40 @@ async fn load_revision(
     let mut committed_by = String::default();
     let mut metadata_entries: Vec<thin_client_v1::Metadata> = Vec::new();
 
-    metadata
-        .walk(|key, value, value_type| {
-            let key = match std::str::from_utf8(key) {
-                Ok(k) => k,
-                Err(_) => return,
-            };
-            match key {
-                metadata::MESSAGE => {
-                    commit_message = std::str::from_utf8(value).unwrap_or_default().to_string();
-                }
-                metadata::TIMESTAMP => {
-                    if value.len() == std::mem::size_of::<u64>() {
-                        timestamp = u64::from_le_bytes(value.try_into().unwrap());
-                    }
-                }
-                metadata::CREATED_BY => {
-                    if let Ok(value) = std::str::from_utf8(value) {
-                        created_by = value.to_string();
-                    }
-                }
-                metadata::COMMITTED_BY => {
-                    if let Ok(value) = std::str::from_utf8(value) {
-                        committed_by = value.to_string();
-                    }
-                }
-                // Branch is surfaced via `identifier.branch_id`; not echoed
-                // again as a generic metadata entry.
-                metadata::BRANCH => {}
-                _ => {
-                    if let Some(entry) = encode_metadata_entry(key, value, value_type) {
-                        metadata_entries.push(entry);
-                    }
+    metadata.walk(|key, value, value_type| {
+        let key = match std::str::from_utf8(key) {
+            Ok(k) => k,
+            Err(_) => return,
+        };
+        match key {
+            metadata::MESSAGE => {
+                commit_message = std::str::from_utf8(value).unwrap_or_default().to_string();
+            }
+            metadata::TIMESTAMP => {
+                if value.len() == std::mem::size_of::<u64>() {
+                    timestamp = u64::from_le_bytes(value.try_into().unwrap());
                 }
             }
-        })
-        .ok();
+            metadata::CREATED_BY => {
+                if let Ok(value) = std::str::from_utf8(value) {
+                    created_by = value.to_string();
+                }
+            }
+            metadata::COMMITTED_BY => {
+                if let Ok(value) = std::str::from_utf8(value) {
+                    committed_by = value.to_string();
+                }
+            }
+            // Branch is surfaced via `identifier.branch_id`; not echoed
+            // again as a generic metadata entry.
+            metadata::BRANCH => {}
+            _ => {
+                if let Some(entry) = encode_metadata_entry(key, value, value_type) {
+                    metadata_entries.push(entry);
+                }
+            }
+        }
+    });
 
     Ok(thin_client_v1::Revision {
         signature: signature.into(),

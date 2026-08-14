@@ -26,15 +26,20 @@ use crate::fs::filesystem_provider::FilesystemPath;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::hash;
 use crate::interface::LoreString;
+use crate::link::LinkFlags;
+use crate::lore::BranchId;
+use crate::lore::RepositoryId;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_error;
 use crate::lore_info;
 use crate::lore_trace;
+use crate::lore_warn;
 use crate::node::Node;
 use crate::node::NodeBlock;
 use crate::node::NodeFileMode;
 use crate::node::NodeFlags;
+use crate::node::NodeID;
 use crate::node::NodeIDExt;
 use crate::node::NodeLink;
 use crate::node::ROOT_NODE;
@@ -1144,6 +1149,16 @@ async fn realize_changes_delete(
                 )
                 .await
                 .forward::<SyncError>("Failed to stage change")?;
+
+                if is_link {
+                    remove_link_registry_entry(
+                        &change.from.repository,
+                        &state_stage,
+                        change.from.address.context.into(),
+                        node_link.node,
+                    )
+                    .await?;
+                }
             }
         }
     }
@@ -1258,6 +1273,96 @@ async fn sync_execute_modify_add(
         Err(err)
     } else {
         Ok(())
+    }
+}
+
+/// Record a link node the change just staged in the staged state's link registry.
+///
+/// Only a link the registry has never seen gets an entry. One already there is
+/// owned by [`stage_link_pin`](crate::link::stage_link_pin) and
+/// [`update_link_pin_by_node`](crate::link::update_link_pin_by_node).
+async fn stage_link_registry_entry(
+    repository: &Arc<RepositoryContext>,
+    state_stage: &Arc<State>,
+    change: &NodeChange,
+    node: Node,
+    staged_node: NodeID,
+) -> Result<(), SyncError> {
+    let link_id: RepositoryId = node.address.context.into();
+
+    if state_stage
+        .link_find(repository.clone(), link_id, staged_node)
+        .await
+        .is_ok()
+    {
+        lore_trace!(
+            "Link {link_id} at {} is already in the registry",
+            change.path
+        );
+        return Ok(());
+    }
+
+    let (branch, flags) = match change
+        .to
+        .state
+        .link_find(change.to.repository.clone(), link_id, change.to.node)
+        .await
+    {
+        Ok(reference) => (
+            reference.branch,
+            LinkFlags::from_bits_retain(reference.flags),
+        ),
+        Err(err) => {
+            lore_warn!(
+                "Incoming state has no link registry entry for link {link_id} at {}: {err}. Tracking the parent branch",
+                change.path
+            );
+            (BranchId::default(), LinkFlags::NoFlags)
+        }
+    };
+
+    lore_debug!(
+        "Adding link {link_id} at {} to the link registry, node {staged_node} revision {} branch {branch}",
+        change.path,
+        node.address.hash
+    );
+
+    state_stage
+        .link_add(
+            repository.clone(),
+            link_id,
+            branch,
+            node.address.hash,
+            staged_node,
+            flags,
+        )
+        .await
+        .forward_with::<SyncError, _>(|| {
+            format!(
+                "Failed to add link {link_id} at {} to the link registry",
+                change.path
+            )
+        })
+}
+
+/// Drop a deleted link node's [`LinkReference`](crate::state::LinkReference)
+/// from the staged state's link registry.
+async fn remove_link_registry_entry(
+    repository: &Arc<RepositoryContext>,
+    state_stage: &Arc<State>,
+    link_id: RepositoryId,
+    node_id: NodeID,
+) -> Result<(), SyncError> {
+    match state_stage
+        .link_remove(repository.clone(), link_id, node_id)
+        .await
+    {
+        Ok(()) => {
+            lore_debug!("Removed link {link_id} node {node_id} from the link registry");
+            Ok(())
+        }
+        Err(err) if err.is_link_not_found() => Ok(()),
+        Err(err) => Err(err).forward::<SyncError>("Failed to remove link from the link registry"),
     }
 }
 
@@ -1556,10 +1661,10 @@ async fn realize_change_modify_add(
                 node.flags |= NodeFlags::StagedMove;
             }
 
-            stage::stage_single_node(
+            let staged_node = stage::stage_single_node(
                 repository.clone(),
                 state_stage.clone(),
-                change.path,
+                change.path.clone(),
                 node,
                 Arc::new(stage::StageStats::default()),
                 None, // TODO(vri): UCS-18008 - Investigate link tracking for sync/realize_changes
@@ -1567,6 +1672,17 @@ async fn realize_change_modify_add(
             )
             .await
             .forward::<SyncError>("Failed to stage change")?;
+
+            if node.is_link() && staged_node.node.is_valid_node_id() {
+                stage_link_registry_entry(
+                    &repository,
+                    &state_stage,
+                    &change,
+                    node,
+                    staged_node.node,
+                )
+                .await?;
+            }
         }
     }
 

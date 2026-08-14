@@ -59,7 +59,7 @@ fn chunk_boundaries(
 /// Uses `FastCDC` (content-defined chunking) when `flags.fixed_size_chunk` is 0,
 /// or fixed-size chunking when it is >0. Each chunk is hashed, stored as a
 /// content-addressed fragment in the immutable `store`, and assembled into a
-/// fragment list (Merklized). Returns the root address and fragment.
+/// fragment list. Returns the root address.
 ///
 /// When the entire buffer fits in a single chunk, the single-fragment fast path
 /// is used and no fragment list is created. In `hash_only` mode, fragments are
@@ -75,7 +75,7 @@ pub async fn write_fragmented(
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<Address, StorageError> {
     let size = buffer.len();
     let mut read_permit = permit;
     let mut tasks = JoinSet::<Result<StoredChunk, StorageError>>::new();
@@ -120,7 +120,7 @@ pub async fn write_fragmented(
                 chunk_permit,
             )
             .await?;
-            return Ok((result.address, result.fragment));
+            return Ok(result.address);
         }
 
         let store = store.clone();
@@ -200,13 +200,13 @@ pub async fn write_fragmented_from_file(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     context: Context,
-    file: Arc<std::fs::File>,
+    file: lore_io::IoFile,
     size: usize,
     flags: WriteOptions,
     hash_only: bool,
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<Address, StorageError> {
     let mut tasks = JoinSet::<Result<StoredChunk, StorageError>>::new();
 
     lore_base::lore_trace!(
@@ -354,7 +354,7 @@ async fn write_chunk_list(
     hash_only: bool,
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<Address, StorageError> {
     results.drain(&mut tasks).await;
 
     if let Some(err) = results.failure {
@@ -419,7 +419,7 @@ async fn write_fragmentlist_impl(
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
-) -> Result<(Address, Fragment), StorageError> {
+) -> Result<Address, StorageError> {
     let size = buffer.len();
 
     if size <= FRAGMENT_SIZE_THRESHOLD {
@@ -430,7 +430,7 @@ async fn write_fragmentlist_impl(
             size_content: content_size as u64,
         };
         if hash_only {
-            Ok((Address { context, hash }, fragment))
+            Ok(Address { context, hash })
         } else {
             let permit = match permit {
                 Some(permit) => Some(permit),
@@ -448,7 +448,7 @@ async fn write_fragmentlist_impl(
                 permit,
             )
             .await?;
-            Ok((result.address, result.fragment))
+            Ok(result.address)
         }
     } else {
         // Fixed size chunking for fragment list
@@ -595,9 +595,7 @@ pub fn write_fragmentlist(
     remote_session: Option<Arc<StorageSession>>,
     tracker: Option<Arc<crate::write_tracker::WriteTracker>>,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<(Address, Fragment), StorageError>> + Send>,
-> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Address, StorageError>> + Send>> {
     Box::pin(write_fragmentlist_impl(
         store,
         partition,
@@ -665,16 +663,16 @@ mod tests {
     }
 
     /// A file holding less than the size it was measured at is the truncation race: the size
-    /// comes from `metadata()`, taken before the chunker ever opens the file, so the chunker
-    /// can find nothing to cut. Zero-length content is the zero hash and no fragment list
-    /// stands in for nothing, so this has to fail rather than describe content that was never
-    /// written.
+    /// comes from `metadata()`, taken before the chunker ever opens the file. The chunker reads
+    /// exactly the length that size promises, so the read itself rejects the file. Either way it
+    /// has to fail rather than describe content that was never written, since zero-length
+    /// content is the zero hash and no fragment list stands in for nothing.
     #[tokio::test]
     async fn a_file_holding_less_than_its_measured_size_is_rejected() {
         let dir = crate::test_util::TempDir::new("lore-storage-truncated-");
         let path = std::path::Path::new(dir.as_ref()).join("truncated");
         std::fs::write(&path, b"").expect("create empty file");
-        let file = Arc::new(std::fs::File::open(&path).expect("open file"));
+        let (file, _) = crate::chunker::open_read(&path).await.expect("open file");
         let store = crate::local::immutable_store::LocalImmutableStore::new(
             Some(std::path::PathBuf::from(dir.as_ref())),
             crate::local::immutable_store::ImmutableStoreSettings::default(),
@@ -697,7 +695,7 @@ mod tests {
         .expect_err("a fragment list with no entries must not be written");
 
         assert!(
-            format!("{err}").contains("no chunks were written"),
+            format!("{err}").contains("file ended before the requested read length"),
             "unexpected failure: {err}"
         );
     }

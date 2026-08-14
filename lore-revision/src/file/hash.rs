@@ -50,7 +50,8 @@ pub async fn hash(
     repository: Arc<RepositoryContext>,
     path: impl AsRef<Path>,
 ) -> Result<Hash, HashError> {
-    let metadata = tokio::fs::metadata(path.as_ref())
+    let metadata = lore_io::IoDriver::global()
+        .metadata(path.as_ref())
         .await
         .emit_map_err(InvalidArguments {
             reason: "path does not exist or is not accessible".into(),

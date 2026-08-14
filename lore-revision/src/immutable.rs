@@ -34,6 +34,8 @@ use crate::repository::RepositoryContext;
 use crate::store::ImmutableStore;
 use crate::store::StoreError;
 use crate::store::StoreMatch;
+use crate::store::StoreMatchResult;
+use crate::store::query_one;
 
 #[error_set]
 pub enum ImmutableError {
@@ -137,9 +139,8 @@ pub async fn load_raw_store_retry(
     store: Arc<dyn ImmutableStore>,
     repository: Partition,
     address: Address,
-    match_required: StoreMatch,
 ) -> Result<(Fragment, Bytes), ImmutableError> {
-    lore_storage::read::read_raw(store, repository, address, match_required)
+    lore_storage::read::read_raw(store, repository, address)
         .await
         .forward("loading raw fragment from store")
 }
@@ -218,17 +219,23 @@ pub async fn load_raw(
 // Read path -- delegates to lore-storage with session
 // ---------------------------------------------------------------------------
 
+/// Stream the given data range to `sender`, returning the number of bytes that will arrive.
+///
+/// `None` streams the whole content, so the count is `size_content` as it always was. A range
+/// is clamped to the content and only the fragments it touches are fetched.
 pub async fn read_stream(
     repository: Arc<RepositoryContext>,
     address: Address,
+    range: Option<Range<usize>>,
     options: ReadOptions,
     sender: Sender<Bytes>,
 ) -> Result<u64, ImmutableError> {
     let store = repository.immutable_store();
     let partition = repository.id;
     let session = Some(resolve_session(&repository));
-    lore_storage::read_stream(store, partition, address, options, sender, session)
+    lore_storage::read_stream(store, partition, address, range, options, sender, session)
         .await
+        .map(|(_fragment, streamed)| streamed.end - streamed.start)
         .forward("reading immutable data")
 }
 
@@ -246,6 +253,7 @@ pub async fn read(
     let session = Some(resolve_session(&repository));
     lore_storage::read(store, partition, address, range, options, session)
         .await
+        .map(|(_fragment, bytes)| bytes)
         .forward("reading immutable data")
 }
 
@@ -264,19 +272,24 @@ pub async fn read_into(
         .forward("reading immutable data")
 }
 
+/// Write the given data range to `path`. The file holds exactly that range starting at its
+/// first byte; `None` writes the whole content.
 pub async fn read_into_file(
     repository: Arc<RepositoryContext>,
     address: Address,
     path: &Path,
+    range: Option<Range<usize>>,
     options: ReadOptions,
 ) -> Result<(Fragment, Option<std::fs::Metadata>), ImmutableError> {
     let store = repository.immutable_store();
     let partition = repository.id;
     let temp_ext = crate::repository::TEMP_FILE_EXTENSION;
     let session = Some(resolve_session(&repository));
-    lore_storage::read_into_file(store, partition, address, path, temp_ext, options, session)
-        .await
-        .forward("reading immutable data")
+    lore_storage::read_into_file(
+        store, partition, address, path, temp_ext, range, options, session,
+    )
+    .await
+    .forward("reading immutable data")
 }
 
 // ---------------------------------------------------------------------------
@@ -292,7 +305,7 @@ pub async fn store_raw(
     buffer: Bytes,
     cache_local: bool,
     remote_write: bool,
-) -> Result<(Address, Fragment), ImmutableError> {
+) -> Result<Address, ImmutableError> {
     store_raw_with_tracker(
         repository,
         address,
@@ -318,7 +331,7 @@ pub async fn store_raw_with_tracker(
     cache_local: bool,
     remote_write: bool,
     tracker: Option<Arc<lore_storage::write_tracker::WriteTracker>>,
-) -> Result<(Address, Fragment), ImmutableError> {
+) -> Result<Address, ImmutableError> {
     let session = if remote_write {
         Some(resolve_session(&repository))
     } else {
@@ -339,7 +352,7 @@ pub async fn store_raw_with_tracker(
     .await
     .forward::<ImmutableError>("storing fragment")?;
 
-    Ok((result.address, result.fragment))
+    Ok(result.address)
 }
 
 // ---------------------------------------------------------------------------
@@ -351,7 +364,7 @@ pub async fn write(
     context: Context,
     buffer: Bytes,
     flags: WriteOptions,
-) -> Result<(Address, Fragment), ImmutableError> {
+) -> Result<Address, ImmutableError> {
     write_with_tracker(repository, context, buffer, flags, None).await
 }
 
@@ -362,7 +375,7 @@ pub async fn write_with_tracker(
     buffer: Bytes,
     flags: WriteOptions,
     tracker: Option<Arc<lore_storage::write_tracker::WriteTracker>>,
-) -> Result<(Address, Fragment), ImmutableError> {
+) -> Result<Address, ImmutableError> {
     let session = if flags.remote_write {
         Some(resolve_session(&repository))
     } else {
@@ -382,12 +395,14 @@ pub async fn write_with_tracker(
     .forward("writing immutable content")
 }
 
+/// Write a file to the immutable store, returning its address and the size of the content that
+/// address stands for.
 pub async fn write_from_file(
     repository: Arc<RepositoryContext>,
     path: &Path,
     context: Context,
     flags: WriteOptions,
-) -> Result<(Address, Fragment), ImmutableError> {
+) -> Result<(Address, u64), ImmutableError> {
     write_from_file_with_tracker(repository, path, context, flags, None).await
 }
 
@@ -398,7 +413,7 @@ pub async fn write_from_file_with_tracker(
     context: Context,
     flags: WriteOptions,
     tracker: Option<Arc<lore_storage::write_tracker::WriteTracker>>,
-) -> Result<(Address, Fragment), ImmutableError> {
+) -> Result<(Address, u64), ImmutableError> {
     let session = if flags.remote_write {
         Some(resolve_session(&repository))
     } else {
@@ -479,7 +494,8 @@ pub async fn cache(
         total_query_count += query_count;
         lore_trace!("Query and cache {query_count} immutable fragments from remote");
 
-        let mut query_tasks: JoinSet<Result<(Bytes, Vec<StoreMatch>), StoreError>> = JoinSet::new();
+        let mut query_tasks: JoinSet<Result<(Bytes, Vec<StoreMatchResult>), StoreError>> =
+            JoinSet::new();
         while !query_address.is_empty() {
             // Cap number of tasks to a reasonable batch size
             const BATCH_COUNT: usize = 100;
@@ -495,13 +511,11 @@ pub async fn cache(
 
             let repository = repository.clone();
             lore_spawn!(query_tasks, async move {
-                let matches = repository
+                let addresses = slice.as_type_slice::<Address>();
+                let mut matches = vec![StoreMatchResult::default(); addresses.len()];
+                repository
                     .immutable_store()
-                    .exist_batch(
-                        repository.id,
-                        slice.as_type_slice::<Address>(),
-                        StoreMatch::MatchHash,
-                    )
+                    .query(repository.id, addresses, &mut matches)
                     .await?;
                 Ok((slice, matches))
             });
@@ -550,8 +564,8 @@ pub async fn cache(
                 && address.count::<Address>() == matches.len()
             {
                 let address = address.as_type_slice::<Address>();
-                for (index, match_made) in matches.iter().enumerate() {
-                    if *match_made != StoreMatch::MatchNone {
+                for (index, resolved) in matches.iter().enumerate() {
+                    if resolved.match_made != StoreMatch::MatchNone {
                         continue;
                     }
 
@@ -627,14 +641,9 @@ pub async fn cache(
 
 pub async fn is_stored_local(repository: Arc<RepositoryContext>, address: Address) -> bool {
     lore_trace!("Check if {} is cached in local store", address);
-    if let Ok(query) = repository
-        .immutable_store()
-        .query(repository.id, address, StoreMatch::MatchHash)
-        .await
-    {
-        lore_trace!("Query result {:?}", query);
-        query.match_made != StoreMatch::MatchNone
-            && (query.fragment.flags & FragmentFlags::PayloadStoredLocal) != 0
+    if let Ok(resolved) = query_one(&repository.immutable_store(), repository.id, address).await {
+        lore_trace!("Resolve result {:?}", resolved);
+        resolved.stored_local
     } else {
         false
     }
@@ -742,7 +751,7 @@ pub trait WriteToImmutable: zerocopy::IntoBytes + zerocopy::Immutable + std::mar
         repository: Arc<RepositoryContext>,
         context: Context,
         flags: WriteOptions,
-    ) -> Result<(Address, Fragment), ImmutableError> {
+    ) -> Result<Address, ImmutableError> {
         let self_slice = self.as_bytes();
         // Unsafe extension of the lifetime of the self-as-buffer memory. Since
         // we await the task and no shared references of the buffer will be kept

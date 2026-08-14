@@ -230,9 +230,15 @@ pub async fn reset(
 
     // We don't know if the revision is on the history line of the remote branch, set local flag
     // to force the next sync to do divergence check. Also remove the last sync cache.
+    // A reset deliberately moves the tip to an arbitrary revision, so it compares
+    // against whatever the pointer holds now rather than a tracked value.
+    let stored_latest = branch::load_latest(repository.clone(), branch.id)
+        .await
+        .unwrap_or_default();
     branch::store_latest(
         repository.clone(),
         branch.id,
+        stored_latest,
         revision,
         BranchLatestStatus::Divergent,
     )

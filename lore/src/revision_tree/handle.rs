@@ -17,11 +17,6 @@
 //! wrapper enforces the in-flight counter protocol the same way
 //! [`crate::storage::store::OpGuard`] does.
 
-// Several items here are unread until their owning verbs land. A file-level
-// `expect` keeps the lint quiet now and fires once every item is wired up —
-// at which point this attribute should be removed.
-#![expect(dead_code)]
-
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::AtomicBool;
@@ -34,8 +29,10 @@ use lore_base::types::Partition;
 use lore_revision::filter::Filter;
 use lore_revision::instance::InstanceId;
 use lore_revision::metadata::Metadata;
+use lore_revision::repository::InMemoryContext;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryFormat;
+use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::state::State;
 use lore_transport::ProtocolError;
 use serde::Deserialize;
@@ -75,7 +72,10 @@ pub(crate) struct RevisionTreeInternal {
     /// Registry key of the parent storage handle this revision tree was
     /// loaded against. Used by the storage-close warning path and the IPC
     /// connection-teardown cascade to match revision tree handles to
-    /// their parent storage handle.
+    /// their parent storage handle. That cascade has not landed, so outside
+    /// tests the field has no reader yet; the expectation below fires as
+    /// unfulfilled once one exists, which is when to remove it.
+    #[cfg_attr(not(test), expect(dead_code))]
     pub(crate) parent_storage_handle_id: u64,
     /// Repository identity (a `Partition`) the loaded revision targets.
     pub(crate) repository: Partition,
@@ -105,6 +105,10 @@ impl RevisionTreeInternal {
     /// block until every in-flight op has paired its decrement. Ops that
     /// race in between increment-and-check self-abort because they see
     /// `invalid=true` before proceeding.
+    ///
+    /// The waiter is registered before the re-check, because `notified()` alone
+    /// stays unregistered until first poll and would miss a decrement firing
+    /// between the check and the await.
     pub(crate) async fn mark_invalid_and_await(&self) {
         self.invalid.store(true, Ordering::Release);
         loop {
@@ -112,9 +116,6 @@ impl RevisionTreeInternal {
                 return;
             }
             let mut notified = std::pin::pin!(self.drained.notified());
-            // Register before the re-check — `notified()` alone is unregistered until
-            // first poll, which would miss a decrement that fires between the check and
-            // the await.
             notified.as_mut().enable();
             if self.in_flight.load(Ordering::Acquire) == 0 {
                 return;
@@ -140,7 +141,6 @@ pub(crate) fn register(internal: Arc<RevisionTreeInternal>) -> LoreRevisionTree 
         if id != LoreRevisionTree::INVALID.handle_id {
             break id;
         }
-        // Counter wrapped to the sentinel (only reachable after 2^64 registrations); skip it.
     };
     REGISTRY.insert(handle_id, internal);
     LoreRevisionTree { handle_id }
@@ -184,17 +184,29 @@ pub(crate) async fn synth_repository_context(
         Some(endpoint) => endpoint.session_connection(repository).await,
         None => Err(ProtocolError::from(NoRemote)),
     };
-    Arc::new(RepositoryContext::new(
-        None,
-        store.immutable.clone(),
-        store.mutable.clone(),
-        repository,
-        InstanceId::default(),
-        remote_result,
-        Arc::new(Filter::default()),
-        RepositoryFormat::Lore,
-    ))
+    Arc::new(
+        RepositoryContext::new(
+            None,
+            store.immutable.clone(),
+            store.mutable.clone(),
+            repository,
+            InstanceId::default(),
+            remote_result,
+            Arc::new(Filter::default()),
+            RepositoryFormat::Lore,
+        )
+        .with_write_token(RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER)),
+    )
 }
+
+/// Gates [`RepositoryWriteToken::in_memory`] for this crate.
+///
+/// The handle exists to build revisions, so its context is write-capable from
+/// load. Being path-less it has no per-path write mutex to take; what serializes
+/// publication is the branch tip compare-and-swap in the commit.
+pub(crate) struct InMemoryMarker;
+impl InMemoryContext for InMemoryMarker {}
+pub(crate) const IN_MEMORY_MARKER: InMemoryMarker = InMemoryMarker;
 
 /// RAII guard protecting an in-flight op. Obtained via
 /// [`RevisionTreeGuard::enter`]; dropping it pairs the in-flight
@@ -228,8 +240,6 @@ impl RevisionTreeGuard {
     }
 
     fn release(internal: &RevisionTreeInternal) {
-        // `fetch_sub` returns the previous value; previous == 1 means we just brought it to
-        // zero — wake the closer.
         if internal.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
             internal.drained.notify_waiters();
         }

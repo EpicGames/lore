@@ -226,7 +226,7 @@ async fn resolve_put_file_item(
     )
     .await
     {
-        Ok((address, _fragment)) => (address, LoreErrorCode::None),
+        Ok((address, _size)) => (address, LoreErrorCode::None),
         Err(err) => (
             Address::default(),
             crate::storage::storage_error_to_code(&err),

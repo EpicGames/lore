@@ -16,6 +16,7 @@ pub mod handle;
 pub mod info;
 pub mod list_children;
 pub mod load;
+pub mod metadata_clear;
 pub mod metadata_get;
 pub mod metadata_set;
 pub mod modify;

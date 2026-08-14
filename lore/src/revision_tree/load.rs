@@ -249,8 +249,6 @@ mod tests {
 
         let status = load(LoreGlobalArgs::default(), args, make_callback(sink.clone())).await;
 
-        // A terminal failure surfaces its code through the `Complete` event, not
-        // a separate `Error` event; an unknown revision hash maps to not-found.
         let expected_code = LoadError::from(NotFound).ffi_code();
         assert_eq!(status, expected_code);
         let events = sink.lock().unwrap().clone();

@@ -722,6 +722,38 @@ impl GrpcServerBuilder<WantsAddress> {
             .await??;
         Ok(())
     }
+
+    /// Serve on a socket the caller already bound, so the port is held from the moment it is
+    /// chosen.
+    ///
+    /// [`GrpcServerBuilder::serve`] binds the address itself, which leaves the caller no way to
+    /// reserve a port and hand it over: between learning a free port and this binding it, anything
+    /// on the machine can take it. A caller that cannot tolerate that window binds first and passes
+    /// the socket.
+    ///
+    /// The socket arrives as [`std::net::TcpListener`] rather than tokio's, because a tokio
+    /// listener belongs to the runtime that created it and this serves on the net runtime; the
+    /// conversion happens there.
+    pub async fn serve_with_listener(
+        self,
+        listener: std::net::TcpListener,
+        signal: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<()> {
+        lore_spawn_net!(async move {
+            listener.set_nonblocking(true)?;
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            self.0
+                .router
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    signal,
+                )
+                .await
+                .map_err(anyhow::Error::from)
+        })
+        .await??;
+        Ok(())
+    }
 }
 
 /// Serves a minimal gRPC server with only the environment endpoint in maintenance mode.

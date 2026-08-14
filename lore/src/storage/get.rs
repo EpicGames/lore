@@ -3,18 +3,26 @@
 //! `lore_storage_get` — read content-addressed buffers from a store.
 //!
 //! Per-item event sequence in single-buffer mode (`streaming=0`):
-//! - `GET_HEADER { id, address, size_content }`
-//! - `GET_DATA { id, address, offset: 0, bytes }` — the full reassembled payload in one event.
-//!   `LoreBytes` points into a `Bytes` buffer that the dispatcher keeps alive for the callback
-//!   invocation via `send_with_bytes`.
+//! - `GET_HEADER { id, address, size_content }` — the size of the whole content, not of what
+//!   this read returns. A ranged read gets the same header as a whole read of the same address.
+//! - `GET_DATA { id, address, offset, bytes }` — the requested range in one event, `offset`
+//!   being where it starts in the content. `LoreBytes` points into a `Bytes` buffer that the
+//!   dispatcher keeps alive for the callback invocation via `send_with_bytes`.
 //! - `GET_ITEM_COMPLETE { id, address, error_code }`.
 //!
 //! In streaming mode (`streaming=1`) the single `GET_DATA` is replaced by one event per leaf
 //! fragment carrying a running `offset`; the cumulative byte count is verified against the
-//! header `size_content` and a mismatch surfaces as `Internal`.
+//! requested range and a mismatch surfaces as `Internal`.
+//!
+//! Ranges: `offset` and `length` select part of the content, `length = 0` meaning "to the
+//! end". A zeroed pair is the whole content, so an item that sets neither reads exactly what
+//! it always did. Both modes fetch only the fragments the range covers. A range reaching past
+//! the end is clamped; a range *starting* past the end is `INVALID_ARGUMENTS`, because an
+//! empty answer would otherwise be indistinguishable from empty content.
 //!
 //! Short-circuits: `address.hash == Hash::default()` emits an empty buffer with
-//! `error_code = NONE`. Missing content yields `error_code = ADDRESS_NOT_FOUND`.
+//! `error_code = NONE`, whatever range was asked for. Missing content yields
+//! `error_code = ADDRESS_NOT_FOUND`.
 
 use std::sync::Arc;
 
@@ -50,7 +58,7 @@ use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
 use crate::storage::store::StoreInternal;
 
-/// One get item — the `(partition, address)` to read.
+/// One get item — the `(partition, address)` to read, and the range of it to read.
 #[repr(C)]
 #[derive(Copy, Clone, Default, PartialEq, Deserialize, Serialize, ValidateText)]
 pub struct LoreStorageGetItem {
@@ -60,6 +68,12 @@ pub struct LoreStorageGetItem {
     pub partition: Partition,
     /// Content address to read; `hash == Hash::default()` short-circuits to an empty buffer
     pub address: Address,
+    /// First content byte to read, counted from the start of the decompressed content.
+    /// Past the end of the content rejects with `INVALID_ARGUMENTS`
+    pub offset: u64,
+    /// Content bytes to read from `offset`; `0` reads to the end. A range reaching past the
+    /// end is clamped to it, so `GET_DATA` may carry fewer bytes than asked for
+    pub length: u64,
     /// Stream one `GET_DATA` per leaf fragment instead of a single reassembled buffer
     pub streaming: u8,
     /// Cache fetched bytes back to the local store even without the producer's
@@ -71,6 +85,8 @@ impl core::fmt::Debug for LoreStorageGetItem {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LoreStorageGetItem")
             .field("id", &self.id)
+            .field("offset", &self.offset)
+            .field("length", &self.length)
             .field("streaming", &self.streaming)
             .field("local_cache", &self.local_cache)
             .finish()
@@ -185,16 +201,21 @@ async fn get_item(
         store.immutable.clone(),
         item.partition,
         item.address,
-        None,
+        crate::storage::item_content_range(item.offset, item.length),
         read_options,
         remote_session,
     )
     .await
     {
-        Ok(bytes) => {
-            let size = bytes.len() as u64;
-            emit_header(&item, size);
-            emit_data(&item, bytes, 0);
+        Ok((fragment, bytes)) => {
+            // Empty bytes here would be indistinguishable from content that is genuinely
+            // empty, so a start past the end is reported rather than clamped.
+            if item.offset > fragment.size_content {
+                emit_item_complete(&item, LoreErrorCode::InvalidArguments);
+                return LoreErrorCode::InvalidArguments;
+            }
+            emit_header(&item, fragment.size_content);
+            emit_data(&item, bytes, item.offset);
             emit_item_complete(&item, LoreErrorCode::None);
             LoreErrorCode::None
         }
@@ -207,10 +228,14 @@ async fn get_item(
 }
 
 /// Streaming-mode read: emit one `GET_DATA` per leaf fragment with a running offset.
-/// `read_stream` returns `size_content` once the root fragment has loaded but before the leaf
-/// chunks finish flowing through the channel — we await that future first to learn the size,
-/// emit `GET_HEADER` ahead of any data, then drain the channel. The cumulative byte count is
-/// verified against the header — a mismatch surfaces as `Internal`.
+/// `read_stream` returns the whole content's fragment and the content range that will arrive
+/// once the root fragment has loaded but before the leaf chunks finish flowing through the
+/// channel — we await that future first, emit `GET_HEADER` ahead of any data, then drain the
+/// channel. The cumulative byte count is verified against the range — a mismatch surfaces as
+/// `Internal`.
+///
+/// A ranged stream fetches only the leaves the range touches, so the memory and the work are
+/// both proportional to the range rather than to the content.
 async fn get_item_streaming(
     store: Arc<StoreInternal>,
     item: LoreStorageGetItem,
@@ -226,13 +251,14 @@ async fn get_item_streaming(
         store.immutable.clone(),
         item.partition,
         item.address,
+        crate::storage::item_content_range(item.offset, item.length),
         read_options,
         tx,
         remote_session,
     );
 
-    let size_content = match stream_future.await {
-        Ok(size) => size,
+    let (fragment, streamed) = match stream_future.await {
+        Ok(started) => started,
         Err(err) => {
             let code = crate::storage::storage_error_to_code(&err);
             emit_item_complete(&item, code);
@@ -240,16 +266,23 @@ async fn get_item_streaming(
         }
     };
 
-    emit_header(&item, size_content);
+    // As in the buffered path. Nothing was spawned for an empty range, so dropping the
+    // receiver here leaves no pipeline writing into a closed channel.
+    if item.offset > fragment.size_content {
+        emit_item_complete(&item, LoreErrorCode::InvalidArguments);
+        return LoreErrorCode::InvalidArguments;
+    }
 
-    let mut offset: u64 = 0;
+    emit_header(&item, fragment.size_content);
+
+    let mut offset = streamed.start;
     while let Some(chunk) = rx.recv().await {
         let len = chunk.len() as u64;
         emit_data(&item, chunk, offset);
         offset += len;
     }
 
-    if offset != size_content {
+    if offset != streamed.end {
         emit_item_complete(&item, LoreErrorCode::Internal);
         return LoreErrorCode::Internal;
     }

@@ -80,14 +80,21 @@ pub fn command_name(command: &Command) -> &'static str {
     }
 }
 
+/// What a peer will admit about an address.
+///
+/// The ladder a store resolves on has four levels; this has three, and the missing one is
+/// deliberate. A hash held only by a partition the caller has no claim to is another tenant's
+/// content, and its existence is not the caller's to learn, so it collapses into `NotFound`
+/// alongside genuine absence. Value 2 is unused for that reason: it is where a hash-only match
+/// would sit if it were sayable.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum QueryStatus {
-    /// Address exist with full match including context
+    /// Address exists with a full match, including context
     ExistFullMatch = 0,
-    /// Hash exist in repository, but not in given context
-    ExistHashMatch = 1,
-    /// Hash does not exist in repository
+    /// Hash exists in this partition, under some other context
+    ExistPartitionMatch = 1,
+    /// Nothing this caller may be told about
     NotFound = 3,
 }
 
@@ -95,7 +102,7 @@ impl From<u8> for QueryStatus {
     fn from(value: u8) -> Self {
         match value {
             0 => Self::ExistFullMatch,
-            1 => Self::ExistHashMatch,
+            1 => Self::ExistPartitionMatch,
             _ => Self::NotFound,
         }
     }
@@ -105,7 +112,7 @@ impl From<usize> for QueryStatus {
     fn from(value: usize) -> Self {
         match value {
             0 => Self::ExistFullMatch,
-            1 => Self::ExistHashMatch,
+            1 => Self::ExistPartitionMatch,
             _ => Self::NotFound,
         }
     }
@@ -118,7 +125,7 @@ impl Display for QueryStatus {
             "{}",
             match self {
                 QueryStatus::ExistFullMatch => "Full match",
-                QueryStatus::ExistHashMatch => "Hash match",
+                QueryStatus::ExistPartitionMatch => "Partition match",
                 QueryStatus::NotFound => "Not found",
             }
         )

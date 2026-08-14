@@ -54,8 +54,6 @@ pub mod util;
 
 #[cfg(all(target_family = "windows", feature = "vfs"))]
 pub mod projfs;
-//#[cfg(all(target_family = "windows", feature = "vfs"))]
-//pub mod swfs;
 
 pub use lore_base::lore_drain_tasks;
 pub use lore_base::lore_limit_drain_tasks;

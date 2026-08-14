@@ -193,7 +193,7 @@ pub async fn info(
             .await
             .forward::<InfoError>("deserializing revision metadata")
     {
-        let _ = event::metadata::send(&metadata);
+        event::metadata::send(&metadata);
     }
 
     if options.delta || options.metadata {
@@ -296,7 +296,7 @@ pub async fn info(
                                 .await
                                 .forward::<InfoError>("deserializing file metadata")
                     {
-                        let _ = event::metadata::send(&metadata);
+                        event::metadata::send(&metadata);
                     }
                 }
             }

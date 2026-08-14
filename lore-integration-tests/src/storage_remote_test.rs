@@ -43,7 +43,11 @@ mod storage_remote_tests {
         _shutdown: tokio::sync::oneshot::Sender<()>,
     }
 
-    async fn start_test_server() -> TestServer {
+    /// Build a fresh in-memory backend pair for a test server to serve.
+    async fn make_backends() -> (
+        Arc<dyn lore_storage::ImmutableStore>,
+        Arc<dyn lore_storage::MutableStore>,
+    ) {
         let backend_immutable = lore_storage::local::immutable_store::create(
             None::<&str>,
             ImmutableStoreCreateOptions::none(),
@@ -65,12 +69,28 @@ mod storage_remote_tests {
         )
         .await
         .unwrap();
+
+        (backend_immutable, backend_mutable)
+    }
+
+    async fn start_test_server() -> TestServer {
+        let (backend_immutable, backend_mutable) = make_backends().await;
+        start_test_server_with(backend_immutable, backend_mutable).await
+    }
+
+    /// Start a server over caller-supplied backends, so a test can wrap the served store in a
+    /// fault-injecting decorator.
+    async fn start_test_server_with(
+        backend_immutable: Arc<dyn lore_storage::ImmutableStore>,
+        backend_mutable: Arc<dyn lore_storage::MutableStore>,
+    ) -> TestServer {
         let backend_for_test = backend_immutable.clone();
         let backend_mutable_for_test: Arc<dyn lore_storage::MutableStore> = backend_mutable.clone();
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // Bound here and handed over, so nothing can take the port between choosing it and
+        // serving on it.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr: SocketAddr = listener.local_addr().unwrap();
-        drop(listener);
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let signal = async {
@@ -81,10 +101,11 @@ mod storage_remote_tests {
             Arc::new(lore_server::notification::local::NotificationSender::default());
         let hook_dispatcher = Arc::new(HookDispatcher::empty());
 
+        let (stopped_tx, mut stopped_rx) = tokio::sync::oneshot::channel::<String>();
         // Background server task in a test; LORE_CONTEXT propagation is unnecessary here.
         #[allow(clippy::disallowed_methods)]
         tokio::spawn(async move {
-            GrpcServerBuilder::new()
+            let outcome = GrpcServerBuilder::new()
                 .with_environment(EnvironmentConfig::default())
                 .with_feature(FeatureSettings::default())
                 .with_immutable_store(backend_immutable.clone(), backend_immutable)
@@ -105,17 +126,28 @@ mod storage_remote_tests {
                 )
                 .with_jwt_verifier(None)
                 .unwrap()
-                .serve(addr, signal)
-                .await
-                .unwrap();
+                .serve_with_listener(listener, signal)
+                .await;
+            let _ = stopped_tx.send(match outcome {
+                Ok(()) => "stopped before the test finished".to_string(),
+                Err(error) => format!("failed: {error}"),
+            });
         });
 
+        // A server that never starts must say so, rather than leaving a client to wait on a socket
+        // nothing is answering.
+        let mut ready = false;
         for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Ok(reason) = stopped_rx.try_recv() {
+                panic!("test server on {addr} {reason}");
+            }
             if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                ready = true;
                 break;
             }
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
+        assert!(ready, "test server on {addr} never accepted a connection");
 
         TestServer {
             url: format!("grpc://127.0.0.1:{}", addr.port()),
@@ -237,6 +269,7 @@ mod storage_remote_tests {
         use lore_revision::event::LoreBytes;
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-put".to_string());
@@ -291,14 +324,11 @@ mod storage_remote_tests {
                 assert_eq!(code, LoreErrorCode::None);
                 assert_ne!(address.hash, lore_base::types::Hash::default());
 
-                let server_match = server
-                    .backend_immutable
-                    .clone()
-                    .exist(partition, address, StoreMatch::MatchFull)
+                let server_match = query_one(&server.backend_immutable.clone(), partition, address)
                     .await
                     .expect("backend exist call");
                 assert_eq!(
-                    server_match,
+                    server_match.match_made,
                     StoreMatch::MatchFull,
                     "remote backend must hold the address after remote_write=1 put",
                 );
@@ -320,6 +350,7 @@ mod storage_remote_tests {
         use lore_revision::event::LoreBytes;
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-put-localonly".to_string());
@@ -371,14 +402,11 @@ mod storage_remote_tests {
                 let (_, address, code) = events[0];
                 assert_eq!(code, LoreErrorCode::None);
 
-                let server_match = server
-                    .backend_immutable
-                    .clone()
-                    .exist(partition, address, StoreMatch::MatchFull)
+                let server_match = query_one(&server.backend_immutable.clone(), partition, address)
                     .await
                     .expect("backend exist call");
                 assert_eq!(
-                    server_match,
+                    server_match.match_made,
                     StoreMatch::MatchNone,
                     "remote backend must NOT hold the address when remote_write=0",
                 );
@@ -465,6 +493,7 @@ mod storage_remote_tests {
                     address,
                     streaming: 0,
                     local_cache: 0,
+                    ..Default::default()
                 };
                 let status = get::get(
                     LoreGlobalArgs::default(),
@@ -492,17 +521,12 @@ mod storage_remote_tests {
                         handle_id,
                     })
                     .expect("handle still registered");
-                let local_match = local
-                    .clone()
-                    .exist(
-                        partition,
-                        address,
-                        lore_storage::store_types::StoreMatch::MatchFull,
-                    )
-                    .await
-                    .expect("local exist call");
+                let local_match =
+                    lore_storage::immutable_store::query_one(&local.clone(), partition, address)
+                        .await
+                        .expect("local exist call");
                 assert_eq!(
-                    local_match,
+                    local_match.match_made,
                     lore_storage::store_types::StoreMatch::MatchNone,
                     "unflagged remote-fetched payload must NOT be cached locally",
                 );
@@ -530,6 +554,7 @@ mod storage_remote_tests {
         use lore_base::types::fragment_flags::FragmentFlags;
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-cache-priority".to_string());
@@ -583,6 +608,7 @@ mod storage_remote_tests {
                             address,
                             streaming: 0,
                             local_cache: 0,
+                            ..Default::default()
                         }]),
                     },
                     callback,
@@ -596,13 +622,11 @@ mod storage_remote_tests {
                         handle_id,
                     })
                     .expect("handle still registered");
-                let local_match = local
-                    .clone()
-                    .exist(partition, address, StoreMatch::MatchFull)
+                let local_match = query_one(&local.clone(), partition, address)
                     .await
                     .expect("local exist call");
                 assert_eq!(
-                    local_match,
+                    local_match.match_made,
                     StoreMatch::MatchFull,
                     "priority-flagged remote-fetched payload must be cached locally",
                 );
@@ -629,6 +653,7 @@ mod storage_remote_tests {
         use lore_base::types::Partition;
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-get-localcache".to_string());
@@ -672,6 +697,7 @@ mod storage_remote_tests {
                             address,
                             streaming: 0,
                             local_cache: 1,
+                            ..Default::default()
                         }]),
                     },
                     callback,
@@ -685,13 +711,11 @@ mod storage_remote_tests {
                         handle_id,
                     })
                     .expect("handle still registered");
-                let local_match = local
-                    .clone()
-                    .exist(partition, address, StoreMatch::MatchFull)
+                let local_match = query_one(&local.clone(), partition, address)
                     .await
                     .expect("local exist");
                 assert_eq!(
-                    local_match,
+                    local_match.match_made,
                     StoreMatch::MatchFull,
                     "local_cache=1 must populate the local store after remote fetch",
                 );
@@ -717,7 +741,6 @@ mod storage_remote_tests {
         use lore_revision::event::LoreBytes;
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
-        use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-put-localcache".to_string());
         LORE_CONTEXT
@@ -775,8 +798,9 @@ mod storage_remote_tests {
                     .expect("handle still registered");
                 let (fragment, _bytes) = local
                     .clone()
-                    .get(partition, address, StoreMatch::MatchFull)
+                    .get(partition, address)
                     .await
+                    .and_then(lore_storage::StoreGetData::into_payload)
                     .expect("local fragment fetch");
                 assert!(
                     fragment.flags
@@ -901,6 +925,17 @@ mod storage_remote_tests {
         partition: lore_base::types::Partition,
         bytes: &[u8],
     ) -> lore_base::types::Address {
+        put_local_and_remote_chunked(handle_id, partition, bytes, 0).await
+    }
+
+    /// As above, but cutting the content at `chunk` so it is stored — and uploaded — as a
+    /// fragment tree rather than one fragment.
+    async fn put_local_and_remote_chunked(
+        handle_id: u64,
+        partition: lore_base::types::Partition,
+        bytes: &[u8],
+        chunk: u64,
+    ) -> lore_base::types::Address {
         use lore::storage::put;
         use lore::storage::put::LoreStoragePutArgs;
         use lore::storage::put::LoreStoragePutItem;
@@ -930,7 +965,7 @@ mod storage_remote_tests {
             },
             remote_write: 1,
             local_cache: 0,
-            fixed_size_chunk: 0,
+            fixed_size_chunk: chunk,
         };
         let status = put::put(
             LoreGlobalArgs::default(),
@@ -951,6 +986,7 @@ mod storage_remote_tests {
     async fn copy_tier1_server_side_when_source_on_both() -> TestResult {
         use lore_base::types::Partition;
         use lore_revision::event::LoreErrorCode;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-copy-tier1".to_string());
@@ -980,14 +1016,12 @@ mod storage_remote_tests {
                 assert_eq!(events[0].2, LoreErrorCode::None);
                 assert_eq!(events[0].1, address);
 
-                let on_server = server
-                    .backend_immutable
-                    .clone()
-                    .exist(target_partition, address, StoreMatch::MatchFull)
-                    .await
-                    .unwrap();
+                let on_server =
+                    query_one(&server.backend_immutable.clone(), target_partition, address)
+                        .await
+                        .unwrap();
                 assert_eq!(
-                    on_server,
+                    on_server.match_made,
                     StoreMatch::MatchFull,
                     "server must hold target entry after server-side copy",
                 );
@@ -1002,6 +1036,7 @@ mod storage_remote_tests {
     async fn copy_tier2_upload_fallback_when_local_source_only() -> TestResult {
         use lore_base::types::Partition;
         use lore_revision::event::LoreErrorCode;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-copy-tier2".to_string());
@@ -1020,14 +1055,12 @@ mod storage_remote_tests {
                     put_local_via_handle(handle_id, source_partition, payload_bytes.as_slice())
                         .await;
 
-                let server_pre = server
-                    .backend_immutable
-                    .clone()
-                    .exist(source_partition, address, StoreMatch::MatchFull)
-                    .await
-                    .unwrap();
+                let server_pre =
+                    query_one(&server.backend_immutable.clone(), source_partition, address)
+                        .await
+                        .unwrap();
                 assert_eq!(
-                    server_pre,
+                    server_pre.match_made,
                     StoreMatch::MatchNone,
                     "precondition: server must NOT have source",
                 );
@@ -1040,14 +1073,12 @@ mod storage_remote_tests {
 
                 // After tier-2 fallback the server now holds the target tuple (uploaded into
                 // the destination's partition).
-                let on_server = server
-                    .backend_immutable
-                    .clone()
-                    .exist(target_partition, address, StoreMatch::MatchFull)
-                    .await
-                    .unwrap();
+                let on_server =
+                    query_one(&server.backend_immutable.clone(), target_partition, address)
+                        .await
+                        .unwrap();
                 assert_eq!(
-                    on_server,
+                    on_server.match_made,
                     StoreMatch::MatchFull,
                     "server must hold target after upload fallback",
                 );
@@ -1352,6 +1383,7 @@ mod storage_remote_tests {
     async fn upload_local_only_payload_pushes_to_remote_and_marks_durable() -> TestResult {
         use lore_base::types::Partition;
         use lore_revision::event::LoreErrorCode;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-upload".to_string());
@@ -1375,14 +1407,11 @@ mod storage_remote_tests {
                 assert_eq!(error_code, LoreErrorCode::None);
                 assert_eq!(already_durable, 0, "first upload was not yet durable");
 
-                let on_server = server
-                    .backend_immutable
-                    .clone()
-                    .exist(partition, address, StoreMatch::MatchFull)
+                let on_server = query_one(&server.backend_immutable.clone(), partition, address)
                     .await
                     .unwrap();
                 assert_eq!(
-                    on_server,
+                    on_server.match_made,
                     StoreMatch::MatchFull,
                     "server must hold the address after a successful upload",
                 );
@@ -1537,6 +1566,7 @@ mod storage_remote_tests {
     async fn copy_idempotent_when_target_already_present() -> TestResult {
         use lore_base::types::Partition;
         use lore_revision::event::LoreErrorCode;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-copy-idempotent".to_string());
@@ -1559,13 +1589,11 @@ mod storage_remote_tests {
                     copy_one_item(handle_id, source_partition, address, target_partition).await;
                 assert_eq!(status1, 0);
                 assert_eq!(events1[0].2, LoreErrorCode::None);
-                let target_after_first = server
-                    .backend_immutable
-                    .clone()
-                    .exist(target_partition, address, StoreMatch::MatchFull)
-                    .await
-                    .unwrap();
-                assert_eq!(target_after_first, StoreMatch::MatchFull);
+                let target_after_first =
+                    query_one(&server.backend_immutable.clone(), target_partition, address)
+                        .await
+                        .unwrap();
+                assert_eq!(target_after_first.match_made, StoreMatch::MatchFull);
 
                 // Second invocation with identical arguments: must return None and leave the
                 // target tuple in the same state.
@@ -1574,12 +1602,10 @@ mod storage_remote_tests {
                 assert_eq!(status2, 0);
                 assert_eq!(events2[0].2, LoreErrorCode::None);
                 assert_eq!(events2[0].1, address);
-                let target_after_second = server
-                    .backend_immutable
-                    .clone()
-                    .exist(target_partition, address, StoreMatch::MatchFull)
-                    .await
-                    .unwrap();
+                let target_after_second =
+                    query_one(&server.backend_immutable.clone(), target_partition, address)
+                        .await
+                        .unwrap();
                 assert_eq!(
                     target_after_second, target_after_first,
                     "second copy must produce no observable change",
@@ -1641,6 +1667,7 @@ mod storage_remote_tests {
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
         use lore_revision::interface::LoreString;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-put-file".to_string());
@@ -1698,14 +1725,11 @@ mod storage_remote_tests {
                 assert_eq!(code, LoreErrorCode::None);
                 assert_ne!(address.hash, lore_base::types::Hash::default());
 
-                let server_match = server
-                    .backend_immutable
-                    .clone()
-                    .exist(partition, address, StoreMatch::MatchFull)
+                let server_match = query_one(&server.backend_immutable.clone(), partition, address)
                     .await
                     .expect("backend exist call");
                 assert_eq!(
-                    server_match,
+                    server_match.match_made,
                     StoreMatch::MatchFull,
                     "remote backend must hold the address after put_file with remote_write=1",
                 );
@@ -1792,6 +1816,7 @@ mod storage_remote_tests {
                     address,
                     path: LoreString::from(target_path.as_str()),
                     local_cache: 0,
+                    ..Default::default()
                 };
                 let status = get_file::get_file(
                     LoreGlobalArgs::default(),
@@ -1857,6 +1882,7 @@ mod storage_remote_tests {
         use lore_revision::event::LoreBytes;
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-bound-offline".to_string());
@@ -1915,14 +1941,11 @@ mod storage_remote_tests {
                 let (_, address, code) = events[0];
                 assert_eq!(code, LoreErrorCode::None);
 
-                let server_match = server
-                    .backend_immutable
-                    .clone()
-                    .exist(partition, address, StoreMatch::MatchFull)
+                let server_match = query_one(&server.backend_immutable.clone(), partition, address)
                     .await
                     .expect("backend exist call");
                 assert_eq!(
-                    server_match,
+                    server_match.match_made,
                     StoreMatch::MatchNone,
                     "bound-offline handle must NOT push to the remote even with remote_write=1",
                 );
@@ -1999,6 +2022,7 @@ mod storage_remote_tests {
                     address,
                     streaming: 0,
                     local_cache: 0,
+                    ..Default::default()
                 };
                 // bound-local + non-streaming get of an address only present on the remote.
                 // The handle must reject the miss locally rather than reaching out.
@@ -2164,6 +2188,7 @@ mod storage_remote_tests {
                             address,
                             streaming: 0,
                             local_cache: 0,
+                            ..Default::default()
                         }]),
                     },
                     callback,
@@ -2361,6 +2386,7 @@ mod storage_remote_tests {
         use lore_base::types::Partition;
         use lore_revision::event::LoreErrorCode;
         use lore_revision::interface::LoreArray;
+        use lore_storage::immutable_store::query_one;
         use lore_storage::store_types::StoreMatch;
 
         let execution = setup_execution("storage-remote-bound-offline-copy".to_string());
@@ -2419,21 +2445,18 @@ mod storage_remote_tests {
 
                 // Server backend must NOT have received the copied address — proves remote
                 // server-side copy was suppressed.
-                let server_match = server
-                    .backend_immutable
-                    .clone()
-                    .exist(
-                        target_partition,
-                        lore_base::types::Address {
-                            hash: source_address.hash,
-                            context: target_context,
-                        },
-                        StoreMatch::MatchFull,
-                    )
-                    .await
-                    .expect("backend exist");
+                let server_match = query_one(
+                    &server.backend_immutable.clone(),
+                    target_partition,
+                    lore_base::types::Address {
+                        hash: source_address.hash,
+                        context: target_context,
+                    },
+                )
+                .await
+                .expect("backend exist");
                 assert_eq!(
-                    server_match,
+                    server_match.match_made,
                     StoreMatch::MatchNone,
                     "bound-offline copy must not reach the remote",
                 );
@@ -2524,6 +2547,7 @@ mod storage_remote_tests {
                             address,
                             streaming: 0,
                             local_cache: 0,
+                            ..Default::default()
                         }]),
                     },
                     callback,
@@ -2994,6 +3018,690 @@ mod storage_remote_tests {
                     complete.lock().unwrap().is_none(),
                     "no per-item terminal event on a pre-dispatch rejection"
                 );
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    // ---------------------------------------------------------------------------
+    // Streaming resilience
+    //
+    // `Get` / `GetMetadata` multiplex every address in a batch onto one bidirectional
+    // stream, and a batch's items share a session, so they share that stream. A per-item
+    // failure is reported in-band on the item's own response, which is what lets the
+    // stream keep serving its siblings. The assertion that discriminates the in-band
+    // behaviour from the old terminal-status behaviour is always the *siblings*: when a
+    // status ended the stream, they failed with a transport error instead of resolving.
+    // ---------------------------------------------------------------------------
+
+    async fn seed_server(
+        server: &TestServer,
+        partition: lore_base::types::Partition,
+        payload: &bytes::Bytes,
+    ) -> lore_base::types::Address {
+        let address = lore_base::types::Address {
+            hash: lore_storage::hash_slice(payload.as_ref()),
+            context: lore_base::types::Context::default(),
+        };
+        let fragment = lore_base::types::Fragment {
+            flags: 0,
+            size_payload: payload.len() as u32,
+            size_content: payload.len() as u64,
+        };
+        server
+            .backend_immutable
+            .clone()
+            .put(partition, address, fragment, Some(payload.clone()), false)
+            .await
+            .expect("seed server with payload");
+        address
+    }
+
+    struct GetBatchResults {
+        codes: HashMap<u64, lore_revision::event::LoreErrorCode>,
+        bytes: HashMap<u64, Vec<u8>>,
+        /// `GET_HEADER`'s `size_content` per item — the whole content's size, which a ranged
+        /// read cannot infer from the bytes it got back.
+        headers: HashMap<u64, u64>,
+        /// The content offset each item's first `GET_DATA` carried.
+        first_offsets: HashMap<u64, u64>,
+    }
+
+    async fn run_get_batch(
+        handle_id: u64,
+        items: Vec<lore::storage::get::LoreStorageGetItem>,
+    ) -> GetBatchResults {
+        let codes: Arc<Mutex<HashMap<u64, lore_revision::event::LoreErrorCode>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let bytes: Arc<Mutex<HashMap<u64, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let headers: Arc<Mutex<HashMap<u64, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+        let first_offsets: Arc<Mutex<HashMap<u64, u64>>> = Arc::new(Mutex::new(HashMap::new()));
+        let codes_for_cb = codes.clone();
+        let bytes_for_cb = bytes.clone();
+        let headers_for_cb = headers.clone();
+        let offsets_for_cb = first_offsets.clone();
+
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::StorageGetHeader(data) => {
+                headers_for_cb
+                    .lock()
+                    .unwrap()
+                    .insert(data.id, data.size_content);
+            }
+            LoreEvent::StorageGetData(data) => {
+                let slice = unsafe {
+                    std::slice::from_raw_parts(data.bytes.ptr.cast::<u8>(), data.bytes.len)
+                };
+                offsets_for_cb
+                    .lock()
+                    .unwrap()
+                    .entry(data.id)
+                    .or_insert(data.offset);
+                bytes_for_cb
+                    .lock()
+                    .unwrap()
+                    .entry(data.id)
+                    .or_default()
+                    .extend_from_slice(slice);
+            }
+            LoreEvent::StorageGetItemComplete(data) => {
+                codes_for_cb
+                    .lock()
+                    .unwrap()
+                    .insert(data.id, data.error_code);
+            }
+            _ => {}
+        }));
+
+        lore::storage::get::get(
+            LoreGlobalArgs::default(),
+            lore::storage::get::LoreStorageGetArgs {
+                handle: lore::storage::handle::LoreStore { handle_id },
+                items: lore_revision::interface::LoreArray::from_vec(items),
+            },
+            callback,
+        )
+        .await;
+
+        let codes = codes.lock().unwrap().clone();
+        let bytes = bytes.lock().unwrap().clone();
+        let headers = headers.lock().unwrap().clone();
+        let first_offsets = first_offsets.lock().unwrap().clone();
+        GetBatchResults {
+            codes,
+            bytes,
+            headers,
+            first_offsets,
+        }
+    }
+
+    /// A get item asking for `offset..offset + length` of the content.
+    fn ranged_get_item(
+        id: u64,
+        partition: lore_base::types::Partition,
+        address: lore_base::types::Address,
+        offset: u64,
+        length: u64,
+        streaming: u8,
+    ) -> lore::storage::get::LoreStorageGetItem {
+        lore::storage::get::LoreStorageGetItem {
+            id,
+            partition,
+            address,
+            offset,
+            length,
+            streaming,
+            ..Default::default()
+        }
+    }
+
+    fn get_item(
+        id: u64,
+        partition: lore_base::types::Partition,
+        address: lore_base::types::Address,
+    ) -> lore::storage::get::LoreStorageGetItem {
+        lore::storage::get::LoreStorageGetItem {
+            id,
+            partition,
+            address,
+            streaming: 0,
+            local_cache: 0,
+            ..Default::default()
+        }
+    }
+
+    /// A remote miss must not disturb the other addresses sharing the Get stream.
+    ///
+    /// Previously the miss was a stream trailer, which ended the stream and failed the siblings
+    /// with an opaque transport error. The absent address is never written anywhere, so it
+    /// misses both the handle's local store and the remote, and it is dispatched first so it is
+    /// on the wire before any sibling can have been answered — ordering it last would leave the
+    /// scheduler to decide whether the siblings were ever exposed to it.
+    #[tokio::test]
+    async fn get_batch_survives_missing_address() -> TestResult {
+        use bytes::Bytes;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+
+        let execution = setup_execution("storage-remote-get-miss-batch".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let partition = Partition::from([0xc1u8; 16]);
+
+                let payloads: Vec<Bytes> = (0..3u8)
+                    .map(|i| Bytes::from(format!("in-band miss sibling payload {i}").into_bytes()))
+                    .collect();
+                let missing = Address {
+                    hash: Hash::from([0xdeu8; 32]),
+                    context: Context::default(),
+                };
+                let mut items = vec![get_item(99, partition, missing)];
+                for (index, payload) in payloads.iter().enumerate() {
+                    let address = seed_server(&server, partition, payload).await;
+                    items.push(get_item(index as u64, partition, address));
+                }
+
+                let handle_id = open_remote_handle(&server).await;
+                let results = run_get_batch(handle_id, items).await;
+
+                assert_eq!(
+                    results.codes.get(&99),
+                    Some(&LoreErrorCode::AddressNotFound),
+                    "the absent address must report AddressNotFound, not a transport error",
+                );
+                for (index, payload) in payloads.iter().enumerate() {
+                    let id = index as u64;
+                    assert_eq!(
+                        results.codes.get(&id),
+                        Some(&LoreErrorCode::None),
+                        "item {id} shares the stream with a miss and must still succeed",
+                    );
+                    assert_eq!(
+                        results.bytes.get(&id).map(Vec::as_slice),
+                        Some(payload.as_ref()),
+                        "item {id} must return its full payload",
+                    );
+                }
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    /// A range on content the handle does not hold locally: the fragment crosses the wire whole
+    /// — no protocol carries a range — and the range is applied to what came back. The header
+    /// still describes the whole content, which is the only way a caller can tell a short read
+    /// from a complete one.
+    #[tokio::test]
+    async fn get_with_a_range_falls_back_to_remote_and_returns_only_the_range() -> TestResult {
+        use bytes::Bytes;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+
+        let execution = setup_execution("storage-remote-get-range".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let partition = Partition::from([0xd1u8; 16]);
+
+                let payload = Bytes::from((0..200u32).map(|b| b as u8).collect::<Vec<u8>>());
+                let address = seed_server(&server, partition, &payload).await;
+
+                let handle_id = open_remote_handle(&server).await;
+                let results = run_get_batch(
+                    handle_id,
+                    vec![ranged_get_item(1, partition, address, 40, 60, 0)],
+                )
+                .await;
+
+                assert_eq!(results.codes.get(&1), Some(&LoreErrorCode::None));
+                assert_eq!(results.headers.get(&1), Some(&(payload.len() as u64)));
+                assert_eq!(results.first_offsets.get(&1), Some(&40));
+                assert_eq!(
+                    results.bytes.get(&1).map(Vec::as_slice),
+                    Some(&payload[40..100]),
+                );
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    /// The same over a fragment tree, which is where a range earns its keep remotely: the
+    /// content is uploaded chunked, then read back through a handle whose local store is empty,
+    /// so every fragment the range needs is a round trip and every fragment it does not need is
+    /// one that never happens.
+    ///
+    /// Buffered and streaming are driven against the same uploaded content, because they prune
+    /// through different code — `read_defragment` and the tree walker — and a range has to mean
+    /// the same thing through both.
+    #[tokio::test]
+    async fn get_with_a_range_over_a_remote_fragment_tree_returns_only_the_range() -> TestResult {
+        use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+
+        let execution = setup_execution("storage-remote-get-range-tree".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let partition = Partition::from([0xd2u8; 16]);
+
+                let content: Vec<u8> = (0..4 * FRAGMENT_SIZE_THRESHOLD)
+                    .map(|byte| (byte as u8).wrapping_mul(31))
+                    .collect();
+
+                let upload_handle = open_remote_handle(&server).await;
+                let address =
+                    put_local_and_remote_chunked(upload_handle, partition, &content, 64 * 1024)
+                        .await;
+                close_handle(upload_handle).await;
+
+                // Starts and ends inside a chunk, so both ends are clipped.
+                let start = 100_000u64;
+                let length = 300_000u64;
+                let expected = &content[start as usize..(start + length) as usize];
+
+                let handle_id = open_remote_handle(&server).await;
+                let results = run_get_batch(
+                    handle_id,
+                    vec![
+                        ranged_get_item(1, partition, address, start, length, 0),
+                        ranged_get_item(2, partition, address, start, length, 1),
+                    ],
+                )
+                .await;
+
+                for id in [1u64, 2u64] {
+                    assert_eq!(
+                        results.codes.get(&id),
+                        Some(&LoreErrorCode::None),
+                        "item {id}"
+                    );
+                    assert_eq!(
+                        results.headers.get(&id),
+                        Some(&(content.len() as u64)),
+                        "item {id} header must describe the whole content",
+                    );
+                    assert_eq!(
+                        results.first_offsets.get(&id),
+                        Some(&start),
+                        "item {id} must place its first chunk at the range start",
+                    );
+                    assert_eq!(
+                        results.bytes.get(&id).map(Vec::as_slice),
+                        Some(expected),
+                        "item {id} must return exactly the range",
+                    );
+                }
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    /// The range is validated against the content the remote actually holds, so a start past
+    /// the end is rejected on the same terms it would be locally.
+    #[tokio::test]
+    async fn get_with_an_offset_past_the_end_rejects_over_remote() -> TestResult {
+        use bytes::Bytes;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+
+        let execution = setup_execution("storage-remote-get-range-past-end".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let partition = Partition::from([0xd3u8; 16]);
+
+                let payload = Bytes::from_static(b"a short remote payload");
+                let address = seed_server(&server, partition, &payload).await;
+
+                let handle_id = open_remote_handle(&server).await;
+                let past_end = payload.len() as u64 + 1;
+                let results = run_get_batch(
+                    handle_id,
+                    vec![ranged_get_item(1, partition, address, past_end, 10, 0)],
+                )
+                .await;
+
+                assert_eq!(
+                    results.codes.get(&1),
+                    Some(&LoreErrorCode::InvalidArguments),
+                );
+                assert!(
+                    !results.bytes.contains_key(&1),
+                    "a rejected range must emit no data",
+                );
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    /// The same guarantee on the `GetMetadata` stream, where a miss is most clearly routine:
+    /// `RemoteImmutableStore::get_metadata` maps `NotFound` to `MatchNone`. The miss is
+    /// dispatched first for the same reason as in the Get case.
+    #[tokio::test]
+    async fn get_metadata_batch_survives_missing_address() -> TestResult {
+        use bytes::Bytes;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+
+        let execution = setup_execution("storage-remote-get-metadata-miss-batch".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_test_server().await;
+                let partition = Partition::from([0xc2u8; 16]);
+
+                let payloads: Vec<Bytes> = (0..3u8)
+                    .map(|i| Bytes::from(format!("metadata sibling payload {i}").into_bytes()))
+                    .collect();
+                let mut items = vec![lore::storage::get_metadata::LoreStorageGetMetadataItem {
+                    id: 99,
+                    partition,
+                    address: Address {
+                        hash: Hash::from([0xadu8; 32]),
+                        context: Context::default(),
+                    },
+                }];
+                for (index, payload) in payloads.iter().enumerate() {
+                    let address = seed_server(&server, partition, payload).await;
+                    items.push(lore::storage::get_metadata::LoreStorageGetMetadataItem {
+                        id: index as u64,
+                        partition,
+                        address,
+                    });
+                }
+
+                let handle_id = open_remote_handle(&server).await;
+
+                let outcomes: Arc<Mutex<HashMap<u64, (LoreErrorCode, u32)>>> =
+                    Arc::new(Mutex::new(HashMap::new()));
+                let outcomes_for_cb = outcomes.clone();
+                let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                    if let LoreEvent::StorageGetMetadataItemComplete(data) = event {
+                        outcomes_for_cb
+                            .lock()
+                            .unwrap()
+                            .insert(data.id, (data.error_code, data.fragment.size_payload));
+                    }
+                }));
+
+                lore::storage::get_metadata::get_metadata(
+                    LoreGlobalArgs::default(),
+                    lore::storage::get_metadata::LoreStorageGetMetadataArgs {
+                        handle: lore::storage::handle::LoreStore { handle_id },
+                        items: lore_revision::interface::LoreArray::from_vec(items),
+                    },
+                    callback,
+                )
+                .await;
+
+                let outcomes = outcomes.lock().unwrap().clone();
+                assert_eq!(
+                    outcomes.get(&99).map(|(code, _)| *code),
+                    Some(LoreErrorCode::AddressNotFound),
+                    "the absent address must report AddressNotFound",
+                );
+                for (index, payload) in payloads.iter().enumerate() {
+                    let id = index as u64;
+                    assert_eq!(
+                        outcomes.get(&id).map(|(code, _)| *code),
+                        Some(LoreErrorCode::None),
+                        "metadata item {id} shares the stream with a miss and must still succeed",
+                    );
+                    assert_eq!(
+                        outcomes.get(&id).map(|(_, size)| *size),
+                        Some(payload.len() as u32),
+                        "metadata item {id} must report the real payload size",
+                    );
+                }
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Answers `get` with `SlowDown` a bounded number of times for one address, then delegates.
+    ///
+    /// Backpressure is the other routine per-item failure — it maps to `ResourceExhausted`,
+    /// also a stream trailer under the old behaviour. Failing only a bounded number of times
+    /// keeps the test fast, since the client's retry then succeeds.
+    ///
+    /// Seeding goes straight into the backing store, which is then wrapped so the server's own
+    /// `handle_get` observes the injected `SlowDown` for exactly one of the addresses.
+    struct SlowDownOnce {
+        inner: Arc<dyn lore_storage::ImmutableStore>,
+        target: lore_base::types::Address,
+        remaining: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl lore_storage::ImmutableStore for SlowDownOnce {
+        // Answered from the wrapped store rather than the trait defaults: these describe how widely
+        // the store behind this one reads and reports, and the `query` contract is written against
+        // them. A decorator that let them default would misdescribe whatever it wraps.
+        fn is_local(&self) -> bool {
+            self.inner.is_local()
+        }
+
+        fn isolates_partitions(&self) -> bool {
+            self.inner.isolates_partitions()
+        }
+
+        fn read_scope(&self) -> lore_storage::StoreMatch {
+            self.inner.read_scope()
+        }
+
+        fn query_scope(&self) -> lore_storage::StoreMatch {
+            self.inner.query_scope()
+        }
+
+        async fn get(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+        ) -> Result<lore_storage::StoreGetData, lore_storage::StoreError> {
+            if address == self.target
+                && self
+                    .remaining
+                    .fetch_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |n| n.checked_sub(1),
+                    )
+                    .is_ok()
+            {
+                return Err(lore_storage::StoreError::from(lore_base::error::SlowDown));
+            }
+            self.inner.clone().get(partition, address).await
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            addresses: &[lore_base::types::Address],
+            results: &mut [lore_storage::StoreMatchResult],
+        ) -> Result<(), lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .query(partition, addresses, results)
+                .await
+        }
+
+        // Forwarded explicitly, as the trait requires: delegating `query` alone would leave the
+        // inner store's own override unused.
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+        ) -> Result<lore_storage::StoreGetData, lore_storage::StoreError> {
+            self.inner.clone().get_metadata(partition, address).await
+        }
+
+        async fn put(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+            fragment: lore_base::types::Fragment,
+            payload: Option<bytes::Bytes>,
+            force: bool,
+        ) -> Result<(), lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .put(partition, address, fragment, payload, force)
+                .await
+        }
+
+        async fn obliterate(
+            self: Arc<Self>,
+            partition: lore_base::types::Partition,
+            address: lore_base::types::Address,
+            stats: Arc<lore_storage::StoreObliterateStats>,
+        ) -> Result<(), lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .obliterate(partition, address, stats)
+                .await
+        }
+
+        async fn evict(
+            self: Arc<Self>,
+            max_capacity: usize,
+            sync_data: bool,
+            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+        ) -> Result<usize, lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .evict(max_capacity, sync_data, sink)
+                .await
+        }
+
+        async fn compact(
+            self: Arc<Self>,
+            max_size: usize,
+            at: Option<usize>,
+            sync_data: bool,
+            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+        ) -> Result<Option<usize>, lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .compact(max_size, at, sync_data, sink)
+                .await
+        }
+
+        async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
+            self.inner.clone().compact_resume_at().await
+        }
+
+        async fn compact_stop(self: Arc<Self>) {
+            self.inner.clone().compact_stop().await;
+        }
+
+        fn max_query_batch(&self) -> Option<usize> {
+            self.inner.max_query_batch()
+        }
+
+        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), lore_storage::StoreError> {
+            self.inner.clone().flush(sync_data).await
+        }
+
+        async fn verify(self: Arc<Self>, heal: bool) -> Result<(), lore_storage::StoreError> {
+            self.inner.clone().verify(heal).await
+        }
+    }
+
+    /// A per-item `SlowDown` must not disturb the other addresses sharing the Get stream.
+    #[tokio::test]
+    async fn get_batch_survives_server_side_slow_down() -> TestResult {
+        use bytes::Bytes;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+
+        let execution = setup_execution("storage-remote-get-slowdown-batch".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let partition = Partition::from([0xc3u8; 16]);
+                let (backend_immutable, backend_mutable) = make_backends().await;
+
+                let payloads: Vec<Bytes> = (0..3u8)
+                    .map(|i| Bytes::from(format!("slowdown sibling payload {i}").into_bytes()))
+                    .collect();
+                let slow_payload = Bytes::from_static(b"slowdown target payload");
+
+                let mut addresses = Vec::new();
+                for payload in payloads.iter().chain(std::iter::once(&slow_payload)) {
+                    let address = lore_base::types::Address {
+                        hash: lore_storage::hash_slice(payload.as_ref()),
+                        context: lore_base::types::Context::default(),
+                    };
+                    backend_immutable
+                        .clone()
+                        .put(
+                            partition,
+                            address,
+                            lore_base::types::Fragment {
+                                flags: 0,
+                                size_payload: payload.len() as u32,
+                                size_content: payload.len() as u64,
+                            },
+                            Some(payload.clone()),
+                            false,
+                        )
+                        .await
+                        .expect("seed backing store");
+                    addresses.push(address);
+                }
+                let slow_address = *addresses.last().unwrap();
+
+                let served: Arc<dyn lore_storage::ImmutableStore> = Arc::new(SlowDownOnce {
+                    inner: backend_immutable,
+                    target: slow_address,
+                    remaining: std::sync::atomic::AtomicUsize::new(1),
+                });
+                let server = start_test_server_with(served, backend_mutable).await;
+                let handle_id = open_remote_handle(&server).await;
+
+                let items = addresses
+                    .iter()
+                    .enumerate()
+                    .map(|(index, address)| get_item(index as u64, partition, *address))
+                    .collect();
+                let results = run_get_batch(handle_id, items).await;
+
+                for (index, payload) in payloads
+                    .iter()
+                    .chain(std::iter::once(&slow_payload))
+                    .enumerate()
+                {
+                    let id = index as u64;
+                    assert_eq!(
+                        results.codes.get(&id),
+                        Some(&LoreErrorCode::None),
+                        "item {id} must succeed — a per-item SlowDown is retryable and must \
+                         leave the stream serving its siblings",
+                    );
+                    assert_eq!(
+                        results.bytes.get(&id).map(Vec::as_slice),
+                        Some(payload.as_ref()),
+                        "item {id} must return its full payload",
+                    );
+                }
 
                 close_handle(handle_id).await;
                 Ok(())

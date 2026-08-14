@@ -179,7 +179,7 @@ pub async fn write_file(
         absolute_path
     };
 
-    match tokio::fs::metadata(&destination).await {
+    match lore_io::IoDriver::global().metadata(&destination).await {
         Ok(metadata) => {
             if metadata.is_dir() {
                 return Err(InvalidPath {
@@ -239,30 +239,37 @@ pub async fn write_file(
         .into());
     }
 
-    if node.size > 0 {
-        let _ = immutable::read_into_file(
+    let written_metadata = if node.size > 0 {
+        immutable::read_into_file(
             repository.clone(),
             node.address,
             destination.as_path(),
+            None,
             immutable::read_options_from_repository(&repository),
         )
         .await
-        .forward::<WriteError>("Failed to write file")?;
+        .forward::<WriteError>("Failed to write file")?
+        .1
     } else {
         // Zero sized file, just create
-        tokio::fs::OpenOptions::new()
-            .read(false)
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(destination.as_path())
-            .await
-            .internal("Failed to write file")?;
-    }
+        Some(
+            lore_io::IoDriver::global()
+                .write_file_bytes(destination.as_path(), bytes::Bytes::new(), false)
+                .await
+                .internal("Failed to write file")?,
+        )
+    };
 
-    let metadata = tokio::fs::metadata(destination.as_path())
-        .await
-        .internal("Failed to write file")?;
+    // Taken from the write where it captured one on the open handle. The multi-fragment path
+    // surfaces none, since the handle travels through the defragment pipeline, so that case is
+    // the one that still asks.
+    let metadata = match written_metadata {
+        Some(metadata) => metadata,
+        None => lore_io::IoDriver::global()
+            .metadata(destination.as_path())
+            .await
+            .internal("Failed to write file")?,
+    };
 
     let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
     if node_executable != util::fs::file_is_executable(&metadata) {
@@ -307,7 +314,7 @@ pub async fn write_address(
         absolute_path
     };
 
-    match tokio::fs::metadata(&destination).await {
+    match lore_io::IoDriver::global().metadata(&destination).await {
         Ok(metadata) => {
             if metadata.is_dir() {
                 return Err(InvalidPath {
@@ -336,6 +343,7 @@ pub async fn write_address(
         repository.clone(),
         address_value,
         destination.as_path(),
+        None,
         immutable::read_options_from_repository(&repository),
     )
     .await

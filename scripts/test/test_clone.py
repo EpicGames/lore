@@ -134,3 +134,37 @@ def test_clone_by_branch_id(new_lore_repo):
 
     with clone.open_file("file.txt") as f:
         assert f.read() == "main content\nfeature\n"
+
+
+@pytest.mark.smoke
+def test_clone_direct_file_write(new_lore_repo):
+    """
+    Verify that clone with --direct-file-write produces correct files on disk.
+
+    --direct-file-write skips the default atomic write strategy (write to temp
+    file then rename) and writes directly to the destination path. The result
+    must be identical to a normal clone.
+    """
+    repo: Lore = new_lore_repo()
+
+    repo.write_commit_push("Initial commit", {
+        "text.txt": "hello world\n",
+        "subdir/nested.txt": "nested content\n",
+        "binary.bin": b"\x00\x01\x02\xff" * 256,
+    })
+
+    clone = repo.clone(direct_file_write=True)
+
+    # Verify text files
+    with clone.open_file("text.txt") as f:
+        assert f.read() == "hello world\n", "text file content mismatch"
+
+    with clone.open_file("subdir/nested.txt") as f:
+        assert f.read() == "nested content\n", "nested file content mismatch"
+
+    # Verify binary file
+    with clone.open_file("binary.bin", "rb") as f:
+        content = f.read()
+    assert content == b"\x00\x01\x02\xff" * 256, (
+        f"binary file content mismatch, got {len(content)} bytes"
+    )

@@ -27,9 +27,10 @@ use crate::errors::NotSupported;
 use crate::errors::Oversized;
 use crate::errors::PayloadNotFound;
 use crate::errors::SlowDown;
+use crate::store_types::StoreGetData;
 use crate::store_types::StoreMatch;
+use crate::store_types::StoreMatchResult;
 use crate::store_types::StoreObliterateStats;
-use crate::store_types::StoreQueryResult;
 
 #[error_set(clone)]
 pub enum StoreError {
@@ -278,6 +279,23 @@ pub fn sanitise_fragment_behavior_flags(fragment: &mut Fragment) -> BehaviorFlag
     BehaviorFlags { do_not_replicate }
 }
 
+/// Resolve one address. The batched form is what stores implement, because batching is a real
+/// capability and asking about one address is the degenerate case of it; this is a free function
+/// rather than a trait method so no store can override it and reintroduce the divergence between
+/// asking about one address and asking about several.
+pub async fn query_one(
+    store: &Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+) -> Result<StoreMatchResult, StoreError> {
+    let mut result = [StoreMatchResult::default()];
+    store
+        .clone()
+        .query(partition, &[address], &mut result)
+        .await?;
+    Ok(result[0])
+}
+
 #[async_trait]
 pub trait ImmutableStore: Any + Send + Sync {
     /// Check if this store is backed by local disk
@@ -285,50 +303,128 @@ pub trait ImmutableStore: Any + Send + Sync {
         false
     }
 
+    /// Whether this store refuses to serve a payload it only found under another partition.
+    ///
+    /// Content is addressed by hash, so the same bytes stored by two tenants resolve to one entry.
+    /// A process that holds content for more than one of them has to decide whether a caller naming
+    /// a partition it does have access to may be served bytes that were only ever written under a
+    /// partition it does not. A single-tenant process has nothing to protect and answers `false`.
+    fn isolates_partitions(&self) -> bool {
+        false
+    }
+
+    /// How widely this store searches when serving content: the widest match it will answer
+    /// [`ImmutableStore::get`] or [`ImmutableStore::get_metadata`] with.
+    ///
+    /// A store that isolates partitions serves the association it was asked for and nothing else.
+    /// It sits behind a trust boundary, and no protocol carrying a served payload carries the level
+    /// it was found at, so whatever such a store serves is read as a full match by whoever receives
+    /// it. Answering only exact associations is what makes that reading true. A single-tenant store
+    /// has no boundary to cross and serves whatever it holds for the hash.
+    ///
+    /// One policy for both reads, so `get` and `get_metadata` cannot drift apart into describing
+    /// content one of them would refuse to hand over. What a store will *report* reaches further —
+    /// see [`ImmutableStore::query_scope`].
+    fn read_scope(&self) -> StoreMatch {
+        if self.isolates_partitions() {
+            StoreMatch::MatchFull
+        } else {
+            StoreMatch::MatchHash
+        }
+    }
+
+    /// How widely this store searches when reporting what it holds, which is wider than what it
+    /// will serve.
+    ///
+    /// A partition match says the payload is already in the partition the caller asked about, so an
+    /// association can be duplicated with [`ImmutableStore::copy`] rather than transferred. That is
+    /// a fact about a partition the caller already holds, and acting on it takes a separate
+    /// operation the store authorizes in its own right — not bytes handed over here. So a store may
+    /// report a level it would refuse to read at, and an isolating store does.
+    fn query_scope(&self) -> StoreMatch {
+        if self.isolates_partitions() {
+            StoreMatch::MatchPartition
+        } else {
+            StoreMatch::MatchHash
+        }
+    }
+
+    /// Serve the payload for an address, searching as widely as this store permits.
+    ///
+    /// There is no level to choose. A context is not an access boundary, so content stored under a
+    /// sibling context in the same partition is always readable; whether the search may cross a
+    /// partition is [`ImmutableStore::isolates_partitions`], which the store answers from its own
+    /// configuration rather than the caller from the call.
+    async fn get(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+    ) -> Result<StoreGetData, StoreError>;
+
     /// Check if this store is available for service
     async fn is_available(self: Arc<Self>, _timeout: Duration) -> bool {
         true
     }
 
-    /// Check the immutable store for existence of the given address within the partition.
-    /// Match request can be used to early out during address-partition-context triplet
-    /// matching if a full match is not required. Returns the match made.
-    async fn exist(
-        self: Arc<Self>,
-        partition: Partition,
-        address: Address,
-        match_requested: StoreMatch,
-    ) -> Result<StoreMatch, StoreError>;
-
-    /// Check for the existence of a batch of addresses. Behavior is identical to `exist`.
-    /// The order of results in the returned `Vec` matches the order of addresses provided as input.
-    async fn exist_batch(
-        self: Arc<Self>,
-        partition: Partition,
-        addresses: &[Address],
-        match_requested: StoreMatch,
-    ) -> Result<Vec<StoreMatch>, StoreError>;
-
-    /// Query the immutable metadata for the given address within the partition.
-    /// Match request can be used to early out during address-partition-context triplet
-    /// matching if a full match is not required.
+    /// Resolve addresses against this store, writing one result per address into `results`, in the
+    /// order the addresses were given. `results` must be as long as `addresses`.
+    ///
+    /// One question, asked once, with no requested level: the store reports the best match it
+    /// establishes rather than confirming a level the caller guessed at.
+    ///
+    /// The contract, checked for every implementation by [`crate::conformance`]:
+    ///
+    /// 1. **Never over-report.** A reported level must hold: the association it names exists. It
+    ///    says nothing about whether the payload can be handed over here — that is
+    ///    [`StoreMatchResult::stored_local`] and [`StoreMatchResult::stored_durable`]. A store may
+    ///    hold the representation and not the bytes, and reports a full match when it does.
+    /// 2. **May under-report.** A store may answer with a weaker level than the truth when
+    ///    establishing the stronger one costs more than it is worth — a durable store need not
+    ///    spend a lookup to distinguish "in this partition" from "somewhere". Callers must read a
+    ///    weak level as "no shortcut available", never as proof of absence.
+    /// 3. **Obliterated never matches**, here and through
+    ///    [`ImmutableStore::get_metadata`] and [`ImmutableStore::get`] alike.
+    /// 4. **Reads do not under-serve, and agree with each other.** Whatever
+    ///    [`ImmutableStore::get`] will serve, [`ImmutableStore::get_metadata`] will describe: both
+    ///    reach exactly as far as [`ImmutableStore::read_scope`], so neither describes what the
+    ///    other would refuse. This reaches further, to [`ImmutableStore::query_scope`], because
+    ///    what it reports is a level to act on with another operation rather than bytes owed here.
+    /// 5. **A match names where it was found, and prefers where it was asked.** Where the partition
+    ///    asked about holds the hash, that is the one reported; another may be named only when it
+    ///    does not, which only a store reading across partitions can do.
+    ///
+    /// `results` must be the same length as `addresses`, and each entry is written in place.
     async fn query(
         self: Arc<Self>,
         partition: Partition,
-        address: Address,
-        match_requested: StoreMatch,
-    ) -> Result<StoreQueryResult, StoreError>;
+        addresses: &[Address],
+        results: &mut [StoreMatchResult],
+    ) -> Result<(), StoreError>;
 
-    /// Get the immutable data for the given address within the partition.
-    /// Match requirement controls cross-partition and cross-context load behavior.
-    /// Returns `StoreError::AddressNotFound` if no match is made.
-    /// Returns `StoreError::PayloadNotFound` if a match is made but no payload is stored locally.
-    async fn get(
+    /// Query the fragment describing the payload stored for the given address.
+    ///
+    /// Where [`ImmutableStore::query`] answers whether a payload exists and where it is stored,
+    /// this answers *what it is* — its compression and its sizes. The two are separate because a
+    /// store that keeps the fragment beside the payload rather than in an index has to go and read
+    /// it, which costs a round trip that `query` deliberately avoids: `query` sits on the ingress
+    /// write path and runs once per fragment stored.
+    ///
+    /// Searched at the same scope as [`ImmutableStore::get`], and for the same reason: the store
+    /// decides how widely it looks, not the caller. Describing a payload is strictly less than
+    /// handing it over, so anything this store would serve the bytes of, it will also describe. A
+    /// weaker level than `MatchFull` says the representation belongs to content reached under
+    /// another context or partition — the same bytes, since the hash is the same.
+    ///
+    /// Required rather than defaulted. A default delegating to `query` is right for a store whose
+    /// `query` already reports the representation, and silently wrong for a wrapper that forwards
+    /// `query` alone — the wrapper's own `query` would answer, the inner store's override would
+    /// never run, and the caller would get a well-formed fragment with no sizes and no error. Every
+    /// implementor decides instead.
+    async fn get_metadata(
         self: Arc<Self>,
         partition: Partition,
         address: Address,
-        match_required: StoreMatch,
-    ) -> Result<(Fragment, Bytes), StoreError>;
+    ) -> Result<StoreGetData, StoreError>;
 
     /// Put the immutable data for the given address within the partition.
     /// If the payload buffer is not given and the store has no previous instance of the data,

@@ -351,7 +351,7 @@ mod tests {
     #[test]
     fn a_batch_entry_name_that_is_not_utf8_is_rejected() {
         let args = crate::revision_tree::add::LoreRevisionTreeAddArgs {
-            id: 1,
+            batch_id: 1,
             handle: crate::revision_tree::handle::LoreRevisionTree::INVALID,
             entries: lore_revision::interface::LoreArray::from_vec(vec![
                 crate::revision_tree::add::LoreRevisionTreeAddEntry {

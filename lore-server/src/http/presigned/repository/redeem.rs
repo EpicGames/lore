@@ -154,13 +154,14 @@ pub async fn handler(
                 parsed_repository,
             ));
 
-            let options = read_options_from_repository(&repository).with_isolation();
+            let options = read_options_from_repository(&repository);
 
             let (tx, rx) = channel(CHUNKED_RESPONSE_BUFFER_SIZE);
 
-            let content_length = immutable::read_stream(repository, parsed_address, options, tx)
-                .await
-                .map_err(RedeemError::ReadStream)?;
+            let content_length =
+                immutable::read_stream(repository, parsed_address, None, options, tx)
+                    .await
+                    .map_err(RedeemError::ReadStream)?;
 
             let mut response_headers = HeaderMap::new();
             response_headers.insert(CONTENT_TYPE, content_type);
@@ -275,7 +276,7 @@ mod tests {
             max_file_size: 100,
             presign_config: Some(config),
         };
-        let settings = LoreHttpServerSettings::default();
+        let settings = LoreHttpServerSettings::test_default();
         TestServer::new(create_router(state, test_health, &settings)).unwrap()
     }
 
@@ -465,6 +466,26 @@ mod tests {
         let response = redeem_with_content_type(Some("image/png")).await;
         assert_eq!(response.status_code(), StatusCode::OK);
         assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "image/png");
+    }
+
+    /// The S3 default type must round-trip verbatim, so a caller that mints
+    /// with forwarded S3 metadata reads back the same value it sent.
+    #[tokio::test]
+    async fn redeem_serves_s3_binary_octet_stream_verbatim() {
+        let response = redeem_with_content_type(Some("binary/octet-stream")).await;
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "binary/octet-stream"
+        );
+        assert_eq!(
+            response.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers().get("content-security-policy").unwrap(),
+            "default-src 'none'; sandbox"
+        );
     }
 
     #[tokio::test]

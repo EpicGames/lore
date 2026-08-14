@@ -176,10 +176,13 @@ pub async fn create(
                         .await
                         .forward::<CreateError>("retrying branch creation after delete")?;
                     }
-                    Err(_err) => {
-                        return Err(CreateError::from(BranchAlreadyExists {
-                            branch: branch.clone(),
-                        }));
+                    Err(err) => {
+                        return Err(CreateError::BranchAlreadyExists(
+                            BranchAlreadyExists {
+                                branch: branch.clone(),
+                            }
+                            .chain_err_from(err, "failed to resolve branch for force-recreate"),
+                        ));
                     }
                 }
             } else {

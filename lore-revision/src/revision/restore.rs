@@ -581,9 +581,18 @@ pub async fn restore(
         BranchLatestStatus::Divergent
     };
 
-    branch::store_latest(repository.clone(), current_branch, revision, status)
+    let stored_latest = branch::load_latest(repository.clone(), current_branch)
         .await
-        .forward::<RestoreError>("storing branch head")?;
+        .unwrap_or_default();
+    branch::store_latest(
+        repository.clone(),
+        current_branch,
+        stored_latest,
+        revision,
+        status,
+    )
+    .await
+    .forward::<RestoreError>("storing branch head")?;
 
     if remote_pushed {
         branch::store_last_sync(repository.clone(), current_branch, revision).await;

@@ -545,7 +545,8 @@ async fn create_empty_directory(
     relative_path: &RelativePath,
 ) -> Result<(), CloneError> {
     let absolute = relative_path.to_absolute_path(repository.require_path()?);
-    tokio::fs::create_dir_all(&absolute)
+    lore_io::IoDriver::global()
+        .create_dir_all(&absolute)
         .await
         .internal_with(|| format!("Failed to create directory {}", absolute.display()))?;
     Ok(())
@@ -802,7 +803,7 @@ async fn process_block_item_dependency(
             // Create parent directories
             let dep_absolute = dep_relative.to_absolute_path(dispatcher.repository.require_path()?);
             if let Some(parent) = dep_absolute.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
+                let _ = lore_io::IoDriver::global().create_dir_all(parent).await;
             }
 
             // Always dispatch with dependency context so the item goes through
@@ -995,7 +996,8 @@ pub async fn clone(
     let filter_view = if let Some(view) = view {
         let mut view_target = dotpath.clone();
         view_target.push(repository::VIEW_FILTER);
-        tokio::fs::copy(view, &view_target)
+        lore_io::IoDriver::global()
+            .copy(view, &view_target)
             .await
             .internal_with(|| {
                 format!(
@@ -1192,9 +1194,13 @@ pub async fn clone(
                     .forward::<CloneError>("Failed to create local branch")?;
             }
             if !revision.is_zero() {
+                let local_latest = branch::load_latest(repository.clone(), branch_id)
+                    .await
+                    .unwrap_or_default();
                 branch::store_latest(
                     repository.clone(),
                     branch_id,
+                    local_latest,
                     revision,
                     BranchLatestStatus::Convergent,
                 )
@@ -1279,7 +1285,6 @@ async fn clone_materialize(
 
         #[cfg(all(target_family = "windows", feature = "vfs"))]
         {
-            //crate::swfs::serve::serve(_path, repository.clone(), state);
             crate::projfs::serve::serve(
                 _path,
                 repository.clone(),
@@ -1435,7 +1440,7 @@ async fn clone_in_path(
             let node_id = node_link.node;
             let absolute = relative.to_absolute_path(repository.require_path()?);
             if let Some(parent) = absolute.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
+                let _ = lore_io::IoDriver::global().create_dir_all(parent).await;
             }
             dep_ctx.visited.insert(node_id);
             dispatcher.dispatch(BlockDiscoverItem {
@@ -1540,7 +1545,8 @@ async fn clone_discover_link(
             // Discovery no longer pre-creates parent dirs; create the full chain here and cache the link dir in stats so later files under it cache-hit.
             let link_dir_hash = hash_string_bytes(absolute_path.as_os_str().as_encoded_bytes());
             if !stats.created_parents.contains(&link_dir_hash) {
-                tokio::fs::create_dir_all(absolute_path.as_path())
+                lore_io::IoDriver::global()
+                    .create_dir_all(absolute_path.as_path())
                     .await
                     .internal_with(|| {
                         format!("Failed to create directory {}", absolute_path.display())
@@ -1845,8 +1851,11 @@ async fn ensure_parent_dir(path: &Path, stats: &CloneStats) -> Result<(), CloneE
         return Ok(());
     }
     // `create_dir_all` only forgives `AlreadyExists`, so check existence ourselves as `spawn_clone_directory` does.
-    if let Err(err) = tokio::fs::create_dir_all(parent).await
-        && !tokio::fs::metadata(parent).await.is_ok_and(|m| m.is_dir())
+    if let Err(err) = lore_io::IoDriver::global().create_dir_all(parent).await
+        && !lore_io::IoDriver::global()
+            .metadata(parent)
+            .await
+            .is_ok_and(|m| m.is_dir())
     {
         return Err(CloneError::internal_with_context(
             err,
@@ -1868,7 +1877,9 @@ async fn clone_file(
     let context = execution_context();
     let call = context.globals();
     let force = call.force();
-    let metadata = tokio::fs::metadata(absolute_path.as_path()).await;
+    let metadata = lore_io::IoDriver::global()
+        .metadata(absolute_path.as_path())
+        .await;
     if let Ok(metadata) = metadata {
         if options.ignore_existing {
             lore_trace!("Ignore existing file {}", absolute_path.display());
@@ -1956,6 +1967,7 @@ async fn clone_file(
                 repository.clone(),
                 node.address,
                 absolute_path.as_path(),
+                None,
                 read_options_from_repository(&repository),
             )
             .await
@@ -1974,21 +1986,18 @@ async fn clone_file(
             metadata
         } else {
             // Zero sized file, just create
-            tokio::fs::OpenOptions::new()
-                .read(false)
-                .write(true)
-                .truncate(true)
-                .create(true)
-                .open(absolute_path.as_path())
+            let metadata = lore_io::IoDriver::global()
+                .write_file_bytes(absolute_path.as_path(), bytes::Bytes::new(), false)
                 .await
                 .internal_with(|| format!("Failed to clone file {}", absolute_path.display()))?;
-            None
+            Some(metadata)
         };
 
         let metadata = if let Some(metadata) = captured_metadata {
             metadata
         } else {
-            tokio::fs::metadata(absolute_path.as_path())
+            lore_io::IoDriver::global()
+                .metadata(absolute_path.as_path())
                 .await
                 .internal_with(|| format!("Failed to clone file {}", absolute_path.display()))?
         };
@@ -2119,7 +2128,8 @@ fn spawn_clone_link(
                     linked_repository.id,
                     absolute_path.display()
                 );
-                tokio::fs::create_dir(absolute_path.as_path())
+                lore_io::IoDriver::global()
+                    .create_dir_all(absolute_path.as_path())
                     .await
                     .internal_with(|| {
                         format!("Failed to create directory {}", absolute_path.display())
@@ -2164,7 +2174,9 @@ async fn spawn_clone_directory(
 
     let future = async move {
         if !execution_context().globals().dry_run() {
-            let result = tokio::fs::create_dir(absolute_path.as_path()).await;
+            let result = lore_io::IoDriver::global()
+                .create_dir_all(absolute_path.as_path())
+                .await;
             if result.is_err() && !absolute_path.is_dir() {
                 stats
                     .directory_inflight
@@ -2228,6 +2240,10 @@ urc_repository_clone_module_in_path(urc_repository_t* repository, urc_state_t* s
 */
 
 #[cfg(test)]
+// Fixture setup builds and permissions files directly rather than through the driver: what these
+// tests exercise is how clone reacts to a filesystem in a given state, not how that state is
+// reached.
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

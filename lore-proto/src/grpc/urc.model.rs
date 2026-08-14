@@ -187,6 +187,10 @@ pub struct Path {
     pub address: ::prost::bytes::Bytes,
     #[prost(enumeration = "PathType", tag = "3")]
     pub r#type: i32,
+    /// True when a link node tracks its parent's branch; false for pinned
+    /// links and non-link nodes.
+    #[prost(bool, tag = "4")]
+    pub tracking: bool,
 }
 impl ::prost::Name for Path {
     const NAME: &'static str = "Path";
@@ -206,6 +210,14 @@ pub struct PathDiff {
     pub to: ::core::option::Option<Path>,
     #[prost(bool, tag = "3")]
     pub automerged: bool,
+    /// Repository the changed content resolves under; empty when it is the
+    /// request's own repository.
+    #[prost(bytes = "bytes", tag = "4")]
+    pub link_partition: ::prost::bytes::Bytes,
+    /// True when a link change tracks its parent's branch; false for pinned
+    /// links and non-link changes.
+    #[prost(bool, tag = "5")]
+    pub tracking: bool,
 }
 impl ::prost::Name for PathDiff {
     const NAME: &'static str = "PathDiff";

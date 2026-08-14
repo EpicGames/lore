@@ -66,9 +66,13 @@ exclude = []
 # args struct definitions land in the header before their extern "C" entry
 # points reference them. `LoreBytes` and `LoreErrorCode` are reachable via
 # the `lore_*_event_data_t` variants and do not need to be listed.
+# `LoreNodeStagedAction` names the values of the `staged_action` field on the
+# child and node-info records; the field is a `uint32_t` there, as `kind` is, so
+# nothing declares the enum type and cbindgen cannot reach it on its own.
 include = [
     "LoreStore",
     "LoreRevisionTree",
+    "LoreNodeStagedAction",
     "LoreRevisionTreeLoadArgs",
     "LoreRevisionTreeCloseArgs",
     "LoreRevisionTreeResolvePathArgs",
@@ -82,6 +86,7 @@ include = [
     "LoreRevisionTreeMoveArgs",
     "LoreRevisionTreeMetadataSetArgs",
     "LoreRevisionTreeMetadataGetArgs",
+    "LoreRevisionTreeMetadataClearArgs",
     "LoreRevisionTreeCommitArgs",
     "LoreRevisionTreeCommitOptions",
 ]
@@ -326,6 +331,7 @@ include = [
 "LoreLinkRemoveArgs" = "lore_link_remove_args_t"
 "LoreLinkListArgs" = "lore_link_list_args_t"
 "LoreLinkUpdateArgs" = "lore_link_update_args_t"
+"LoreLinkBranchCreateEventData" = "lore_link_branch_create_event_data_t"
 "LoreLinkChangeEventData" = "lore_link_change_event_data_t"
 "LoreLinkEntryEventData" = "lore_link_entry_event_data_t"
 "LoreLinkStagedEntryEventData" = "lore_link_staged_entry_event_data_t"
@@ -486,6 +492,7 @@ include = [
 "LoreRevisionTreeMoveCompleteEventData" = "lore_revision_tree_move_complete_event_data_t"
 "LoreRevisionTreeMetadataSetCompleteEventData" = "lore_revision_tree_metadata_set_complete_event_data_t"
 "LoreRevisionTreeMetadataGetCompleteEventData" = "lore_revision_tree_metadata_get_complete_event_data_t"
+"LoreRevisionTreeMetadataClearCompleteEventData" = "lore_revision_tree_metadata_clear_complete_event_data_t"
 "LoreRevisionTreeCommitCompleteEventData" = "lore_revision_tree_commit_complete_event_data_t"
 "LoreRevisionTreeCloseCompleteEventData" = "lore_revision_tree_close_complete_event_data_t"
 "LoreRevisionTreeListChildrenBeginEventData" = "lore_revision_tree_list_children_begin_event_data_t"
@@ -502,9 +509,20 @@ include = [
 "LoreArray_lore_revision_tree_add_entry" = "lore_revision_tree_add_entry_array_t"
 "LoreRevisionTreeDeleteArgs" = "lore_revision_tree_delete_args_t"
 "LoreRevisionTreeModifyArgs" = "lore_revision_tree_modify_args_t"
+"LoreRevisionTreeModifyEntry" = "lore_revision_tree_modify_entry_t"
+"LoreArray_lore_revision_tree_delete_entry" = "lore_revision_tree_delete_entry_array_t"
+"LoreRevisionTreeDeleteEntry" = "lore_revision_tree_delete_entry_t"
+"LoreArray_lore_revision_tree_modify_entry" = "lore_revision_tree_modify_entry_array_t"
 "LoreRevisionTreeMoveArgs" = "lore_revision_tree_move_args_t"
 "LoreRevisionTreeMetadataSetArgs" = "lore_revision_tree_metadata_set_args_t"
+"LoreRevisionTreeMetadataSetEntry" = "lore_revision_tree_metadata_set_entry_t"
+"LoreArray_lore_revision_tree_metadata_set_entry" = "lore_revision_tree_metadata_set_entry_array_t"
 "LoreRevisionTreeMetadataGetArgs" = "lore_revision_tree_metadata_get_args_t"
+"LoreRevisionTreeMetadataClearArgs" = "lore_revision_tree_metadata_clear_args_t"
+"LoreRevisionTreeMetadataClearEntry" = "lore_revision_tree_metadata_clear_entry_t"
+"LoreArray_lore_revision_tree_metadata_clear_entry" = "lore_revision_tree_metadata_clear_entry_array_t"
+"LoreRevisionTreeMetadataGetEntry" = "lore_revision_tree_metadata_get_entry_t"
+"LoreArray_lore_revision_tree_metadata_get_entry" = "lore_revision_tree_metadata_get_entry_array_t"
 "LoreRevisionTreeCommitArgs" = "lore_revision_tree_commit_args_t"
 "LoreRevisionTreeCommitOptions" = "lore_revision_tree_commit_options_t"
 "LoreString" = "lore_string_t"
@@ -516,6 +534,7 @@ include = [
 "LoreArray_lore_metadata_type" = "lore_metadata_type_array_t"
 "LoreArray_lore_string" = "lore_string_array_t"
 "LoreArray_lore_trace_location" = "lore_trace_location_array_t"
+"LoreNodeStagedAction" = "lore_node_staged_action_t"
 "LoreNodeType" = "lore_node_type_t"
 "LoreNotificationBranchCreatedEventData" = "lore_notification_branch_created_event_data_t"
 "LoreNotificationBranchDeletedEventData" = "lore_notification_branch_deleted_event_data_t"

@@ -40,7 +40,6 @@ use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::state;
 use crate::state::State;
-use crate::store;
 use crate::util::serde::u8_as_bool;
 
 /// Data for the event sent when a branch push starts.
@@ -142,6 +141,10 @@ pub struct LoreBranchPushFragmentEndEventData {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushBranchCreateBeginEventData {
+    /// The repository the branch is created in.
+    pub repository: RepositoryId,
+    /// The branch being created.
+    pub branch: BranchId,
     /// The local revision the branch starts from.
     pub local_revision: Hash,
 }
@@ -160,6 +163,10 @@ pub struct LoreBranchPushBranchCreateEndEventData {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushRevisionPushBeginEventData {
+    /// The repository being pushed.
+    pub repository: RepositoryId,
+    /// The branch being pushed to.
+    pub branch: BranchId,
     /// The latest revision of the branch on the remote.
     pub remote_revision: Hash,
     /// The local revision being pushed.
@@ -184,6 +191,10 @@ pub struct LoreBranchPushRevisionPushUpdateEventData {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchPushRevisionPushEndEventData {
+    /// The repository that was pushed.
+    pub repository: RepositoryId,
+    /// The branch that was pushed to.
+    pub branch: BranchId,
     /// The branch revision on the remote before the push.
     pub old_remote_revision: Hash,
     /// The branch revision on the remote after the push.
@@ -639,6 +650,8 @@ async fn collect_fragments_and_push(
         };
 
         event::LoreEvent::BranchPushBranchCreateBegin(LoreBranchPushBranchCreateBeginEventData {
+            repository: repository.id,
+            branch,
             local_revision: branch_point,
         })
         .send();
@@ -838,6 +851,8 @@ async fn collect_fragments_and_push(
         };
 
         event::LoreEvent::BranchPushRevisionPushBegin(LoreBranchPushRevisionPushBeginEventData {
+            repository: repository.id,
+            branch,
             remote_revision: remote_latest,
             local_revision: current_revision,
         })
@@ -861,6 +876,8 @@ async fn collect_fragments_and_push(
 
                     event::LoreEvent::BranchPushBranchCreateBegin(
                         LoreBranchPushBranchCreateBeginEventData {
+                            repository: repository.id,
+                            branch,
                             local_revision: remote_latest,
                         },
                     )
@@ -895,9 +912,13 @@ async fn collect_fragments_and_push(
                 // Server performed a fast-forward merge — push succeeded with a new revision.
                 // Store the server-created revision as local latest (marked divergent since the
                 // local working directory still reflects the original merge revision).
+                let local_latest = branch::load_latest(repository.clone(), branch)
+                    .await
+                    .unwrap_or_default();
                 branch::store_latest(
                     repository.clone(),
                     branch,
+                    local_latest,
                     response.revision,
                     BranchLatestStatus::Divergent,
                 )
@@ -911,6 +932,8 @@ async fn collect_fragments_and_push(
 
                 event::LoreEvent::BranchPushRevisionPushEnd(
                     LoreBranchPushRevisionPushEndEventData {
+                        repository: repository.id,
+                        branch,
                         old_remote_revision: current_remote,
                         new_remote_revision: current_latest,
                         new_remote_revision_number: current_number,
@@ -963,6 +986,8 @@ async fn collect_fragments_and_push(
         }
 
         event::LoreEvent::BranchPushRevisionPushEnd(LoreBranchPushRevisionPushEndEventData {
+            repository: repository.id,
+            branch,
             old_remote_revision: current_remote,
             new_remote_revision: current_latest,
             new_remote_revision_number: current_number,
@@ -986,9 +1011,13 @@ async fn collect_fragments_and_push(
         && !fast_forward_merged
         && !dry_run
     {
+        let local_latest = branch::load_latest(repository.clone(), branch)
+            .await
+            .unwrap_or_default();
         branch::store_latest(
             repository.clone(),
             branch,
+            local_latest,
             current_latest,
             BranchLatestStatus::Convergent,
         )
@@ -1154,27 +1183,13 @@ pub(crate) async fn push_fragments(
         let storage = storage.clone();
         let stats = stats.clone();
         lore_spawn!(tasks, async move {
-            let (fragment, payload) = match immutable::load_raw_store_retry(
+            let (fragment, payload) = immutable::load_raw_store_retry(
                 repository.immutable_store(),
                 repository.id,
                 address,
-                store::StoreMatch::MatchFull,
             )
             .await
-            {
-                Ok((fragment, payload)) => (fragment, payload),
-                Err(ref e) if e.is_address_not_found() || e.is_payload_not_found() => {
-                    immutable::load_raw_store_retry(
-                        repository.immutable_store(),
-                        repository.id,
-                        address,
-                        store::StoreMatch::MatchHash,
-                    )
-                    .await
-                    .forward::<PushError>("loading fragment payload")?
-                }
-                Err(err) => Err(err).forward::<PushError>("loading fragment payload")?,
-            };
+            .forward::<PushError>("loading fragment payload")?;
 
             let payload_size = payload.len() as u64;
             stats.bytes_total.fetch_add(payload_size, Ordering::Relaxed);

@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -37,6 +38,7 @@ use lore::interface::LoreEvent;
 use lore::interface::LoreGlobalArgs;
 use lore::interface::LoreMetadataType;
 use lore::interface::LoreString;
+use lore::interface::Partition;
 use lore::runtime;
 use parking_lot::Mutex;
 
@@ -557,6 +559,21 @@ fn handle_branch_create(globals: LoreGlobalArgs, args: &BranchCreateArgs) -> u8 
                     );
                 }
             }
+            LoreEvent::LinkBranchCreate(data) => {
+                let outcome = if data.reused != 0 {
+                    "reusing existing branch"
+                } else {
+                    "created branch"
+                };
+                println!(
+                    "Link {}: {outcome} {}{}{} at revision {}",
+                    data.link_path.as_str(),
+                    BranchStyles::CURRENT_BRANCH,
+                    data.branch,
+                    anstyle::Reset,
+                    data.revision,
+                );
+            }
             LoreEvent::Complete(_) => {}
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
@@ -770,8 +787,23 @@ fn handle_branch_switch(globals: LoreGlobalArgs, args: &BranchSwitchArgs) -> u8 
 }
 
 pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 {
-    let branch_name = Arc::new(Mutex::new(String::new()));
     let response_message = Arc::new(Mutex::new(String::new()));
+
+    // The push events identify a branch by ID, so keep the names reported by the
+    // `BranchPush` event of every branch the cascade visits — it precedes that
+    // branch's own revision events. A linked repository reuses the parent's
+    // branch ID under its own name, so the repository is part of the key.
+    let branch_names = Arc::new(Mutex::new(BTreeMap::<(Partition, Context), String>::new()));
+    let name_of = {
+        let branch_names = branch_names.clone();
+        move |repository: Partition, branch: Context| {
+            branch_names
+                .lock()
+                .get(&(repository, branch))
+                .cloned()
+                .unwrap_or_else(|| branch.to_string())
+        }
+    };
 
     let push_args = LoreBranchPushArgs {
         branch: args.name.clone().into(),
@@ -784,6 +816,10 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::BranchPush(data) => {
+                branch_names
+                    .lock()
+                    .insert((data.repository, data.branch), data.branch_name.to_string());
+
                 let main_branch_prints = data.branch_name.as_str() == "main"
                     && !data.remote_revision.is_zero()
                     && globals.force == 0;
@@ -807,8 +843,6 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
                         println!("Repository {}", data.repository);
                     }
                 }
-
-                *branch_name.lock() = data.branch_name.to_string();
             }
             LoreEvent::BranchPushRevisionUpdateBegin(data) => {
                 println!(
@@ -851,16 +885,19 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
                     }
                 }
             LoreEvent::BranchPushBranchCreateBegin(data) => {
-                let branch_name = branch_name.lock();
                 println!(
                     "Creating branch {} at {}",
-                    *branch_name, data.local_revision
+                    name_of(data.repository, data.branch),
+                    data.local_revision
                 );
             }
             LoreEvent::BranchPushRevisionPushBegin(data) => {
-                let branch_name = branch_name.lock();
                 if data.local_revision != data.remote_revision {
-                    println!("Pushing {} to branch {}", data.local_revision, *branch_name);
+                    println!(
+                        "Pushing {} to branch {}",
+                        data.local_revision,
+                        name_of(data.repository, data.branch)
+                    );
                 }
             }
             LoreEvent::BranchPushRevisionPushUpdate(data) => {
@@ -871,21 +908,26 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
             }
             LoreEvent::BranchPushRevisionPushEnd(data) => {
                 *response_message.lock() = data.message.to_string();
-                let branch_name = branch_name.lock();
                 if data.fast_forward_merged != 0 {
                     println!(
                         "Pushed revision {} -> {} to branch {} (fast-forward merged on server, run 'lore sync' to update)",
-                        data.new_remote_revision_number, data.new_remote_revision, *branch_name
+                        data.new_remote_revision_number,
+                        data.new_remote_revision,
+                        name_of(data.repository, data.branch)
                     );
                 } else if data.old_remote_revision != data.new_remote_revision {
                     println!(
                         "Pushed revision {} -> {} to branch {}",
-                        data.new_remote_revision_number, data.new_remote_revision, *branch_name
+                        data.new_remote_revision_number,
+                        data.new_remote_revision,
+                        name_of(data.repository, data.branch)
                     );
                 } else {
                     println!(
                         "Revision {} -> {} already at latest of branch {}",
-                        data.new_remote_revision_number, data.new_remote_revision, *branch_name
+                        data.new_remote_revision_number,
+                        data.new_remote_revision,
+                        name_of(data.repository, data.branch)
                     );
                 }
             }

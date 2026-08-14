@@ -161,6 +161,8 @@ async fn stream_tree(
                 hash: address.hash.into(),
                 context: address.context.into(),
             }),
+            size: tree_path.size,
+            mode: tree_path.mode,
         };
         if tx
             .send(Ok(RevisionTreeResponse {

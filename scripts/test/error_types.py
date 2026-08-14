@@ -145,6 +145,9 @@ class NotALinkError(LoreException): ...
 class LinkNotFoundError(LoreException): ...
 
 
+class LinkPinDivergedError(LoreException): ...
+
+
 class NotALayerError(LoreException): ...
 
 
@@ -217,6 +220,7 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Nothing staged for commit", NothingStagedError),
     ("Path is not a link", NotALinkError),
     ("Link not found", LinkNotFoundError),
+    ("Link pin conflict at", LinkPinDivergedError),
     ("Path is not a layer", NotALayerError),
     ("Failed to connect to remote URL", BadSharedStoreRemoteUrl),
     ("Local modifications prevent synchronization", LocalModificationsError),

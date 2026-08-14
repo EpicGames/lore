@@ -18,6 +18,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_revision::lore::RepositoryId;
 use lore_storage::StoreMatch;
+use lore_storage::immutable_store::query_one;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use serde::Deserialize;
 use serde::Serialize;
@@ -176,16 +177,14 @@ pub async fn handler(
     LORE_CONTEXT
         .scope(execution, async move {
             // Verify the address exists before issuing a URL for it.
-            let match_result = immutable_store
-                .clone()
-                .exist(repository, parsed_address, StoreMatch::MatchFull)
+            let match_result = query_one(&immutable_store, repository, parsed_address)
                 .await
                 .map_err(|e| {
-                    warn!(%e, "Presign exist check failed");
+                    warn!(%e, "Presign resolve check failed");
                     PresignError::StoreError
                 })?;
 
-            if match_result == StoreMatch::MatchNone {
+            if match_result.match_made != StoreMatch::MatchFull {
                 return Err(PresignError::NotFound);
             }
 
@@ -311,7 +310,7 @@ mod tests {
                     max_file_size: 100,
                     presign_config: Some(test_presign_config()),
                 };
-                let settings = LoreHttpServerSettings::default();
+                let settings = LoreHttpServerSettings::test_default();
                 let server =
                     TestServer::new(create_router(state, test_health, &settings)).unwrap();
 
@@ -326,6 +325,14 @@ mod tests {
     #[tokio::test]
     async fn returns_404_when_address_not_found() {
         let response = mint(json!({"ttl_seconds": 3600})).await;
+        assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+    }
+
+    /// The S3 default type passes the allowlist, so it reaches the existence
+    /// check and returns 404 rather than 400.
+    #[tokio::test]
+    async fn accepts_s3_binary_octet_stream() {
+        let response = mint(json!({"content_type": "binary/octet-stream"})).await;
         assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
     }
 

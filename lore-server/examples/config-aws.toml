@@ -32,14 +32,20 @@ mode = "aws"
 
 # Immutable store settings (S3 + DynamoDB)
 [plugins.aws.immutable_store]
-s3_bucket = "urc-fragments"
+s3_bucket = "lore-fragments"
 # s3_endpoint_url = "http://localhost:4566"
 # s3_region = "us-east-1"
 s3_slow_operation_threshold_millis = 5000
 s3_timeout_millis = 30000
 
-dynamodb_fragments_table = "urc-fragments"
-dynamodb_metadata_table = "urc-metadata"
+dynamodb_fragments_table = "lore-fragments"
+# Holds fragment state; a row's presence means the hash exists. Its own table, distinct from the
+# one that held fragment metadata. Required, with no alias.
+dynamodb_fragment_state_table = "lore-fragment-state"
+# Read only where objects stored before the fragment moved onto the S3 object may still exist.
+# Accepts the older dynamodb_metadata_table spelling. Leave unset on a deployment created after
+# that change, as here.
+# dynamodb_fragment_metadata_table = "lore-fragment-metadata"
 # dynamodb_endpoint_url = "http://localhost:4566"
 # dynamodb_region = "us-east-1"
 dynamodb_slow_operation_threshold_millis = 2000
@@ -50,7 +56,7 @@ dynamodb_timeout_millis = 15000
 
 # Mutable store settings (DynamoDB)
 [plugins.aws.mutable_store]
-dynamodb_table = "urc-mutable"
+dynamodb_table = "lore-mutable"
 # dynamodb_endpoint_url = "http://localhost:4566"
 # dynamodb_region = "us-east-1"
 slow_operation_threshold_millis = 2000
@@ -58,7 +64,7 @@ timeout_millis = 15000
 
 # Lock store settings (DynamoDB)
 [plugins.aws.lock_store]
-dynamodb_table = "urc-locks"
+dynamodb_table = "lore-locks"
 # dynamodb_endpoint_url = "http://localhost:4566"
 # dynamodb_region = "us-east-1"
 dynamodb_slow_operation_threshold_millis = 1000

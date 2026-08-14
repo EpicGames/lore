@@ -442,7 +442,9 @@ async fn file_size_from_node_change_path(
         Ok(0)
     } else {
         let path_str = change.path.as_str().to_string();
-        let result = tokio::fs::metadata(change.path.to_absolute_path(repository_path)).await;
+        let result = lore_io::IoDriver::global()
+            .metadata(change.path.to_absolute_path(repository_path))
+            .await;
         // The file may have vanished between the diff's filesystem walk and
         // this stat — e.g. a concurrent `branch switch` deleted it from the
         // working directory. Treat the concurrent deletion as benign and
@@ -501,7 +503,7 @@ async fn dirty_change_is_modified(
     }
 
     let absolute_path = change.path.to_absolute_path(repository.require_path()?);
-    let Ok(metadata) = tokio::fs::metadata(&absolute_path).await else {
+    let Ok(metadata) = lore_io::IoDriver::global().metadata(&absolute_path).await else {
         return Ok(true);
     };
     if !metadata.is_file() {
@@ -1356,7 +1358,10 @@ pub async fn status(
                     exists_in_state = true;
                 } else {
                     let absolute_path = path.to_absolute_path(repository.require_path()?);
-                    exists_in_filesystem = std::fs::exists(absolute_path).unwrap_or_default();
+                    exists_in_filesystem = lore_io::IoDriver::global()
+                        .metadata(absolute_path)
+                        .await
+                        .is_ok();
                 }
 
                 if !exists_in_state && !exists_in_filesystem {

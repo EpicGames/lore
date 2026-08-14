@@ -1,15 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io::Seek;
-use std::io::SeekFrom;
-#[cfg(target_family = "unix")]
-use std::os::unix::fs::FileExt;
-#[cfg(target_family = "windows")]
-use std::os::windows::fs::FileExt;
-#[cfg(target_family = "windows")]
-use std::os::windows::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -18,6 +8,9 @@ use std::sync::atomic::Ordering;
 use bytes::Bytes;
 use bytes::BytesMut;
 use lore_error_set::prelude::*;
+use lore_io::IoDriver;
+use lore_io::IoFile;
+use lore_io::OpenOptions;
 use tokio::sync::RwLock;
 use tokio::sync::RwLockWriteGuard;
 use tokio::task::JoinSet;
@@ -34,140 +27,24 @@ pub struct PackStoreRef {
 struct PackFile {
     id: u32,
     size: usize,
-    file: Option<File>,
+    file: Option<IoFile>,
     buffer: Vec<u8>,
     dirty: AtomicBool,
 }
 
-#[cfg(target_family = "windows")]
-struct Retry {
-    current: u64,
-    maximum: u64,
-    counter: usize,
-    limit: usize,
+async fn packfile_read(file: &IoFile, offset: usize, size: usize) -> Result<Bytes, PackfileError> {
+    Ok(
+        crate::fs_util::retry_transient(|| file.read_exact_at(size, offset as u64))
+            .await
+            .internal("Failed reading from packstore file")?,
+    )
 }
 
-#[cfg(target_family = "windows")]
-impl Retry {
-    fn new(start: u64, maximum: u64, limit: usize) -> Self {
-        Retry {
-            current: start,
-            maximum,
-            counter: 0,
-            limit,
-        }
-    }
-
-    async fn wait(&mut self) -> bool {
-        tokio::time::sleep(std::time::Duration::from_millis(self.current)).await;
-        self.current = std::cmp::min(self.current * 2, self.maximum);
-        self.counter += 1;
-        self.counter < self.limit
-    }
-}
-
-#[cfg(target_family = "windows")]
-async fn packfile_read(file: &File, offset: usize, size: usize) -> Result<Bytes, PackfileError> {
-    let mut buffer = BytesMut::with_capacity(size);
-    unsafe { buffer.set_len(size) };
-    let mut retry = Retry::new(10, 10_000, 100);
-    let mut read = 0;
-    let mut offset = offset;
-    loop {
-        match file
-            .seek_read(&mut buffer.as_mut()[read..], offset as u64)
-            .internal("Failed reading from packstore file")
-        {
-            Ok(this_read) => {
-                if this_read == 0 {
-                    break;
-                }
-                read += this_read;
-                offset += this_read;
-                if read == size {
-                    break;
-                }
-            }
-            Err(err) => {
-                if !retry.wait().await {
-                    return Err(err.into());
-                }
-            }
-        }
-    }
-    if read != size {
-        return Err(PackfileError::internal(format!(
-            "Failed reading from packstore file, read {read} of {size} bytes"
-        )));
-    }
-    Ok(buffer.freeze())
-}
-
-#[cfg(target_family = "windows")]
-async fn packfile_write(
-    file: &mut File,
-    buffer: Bytes,
-    offset: usize,
-) -> Result<(), PackfileError> {
-    // On Windows the seek_read changes the file pointer so we must
-    // use seek_write to write to the end
-    let mut retry = Retry::new(10, 10_000, 100);
-    let mut wrote = 0;
-    let mut offset = offset;
-    let size = buffer.len();
-    loop {
-        match file
-            .seek_write(&buffer.as_ref()[wrote..], offset as u64)
-            .internal("Failed writing to packstore file")
-        {
-            Ok(this_write) => {
-                if this_write == 0 {
-                    break;
-                }
-                wrote += this_write;
-                offset += this_write;
-                if wrote == size {
-                    break;
-                }
-            }
-            Err(err) => {
-                if !retry.wait().await {
-                    return Err(err.into());
-                }
-            }
-        }
-    }
-    if wrote != size {
-        return Err(PackfileError::internal(format!(
-            "Failed writing to packstore file, wrote {wrote} of {size} bytes"
-        )));
-    }
+async fn packfile_write(file: &IoFile, buffer: Bytes, offset: usize) -> Result<(), PackfileError> {
+    crate::fs_util::retry_transient(|| file.write_all_at(buffer.clone(), offset as u64))
+        .await
+        .internal("Failed writing to packstore file")?;
     Ok(())
-}
-
-#[allow(clippy::unused_async)]
-#[cfg(target_family = "unix")]
-async fn packfile_read(file: &File, offset: usize, size: usize) -> Result<Bytes, PackfileError> {
-    let mut buffer = BytesMut::with_capacity(size);
-    // Safety: Ok to leave uninitialized, read_exact_at will either initialize all data with the read operation, or fail
-    unsafe { buffer.set_len(size) };
-    file.read_exact_at(buffer.as_mut(), offset as u64)
-        .internal("Failed reading from packstore file")?;
-    Ok(buffer.freeze())
-}
-
-#[allow(clippy::unused_async)]
-#[cfg(target_family = "unix")]
-async fn packfile_write(
-    file: &mut File,
-    buffer: Bytes,
-    offset: usize,
-) -> Result<(), PackfileError> {
-    // On Unix based system the read_exact_at does not change file position so the file position
-    // should always be at end of file - but offset is required to replace data (e.g. for obliteration)
-    Ok(file
-        .write_all_at(buffer.as_ref(), offset as u64)
-        .internal("Failed writing to packstore file")?)
 }
 
 /// Maximum size of a single packfile
@@ -216,9 +93,9 @@ impl PackStore {
         if let Some(path) = self.path.as_ref() {
             let path = path.clone();
             if !path.exists() {
-                std::fs::DirBuilder::new()
-                    .recursive(true)
-                    .create(&path)
+                IoDriver::global()
+                    .create_dir_all(&path)
+                    .await
                     .internal(&format!(
                         "Failed to create packstore directory {}",
                         path.display()
@@ -234,7 +111,7 @@ impl PackStore {
                 let Ok(entry) = entry else {
                     continue;
                 };
-                let Ok(file_meta) = std::fs::metadata(entry.path()) else {
+                let Ok(file_meta) = IoDriver::global().metadata(entry.path()).await else {
                     continue;
                 };
                 if !file_meta.is_file() {
@@ -260,29 +137,39 @@ impl PackStore {
             for index in 0..packfile_count {
                 let file_id = index + 1;
                 let file_path = path.join(file_id.to_string());
-                let mut file_options = OpenOptions::new();
-                file_options.read(true).write(true);
+                let file_options = OpenOptions::new().read(true).write(true);
+                // A packfile is the store's own, and nothing outside this process may write one
+                // while it is open here. Stated at the call site because the driver shares by
+                // default, most of what it opens being files Lore does not own.
                 #[cfg(target_family = "windows")]
+                let file_options = file_options
+                    .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
+                let file_options = if IoDriver::global()
+                    .metadata(file_path.as_path())
+                    .await
+                    .is_ok()
                 {
-                    // Prevent any other process from writing the file
-                    file_options
-                        .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
-                }
-                if let Ok(_meta) = std::fs::metadata(file_path.as_path()) {
                     lore_base::lore_trace!("Resuming packfile {file_id}");
-                    file_options.create(false);
+                    file_options
                 } else {
                     lore_base::lore_trace!("Create packfile {file_id}");
-                    file_options.create(true).truncate(true);
-                }
-                let mut file = file_options.open(file_path.as_path()).internal(&format!(
-                    "Failed opening packstore file {}",
-                    file_path.display()
-                ))?;
-                let file_size = file.seek(SeekFrom::End(0)).internal(&format!(
-                    "Failed seeking to packstore file end {}",
-                    file_path.display()
-                ))?;
+                    file_options.create(true).truncate(true)
+                };
+                let file = IoDriver::global()
+                    .open(file_path.as_path(), &file_options)
+                    .await
+                    .internal(&format!(
+                        "Failed opening packstore file {}",
+                        file_path.display()
+                    ))?;
+                let file_size = file
+                    .metadata()
+                    .await
+                    .internal(&format!(
+                        "Failed reading packstore file size {}",
+                        file_path.display()
+                    ))?
+                    .len();
 
                 let file = PackFile {
                     id: file_id,
@@ -304,7 +191,7 @@ impl PackStore {
 
         lore_base::lore_trace!("{} writable packfiles", writeable.len());
 
-        let _ = self.fill_writeable(packfile, writeable);
+        let _ = self.fill_writeable(packfile, writeable).await;
 
         if let Some(gc) = &self.gc_counters {
             gc.add_loaded_size(loaded_size);
@@ -323,10 +210,10 @@ impl PackStore {
             }
         }
 
-        let _ = self.fill_writeable(packfile, writeable);
+        let _ = self.fill_writeable(packfile, writeable).await;
     }
 
-    fn fill_writeable<'a>(
+    async fn fill_writeable<'a>(
         &'a self,
         mut packfile: RwLockWriteGuard<'a, Vec<RwLock<PackFile>>>,
         mut writeable: RwLockWriteGuard<'a, Vec<u32>>,
@@ -338,22 +225,22 @@ impl PackStore {
 
             let file = if let Some(path) = self.path.as_ref() {
                 let file_path = path.join(id.to_string());
-                let mut file_options = OpenOptions::new();
-                file_options
+                let file_options = OpenOptions::new()
                     .read(true)
                     .write(true)
                     .create(true)
                     .truncate(true);
+                // The store's own file, as above.
                 #[cfg(target_family = "windows")]
-                {
-                    // Prevent any other process from writing the file
-                    file_options
-                        .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
-                }
-                let file = file_options.open(file_path.as_path()).internal(&format!(
-                    "Failed opening packstore file {}",
-                    file_path.display()
-                ))?;
+                let file_options = file_options
+                    .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ);
+                let file = IoDriver::global()
+                    .open(file_path.as_path(), &file_options)
+                    .await
+                    .internal(&format!(
+                        "Failed opening packstore file {}",
+                        file_path.display()
+                    ))?;
 
                 PackFile {
                     id,
@@ -448,7 +335,7 @@ impl PackStore {
                         "Discard compacted and truncated packfile {}",
                         file_path.display()
                     );
-                    let _ = tokio::fs::remove_file(file_path.as_path()).await;
+                    let _ = IoDriver::global().remove_file(file_path.as_path()).await;
                 }
 
                 return Ok(());
@@ -458,8 +345,8 @@ impl PackStore {
 
             packfile.dirty.store(false, Ordering::Release);
             if let Some(file) = packfile.file.as_ref() {
-                let _ = file.set_len(0);
-                let _ = file.sync_all();
+                let _ = file.set_len(0).await;
+                let _ = file.sync_all().await;
             }
             packfile.buffer.clear();
             packfile.size = 0;
@@ -578,8 +465,8 @@ impl PackStore {
 
         packfile.dirty.store(true, Ordering::Relaxed);
 
-        if let Some(file) = packfile.file.as_mut() {
-            packfile_write(file, buffer.clone(), offset).await?;
+        if let Some(file) = packfile.file.as_ref() {
+            packfile_write(file, buffer, offset).await?;
             packfile.size += size;
             if packfile.size >= PACKSTORE_SIZE_LIMIT as usize {
                 full = true;
@@ -623,16 +510,16 @@ impl PackStore {
         }
 
         let index = (id - 1) as usize;
-        let mut packfile = packfiles[index].write().await;
+        let packfile = packfiles[index].write().await;
         if packfile.id != id {
             return Err(PackfileError::internal("Packfile ID mismatch index"));
         }
 
         packfile.dirty.store(true, Ordering::Relaxed);
 
-        if let Some(file) = packfile.file.as_mut() {
+        if let Some(file) = packfile.file.as_ref() {
             packfile_write(file, zeros, offset).await?;
-            let _ = file.sync_data();
+            let _ = file.sync_data().await;
         }
 
         Ok(())
@@ -660,11 +547,7 @@ impl PackStore {
         }
 
         if sync_data && let Some(file) = &packfile.file {
-            if let Ok(file) = file.try_clone() {
-                let _ = lore_base::lore_spawn_blocking!(move || file.sync_data()).await;
-            } else {
-                let _ = file.sync_data();
-            }
+            let _ = file.sync_data().await;
         }
 
         Ok(())
@@ -686,13 +569,10 @@ impl PackStore {
             }
 
             if sync_data && let Some(file) = &packfile.file {
-                // Try to sync in a blocking thread if possible to duplicate file handle
-                if let Ok(file) = file.try_clone() {
-                    lore_base::lore_spawn_blocking!(flush_tasks, move || file.sync_data());
-                } else {
-                    // Sync in this thread if not
-                    let _ = file.sync_data();
-                }
+                let file = file.clone();
+                lore_base::lore_spawn!(flush_tasks, async move {
+                    let _ = file.sync_data().await;
+                });
             }
         }
 

@@ -83,7 +83,9 @@ fn emit_node_path_error(id: u64, error_code: LoreErrorCode) {
 /// resolves to an empty path (e.g. an unallocated slot) is rejected with
 /// `error_code = INVALID_ARGUMENTS` rather than returning a bogus empty path. An
 /// invalid or unknown node id likewise completes with
-/// `error_code = INVALID_ARGUMENTS`. The verb materializes no bytes to disk.
+/// `error_code = INVALID_ARGUMENTS` — `State::node_path` does not distinguish an
+/// out-of-range id from a read failure, so both collapse to it, as in
+/// `list_children`. The verb materializes no bytes to disk.
 pub async fn node_path(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeNodePathArgs,
@@ -116,9 +118,6 @@ async fn node_path_impl(
                 return Err(invalid("node id is invalid"));
             }
 
-            // An unresolvable id is a bad argument; `State::node_path` does not
-            // distinguish an out-of-range id from a read failure, so both collapse to
-            // `InvalidArguments` (as in `list_children`).
             let Ok(path) = internal
                 .state
                 .node_path(internal.repository_context.clone(), node_id)
@@ -128,8 +127,6 @@ async fn node_path_impl(
                 return Err(invalid("node id is unknown"));
             };
 
-            // Every non-root node has a non-empty name, so an empty path means the
-            // id landed on an unallocated slot rather than a real node.
             if node_id != ROOT_NODE && path.is_empty() {
                 emit_node_path_error(id, LoreErrorCode::InvalidArguments);
                 return Err(invalid("node id does not resolve to a named node"));
@@ -459,13 +456,13 @@ mod tests {
         release(handle, store_handle_id);
     }
 
+    /// Nothing is added to the handle, so id 1 is an in-range but unallocated
+    /// slot, which would otherwise reconstruct to an empty (root-looking) path.
     #[tokio::test]
     async fn node_path_unallocated_node_returns_invalid_arguments() {
         let (handle, store_handle_id) =
             load_handle("np-unallocated", Partition::from([0x55u8; 16])).await;
 
-        // No nodes added: id 1 is an in-range but unallocated slot, which would
-        // otherwise reconstruct to an empty (root-looking) path.
         let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let status = node_path(
             LoreGlobalArgs::default(),

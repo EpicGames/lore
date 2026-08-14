@@ -78,7 +78,7 @@ pub async fn handler(
             };
 
             let context = uuid::Uuid::now_v7().into();
-            let (address, _fragment) = match immutable::write(
+            let address = match immutable::write(
                 repository.clone(),
                 context,
                 data,

@@ -8,7 +8,13 @@
 //!   `error_code = NONE`.
 //! - missing content → `ADDRESS_NOT_FOUND`.
 //! - file write failure → `INTERNAL`.
+//! - `offset` past the end of the content → `INVALID_ARGUMENTS`.
 //! - otherwise: `read_into_file` writes the reassembled payload.
+//!
+//! Ranges: `offset` and `length` select part of the content, `length = 0` meaning "to the
+//! end"; a zeroed pair writes the whole content, as it always did. The file holds exactly the
+//! requested range starting at its own first byte — it is *not* a sparse copy of the original
+//! at the original offsets — and only the fragments the range covers are fetched.
 //!
 //! Unlike `get`, no `GET_HEADER` or `GET_DATA` events are emitted; only the terminal
 //! `GET_ITEM_COMPLETE`.
@@ -63,6 +69,12 @@ pub struct LoreStorageGetFileItem {
     /// Destination path; empty rejects with `INVALID_ARGUMENTS`. Multi-fragment writes
     /// stage via `<path>.loretmp` then atomically rename
     pub path: LoreString,
+    /// First content byte to write, counted from the start of the decompressed content.
+    /// Past the end of the content rejects with `INVALID_ARGUMENTS`
+    pub offset: u64,
+    /// Content bytes to write from `offset`; `0` writes to the end. The file holds exactly the
+    /// requested range starting at its own first byte, and is sized to it
+    pub length: u64,
     /// Cache fetched fragments back to the local store, not just write them to `path`
     pub local_cache: u8,
 }
@@ -72,6 +84,8 @@ impl core::fmt::Debug for LoreStorageGetFileItem {
         f.debug_struct("LoreStorageGetFileItem")
             .field("id", &self.id)
             .field("path", &self.path.as_str())
+            .field("offset", &self.offset)
+            .field("length", &self.length)
             .finish()
     }
 }
@@ -204,11 +218,16 @@ async fn resolve_get_file_item(
         item.address,
         Path::new(path_str),
         ".loretmp",
+        crate::storage::item_content_range(item.offset, item.length),
         read_options,
         remote_session,
     )
     .await
     {
+        // As in `get`: a start past the end of the content is a caller mistake rather than an
+        // empty read. The target has already been written by then — it holds the zero bytes
+        // the range resolved to, which is what any failed write of a range leaves behind.
+        Ok((fragment, _)) if item.offset > fragment.size_content => LoreErrorCode::InvalidArguments,
         Ok(_) => LoreErrorCode::None,
         Err(err) => crate::storage::storage_error_to_code(&err),
     }

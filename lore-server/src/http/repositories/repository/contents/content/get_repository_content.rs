@@ -149,13 +149,14 @@ pub async fn handler(
                 parsed_repository.into(),
             ));
 
-            let options = immutable::read_options_from_repository(&repository).with_isolation();
+            let options = immutable::read_options_from_repository(&repository);
 
             let (tx, rx) = channel(CHUNKED_RESPONSE_BUFFER_SIZE);
 
-            let content_length = immutable::read_stream(repository, parsed_address, options, tx)
-                .await
-                .map_err(GetContentError::ReadStream)?;
+            let content_length =
+                immutable::read_stream(repository, parsed_address, None, options, tx)
+                    .await
+                    .map_err(GetContentError::ReadStream)?;
 
             let stream = ReceiverStream::new(rx).map(Ok::<Bytes, GetContentError>);
 
@@ -207,7 +208,7 @@ mod tests {
                     presign_config: None,
                 };
 
-                let settings = LoreHttpServerSettings::default();
+                let settings = LoreHttpServerSettings::test_default();
                 let app = create_router(test_shared_state, test_health, &settings);
                 let test_server = TestServer::new(app).unwrap();
 
@@ -232,7 +233,7 @@ mod tests {
                     max_file_size: 100,
                     presign_config: None,
                 };
-                let settings = LoreHttpServerSettings::default();
+                let settings = LoreHttpServerSettings::test_default();
                 let app = create_router(test_shared_state, test_health, &settings);
                 let test_server = TestServer::new(app).unwrap();
 
@@ -259,7 +260,7 @@ mod tests {
                     max_file_size: 100,
                     presign_config: None,
                 };
-                let settings = LoreHttpServerSettings::default();
+                let settings = LoreHttpServerSettings::test_default();
                 let app = create_router(test_shared_state, test_health, &settings);
                 let test_server = TestServer::new(app).unwrap();
 
@@ -303,7 +304,7 @@ mod tests {
                     max_file_size: 100,
                     presign_config: None,
                 };
-                let settings = LoreHttpServerSettings::default();
+                let settings = LoreHttpServerSettings::test_default();
                 let app = create_router(test_shared_state, test_health, &settings);
                 let test_server = TestServer::new(app).unwrap();
                 let valid_url = format!("/v1/repository/{repository}/content/{address}");
@@ -346,7 +347,7 @@ mod tests {
                     max_file_size: 100,
                     presign_config: None,
                 };
-                let settings = LoreHttpServerSettings::default();
+                let settings = LoreHttpServerSettings::test_default();
                 let app = create_router(test_shared_state, test_health, &settings);
                 let test_server = TestServer::new(app).unwrap();
                 let valid_url = format!("/v1/repository/{repository}/content/{address}");
@@ -406,7 +407,7 @@ mod tests {
                     max_file_size: 100,
                     presign_config: None,
                 };
-                let settings = LoreHttpServerSettings::default();
+                let settings = LoreHttpServerSettings::test_default();
                 let app = create_router(test_shared_state, test_health, &settings);
                 let test_server = TestServer::new(app).unwrap();
                 let valid_url = format!("/v1/repository/{repository}/content/{address}");

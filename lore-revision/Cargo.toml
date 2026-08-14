@@ -37,6 +37,7 @@ ring = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 serde = { workspace = true }
+serde_bytes = { workspace = true }
 serde_with = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
@@ -51,6 +52,7 @@ url = { workspace = true }
 lore-base = { workspace = true }
 lore-error-set = { workspace = true }
 lore-credential = { workspace = true }
+lore-io = { workspace = true }
 lore-storage = { workspace = true }
 lore-macro = { workspace = true }
 lore-proto = { workspace = true }
@@ -64,6 +66,8 @@ zerocopy = { workspace = true }
 windows-sys = { workspace = true, features = ["Win32_Storage_ProjectedFileSystem", "Win32_Storage_FileSystem", "Win32_System_Diagnostics", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_Security"] }
 
 [dev-dependencies]
+# The non-self-describing format an event crosses the service boundary in.
+bitcode = { workspace = true }
 lore-storage = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
@@ -74,7 +78,12 @@ trybuild = { workspace = true }
 default = []
 oodle = ["lore-storage/oodle"]
 integration_tests = []
+compile_fail_tests = []
 failure_generator = []
 seeding = []
 trace_log = ["lore-base/trace_log"]
 vfs = []
+
+[[test]]
+name = "compile_fail"
+required-features = ["compile_fail_tests"]

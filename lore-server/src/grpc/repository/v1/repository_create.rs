@@ -25,6 +25,7 @@ use super::record::build_repository;
 use super::repository_get::repository_load_id;
 use super::repository_get::repository_load_name;
 use crate::grpc::ServerResultExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
@@ -62,11 +63,7 @@ pub async fn handler(
 ) -> Result<Response<RepositoryCreateResponse>, Status> {
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-    let authorization = request
-        .metadata()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .map(|s| s.to_string());
+    let authorization = extract_authorization_header(&request);
     let req = request.into_inner();
     let caller_context = CallerContext {
         repository_id: RepositoryId::default(), // RepositoryCreate has no pre-existing repository

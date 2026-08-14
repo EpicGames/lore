@@ -3,6 +3,7 @@
 pub mod chunker;
 pub mod compress;
 pub mod concurrency;
+pub mod conformance;
 pub mod defragment;
 pub mod error;
 pub mod errors;
@@ -48,7 +49,6 @@ pub use concurrency::FRAGMENT_BUDGET_KIB;
 pub use concurrency::FRAGMENT_MINIMUM_COST_KIB;
 pub use concurrency::FRAGMENT_SIZE_EXPECTED;
 pub use concurrency::FRAGMENT_SIZE_MINIMUM;
-pub use concurrency::LOCAL_ISOLATION;
 pub use concurrency::SemaphoreError;
 pub use concurrency::compress_limit_acquire;
 pub use concurrency::configure;
@@ -124,9 +124,10 @@ pub use read::write_all_to_file;
 // Re-export store types
 pub use store_types::KeyType;
 pub use store_types::KeyValueStream;
+pub use store_types::StoreGetData;
 pub use store_types::StoreMatch;
+pub use store_types::StoreMatchResult;
 pub use store_types::StoreObliterateStats;
-pub use store_types::StoreQueryResult;
 pub use typed_bytes::TypedBytes;
 pub use typed_bytes::TypedBytesMut;
 pub use types::Address;

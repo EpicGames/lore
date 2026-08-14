@@ -393,3 +393,9 @@ pub struct MaxHistorySearchDepth;
 #[error("No commit identity configured; pass --identity or set identity in .lore/config.toml")]
 #[ffi_code(48)]
 pub struct MissingIdentity;
+
+// FFI code 49
+#[derive(Debug, Clone, Error, FfiError)]
+#[error("Compression would be inefficient")]
+#[ffi_code(49)]
+pub struct InefficientCompression;

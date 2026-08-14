@@ -6,7 +6,12 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+// Required, not redundant: `#[error_set]` expands to paths rooted at `lore_error_set`.
+use lore::error_set as lore_error_set;
+use lore::error_set::prelude::*;
 use lore::interface::LoreEvent;
+use lore::lore_spawn;
+use lore::lore_spawn_blocking;
 use lore::remote::connection::ConnectionError;
 use lore::remote::connection::ConnectionErrorWithId;
 use lore::remote::connection::ConnectionId;
@@ -19,9 +24,6 @@ use lore::remote::message::write_v1_message;
 use lore::remote::network::UdsListener;
 use lore::remote::network::UdsStream;
 use lore::remote::network::uds_supported;
-use lore_base::lore_spawn;
-use lore_base::lore_spawn_blocking;
-use lore_error_set::prelude::*;
 use tokio::sync::mpsc;
 
 use crate::eprintln;

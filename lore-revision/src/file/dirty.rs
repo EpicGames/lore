@@ -114,6 +114,8 @@ pub async fn dirty(
 /// callers that already work with `RelativePath` (e.g. `commit_impl`
 /// replaying tracked paths against a freshly committed revision) can hand
 /// them in directly.
+///
+/// Wraps [`dirty_relative_paths_in`] with the instance anchor I/O.
 pub(crate) async fn dirty_relative_paths(
     repository: Arc<RepositoryContext>,
     paths: Vec<RelativePath>,
@@ -123,7 +125,34 @@ pub(crate) async fn dirty_relative_paths(
             .await
             .forward::<DirtyError>("Failed to deserialize revision state")?;
     let current_revision = state_current.revision();
-    let state = state_staged.unwrap_or_else(|| state_current.clone());
+    let state_staged = state_staged.unwrap_or_else(|| state_current.clone());
+    let staged_revision = state_staged.revision();
+
+    let signature =
+        dirty_relative_paths_in(repository.clone(), state_current, state_staged, paths).await?;
+
+    // Current is never anchored as staged, and matching either input state
+    // means nothing was dirtied.
+    if signature != current_revision && signature != staged_revision {
+        crate::instance::store_staged_anchor(&repository, signature)
+            .await
+            .forward::<DirtyError>("Failed to serialize staged anchor")?;
+    }
+
+    Ok(signature)
+}
+
+/// Apply dirty markers against explicit states, reading and writing no
+/// anchors. Pass a clone of `state_current` as `state_staged` when nothing is
+/// staged yet. Returns `state_staged`'s own revision when no path produced a
+/// marker.
+pub(crate) async fn dirty_relative_paths_in(
+    repository: Arc<RepositoryContext>,
+    state_current: Arc<State>,
+    state_staged: Arc<State>,
+    paths: Vec<RelativePath>,
+) -> Result<Hash, DirtyError> {
+    let current_revision = state_current.revision();
 
     let stats = Arc::new(DirtyStats::default());
     let force = execution_context().globals().force();
@@ -141,8 +170,9 @@ pub(crate) async fn dirty_relative_paths(
         dirty_path(
             repository.clone(),
             state_current.clone(),
-            state.clone(),
+            state_staged.clone(),
             relative_path,
+            DiskState::Unknown,
             stats.clone(),
         )
         .await?;
@@ -156,34 +186,38 @@ pub(crate) async fn dirty_relative_paths(
     lore_debug!("Dirtied {total} paths: {modify} modified, {add} added, {delete} deleted");
 
     if total == 0 {
-        return Ok(state.revision());
+        return Ok(state_staged.revision());
     }
 
     // Staged states should have no revision number
-    state.set_revision_number(0);
-    state.set_parent_self(current_revision);
+    state_staged.set_revision_number(0);
+    state_staged.set_parent_self(current_revision);
 
     // If this is the first modification of the state (cloned from current), reset other parent
-    if state.revision() == current_revision {
-        state.set_parent_other(Hash::default());
-        state.set_metadata_hash(Hash::default());
+    if state_staged.revision() == current_revision {
+        state_staged.set_parent_other(Hash::default());
+        state_staged.set_metadata_hash(Hash::default());
     }
 
     let token = repository
         .try_write_token()
         .expect("dirty requires write access");
-    let signature = state
+    let signature = state_staged
         .serialize(repository.clone(), token)
         .await
         .forward::<DirtyError>("Failed to serialize staged revision state")?;
 
-    if signature != current_revision {
-        crate::instance::store_staged_anchor(&repository, signature)
-            .await
-            .forward::<DirtyError>("Failed to serialize staged anchor")?;
-    }
-
     Ok(signature)
+}
+
+/// What a caller already established about a path on disk, so that a scan asks once per path.
+enum DiskState {
+    /// Described by the listing that found it.
+    Present(std::fs::Metadata),
+    /// Established absent, which is why the path is being visited at all.
+    Absent,
+    /// Not looked at; [`dirty_path`] asks.
+    Unknown,
 }
 
 /// Process a single path and determine the dirty action.
@@ -192,12 +226,19 @@ async fn dirty_path(
     state_current: Arc<State>,
     state_staged: Arc<State>,
     relative_path: &RelativePath,
+    disk_state: DiskState,
     stats: Arc<DirtyStats>,
 ) -> Result<(), DirtyError> {
     let absolute_path = relative_path.to_absolute_path(repository.require_path()?);
-    let metadata = tokio::fs::metadata(&absolute_path).await;
-    let exists_on_disk = metadata.is_ok();
-    let is_dir = metadata.as_ref().is_ok_and(|m| m.is_dir());
+    let (exists_on_disk, is_dir) = match disk_state {
+        DiskState::Present(metadata) => (true, metadata.is_dir()),
+        DiskState::Absent => (false, false),
+        DiskState::Unknown => {
+            let metadata = lore_io::IoDriver::global().metadata(&absolute_path).await;
+            let is_dir = metadata.as_ref().is_ok_and(|metadata| metadata.is_dir());
+            (metadata.is_ok(), is_dir)
+        }
+    };
 
     let staged_link = state_staged
         .find_node_link(repository.clone(), relative_path.as_str())
@@ -645,20 +686,21 @@ fn dirty_directory<'a>(
     stats: Arc<DirtyStats>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DirtyError>> + Send + 'a>> {
     Box::pin(async move {
-        let mut entries = tokio::fs::read_dir(absolute_path).await.map_err(|e| {
-            DirtyError::internal_with_context(
-                e,
-                &format!("Failed to read directory {}", absolute_path.display()),
-            )
-        })?;
-
-        while let Some(entry) = entries
-            .next_entry()
+        let mut entries = lore_io::IoDriver::global()
+            .read_dir(absolute_path)
             .await
-            .map_err(|e| DirtyError::internal_with_context(e, "Failed to read directory entry"))?
-        {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
+            .map_err(|e| {
+                DirtyError::internal_with_context(
+                    e,
+                    &format!("Failed to read directory {}", absolute_path.display()),
+                )
+            })?;
+
+        while let Some(entry) = entries.next().await {
+            let entry = entry.map_err(|e| {
+                DirtyError::internal_with_context(e, "Failed to read directory entry")
+            })?;
+            let name_str = entry.file_name.to_string_lossy();
             let child_path = dir_path.push_into_buf(&name_str).freeze();
 
             let force = execution_context().globals().force();
@@ -675,6 +717,9 @@ fn dirty_directory<'a>(
                 state_current.clone(),
                 state_staged.clone(),
                 &child_path,
+                entry
+                    .metadata
+                    .map_or(DiskState::Unknown, DiskState::Present),
                 stats.clone(),
             )
             .await?;
@@ -700,13 +745,18 @@ fn dirty_directory<'a>(
                 let child_abs = absolute_path.join(&child_name);
 
                 // Only process children that are NOT on disk (deletes)
-                if tokio::fs::metadata(&child_abs).await.is_err() {
+                if lore_io::IoDriver::global()
+                    .metadata(&child_abs)
+                    .await
+                    .is_err()
+                {
                     let child_rel = child_path_buf.freeze();
                     dirty_path(
                         repository.clone(),
                         state_current.clone(),
                         state_staged.clone(),
                         &child_rel,
+                        DiskState::Absent,
                         stats.clone(),
                     )
                     .await?;

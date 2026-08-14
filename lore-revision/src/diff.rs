@@ -156,7 +156,10 @@ pub async fn diff_filesystem_paths(
                 exists_in_state = true;
             } else {
                 let absolute_path = path.to_absolute_path(repository.require_path()?);
-                exists_in_filesystem = std::fs::exists(absolute_path).unwrap_or_default();
+                exists_in_filesystem = lore_io::IoDriver::global()
+                    .metadata(absolute_path)
+                    .await
+                    .is_ok();
             }
 
             if !exists_in_state && !exists_in_filesystem {

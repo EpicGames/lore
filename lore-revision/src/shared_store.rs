@@ -128,7 +128,8 @@ pub async fn create_shared_store(
 
     if shared_store_path.exists() {
         if global_cli_args.force() {
-            tokio::fs::remove_dir_all(&shared_store_path)
+            lore_io::IoDriver::global()
+                .remove_dir_all(&shared_store_path)
                 .await
                 .internal_with(|| {
                     format!("removing shared store at {}", shared_store_path.display())
@@ -292,13 +293,13 @@ async fn migrate_legacy_store_in_base(
     }
 
     if let Some(parent) = target_store_path.parent() {
-        tokio::fs::create_dir_all(parent)
+        lore_io::IoDriver::global()
+            .create_dir_all(parent)
             .await
             .internal_with(|| format!("creating shared store directory {}", parent.display()))?;
     }
-    #[allow(clippy::disallowed_methods)]
-    // Authorized shared-store writer (global data dir, not repo tree).
-    tokio::fs::rename(&legacy_store_path, target_store_path)
+    lore_io::IoDriver::global()
+        .rename(&legacy_store_path, target_store_path)
         .await
         .internal_with(|| {
             format!(

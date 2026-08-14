@@ -26,6 +26,7 @@ use tracing::warn;
 use crate::authnz::auth::grpc_get_auth_client;
 use crate::authnz::common::create_request_with_authorization;
 use crate::grpc::ServerResultExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::util::setup_execution;
@@ -39,11 +40,7 @@ pub async fn handler(
 ) -> Result<Response<RepositoryListResponse>, Status> {
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-    let authorization = request
-        .metadata()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .map(|s| s.to_string());
+    let authorization = extract_authorization_header(&request);
     let _req = request.into_inner();
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);

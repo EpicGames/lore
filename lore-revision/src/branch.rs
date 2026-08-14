@@ -81,6 +81,7 @@ use crate::revision::DiffItem;
 use crate::revision::DiffResult;
 use crate::revision::sync;
 use crate::state;
+use crate::state::LinkReference;
 use crate::state::State;
 use crate::state::StateData;
 use crate::state::StateError;
@@ -819,13 +820,27 @@ pub enum BranchLatestStatus {
     Convergent,
 }
 
+/// Advance a branch's local latest pointer from `previous` to `latest`.
+///
+/// The pointer write is a compare-and-swap against `previous`: when the stored
+/// tip is anything else the branch advanced under the caller and
+/// [`BranchError::BranchAdvanced`] is returned having written nothing. Creating
+/// a branch passes `Hash::default()`. A caller deliberately overwriting a tip it
+/// has not tracked reads it with [`load_latest`] and passes that.
 pub async fn store_latest(
     repository: Arc<RepositoryContext>,
     branch: BranchId,
+    previous: Hash,
     latest: Hash,
     status: BranchLatestStatus,
 ) -> Result<(), BranchError> {
-    mutable_store(repository.clone(), LATEST, branch, latest).await?;
+    let stored = mutable_try_store(repository.clone(), LATEST, branch, previous, latest).await?;
+    if stored != previous {
+        lore_debug!(
+            "Branch {branch} advanced to {stored} while storing latest {latest} (expected {previous})"
+        );
+        return Err(BranchAdvanced.into());
+    }
 
     // Server does not store latest status or history
     if execution_context().is_server() {
@@ -904,7 +919,7 @@ pub async fn store_latest_history(
         previous: old_history_latest,
     };
 
-    let (address, _) = entry
+    let address = entry
         .write_to_immutable(
             repository.clone(),
             Context::default(),
@@ -1048,10 +1063,13 @@ async fn resolve_remote(
     branch: &str,
 ) -> Result<BranchStatus, BranchError> {
     let branch_input = branch;
-    let remote = repository.remote().await.map_err(|_err| {
-        BranchError::from(BranchNotFound {
-            branch: branch_input.to_string(),
-        })
+    let remote = repository.remote().await.map_err(|err| {
+        BranchError::BranchNotFound(
+            BranchNotFound {
+                branch: branch_input.to_string(),
+            }
+            .chain_err_from(err, "remote unavailable for branch lookup"),
+        )
     })?;
     let service = remote
         .revision(repository.id)
@@ -1098,10 +1116,13 @@ async fn resolve_default(
     } else if let Ok(branch) = branch::load_name_to_id(repository.clone(), branch).await {
         branch
     } else {
-        let remote = repository.remote().await.map_err(|_err| {
-            BranchError::from(BranchNotFound {
-                branch: branch_input.to_string(),
-            })
+        let remote = repository.remote().await.map_err(|err| {
+            BranchError::BranchNotFound(
+                BranchNotFound {
+                    branch: branch_input.to_string(),
+                }
+                .chain_err_from(err, "remote unavailable for branch lookup"),
+            )
         })?;
         match remote
             .revision(repository.id)
@@ -1393,25 +1414,23 @@ pub async fn branch_metadata(
     let mut creator = String::default();
     let mut created = 0u64;
     let mut stack = vec![];
-    metadata
-        .walk(|key, value, _value_type| {
-            if key.eq(NAME.as_bytes()) {
-                name = String::from_utf8_lossy(value).to_string();
-            } else if key.eq(CATEGORY.as_bytes()) {
-                category = String::from_utf8_lossy(value).to_string();
-            } else if key.eq(PARENT_DEPRECATED.as_bytes()) {
-                parent = value.into();
-            } else if key.eq(BRANCH_POINT_DEPRECATED.as_bytes()) {
-                branch_point = value.into();
-            } else if key.eq(CREATOR.as_bytes()) {
-                creator = String::from_utf8_lossy(value).to_string();
-            } else if key.eq(CREATED.as_bytes()) {
-                created = u64::from_le_bytes(value.try_into().unwrap_or_default());
-            } else if key.eq(STACK.as_bytes()) {
-                stack = stack_from_bytes(value);
-            }
-        })
-        .forward::<BranchError>("Failed to walk branch metadata")?;
+    metadata.walk(|key, value, _value_type| {
+        if key.eq(NAME.as_bytes()) {
+            name = String::from_utf8_lossy(value).to_string();
+        } else if key.eq(CATEGORY.as_bytes()) {
+            category = String::from_utf8_lossy(value).to_string();
+        } else if key.eq(PARENT_DEPRECATED.as_bytes()) {
+            parent = value.into();
+        } else if key.eq(BRANCH_POINT_DEPRECATED.as_bytes()) {
+            branch_point = value.into();
+        } else if key.eq(CREATOR.as_bytes()) {
+            creator = String::from_utf8_lossy(value).to_string();
+        } else if key.eq(CREATED.as_bytes()) {
+            created = u64::from_le_bytes(value.try_into().unwrap_or_default());
+        } else if key.eq(STACK.as_bytes()) {
+            stack = stack_from_bytes(value);
+        }
+    });
 
     if stack.is_empty() && !parent.is_zero() {
         stack.push(BranchPoint {
@@ -1678,6 +1697,7 @@ pub async fn create(
         store_latest(
             repository.clone(),
             branch,
+            Hash::default(),
             head,
             BranchLatestStatus::Divergent,
         )
@@ -1716,7 +1736,12 @@ async fn create_linked_branches(
         return Ok(current_latest);
     }
 
-    let mut link_tasks = JoinSet::new();
+    // A repository can be linked at more than one mount path, and the branch has
+    // a single identity within it. Group the mounts by repository so the cascade
+    // creates that branch once instead of racing itself: concurrent creates with
+    // the same branch ID resolve to one winner, and the loser is rejected with
+    // "branch has been advanced by another instance", failing the whole create.
+    let mut link_groups: Vec<(RepositoryId, Vec<LinkReference>)> = Vec::new();
 
     for link_reference in link_list.iter() {
         if link_reference.flags & LinkFlags::DisableAutoFollow != 0 {
@@ -1727,8 +1752,19 @@ async fn create_linked_branches(
             continue;
         }
 
+        match link_groups
+            .iter_mut()
+            .find(|(link_id, _mounts)| *link_id == link_reference.repository)
+        {
+            Some((_link_id, mounts)) => mounts.push(*link_reference),
+            None => link_groups.push((link_reference.repository, vec![*link_reference])),
+        }
+    }
+
+    let mut link_tasks = JoinSet::new();
+
+    for (link_id, mounts) in link_groups {
         lore_spawn!(link_tasks, {
-            let link_id = link_reference.repository;
             let link = Arc::new(repository.to_link_context(link_id).await);
             let link_remote = link.remote().await.forward_with::<BranchError, _>(|| {
                 format!("Failed to connect to link repository {link_id}")
@@ -1739,46 +1775,66 @@ async fn create_linked_branches(
             let branch_id = branch;
             let branch_name = name.clone();
             let branch_category = category.clone();
-            let link_reference = *link_reference;
 
             async move {
-                let resolved_parent_branch = link_reference.resolve_branch(current_branch);
+                // The first mount seeds the branch point; the others adopt what
+                // it resolved to, since they all address the same branch.
+                let leader = mounts[0];
+                let resolved_parent_branch = leader.resolve_branch(current_branch);
 
-                link::create_branch(
+                let outcome = link::create_branch(
                     link.clone(),
                     link_remote,
                     branch_id,
                     branch_name,
                     branch_category,
                     resolved_parent_branch,
-                    link_reference.signature,
+                    leader.signature,
                 )
                 .await
                 .forward_with::<BranchError, _>(|| {
                     format!("Failed to create branch for link repository {link_id}")
                 })?;
 
-                // When the link uses the implicit branch convention (zero),
-                // skip update_link_pin_by_node — the branch is already
-                // implicitly correct and the signature is unchanged (the new
-                // linked branch points to the same revision). This avoids
-                // dirtying the state and producing a bookkeeping revision.
-                if !link_reference.branch.is_zero() {
-                    link::update_link_pin_by_node(
-                        &state,
-                        repository.clone(),
-                        link_reference.repository,
+                // The create is shared, the reporting is not: every mount that
+                // follows this repository reports its own outcome, keyed on its
+                // path, because the repository ID cannot tell the mounts apart.
+                for mount in mounts.iter() {
+                    let link_path = state
+                        .node_path(repository.clone(), mount.local_node)
+                        .await
+                        .unwrap_or_default();
+
+                    link::report_branch_outcome(
+                        &link_path,
+                        link_id,
                         branch_id,
-                        link_reference.signature,
-                        link_reference.local_node,
-                    )
-                    .await
-                    .forward_with::<BranchError, _>(|| {
-                        format!(
-                            "Failed to update link reference for link repository {}",
-                            link_reference.repository
+                        outcome.revision,
+                        outcome.reused,
+                    );
+
+                    // When the link uses the implicit branch convention (zero),
+                    // skip update_link_pin_by_node — the branch is already
+                    // implicitly correct and the signature is unchanged (the new
+                    // linked branch points to the same revision). This avoids
+                    // dirtying the state and producing a bookkeeping revision.
+                    if !mount.branch.is_zero() {
+                        link::update_link_pin_by_node(
+                            &state,
+                            repository.clone(),
+                            mount.repository,
+                            branch_id,
+                            mount.signature,
+                            mount.local_node,
                         )
-                    })?;
+                        .await
+                        .forward_with::<BranchError, _>(|| {
+                            format!(
+                                "Failed to update link reference for link repository {}",
+                                mount.repository
+                            )
+                        })?;
+                    }
                 }
 
                 Ok(())
@@ -2299,41 +2355,37 @@ impl From<&RevisionListItem> for lore_proto::Revision {
             parent_self_number: revision.parent_self_revision_number,
             parent_other_number: revision.parent_other_revision_number,
         };
-        revision
-            .metadata
-            .walk(|key, value, value_type| {
-                let key = std::str::from_utf8(key).unwrap_or("<binary>");
-                match key {
-                    metadata::MESSAGE => {
-                        proto_revision.commit_message =
-                            std::str::from_utf8(value).unwrap_or("<binary>").to_string();
-                    }
-                    metadata::TIMESTAMP => {
-                        if value.len() == std::mem::size_of::<u64>() {
-                            proto_revision.timestamp =
-                                u64::from_le_bytes(value.try_into().unwrap());
-                        }
-                    }
-                    metadata::CREATED_BY => {
-                        if let Ok(value) = std::str::from_utf8(value) {
-                            proto_revision.created_by = value.to_string();
-                        }
-                    }
-                    metadata::COMMITTED_BY => {
-                        if let Ok(value) = std::str::from_utf8(value) {
-                            proto_revision.committed_by = value.to_string();
-                        }
-                    }
-                    _ => {
-                        let metadata =
-                            as_lore_proto_metadata(String::from(key), value, value_type).ok();
-                        if let Some(metadata) = metadata {
-                            proto_revision.metadata.push(metadata);
-                        }
+        revision.metadata.walk(|key, value, value_type| {
+            let key = std::str::from_utf8(key).unwrap_or("<binary>");
+            match key {
+                metadata::MESSAGE => {
+                    proto_revision.commit_message =
+                        std::str::from_utf8(value).unwrap_or("<binary>").to_string();
+                }
+                metadata::TIMESTAMP => {
+                    if value.len() == std::mem::size_of::<u64>() {
+                        proto_revision.timestamp = u64::from_le_bytes(value.try_into().unwrap());
                     }
                 }
-            })
-            .unwrap_or_default();
+                metadata::CREATED_BY => {
+                    if let Ok(value) = std::str::from_utf8(value) {
+                        proto_revision.created_by = value.to_string();
+                    }
+                }
+                metadata::COMMITTED_BY => {
+                    if let Ok(value) = std::str::from_utf8(value) {
+                        proto_revision.committed_by = value.to_string();
+                    }
+                }
+                _ => {
+                    let metadata =
+                        as_lore_proto_metadata(String::from(key), value, value_type).ok();
+                    if let Some(metadata) = metadata {
+                        proto_revision.metadata.push(metadata);
+                    }
+                }
+            }
+        });
 
         proto_revision
     }
@@ -2688,11 +2740,8 @@ async fn try_auto_resolve_conflict(
         }
     } else {
         lore_trace!("Change from theirs has no valid to node, empty theirs file");
-        let _ = tokio::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(&theirs_path)
+        let _ = lore_io::IoDriver::global()
+            .write_file_bytes(&theirs_path, bytes::Bytes::new(), false)
             .await;
     }
 
@@ -2736,11 +2785,8 @@ async fn try_auto_resolve_conflict(
         }
     } else {
         lore_trace!("Change from base has no valid to node, empty base file");
-        let _ = tokio::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(&base_path)
+        let _ = lore_io::IoDriver::global()
+            .write_file_bytes(&base_path, bytes::Bytes::new(), false)
             .await;
     }
 
@@ -2776,11 +2822,8 @@ async fn try_auto_resolve_conflict(
         }
     } else {
         lore_trace!("Change to mine has no valid to node, empty mine file");
-        let _ = tokio::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .create(true)
-            .open(&mine_path)
+        let _ = lore_io::IoDriver::global()
+            .write_file_bytes(&mine_path, bytes::Bytes::new(), false)
             .await;
     }
 

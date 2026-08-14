@@ -283,14 +283,10 @@ fn store_open_options() -> fs::OpenOptions {
 /// whole load -> modify -> store span (not just the individual file
 /// operations) so concurrent processes cannot interleave their updates.
 async fn lock_store_file(path: &Path) -> Result<FSLock, TokenStoreError> {
-    let path = path.to_path_buf();
-    lore_base::lore_spawn_blocking!(move || FSLock::acquire_file_lock(path))
-        .await
-        .map_err(|e| TokenStoreError::internal_with_context(e, "Failed to lock store file"))?
-        .map_err(|e| {
-            lore_warn!("Failed to lock store file: {e}");
-            TokenStoreError::internal_with_context(e, "Failed to lock store file")
-        })
+    FSLock::acquire_file_lock(path).await.map_err(|e| {
+        lore_warn!("Failed to lock store file: {e}");
+        TokenStoreError::internal_with_context(e, "Failed to lock store file")
+    })
 }
 
 /// Cross-process guard for `tokens.toml`, creating the store directory so

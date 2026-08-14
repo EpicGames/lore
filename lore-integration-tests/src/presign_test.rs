@@ -140,7 +140,7 @@ mod presign_tests {
         let vend_resp = client
             .post(&vend_url)
             .header("content-type", "application/json")
-            .body(r#"{"ttl_seconds":3600}"#)
+            .body(r#"{"ttl_seconds":3600,"content_type":"binary/octet-stream"}"#)
             .send()
             .await
             .unwrap();
@@ -158,6 +158,12 @@ mod presign_tests {
             .unwrap();
 
         assert_eq!(redeem_resp.status(), 200);
+
+        // S3's default type survives the mint and comes back unchanged.
+        assert_eq!(
+            redeem_resp.headers().get("content-type").unwrap(),
+            "binary/octet-stream"
+        );
 
         let body = redeem_resp.bytes().await.unwrap();
         assert_eq!(body.as_ref(), &expected_payload[..]);

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::any::Any;
+use std::borrow::Cow;
 use std::fmt::Debug;
 use std::fmt::Display;
 use std::path::Path;
@@ -9,6 +10,8 @@ use std::sync::Arc;
 use std::sync::Once;
 use std::sync::atomic::AtomicBool;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use lore_base::runtime::runtime_shutdown_timeout;
 use lore_base::text::TextNotUtf8;
 use lore_base::text::ValidateText;
@@ -17,8 +20,10 @@ pub use lore_credential::user_info;
 pub use lore_transport::drop_connections;
 use serde::Deserialize;
 use serde::Serialize;
+use serde::de;
 use serde::ser::SerializeSeq;
 use tokio::sync::Mutex;
+use zerocopy::IntoBytes;
 
 use crate::change::FileAction;
 use crate::event::LoreBytes;
@@ -34,8 +39,13 @@ use crate::util::path::RelativePath;
 use crate::util::serde::u8_as_bool;
 
 /// A block of raw bytes described by a pointer and a length.
+///
+/// Owns its payload: [`Self::from_bytes`] copies into a fresh allocation and
+/// `Drop` frees it, so a value carried in an event stays valid without the
+/// producer having to outlive the dispatch. An empty block is a NULL pointer
+/// with length 0.
 #[repr(C)]
-#[derive(Debug, Copy, Clone, PartialEq)]
+#[derive(Debug)]
 pub struct LoreBinary {
     /// Pointer to the start of the byte block.
     pub payload: *const std::ffi::c_void,
@@ -47,28 +57,121 @@ unsafe impl Send for LoreBinary {}
 unsafe impl Sync for LoreBinary {}
 
 impl LoreBinary {
-    fn as_bytes(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.payload.cast::<u8>(), self.length) }
+    pub fn is_empty(&self) -> bool {
+        self.length == 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.length
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        if self.is_empty() {
+            &[]
+        } else {
+            // SAFETY: a non-empty block points at `length` initialized bytes owned by
+            // this value, allocated in `from_bytes` and freed in `Drop`.
+            unsafe { std::slice::from_raw_parts(self.payload.cast::<u8>(), self.length) }
+        }
+    }
+
+    /// Build an owning `LoreBinary` from raw bytes, copied into a freshly
+    /// allocated buffer that `Drop` frees with the matching layout.
+    pub fn from_bytes(source: &[u8]) -> Self {
+        if source.is_empty() {
+            return Self::default();
+        }
+        // SAFETY: the layout is non-zero-sized and matches the one `free` uses;
+        // the copy fills exactly the bytes just allocated.
+        unsafe {
+            let length = source.len();
+            let layout = std::alloc::Layout::from_size_align_unchecked(length, 1);
+            let buffer = std::alloc::alloc(layout);
+            std::ptr::copy_nonoverlapping(source.as_ptr(), buffer, length);
+            LoreBinary {
+                payload: buffer.cast::<std::ffi::c_void>(),
+                length,
+            }
+        }
+    }
+
+    fn free(&mut self) {
+        if !self.payload.is_null() && self.length > 0 {
+            // SAFETY: the layout matches the one `from_bytes` allocated with.
+            unsafe {
+                let layout = std::alloc::Layout::from_size_align_unchecked(self.length, 1);
+                std::alloc::dealloc(self.payload as *mut u8, layout);
+            }
+        }
+        self.payload = std::ptr::null();
+        self.length = 0;
     }
 }
 
+impl Default for LoreBinary {
+    fn default() -> Self {
+        LoreBinary {
+            payload: std::ptr::null(),
+            length: 0,
+        }
+    }
+}
+
+impl Clone for LoreBinary {
+    fn clone(&self) -> Self {
+        Self::from_bytes(self.as_bytes())
+    }
+}
+
+impl Drop for LoreBinary {
+    fn drop(&mut self) {
+        self.free();
+    }
+}
+
+impl PartialEq for LoreBinary {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+/// Base64 text for a self-describing format, raw bytes for the rest.
+///
+/// A format that writes bytes as text has to be told which text: JSON would
+/// otherwise render a block as one number per byte, which costs about four
+/// characters for each byte carried. The split is the same one
+/// [`lore_base::types::serialize_hex`] makes for the identifiers, in base64
+/// rather than hex because a block has no length bound to keep it short.
+///
+/// The text path allocates about a third again the payload and cannot stream:
+/// `serialize_str` wants one contiguous `&str`, so the encoding has to be
+/// complete before it is handed over. Only JSON pays it.
 impl Serialize for LoreBinary {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
     {
-        serializer.serialize_bytes(self.as_bytes())
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&BASE64.encode(self.as_bytes()))
+        } else {
+            serializer.serialize_bytes(self.as_bytes())
+        }
     }
 }
 
 impl<'de> Deserialize<'de> for LoreBinary {
-    #[allow(clippy::unimplemented)]
-    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        // TODO(UCS-13323)
-        unimplemented!("LoreBinary deserialization. Requires redesign of LoreBinary ownership")
+        if deserializer.is_human_readable() {
+            let text = String::deserialize(deserializer)?;
+            let value = BASE64.decode(text.as_bytes()).map_err(de::Error::custom)?;
+            Ok(LoreBinary::from_bytes(&value))
+        } else {
+            let value: Vec<u8> = serde_bytes::deserialize(deserializer)?;
+            Ok(LoreBinary::from_bytes(&value))
+        }
     }
 }
 
@@ -985,47 +1088,233 @@ pub enum LoreError {
 /// A metadata value, tagged by the kind of value it holds.
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
-#[repr(C)]
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "tagName", content = "data", rename_all = "camelCase")]
+#[repr(C, u32)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum LoreMetadata {
     /// An address value.
-    Address(Address),
-    /// A boolean value, stored as a byte.
-    Boolean(#[serde(with = "u8_as_bool")] u8),
-    /// A block of raw bytes.
-    Binary(LoreBinary),
+    Address(Address) = LoreMetadataType::Address as u32,
+    /// A boolean value, stored as a byte; any non-zero value is true.
+    Boolean(u8) = LoreMetadataType::Boolean as u32,
     /// A context value.
-    Context(Context),
+    Context(Context) = LoreMetadataType::Context as u32,
     /// A hash value.
-    Hash(Hash),
+    Hash(Hash) = LoreMetadataType::Hash as u32,
     /// An unsigned integer value.
-    Numeric(u64),
+    Numeric(u64) = LoreMetadataType::Numeric as u32,
     /// A string value.
-    String(LoreString),
+    String(LoreString) = LoreMetadataType::String as u32,
+    /// A block of raw bytes.
+    Binary(LoreBinary) = LoreMetadataType::Binary as u32,
 }
 
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
 #[repr(C)]
 /// The kind of value held by a metadata entry.
-#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+///
+/// This is both the tag a caller passes across the API and the tag written into
+/// a stored metadata buffer — the same type, so the two cannot drift apart.
+///
+/// There is deliberately no zero value: a zero-initialized field has not chosen
+/// a type and must not be passed as one.
+#[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LoreMetadataType {
-    /// A block of raw bytes.
-    Binary = 0,
-    /// An unsigned integer value.
-    Numeric = 1,
-    /// A string value.
-    String = 2,
+    /// A content address: 48 bytes, the 32-byte hash followed by the 16-byte
+    /// context.
+    Address = 1,
+    /// A boolean: exactly one byte, where any non-zero value is true.
+    Boolean = 2,
+    /// A context identifier: 16 raw bytes.
+    Context = 3,
+    /// A content hash: 32 raw bytes.
+    Hash = 4,
+    /// An unsigned 64-bit integer: 8 bytes, little-endian.
+    Numeric = 5,
+    /// Text: UTF-8 bytes, not terminated.
+    String = 6,
+    /// Raw bytes, stored exactly as supplied and of any length.
+    Binary = 255,
 }
 
-impl From<LoreMetadataType> for crate::metadata::MetadataType {
-    fn from(value: LoreMetadataType) -> Self {
-        match value {
-            LoreMetadataType::Binary => Self::Binary,
-            LoreMetadataType::Numeric => Self::Numeric,
-            LoreMetadataType::String => Self::String,
+/// Adjacent tagging (`{"tagName": …, "data": …}`) for self-describing formats,
+/// external tagging for the rest.
+///
+/// The derive cannot express both, and one representation will not do: adjacent
+/// tagging needs `deserialize_identifier`, which the binary format used between
+/// a client and the service does not implement, while switching everything to
+/// external tagging would change the JSON that existing clients already read.
+/// The split is the same one [`crate::lore::Address`] makes.
+mod metadata_repr {
+    use serde::Deserialize;
+    use serde::Serialize;
+
+    use super::*;
+
+    pub(super) const ADDRESS: (u32, &str) = (0, "address");
+    pub(super) const BOOLEAN: (u32, &str) = (1, "boolean");
+    pub(super) const BINARY: (u32, &str) = (2, "binary");
+    pub(super) const CONTEXT: (u32, &str) = (3, "context");
+    pub(super) const HASH: (u32, &str) = (4, "hash");
+    pub(super) const NUMERIC: (u32, &str) = (5, "numeric");
+    pub(super) const STRING: (u32, &str) = (6, "string");
+
+    pub(super) fn emit<S, T>(
+        serializer: S,
+        variant: (u32, &'static str),
+        value: &T,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+        T: Serialize + ?Sized,
+    {
+        let (index, name) = variant;
+        if serializer.is_human_readable() {
+            use serde::ser::SerializeStruct;
+            let mut tagged = serializer.serialize_struct("LoreMetadata", 2)?;
+            tagged.serialize_field("tagName", name)?;
+            tagged.serialize_field("data", value)?;
+            tagged.end()
+        } else {
+            serializer.serialize_newtype_variant("LoreMetadata", index, name, value)
+        }
+    }
+
+    /// Mirrors [`LoreMetadata`]'s variants so the derive can do the reading.
+    ///
+    /// The order here is not [`LoreMetadata`]'s and need not be: what matters is
+    /// that it matches the indices the constants above carry, since the external
+    /// form is read by position. Move a variant in one and the other has to move
+    /// with it, or a value is written under one kind and read back as another.
+    #[derive(Deserialize)]
+    #[serde(tag = "tagName", content = "data", rename_all = "camelCase")]
+    pub(super) enum Tagged {
+        Address(Address),
+        Boolean(#[serde(with = "u8_as_bool")] u8),
+        Binary(LoreBinary),
+        Context(Context),
+        Hash(Hash),
+        Numeric(u64),
+        String(LoreString),
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub(super) enum External {
+        Address(Address),
+        Boolean(#[serde(with = "u8_as_bool")] u8),
+        Binary(LoreBinary),
+        Context(Context),
+        Hash(Hash),
+        Numeric(u64),
+        String(LoreString),
+    }
+
+    impl From<Tagged> for LoreMetadata {
+        fn from(value: Tagged) -> Self {
+            match value {
+                Tagged::Address(inner) => LoreMetadata::Address(inner),
+                Tagged::Boolean(inner) => LoreMetadata::Boolean(inner),
+                Tagged::Binary(inner) => LoreMetadata::Binary(inner),
+                Tagged::Context(inner) => LoreMetadata::Context(inner),
+                Tagged::Hash(inner) => LoreMetadata::Hash(inner),
+                Tagged::Numeric(inner) => LoreMetadata::Numeric(inner),
+                Tagged::String(inner) => LoreMetadata::String(inner),
+            }
+        }
+    }
+
+    impl From<External> for LoreMetadata {
+        fn from(value: External) -> Self {
+            match value {
+                External::Address(inner) => LoreMetadata::Address(inner),
+                External::Boolean(inner) => LoreMetadata::Boolean(inner),
+                External::Binary(inner) => LoreMetadata::Binary(inner),
+                External::Context(inner) => LoreMetadata::Context(inner),
+                External::Hash(inner) => LoreMetadata::Hash(inner),
+                External::Numeric(inner) => LoreMetadata::Numeric(inner),
+                External::String(inner) => LoreMetadata::String(inner),
+            }
+        }
+    }
+}
+
+impl Serialize for LoreMetadata {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use metadata_repr::*;
+        match self {
+            LoreMetadata::Address(value) => emit(serializer, ADDRESS, value),
+            LoreMetadata::Boolean(value) => emit(serializer, BOOLEAN, &(*value != 0)),
+            LoreMetadata::Binary(value) => emit(serializer, BINARY, value),
+            LoreMetadata::Context(value) => emit(serializer, CONTEXT, value),
+            LoreMetadata::Hash(value) => emit(serializer, HASH, value),
+            LoreMetadata::Numeric(value) => emit(serializer, NUMERIC, value),
+            LoreMetadata::String(value) => emit(serializer, STRING, value),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LoreMetadata {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            metadata_repr::Tagged::deserialize(deserializer).map(LoreMetadata::from)
+        } else {
+            metadata_repr::External::deserialize(deserializer).map(LoreMetadata::from)
+        }
+    }
+}
+
+impl LoreMetadata {
+    /// The value's stored byte form and the tag it is stored under.
+    ///
+    /// The inverse of [`crate::event::LoreMetadataEventData::new`], which reads
+    /// the same pair back out. Nothing here can fail: the value already is the
+    /// type it claims, which is the point of carrying a typed value rather than
+    /// text plus a separate tag.
+    ///
+    /// A kind that already holds its stored bytes contiguously lends them out,
+    /// so the two kinds of unbounded length cost nothing to encode; only the
+    /// two that have to be laid out as bytes allocate, and both are tiny.
+    pub fn to_stored(&self) -> (Cow<'_, [u8]>, LoreMetadataType) {
+        match self {
+            LoreMetadata::Address(address) => {
+                (Cow::Borrowed(address.as_bytes()), LoreMetadataType::Address)
+            }
+            LoreMetadata::Boolean(flag) => (
+                Cow::Owned(vec![u8::from(*flag != 0)]),
+                LoreMetadataType::Boolean,
+            ),
+            LoreMetadata::Binary(block) => {
+                (Cow::Borrowed(block.as_bytes()), LoreMetadataType::Binary)
+            }
+            LoreMetadata::Context(context) => {
+                (Cow::Borrowed(context.data()), LoreMetadataType::Context)
+            }
+            LoreMetadata::Hash(hash) => (Cow::Borrowed(hash.data()), LoreMetadataType::Hash),
+            LoreMetadata::Numeric(number) => (
+                Cow::Owned(number.to_le_bytes().to_vec()),
+                LoreMetadataType::Numeric,
+            ),
+            LoreMetadata::String(text) => {
+                (Cow::Borrowed(text.as_bytes()), LoreMetadataType::String)
+            }
+        }
+    }
+}
+
+impl ValidateText for LoreMetadata {
+    fn validate_text(&self) -> Result<(), TextNotUtf8> {
+        match self {
+            LoreMetadata::String(text) => text.validate_text(),
+            // Every other variant is fixed-width or opaque bytes; a binary value
+            // is deliberately not text and must not be rejected for not being it.
+            _ => Ok(()),
         }
     }
 }
@@ -1043,6 +1332,30 @@ pub enum LoreNodeType {
     File = 1,
     /// A symbolic link.
     Link = 2,
+}
+
+/// cbindgen:prefix-with-name
+/// cbindgen:rename-all=ScreamingSnakeCase
+#[repr(C)]
+/// The change staged on a node for the next revision. `None` is a node the
+/// current revision holds unchanged; every other value is an edit that has not
+/// been committed yet.
+#[derive(Clone, Copy, PartialEq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LoreNodeStagedAction {
+    /// No staged change.
+    #[default]
+    None = 0,
+    /// Staged for addition; the node is not in the revision it was loaded from.
+    Add = 1,
+    /// Staged with rewritten content fields.
+    Modify = 2,
+    /// Staged for removal; the node is dropped when the revision is committed.
+    Delete = 3,
+    /// Staged at a new path or under a new name.
+    Move = 4,
+    /// Staged as a copy of another node.
+    Copy = 5,
 }
 
 /// cbindgen:prefix-with-name
@@ -1271,5 +1584,188 @@ mod tests {
             .map_err(|error| error.inside("globals"))
             .expect_err("the identity must fail");
         assert_eq!(error.field(), "globals.identity");
+    }
+}
+
+#[cfg(test)]
+mod metadata_repr_tests {
+    use super::LoreBinary;
+    use super::LoreMetadata;
+    use super::LoreString;
+
+    /// The JSON shape is a published wire format that existing clients read, and
+    /// the serializer producing it is hand-written rather than derived, so the
+    /// exact bytes are the contract — not just that a round trip works. Every
+    /// kind is pinned, because each reaches JSON by its own route: a bool for a
+    /// byte, hex text for the identifiers, and base64 for a block of raw bytes.
+    #[test]
+    fn json_keeps_the_adjacently_tagged_shape() {
+        let hash = super::Hash::from([0xabu8; 32]);
+        let context = super::Context::from([0xcdu8; 16]);
+        let cases = [
+            (
+                LoreMetadata::String(LoreString::from_str("hi")),
+                r#"{"tagName":"string","data":"hi"}"#.to_string(),
+            ),
+            (
+                LoreMetadata::Numeric(4207),
+                r#"{"tagName":"numeric","data":4207}"#.to_string(),
+            ),
+            (
+                LoreMetadata::Boolean(1),
+                r#"{"tagName":"boolean","data":true}"#.to_string(),
+            ),
+            (
+                LoreMetadata::Boolean(0),
+                r#"{"tagName":"boolean","data":false}"#.to_string(),
+            ),
+            (
+                LoreMetadata::Binary(LoreBinary::from_bytes(&[0x00, 0xff, 0x01])),
+                r#"{"tagName":"binary","data":"AP8B"}"#.to_string(),
+            ),
+            (
+                LoreMetadata::Hash(hash),
+                format!(r#"{{"tagName":"hash","data":"{}"}}"#, "ab".repeat(32)),
+            ),
+            (
+                LoreMetadata::Context(context),
+                format!(r#"{{"tagName":"context","data":"{}"}}"#, "cd".repeat(16)),
+            ),
+            (
+                LoreMetadata::Address(super::Address { hash, context }),
+                format!(
+                    r#"{{"tagName":"address","data":"{}-{}"}}"#,
+                    "ab".repeat(32),
+                    "cd".repeat(16)
+                ),
+            ),
+        ];
+
+        for (value, want) in cases {
+            let json = serde_json::to_string(&value).expect("serialize");
+            assert_eq!(json, want, "the published shape must not drift");
+            let back: LoreMetadata = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, value);
+        }
+    }
+
+    /// A boolean is a JSON bool but a byte in the C union, and the two must not
+    /// disagree: any non-zero byte is true, and true reads back as exactly 1.
+    #[test]
+    fn a_non_zero_boolean_byte_normalizes_through_json() {
+        let json = serde_json::to_string(&LoreMetadata::Boolean(37)).expect("serialize");
+        assert_eq!(json, r#"{"tagName":"boolean","data":true}"#);
+        let back: LoreMetadata = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, LoreMetadata::Boolean(1));
+    }
+
+    /// Every variant has to survive the format used between a client and the
+    /// service, which cannot read the tagged shape at all.
+    #[test]
+    fn every_variant_survives_the_compact_format() {
+        let values = [
+            LoreMetadata::Address(super::Address::default()),
+            LoreMetadata::Boolean(1),
+            LoreMetadata::Binary(LoreBinary::from_bytes(&[0x00, 0xff])),
+            LoreMetadata::Context(super::Context::default()),
+            LoreMetadata::Hash(super::Hash::default()),
+            LoreMetadata::Numeric(u64::MAX),
+            LoreMetadata::String(LoreString::from_str("hi")),
+        ];
+
+        for value in values {
+            let encoded = bitcode::serialize(&value).expect("serialize");
+            let decoded: LoreMetadata = bitcode::deserialize(&encoded).expect("deserialize");
+            assert_eq!(decoded, value, "{value:?} must survive the compact format");
+        }
+    }
+}
+
+#[cfg(test)]
+mod binary_tests {
+    use super::LoreBinary;
+
+    /// `LoreBinary` owns its payload, so a clone survives the original being
+    /// dropped. Before it owned anything, the clone was a copy of a pointer and
+    /// this read freed memory.
+    #[test]
+    fn a_clone_outlives_the_value_it_came_from() {
+        let clone = {
+            let original = LoreBinary::from_bytes(&[0xde, 0xad, 0xbe, 0xef]);
+            original.clone()
+        };
+        assert_eq!(clone.as_bytes(), &[0xde, 0xad, 0xbe, 0xef]);
+    }
+
+    #[test]
+    fn an_empty_block_is_a_null_pointer_of_zero_length() {
+        let empty = LoreBinary::from_bytes(&[]);
+        assert!(empty.is_empty());
+        assert_eq!(empty.len(), 0);
+        assert!(empty.payload.is_null());
+        assert_eq!(empty.as_bytes(), &[] as &[u8]);
+        assert_eq!(empty, LoreBinary::default());
+    }
+
+    /// An event carrying a binary metadata value reaches an out-of-process
+    /// caller as a serialized value, so it has to deserialize. It used to panic
+    /// outright: the impl was `unimplemented!()`, which is why the revision-tree
+    /// read verb refused binary values rather than delivering one.
+    ///
+    /// Both a self-describing format and a non-self-describing one are covered,
+    /// because the two take different paths through the impl.
+    #[test]
+    fn a_binary_value_survives_serialization() {
+        let block = LoreBinary::from_bytes(b"raw\x00bytes");
+
+        let json = serde_json::to_vec(&block).expect("json serialize");
+        let from_json: LoreBinary = serde_json::from_slice(&json).expect("json deserialize");
+        assert_eq!(from_json, block, "json must round-trip a binary block");
+
+        let encoded = bitcode::serialize(&block).expect("bitcode serialize");
+        let from_bitcode: LoreBinary = bitcode::deserialize(&encoded).expect("bitcode deserialize");
+        assert_eq!(
+            from_bitcode, block,
+            "bitcode must round-trip a binary block"
+        );
+    }
+
+    /// Equality is by content, not by length or by pointer identity: two blocks
+    /// of the same size holding different bytes are different values.
+    #[test]
+    fn blocks_of_equal_length_compare_by_content() {
+        let block = LoreBinary::from_bytes(&[1, 2, 3, 4]);
+        assert_eq!(block, LoreBinary::from_bytes(&[1, 2, 3, 4]));
+        assert_ne!(block, LoreBinary::from_bytes(&[1, 2, 3, 5]));
+        assert_ne!(block, LoreBinary::from_bytes(&[1, 2, 3]));
+    }
+
+    /// An empty block still has to survive a round trip: the deserializer has to
+    /// produce the null-pointer form rather than a dangling allocation. Both
+    /// formats are covered, since an empty block is the one input where the
+    /// text encoding carries no characters at all.
+    #[test]
+    fn an_empty_block_survives_serialization() {
+        let empty = LoreBinary::from_bytes(&[]);
+
+        let json = serde_json::to_string(&empty).expect("json serialize");
+        assert_eq!(json, r#""""#);
+        let from_json: LoreBinary = serde_json::from_str(&json).expect("json deserialize");
+        assert_eq!(from_json, empty);
+        assert!(from_json.payload.is_null());
+
+        let encoded = bitcode::serialize(&empty).expect("bitcode serialize");
+        let decoded: LoreBinary = bitcode::deserialize(&encoded).expect("bitcode deserialize");
+        assert_eq!(decoded, empty);
+        assert!(decoded.payload.is_null());
+    }
+
+    /// Text that is not base64 is a malformed payload, not an empty block: a
+    /// reader that quietly produced one would hand a caller a value the sender
+    /// never wrote.
+    #[test]
+    fn json_text_that_is_not_base64_fails_to_read() {
+        let result: Result<LoreBinary, _> = serde_json::from_str(r#""not base64!""#);
+        assert!(result.is_err());
     }
 }

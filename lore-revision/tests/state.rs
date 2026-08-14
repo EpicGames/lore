@@ -299,6 +299,52 @@ mod tests {
         assert!(flags.contains(change::Flags::Merge));
         assert!(flags.contains(change::Flags::Conflict));
     }
+
+    #[tokio::test]
+    async fn deserialize_nonexistent_hash_returns_not_found() {
+        use lore_base::types::Hash;
+
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = Context::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+
+                let immutable_store = LocalImmutableStore::new(
+                    None,
+                    lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("Failed to create immutable store");
+
+                let repository = Arc::new(RepositoryContext::new(
+                    Some(path),
+                    immutable_store,
+                    mutable_store,
+                    repository_id.into(),
+                    lore_revision::instance::InstanceId::default(),
+                    Err(ProtocolError::from(NoRemote)),
+                    Arc::default(),
+                    RepositoryFormat::Lore,
+                ));
+
+                // A non-zero hash that was never written to the store.
+                let fake_hash = Hash::from([1u8; 32]);
+                let result = State::deserialize(repository, fake_hash).await;
+
+                assert!(result.is_err());
+                assert!(
+                    result.unwrap_err().is_not_found(),
+                    "expected NotFound for a hash that does not exist in the store"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
 }
 
 mod single_file_compare_result_tests {

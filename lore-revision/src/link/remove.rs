@@ -27,15 +27,32 @@ pub async fn remove(
     token: &RepositoryWriteToken,
     link_path: RelativePath,
 ) -> Result<(), LinkError> {
-    let (state_current, state_staged, _branch) =
+    let (state_current, state_staged, parent_branch) =
         State::deserialize_current_and_staged(repository.clone())
             .await
             .forward::<LinkError>("Failed deserializing state")?;
     let state_staged = state_staged.unwrap_or_else(|| state_current.clone());
 
     lore_debug!("Resolve link to unlink from {link_path}");
-    let node_link = state_staged
-        .find_node_link(repository.clone(), link_path.as_str())
+
+    // Resolve through any parent links so mutations target the owning repo.
+    let chain = crate::link::resolve_link_chain(
+        repository.clone(),
+        state_staged.clone(),
+        state_current.clone(),
+        link_path.clone(),
+        parent_branch,
+    )
+    .await?;
+    let inner_repository = chain.innermost_repository.clone();
+    let inner_state = chain.innermost_state.clone();
+
+    let node_link = inner_state
+        .find_relative_node_link(
+            inner_repository.clone(),
+            chain.innermost_base_node,
+            chain.remainder_path.as_str(),
+        )
         .await
         .forward::<LinkError>("Invalid path")?;
 
@@ -47,8 +64,8 @@ pub async fn remove(
         .into());
     }
 
-    let link_node = state_staged
-        .node(repository.clone(), node_link.node)
+    let link_node = inner_state
+        .node(inner_repository.clone(), node_link.node)
         .await
         .forward::<LinkError>("Failed deserializing state")?;
 
@@ -62,25 +79,23 @@ pub async fn remove(
     let link_id: RepositoryId = link_node.address.context.into();
     let is_staged_add = link_node.is_staged_add();
 
-    // Remove the directory contents
-    let node_path = state_staged
-        .node_path(repository.clone(), node_link.node)
-        .await
-        .forward::<LinkError>("Failed to resolve node path")?;
-    let absolute_path = repository.require_path()?.join(node_path);
+    // On-disk path is the full link path regardless of nesting.
+    let absolute_path = link_path.to_absolute_path(repository.require_path()?);
     crate::util::fs::unlink_recursive(absolute_path.as_path())
         .await
         .internal_with(|| format!("Failed to delete directory {}", absolute_path.display()))?;
 
     if is_staged_add {
         // Recreate the empty directory so it appears as an unstaged change
-        let _ = tokio::fs::create_dir_all(absolute_path.as_path()).await;
+        let _ = lore_io::IoDriver::global()
+            .create_dir_all(absolute_path.as_path())
+            .await;
 
         // Link was added but never committed — discard the node from the staged tree
         lore_debug!("Link node was staged for add, discarding instead of staging delete");
         state::node_discard_patch(
-            state_staged.clone(),
-            repository.clone(),
+            inner_state.clone(),
+            inner_repository.clone(),
             node_link.node,
             |discarded_node_id, _flags| {
                 lore_debug!("Discarded link node {discarded_node_id}");
@@ -91,8 +106,8 @@ pub async fn remove(
     } else {
         // Link exists in committed state — stage as deleted
         stage::stage_delete(
-            repository.clone(),
-            state_staged.clone(),
+            inner_repository.clone(),
+            inner_state.clone(),
             node_link.node,
             NodeFlags::NoFlags,
             Arc::default(),
@@ -102,14 +117,17 @@ pub async fn remove(
         .forward::<LinkError>("Failed to delete link")?;
     }
 
-    state_staged
+    inner_state
         .link_remove(
-            repository.clone(),
+            inner_repository.clone(),
             link_node.address.context.into(),
             node_link.node,
         )
         .await
         .forward::<LinkError>("Failed to remove link")?;
+
+    // Fold nested link revisions up into the top-level state (no-op if flat).
+    crate::link::propagate_link_chain(&chain, token).await?;
 
     state_staged.set_parent_self(state_current.revision());
     state_staged.set_revision_number(0);
