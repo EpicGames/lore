@@ -1,0 +1,33 @@
+[package]
+name = "lore-postgres"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+deadpool-postgres.workspace = true
+lore-aws.workspace = true
+lore-base.workspace = true
+lore-storage.workspace = true
+rustls.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio-postgres.workspace = true
+tokio-postgres-rustls.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+lore-aws = { workspace = true, features = ["catalog-contract-tests"] }
+tokio.workspace = true
+
+[features]
+default = []
+integration-tests = []
+
+[[test]]
+name = "catalog_contract"
+path = "tests/catalog_contract.rs"
+required-features = ["integration-tests"]

@@ -1,0 +1,27 @@
+[package]
+name = "lore-postgres-server"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+anyhow = "1.0.103"
+lore-aws.workspace = true
+lore-base.workspace = true
+lore-hashicorp.workspace = true
+lore-postgres = { path = "../lore-postgres" }
+lore-server.workspace = true
+lore-storage.workspace = true
+serde.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[lib]
+name = "lore_postgres_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "loreserver-postgres"
+path = "src/main.rs"

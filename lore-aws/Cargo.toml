@@ -47,3 +47,4 @@ lore-proto = { workspace = true }
 [features]
 default = []
 mocks = []
+catalog-contract-tests = []

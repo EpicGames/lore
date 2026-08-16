@@ -1,0 +1,54 @@
+# Overlay for loreserver-postgres. Secrets should be supplied through environment variables.
+
+[immutable_store]
+mode = "composite"
+composite.local.mode = "local"
+composite.durable.mode = "postgres_s3"
+
+[immutable_store.composite.local.local]
+path = "/var/lib/lore/cache"
+flush_delay_seconds = 1
+max_capacity = 1_000_000
+max_size = 536_870_912_000
+
+[immutable_store.composite.replica_factory]
+client_message_buffer = 10_000
+read_replicas_enabled = true
+use_grpc_write_replication = true
+enable_same_region_write = true
+
+[plugins.postgres_s3.immutable_store]
+s3_bucket = "replace-with-r2-bucket"
+s3_endpoint_url = "https://replace-with-account-id.r2.cloudflarestorage.com"
+s3_region = "auto"
+s3_object_versioning = "unversioned"
+s3_force_path_style = true
+s3_slow_operation_threshold_millis = 5_000
+timeout_millis = 30_000
+force_write = false
+
+[plugins.postgres_s3.immutable_store.postgres]
+# Override this value with
+# LORE__PLUGINS__POSTGRES_S3__IMMUTABLE_STORE__POSTGRES__CONNECTION_STRING.
+connection_string = "host=127.0.0.1 dbname=lore user=lore sslmode=require"
+schema = "lore_fragment_catalog"
+max_connections = 16
+connect_timeout_millis = 5_000
+max_batch_size = 10_000
+
+[topology]
+provider = "consul"
+
+[plugins.consul]
+# CONSUL_HTTP_TOKEN supplies the ACL token without placing it in this file.
+address = "http://127.0.0.1:8500"
+service_name = "lore-server"
+ignore_address = ""
+poll_interval_secs = 30
+
+# These local stores are for a single primary. See README.md before scaling to multiple writers.
+[mutable_store]
+mode = "local"
+
+[lock_store]
+mode = "local"

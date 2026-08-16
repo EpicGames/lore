@@ -5,6 +5,8 @@
 //! This module provides a plugin factory for Consul-based topology discovery:
 //! - [`ConsulTopologyPluginFactory`] - Creates Consul-backed topology instances
 
+use std::env;
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,11 +26,19 @@ use crate::plugins::PluginRegistry;
 use crate::plugins::TopologyPluginFactory;
 
 /// Configuration for the Consul topology plugin.
-#[derive(Debug, Clone, Deserialize)]
-//#[serde(deny_unknown_fields)]
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConsulTopologyPluginConfig {
     /// Optional Consul client config. Will read from environment if not set
     pub client_config: Option<client::Config>,
+
+    /// Consul HTTP address. This is the concise form used by existing examples.
+    #[serde(default)]
+    pub address: Option<String>,
+
+    /// Optional Consul ACL token. Prefer `CONSUL_HTTP_TOKEN` in production.
+    #[serde(default)]
+    pub token: Option<String>,
 
     /// Service name to discover peers for.
     pub service_name: String,
@@ -40,6 +50,42 @@ pub struct ConsulTopologyPluginConfig {
     /// Optional poll interval in seconds for refreshing the peer list.
     #[serde(default)]
     pub poll_interval_secs: Option<u64>,
+}
+
+impl fmt::Debug for ConsulTopologyPluginConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ConsulTopologyPluginConfig")
+            .field(
+                "client_config_address",
+                &self.client_config.as_ref().map(|config| &config.address),
+            )
+            .field("address", &self.address)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("service_name", &self.service_name)
+            .field("ignore_address", &self.ignore_address)
+            .field("poll_interval_secs", &self.poll_interval_secs)
+            .finish()
+    }
+}
+
+impl ConsulTopologyPluginConfig {
+    fn client_config(&self) -> client::Config {
+        if let Some(config) = &self.client_config {
+            return config.clone();
+        }
+        if let Some(address) = &self.address {
+            return client::Config {
+                address: address.clone(),
+                token: self
+                    .token
+                    .clone()
+                    .or_else(|| env::var("CONSUL_HTTP_TOKEN").ok()),
+                ..Default::default()
+            };
+        }
+        client::Config::from_env()
+    }
 }
 
 /// Plugin factory for creating Consul-backed topology discovery.
@@ -83,11 +129,7 @@ impl TopologyPluginFactory for ConsulTopologyPluginFactory {
             "Creating Consul topology"
         );
 
-        let consul_client_config = if let Some(config) = &plugin_config.client_config {
-            config.clone()
-        } else {
-            client::Config::from_env()
-        };
+        let consul_client_config = plugin_config.client_config();
 
         let consul_client = Consul::new(consul_client_config);
         let rs_consul: RsConsul = consul_client.into();
@@ -133,6 +175,23 @@ mod tests {
     fn test_consul_topology_factory_name() {
         let factory = ConsulTopologyPluginFactory;
         assert_eq!(factory.name(), "consul");
+    }
+
+    #[test]
+    fn top_level_address_is_used_and_token_is_redacted() {
+        let config: ConsulTopologyPluginConfig = toml::from_str(
+            r#"
+address = "http://consul.internal:8500"
+token = "do-not-log"
+service_name = "lore"
+"#,
+        )
+        .expect("valid Consul config");
+
+        let client_config = config.client_config();
+        assert_eq!(client_config.address, "http://consul.internal:8500");
+        assert_eq!(client_config.token.as_deref(), Some("do-not-log"));
+        assert!(!format!("{config:?}").contains("do-not-log"));
     }
 
     #[tokio::test]

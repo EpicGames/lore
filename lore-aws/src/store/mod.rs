@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+pub mod dynamodb_fragment_catalog;
+pub mod fragment_catalog;
 pub mod immutable_store;
 pub mod lock_store;
 pub mod mutable_store;

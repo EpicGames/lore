@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+members = ["lore-postgres", "lore-postgres-server"]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+async-trait = "0.1.89"
+deadpool-postgres = { version = "0.14.1", features = ["serde"] }
+lore-aws = { path = "../../lore-aws" }
+lore-base = { path = "../../lore-base" }
+lore-hashicorp = { path = "../../lore-hashicorp" }
+lore-server = { path = "../../lore-server" }
+lore-storage = { path = "../../lore-storage" }
+rustls = { version = "0.23.31", default-features = false, features = ["ring", "std"] }
+serde = { version = "1.0.219", features = ["derive"] }
+sha2 = "0.11.0"
+thiserror = "2.0.16"
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
+tokio-postgres = "0.7.18"
+tokio-postgres-rustls = { version = "0.14.0", features = ["native-certs", "ring"] }
+toml = "0.9.5"
+tracing = "0.1.41"
+
+[patch.crates-io]
+quinn-proto = { path = "../../vendor/quinn-proto" }

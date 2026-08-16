@@ -1,18 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::collections::HashMap;
-use std::fmt::Debug;
-use std::fmt::Formatter;
-use std::string::ToString;
 use std::sync::Arc;
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
-use aws_sdk_dynamodb::error::SdkError;
+#[cfg(test)]
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
-use aws_sdk_dynamodb::primitives::Blob;
-use aws_sdk_dynamodb::types::AttributeValue;
-use aws_sdk_dynamodb::types::Select;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use bytes::Bytes;
 use bytes::BytesMut;
@@ -27,9 +20,6 @@ use lore_base::types::FragmentReference;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_base::types::TypedBytes;
-use lore_revision::lore_warn;
-use lore_revision::util::task_queue::METRICS_TASK_QUEUE_LABEL;
-use lore_revision::util::task_queue::TaskQueue;
 use lore_storage::ImmutableStore as ImmutableStoreTrait;
 use lore_storage::StoreError;
 use lore_storage::StoreMatch;
@@ -41,90 +31,44 @@ use lore_telemetry::LabelArray;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
 use lore_telemetry::timed;
 use lore_telemetry::timer::TimedResult;
-use lore_telemetry::tracing::fields::ADDRESS;
-use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Histogram;
 use serde::Deserialize;
-use serde::Serialize;
 use smallvec::SmallVec;
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 use tracing::debug;
-use tracing::error;
 use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
 use crate::aws_error::AwsError;
 use crate::default_aws_timeout_millis;
-use crate::dynamodb::ConditionParts;
 use crate::dynamodb::DynamoDb;
-use crate::dynamodb::DynamoDbPutCondition;
-use crate::dynamodb::DynamoDbQuery;
-use crate::dynamodb::error::SdkError as DynamoDbSdkError;
 use crate::s3::S3;
+#[cfg(test)]
+use crate::store::dynamodb_fragment_catalog::AssociationEntry as FragmentsEntry;
+#[cfg(test)]
+use crate::store::dynamodb_fragment_catalog::AssociationQuery as FragmentsQuery;
+use crate::store::dynamodb_fragment_catalog::DynamoDbFragmentCatalog;
+#[cfg(test)]
+use crate::store::dynamodb_fragment_catalog::MetadataCondition as UpdateMetadataCondition;
+#[cfg(test)]
+use crate::store::dynamodb_fragment_catalog::MetadataEntry as FragmentMetadataEntry;
+use crate::store::fragment_catalog::BeginObliteration;
+use crate::store::fragment_catalog::FragmentCatalog;
+use crate::store::fragment_catalog::ReleaseAssociation;
 
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
-struct FragmentsEntry {
-    hash: Hash,
-    #[serde(with = "serde_bytes")]
-    repository_context: [u8; size_of::<Context>() * 2],
-}
-
-impl From<&FragmentsEntry> for Address {
-    fn from(value: &FragmentsEntry) -> Self {
-        Address {
-            hash: value.hash,
-            context: Context::from(&value.repository_context[size_of::<Context>()..]),
-        }
-    }
-}
-
-impl Debug for FragmentsEntry {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FragmentsEntry")
-            .field("hash", &self.hash)
-            .field("repository_context", &hex::encode(self.repository_context))
-            .finish()
-    }
-}
-
-impl FragmentsEntry {
-    fn new(repository: Context, address: Address) -> Self {
-        let mut repository_context = [0u8; size_of::<Context>() * 2];
-        repository_context[..size_of::<Context>()].copy_from_slice(repository.data());
-        repository_context[size_of::<Context>()..].copy_from_slice(address.context.data());
-
-        Self {
-            hash: address.hash,
-            repository_context,
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct FragmentMetadataEntry {
-    hash: Hash,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(flatten)]
-    fragment: Option<Fragment>,
-}
-
-impl FragmentMetadataEntry {
-    fn new(hash: Hash) -> Self {
-        Self {
-            hash,
-            fragment: None,
-        }
-    }
-
-    fn with_fragment(mut self, fragment: Fragment) -> Self {
-        self.fragment = Some(fragment);
-
-        self
-    }
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum S3ObjectVersioning {
+    /// The backend may retain historical object versions. Obliteration must enumerate and delete
+    /// every version rather than relying on an unversioned delete.
+    #[default]
+    Versioned,
+    /// The backend stores only one value per key. Obliteration can permanently remove it with one
+    /// exact-key `DeleteObject` request.
+    Unversioned,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -132,6 +76,8 @@ pub struct S3StoreSettings {
     pub bucket: String,
     pub endpoint_url: Option<String>,
     pub region: Option<String>,
+    #[serde(default)]
+    pub object_versioning: S3ObjectVersioning,
     pub slow_operation_threshold_millis: u64,
     #[serde(default = "default_aws_timeout_millis")]
     pub timeout_millis: u64,
@@ -143,6 +89,7 @@ impl S3StoreSettings {
             bucket,
             endpoint_url: None,
             region: None,
+            object_versioning: S3ObjectVersioning::default(),
             slow_operation_threshold_millis: u64::MAX,
             timeout_millis: default_aws_timeout_millis(),
         }
@@ -155,6 +102,11 @@ impl S3StoreSettings {
 
     pub fn with_region(mut self, region: String) -> Self {
         self.region = Some(region);
+        self
+    }
+
+    pub fn with_object_versioning(mut self, object_versioning: S3ObjectVersioning) -> Self {
+        self.object_versioning = object_versioning;
         self
     }
 }
@@ -220,115 +172,31 @@ impl AwsImmutableStoreSettings {
     }
 }
 
-pub const FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE: &str = "hash";
-pub const FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE: &str = "repository_context";
-
-#[derive(Debug, Clone, PartialEq)]
-enum FragmentsQuery {
-    Repository(Hash, Context),
-    Hash(Hash),
-    HashCount(Hash),
+/// Object-store settings independent of the metadata catalog implementation.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ObjectStoreImmutableStoreSettings {
+    pub s3: S3StoreSettings,
+    #[serde(default)]
+    pub force_write: bool,
 }
 
-impl DynamoDbQuery for FragmentsQuery {
-    fn key_condition_expression(&self) -> &str {
-        match self {
-            FragmentsQuery::Repository(_, _) => "#pk = :hash and begins_with(#sk, :repository)",
-            FragmentsQuery::Hash(_) | FragmentsQuery::HashCount(_) => "#pk = :hash",
-        }
-    }
-
-    fn expression_attribute_names(&self) -> HashMap<String, String> {
-        match self {
-            FragmentsQuery::Repository(_, _) => HashMap::from([
-                (
-                    "#pk".to_string(),
-                    FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
-                ),
-                (
-                    "#sk".to_string(),
-                    FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE.to_string(),
-                ),
-            ]),
-            FragmentsQuery::Hash(_) | FragmentsQuery::HashCount(_) => HashMap::from([(
-                "#pk".to_string(),
-                FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
-            )]),
-        }
-    }
-
-    fn expression_attribute_values(&self) -> HashMap<String, AttributeValue> {
-        match self {
-            FragmentsQuery::Repository(hash, repository) => HashMap::from([
-                (
-                    ":hash".to_string(),
-                    AttributeValue::B(Blob::new(hash.data())),
-                ),
-                (
-                    ":repository".to_string(),
-                    AttributeValue::B(Blob::new(repository.data())),
-                ),
-            ]),
-            FragmentsQuery::Hash(hash) | FragmentsQuery::HashCount(hash) => HashMap::from([(
-                ":hash".to_string(),
-                AttributeValue::B(Blob::new(hash.data())),
-            )]),
-        }
-    }
-
-    fn limit(&self) -> Option<i32> {
-        match self {
-            FragmentsQuery::Repository(_, _) | FragmentsQuery::Hash(_) => Some(1),
-            FragmentsQuery::HashCount(_) => None,
-        }
-    }
-
-    fn select(&self) -> Option<Select> {
-        match self {
-            FragmentsQuery::Repository(_, _) | FragmentsQuery::Hash(_) => None,
-            FragmentsQuery::HashCount(_) => Some(Select::Count),
-        }
-    }
-
-    fn consistent_read(&self) -> bool {
-        matches!(self, FragmentsQuery::HashCount(_))
+impl ObjectStoreImmutableStoreSettings {
+    pub fn new(s3: S3StoreSettings, force_write: bool) -> Self {
+        Self { s3, force_write }
     }
 }
 
-#[derive(Debug, PartialEq)]
-struct UpdateMetadataCondition(Fragment);
-
-impl DynamoDbPutCondition for UpdateMetadataCondition {
-    fn into_parts(self) -> ConditionParts {
-        ConditionParts {
-            condition_expression: "#flags = :flags AND #size_payload = :size_payload AND #size_content = :size_content".to_string(),
-            expression_names: HashMap::from([
-                ("#flags".to_string(), "flags".to_string()),
-                ("#size_payload".to_string(), "size_payload".to_string()),
-                ("#size_content".to_string(), "size_content".to_string()),
-            ]),
-            expression_values: HashMap::from([
-                (
-                    ":flags".to_string(),
-                    AttributeValue::N(self.0.flags.to_string()),
-                ),
-                (
-                    ":size_payload".to_string(),
-                    AttributeValue::N(self.0.size_payload.to_string()),
-                ),
-                (
-                    ":size_content".to_string(),
-                    AttributeValue::N(self.0.size_content.to_string()),
-                ),
-            ]),
+impl From<&AwsImmutableStoreSettings> for ObjectStoreImmutableStoreSettings {
+    fn from(settings: &AwsImmutableStoreSettings) -> Self {
+        Self {
+            s3: settings.s3.clone(),
+            force_write: settings.force_write,
         }
     }
 }
 
 static STORE_ATTRIBUTES: LazyLock<[KeyValue; 1]> =
     LazyLock::new(|| [KeyValue::new("store", "aws")]);
-
-type BatchTaskResult = Result<(usize, StoreMatch), (usize, StoreError)>;
 
 struct GetS3objectContentsOutput {
     read: usize,
@@ -337,11 +205,9 @@ struct GetS3objectContentsOutput {
 
 pub struct AwsImmutableStore {
     s3: S3,
-    dynamodb: DynamoDb,
-    task_queue: TaskQueue<BatchTaskResult>,
+    catalog: Arc<dyn FragmentCatalog>,
     bucket: String,
-    fragments_table_name: Arc<str>,
-    metadata_table_name: Arc<str>,
+    object_versioning: S3ObjectVersioning,
     force_write: bool,
     latency_histogram: Histogram<f64>,
     labels_get: LabelArray,
@@ -355,6 +221,21 @@ pub struct AwsImmutableStore {
 
 impl AwsImmutableStore {
     pub fn new(s3: S3, dynamodb: DynamoDb, settings: &AwsImmutableStoreSettings) -> Self {
+        let catalog = Arc::new(DynamoDbFragmentCatalog::new(
+            dynamodb,
+            &settings.dynamodb,
+            settings.batch_exist_submission_limit,
+        ));
+        let object_store_settings = settings.into();
+        Self::with_catalog(s3, catalog, &object_store_settings)
+    }
+
+    /// Compose an S3-compatible payload store with a semantic metadata catalog.
+    pub fn with_catalog(
+        s3: S3,
+        catalog: Arc<dyn FragmentCatalog>,
+        settings: &ObjectStoreImmutableStoreSettings,
+    ) -> Self {
         let provider = AwsImmutableStoreInstrumentProvider;
 
         let latency_histogram =
@@ -368,19 +249,9 @@ impl AwsImmutableStore {
         let labels_copy = provider.get_labels_for_operation_context("copy");
         Self {
             s3,
-            dynamodb,
-            task_queue: TaskQueue::new(
-                u32::MAX,
-                Semaphore::MAX_PERMITS,
-                settings.batch_exist_submission_limit,
-                vec![KeyValue::new(
-                    METRICS_TASK_QUEUE_LABEL,
-                    "store.immutable.aws",
-                )],
-            ),
+            catalog,
             bucket: settings.s3.bucket.clone(),
-            fragments_table_name: Arc::from(settings.dynamodb.fragments_table_name.clone()),
-            metadata_table_name: Arc::from(settings.dynamodb.metadata_table_name.clone()),
+            object_versioning: settings.s3.object_versioning,
             force_write: settings.force_write,
             latency_histogram,
             labels_get,
@@ -393,87 +264,19 @@ impl AwsImmutableStore {
         }
     }
 
-    async fn exists_exact(&self, entry: &FragmentsEntry) -> Result<bool, StoreError> {
-        let item = serde_dynamo::to_item(entry).map_err(|e| {
-            warn!(
-                "Failed to convert fragment entry: {entry:?} to dynamo attribute value map: {e:?}",
-            );
-            StoreError::internal_with_context(
-                e,
-                "Failed to serialize fragment entry for DynamoDB lookup",
-            )
-        })?;
-
-        let output = self
-            .dynamodb
-            .get_item(
-                &self.fragments_table_name,
-                item,
-                true, /* consistent read */
-            )
-            .await
-            .map_err(|e| {
-                warn!("DynamoDb lookup for fragment entry failed for {entry:?}: {e:?}");
-                if matches!(&e, AwsError::AwsSdkError(_)) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(e, "DynamoDB fragment lookup failed")
-                }
-            })?;
-
-        Ok(output.item.is_some())
-    }
-
-    async fn exists_repository(&self, entry: &FragmentsEntry) -> Result<bool, StoreError> {
-        let repo = Context::from(&entry.repository_context[..size_of::<Context>()]);
-
-        self.dynamodb
-            .query_single(
-                &self.fragments_table_name,
-                FragmentsQuery::Repository(entry.hash, repo),
-            )
-            .await
-            .map(|output| output.count > 0)
-            .map_err(|e| {
-                warn!(
-                    "DynamoDb query for fragment entry by hash and repo failed for {entry:?}: {e:?}"
-                );
-                if matches!(&e, AwsError::AwsSdkError(_)) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(
-                        e,
-                        "DynamoDB fragment query by repository failed",
-                    )
-                }
-            })
-    }
-
-    async fn exists_hash(&self, entry: &FragmentsEntry) -> Result<bool, StoreError> {
-        self.dynamodb
-            .query_single(&self.fragments_table_name, FragmentsQuery::Hash(entry.hash))
-            .await
-            .map(|output| output.count > 0)
-            .map_err(|e| {
-                warn!("DynamoDb query for fragment entry by hash failed for {entry:?}: {e:?}");
-                if matches!(&e, AwsError::AwsSdkError(_)) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(e, "DynamoDB fragment query by hash failed")
-                }
-            })
-    }
-
     async fn ensure_exists(
         &self,
         repository: Context,
         address: Address,
         match_required: StoreMatch,
     ) -> Result<(), StoreError> {
-        if !self.exists(repository, address, match_required).await? {
+        let match_made = self
+            .catalog
+            .exist(repository, address, match_required)
+            .await?;
+        if match_made != match_required {
             return Err(StoreError::from(AddressNotFound::from(address)));
         }
-
         Ok(())
     }
 
@@ -483,226 +286,11 @@ impl AwsImmutableStore {
         address: Address,
         match_requested: StoreMatch,
     ) -> Result<bool, StoreError> {
-        if match_requested == StoreMatch::MatchNone {
-            return Ok(false);
-        }
-
-        let key = FragmentsEntry::new(repository, address);
-
-        match match_requested {
-            StoreMatch::MatchFull => self.exists_exact(&key).await,
-            StoreMatch::MatchPartition => self.exists_repository(&key).await,
-            StoreMatch::MatchHash => self.exists_hash(&key).await,
-            StoreMatch::MatchNone => Ok(false),
-        }.inspect(|matched| {
-            if !matched {
-                debug!("Fragment does not exist for repository: {repository} and address: {address} with match required: {match_requested:?}.");
-            }
-        })
-    }
-
-    // Performs an existence check for a batch of addresses at the `MatchFull` level. This means we
-    // can use `BatchGetItem` to reduce the number of Dynamo calls we need to have in flight at
-    // once.
-    async fn exist_batch_exact(
-        &self,
-        repository: Context,
-        addresses: &[Address],
-    ) -> Result<Vec<StoreMatch>, StoreError> {
-        let mut items = Vec::with_capacity(addresses.len());
-
-        let mut address_index_map = HashMap::new();
-
-        for (pos, address) in addresses.iter().enumerate() {
-            let address = *address;
-
-            address_index_map.insert(address, pos);
-
-            let entry = FragmentsEntry::new(repository, address);
-            items.push(serde_dynamo::to_item(&entry).map_err(|e| {
-                warn!(
-                    "Failed to convert fragment entry: {entry:?} to dynamo attribute value map: {e:?}",
-                );
-                StoreError::internal_with_context(e, "Failed to serialize fragment entry for DynamoDB batch lookup")
-            })?);
-        }
-
-        let output = self
-            .dynamodb
-            .batch_get_item(
-                &self.fragments_table_name,
-                items,
-                true, /* consistent read */
-            )
-            .await
-            .map_err(|err| {
-                warn!("DynamoDb batch exists failed: {err:?}");
-                if matches!(&err, AwsError::AwsSdkError(_)) {
-                    StoreError::from(SlowDown)
-                } else {
-                    warn!("DynamoDb batch exists failed addresses: {addresses:?}");
-                    StoreError::internal_with_context(err, "DynamoDB batch get items failed")
-                }
-            })?;
-
-        let mut result: Vec<StoreMatch> = addresses.iter().map(|_| StoreMatch::MatchNone).collect();
-
-        for item in output {
-            match serde_dynamo::from_item::<HashMap<String, AttributeValue>, FragmentsEntry>(item) {
-                Ok(entry) => match address_index_map.get(&((&entry).into())) {
-                    Some(pos) => result[*pos] = StoreMatch::MatchFull,
-                    None => {
-                        warn!(
-                            "Found entry in batch get item result that didn't exist in the input addresses? {entry:?}"
-                        );
-                    }
-                },
-                Err(e) => {
-                    warn!("Failed to convert dynamo item to fragments entry: {e:?}");
-                }
-            }
-        }
-
-        Ok(result)
-    }
-
-    // Performs an existence check for a batch of addresses at either the `MatchHash` or
-    // `MatchPartition` level. Any other value for `match_requested` will result in an error. This
-    // method will perform individual DynamoDb queries for each provided address, limiting the
-    // number of submitted tasks via a `TaskQueue` with a submission limit in place in order to
-    // enforce an upper bound on memory usage when checking the existence of a large number of
-    // fragments concurrently.
-    async fn exist_batch_inexact(
-        &self,
-        repository: Context,
-        addresses: &[Address],
-        match_requested: StoreMatch,
-    ) -> Result<Vec<StoreMatch>, StoreError> {
-        if matches!(
-            match_requested,
-            StoreMatch::MatchNone | StoreMatch::MatchFull
-        ) {
-            warn!("Invalid match requested for exist_batch_internal: {match_requested:?}");
-            return Err(StoreError::internal(
-                "Invalid match type for batch inexact exist (must be Hash or Repository)",
-            ));
-        }
-
-        let mut join_set = JoinSet::new();
-
-        let dynamodb = self.dynamodb.clone();
-        for (pos, address) in addresses.iter().enumerate() {
-            let dynamodb = dynamodb.clone();
-            let address = *address;
-
-            let table_name = self.fragments_table_name.clone();
-            let task = async move {
-                match match_requested {
-                    StoreMatch::MatchPartition => dynamodb.query_single(
-                        &table_name,
-                        FragmentsQuery::Repository(address.hash, repository),
-                    ),
-                    StoreMatch::MatchHash => dynamodb.query_single(
-                        &table_name,
-                        FragmentsQuery::Hash(address.hash),
-                    ),
-                    _ => {
-                        // We've already checked for the other match types above, so we should never
-                        // reach this
-                        error!("Invalid match requested: {match_requested:?}");
-                        unreachable!();
-                    }
-                }.await
-                    .map(|output| (pos, if output.count > 0 { match_requested } else { StoreMatch::MatchNone }))
-                    .map_err(|e| {
-                        warn!(
-                            "DynamoDb query for fragment entry by hash and repo failed for repository: {repository} and address: {address}: {e:?}"
-                        );
-                        if matches!(&e, AwsError::AwsSdkError(_)) {
-                            (pos, StoreError::from(SlowDown))
-                        } else {
-                            (pos, StoreError::internal_with_context(e, "DynamoDB query for batch inexact exist failed"))
-                        }
-                    })
-            }.in_current_span();
-
-            lore_base::lore_spawn!(
-                join_set,
-                self.task_queue
-                    .submit(Box::pin(task))
-                    .await
-                    .map_err(|err| {
-                        lore_warn!("Task queue error: {err}");
-                        StoreError::internal_with_context(
-                            err,
-                            "Failed to submit batch inexact exist task",
-                        )
-                    })?
-                    .in_current_span()
-            );
-        }
-
-        let mut output: Vec<StoreMatch> = addresses.iter().map(|_| StoreMatch::MatchNone).collect();
-
-        while let Some(join_result) = join_set.join_next().await {
-            if let Err(e) = join_result {
-                warn!("Failed to join exist batch task, falling back to no match {e:?}");
-                continue;
-            }
-
-            let result = join_result.unwrap().map_err(|e| {
-                // If the task queue itself failed, something has gone terribly wrong.
-                error!("TaskQueue failure: {e:?}");
-                StoreError::internal_with_context(
-                    e,
-                    "Failed to process batch inexact exist results",
-                )
-            })?;
-
-            match result {
-                Ok((pos, m)) => output[pos] = m,
-                Err((pos, e)) => {
-                    // If an individual check failed, log the error and continue on, using the
-                    // default `MatchNone` that was prepopulated for the index.
-                    warn!(
-                        "Failed to check existence for address {} in repository {repository}: {e:?}",
-                        addresses[pos]
-                    );
-                }
-            }
-        }
-
-        Ok(output)
-    }
-
-    async fn lookup(
-        &self,
-        repository: Context,
-        address: Address,
-        match_requested: StoreMatch,
-    ) -> Result<StoreMatch, StoreError> {
-        let mut match_requested = match_requested;
-        let mut exists = self.exists(repository, address, match_requested).await?;
-
-        // If a full match was requested but not found, short circuit. Since we do not currently
-        // support partial uploads there's no benefit to checking to see if a match exists at any
-        // other granularity.
-        // TODO(jcohen): If we decide to re-add support for partial uploads, this will need to be
-        //  removed.
-        if !exists && match_requested == StoreMatch::MatchFull {
-            return Ok(StoreMatch::MatchNone);
-        }
-
-        while !exists && match_requested.prev().is_some() {
-            match_requested = match_requested.prev().unwrap();
-            exists = self.exists(repository, address, match_requested).await?;
-        }
-
-        Ok(if exists {
-            match_requested
-        } else {
-            StoreMatch::MatchNone
-        })
+        Ok(self
+            .catalog
+            .exist(repository, address, match_requested)
+            .await?
+            == match_requested)
     }
 
     async fn do_query(
@@ -712,123 +300,17 @@ impl AwsImmutableStore {
         match_requested: StoreMatch,
         hide_obliterates: bool,
     ) -> Result<StoreQueryResult, StoreError> {
-        let match_made = self.lookup(repository, address, match_requested).await?;
-
-        if match_made == StoreMatch::MatchNone {
-            return Ok(StoreQueryResult {
-                fragment: Fragment::default(),
-                match_made,
-            });
-        }
-
-        let fragment = self.load_metadata(address.hash).await.map_err(|e| {
-            warn!(
-                "Load metadata failed for address: {address:?} in repository: {repository:?}: {e:?}"
-            );
-            StoreError::internal_with_context(e, "Failed to load metadata after fragment lookup")
-        })?;
-
-        if (fragment.flags & FragmentFlags::PayloadObliteration) != 0 && hide_obliterates {
-            debug!("Query found obliterated fragment at address {address}");
-            Ok(StoreQueryResult {
-                fragment: Fragment::default(),
-                match_made: StoreMatch::MatchNone,
-            })
-        } else {
-            Ok(StoreQueryResult {
-                fragment,
-                match_made,
-            })
-        }
-    }
-
-    async fn write_metadata(
-        &self,
-        repository: Context,
-        address: Address,
-        fragment: Fragment,
-    ) -> Result<(), StoreError> {
-        let metadata = FragmentMetadataEntry::new(address.hash).with_fragment(fragment);
-        let item = serde_dynamo::to_item(&metadata).map_err(|e| {
-            warn!("Failed to serialize metadata entry for repository: {repository:?} and address: {address:?} to dynamo av map: {e:?}");
-            StoreError::internal_with_context(e, "Failed to serialize metadata for DynamoDB write")
-        })?;
-
-        self.dynamodb.put_item(&self.metadata_table_name, item).await.map_err(|e| {
-            warn!("Failed to save metadata entry for repository: {repository:?} and address: {address:?}: {e:?}");
-            if matches!(&e, AwsError::AwsSdkError(_)) {
-                StoreError::from(SlowDown)
-            } else {
-                StoreError::internal_with_context(e, "DynamoDB metadata write failed")
-            }
-        })?;
-
-        Ok(())
-    }
-
-    async fn update_metadata(
-        &self,
-        address: Address,
-        updated: Fragment,
-        expected: Fragment,
-    ) -> Result<(), StoreError> {
-        let metadata = FragmentMetadataEntry::new(address.hash).with_fragment(updated);
-        let item = serde_dynamo::to_item(&metadata).map_err(|e| {
-            warn!("Failed to serialize metadata entry for fragment with address: {address}: {e:?}");
-            StoreError::internal_with_context(e, "Failed to serialize metadata for DynamoDB update")
-        })?;
-
         let result = self
-            .dynamodb
-            .put_item_conditional(
-                &self.metadata_table_name,
-                item,
-                UpdateMetadataCondition(expected),
-            )
-            .await;
-
-        match result {
-            Ok(_) => Ok(()),
-            Err(AwsError::AwsSdkError(DynamoDbSdkError::ServiceError(err)))
-                if err.err().is_conditional_check_failed_exception() =>
-            {
-                if let PutItemError::ConditionalCheckFailedException(e) = err.err() {
-                    match e.item() {
-                        Some(item) => {
-                            let entry: Option<FragmentMetadataEntry> =
-                                serde_dynamo::from_item(item.to_owned())
-                                    .inspect_err(|e| {
-                                        warn!("Failed to parse fragment from item: {item:?}: {e}");
-                                    })
-                                    .ok();
-
-                            warn!(
-                                "Failed to update metadata, expected metadata: {expected:?} did not match actual: {:?}",
-                                entry
-                            );
-                        }
-                        None => {
-                            warn!(
-                                "Failed to update metadata, no existing metadata found for {address}"
-                            );
-                        }
-                    }
-                    Err(StoreError::internal(
-                        "Failed to update metadata due to conflict",
-                    ))
-                } else {
-                    unreachable!()
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "DynamoDB conditional put failed while updating metadata for {address}: {e:?}"
-                );
-                Err(StoreError::internal_with_context(
-                    e,
-                    "DynamoDB conditional metadata update failed",
-                ))
-            }
+            .catalog
+            .query(repository, address, match_requested)
+            .await?;
+        if hide_obliterates
+            && result.fragment.flags & FragmentFlags::PayloadObliteration.bits() != 0
+        {
+            debug!("Query found obliterated fragment at address {address}");
+            Ok(StoreQueryResult::default())
+        } else {
+            Ok(result)
         }
     }
 
@@ -837,77 +319,7 @@ impl AwsImmutableStore {
         repository: Context,
         address: Address,
     ) -> Result<(), StoreError> {
-        let entry = FragmentsEntry::new(repository, address);
-
-        let item = serde_dynamo::to_item(&entry).map_err(|e| {
-            warn!("Failed to convert fragment entry: {entry:?} to dynamo attribute value map: {e}");
-            StoreError::internal_with_context(
-                e,
-                "Failed to serialize fragment association for DynamoDB",
-            )
-        })?;
-
-        self.dynamodb.put_item(&self.fragments_table_name, item).await
-            .map_err(|e| {
-                warn!({REPOSITORY_ID} = %repository, {ADDRESS} = %address, error = ?e, "Failed to put item while storing fragment association");
-                if matches!(&e, AwsError::AwsSdkError(_)) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(e, "DynamoDB fragment association write failed")
-                }
-            })?;
-
-        Ok(())
-    }
-
-    async fn has_associations(&self, hash: Hash) -> Result<bool, StoreError> {
-        self.dynamodb
-            .query_single(&self.fragments_table_name, FragmentsQuery::HashCount(hash))
-            .await
-            .map(|output| output.count > 0)
-            .map_err(|e| {
-                warn!(
-                    "DynamoDb query for fragment association count failed for hash {hash}: {e:?}"
-                );
-                if matches!(&e, AwsError::AwsSdkError(_)) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(
-                        e,
-                        "DynamoDB fragment association count query failed",
-                    )
-                }
-            })
-    }
-
-    async fn delete_association(
-        &self,
-        repository: Context,
-        address: Address,
-    ) -> Result<(), StoreError> {
-        let entry = FragmentsEntry::new(repository, address);
-
-        let item = serde_dynamo::to_item(&entry).map_err(|e| {
-            warn!("Failed to convert fragment entry: {entry:?} to dynamo attribute value map: {e}");
-            StoreError::internal_with_context(
-                e,
-                "Failed to serialize fragment association for DynamoDB delete",
-            )
-        })?;
-
-        self.dynamodb
-            .delete_item(&self.fragments_table_name, item)
-            .await
-            .map_err(|e| {
-                warn!("Failed to delete fragment association for repository: {repository} and address: {address}: {e:?}");
-                if matches!(&e, AwsError::AwsSdkError(_)) {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::internal_with_context(e, "DynamoDB fragment association delete failed")
-                }
-            })?;
-
-        Ok(())
+        self.catalog.associate_fragment(repository, address).await
     }
 
     async fn write_payload(
@@ -945,22 +357,34 @@ impl AwsImmutableStore {
                 }
             })?;
 
-        // Writing metadata is not tied to writing the payload to S3, which means that over time
-        // we'll likely wind up in a scenario where some fragments exist in S3, but their associated
-        // metadata does not exist in Dynamo. In this scenario, a later query and/or read for the
-        // fragment would treat it as not found, prompting clients to resend the fragment. This
-        // means that whenever we land in this scenario, we should be self-healing.
-        self.write_metadata(repository, address, fragment).await?;
-
-        self.associate_fragment(repository, address).await?;
-
-        Ok(())
+        // Payload and catalog cannot share one transaction. Persisting the object first means a
+        // catalog failure can leave an unreachable object, but never an association that points to
+        // absent bytes. A later put repairs that safe orphan idempotently.
+        self.catalog
+            .register_fragment(repository, address, fragment)
+            .await
     }
 
     /// Permanently delete a payload from S3 by removing *ALL* versions from the bucket.
     async fn delete_payload(&self, hash: Hash) -> Result<(), StoreError> {
         let mut dst = [0u8; 64];
         let hash = lore_revision::util::to_hex_str(hash.data(), &mut dst);
+
+        if self.object_versioning == S3ObjectVersioning::Unversioned {
+            return self
+                .s3
+                .delete_object(self.bucket.as_str(), hash, None)
+                .await
+                .map(|_| ())
+                .map_err(|e| {
+                    warn!("Failed to delete unversioned payload for hash: {hash}: {e:?}");
+                    if matches!(&e, AwsError::AwsSdkError(_)) {
+                        StoreError::from(SlowDown)
+                    } else {
+                        StoreError::internal_with_context(e, "S3 delete object failed")
+                    }
+                });
+        }
 
         let versions: Option<Vec<Option<String>>> = self
             .s3
@@ -1036,49 +460,7 @@ impl AwsImmutableStore {
     }
 
     async fn load_metadata(&self, hash: Hash) -> Result<Fragment, StoreError> {
-        let item = serde_dynamo::to_item(FragmentMetadataEntry::new(hash)).map_err(|e| {
-            warn!("Failed to serialize fragment metadata entry for {hash}: {e:?}");
-            StoreError::internal_with_context(
-                e,
-                "Failed to serialize fragment entry for DynamoDB metadata load",
-            )
-        })?;
-
-        let metadata: FragmentMetadataEntry = if let Some(av_map) = self
-            .dynamodb
-            .get_item(
-                &self.metadata_table_name,
-                item,
-                true, /* consistent read */
-            )
-            .await
-            .map_err(|e| {
-                warn!(%hash, ?e, "Failed to get fragment metadata for hash");
-                if let AwsError::AwsSdkError(sdk_error) = e
-                    && let SdkError::TimeoutError(_) = sdk_error
-                {
-                    StoreError::from(SlowDown)
-                } else {
-                    StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
-                }
-            })?
-            .item
-        {
-            serde_dynamo::from_item(av_map).map_err(|e| {
-                warn!("Failed to deserialize fragment metadata: {e:?}");
-                StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
-            })
-        } else {
-            warn!("Failed to get metadata for fragment, no item found");
-            Err(StoreError::from(AddressNotFound::from(
-                Address::zero_context_hash(hash),
-            )))
-        }?;
-
-        metadata.fragment.ok_or_else(|| {
-            warn!("No fragment found on metadata from store: {metadata:?}");
-            StoreError::internal("Fragment metadata entry missing fragment field")
-        })
+        self.catalog.load_metadata(hash).await
     }
 
     async fn get_s3_object_contents(
@@ -1225,18 +607,9 @@ impl ImmutableStoreTrait for AwsImmutableStore {
     ) -> Result<Vec<StoreMatch>, StoreError> {
         let repository: Context = partition.into();
         timed!(self.latency_histogram, &self.labels_exist_batch, {
-            match match_requested {
-                StoreMatch::MatchNone => {
-                    Ok(addresses.iter().map(|_| StoreMatch::MatchNone).collect())
-                }
-                StoreMatch::MatchHash | StoreMatch::MatchPartition => {
-                    // We cannot use Dynamo batch gets for these, so must fall back to performing
-                    // individual prefix queries
-                    self.exist_batch_inexact(repository, addresses, match_requested)
-                        .await
-                }
-                StoreMatch::MatchFull => self.exist_batch_exact(repository, addresses).await,
-            }
+            self.catalog
+                .query_batch(repository, addresses, match_requested)
+                .await
         })
         .into()
     }
@@ -1408,28 +781,26 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             // expect this to be invoked, the log output in this method is intentionally very verbose.
             let span = tracing::Span::current();
 
-            let original_metadata = self
-                .metadata_with_size_validation(address.hash)
+            let lease = match self
+                .catalog
+                .begin_obliteration(address.hash)
                 .instrument(span.clone())
-                .await?;
-
-            info!("Original metadata: {original_metadata:?}");
-
-            // Acquire the lock on the fragment.
-            let updated_metadata = if original_metadata.flags & FragmentFlags::PayloadObliteration == 0
+                .await?
             {
-                let mut updated_metadata = original_metadata;
-                updated_metadata.flags |= FragmentFlags::PayloadObliterating;
-
-                self.update_metadata(address, updated_metadata, original_metadata)
-                    .instrument(span.clone())
-                    .await?;
-                info!("Acquired obliteration lock, updated metadata: {updated_metadata:?}");
-                updated_metadata
-            } else {
-                info!("Fragment metadata indicates fragment is already being (or has previously been) obliterated");
-                return Ok(());
+                BeginObliteration::AlreadyObliterated => {
+                    info!("Fragment metadata indicates fragment was already obliterated");
+                    return Ok(());
+                }
+                BeginObliteration::Acquired(lease) => lease,
             };
+            let original_metadata = lease.original();
+            let updated_metadata = lease.marker();
+            lore_storage::validate_fragment_size(&original_metadata)?;
+            info!(
+                original = ?original_metadata,
+                marker = ?updated_metadata,
+                "Acquired or resumed obliteration"
+            );
 
             if updated_metadata.flags & FragmentFlags::PayloadFragmented != 0 {
                 info!("Fragment is fragmented");
@@ -1437,7 +808,11 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 // only cares about the size fields (which haven't changed), but it feels wrong given it
                 // doesn't explicitly match the metadata for what's currently in S3.
                 let payload = self
-                    .read_payload(self.get_s3_object_contents(address.hash).await?, address.hash, original_metadata)?
+                    .read_payload(
+                        self.get_s3_object_contents(address.hash).await?,
+                        address.hash,
+                        original_metadata,
+                    )?
                     .to_aligned::<FragmentReference>();
 
                 let sub_fragments = payload.as_type_slice::<FragmentReference>();
@@ -1484,40 +859,26 @@ impl ImmutableStoreTrait for AwsImmutableStore {
 
                 if failures {
                     warn!("Obliteration failed for at least one sub-fragment.");
-                    return Err(StoreError::internal(format!("Failed to obliterate immutable {address}")));
+                    return Err(StoreError::internal(format!(
+                        "Failed to obliterate immutable {address}"
+                    )));
                 }
 
                 info!("Done obliterating sub-fragments");
             }
 
-            self.delete_association(repository, address)
+            let release = self
+                .catalog
+                .release_association(repository, address, lease)
                 .instrument(span.clone())
                 .await?;
             stats
                 .num_fragments
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-            // TODO(jcohen): Assuming we always lock the fragment regardless of the association count
-            //  then this process of re-checking the count after removing the association should
-            //  theoretically not be necessary since no one else should have been able to add a new
-            //  fragment association while we maintain the lock.
-            info!("Association deleted, re-checking for other association...");
-            let remain_associated = self
-                .has_associations(address.hash)
-                .instrument(span.clone())
-                .await?;
-
-            // If the association count is still >= 1 after we deleted, other references remain, so
-            // there's nothing left to do...
-            if remain_associated {
-                info!("Fragment still associated, nothing more to do");
-                return self
-                    .update_metadata(address, original_metadata, updated_metadata)
-                    .instrument(span.clone())
-                    .await
-                    .inspect_err(|e| {
-                        warn!("Failed to reset metadata back to original state: {e:?}");
-                    });
+            if release == ReleaseAssociation::ReferencesRemain {
+                info!("Fragment still associated; catalog restored active metadata");
+                return Ok(());
             }
 
             self.delete_payload(address.hash)
@@ -1528,13 +889,8 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                 .num_payloads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-            let mut obliterated_metadata = updated_metadata;
-            obliterated_metadata.flags = FragmentFlags::PayloadObliterated.bits();
-            obliterated_metadata.size_payload = 0;
-            obliterated_metadata.size_content = 0;
-
-            // Final metadata update to clear out the sizes and set the flags to `Obliterated`.
-            self.update_metadata(address, obliterated_metadata, updated_metadata)
+            self.catalog
+                .finalize_obliteration(address.hash, lease)
                 .await
                 .inspect_err(|e| {
                     // At this point we've already deleted the underlying payload, so there's not any
@@ -1542,7 +898,8 @@ impl ImmutableStoreTrait for AwsImmutableStore {
                     // broken.
                     warn!("Failed to finalize obliterate for {address}: {e:?}");
                 })
-        }).into()
+        })
+        .into()
     }
 
     #[lore_macro::lore_instrument]
@@ -1622,8 +979,7 @@ impl ImmutableStoreTrait for AwsImmutableStore {
     }
 
     fn max_query_batch(&self) -> Option<usize> {
-        // DynamoDB batch size cannot exceed 100
-        Some(crate::dynamodb::BATCH_GET_ITEM_MAX_COUNT)
+        self.catalog.max_query_batch()
     }
 }
 
@@ -1774,9 +1130,13 @@ mod test {
             });
     }
 
-    async fn initialize_immutable_store(s3: S3, dynamodb: DynamoDb) -> AwsImmutableStore {
+    async fn initialize_immutable_store_with_versioning(
+        s3: S3,
+        dynamodb: DynamoDb,
+        object_versioning: S3ObjectVersioning,
+    ) -> AwsImmutableStore {
         let settings = AwsImmutableStoreSettings {
-            s3: S3StoreSettings::new(BUCKET.to_string()),
+            s3: S3StoreSettings::new(BUCKET.to_string()).with_object_versioning(object_versioning),
             dynamodb: DynamoDbImmutableStoreSettings::new(
                 FRAGMENTS_TABLE_NAME.to_string(),
                 METADATA_TABLE_NAME.to_string(),
@@ -1791,6 +1151,32 @@ mod test {
                 AwsImmutableStore::new(s3, dynamodb, &settings)
             })
             .await
+    }
+
+    async fn initialize_immutable_store(s3: S3, dynamodb: DynamoDb) -> AwsImmutableStore {
+        initialize_immutable_store_with_versioning(s3, dynamodb, S3ObjectVersioning::Versioned)
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_delete_payload_unversioned_skips_version_listing() {
+        let mut s3mock = MockS3Impl::default();
+        let dynamodb_mock = MockDynamoDb::default();
+        let hash = random::<Hash>();
+
+        mock_delete_payload(&mut s3mock, hash, None, false /* fail */);
+
+        let store = initialize_immutable_store_with_versioning(
+            s3mock,
+            dynamodb_mock,
+            S3ObjectVersioning::Unversioned,
+        )
+        .await;
+
+        store
+            .delete_payload(hash)
+            .await
+            .expect("unversioned payload delete failed");
     }
 
     #[tokio::test]
@@ -2880,22 +2266,55 @@ mod test {
     async fn test_obliterate_already_obliterating() {
         let repository = random::<Context>();
 
-        let s3mock = MockS3Impl::default();
+        let mut s3mock = MockS3Impl::default();
         let mut dynamodb_mock = MockDynamoDb::default();
 
-        let (_fragment, address) = mock_load_fragment_metadata(
+        let (fragment, address) = mock_load_fragment_metadata(
             &mut dynamodb_mock,
             Some(FragmentFlags::PayloadObliterating),
             false, /* fail */
         );
 
+        mock_count_associations(&mut dynamodb_mock, address.hash, 0, false /* fail */);
+        mock_remove_association(
+            &mut dynamodb_mock,
+            repository,
+            address,
+            false, /* fail */
+        );
+
+        let version_id = Some("some-version".to_string());
+        mock_list_versions(&mut s3mock, address.hash, version_id.clone(), false);
+        mock_delete_payload(&mut s3mock, address.hash, version_id, false /* fail */);
+
+        let mut final_metadata = fragment;
+        final_metadata.flags = FragmentFlags::PayloadObliterated.bits();
+        final_metadata.size_content = 0;
+        final_metadata.size_payload = 0;
+        let item: HashMap<String, AttributeValue> = serde_dynamo::to_item(
+            FragmentMetadataEntry::new(address.hash).with_fragment(final_metadata),
+        )
+        .expect("failed to serialize final metadata");
+
+        dynamodb_mock
+            .expect_put_item_conditional()
+            .with(
+                eq(Arc::<str>::from(METADATA_TABLE_NAME)),
+                eq(item),
+                eq(UpdateMetadataCondition(fragment)),
+            )
+            .return_once(move |_, _, _| Ok(PutItemOutput::builder().build()));
+
         let store = initialize_immutable_store(s3mock, dynamodb_mock).await;
 
-        let stats = Default::default();
+        let stats: Arc<StoreObliterateStats> = Default::default();
         Arc::new(store)
-            .obliterate(repository.into(), address, stats)
+            .obliterate(repository.into(), address, stats.clone())
             .await
             .expect("obliterate failed");
+
+        assert_eq!(stats.num_fragments.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
@@ -3195,7 +2614,7 @@ mod test {
             .await
             .expect("obliterate failed");
 
-        // The rest of the necessary assertions are handled by expectations on the Dynamo and S3
+        // The rest of the necessary assertions are handled by expectations on the catalog and S3
         // mocks.
         assert_eq!(stats.num_fragments.load(Ordering::Relaxed), 1);
         assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 1);
@@ -3239,8 +2658,7 @@ mod test {
             .await
             .expect("obliterate failed");
 
-        // The rest of the necessary assertions are handled by expectations on the Dynamo and S3
-        // mocks.
+        // The association was released and remaining references restored the active metadata.
         assert_eq!(stats.num_fragments.load(Ordering::Relaxed), 1);
         assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 0);
     }
@@ -3422,9 +2840,9 @@ mod test {
                 .is_slow_down()
         );
 
-        // The rest of the necessary assertions are handled by expectations on the Dynamo and S3
-        // mocks.
-        assert_eq!(stats.num_fragments.load(Ordering::Relaxed), 1);
+        // A catalog release is one semantic operation. Do not report a fragment as released when
+        // the catalog could not determine and commit the outcome.
+        assert_eq!(stats.num_fragments.load(Ordering::Relaxed), 0);
         assert_eq!(stats.num_payloads.load(Ordering::Relaxed), 0);
     }
 

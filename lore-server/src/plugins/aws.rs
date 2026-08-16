@@ -16,6 +16,7 @@ use lore_aws::clients::TimeoutConfig;
 use lore_aws::store::immutable_store::AwsImmutableStore;
 use lore_aws::store::immutable_store::AwsImmutableStoreSettings;
 use lore_aws::store::immutable_store::DynamoDbImmutableStoreSettings;
+use lore_aws::store::immutable_store::S3ObjectVersioning;
 use lore_aws::store::immutable_store::S3StoreSettings;
 use lore_aws::store::lock_store::DynamoDbLockStore;
 use lore_aws::store::mutable_store::AwsMutableStore;
@@ -65,6 +66,14 @@ pub struct AwsImmutableStorePluginConfig {
     /// Optional S3 region.
     #[serde(default)]
     pub s3_region: Option<String>,
+
+    /// Whether the S3-compatible backend retains historical object versions.
+    ///
+    /// Defaults to `versioned`, which preserves the existing conservative behavior. Set this to
+    /// `unversioned` only for a backend such as Cloudflare R2 where one exact-key `DeleteObject`
+    /// permanently removes the payload.
+    #[serde(default)]
+    pub s3_object_versioning: S3ObjectVersioning,
 
     /// `DynamoDB` table name for storing fragment associations.
     pub dynamodb_fragments_table: String,
@@ -298,6 +307,7 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
             bucket: plugin_config.s3_bucket,
             endpoint_url: plugin_config.s3_endpoint_url,
             region: plugin_config.s3_region,
+            object_versioning: plugin_config.s3_object_versioning,
             slow_operation_threshold_millis: plugin_config.s3_slow_operation_threshold_millis,
             timeout_millis: plugin_config.timeout_millis,
         };
@@ -634,6 +644,7 @@ mod tests {
             s3_bucket = "test-bucket"
             s3_endpoint_url = "http://localhost:4566"
             s3_region = "us-east-1"
+            s3_object_versioning = "unversioned"
             dynamodb_fragments_table = "fragments"
             dynamodb_metadata_table = "metadata"
             dynamodb_endpoint_url = "http://localhost:4566"
@@ -653,6 +664,10 @@ mod tests {
             Some("http://localhost:4566".to_string())
         );
         assert_eq!(plugin_config.s3_region, Some("us-east-1".to_string()));
+        assert_eq!(
+            plugin_config.s3_object_versioning,
+            S3ObjectVersioning::Unversioned
+        );
         assert_eq!(plugin_config.dynamodb_fragments_table, "fragments");
         assert_eq!(plugin_config.dynamodb_metadata_table, "metadata");
         assert_eq!(
@@ -680,6 +695,10 @@ mod tests {
         assert_eq!(plugin_config.s3_bucket, "test-bucket");
         assert!(plugin_config.s3_endpoint_url.is_none());
         assert!(plugin_config.s3_region.is_none());
+        assert_eq!(
+            plugin_config.s3_object_versioning,
+            S3ObjectVersioning::Versioned
+        );
         assert_eq!(plugin_config.dynamodb_fragments_table, "fragments");
         assert_eq!(plugin_config.dynamodb_metadata_table, "metadata");
         assert!(plugin_config.dynamodb_endpoint_url.is_none());
