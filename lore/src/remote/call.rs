@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 use std::io::Write;
 
+use bytes::Bytes;
+use lore_base::error::ServiceUnavailable;
 use lore_base::log::LoreLogLevel;
 use lore_error_set::prelude::*;
 use lore_revision::event::EventError;
@@ -22,16 +24,30 @@ use crate::remote::network::UdsStream;
 use crate::remote::network::uds_supported;
 
 #[error_set]
-pub enum ServiceCallError {}
+pub enum ServiceCallError {
+    ServiceUnavailable,
+}
 
 impl EventError for ServiceCallError {
     fn translated(&self) -> LoreError {
-        LoreError::Internal
+        match self {
+            ServiceCallError::ServiceUnavailable(_) => LoreError::ServiceUnavailable,
+            ServiceCallError::Internal(_) => LoreError::Internal,
+        }
     }
 
     fn inner(&self) -> String {
         self.to_string()
     }
+}
+
+/// Reports that a routed call never ran because no service could be reached or
+/// started, as the one failure a caller can act on. Carries the underlying
+/// failure as its reason, so the detail is not lost behind the category.
+fn unavailable(error: &impl std::fmt::Display) -> ServiceCallError {
+    ServiceCallError::from(ServiceUnavailable {
+        reason: error.to_string(),
+    })
 }
 
 /// Records the directory the service resolves this call's relative paths
@@ -65,9 +81,32 @@ pub async fn service_call<ArgsType: LoreArgs + Clone + Send + 'static>(
                 LoreLogLevel::Error,
                 format!("Failed to send command to Lore service because: {err}"),
             )));
+            let code = err.ffi_code();
             event_dispatcher.send_error(err);
-            1
+            code
         })
+}
+
+/// Opens a connection to the service and writes the already-serialized message,
+/// returning the connection to read the reply from.
+///
+/// Takes [`Bytes`] rather than the buffer itself because the caller sends the
+/// same message twice when it has to start a service first, and the write
+/// happens on a blocking thread that needs to own what it writes. Sharing the
+/// buffer keeps the second attempt from copying a payload that is as large as
+/// the command — every path of a bulk `stage`, for one.
+async fn connect_and_send(message_bytes: Bytes) -> Result<UdsStream, ServiceCallError> {
+    lore_base::lore_spawn_blocking!(move || {
+        let mut connection =
+            UdsStream::connect().forward::<ServiceCallError>("connecting to local socket")?;
+        connection
+            .writer()
+            .write_all(&message_bytes)
+            .internal("sending message")?;
+        Ok::<UdsStream, ServiceCallError>(connection)
+    })
+    .await
+    .internal("joining connection task")?
 }
 
 pub async fn service_call_impl<ArgsType: LoreArgs + Clone + Send + 'static>(
@@ -79,26 +118,30 @@ pub async fn service_call_impl<ArgsType: LoreArgs + Clone + Send + 'static>(
         return Err(ServiceCallError::internal("OS doesn't support IPC"));
     }
 
-    let connection = lore_base::lore_spawn_blocking!(|| {
-        let mut connection =
-            UdsStream::connect().forward::<ServiceCallError>("connecting to local socket")?;
+    let message = MessageToServer {
+        globals,
+        command: args.to_command(),
+    };
+    let message_bytes = Bytes::from(
+        write_v1_message(message, SerializationType::Json)
+            .forward::<ServiceCallError>("serializing message")?,
+    );
 
-        let message = MessageToServer {
-            globals,
-            command: args.to_command(),
-        };
-
-        let message_bytes = write_v1_message(message, SerializationType::Json)
-            .forward::<ServiceCallError>("serializing message")?;
-
+    // Send to an existing service first, and only start one if that fails, so
+    // the common path opens a single connection rather than a liveness probe
+    // followed by the real one.
+    let connection = if let Ok(connection) = connect_and_send(message_bytes.clone()).await {
         connection
-            .writer()
-            .write_all(&message_bytes)
-            .internal("sending message")?;
-        Ok::<UdsStream, ServiceCallError>(connection)
-    })
-    .await
-    .internal("joining connection task")??;
+    } else {
+        // Auto-start carries no executable: the routed call has no field for
+        // one, so this is the current-executable rule, which only the CLI meets.
+        crate::remote::process::ensure_running(None)
+            .await
+            .map_err(|error| unavailable(&error))?;
+        connect_and_send(message_bytes)
+            .await
+            .map_err(|error| unavailable(&error))?
+    };
 
     'read_from_stream: loop {
         let mut connection = connection.try_clone().internal("cloning connection")?;
@@ -120,8 +163,43 @@ pub async fn service_call_impl<ArgsType: LoreArgs + Clone + Send + 'static>(
     }
 
     Err(ServiceCallError::internal(
-        "Lore service closed connection without sending a result",
+        "Lore service closed the connection without sending a result; \
+         it may have been stopped or terminated while the request was in flight",
     ))
+}
+
+/// Sends one command to a service that is already running and returns as soon
+/// as it is written, without waiting for a result. Used for requests whose
+/// effect is that the service exits, where waiting for a reply would race the
+/// service's own shutdown. Does not start a service.
+pub async fn service_send_no_reply<ArgsType: LoreArgs + Clone + Send + 'static>(
+    globals: LoreGlobalArgs,
+    args: ArgsType,
+) -> Result<(), ServiceCallError> {
+    if !uds_supported() {
+        return Err(ServiceCallError::internal("OS doesn't support IPC"));
+    }
+
+    lore_base::lore_spawn_blocking!(|| {
+        let mut connection =
+            UdsStream::connect().forward::<ServiceCallError>("connecting to local socket")?;
+
+        let message = MessageToServer {
+            globals,
+            command: args.to_command(),
+        };
+
+        let message_bytes = write_v1_message(message, SerializationType::Json)
+            .forward::<ServiceCallError>("serializing message")?;
+
+        connection
+            .writer()
+            .write_all(&message_bytes)
+            .internal("sending message")?;
+        Ok::<(), ServiceCallError>(())
+    })
+    .await
+    .internal("joining send task")?
 }
 
 pub fn handle_message(

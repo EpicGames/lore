@@ -411,7 +411,8 @@ impl<'de> serde::Deserialize<'de> for LoreBytes {
 /// Numbered independently of the general library error code that a `Complete`
 /// event's status carries: `NONE`, `INVALID_ARGUMENTS` and `ADDRESS_NOT_FOUND`
 /// happen to share its values, `INTERNAL` (3 against -1) and `SLOW_DOWN`
-/// (4 against 5) do not. Compare a code from an event only against this enum.
+/// (4 against 5) do not, and `SERVICE_UNAVAILABLE` shares its value by
+/// construction. Compare a code from an event only against this enum.
 ///
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
@@ -429,6 +430,15 @@ pub enum LoreErrorCode {
     Internal = 3,
     /// The backing store is overloaded; the caller should retry later.
     SlowDown = 4,
+    /// A call routed to the Lore service never ran, because no service could be
+    /// reached and none could be started.
+    ///
+    /// The exception to the independent numbering above: this shares the value
+    /// of the general library code, so the same number identifies the condition
+    /// whether it arrives as a return value or on an event. Callers act on it
+    /// by starting a service and retrying — an embedder with
+    /// `lore_service_start`, naming the Lore executable it ships.
+    ServiceUnavailable = 50,
 }
 
 /// Data for an error event.

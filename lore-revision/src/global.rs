@@ -71,6 +71,8 @@ pub struct GlobalConfig {
     default_shared_stores: BTreeMap<String, DefaultSharedStoreConfigValue>,
     #[serde(alias = "use_global_store_automatically")]
     pub use_shared_store_automatically: Option<bool>,
+    pub use_service_automatically: Option<bool>,
+    pub service_executable: Option<String>,
 }
 
 impl GlobalConfig {
@@ -111,6 +113,20 @@ impl GlobalConfig {
     }
     pub fn use_shared_store_automatically(&self) -> bool {
         self.use_shared_store_automatically.unwrap_or(false)
+    }
+    pub fn use_service_automatically(&self) -> bool {
+        self.use_service_automatically.unwrap_or(false)
+    }
+    /// The executable to launch as the service when a caller names none.
+    ///
+    /// Blank is the same as unset: a stored empty string would otherwise be
+    /// launched as a command with no name, failing where falling back to the
+    /// running executable would have worked.
+    pub fn service_executable(&self) -> Option<&str> {
+        self.service_executable
+            .as_deref()
+            .map(str::trim)
+            .filter(|executable| !executable.is_empty())
     }
     pub fn suggested_path_for_remote_url(remote_url: &str) -> Result<PathBuf, GlobalConfigError> {
         let data_dir = get_global_data_dir()?;

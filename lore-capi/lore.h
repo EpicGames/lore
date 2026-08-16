@@ -148,7 +148,8 @@ typedef enum lore_node_type_t {
 // Numbered independently of the general library error code that a `Complete`
 // event's status carries: `NONE`, `INVALID_ARGUMENTS` and `ADDRESS_NOT_FOUND`
 // happen to share its values, `INTERNAL` (3 against -1) and `SLOW_DOWN`
-// (4 against 5) do not. Compare a code from an event only against this enum.
+// (4 against 5) do not, and `SERVICE_UNAVAILABLE` shares its value by
+// construction. Compare a code from an event only against this enum.
 //
 typedef enum lore_error_code_t {
   // No error; the operation succeeded.
@@ -161,6 +162,15 @@ typedef enum lore_error_code_t {
   LORE_ERROR_CODE_INTERNAL = 3,
   // The backing store is overloaded; the caller should retry later.
   LORE_ERROR_CODE_SLOW_DOWN = 4,
+  // A call routed to the Lore service never ran, because no service could be
+  // reached and none could be started.
+  //
+  // The exception to the independent numbering above: this shares the value
+  // of the general library code, so the same number identifies the condition
+  // whether it arrives as a return value or on an event. Callers act on it
+  // by starting a service and retrying — an embedder with
+  // `lore_service_start`, naming the Lore executable it ships.
+  LORE_ERROR_CODE_SERVICE_UNAVAILABLE = 50,
 } lore_error_code_t;
 
 // Whether a repository being created or cloned should be backed by a shared store.
@@ -5245,16 +5255,38 @@ typedef struct lore_storage_upload_args_t {
   struct lore_storage_upload_item_array_t items;
 } lore_storage_upload_args_t;
 
-// Arguments for starting the Lore service process for the current repository (no parameters).
+// Arguments for starting the Lore service process.
 typedef struct lore_service_start_args_t {
-  int _unused;
+  // Executable to launch as the service, run as `<executable> service run`.
+  // An absolute path, a path relative to the working directory, or a bare
+  // name looked up on `PATH`. Empty falls back to the `service_executable`
+  // global config setting, and fails when that names nothing either: a
+  // service is only ever started from an executable someone named, never
+  // from the running one, which for an embedder is the host application.
+  struct lore_string_t executable;
 } lore_service_start_args_t;
 
-// Arguments for stopping the Lore service process for the current or all repositories.
+// Arguments for stopping the Lore service process (no parameters).
 typedef struct lore_service_stop_args_t {
-  // Stop all repositories rather than just the current one
-  uint8_t all;
+  int _unused;
 } lore_service_stop_args_t;
+
+// Arguments for setting whether Lore automatically routes calls through the service process.
+typedef struct lore_service_set_use_automatically_args_t {
+  // Automatically use the service process
+  uint8_t enabled;
+} lore_service_set_use_automatically_args_t;
+
+// Arguments for setting the executable Lore launches as the service process.
+typedef struct lore_service_set_executable_args_t {
+  // Executable to launch when a call to start the service names none, run as
+  // `<executable> service run`. An absolute path, a path relative to the
+  // working directory, or a bare name looked up on `PATH`. Empty clears the
+  // setting, after which only a call that names its own executable can start
+  // a service, and automatic routing is off however
+  // `use_service_automatically` is set.
+  struct lore_string_t executable;
+} lore_service_set_executable_args_t;
 
 // Arguments for subscribing to repository notifications (no parameters).
 typedef struct lore_notification_subscribe_args_t {
@@ -10979,6 +11011,17 @@ void lore_storage_upload_async(const struct lore_global_args_t *globals,
 
 // Start the Lore background service.
 //
+// Starting one that is already running succeeds without starting a second.
+//
+// `args.executable` names the binary to launch, run as `<executable> service
+// run`. Leaving it empty launches the current executable, which must then be
+// the Lore CLI itself: an application Lore is linked into is not relaunched as
+// the service, since running the host with `service run` would launch
+// something arbitrary. An embedder therefore ships the Lore executable and
+// names it here — this is the only way to start a service from an embedded
+// Lore, and the same restriction applies to the automatic start-up that
+// `use_service_automatically` performs, which carries no executable.
+//
 // # Events
 //
 // Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
@@ -11056,6 +11099,100 @@ int32_t lore_service_stop(const struct lore_global_args_t *globals,
 void lore_service_stop_async(const struct lore_global_args_t *globals,
                              const struct lore_service_stop_args_t *args,
                              struct lore_event_callback_config_t callback);
+
+// Set whether Lore automatically routes calls through the background service.
+//
+// When enabled, every Lore call is executed by the service process, which is
+// started automatically if it is not already running. Routing also requires an
+// executable to start one from, set with `lore_service_set_executable`; with
+// this enabled and none configured, calls run locally.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+int32_t lore_service_set_use_automatically(const struct lore_global_args_t *globals,
+                                           const struct lore_service_set_use_automatically_args_t *args,
+                                           struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_service_set_use_automatically`.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+void lore_service_set_use_automatically_async(const struct lore_global_args_t *globals,
+                                              const struct lore_service_set_use_automatically_args_t *args,
+                                              struct lore_event_callback_config_t callback);
+
+// Set the executable Lore launches as the background service when a call to
+// start one names none.
+//
+// A service is only ever started from an executable someone named: the running
+// executable is not a candidate, since with Lore embedded it is the host
+// application. Name the Lore binary shipped alongside the library here, and
+// the calls that carry no executable of their own can start one. It is also
+// half of what automatic routing requires, alongside
+// `lore_service_set_use_automatically`; without it, calls run locally. An
+// empty `executable` clears the setting.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+int32_t lore_service_set_executable(const struct lore_global_args_t *globals,
+                                    const struct lore_service_set_executable_args_t *args,
+                                    struct lore_event_callback_config_t callback);
+
+// Asynchronous version of `lore_service_set_executable`.
+//
+// # Events
+//
+// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+//
+// ## Standard Events
+//
+// These events are emitted by all interface functions:
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+void lore_service_set_executable_async(const struct lore_global_args_t *globals,
+                                       const struct lore_service_set_executable_args_t *args,
+                                       struct lore_event_callback_config_t callback);
 
 // Subscribe to repository notifications.
 //

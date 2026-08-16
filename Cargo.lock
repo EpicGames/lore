@@ -2659,6 +2659,7 @@ dependencies = [
  "aws-sdk-s3",
  "axum",
  "bytes",
+ "ctor",
  "lore",
  "lore-aws",
  "lore-base",

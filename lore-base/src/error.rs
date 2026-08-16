@@ -399,3 +399,17 @@ pub struct MissingIdentity;
 #[error("Compression would be inefficient")]
 #[ffi_code(49)]
 pub struct InefficientCompression;
+
+// FFI code 50
+/// No Lore service process could be reached, and none could be started, so a
+/// call routed to the service never ran. Distinct from an internal error
+/// because it is the one service failure a caller can act on: start a service
+/// and try again. An embedder does that with `lore_service_start`, naming the
+/// Lore executable it ships, since it cannot be started automatically from a
+/// host application.
+#[derive(Debug, Clone, Error, FfiError)]
+#[error("The Lore service is not available: {reason}")]
+#[ffi_code(50)]
+pub struct ServiceUnavailable {
+    pub reason: String,
+}

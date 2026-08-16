@@ -1140,6 +1140,13 @@ pub enum LoreError {
     /// Discriminant matches the error code of the underlying `Oversized` struct
     /// in `lore-base` so callers see a single consistent code.
     Oversized = 26,
+    /// A call routed to the Lore service never ran, because no service could be
+    /// reached and none could be started. The one service failure a caller can
+    /// act on: start a service and retry. An embedder starts one with
+    /// `lore_service_start`, naming the Lore executable it ships, since a host
+    /// application is never relaunched as the service. Discriminant matches the
+    /// `ServiceUnavailable` struct in `lore-base`, as `Oversized` does.
+    ServiceUnavailable = 50,
 
     // Legacy error categories (transitional, will be removed)
     /// A requested item was not found.

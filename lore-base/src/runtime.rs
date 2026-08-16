@@ -859,6 +859,26 @@ impl Default for TokioSettings {
     }
 }
 
+impl TokioSettings {
+    /// Settings for a process that only relays work elsewhere, such as a client
+    /// whose calls all execute in the Lore service. Sized for IPC rather than
+    /// for doing the work: each pool keeps [`MIN_THREADS_PER_POOL`], so that
+    /// none of them can starve another.
+    ///
+    /// The net pool is left at its process default, which on a client is
+    /// already [`DEFAULT_NET_THREADS`] and so no larger than the minimum. A
+    /// relaying process makes no remote calls of its own anyway — the service
+    /// it relays to does.
+    pub fn relay_only() -> Self {
+        TokioSettings {
+            max_blocking_threads: MIN_THREADS_PER_POOL,
+            thread_keep_alive_seconds: default_thread_keep_alive(),
+            worker_threads: Some(MIN_THREADS_PER_POOL),
+            net_threads: None,
+        }
+    }
+}
+
 /// Returns a handle to the shared tokio runtime, creating it lazily with default settings.
 pub fn runtime() -> Handle {
     runtime_with_settings(None)
@@ -1253,6 +1273,45 @@ mod tests {
         );
         assert_eq!(counts.net, DEFAULT_NET_THREADS);
         assert_eq!(counts.io, IO_REQUEST);
+    }
+
+    #[test]
+    fn relay_only_settings_are_minimal() {
+        let relay = TokioSettings::relay_only();
+        assert_eq!(relay.worker_threads, Some(MIN_THREADS_PER_POOL));
+        assert_eq!(relay.max_blocking_threads, MIN_THREADS_PER_POOL);
+        assert!(
+            relay.net_threads.is_none(),
+            "a relay process makes no remote calls, so it leaves the net pool at its default"
+        );
+    }
+
+    #[test]
+    fn relay_runtime_is_smaller_than_full() {
+        let relay = core_thread_counts(&TokioSettings::relay_only());
+        let full = core_thread_counts(&TokioSettings::default());
+
+        assert_eq!(
+            relay.worker, MIN_THREADS_PER_POOL,
+            "a relay runtime is sized for IPC, not for doing the work"
+        );
+        assert!(
+            full.worker >= relay.worker,
+            "the full runtime is never smaller than the relay one"
+        );
+        assert!(
+            full.total() >= relay.total(),
+            "the full runtime never budgets fewer threads in total"
+        );
+    }
+
+    #[test]
+    fn relay_blocking_pool_keeps_the_minimum() {
+        // The configured blocking size is the core runtime's own pool, with the
+        // net runtime's thread budgeted on top, so the core pool still ends up
+        // with what the settings asked for.
+        let counts = core_thread_counts(&TokioSettings::relay_only());
+        assert_eq!(core_blocking_threads(counts), MIN_THREADS_PER_POOL);
     }
 
     #[test]

@@ -67,6 +67,7 @@ def test_file(new_lore_repo, lore_executable_path):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        env=repo.sandboxed_env(),
     )
 
     # Wait for commit to announce it has started fragmenting files, then give the
@@ -90,6 +91,18 @@ def test_file(new_lore_repo, lore_executable_path):
     time.sleep(0.2)
     p.terminate()
     p.wait(2)
+
+    # What this checks is that a commit still succeeds after one was killed
+    # while it was writing data. Where the kill lands is not something a sleep
+    # can pin down: the commit records the revision early and then writes for
+    # far longer, so a kill during the writing usually finds the stage already
+    # cleared, and a faster commit makes that the common case. Stage something
+    # again when that happens, so the commit below always has work to do and the
+    # recovery is exercised either way.
+    if "Changes staged for commit" not in repo.status():
+        with repo.open_file("after_interrupted_commit.uasset", "w+b") as output_file:
+            output_file.write(os.urandom(8192))
+        repo.stage(scan=True)
 
     repo.commit("Test commit after waiting")
     repo.repository_verify()

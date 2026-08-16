@@ -126,6 +126,7 @@ packfiles
 paginator
 performant
 precompiled
+[Ss]ubcommand(s)?
 syscall
 syscalls
 [Tt]iering

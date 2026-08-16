@@ -24,6 +24,7 @@ axum = { workspace = true }
 aws-sdk-dynamodb = { version = "1.92.0", default-features = false, features = ["rt-tokio"] }
 aws-sdk-s3 = { version = "1.104.0", default-features = false, features = ["rt-tokio"] }
 bytes = { workspace = true }
+ctor = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 ring = { workspace = true }

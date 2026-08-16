@@ -207,9 +207,12 @@ class Lore:
         for k, v in self.environment_vars.items():
             env[k] = v
         env["LORE_GLOBAL_PATH"] = self.global_dir
-        # Isolate the auth token store per test so a developer's
-        # locally cached credentials don't leak into smoke runs.
-        env.setdefault("LORE_AUTH_PATH", self.global_dir)
+        # Isolate the auth token store per test so a developer's locally
+        # cached credentials don't leak into smoke runs, and so concurrent
+        # tests don't share one store. Assigned rather than defaulted: the
+        # session sets a run-wide store for the processes that have no test to
+        # belong to, and a default would leave every test using that one.
+        env["LORE_AUTH_PATH"] = self.global_dir
         return env
 
     def run(
@@ -2321,8 +2324,19 @@ class Lore:
     def service_start(self, **kwargs: Unpack[GlobalOptions]):
         return self.run(["service", "start"], **kwargs)
 
-    def service_stop(self, stop_all: bool = False, **kwargs: Unpack[GlobalOptions]):
-        return self.run(["service", "stop", "true" if stop_all else "false"], **kwargs)
+    def service_stop(self, **kwargs: Unpack[GlobalOptions]):
+        return self.run(["service", "stop"], **kwargs)
+
+    def service_set_executable(self, executable: str, **kwargs: Unpack[GlobalOptions]):
+        return self.run(["service", "set-executable", executable], **kwargs)
+
+    def service_set_use_automatically(
+        self, enabled: bool, **kwargs: Unpack[GlobalOptions]
+    ):
+        return self.run(
+            ["service", "set-use-automatically", "true" if enabled else "false"],
+            **kwargs,
+        )
 
     def notification_subscribe(
         self, timeout: int | None = None, **kwargs: Unpack[GlobalOptions]
@@ -2386,6 +2400,20 @@ class Lore:
 
         filecmp.clear_cache()
         return filecmp.cmp(source_path, dest_path, shallow=False)
+
+    def sandboxed_env(self, **extra: str) -> dict[str, str]:
+        """The environment a Lore command must run in to stay inside this test.
+
+        Commands run through this wrapper get it already. A test that spawns the
+        binary itself — to kill it, or to read its output as it streams — has to
+        ask for it, or the command reads the developer's global config and
+        credentials instead of the ones this test set up.
+        """
+        environment = os.environ.copy()
+        environment["LORE_GLOBAL_PATH"] = self.global_dir
+        environment["LORE_AUTH_PATH"] = self.global_dir
+        environment.update(extra)
+        return environment
 
     def open_file(self, path, mode="r", encoding=None):
         return open(self._fix_path(path), mode, encoding=encoding)
