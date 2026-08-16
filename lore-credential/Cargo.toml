@@ -20,7 +20,6 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }
 url = { workspace = true }
-zerocopy = { workspace = true }
 
 [features]
 trace_log = ["lore-base/trace_log"]
