@@ -930,14 +930,24 @@ pub fn handle_repository_delete(globals: LoreGlobalArgs, args: &RepositoryDelete
 
     let args = LoreRepositoryDeleteArgs { repository_url };
 
+    let dry_run = globals.dry_run();
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::Complete(data) if data.status == 0 => {
-                println!(
-                    "{}Repository deleted successfully{}",
-                    CommonStyles::SUCCESS,
-                    anstyle::Reset
-                );
+                if dry_run {
+                    println!(
+                        "{}Repository would be deleted{}",
+                        CommonStyles::SUCCESS,
+                        anstyle::Reset
+                    );
+                } else {
+                    println!(
+                        "{}Repository deleted successfully{}",
+                        CommonStyles::SUCCESS,
+                        anstyle::Reset
+                    );
+                }
             }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
