@@ -6,6 +6,7 @@ use lore_error_set::prelude::*;
 
 use super::RepositoryError;
 use crate::lore::RepositoryId;
+use crate::lore::execution_context;
 use crate::protocol;
 use crate::repository;
 
@@ -41,10 +42,12 @@ pub async fn delete(repository_url: &str, identity: &str) -> Result<(), Reposito
         id = data.id;
     }
 
-    repository_service
-        .delete(id)
-        .await
-        .forward::<RepositoryError>("Failed to delete repository")?;
+    if !execution_context().globals().dry_run() {
+        repository_service
+            .delete(id)
+            .await
+            .forward::<RepositoryError>("Failed to delete repository")?;
+    }
 
     Ok(())
 }
