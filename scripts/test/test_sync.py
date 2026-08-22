@@ -659,3 +659,51 @@ def test_sync_far_behind_with_local_merge_tip_and_remote_merges(new_lore_repo):
     sync_output = repo.sync()
     _assert_clean_fast_forward(sync_output)
     repo.repository_verify()
+
+
+@pytest.mark.smoke
+def test_sync_remote_explicit_revision(new_lore_repo):
+    """
+    Test that syncing to an explicit revision with --remote updates the
+    local branch Latest pointer, preventing 'Local branch is behind remote'
+    status.
+    """
+    repo = new_lore_repo()
+
+    # Create some initial history
+    with repo.open_file("file1.txt", "w+") as f:
+        f.write("v1")
+    repo.stage("file1.txt")
+    repo.commit("Commit 1")
+
+    # Create a side branch
+    repo.branch_create("feature")
+    repo.branch_switch("feature")
+    with repo.open_file("file2.txt", "w+") as f:
+        f.write("v1")
+    repo.stage("file2.txt")
+    repo.commit("Feature commit")
+    repo.push()
+
+    # Switch back to main, merge the feature branch
+    repo.branch_switch("main")
+    repo.branch_merge_start("feature", message="Merge feature into main")
+    repo.push()
+
+    # Get the client to a clean state on an older commit
+    clone = repo.clone()
+    clone.sync("@LATEST~1")
+    # Get the latest revision hash from the remote by running branch_latest
+    import re
+    merge_revision_output = repo.run(["status"])
+    merge_revision = re.search(r'revision \d+ -> ([a-f0-9]+)', merge_revision_output).group(1)
+    # Now simulate the bug: sync explicitly to the merge revision with --remote
+    clone.sync(merge_revision, remote=True)
+
+    # Check that status does NOT complain about being behind remote
+    status_output = clone.status()
+    assert "Local branch is behind remote" not in status_output, "Branch Latest pointer was not updated"
+
+    # Second sync should say Already on branch, without actually syncing anything
+    sync_output = clone.sync()
+    assert "Already on branch" in sync_output, "Sync did not realize we are already at latest"
