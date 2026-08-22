@@ -189,7 +189,7 @@ jobs:
         with:
           key: smoke-${{ matrix.name }}
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
 
       - name: Build lore and loreserver (release)
         run: >
