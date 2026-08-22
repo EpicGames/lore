@@ -598,7 +598,8 @@ pub struct LoreRevisionHistoryArgs {
     pub revision: LoreString,
     /// Restrict to this branch; empty for current
     pub branch: LoreString,
-    /// Stop at revisions created before this date (Unix timestamp; 0 disables)
+    /// Stop at revisions created before this date (milliseconds since the
+    /// Unix epoch; 0 disables)
     pub date: u64,
     /// Maximum number of revisions to return; 0 for unlimited
     pub length: u32,

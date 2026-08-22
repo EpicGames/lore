@@ -1831,7 +1831,8 @@ typedef struct lore_repository_data_event_data_t {
   struct lore_string_t default_branch_name;
   // Name of the user who created the repository.
   struct lore_string_t creator;
-  // Creation time of the repository, in seconds since the Unix epoch.
+  // Creation time of the repository, in milliseconds since the Unix
+  // epoch.
   uint64_t created;
 } lore_repository_data_event_data_t;
 
@@ -4602,7 +4603,8 @@ typedef struct lore_revision_history_args_t {
   struct lore_string_t revision;
   // Restrict to this branch; empty for current
   struct lore_string_t branch;
-  // Stop at revisions created before this date (Unix timestamp; 0 disables)
+  // Stop at revisions created before this date (milliseconds since the
+  // Unix epoch; 0 disables)
   uint64_t date;
   // Maximum number of revisions to return; 0 for unlimited
   uint32_t length;
