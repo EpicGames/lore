@@ -7,7 +7,7 @@ classifiers = ["Private :: Do Not Upload"]
 requires-python = ">=3.13"
 dependencies = [
     "grpcio>=1.81.0",
-    "pytest>=8.4.2",
+    "pytest>=9.1.1",
     "pytest-json-ctrf>=0.3.6",
     "pytest-xdist>=3.8.0",
 ]
