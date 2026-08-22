@@ -14,12 +14,15 @@ mod tests {
     use lore_revision::commit;
     use lore_revision::commit::CommitOptions;
     use lore_revision::file;
+    use lore_revision::instance;
+    use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreString;
     use lore_revision::lore::RepositoryId;
     use lore_revision::lore_debug;
     use lore_revision::node;
     use lore_revision::node::NodeFlags;
+    use lore_revision::relay::EventDispatcher;
     use lore_revision::repository;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::stage;
@@ -27,6 +30,150 @@ mod tests {
     use lore_revision::state;
 
     include!("helper.rs");
+
+    #[tokio::test]
+    async fn stage_dry_run_no_persist() {
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
+                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
+                let repository = repository::create_local(
+                    path.as_path(),
+                    &write_token,
+                    repository_id,
+                    Context::from(uuid::Uuid::now_v7()),
+                    branch::DEFAULT_DEFAULT_NAME.to_string(),
+                    repository::RepositoryConfig::default(),
+                    false,
+                )
+                .await
+                .expect("Failed to initialize repository");
+
+                let file_path = path.as_path().join("test.file");
+                {
+                    let mut file = std::fs::File::options()
+                        .create(true)
+                        .truncate(true)
+                        .read(true)
+                        .write(true)
+                        .open(file_path.as_path())
+                        .expect("Failed to create test file");
+                    file.write_all(&[0, 1, 2, 3, 4])
+                        .expect("Failed to write test file");
+                }
+
+                let _ = file::stage::stage(
+                    repository.clone(),
+                    &write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&path)]),
+                    StageOptions {
+                        case_change: stage::StageCaseChange::Error,
+                        node_flags: NodeFlags::NoFlags,
+                        file_id: None,
+                        no_children: false,
+                        scan: true,
+                    },
+                )
+                .await
+                .expect("Failed to stage initial file");
+
+                let options = CommitOptions {
+                    message: String::new(),
+                    link_messages: std::collections::HashMap::new(),
+                    link: None,
+                    layer_messages: std::collections::HashMap::new(),
+                    layer: None,
+                    stats: false,
+                };
+                let committed_signature =
+                    Box::pin(commit::commit(repository.clone(), &write_token, options))
+                        .await
+                        .expect("Failed to commit revision");
+
+                {
+                    let mut file = std::fs::File::options()
+                        .write(true)
+                        .truncate(true)
+                        .open(file_path.as_path())
+                        .expect("Failed to reopen test file");
+                    file.write_all(&[5, 6, 7, 8, 9])
+                        .expect("Failed to modify test file");
+                }
+
+                let dry_run_execution = std::sync::Arc::new(ExecutionContext::new_client(
+                    LoreGlobalArgs {
+                        dry_run: 1,
+                        ..Default::default()
+                    },
+                    EventDispatcher::no_dispatch(),
+                ));
+
+                LORE_CONTEXT
+                    .scope(
+                        dry_run_execution,
+                        file::stage::stage(
+                            repository.clone(),
+                            &write_token,
+                            LoreArray::from_vec(vec![LoreString::from(&path)]),
+                            StageOptions {
+                                case_change: stage::StageCaseChange::Error,
+                                node_flags: NodeFlags::NoFlags,
+                                file_id: None,
+                                no_children: false,
+                                scan: true,
+                            },
+                        ),
+                    )
+                    .await
+                    .expect("Dry-run stage failed");
+
+                let staged_revision = instance::load_staged_revision(&repository)
+                    .await
+                    .ok()
+                    .flatten();
+                assert!(
+                    staged_revision.is_none() || staged_revision == Some(committed_signature),
+                    "Dry-run stage should not persist a new staged anchor"
+                );
+
+                let signature = file::stage::stage(
+                    repository.clone(),
+                    &write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&path)]),
+                    StageOptions {
+                        case_change: stage::StageCaseChange::Error,
+                        node_flags: NodeFlags::NoFlags,
+                        file_id: None,
+                        no_children: false,
+                        scan: true,
+                    },
+                )
+                .await
+                .expect("Real stage after dry-run failed");
+
+                assert_ne!(
+                    signature, committed_signature,
+                    "Real stage after dry-run should persist staged changes"
+                );
+
+                let staged_revision = instance::load_staged_revision(&repository)
+                    .await
+                    .ok()
+                    .flatten()
+                    .expect("Real stage should persist staged anchor");
+                assert_eq!(staged_revision, signature);
+
+                let _ = std::fs::remove_dir_all(path.as_path());
+            }))
+            .await
+            .expect("Test task failed");
+    }
 
     #[tokio::test]
     async fn stage_non_exist() {

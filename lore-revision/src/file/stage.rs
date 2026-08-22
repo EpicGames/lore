@@ -449,9 +449,11 @@ pub async fn stage(
 
         if signature != current_revision {
             staged_revision = signature;
-            crate::instance::store_staged_anchor(&repository, signature)
-                .await
-                .forward::<StageError>("Failed to serialize staged anchor")?;
+            if !execution_context().globals().dry_run() {
+                crate::instance::store_staged_anchor(&repository, signature)
+                    .await
+                    .forward::<StageError>("Failed to serialize staged anchor")?;
+            }
         }
 
         event::LoreEvent::FileStageRevision(LoreFileStageRevisionEventData {
@@ -491,7 +493,7 @@ pub async fn stage(
             .await
             .forward::<StageError>("Failed to serialize staged revision state")?;
 
-        if signature != layer.current {
+        if signature != layer.current && !execution_context().globals().dry_run() {
             layer::store_layer_staged(
                 repository.clone(),
                 token,
@@ -716,9 +718,11 @@ pub async fn stage_merge(
         .serialize(repository.clone(), token)
         .await
         .forward::<StageError>("Failed to serialize staged revision state")?;
-    crate::instance::store_staged_anchor(&repository, signature)
-        .await
-        .forward::<StageError>("Failed to serialize staged anchor")?;
+    if !execution_context().globals().dry_run() {
+        crate::instance::store_staged_anchor(&repository, signature)
+            .await
+            .forward::<StageError>("Failed to serialize staged anchor")?;
+    }
 
     event::LoreEvent::FileStageRevision(LoreFileStageRevisionEventData {
         repository: repository.id,
@@ -1092,9 +1096,11 @@ pub async fn stage_move(
         .serialize(repository.clone(), token)
         .await
         .forward::<StageError>("Failed to serialize staged revision state")?;
-    crate::instance::store_staged_anchor(&repository, signature)
-        .await
-        .forward::<StageError>("Failed to serialize staged anchor")?;
+    if !execution_context().globals().dry_run() {
+        crate::instance::store_staged_anchor(&repository, signature)
+            .await
+            .forward::<StageError>("Failed to serialize staged anchor")?;
+    }
 
     event::LoreEvent::FileStageRevision(LoreFileStageRevisionEventData {
         repository: repository.id,
