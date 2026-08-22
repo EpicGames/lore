@@ -209,7 +209,6 @@ pub async fn acquire(
         .await
         .forward::<AcquireError>("Unable to acquire lock while offline")?;
 
-    let resources_count = resources.len();
     let resources_values = resources.values().cloned().collect::<Vec<_>>();
     let batch_iterator = resources_values.chunks(LOCK_BATCH_SIZE);
     let num_batches = batch_iterator.len();
@@ -246,25 +245,16 @@ pub async fn acquire(
     }
     task_error?;
 
-    let mut locks = Vec::with_capacity(resources_count);
-
-    let mut num_batch_success = 0;
-    let mut num_batch_failed = 0;
-    for batch_result in batches_results {
-        if let Ok(mut results) = batch_result {
-            locks.append(&mut results);
-            num_batch_success += 1;
-        } else {
-            num_batch_failed += 1;
-        }
-    }
+    let (mut locks, num_batch_success, num_batch_failed, first_batch_error) =
+        fold_batch_results(batches_results);
 
     if num_batch_failed > 0 {
         lore_error!("Failed to lock-acquire {num_batch_failed} batch(es) out of {num_batches}");
     }
 
     if num_batch_success == 0 {
-        return Err(AcquireError::internal("Failed to acquire the lock"));
+        return Err(first_batch_error
+            .unwrap_or_else(|| AcquireError::internal("Failed to acquire the lock")));
     }
 
     if num_batch_success > 0 && num_batch_success < num_batches {
@@ -281,7 +271,8 @@ pub async fn acquire(
             .await
             .forward::<AcquireError>("Failed to acquire the lock")?;
 
-        return Err(AcquireError::internal("Failed to acquire the lock"));
+        return Err(first_batch_error
+            .unwrap_or_else(|| AcquireError::internal("Failed to acquire the lock")));
     }
 
     locks.sort_by(|lock_a, lock_b| {
@@ -323,4 +314,59 @@ pub async fn acquire(
     }
 
     Ok(())
+}
+
+/// Fold per-batch outcomes into acquired locks, success/failure counts, and
+/// the first error encountered. Keeping that error is what lets the server's
+/// denial reason (lock contention, precondition failures) reach the caller
+/// instead of being replaced by a generic failure message.
+fn fold_batch_results(
+    batch_results: Vec<Result<Vec<LockData>, AcquireError>>,
+) -> (Vec<LockData>, usize, usize, Option<AcquireError>) {
+    let mut locks = Vec::new();
+    let mut num_success = 0;
+    let mut num_failed = 0;
+    let mut first_error = None;
+    for result in batch_results {
+        match result {
+            Ok(mut acquired) => {
+                locks.append(&mut acquired);
+                num_success += 1;
+            }
+            Err(err) => {
+                num_failed += 1;
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        }
+    }
+    (locks, num_success, num_failed, first_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fold_batch_results_preserves_first_error() {
+        let denial = AcquireError::internal("lock denied: resource already locked");
+        let (locks, num_success, num_failed, first_error) =
+            fold_batch_results(vec![Err(denial), Err(AcquireError::internal("second"))]);
+        assert!(locks.is_empty());
+        assert_eq!(num_success, 0);
+        assert_eq!(num_failed, 2);
+        let message = first_error.expect("first error is kept").to_string();
+        assert!(message.contains("already locked"), "got: {message}");
+    }
+
+    #[test]
+    fn fold_batch_results_collects_locks() {
+        let (locks, num_success, num_failed, first_error) =
+            fold_batch_results(vec![Ok(vec![LockData::default()]), Ok(vec![])]);
+        assert_eq!(locks.len(), 1);
+        assert_eq!(num_success, 2);
+        assert_eq!(num_failed, 0);
+        assert!(first_error.is_none());
+    }
 }
