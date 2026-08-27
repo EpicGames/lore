@@ -23,6 +23,12 @@ service RepositoryService {
   rpc RepositoryGet        (RepositoryGetRequest)        returns (RepositoryGetResponse);
   // Stream all repositories the caller is authorised to see.
   rpc RepositoryList       (RepositoryListRequest)       returns (stream RepositoryListResponse);
+  // Count the repositories the caller is authorised to see, without
+  // enumerating them. Applies the same optional filters as
+  // `RepositoryList`. Cheaper than `RepositoryList` because no per-repo
+  // metadata is streamed back to the caller; when no filter is set, the
+  // server can answer from the repository id set alone.
+  rpc RepositoryCount      (RepositoryCountRequest)      returns (RepositoryCountResponse);
   // Cheap hash-only read of a repository's current metadata pointer.
   rpc RepositoryMetadataGet(RepositoryMetadataGetRequest) returns (RepositoryMetadataGetResponse);
   // Compare-and-swap update of a repository's metadata pointer. CAS miss is
@@ -116,6 +122,23 @@ message RepositoryListResponse {
   // A repository matching the request's filters and the caller's
   // authorisation.
   lore.model.v1.Repository repository = 1;
+}
+
+// Request to count repositories the caller is authorised to see. Filter
+// semantics mirror `RepositoryListRequest`; a repository is counted iff
+// `RepositoryList` with the same filters would emit it.
+message RepositoryCountRequest {
+  // If set, only repositories whose `creator` field is an exact
+  // byte-for-byte case-sensitive match are counted.
+  optional string creator = 1;
+}
+
+// Response carrying the count of matching repositories. `count` defaults
+// to zero, so an absent or unset value is safe to read as zero.
+message RepositoryCountResponse {
+  // Number of repositories matching the request's filters and the
+  // caller's authorisation.
+  uint64 count = 1;
 }
 
 // Request for a cheap hash-only read of a repository's metadata pointer.
