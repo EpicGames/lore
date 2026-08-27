@@ -124,6 +124,10 @@ message RevisionTreeRequest {
   // emits only direct children of the prefix root; 2 emits direct
   // children plus grandchildren; etc. 0 or unset means unbounded.
   optional uint32 max_depth = 4;
+  // If true, populate `TreeNode.last_commit`. Off by default.
+  // Note: Attribution costs one delta-block read per state plus one
+  // file-metadata-block read per entry.
+  bool include_last_commit = 5;
 }
 
 // Header for a RevisionTree stream. Echoes the resolved revision so

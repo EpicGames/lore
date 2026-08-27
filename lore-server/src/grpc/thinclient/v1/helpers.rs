@@ -318,6 +318,84 @@ pub(super) async fn diff_conflict_from_pair(
     }
 }
 
+/// Load the `TreeCommit` describing `signature` from `repository`.
+///
+/// Deliberately not `load_revision`: that also resolves both parents, two
+/// loads per revision a tree listing has no use for.
+///
+/// Attribution is decoration on a listing, so a revision that fails to load
+/// is warned about and reported as `None` rather than failing the whole walk.
+///
+/// `repository` must be the context the revision belongs to. When the tree
+/// walk crossed a link boundary the linked repository's revisions live in
+/// the linked context, not the walked one - the caller resolves that pairing
+/// via `TreePath::last_revision_repository` before calling in here.
+pub(super) async fn load_tree_commit(
+    repository: &Arc<RepositoryContext>,
+    signature: Hash,
+) -> Option<thin_client_v1::TreeCommit> {
+    let state = State::deserialize(repository.clone(), signature)
+        .await
+        .inspect_err(|err| {
+            warn!(
+                {REPOSITORY_ID} = %repository.id, {REVISION} = %signature, ?err,
+                "Skipping tree attribution: revision state did not load",
+            );
+        })
+        .ok()?;
+    let metadata_hash = state.metadata_hash();
+    let metadata = Metadata::deserialize(repository.clone(), metadata_hash)
+        .await
+        .inspect_err(|err| {
+            warn!(
+                {REPOSITORY_ID} = %repository.id, {REVISION} = %signature,
+                {METADATA} = %metadata_hash, ?err,
+                "Skipping tree attribution: revision metadata did not load",
+            );
+        })
+        .ok()?;
+
+    // A revision whose metadata names no branch still has a usable message
+    // and timestamp, which are what a listing displays. Fall back to a zero
+    // branch rather than dropping the whole record for a missing provenance
+    // detail.
+    let branch_id = metadata.get_branch().unwrap_or_else(|err| {
+        warn!(
+            {REPOSITORY_ID} = %repository.id, {REVISION} = %signature, ?err,
+            "Tree attribution: revision metadata names no branch",
+        );
+        BranchId::default()
+    });
+
+    let mut commit = thin_client_v1::TreeCommit {
+        signature: signature.into(),
+        identifier: Some(model_v1::RevisionIdentifier {
+            branch_id: branch_id.into(),
+            number: state.revision_number(),
+        }),
+        ..Default::default()
+    };
+    metadata.walk(|key, value, _value_type| {
+        let Ok(key) = std::str::from_utf8(key) else {
+            return;
+        };
+        match key {
+            lore_revision::metadata::MESSAGE => {
+                commit.commit_message = String::from_utf8_lossy(value).into_owned();
+            }
+            lore_revision::metadata::TIMESTAMP if value.len() == std::mem::size_of::<u64>() => {
+                commit.timestamp = u64::from_le_bytes(value.try_into().unwrap_or_default());
+            }
+            lore_revision::metadata::COMMITTED_BY => {
+                commit.committed_by = String::from_utf8_lossy(value).into_owned();
+            }
+            _ => {}
+        }
+    });
+
+    Some(commit)
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;

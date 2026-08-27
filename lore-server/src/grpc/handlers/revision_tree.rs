@@ -60,7 +60,8 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            tree(repository.clone(), revision, path, max_depth, can_read)
+            // No attribution: this legacy message has no field to carry it.
+            tree(repository.clone(), revision, path, max_depth, can_read, false)
                 .await
                 .map(|result| {
                     debug!("Got tree");

@@ -17,9 +17,17 @@ from protobuf_wire import (
     field_bool,
     field_bytes,
     field_int,
+    field_message,
     field_string,
     parse_fields,
 )
+
+
+def _encode_bool_field(field_number: int, value: bool) -> bytes:
+    """Encode one `bool` field. Proto3 default is False, which is not
+    serialised - callers should only emit this when the value is True."""
+    tag = field_number << 3 | 0  # wire type 0 = VARINT
+    return bytes([tag, 1 if value else 0])
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +46,7 @@ ACTION_ADD = 1
 ACTION_DELETE = 2
 
 _TREE_REQUEST_SIGNATURE = 2
+_TREE_REQUEST_INCLUDE_LAST_COMMIT = 5
 _DIFF_REQUEST_SIGNATURE_FROM = 2
 _DIFF_REQUEST_SIGNATURE_TO = 4
 
@@ -48,6 +57,17 @@ _DIFF_RESPONSE_PARTITION = 4
 _TREE_NODE_PATH = 1
 _TREE_NODE_NODE_TYPE = 2
 _TREE_NODE_TRACKING = 6
+_TREE_NODE_LAST_COMMIT = 7
+
+_TREE_COMMIT_SIGNATURE = 1
+_TREE_COMMIT_MESSAGE = 2
+_TREE_COMMIT_TIMESTAMP = 3
+_TREE_COMMIT_IDENTIFIER = 4
+_TREE_COMMIT_COMMITTED_BY = 5
+
+# lore.model.v1.RevisionIdentifier
+_REVISION_IDENTIFIER_BRANCH_ID = 1
+_REVISION_IDENTIFIER_NUMBER = 2
 
 _DIFF_CHANGE_PATH = 1
 _DIFF_CHANGE_ACTION = 3
@@ -60,12 +80,28 @@ _DIFF_PARTITION_LINK_PARTITION = 2
 
 
 @dataclass(frozen=True)
+class TreeCommit:
+    """One `lore.thin_client.v1.TreeCommit` attached to a `TreeNode`.
+
+    `branch_id` is the raw bytes of the resolved `RevisionIdentifier.branch_id`
+    - hex-format at the callsite to compare against `Lore.get_id()`."""
+
+    signature: bytes
+    commit_message: str
+    timestamp: int
+    branch_id: bytes
+    number: int
+    committed_by: str
+
+
+@dataclass(frozen=True)
 class TreeNode:
     """One `lore.thin_client.v1.TreeNode` off a `RevisionTree` stream."""
 
     path: str
     node_type: int
     tracking: bool
+    last_commit: TreeCommit | None
 
 
 @dataclass(frozen=True)
@@ -108,12 +144,32 @@ def _payloads(response: bytes, payload_field: int) -> list[dict]:
     ]
 
 
+def _tree_commit(node: dict) -> TreeCommit | None:
+    """`TreeCommit` off a `TreeNode`, or `None` when the server did not
+    populate one - either the walk was not asked to attribute (proto3
+    default: field absent), or the walk could not attribute this entry
+    (root, or an entry the resolver skipped)."""
+    commit = field_message(node, _TREE_NODE_LAST_COMMIT)
+    if commit is None:
+        return None
+    identifier = field_message(commit, _TREE_COMMIT_IDENTIFIER) or {}
+    return TreeCommit(
+        signature=field_bytes(commit, _TREE_COMMIT_SIGNATURE),
+        commit_message=field_string(commit, _TREE_COMMIT_MESSAGE),
+        timestamp=field_int(commit, _TREE_COMMIT_TIMESTAMP),
+        branch_id=field_bytes(identifier, _REVISION_IDENTIFIER_BRANCH_ID),
+        number=field_int(identifier, _REVISION_IDENTIFIER_NUMBER),
+        committed_by=field_string(commit, _TREE_COMMIT_COMMITTED_BY),
+    )
+
+
 def _tree_nodes(response: bytes) -> list[TreeNode]:
     return [
         TreeNode(
             path=field_string(node, _TREE_NODE_PATH),
             node_type=field_int(node, _TREE_NODE_NODE_TYPE),
             tracking=field_bool(node, _TREE_NODE_TRACKING),
+            last_commit=_tree_commit(node),
         )
         for node in _payloads(response, _TREE_RESPONSE_NODE)
     ]
@@ -168,12 +224,22 @@ def revision_tree(
     repository_id: bytes,
     signature: bytes,
     timeout: float = 30.0,
+    include_last_commit: bool = False,
 ) -> list[TreeNode]:
-    """Every `TreeNode` the server streams for `signature`, in stream order."""
+    """Every `TreeNode` the server streams for `signature`, in stream order.
+
+    Setting `include_last_commit` populates `TreeNode.last_commit` on entries
+    the walker can attribute - files, links, and directories that live in the
+    walked repository, plus everything under a link that lives in the linked
+    repository."""
+    request = encode_bytes_field(_TREE_REQUEST_SIGNATURE, signature)
+    # Proto3 default for bool is False, so only serialise when True.
+    if include_last_commit:
+        request += _encode_bool_field(_TREE_REQUEST_INCLUDE_LAST_COMMIT, True)
     nodes = _collect_stream(
         grpc_target,
         _REVISION_TREE_METHOD,
-        encode_bytes_field(_TREE_REQUEST_SIGNATURE, signature),
+        request,
         repository_id,
         _tree_nodes,
         timeout,

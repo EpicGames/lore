@@ -1125,12 +1125,18 @@ pub struct TreeResult {
     pub paths: Vec<TreePath>,
 }
 
+/// Walk the tree at `revision`, optionally attributing each entry with the
+/// revision that last modified it.
+///
+/// `include_last_commit` populates [`TreePath::last_revision`] and
+/// [`TreePath::last_revision_repository`]. Off by default.
 pub async fn tree(
     repository: Arc<RepositoryContext>,
     revision: Hash,
     path: RelativePath,
     max_depth: usize,
     can_read: crate::state::CanReadRepository,
+    include_last_commit: bool,
 ) -> Result<TreeResult, StateError> {
     lore_debug!(
         "Gathering tree in repository {} revision: {} path: {}",
@@ -1139,7 +1145,15 @@ pub async fn tree(
         path.as_str()
     );
     let state = State::deserialize(repository.clone(), revision).await?;
-    let paths = gather_tree_paths(state, repository, path, max_depth, can_read).await?;
+    let paths = gather_tree_paths(
+        state,
+        repository,
+        path,
+        max_depth,
+        can_read,
+        include_last_commit,
+    )
+    .await?;
     Ok(TreeResult { paths })
 }
 

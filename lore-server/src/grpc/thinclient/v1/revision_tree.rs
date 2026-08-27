@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashMap;
+use std::collections::hash_map;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -11,6 +13,7 @@ use lore_proto::lore::thin_client::v1 as thin_client_v1;
 use lore_proto::lore::thin_client::v1::RevisionTreeRequest;
 use lore_proto::lore::thin_client::v1::RevisionTreeResponse;
 use lore_proto::lore::thin_client::v1::revision_tree_response::Payload;
+use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision::tree;
 use lore_revision::util::path::RelativePath;
@@ -26,6 +29,7 @@ use tracing::Instrument;
 use tracing::debug;
 use tracing::warn;
 
+use super::helpers::load_tree_commit;
 use super::helpers::node_flags_to_node_type;
 use super::helpers::resolve_to_identifier;
 use crate::grpc::extract_correlation_id;
@@ -71,6 +75,7 @@ pub async fn handler(
         _ => RelativePath::new(),
     };
     let max_depth = req.max_depth.map_or(usize::MAX, |d| d as usize);
+    let include_last_commit = req.include_last_commit;
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
     let repository = Arc::new(RepositoryContext::new_server_context(
@@ -100,7 +105,17 @@ pub async fn handler(
 
             lore_spawn!(
                 async move {
-                    stream_tree(repository, signature, path, max_depth, can_read, header, tx).await;
+                    stream_tree(
+                        repository,
+                        signature,
+                        path,
+                        max_depth,
+                        can_read,
+                        header,
+                        tx,
+                        include_last_commit,
+                    )
+                    .await;
                 }
                 .in_current_span()
             );
@@ -120,6 +135,7 @@ async fn stream_tree(
     can_read: lore_revision::state::CanReadRepository,
     header: thin_client_v1::RevisionTreeHeader,
     tx: mpsc::Sender<Result<RevisionTreeResponse, Status>>,
+    include_last_commit: bool,
 ) {
     // Emit header first. If the client has already dropped, just bail.
     if tx
@@ -133,7 +149,16 @@ async fn stream_tree(
         return;
     }
 
-    let result = match tree(repository.clone(), signature, path, max_depth, can_read).await {
+    let result = match tree(
+        repository.clone(),
+        signature,
+        path,
+        max_depth,
+        can_read,
+        include_last_commit,
+    )
+    .await
+    {
         Ok(result) => result,
         Err(err) => {
             let status = if err.is_invalid_path() {
@@ -152,19 +177,43 @@ async fn stream_tree(
         }
     };
 
+    // Entries commonly share a last-touching revision, so resolve each
+    // distinct one once rather than per entry. The key is
+    // (repository, signature) rather than just signature because the walker
+    // crosses link boundaries. An entry inside a linked subtree
+    // reports the linked repository, and its revisions live in that
+    // repository's context, not the walked one.
+    //
+    // Empty when attribution was not asked for, since every `last_revision`
+    // is then zero.
+    let mut commits: HashMap<(RepositoryId, Hash), thin_client_v1::TreeCommit> = HashMap::new();
+    for key in result
+        .paths
+        .iter()
+        .map(|tree_path| (tree_path.last_revision_repository, tree_path.last_revision))
+        .filter(|(_, last_revision)| !last_revision.is_zero())
+    {
+        let hash_map::Entry::Vacant(entry) = commits.entry(key) else {
+            continue;
+        };
+        // Reuse the walked context when the revision belongs to the walked
+        // repository; build a linked context only when it does not. Building
+        // one for the common case would pay `to_link_context` every time.
+        let (repository_id, last_revision) = key;
+        let resolved = if repository_id == repository.id {
+            load_tree_commit(&repository, last_revision).await
+        } else {
+            let linked = Arc::new(repository.to_link_context(repository_id).await);
+            load_tree_commit(&linked, last_revision).await
+        };
+        if let Some(commit) = resolved {
+            entry.insert(commit);
+        }
+    }
+
     let mut emitted: u64 = 0;
     for tree_path in result.paths {
-        let node = thin_client_v1::TreeNode {
-            path: tree_path.path.to_string(),
-            node_type: node_flags_to_node_type(tree_path.flags) as i32,
-            address: tree_path.address.map(|address| model_v1::Address {
-                hash: address.hash.into(),
-                context: address.context.into(),
-            }),
-            size: tree_path.size,
-            mode: tree_path.mode,
-            tracking: tree_path.tracking,
-        };
+        let node = tree_node(&tree_path, &commits);
         if tx
             .send(Ok(RevisionTreeResponse {
                 payload: Some(Payload::Node(node)),
@@ -179,6 +228,32 @@ async fn stream_tree(
     }
 
     debug!(emitted, "RevisionTree complete");
+}
+
+/// Project one walked entry onto the wire, attaching its attribution.
+///
+/// `commits` is keyed by (repository, signature), so entries sharing a
+/// last-touching revision share one record. A zero `last_revision`
+/// (attribution not requested, or an entry the walk declined to attribute)
+/// finds nothing and stays `None`.
+fn tree_node(
+    tree_path: &lore_revision::state::TreePath,
+    commits: &HashMap<(RepositoryId, Hash), thin_client_v1::TreeCommit>,
+) -> thin_client_v1::TreeNode {
+    thin_client_v1::TreeNode {
+        path: tree_path.path.to_string(),
+        node_type: node_flags_to_node_type(tree_path.flags) as i32,
+        address: tree_path.address.map(|address| model_v1::Address {
+            hash: address.hash.into(),
+            context: address.context.into(),
+        }),
+        size: tree_path.size,
+        mode: tree_path.mode,
+        tracking: tree_path.tracking,
+        last_commit: commits
+            .get(&(tree_path.last_revision_repository, tree_path.last_revision))
+            .cloned(),
+    }
 }
 
 #[cfg(test)]
@@ -216,11 +291,23 @@ mod test {
             query: Some(query),
             path_prefix,
             max_depth,
+            include_last_commit: false,
         });
         request.metadata_mut().insert_bin(
             REPOSITORY_ID_KEY,
             tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
         );
+        request
+    }
+
+    /// `make_request`, with attribution asked for.
+    fn make_attributed_request(
+        repository: RepositoryId,
+        query: Query,
+        max_depth: Option<u32>,
+    ) -> Request<RevisionTreeRequest> {
+        let mut request = make_request(repository, query, None, max_depth);
+        request.get_mut().include_last_commit = true;
         request
     }
 
@@ -501,6 +588,7 @@ mod test {
                 query: None,
                 path_prefix: None,
                 max_depth: None,
+                include_last_commit: false,
             });
             request.metadata_mut().insert_bin(
                 REPOSITORY_ID_KEY,
@@ -637,8 +725,8 @@ mod test {
 
             let response = handler(
                 make_request(repository, Query::Signature(signature.into()), None, None),
-                immutable_store,
-                mutable_store,
+                immutable_store.clone(),
+                mutable_store.clone(),
             )
             .await
             .expect("handler ok");
@@ -649,6 +737,27 @@ mod test {
                 .map(|r| r.expect("stream item"))
                 .collect();
             assert_eq!(items.len(), 1);
+            assert!(matches!(items[0].payload, Some(Payload::Header(_))));
+
+            // Same revision, this time asking for attribution. A freshly
+            // created repository is empty, so this is the first thing a UI
+            // requesting `include_last_commit` will hit: building the
+            // attribution context reads the delta block, and an empty
+            // revision may not have one.
+            let attributed = handler(
+                make_attributed_request(repository, Query::Signature(signature.into()), None),
+                immutable_store,
+                mutable_store,
+            )
+            .await
+            .expect("attribution must not fail on an empty revision");
+
+            let items: Vec<_> = collect(attributed)
+                .await
+                .into_iter()
+                .map(|r| r.expect("attribution must not error mid-stream"))
+                .collect();
+            assert_eq!(items.len(), 1, "still header-only");
             assert!(matches!(items[0].payload, Some(Payload::Header(_))));
         }))
         .await;
@@ -1543,6 +1652,220 @@ mod test {
             ));
             let err = items[1].as_ref().expect_err("expected error item");
             assert_eq!(err.code(), tonic::Code::NotFound);
+        }))
+        .await;
+    }
+
+    /// `include_last_commit` gates the field: absent unless asked for.
+    /// Does not change which nodes the walk emits.
+    #[tokio::test]
+    async fn last_commit_is_gated_by_the_request_flag() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (_branch, signatures) =
+                push_branch_with_revisions(&repository_context, &[&["top.txt"]]).await;
+            let tip = *signatures.last().expect("one revision");
+
+            let nodes = async |request| {
+                collect(
+                    handler(request, immutable_store.clone(), mutable_store.clone())
+                        .await
+                        .expect("handler ok"),
+                )
+                .await
+                .into_iter()
+                .map(|r| r.expect("stream item"))
+                .filter_map(|item| match item.payload {
+                    Some(Payload::Node(node)) => Some(node),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+            };
+
+            let unattributed = nodes(make_request(
+                repository,
+                Query::Signature(tip.into()),
+                None,
+                None,
+            ))
+            .await;
+            assert!(!unattributed.is_empty(), "the walk must emit nodes");
+            assert!(
+                unattributed.iter().all(|node| node.last_commit.is_none()),
+                "last_commit must be absent when not requested",
+            );
+
+            // Asking for attribution must not break the walk. These fixtures
+            // serialize states directly rather than committing, so no delta
+            // block or file-metadata records exist to attribute against and
+            // every entry stays unattributed. Attribution correctness is
+            // proved in `lore-revision`'s `tree_attributes_with_last_commit`
+            // and `tree_attributes_across_a_link`; what matters here is that
+            // the request flag is honoured and the stream still emits the
+            // same nodes.
+            let attributed = nodes(make_attributed_request(
+                repository,
+                Query::Signature(tip.into()),
+                None,
+            ))
+            .await;
+            assert_eq!(
+                attributed.len(),
+                unattributed.len(),
+                "attribution must not change which nodes are emitted",
+            );
+        }))
+        .await;
+    }
+
+    /// Each entry must receive its **own** attribution, not a neighbour's.
+    /// This is the seam between attribution (proved in `lore-revision`) and
+    /// resolution (proved by `load_tree_commit_reads_the_revision_record`),
+    /// and it needs no store: hand-built entries and a hand-built map are
+    /// enough.
+    #[tokio::test]
+    async fn tree_node_attaches_each_entry_to_its_own_commit() {
+        fn entry(
+            path: &str,
+            last_revision_repository: RepositoryId,
+            last_revision: Hash,
+        ) -> lore_revision::state::TreePath {
+            lore_revision::state::TreePath {
+                path: lore_revision::util::path::RelativePath::new_from_initial_path(path)
+                    .expect("valid path"),
+                address: None,
+                flags: NodeFlags::File,
+                size: 0,
+                mode: 0,
+                tracking: false,
+                last_revision,
+                last_revision_repository,
+            }
+        }
+        fn commit(number: u64, revision: Hash) -> thin_client_v1::TreeCommit {
+            thin_client_v1::TreeCommit {
+                signature: revision.into(),
+                identifier: Some(model_v1::RevisionIdentifier {
+                    branch_id: BranchId::default().into(),
+                    number,
+                }),
+                ..Default::default()
+            }
+        }
+        fn number_of(node: &thin_client_v1::TreeNode) -> u64 {
+            node.last_commit
+                .as_ref()
+                .expect("attributed")
+                .identifier
+                .as_ref()
+                .expect("an attributed commit always carries its identifier")
+                .number
+        }
+
+        let repo = random::<RepositoryId>();
+        let older = Hash::from_u64(0x11);
+        let newer = Hash::from_u64(0x22);
+        let commits =
+            HashMap::from([((repo, older), commit(1, older)), ((repo, newer), commit(2, newer))]);
+
+        let from_older = tree_node(&entry("old.txt", repo, older), &commits);
+        let from_newer = tree_node(&entry("new.txt", repo, newer), &commits);
+        let unattributed = tree_node(
+            &entry("none.txt", RepositoryId::default(), Hash::default()),
+            &commits,
+        );
+
+        assert_eq!(
+            number_of(&from_older),
+            1,
+            "an entry must take the commit for its own revision",
+        );
+        assert_eq!(
+            number_of(&from_newer),
+            2,
+            "a sibling on a different revision must not inherit the first's commit",
+        );
+        assert!(
+            unattributed.last_commit.is_none(),
+            "a zero last_revision must stay unattributed",
+        );
+
+        // An entry naming a revision the resolver skipped stays unattributed
+        // rather than borrowing whatever else is in the map.
+        let missing = tree_node(&entry("gone.txt", repo, Hash::from_u64(0x99)), &commits);
+        assert!(
+            missing.last_commit.is_none(),
+            "an unresolved revision must not fall back to another entry's commit",
+        );
+
+        // The same signature in a different repository is a different key -
+        // linked-subtree entries carry the linked repo id, so their lookup
+        // must not collide with the walked repo's map entries.
+        let other_repo = random::<RepositoryId>();
+        let cross_repo = tree_node(&entry("linked/inner.txt", other_repo, older), &commits);
+        assert!(
+            cross_repo.last_commit.is_none(),
+            "a signature under a different repository must not borrow the walked repo's commit",
+        );
+    }
+
+    /// The signature-to-`TreeCommit` resolution the handler applies to every
+    /// attributed entry.
+    #[tokio::test]
+    async fn load_tree_commit_reads_the_revision_record() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store,
+                mutable_store,
+                repository,
+            ));
+            let (branch, signatures) =
+                push_branch_with_revisions(&repository_context, &[&["a.txt"], &["b.txt"]]).await;
+            let second = signatures[1];
+
+            let commit = load_tree_commit(&repository_context, second)
+                .await
+                .expect("a pushed revision must resolve");
+            assert_eq!(
+                commit.signature,
+                Into::<bytes::Bytes>::into(second),
+                "the record must describe the revision it was asked for",
+            );
+
+            // The identifier is what makes attribution usable as provenance:
+            // the number alone is per-branch and cannot say which branch it
+            // counts on.
+            let identifier = commit
+                .identifier
+                .as_ref()
+                .expect("a resolved commit must carry its identifier");
+            assert_eq!(identifier.number, 2, "second revision on the branch");
+            assert_eq!(
+                identifier.branch_id,
+                Into::<bytes::Bytes>::into(branch),
+                "the identifier must name the branch the revision was committed to",
+            );
+
+            // A signature that was never pushed is reported as unresolvable
+            // rather than failing the walk.
+            assert!(
+                load_tree_commit(&repository_context, Hash::from_u64(0xdead))
+                    .await
+                    .is_none(),
+                "an unknown revision must be skipped, not fatal",
+            );
         }))
         .await;
     }
