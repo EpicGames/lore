@@ -137,6 +137,7 @@ This page is generated from `lore --markdown-help` (CLI `0.8.2-nightly+31`). Eve
 * [`lore link remove`↴](#lore-link-remove)
 * [`lore link update`↴](#lore-link-update)
 * [`lore link list`↴](#lore-link-list)
+* [`lore link info`↴](#lore-link-info)
 * [`lore status`↴](#lore-status)
 * [`lore clone`↴](#lore-clone)
 * [`lore stage`↴](#lore-stage)
@@ -161,6 +162,8 @@ This page is generated from `lore --markdown-help` (CLI `0.8.2-nightly+31`). Eve
 * [`lore service run`↴](#lore-service-run)
 * [`lore service start`↴](#lore-service-start)
 * [`lore service stop`↴](#lore-service-stop)
+* [`lore service set-use-automatically`↴](#lore-service-set-use-automatically)
+* [`lore service set-executable`↴](#lore-service-set-executable)
 * [`lore notification`↴](#lore-notification)
 * [`lore notification subscribe`↴](#lore-notification-subscribe)
 * [`lore completions`↴](#lore-completions)
@@ -214,15 +217,16 @@ This page is generated from `lore --markdown-help` (CLI `0.8.2-nightly+31`). Eve
 * `--local` — Use local data
 * `--identity <IDENTITY>` — Use given identity
 * `--identity-token <token>` — Use given authentication token instead of one from the secure store. Acts as the identity the token was issued to
-* `--access-token <token>` — Use given authorization token instead of exchanging one with the authentication service. On its own it acts as the identity the token was issued to, and operations needing an authentication token fail rather than falling back to the secure store
+* `--access-token <token>` — Use given authorization token instead of exchanging one with the authentication service
 * `--max-connections <MAX_CONNECTIONS>` — Set maximum number of parallel connections
 * `--file-count-limit <count>` — Set maximum number of parallel files opened
 * `--file-size-limit <size>` — Set maximum total size in bytes of parallel files opened
 * `--compress-limit <count>` — Set maximum number of parallel compress operations
 * `--search-limit <SEARCH_LIMIT>` — Set maximum number of revisions to search when matching or finding revisions
 * `--search-nearest` — Set to search for nearest match when matching revisions
-* `--gc` — Set to run automatic garbage collection on local store in background
+* `--no-gc` — Prevent automatic incremental garbage collection for this command; it otherwise runs in the background on writes. `lore repository gc` always runs a full pass regardless
 * `--sync-data` — Force sync data to storage media during flush
+* `--cache` — Cache fragment payloads fetched from remote in the local store
 * `--non-interactive` — Disable interactive prompts (e.g., per-link commit messages)
 
 
@@ -883,11 +887,18 @@ Diff two branches using the common ancestor base revision Will calculate the set
 
 Archive an existing branch
 
-**Usage:** `lore branch archive <branch>`
+**Usage:** `lore branch archive [OPTIONS] <branch>`
 
 ###### **Arguments:**
 
 * `<branch>` — Name of the branch to archive
+
+###### **Options:**
+
+* `--include-layers` — Also archive the branch in every configured layer
+* `--layer <path>` — Also archive the branch in the layer at the given mount path
+* `--include-links` — Also archive the branch in every configured link
+* `--link <path>` — Also archive the branch in the link at the given mount path
 
 
 
@@ -2124,6 +2135,7 @@ Link commands
 * `remove` — Remove the link at the given point in the repository
 * `update` — Update the link to a new pin
 * `list` — List all links in the repository
+* `info` — Show detailed information about the link at the given path
 
 
 
@@ -2183,6 +2195,18 @@ List all links in the repository
 ###### **Options:**
 
 * `--staged` — Only show links with staged changes
+
+
+
+## `lore link info`
+
+Show detailed information about the link at the given path
+
+**Usage:** `lore link info <link_path>`
+
+###### **Arguments:**
+
+* `<link_path>` — Path in the repository of the link to describe
 
 
 
@@ -2598,8 +2622,10 @@ Manage the repository in a service process
 ###### **Subcommands:**
 
 * `run` — Run this process as the service
-* `start` — Start service for a repository
-* `stop` — Stop service for a repository
+* `start` — Start the service process
+* `stop` — Stop the service process
+* `set-use-automatically` — Set whether to automatically use the service process
+* `set-executable` — Set the executable to launch as the service process
 
 
 
@@ -2613,24 +2639,48 @@ Run this process as the service
 
 ## `lore service start`
 
-Start service for a repository
+Start the service process
 
-**Usage:** `lore service start`
+**Usage:** `lore service start [OPTIONS]`
+
+###### **Options:**
+
+* `--executable <path>` — Executable to launch as the service process, run as `<executable> service run`. Defaults to the configured `service_executable`
 
 
 
 ## `lore service stop`
 
-Stop service for a repository
+Stop the service process
 
-**Usage:** `lore service stop [all]`
+**Usage:** `lore service stop`
+
+
+
+## `lore service set-use-automatically`
+
+Set whether to automatically use the service process
+
+**Usage:** `lore service set-use-automatically <enabled>`
 
 ###### **Arguments:**
 
-* `<all>` — Flag to stop servicing all repositories
+* `<enabled>` — Automatically run Lore commands through the service process
 
   Possible values: `true`, `false`
 
+
+
+
+## `lore service set-executable`
+
+Set the executable to launch as the service process
+
+**Usage:** `lore service set-executable <path>`
+
+###### **Arguments:**
+
+* `<path>` — Executable to launch as the service process when none is named, run as `<executable> service run`. Empty clears the setting
 
 
 

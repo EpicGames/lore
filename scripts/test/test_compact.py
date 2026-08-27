@@ -111,7 +111,8 @@ def test_store_compaction(new_lore_repo, lore_executable_path):
                     "--debug",
                     "repository",
                     "gc",
-                ]
+                ],
+                env=repo.sandboxed_env(),
             )
 
             time.sleep(random.uniform(1.0, 5.0))

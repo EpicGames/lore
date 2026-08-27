@@ -276,6 +276,10 @@ pub(crate) fn aggregate_error_code(
 ) -> Option<LoreErrorCode> {
     fn severity(code: LoreErrorCode) -> u8 {
         match code {
+            // Not a per-item outcome: it means the call never reached a store
+            // at all, so no item ran to report one. Ranked highest for the same
+            // reason, should it ever be aggregated.
+            LoreErrorCode::ServiceUnavailable => 5,
             LoreErrorCode::InvalidArguments => 4,
             LoreErrorCode::Internal => 3,
             LoreErrorCode::SlowDown => 2,

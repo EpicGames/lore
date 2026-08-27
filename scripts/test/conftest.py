@@ -5,7 +5,9 @@ import logging
 import os
 import platform
 import subprocess
+import tempfile
 import typing
+import uuid
 
 import sys
 from pathlib import Path
@@ -172,10 +174,13 @@ def _service_unreachable(output):
     return platform.system() == "Windows" and "10022" in output
 
 
-def _wait_for_service_ready(lore_executable_path, service_process, attempts=30):
+def _wait_for_service_ready(
+    lore_executable_path, service_process, global_dir, attempts=30
+):
     """Block until the background service answers a probe."""
     probe_env = os.environ.copy()
     probe_env["LORE_USE_SERVICE"] = "1"
+    probe_env["LORE_GLOBAL_PATH"] = global_dir
     for _ in range(attempts):
         if service_process.poll() is not None:
             pytest.fail(
@@ -213,7 +218,7 @@ class TrackedServices(object):
         command_args = [self.lore_executable_path, "service", "run"]
         logger.info("Executing Lore service command: %s", command_args)
         process = subprocess.Popen(command_args, cwd=directory, env=env)
-        _wait_for_service_ready(self.lore_executable_path, process)
+        _wait_for_service_ready(self.lore_executable_path, process, self.global_dir_name)
         self.service_processes[directory] = process
 
         return process
@@ -557,6 +562,37 @@ def auto_lore_local_server(
 def pytest_configure(config):
     """Register the xdist controller cleanup plugin early so its
     pytest_sessionfinish hook fires on the controller process."""
+    # Give this run a Lore service socket of its own. The socket is otherwise
+    # one per user, named the same for everyone, so the tests would reach — and
+    # stop — whatever service the developer or another run has going, and that
+    # service would answer test commands while holding its own global config,
+    # defeating the LORE_GLOBAL_PATH isolation everywhere else. With a private
+    # socket the suite can launch real services and exercise automatic use.
+    # Every helper builds its environment from os.environ, so setting it here
+    # reaches both the clients and the services they start. Under xdist the
+    # controller sets it first and the workers inherit it, so one socket covers
+    # the whole run rather than one per worker. Service tests still share an
+    # xdist_group, because a service is shared state either way: without the
+    # group, concurrent tests would start and stop one under each other.
+    os.environ.setdefault(
+        "LORE_SERVICE_SOCKET", f"lore_service_test_{uuid.uuid4().hex[:16]}"
+    )
+
+    # Give the whole run a global config and credential store of its own, so
+    # that nothing can reach the developer's. Tests that isolate per test still
+    # set their own `LORE_GLOBAL_PATH` on each command and are unaffected; this
+    # is the floor for everything that doesn't — a raw `Popen` of the binary, or
+    # the C API called in this process, which has no command to set it on.
+    # Without it those read the real global config, so a developer with
+    # `use_service_automatically` enabled sees commands routed to a service and
+    # tests failing in ways that depend on their machine.
+    session_sandbox = os.path.join(
+        tempfile.gettempdir(), f"lore_test_global_{uuid.uuid4().hex[:16]}"
+    )
+    os.makedirs(session_sandbox, exist_ok=True)
+    os.environ.setdefault("LORE_GLOBAL_PATH", session_sandbox)
+    os.environ.setdefault("LORE_AUTH_PATH", session_sandbox)
+
     config.pluginmanager.register(_XdistControllerCleanup(), "lore_xdist_cleanup")
     config.addinivalue_line(
         "markers", "regression: mark tests that don't run on every CI"

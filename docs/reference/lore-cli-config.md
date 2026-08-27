@@ -4,10 +4,11 @@
 
 ```text
 <repo>/.lore/config.toml   # per-repository client settings (created on init/clone)
+~/.config/lore/config.toml # user-level global settings (OS user config dir; Linux shown)
 ~/.config/lore/cli.toml    # user-level CLI settings (OS user config dir; Linux shown)
 ```
 
-This page documents the **Lore CLI** client configuration: the per-repository `config.toml` and the user-level `cli.toml` that the `lore` binary reads. These are distinct from the Lore Server daemon's configuration — for server stores, endpoints, topology, and plugin backends, see the [Lore Server configuration reference](lore-server-config.md). The fields below are written by `lore repository create` and `lore clone`, or you edit them by hand; you don't need to read the source to look one up.
+This page documents the **Lore CLI** client configuration: the per-repository `config.toml`, the user-level global `config.toml`, and the user-level `cli.toml` that the `lore` binary reads. These are distinct from the Lore Server daemon's configuration — for server stores, endpoints, topology, and plugin backends, see the [Lore Server configuration reference](lore-server-config.md). The fields below are written by `lore repository create` and `lore clone`, or you edit them by hand; you don't need to read the source to look one up.
 
 ## Per-repository `config.toml`
 
@@ -85,6 +86,48 @@ The table key and both fields accept legacy serde aliases for backward compatibi
 A config that uses the legacy names still loads. New configs use the current names.
 
 Lore normally writes this table for you when you clone with `--use-shared-store`. For how shared stores work and how to set one up, see [Step 6 of the Quickstart](../tutorials/quickstart.md#step-6-set-up-a-shared-store-and-clone-a-second-working-tree); for the `lore clone` and `lore shared-store` flags, see the [Lore CLI command reference](lore-cli-commands.md).
+
+## User-level global `config.toml`
+
+### Location
+
+The global `config.toml` holds settings that apply to every repository, rather than to one. It shares the OS user config directory with `cli.toml`, so on a typical Linux setup it's `~/.config/lore/config.toml`; see the table under `cli.toml` below for the other platforms. Setting `LORE_GLOBAL_PATH` moves the whole directory, which is how the test suite isolates it.
+
+The file is optional. When it's absent, every setting below takes its default.
+
+### Fields
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `use_shared_store_automatically` | Boolean | `false` | Whether `lore repository create` and `lore clone` configure a shared store without being asked. Read only when a repository is created or cloned; the result is written into that repository's own config. |
+| `use_service_automatically` | Boolean | `false` | Whether Lore runs every command in the background service process. Takes effect only alongside `service_executable`. See below. |
+| `service_executable` | String | unset | Executable Lore launches as the service process when a call to start one names none. See below. |
+| `default_shared_stores` | table | empty | Per-remote default shared store paths, keyed by remote URL. |
+
+### Running commands through the service
+
+Running commands through the service takes two settings, not one:
+
+```bash
+lore service set-use-automatically true
+lore service set-executable /path/to/lore
+```
+
+With both set, Lore sends each command to a background service process over a local socket instead of executing it in the CLI process, and starts that service automatically if it isn't already running. With only `use_service_automatically`, commands run in the CLI process as before: routing has to be able to start a service, and Lore never infers which executable that would be, so the setting on its own has nothing to act on.
+
+`lore service start` and `lore service stop` control the process explicitly. Starting when a service is already running, and stopping when none is, are both no-ops rather than errors.
+
+The `LORE_USE_SERVICE` environment variable overrides the setting for a single invocation: an empty value, `0`, `false`, `f`, `no`, `n`, or `off` (in any case) forces the service off, and any other value forces it on.
+
+A service is only ever started from an executable someone named. Two things name one, in falling order of precedence: the call itself, via `lore service start --executable <path>` or the `executable` field of `lore_service_start_args_t`; then `service_executable` from this config. The running executable is never a candidate — with Lore embedded as a library it's the host application, and even for the CLI, inferring it would make the answer depend on what the binary happens to be called.
+
+`service_executable` takes an absolute path, a path relative to the working directory, or a bare name looked up on `PATH`. An empty value clears the setting. Whatever is named is launched as `<executable> service run` and isn't checked for being a Lore binary; one that isn't simply fails to start listening, and the call that asked for it reports that.
+
+For an embedded caller this is the setting that makes the service reachable at all: the routed calls carry no executable of their own, so without it there is nothing to start, and routing stays off however `use_service_automatically` is set. Point it at the Lore binary shipped alongside the library, either by writing the config or by calling `lore_service_set_executable` once at start-up.
+
+There is one service per user: the socket is named the same for every Lore process you run, so they all reach the same one. Setting `LORE_SERVICE_SOCKET` to a different name gives the processes that share that value a service of their own, which is how the test suite starts real services without meeting the one you are running. The value is a file name, not a path — a value containing a path separator is refused and the default is used.
+
+A call that was routed to the service but never ran, because none could be reached and none could be started, reports the error code `50` — `LORE_ERROR_CODE_SERVICE_UNAVAILABLE`, distinct from the generic internal error so that it can be told apart from a failure of the command itself. It's the one service failure a caller can act on: start a service and retry. Starting one that's already running succeeds without starting a second, so an embedded caller can call `lore_service_start` with its bundled executable at start-up, or in response to this code, without checking first.
 
 ## User-level `cli.toml`
 
