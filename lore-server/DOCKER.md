@@ -6,16 +6,21 @@ telemetry integration, or replication is configured.
 ## Prerequisites
 
 - Docker with BuildKit support
-- On Apple Silicon (M-series Macs), builds must target `linux/amd64` due to Graviton-specific
-  compiler flags in `.cargo/config.toml` for `aarch64-unknown-linux-gnu`
+
+Both `linux/amd64` and `linux/arm64` build. The Dockerfile overrides the Graviton-specific
+`target-cpu` that `.cargo/config.toml` sets for `aarch64-unknown-linux-gnu`, so the arm64
+image runs on any armv8-a host rather than Graviton3 and newer only.
 
 ## Building
 
 From the repository root:
 
 ```sh
-docker build --platform linux/amd64 -f lore-server/Dockerfile -t loreserver .
+docker build -f lore-server/Dockerfile -t loreserver .
 ```
+
+Pass `--platform linux/amd64` or `--platform linux/arm64` to cross-build; expect it to be slow,
+since a release Rust build under emulation is far slower than a native one.
 
 The build compiles the `loreserver` binary and generates self-signed TLS certificates for QUIC
 using `scripts/server/make-certs.sh`.
