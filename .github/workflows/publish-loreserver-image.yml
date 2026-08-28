@@ -83,6 +83,15 @@ jobs:
           cache-from: type=gha,scope=loreserver-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=loreserver-${{ matrix.arch }}
 
+      # A clean build proves only that the image compiles. Run the binary on
+      # the native runner as well: a codegen flag aimed at the wrong CPU
+      # produces an image that builds happily and then dies with SIGILL the
+      # first time anyone starts it.
+      - name: Smoke test the pushed image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: docker run --rm "${IMAGE}@${DIGEST}" --version
+
       # The merge job addresses each architecture by digest. Hand the digests
       # over as empty files named after themselves.
       - name: Export digest
