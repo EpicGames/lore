@@ -54,19 +54,6 @@ jobs:
         with:
           persist-credentials: false
 
-      # A release build of the workspace does not fit next to the runner
-      # image's preinstalled toolchains. Reclaim the ones this build never
-      # touches before BuildKit starts writing layers.
-      - name: Free disk space
-        run: |
-          sudo rm -rf \
-            /usr/share/dotnet \
-            /usr/local/lib/android \
-            /opt/ghc \
-            /usr/local/share/boost \
-            "${AGENT_TOOLSDIRECTORY:?}"
-          df -h /
-
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
