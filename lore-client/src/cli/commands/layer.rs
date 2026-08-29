@@ -251,7 +251,7 @@ pub fn handle_layer_list(globals: LoreGlobalArgs) -> u8 {
 
     let status = runtime().block_on(layer::layer_list(globals, layer_args, callback)) as u8;
 
-    if !have_layers.load(std::sync::atomic::Ordering::Relaxed) {
+    if status == 0 && !have_layers.load(std::sync::atomic::Ordering::Relaxed) {
         println!("No layers");
     }
 

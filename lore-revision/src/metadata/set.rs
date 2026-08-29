@@ -11,13 +11,21 @@ use zerocopy::IntoBytes;
 
 use crate::errors::AddressNotFound;
 use crate::errors::Disconnected;
+use crate::errors::FileNotFound;
 use crate::errors::InvalidArguments;
 use crate::errors::InvalidPath;
 use crate::errors::LinkNotFound;
+use crate::errors::Maintenance;
+use crate::errors::NoRemote;
 use crate::errors::NodeNotFound;
+use crate::errors::NotAuthenticated;
+use crate::errors::NotAuthorized;
+use crate::errors::NotConnected;
 use crate::errors::NotFound;
+use crate::errors::NotSupported;
 use crate::errors::Oversized;
 use crate::errors::PayloadNotFound;
+use crate::errors::SlowDown;
 use crate::errors::WriteRequired;
 use crate::event;
 use crate::immutable;
@@ -46,6 +54,14 @@ pub enum SetError {
     AddressNotFound,
     PayloadNotFound,
     Disconnected,
+    SlowDown,
+    Maintenance,
+    NotConnected,
+    NoRemote,
+    NotAuthenticated,
+    NotAuthorized,
+    NotSupported,
+    FileNotFound,
 }
 
 impl event::EventError for SetError {
@@ -83,7 +99,7 @@ pub async fn set_revision(
 
     let (current_revision, _current_branch) = crate::instance::load_current_anchor(&repository)
         .await
-        .internal("Failed to deserialize current revision anchor")?;
+        .forward::<SetError>("Failed to deserialize current revision anchor")?;
     let staged_revision = crate::instance::load_staged_revision(&repository)
         .await
         .ok()
@@ -92,7 +108,7 @@ pub async fn set_revision(
 
     let state = state::State::deserialize(repository.clone(), staged_revision)
         .await
-        .internal("Failed to deserialize state")?;
+        .forward_any::<SetError>("Failed to deserialize state")?;
 
     let metadata_hash = if current_revision == staged_revision {
         Hash::default()
@@ -104,7 +120,7 @@ pub async fn set_revision(
     } else {
         Metadata::deserialize(repository.clone(), metadata_hash)
             .await
-            .internal("Failed to deserialize metadata")?
+            .forward::<SetError>("Failed to deserialize metadata")?
     };
 
     for i in 0..keys.len() {
@@ -125,7 +141,7 @@ pub async fn set_revision(
                         let repository_path = repository.require_path()?;
                         let relative_path =
                             RelativePath::new_from_user_path(repository_path, &user_path)
-                                .internal("Invalid path")?;
+                                .forward::<SetError>("Invalid path")?;
                         relative_path.to_absolute_path(repository_path)
                     }
                 };
@@ -147,17 +163,17 @@ pub async fn set_revision(
                     immutable::write_options_from_repository(repository.clone()),
                 )
                 .await
-                .internal("Failed to write payload")?
+                .forward::<SetError>("Failed to write payload")?
             };
 
             // When storing binary data, put its address in the metadata
             metadata
                 .set(key, address.as_bytes(), MetadataType::Address)
-                .internal("Failed to set metadata")?;
+                .forward::<SetError>("Failed to set metadata")?;
         } else {
             metadata
                 .set(key, value, format)
-                .internal("Failed to set metadata")?;
+                .forward::<SetError>("Failed to set metadata")?;
         }
     }
 
@@ -165,7 +181,7 @@ pub async fn set_revision(
         metadata
             .serialize(repository.clone())
             .await
-            .internal("Failed to write metadata")?,
+            .forward::<SetError>("Failed to write metadata")?,
     );
 
     // Serialize the new current state
@@ -180,11 +196,11 @@ pub async fn set_revision(
         let signature = state
             .serialize(repository.clone(), token)
             .await
-            .internal("Failed to serialize revision state")?;
+            .forward_any::<SetError>("Failed to serialize revision state")?;
 
         crate::instance::store_staged_anchor(&repository, signature)
             .await
-            .internal("Failed to serialize staged revision anchor")?;
+            .forward::<SetError>("Failed to serialize staged revision anchor")?;
     }
 
     event::metadata::send(&metadata);
@@ -203,12 +219,12 @@ async fn set_file_task(
     events: bool,
 ) -> Result<(), SetError> {
     let relative_path = RelativePath::new_from_user_path(repository.require_path()?, path)
-        .internal("Invalid path")?;
+        .forward::<SetError>("Invalid path")?;
 
     let node_link = state
         .find_node_link(repository.clone(), relative_path.as_str())
         .await
-        .internal("Invalid node")?;
+        .forward_any::<SetError>("Invalid node")?;
     if !node_link.is_valid() {
         return Err(SetError::internal("Invalid node"));
     }
@@ -220,7 +236,7 @@ async fn set_file_task(
     let metadata_block = state
         .block_file_metadata(repository.clone(), metadata_block_index)
         .await
-        .internal("Failed to deserialize metadata block")?;
+        .forward_any::<SetError>("Failed to deserialize metadata block")?;
 
     let mut metadata;
     loop {
@@ -236,7 +252,7 @@ async fn set_file_task(
         } else {
             Metadata::deserialize(repository.clone(), metadata_hash)
                 .await
-                .internal("Failed to deserialize metadata")?
+                .forward::<SetError>("Failed to deserialize metadata")?
         };
 
         for index in 0..keys.len() {
@@ -257,7 +273,7 @@ async fn set_file_task(
                             let repository_path = repository.require_path()?;
                             let relative_path =
                                 RelativePath::new_from_user_path(repository_path, &user_path)
-                                    .internal("Invalid path")?;
+                                    .forward::<SetError>("Invalid path")?;
                             relative_path.to_absolute_path(repository_path)
                         }
                     };
@@ -279,24 +295,24 @@ async fn set_file_task(
                         immutable::write_options_from_repository(repository.clone()),
                     )
                     .await
-                    .internal("Failed to write payload")?
+                    .forward::<SetError>("Failed to write payload")?
                 };
 
                 // When storing binary data, put its address in the metadata
                 metadata
                     .set(key, address.as_bytes(), MetadataType::Address)
-                    .internal("Failed to set metadata")?;
+                    .forward::<SetError>("Failed to set metadata")?;
             } else {
                 metadata
                     .set(key, value, format)
-                    .internal("Failed to set metadata")?;
+                    .forward::<SetError>("Failed to set metadata")?;
             }
         }
 
         let metadata_hash_updated = metadata
             .serialize(repository.clone())
             .await
-            .internal("Failed to write metadata")?;
+            .forward::<SetError>("Failed to write metadata")?;
 
         let dirtied = {
             let mut block_writer = metadata_block.write();
@@ -368,7 +384,7 @@ pub async fn set_file(
 
     let (current_revision, _current_branch) = crate::instance::load_current_anchor(&repository)
         .await
-        .internal("Failed to deserialize current revision anchor")?;
+        .forward::<SetError>("Failed to deserialize current revision anchor")?;
     let staged_revision = crate::instance::load_staged_revision(&repository)
         .await
         .ok()
@@ -377,7 +393,7 @@ pub async fn set_file(
 
     let state = state::State::deserialize(repository.clone(), staged_revision)
         .await
-        .internal("Failed to deserialize state")?;
+        .forward_any::<SetError>("Failed to deserialize state")?;
 
     let events = paths.len() == 1; // Only if a single path is given.
 
@@ -450,11 +466,11 @@ pub async fn set_file(
         let signature = state
             .serialize(repository.clone(), token)
             .await
-            .internal("Failed to serialize revision state")?;
+            .forward_any::<SetError>("Failed to serialize revision state")?;
 
         crate::instance::store_staged_anchor(&repository, signature)
             .await
-            .internal("Failed to serialize staged revision anchor")?;
+            .forward::<SetError>("Failed to serialize staged revision anchor")?;
     }
 
     Ok(())

@@ -14,6 +14,7 @@ mod tests {
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
+    use lore_revision::repository::LoreSharedStoreMode;
     use rand::Rng;
     use rand::distr::Alphanumeric;
 
@@ -36,7 +37,7 @@ mod tests {
             id: LoreString::default(),
             description: LoreString::default(),
             default_branch_name: LoreString::default(),
-            use_shared_store: 0,
+            use_shared_store: LoreSharedStoreMode::Disabled,
             shared_store_path: LoreString::default(),
         };
         let result = lore::repository::create(globals.clone(), args, None).await;

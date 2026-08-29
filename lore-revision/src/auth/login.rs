@@ -336,6 +336,8 @@ pub async fn interactive(
         auth_url.as_str(),
         authn.user_id.as_str(),
         vulnerable_all_tokens(),
+        authn.token.as_str(),
+        "",
     )
     .await
     else {

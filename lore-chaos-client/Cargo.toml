@@ -20,6 +20,8 @@ lore = { workspace = true }
 [[bin]]
 name = "lore_chaos_client"
 path = "src/main.rs"
+# The binary holds no unit tests; the library it drives does.
+test = false
 
 [lib]
 name = "lore_chaos_client"

@@ -45,7 +45,7 @@ pub struct QuinnServer {
 }
 
 impl QuinnServer {
-    pub fn start(settings: QuinnConfig) -> anyhow::Result<Self> {
+    pub fn start(mut settings: QuinnConfig) -> anyhow::Result<Self> {
         let span = info_span!(
             "quinn_server",
             quinn_server_name = settings.server_metrics_name
@@ -116,20 +116,28 @@ impl QuinnServer {
                 .ack_frequency_config(Some(ack_freq_config));
         }
 
-        let socket = socket2::Socket::new(
-            Domain::for_address(settings.address),
-            Type::DGRAM,
-            Some(Protocol::UDP),
-        )?;
+        // A caller that needs this port on TCP as well binds both itself and hands the UDP half
+        // over, because there is no way to reserve a number across two binds. Its socket carries
+        // its own options, so the reuse flags below are deliberately not applied to it.
+        let socket: std::net::UdpSocket = if let Some(socket) = settings.socket.take() {
+            socket
+        } else {
+            let socket = socket2::Socket::new(
+                Domain::for_address(settings.address),
+                Type::DGRAM,
+                Some(Protocol::UDP),
+            )?;
 
-        // Reuse must be configured before bind.
-        socket.reuse_address()?;
+            // Reuse must be configured before bind.
+            socket.reuse_address()?;
 
-        // set_reuse_port is not implemented on Windows
-        #[cfg(target_family = "unix")]
-        socket.set_reuse_port(true)?;
+            // set_reuse_port is not implemented on Windows
+            #[cfg(target_family = "unix")]
+            socket.set_reuse_port(true)?;
 
-        socket.bind(&socket2::SockAddr::from(settings.address))?;
+            socket.bind(&socket2::SockAddr::from(settings.address))?;
+            socket.into()
+        };
 
         // `NetRuntime` places every task quinn spawns on net, including the connection driver
         // created when an `Incoming` is awaited. The guard covers what it cannot: the socket is
@@ -140,7 +148,7 @@ impl QuinnServer {
             quinn::Endpoint::new(
                 endpoint_config,
                 Some(server_config),
-                socket.into(),
+                socket,
                 Arc::new(NetRuntime),
             )?
         };

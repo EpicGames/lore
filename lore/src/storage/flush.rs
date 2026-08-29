@@ -76,13 +76,13 @@ async fn flush_local(
                 .clone()
                 .flush(sync_data)
                 .await
-                .internal("immutable store flush")?;
+                .forward_any::<FlushError>("immutable store flush")?;
             store
                 .mutable
                 .clone()
                 .flush(sync_data)
                 .await
-                .internal("mutable store flush")?;
+                .forward_any::<FlushError>("mutable store flush")?;
             Ok::<(), FlushError>(())
         },
     )

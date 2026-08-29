@@ -111,7 +111,6 @@ async fn node_path_impl(
         },
         async move |internal, args: LoreRevisionTreeNodePathArgs| {
             let id = args.id;
-            let state = internal.state();
             let node_id = args.node_id;
 
             if !node_id.is_valid_or_root_node_id() {
@@ -119,21 +118,9 @@ async fn node_path_impl(
                 return Err(invalid("node id is invalid"));
             }
 
-            // A discarded slot keeps its name (and parent link) for history
-            // weaving, so the path would reconstruct; the node itself is
-            // gone (e.g. deleted through this handle).
-            if let Ok(node) = state
-                .node(internal.repository_context.clone(), node_id)
-                .await
-                && node.is_discarded()
-            {
-                emit_node_path_error(id, LoreErrorCode::InvalidArguments);
-                return Err(invalid("node id resolves to a deleted node"));
-            }
+            let access = internal.access_shared().await;
+            let state = access.state();
 
-            // An unresolvable id is a bad argument; `State::node_path` does not
-            // distinguish an out-of-range id from a read failure, so both collapse to
-            // `InvalidArguments` (as in `list_children`).
             let Ok(path) = state
                 .node_path(internal.repository_context.clone(), node_id)
                 .await
@@ -247,7 +234,7 @@ mod tests {
         let entry = rt_handle::REGISTRY
             .get(&handle.handle_id)
             .expect("handle registered");
-        (entry.state(), entry.repository_context.clone())
+        (entry.state_for_tests(), entry.repository_context.clone())
     }
 
     /// Add a node under `parent` and return its id. `is_file` chooses a file vs
@@ -424,7 +411,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "an invalid node id must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "an invalid node id must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let data = node_path_event(&events)
             .expect("a failure must still emit the node path terminal carrying the id");
@@ -434,7 +425,7 @@ mod tests {
             LoreErrorCode::InvalidArguments,
             "got {events:?}"
         );
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
 
         release(handle, store_handle_id);
     }
@@ -456,7 +447,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "a node id past any allocated block must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "a node id past any allocated block must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let data = node_path_event(&events)
             .expect("a failure must still emit the node path terminal carrying the id");
@@ -466,7 +461,7 @@ mod tests {
             LoreErrorCode::InvalidArguments,
             "an unknown node id must report InvalidArguments, got {events:?}"
         );
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
 
         release(handle, store_handle_id);
     }
@@ -490,7 +485,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "an unallocated node id must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "an unallocated node id must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let data = node_path_event(&events)
             .expect("a failure must still emit the node path terminal carrying the id");
@@ -500,7 +499,7 @@ mod tests {
             LoreErrorCode::InvalidArguments,
             "a non-root node resolving to an empty path must report InvalidArguments, got {events:?}"
         );
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
 
         release(handle, store_handle_id);
     }
@@ -520,7 +519,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "an unknown handle must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "an unknown handle must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let data = node_path_event(&events)
             .expect("a handle miss must still emit the node path terminal carrying the id");
@@ -530,6 +533,6 @@ mod tests {
             LoreErrorCode::InvalidArguments,
             "got {events:?}"
         );
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
     }
 }

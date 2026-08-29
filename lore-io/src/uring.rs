@@ -562,6 +562,10 @@ impl UringDriver {
         PsyncDriver.metadata(path).await
     }
 
+    pub(crate) async fn holds_name_exactly(&self, path: PathBuf) -> Option<bool> {
+        PsyncDriver.holds_name_exactly(path).await
+    }
+
     pub(crate) async fn file_metadata(
         &self,
         file: Arc<File>,

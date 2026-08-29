@@ -9,7 +9,7 @@ use std::str::FromStr;
 use http::Uri;
 use lore_base::lore_spawn_net;
 use lore_base::types::RepositoryId;
-use lore_error_set::WrapInternal;
+use lore_error_set::prelude::*;
 use lore_revision::errors::UnhandledError;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
@@ -154,7 +154,8 @@ pub trait ForwardedRequests: Send + Sync {
 
 async fn make_channel(settings: &GrpcInternalClientSettings) -> Result<Channel, UnhandledError> {
     let tls_config = if let Some(certs) = &settings.certs {
-        let tls = load_client_tls(certs.clone()).internal("loading client tls with certs")?;
+        let tls = load_client_tls(certs.clone())
+            .forward::<UnhandledError>("loading client tls with certs")?;
         Some(tls)
     } else {
         None

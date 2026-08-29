@@ -36,6 +36,15 @@ pub use lore_error_set as error_set;
 const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn shutdown() {
+    // Before the storage handles: a tree writes through the stores its parent owns, so
+    // draining trees first leaves the storage flush below a quiesced store.
+    if !lore_base::runtime::shutdown_block_on(revision_tree::close_all_handles(), SHUTDOWN_WAIT) {
+        lore_base::lore_warn!(
+            "Timed out closing revision tree handles during shutdown; in-flight edits may be \
+             incomplete"
+        );
+    }
+
     // Close every outstanding storage handle before connections drop and the runtime tears
     // down. The close sequence (mark invalid, drain in-flight, spawn flush) must run inside
     // an async context to await the per-handle drains, and this function is synchronous

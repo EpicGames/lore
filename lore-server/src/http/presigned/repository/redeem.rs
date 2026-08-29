@@ -371,24 +371,16 @@ mod tests {
     use crate::http::presign_token::CURRENT_TOKEN_VERSION;
     use crate::http::presign_token::PresignTokenPayload;
     use crate::http::presign_token::sign;
+    use crate::http::security_headers::ContentTypePolicy;
     use crate::http::server::LoreHttpServerSettings;
     use crate::http::server::PresignConfig;
     use crate::http::server::ServerHealth;
     use crate::http::server::ServerState;
     use crate::http::server::create_router;
+    use crate::http::test_utils::content_type_policy;
+    use crate::http::test_utils::presign_config;
+    use crate::http::test_utils::presign_config_with_policy;
     use crate::store::test_store_create;
-
-    fn test_presign_config() -> PresignConfig {
-        let key_bytes = [0u8; 32];
-        PresignConfig {
-            hmac_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes),
-            key_id: "test_key_id_1234".to_string(),
-            min_ttl_seconds: 1,
-            default_ttl_seconds: 3600,
-            max_ttl_seconds: 86400,
-            content_type_allowlist: crate::http::security_headers::ContentTypeAllowlist::default(),
-        }
-    }
 
     fn valid_token(repository_id: &str, address: &str, config: &PresignConfig) -> String {
         token_with_content_type(repository_id, address, config, None)
@@ -436,8 +428,16 @@ mod tests {
         TestServer::new(create_router(state, test_health, &settings)).unwrap()
     }
 
-    /// Stores random content and redeems it with a token carrying `content_type`.
     async fn redeem_with_content_type(content_type: Option<&str>) -> axum_test::TestResponse {
+        redeem_with_policy(content_type, ContentTypePolicy::default()).await
+    }
+
+    /// Stores random content, then redeems it with a token carrying `content_type`
+    /// against a server whose allowlist comes from `policy`.
+    async fn redeem_with_policy(
+        content_type: Option<&str>,
+        policy: ContentTypePolicy,
+    ) -> axum_test::TestResponse {
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
         let content_type = content_type.map(String::from);
@@ -451,7 +451,7 @@ mod tests {
                     .await
                     .expect("Failed to put data in immutable store");
 
-                let config = test_presign_config();
+                let config = presign_config_with_policy(policy);
                 let repo_hex = format!("{repository}");
                 let address_str = format!("{address}");
                 let token = token_with_content_type(
@@ -479,7 +479,7 @@ mod tests {
                 let repository = random::<RepositoryId>();
                 let address = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff-ffffffffffffffffffffffffffffffff";
 
-                let config = test_presign_config();
+                let config = presign_config();
                 let repo_hex = format!("{repository}");
                 let token = valid_token(&repo_hex, address, &config);
 
@@ -504,7 +504,7 @@ mod tests {
                 let repository = random::<RepositoryId>();
                 let address = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff-ffffffffffffffffffffffffffffffff";
 
-                let config = test_presign_config();
+                let config = presign_config();
                 let repo_hex = format!("{repository}");
 
                 let payload = PresignTokenPayload {
@@ -553,7 +553,7 @@ mod tests {
                     .await
                     .expect("Failed to put data in immutable store");
 
-                let config = test_presign_config();
+                let config = presign_config();
                 let repo_hex = format!("{repository}");
                 let address_str = format!("{address}");
                 let token = valid_token(&repo_hex, &address_str, &config);
@@ -612,7 +612,7 @@ mod tests {
                     .await
                     .expect("Failed to put data in immutable store");
 
-                let config = test_presign_config();
+                let config = presign_config();
                 let repo_hex = repository.to_string();
                 let address_str = address.to_string();
                 let token = valid_token(&repo_hex, &address_str, &config);
@@ -659,7 +659,7 @@ mod tests {
                     .put(repository, address, fragment_data, Some(payload), false)
                     .await
                     .expect("Failed to put data in immutable store");
-                let config = test_presign_config();
+                let config = presign_config();
                 let repo_hex = repository.to_string();
                 let address_str = address.to_string();
                 let token = valid_token(&repo_hex, &address_str, &config);
@@ -694,7 +694,7 @@ mod tests {
             .scope(execution, async move {
                 let repository = random::<RepositoryId>();
                 let address = Address::default().to_string();
-                let config = test_presign_config();
+                let config = presign_config();
                 let repo_hex = repository.to_string();
                 let expires_at = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -747,7 +747,7 @@ mod tests {
                 let repository = random::<RepositoryId>();
                 let address = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff-ffffffffffffffffffffffffffffffff";
 
-                let config = test_presign_config();
+                let config = presign_config();
                 let repo_hex = format!("{repository}");
 
                 let server = build_test_server(immutable_store, mutable_store, config);
@@ -826,6 +826,45 @@ mod tests {
         // A legacy token whose allowed media type carries a control-char
         // parameter must not 500 — redeem falls back to octet-stream.
         let response = redeem_with_content_type(Some("image/png; x=\u{7}")).await;
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/octet-stream"
+        );
+    }
+
+    /// A type added through `presigned_url_extra_content_types` is served verbatim,
+    /// and the protections still apply to it.
+    #[tokio::test]
+    async fn redeem_serves_configured_extra_content_type_verbatim() {
+        let response = redeem_with_policy(
+            Some("application/zip"),
+            content_type_policy(&["application/zip"], &[]),
+        )
+        .await;
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "application/zip"
+        );
+        assert_eq!(
+            response.headers().get("x-content-type-options").unwrap(),
+            "nosniff"
+        );
+        assert_eq!(
+            response.headers().get("content-security-policy").unwrap(),
+            "default-src 'none'; sandbox"
+        );
+    }
+
+    /// A built-in type removed through `presigned_url_denied_content_types` is
+    /// coerced, even though an already-issued token carries it.
+    #[tokio::test]
+    async fn redeem_coerces_configured_denied_content_type() {
+        let response =
+            redeem_with_policy(Some("image/png"), content_type_policy(&[], &["image/png"])).await;
+
         assert_eq!(response.status_code(), StatusCode::OK);
         assert_eq!(
             response.headers().get(CONTENT_TYPE).unwrap(),

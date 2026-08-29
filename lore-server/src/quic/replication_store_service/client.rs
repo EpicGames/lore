@@ -41,6 +41,7 @@ use tokio::sync::SemaphorePermit;
 use tracing::trace;
 use tracing::warn;
 
+use crate::protocol::replication_store::copy::ImmutableCopy;
 use crate::protocol::replication_store::get;
 use crate::protocol::replication_store::get::Get;
 use crate::protocol::replication_store::get_metadata;
@@ -151,6 +152,9 @@ pub trait StoreClient: Send + Sync + Sized + 'static {
         &self,
         request: Query,
     ) -> Result<QueryResponse, ReplicationStoreClientError>;
+
+    /// Request an Immutable `Copy` on the server
+    async fn copy(&self, request: ImmutableCopy) -> Result<(), ReplicationStoreClientError>;
 }
 
 #[derive(Clone)]
@@ -353,6 +357,12 @@ impl StoreClient for ReplicationStoreClient {
         request: Query,
     ) -> Result<QueryResponse, ReplicationStoreClientError> {
         self.send_query(request, Command::ImmutableLocalQuery).await
+    }
+
+    async fn copy(&self, request: ImmutableCopy) -> Result<(), ReplicationStoreClientError> {
+        let quic_chunks = request.to_quic_chunks();
+        send_normal_with_reconnect(self, Command::ImmutableCopy, 0, || quic_chunks.clone()).await?;
+        Ok(())
     }
 }
 

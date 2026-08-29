@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
+pub use lore_revision::event::LoreLinkStagedState;
 use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::link::LinkError;
 pub use lore_revision::link::LinkFlags;
@@ -218,6 +219,66 @@ async fn list_local(
     repository_call_read(globals, callback, args, list, move |repository, _args| {
         lore_revision::link::list::list(repository)
     })
+    .await
+}
+
+/// Arguments for reading detailed information about a single link.
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
+#[handler(info_local)]
+pub struct LoreLinkInfoArgs {
+    /// Path within this repository of the link to describe
+    pub link_path: LoreString,
+}
+
+/// Reports detailed information about the link mounted at the given path.
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
+///
+/// ## Link Events
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::LinkInfo`](crate::interface::LoreEvent::LinkInfo) | Emitted once for the described link |
+pub async fn info(
+    globals: LoreGlobalArgs,
+    args: LoreLinkInfoArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    dispatch_call(globals, args, callback, info_local).await
+}
+
+async fn info_local(
+    globals: LoreGlobalArgs,
+    args: LoreLinkInfoArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    repository_call_read(
+        globals,
+        callback,
+        args,
+        info,
+        move |repository, args| async move {
+            let link_path = RelativePath::new_from_user_path(
+                repository.require_path()?,
+                args.link_path.as_str(),
+            )
+            .forward::<LinkError>("resolving link path")?;
+
+            lore_revision::link::info::info(repository, link_path).await
+        },
+    )
     .await
 }
 

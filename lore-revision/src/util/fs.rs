@@ -13,12 +13,18 @@ use std::os::windows::fs::MetadataExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 
+use lore_base::lore_spawn;
 use rand::distr::Alphanumeric;
 use rand::distr::SampleString;
+use tokio::task::JoinSet;
 
+use super::path::DepthPath;
 use super::path::RelativePath;
 use super::path::RelativePathBuf;
+use super::path::path_depth;
+use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::hash::hash_string;
 use crate::lore_debug;
 use crate::lore_trace;
@@ -175,25 +181,35 @@ pub async fn filesystem_names_all_exist(parent: &Path, names: &[&str]) -> bool {
 // TODO(mjansson): We could pass around a hashmap cache of directory to file list mappings
 // while executing an operation, to reduce the number of iterations on the file system to
 // find files and their existing names - used by filesystem_name, filesystem_path and list_files
+/// Whether the directory `path` holds a child named exactly `name`.
+///
+/// The question nearly every caller actually has, and the filesystem answers it
+/// directly: one lookup, no directory read, and no string to hold the answer.
+/// [`filesystem_names`] is for the case this rules out, where the name is on
+/// disk in some other case and the caller needs to be told which.
+///
+/// `Some(false)` does not mean the name is absent - it means not in this case.
+/// `None` is the platform declining to say, as macOS does for every name and
+/// Windows does past `MAX_PATH`; only reading the directory answers those, which
+/// is what [`filesystem_names`] is for.
+pub async fn filesystem_name_matches(path: impl AsRef<Path>, name: &str) -> Option<bool> {
+    lore_io::IoDriver::global()
+        .holds_name_exactly(path.as_ref().join(name))
+        .await
+}
+
+/// Every case variation of `name` the directory `path` holds, the exact one
+/// alone if it is there, and `NotFound` if no variation is.
+///
+/// Reads the directory and compares every child, which is what answering for
+/// variations other than the one asked about takes. A caller that only needs to
+/// know whether the case it has is the one on disk should ask
+/// [`filesystem_name_matches`] instead.
 pub async fn filesystem_names(
     path: impl AsRef<Path>,
     name: &str,
 ) -> tokio::io::Result<Vec<String>> {
     let path = path.as_ref();
-
-    // TODO(mjansson): This should be a test for file system case sensitivity, in the sense that the file system
-    //                 support multiple concurrent case variations of the same file name
-    #[cfg(target_os = "linux")]
-    {
-        let initial_path = path.join(name);
-        if lore_io::IoDriver::global()
-            .metadata(initial_path.as_path())
-            .await
-            .is_ok()
-        {
-            return Ok(vec![name.to_string()]);
-        }
-    }
 
     let mut matches = vec![];
     let match_name = name.to_lowercase();
@@ -241,10 +257,221 @@ pub async fn filesystem_names(
     ))
 }
 
+/// The case each directory prefix is held in on disk, resolved once for the
+/// paths that share them.
+///
+/// A set of targets under one tree is mostly the same directories over and over:
+/// 200,000 paths of nine components each are 1.8 million lookups against 29,000
+/// distinct directories. Resolving each of those once and handing the answers to
+/// [`filesystem_path`] leaves each path with only its own leaf to resolve.
+///
+/// Keys are relative to the base path they were resolved against, and only that
+/// one - a map built for the repository root says nothing about a path under a
+/// layer or a link mount. A prefix whose case is ambiguous or that is not
+/// there is left out, so paths under it resolve as they would have without this.
+#[derive(Default)]
+pub struct ResolvedPrefixes {
+    prefixes: std::collections::HashMap<String, String>,
+}
+
+impl ResolvedPrefixes {
+    pub fn is_empty(&self) -> bool {
+        self.prefixes.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.prefixes.len()
+    }
+
+    /// The longest resolved prefix covering `path`, as the number of components
+    /// it accounts for and the case variation to use for them.
+    ///
+    /// Starts from `path` itself so a prefix asked about directly answers for
+    /// itself, then walks up. The parent hits on the first or second try for any
+    /// path in a set that shares its directories, which is the case this is for.
+    pub fn longest_prefix_of(&self, path: &str) -> Option<(usize, &str)> {
+        let mut end = path.len();
+        loop {
+            let candidate = &path[..end];
+            if let Some(resolved) = self.prefixes.get(candidate) {
+                return Some((path_depth(candidate), resolved.as_str()));
+            }
+            end = candidate.rfind('/')?;
+        }
+    }
+
+    pub(crate) fn insert(&mut self, path: String, resolved: String) {
+        self.prefixes.insert(path, resolved);
+    }
+}
+
+/// Resolve the on-disk case of each of `paths`, each against the case already
+/// established for its parent.
+///
+/// `paths` must be shallowest first, so a parent is always resolved before the
+/// children that are resolved against it - which the caller has anyway, since
+/// that is the order shared ancestors have to be created in.
+///
+/// A run of paths at the same depth resolves as one batch. Nothing in such a run
+/// is an ancestor of anything else in it, so none of them is waiting on another,
+/// and each is one or two syscalls: doing them one at a time is one round trip to
+/// the syscall pool per path.
+pub(crate) async fn resolve_prefixes(
+    base_path: impl AsRef<Path>,
+    paths: &[DepthPath],
+) -> ResolvedPrefixes {
+    /// The parent a run of siblings shares, resolved once for the run.
+    struct ParentRun<'a> {
+        parent: &'a str,
+        variation: Arc<str>,
+        directory: Arc<Path>,
+    }
+
+    fn parent_of(path: &str) -> &str {
+        path.rfind('/').map_or("", |separator| &path[..separator])
+    }
+
+    fn resolve_parent<'a>(
+        parent: &'a str,
+        base_path: &Path,
+        resolved: &ResolvedPrefixes,
+    ) -> ParentRun<'a> {
+        // A parent left out of the map resolves to itself: either it is the root,
+        // or it could not be resolved and this will not resolve either.
+        let variation: Arc<str> = resolved
+            .longest_prefix_of(parent)
+            .map_or(parent, |(_, it)| it)
+            .into();
+        let mut directory = base_path.to_path_buf();
+        if !variation.is_empty() {
+            directory.push(variation.as_ref());
+        }
+        ParentRun {
+            parent,
+            variation,
+            directory: directory.into(),
+        }
+    }
+
+    fn collect(
+        joined: Result<Option<(String, String)>, tokio::task::JoinError>,
+        resolved: &mut ResolvedPrefixes,
+    ) {
+        if let Ok(Some((path, variation))) = joined {
+            resolved.insert(path, variation);
+        }
+    }
+
+    let base_path = base_path.as_ref();
+    let mut resolved = ResolvedPrefixes::default();
+    let mut level_start = 0;
+    while level_start < paths.len() {
+        let depth = paths[level_start].depth();
+        let mut level_end = level_start;
+        while level_end < paths.len() && paths[level_end].depth() == depth {
+            level_end += 1;
+        }
+
+        // Every parent of a level sits above it, so nothing the level resolves
+        // changes one and a run of siblings answers from the first of them.
+        let mut shared = resolve_parent(parent_of(paths[level_start].path()), base_path, &resolved);
+
+        let mut tasks: JoinSet<Option<(String, String)>> = JoinSet::new();
+        for path in &paths[level_start..level_end] {
+            let parent = parent_of(path.path());
+            if shared.parent != parent {
+                shared = resolve_parent(parent, base_path, &resolved);
+            }
+
+            let variation = shared.variation.clone();
+            let directory = shared.directory.clone();
+            let path = path.path().to_string();
+            lore_spawn!(tasks, async move {
+                let name = path
+                    .rfind('/')
+                    .map_or(path.as_str(), |separator| &path[separator + 1..]);
+                if filesystem_name_matches(&directory, name).await == Some(true) {
+                    let resolved = join_relative(&variation, name);
+                    return Some((path, resolved));
+                }
+                // One variation is an answer; several are the ambiguity
+                // `filesystem_path` forks on, and are left for it to find as it
+                // always did. A platform that would not say arrives here too,
+                // and the read settles it.
+                if let Ok(names) = filesystem_names(&directory, name).await
+                    && let [single] = names.as_slice()
+                {
+                    let resolved = join_relative(&variation, single);
+                    return Some((path, resolved));
+                }
+                None
+            });
+
+            while let Some(joined) = tasks.try_join_next() {
+                collect(joined, &mut resolved);
+            }
+            while tasks.len() >= MAX_CONCURRENT_TREE_TASKS
+                && let Some(joined) = tasks.join_next().await
+            {
+                collect(joined, &mut resolved);
+            }
+        }
+        while let Some(joined) = tasks.join_next().await {
+            collect(joined, &mut resolved);
+        }
+        level_start = level_end;
+    }
+    resolved
+}
+
+fn join_relative(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+/// `find_path` in the case the file system holds it, relative to `base_path`.
+///
+/// The components are read off the file system and joined here, so the result is
+/// clean by construction and a caller can walk it without validating or cleaning
+/// it again.
+///
+/// A path the file system does not hold is an error rather than a case.
 pub async fn filesystem_path(
     base_path: impl AsRef<Path>,
     find_path: &RelativePath,
-) -> tokio::io::Result<String> {
+    prefixes: Option<&ResolvedPrefixes>,
+) -> tokio::io::Result<RelativePath> {
+    filesystem_path_and_metadata(base_path, find_path, prefixes)
+        .await
+        .map(|(path, _)| path)
+}
+
+/// The metadata of `path`, stat'ed unless [`filesystem_path_and_metadata`]
+/// already read it while resolving the path. A path the file system does not
+/// hold has none, which is what the callers act on.
+pub async fn metadata_or_stat(
+    resolved: Option<Metadata>,
+    path: impl Into<PathBuf>,
+) -> Option<Metadata> {
+    match resolved {
+        Some(metadata) => Some(metadata),
+        None => lore_io::IoDriver::global().metadata(path).await.ok(),
+    }
+}
+
+/// [`filesystem_path`], and the metadata of the resolved path where establishing
+/// it read that metadata, so a caller needing both reads it once.
+///
+/// `None` where the path was resolved a component at a time, which establishes
+/// each name without reading the metadata of the whole.
+pub async fn filesystem_path_and_metadata(
+    base_path: impl AsRef<Path>,
+    find_path: &RelativePath,
+    prefixes: Option<&ResolvedPrefixes>,
+) -> tokio::io::Result<(RelativePath, Option<std::fs::Metadata>)> {
     let base_path = base_path.as_ref();
 
     // TODO(mjansson): This should be a test for file system case sensitivity, in the sense that the file system
@@ -252,20 +479,35 @@ pub async fn filesystem_path(
     #[cfg(target_os = "linux")]
     {
         let initial_path = base_path.join(find_path.as_str());
-        if lore_io::IoDriver::global()
-            .metadata(initial_path.as_path())
-            .await
-            .is_ok()
-        {
-            return Ok(find_path.as_str().to_string());
+        if let Ok(metadata) = lore_io::IoDriver::global().metadata(initial_path).await {
+            return Ok((find_path.clone(), Some(metadata)));
         }
     }
 
     let mut full_path = base_path.to_path_buf();
     let mut remain_path = find_path.clone();
-    let mut found_path = RelativePathBuf::new();
+    let mut found_path = RelativePathBuf::with_capacity(find_path.len());
+
+    // Whatever an earlier path already established is not established again.
+    if let Some((components, resolved)) =
+        prefixes.and_then(|prefixes| prefixes.longest_prefix_of(find_path.as_str()))
+    {
+        full_path.push(resolved);
+        found_path.push(resolved);
+        remain_path.pop_root_repeat(components);
+    }
+
     while !remain_path.is_empty() {
         let name = remain_path.pop_root();
+        // Nearly every component is already in the case the filesystem holds it,
+        // and that costs one lookup to establish. Only where it is not, or where
+        // the platform will not say, does the directory get read, and a name
+        // allocated for what it says.
+        if filesystem_name_matches(full_path.as_path(), name).await == Some(true) {
+            full_path.push(name);
+            found_path.push(name);
+            continue;
+        }
         let fs_names = filesystem_names(full_path.as_path(), name).await?;
         if fs_names.len() > 1 {
             if remain_path.is_empty() {
@@ -333,16 +575,18 @@ pub async fn filesystem_path(
         find_path.as_str(),
         base_path.display()
     );
-    Ok(found_path.as_str().to_string())
+    Ok((found_path.freeze(), None))
 }
 
 pub fn filesystem_path_fork(
     base_path: impl AsRef<Path>,
     find_path: &RelativePath,
-) -> Pin<Box<dyn Future<Output = tokio::io::Result<String>> + Send>> {
+) -> Pin<Box<dyn Future<Output = tokio::io::Result<RelativePath>> + Send>> {
     let base_path = base_path.as_ref().to_path_buf();
     let find_path = find_path.clone();
-    Box::pin(async move { filesystem_path(base_path, &find_path).await })
+    // The fork resolves a path under one of several case variations of a
+    // directory, which is not a prefix any map here was built against.
+    Box::pin(async move { filesystem_path(base_path, &find_path, None).await })
 }
 
 /// Represents a single filesystem item.
@@ -886,6 +1130,378 @@ mod tests {
 
         assert!(filesystem_names_all_exist(dir.path(), &["Assets"]).await);
         assert!(!filesystem_names_all_exist(dir.path(), &["assets"]).await);
+    }
+
+    fn depth_paths(paths: &[&str]) -> Vec<DepthPath> {
+        paths
+            .iter()
+            .map(|path| DepthPath::new((*path).to_string()))
+            .collect()
+    }
+
+    /// Whether the filesystem under the temporary directory holds one case variation of a name
+    /// and answers lookups in any other. Windows and macOS do by default and Linux does not, but a
+    /// mount can be either on any of them, so the tests below ask rather than assume — and the
+    /// two behaviours are different enough that a test written for one is not a test of the
+    /// other.
+    fn case_insensitive(dir: &Path) -> bool {
+        let probe = dir.join("CaseProbe");
+        std::fs::write(&probe, b"").expect("write probe");
+        let insensitive = std::fs::metadata(dir.join("caseprobe")).is_ok();
+        std::fs::remove_file(&probe).expect("remove probe");
+        insensitive
+    }
+
+    /// What the lookup answers where the platform has one, and `None` where it
+    /// has not — macOS can say nothing about a case variation short of the
+    /// directory read this exists to avoid, so every expectation collapses to that
+    /// there.
+    fn verdict(held: bool) -> Option<bool> {
+        cfg!(any(target_os = "linux", target_family = "windows")).then_some(held)
+    }
+
+    /// The distinction the whole thing rests on: this answers for the case
+    /// variation asked about, where `Path::exists` answers for the file whatever
+    /// it is called. A case-insensitive filesystem finds the file under either name,
+    /// and must still say no to the one it does not hold.
+    #[tokio::test]
+    async fn name_matches_only_the_case_variation_on_disk() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
+
+        assert_eq!(
+            filesystem_name_matches(dir.path(), "Test.file").await,
+            verdict(true)
+        );
+        assert_eq!(
+            filesystem_name_matches(dir.path(), "test.FILE").await,
+            verdict(false),
+            "a case variation the filesystem does not hold is not a match, whether or not it would find the file"
+        );
+        assert_eq!(
+            filesystem_name_matches(dir.path(), "other.file").await,
+            verdict(false)
+        );
+        assert_eq!(
+            filesystem_name_matches(dir.path(), "Test.file.").await,
+            verdict(false),
+            "a trailing dot names a file that is not there"
+        );
+        assert_eq!(
+            filesystem_name_matches(&dir.path().join("absent"), "Test.file").await,
+            verdict(false),
+            "a missing directory holds nothing"
+        );
+    }
+
+    /// A directory is what most components resolve to, and the lookup has to
+    /// answer for one as readily as for a file.
+    #[tokio::test]
+    async fn name_matches_a_directory() {
+        let dir = temp_dir();
+        std::fs::create_dir(dir.path().join("Assets")).expect("create dir");
+
+        assert_eq!(
+            filesystem_name_matches(dir.path(), "Assets").await,
+            verdict(true)
+        );
+    }
+
+    /// The path already in the case the filesystem holds it in - the case
+    /// [`filesystem_path`] is built around - comes back unchanged.
+    #[tokio::test]
+    async fn path_resolves_a_path_already_in_the_case_on_disk() {
+        let dir = temp_dir();
+        let nested = dir.path().join("Assets").join("Meshes");
+        std::fs::create_dir_all(&nested).expect("create dirs");
+        std::fs::write(nested.join("Rock.mesh"), b"").expect("write file");
+
+        let asked: RelativePath =
+            std::str::FromStr::from_str("Assets/Meshes/Rock.mesh").expect("relative path");
+        let (resolved, metadata) = filesystem_path_and_metadata(dir.path(), &asked, None)
+            .await
+            .expect("the path must resolve");
+        assert_eq!(resolved.as_str(), "Assets/Meshes/Rock.mesh");
+        assert_eq!(
+            metadata.is_some(),
+            cfg!(target_os = "linux"),
+            "the metadata comes back from the platforms that settle the path by reading it whole"
+        );
+    }
+
+    #[tokio::test]
+    async fn names_answers_with_the_case_variation_it_was_given() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
+
+        assert_eq!(
+            filesystem_names(dir.path(), "Test.file")
+                .await
+                .expect("a name the filesystem holds must resolve"),
+            vec!["Test.file".to_string()]
+        );
+    }
+
+    /// The reason the helper exists: a caller holding a name in one case needs the one the
+    /// filesystem kept. The directory is read and the names compared here rather than looked up,
+    /// so the case variation on disk is reported whether or not the filesystem would itself
+    /// have found the file under the one asked about.
+    #[tokio::test]
+    async fn names_answers_with_the_stored_case_variation() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
+
+        assert_eq!(
+            filesystem_names(dir.path(), "test.FILE")
+                .await
+                .expect("a case variation must resolve"),
+            vec!["Test.file".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn names_reports_a_name_that_is_not_there_in_any_case() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
+
+        assert!(
+            filesystem_names(dir.path(), "other.file").await.is_err(),
+            "a name no case variation of which is there must not resolve"
+        );
+    }
+
+    /// Win32 trims trailing dots and spaces from a path before it looks it up, so asking about a
+    /// name with one can be answered about the neighbouring name. That is a different file, and
+    /// must not be reported as a case variation of the name asked about.
+    #[tokio::test]
+    async fn names_does_not_answer_with_a_neighbouring_name() {
+        let dir = temp_dir();
+        std::fs::write(dir.path().join("Test.file"), b"").expect("write file");
+
+        assert!(
+            filesystem_names(dir.path(), "Test.file.").await.is_err(),
+            "a trailing dot names a file that is not there"
+        );
+    }
+
+    /// Where variations can coexist, every one of them comes back — resolving that ambiguity is
+    /// the caller's to do — while an exact match answers for itself alone. Only a case-sensitive
+    /// filesystem can hold the two files this needs.
+    #[tokio::test]
+    async fn names_reports_every_case_variation_that_coexists() {
+        let dir = temp_dir();
+        if case_insensitive(dir.path()) {
+            return;
+        }
+        std::fs::write(dir.path().join("Test.file"), b"").expect("write Test.file");
+        std::fs::write(dir.path().join("test.file"), b"").expect("write test.file");
+
+        let mut found = filesystem_names(dir.path(), "TEST.FILE")
+            .await
+            .expect("the variations must resolve");
+        found.sort();
+        assert_eq!(
+            found,
+            vec!["Test.file".to_string(), "test.file".to_string()],
+            "an ambiguous name must report every case variation, not pick one"
+        );
+
+        assert_eq!(
+            filesystem_names(dir.path(), "test.file")
+                .await
+                .expect("an exact name must resolve"),
+            vec!["test.file".to_string()],
+            "a case variation the filesystem holds answers for itself, ambiguity or not"
+        );
+    }
+
+    /// A path is resolved a component at a time, so an ancestor in the wrong case has to be
+    /// corrected as well as the leaf.
+    #[tokio::test]
+    async fn path_resolves_every_component_to_its_stored_case_variation() {
+        let dir = temp_dir();
+        if !case_insensitive(dir.path()) {
+            return;
+        }
+        let nested = dir.path().join("Assets").join("Meshes");
+        std::fs::create_dir_all(&nested).expect("create dirs");
+        std::fs::write(nested.join("Rock.mesh"), b"").expect("write file");
+
+        let asked = std::str::FromStr::from_str("assets/MESHES/rock.MESH")
+            .expect("relative path is infallible");
+        let resolved = filesystem_path(dir.path(), &asked, None)
+            .await
+            .expect("the path must resolve");
+        assert_eq!(resolved.as_str(), "Assets/Meshes/Rock.mesh");
+        assert_eq!(
+            resolved.as_lowercase_str(),
+            "assets/meshes/rock.mesh",
+            "the lowercase form answers for the case that was resolved"
+        );
+    }
+
+    /// Shared directories are resolved once, and every path under them then uses
+    /// what was established rather than looking again — including when the
+    /// case the caller has differs from the one on disk, which is the part
+    /// that would go wrong if the answer were not carried over.
+    ///
+    /// Spellings are matched over a directory listing rather than by asking the
+    /// filesystem to look the name up, so this holds on a case-sensitive one as
+    /// much as on a case-insensitive one and is not conditioned on which it is.
+    #[tokio::test]
+    async fn resolved_prefixes_answer_for_the_paths_under_them() {
+        let dir = temp_dir();
+        let nested = dir.path().join("Assets").join("Meshes");
+        std::fs::create_dir_all(&nested).expect("create dirs");
+        std::fs::write(nested.join("Rock.mesh"), b"").expect("write file");
+
+        // Shallowest first, as the caller has them.
+        let shared = depth_paths(&["assets", "assets/meshes"]);
+        let prefixes = resolve_prefixes(dir.path(), &shared).await;
+
+        assert_eq!(prefixes.len(), 2);
+        assert_eq!(prefixes.longest_prefix_of("assets"), Some((1, "Assets")));
+        assert_eq!(
+            prefixes.longest_prefix_of("assets/meshes"),
+            Some((2, "Assets/Meshes"))
+        );
+        assert_eq!(
+            prefixes.longest_prefix_of("assets/meshes/rock.MESH"),
+            Some((2, "Assets/Meshes")),
+            "a path is covered by the longest prefix above it, not by itself"
+        );
+        assert_eq!(prefixes.longest_prefix_of("elsewhere/file"), None);
+
+        let asked: RelativePath =
+            std::str::FromStr::from_str("assets/meshes/rock.MESH").expect("relative path");
+        let (resolved, metadata) =
+            filesystem_path_and_metadata(dir.path(), &asked, Some(&prefixes))
+                .await
+                .expect("the path must resolve");
+        assert_eq!(resolved.as_str(), "Assets/Meshes/Rock.mesh");
+        assert_eq!(
+            resolved.as_lowercase_str(),
+            "assets/meshes/rock.mesh",
+            "the prefix the map answered with carries a lowercase form of its own"
+        );
+        assert!(
+            metadata.is_none(),
+            "a path settled a component at a time is never read whole"
+        );
+    }
+
+    /// A prefix that is not there, or that several case variations answer for, is left
+    /// out — so a path under it resolves as it would have with no map at all,
+    /// rather than being resolved against a directory that was guessed.
+    #[tokio::test]
+    async fn resolved_prefixes_leave_out_what_they_cannot_settle() {
+        let dir = temp_dir();
+        std::fs::create_dir(dir.path().join("Assets")).expect("create dir");
+
+        let shared = depth_paths(&["absent", "absent/deeper"]);
+        let prefixes = resolve_prefixes(dir.path(), &shared).await;
+        assert!(prefixes.is_empty(), "nothing there resolves");
+
+        // The path still resolves through the walk, which reports it as missing
+        // in the same way it would without a map.
+        let asked: RelativePath =
+            std::str::FromStr::from_str("absent/file").expect("relative path");
+        assert!(
+            filesystem_path(dir.path(), &asked, Some(&prefixes))
+                .await
+                .is_err()
+        );
+
+        if case_insensitive(dir.path()) {
+            return;
+        }
+        std::fs::create_dir(dir.path().join("assets")).expect("create second variation");
+        let shared = depth_paths(&["ASSETS"]);
+        assert!(
+            resolve_prefixes(dir.path(), &shared).await.is_empty(),
+            "two case variations answer for it, so the caller has to fork and decide"
+        );
+    }
+
+    /// The map is an answer about the filesystem as it was when it was built. A
+    /// caller that renames while it stages - which `StageCaseChange::Keep` does,
+    /// including to the directories these prefixes name - must not be given one,
+    /// and this is what that would look like: the path still resolves, to the
+    /// case variation that is no longer there.
+    #[tokio::test]
+    async fn a_resolved_prefix_does_not_survive_the_directory_being_renamed() {
+        let dir = temp_dir();
+        std::fs::create_dir(dir.path().join("Assets")).expect("create dir");
+        std::fs::write(dir.path().join("Assets").join("rock.mesh"), b"").expect("write file");
+
+        let prefixes = resolve_prefixes(dir.path(), &depth_paths(&["Assets"])).await;
+        assert_eq!(prefixes.longest_prefix_of("Assets"), Some((1, "Assets")));
+
+        std::fs::rename(dir.path().join("Assets"), dir.path().join("ASSETS")).expect("rename");
+
+        let asked: RelativePath =
+            std::str::FromStr::from_str("Assets/rock.mesh").expect("relative path");
+        let afresh = filesystem_path(dir.path(), &asked, None).await.ok();
+        assert_eq!(
+            afresh.as_ref().map(RelativePath::as_str),
+            Some("ASSETS/rock.mesh"),
+            "resolving afresh finds the directory under the name it now has"
+        );
+        let mapped = filesystem_path(dir.path(), &asked, Some(&prefixes))
+            .await
+            .ok();
+        assert_ne!(
+            mapped.as_ref().map(RelativePath::as_str),
+            Some("ASSETS/rock.mesh"),
+            "the map still answers with the name the directory had"
+        );
+    }
+
+    /// What the map is allowed to change is how long resolving takes, never what
+    /// it resolves to. Every shape that reaches it has to come back the same
+    /// either way, because everything downstream - the tree node the path is
+    /// compared against, and what a case change means for it - reads the result
+    /// and nothing else.
+    #[tokio::test]
+    async fn a_resolved_prefix_answers_exactly_as_the_walk_would() {
+        let dir = temp_dir();
+        let nested = dir.path().join("Assets").join("Meshes");
+        std::fs::create_dir_all(&nested).expect("create dirs");
+        std::fs::write(nested.join("Rock.mesh"), b"").expect("write file");
+        std::fs::create_dir(dir.path().join("Assets").join("Empty")).expect("create dir");
+
+        let shared = depth_paths(&[
+            "Assets",
+            "assets",
+            "Assets/Meshes",
+            "assets/meshes",
+            "absent",
+        ]);
+        let prefixes = resolve_prefixes(dir.path(), &shared).await;
+
+        for asked in [
+            // Given exactly as the filesystem holds it.
+            "Assets/Meshes/Rock.mesh",
+            // Given in another case, at the leaf, at an ancestor, and at both.
+            "Assets/Meshes/rock.MESH",
+            "assets/meshes/Rock.mesh",
+            "ASSETS/MESHES/ROCK.MESH",
+            // Not there at all, below a prefix that is and one that is not.
+            "Assets/Meshes/absent.mesh",
+            "absent/deeper/absent.mesh",
+            // A directory rather than a file, and a single component.
+            "Assets/Empty",
+            "Assets",
+        ] {
+            let asked: RelativePath = std::str::FromStr::from_str(asked).expect("relative path");
+            assert_eq!(
+                filesystem_path(dir.path(), &asked, Some(&prefixes))
+                    .await
+                    .ok(),
+                filesystem_path(dir.path(), &asked, None).await.ok(),
+                "{asked} must resolve the same with the map as without it"
+            );
+        }
     }
 
     #[tokio::test]

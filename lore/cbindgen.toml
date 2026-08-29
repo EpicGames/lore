@@ -33,7 +33,7 @@ header = '''// LORE C API
 // inside an event is valid only while the callback runs; copy its bytes to keep
 // them after the callback returns. A string the caller passes in must be valid
 // UTF-8: the library checks every string an operation carries before it starts
-// the call, and fails the whole call with error code 1 (invalid arguments)
+// the call, and fails the whole call with error code 3 (invalid arguments)
 // naming the offending field if any of them is not. The library copies the
 // bytes, so the caller may free the string once the call returns. See
 // lore_string_t for the layout of the type.
@@ -332,11 +332,14 @@ include = [
 "LoreMetadata_Tag" = "lore_metadata_tag_t"
 "LoreLinkAddArgs" = "lore_link_add_args_t"
 "LoreLinkRemoveArgs" = "lore_link_remove_args_t"
+"LoreLinkInfoArgs" = "lore_link_info_args_t"
 "LoreLinkListArgs" = "lore_link_list_args_t"
 "LoreLinkUpdateArgs" = "lore_link_update_args_t"
 "LoreLinkBranchCreateEventData" = "lore_link_branch_create_event_data_t"
 "LoreLinkChangeEventData" = "lore_link_change_event_data_t"
 "LoreLinkEntryEventData" = "lore_link_entry_event_data_t"
+"LoreLinkInfoEventData" = "lore_link_info_event_data_t"
+"LoreLinkStagedState" = "lore_link_staged_state_t"
 "LoreLinkStagedEntryEventData" = "lore_link_staged_entry_event_data_t"
 "LorePathIgnoreEventData" = "lore_path_ignore_event_data_t"
 "LoreProgressEventData" = "lore_progress_event_data_t"
@@ -421,6 +424,7 @@ include = [
 "LoreSharedStoreCreateArgs" = "lore_shared_store_create_args_t"
 "LoreSharedStoreCreateEventData" = "lore_shared_store_create_event_data_t"
 "LoreSharedStoreInfoArgs" = "lore_shared_store_info_args_t"
+"LoreSharedStoreMode" = "lore_shared_store_mode_t"
 "LoreSharedStoreInfoEventData" = "lore_shared_store_info_event_data_t"
 "LoreSharedStoreSetUseAutomaticallyArgs" = "lore_shared_store_set_use_automatically_args_t"
 "LoreServiceStartArgs" = "lore_service_start_args_t"
@@ -432,10 +436,16 @@ include = [
 "LoreStorageRemoteConfig" = "lore_storage_remote_config_t"
 "LoreStoragePutArgs" = "lore_storage_put_args_t"
 "LoreStoragePutItem" = "lore_storage_put_item_t"
+"LoreStoragePutResolvedArgs" = "lore_storage_put_resolved_args_t"
+"LoreStoragePutResolvedItem" = "lore_storage_put_resolved_item_t"
 "LoreArray_lore_storage_put_item" = "lore_storage_put_item_array_t"
+"LoreArray_lore_storage_put_resolved_item" = "lore_storage_put_resolved_item_array_t"
 "LoreStorageGetArgs" = "lore_storage_get_args_t"
 "LoreStorageGetItem" = "lore_storage_get_item_t"
+"LoreStorageGetResolvedArgs" = "lore_storage_get_resolved_args_t"
+"LoreStorageGetResolvedItem" = "lore_storage_get_resolved_item_t"
 "LoreArray_lore_storage_get_item" = "lore_storage_get_item_array_t"
+"LoreArray_lore_storage_get_resolved_item" = "lore_storage_get_resolved_item_array_t"
 "LoreStorageGetMetadataArgs" = "lore_storage_get_metadata_args_t"
 "LoreStorageGetMetadataItem" = "lore_storage_get_metadata_item_t"
 "LoreArray_lore_storage_get_metadata_item" = "lore_storage_get_metadata_item_array_t"
@@ -517,6 +527,8 @@ include = [
 "LoreRevisionTreeDeleteEntry" = "lore_revision_tree_delete_entry_t"
 "LoreArray_lore_revision_tree_modify_entry" = "lore_revision_tree_modify_entry_array_t"
 "LoreRevisionTreeMoveArgs" = "lore_revision_tree_move_args_t"
+"LoreRevisionTreeMoveEntry" = "lore_revision_tree_move_entry_t"
+"LoreArray_lore_revision_tree_move_entry" = "lore_revision_tree_move_entry_array_t"
 "LoreRevisionTreeMetadataSetArgs" = "lore_revision_tree_metadata_set_args_t"
 "LoreRevisionTreeMetadataSetEntry" = "lore_revision_tree_metadata_set_entry_t"
 "LoreArray_lore_revision_tree_metadata_set_entry" = "lore_revision_tree_metadata_set_entry_array_t"

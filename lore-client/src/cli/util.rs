@@ -1,17 +1,26 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use lore::branch;
+use lore::branch::LoreBranchInfoArgs;
+use lore::interface::Context;
 use lore::interface::LoreArray;
+use lore::interface::LoreEvent;
+use lore::interface::LoreEventCallback;
 use lore::interface::LoreGlobalArgs;
 use lore::interface::LoreMaintenanceEventData;
 use lore::interface::LorePathIgnoreEventData;
 use lore::interface::LoreRevisionSyncProgressEventData;
 use lore::interface::LoreString;
+use lore::runtime;
+use parking_lot::Mutex;
 
 use crate::eprintln;
 use crate::println;
@@ -156,6 +165,62 @@ pub fn convert_paths_and_targets(
     }
 
     LoreArray::from_vec(converted)
+}
+
+/// Resolves branch identifiers to names, remembering each answer.
+///
+/// Events carry the branch identifier rather than its name, so naming a branch
+/// costs a round trip. Links commonly follow one branch, and a listing would
+/// otherwise pay that trip once per link, so repeats are served from the map.
+/// An unresolvable identifier answers as itself.
+///
+/// `link_path` names the mount whose repository owns the branch, empty for a
+/// branch of this repository. A link pinned to its own branch keeps that name
+/// only in the linked repository, so the lookup has to be scoped there.
+pub struct BranchNameResolver {
+    globals: LoreGlobalArgs,
+    names: HashMap<(Context, String), String>,
+}
+
+impl BranchNameResolver {
+    pub fn new(globals: LoreGlobalArgs) -> Self {
+        Self {
+            globals,
+            names: HashMap::new(),
+        }
+    }
+
+    pub fn name(&mut self, id: Context, link_path: &str) -> String {
+        let key = (id, link_path.to_string());
+        if let Some(name) = self.names.get(&key) {
+            return name.clone();
+        }
+        let resolved = self.lookup(id, link_path);
+        self.names.insert(key, resolved.clone());
+        resolved
+    }
+
+    fn lookup(&self, id: Context, link_path: &str) -> String {
+        let args = LoreBranchInfoArgs {
+            branch: LoreString::from(id.to_string().as_str()),
+            link: LoreString::from(link_path),
+        };
+        let name = Arc::new(Mutex::new(None));
+        let name_cb = name.clone();
+        // Sub-operation callback without the default handlers: a name that will
+        // not resolve falls back to the identifier, and reporting that as an
+        // error would put a line on stderr for every link in a listing.
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+            if let LoreEvent::BranchInfo(data) = event {
+                *name_cb.lock() = Some(data.name.to_string());
+            }
+        }));
+        runtime().block_on(branch::info(self.globals.clone(), args, callback));
+        name.lock()
+            .take()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| id.to_string())
+    }
 }
 
 pub fn handle_maintenance_event(event: &LoreMaintenanceEventData) {

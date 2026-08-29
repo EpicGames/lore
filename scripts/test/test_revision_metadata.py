@@ -210,3 +210,43 @@ def test_revision_metadata_set_odd_args_rejected(new_lore_repo):
 
     with pytest.raises(ImproperArgumentsError):
         repo.revision_metadata_set(["key1", "value1", "key2"])
+
+
+@pytest.mark.smoke
+def test_revision_metadata_set_binary(new_lore_repo):
+    """--binary reads file from disk, stores in immutable store, saves hash-address in metadata (set.rs:115-153).
+    Source file can be deleted after set — data lives in store, not on disk."""
+    repo: Lore = new_lore_repo()
+
+    with repo.open_file("content.txt", "w") as f:
+        f.write("some content\n")
+    repo.stage("content.txt")
+
+    # Create a binary payload file and set it as metadata
+    payload = b"\x00\x01\x02\xff binary payload data \xfe\xfd"
+    with repo.open_file("metadata_payload.bin", "wb") as f:
+        f.write(payload)
+
+    repo.revision_metadata_set(
+        ["build-artifact", "metadata_payload.bin"], binary=True
+    )
+
+    # Delete source file — data is already in immutable store
+    repo.remove_file("metadata_payload.bin")
+    assert not repo.file_exists("metadata_payload.bin")
+
+    # Commit and push must succeed without the source file
+    repo.commit("Commit with binary metadata")
+    repo.push()
+
+    # Verify the key appears in metadata listing
+    all_metadata = repo.revision_metadata_get()
+    assert "build-artifact" in all_metadata.lower(), (
+        f"Expected 'build-artifact' key in metadata output.\nGot:\n{all_metadata}"
+    )
+
+    # Verify fetching the specific key returns an address (hash)
+    value = repo.revision_metadata_get("build-artifact")
+    assert value.strip(), (
+        "Expected non-empty value for binary metadata key 'build-artifact'"
+    )

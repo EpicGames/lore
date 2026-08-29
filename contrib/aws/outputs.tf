@@ -28,6 +28,11 @@ output "s3_bucket" {
   value       = aws_s3_bucket.fragments.id
 }
 
+output "fragment_metadata_table" {
+  description = "Existing fragment metadata table the primary falls back to for objects predating fragment metadata on the S3 object, null when none is adopted"
+  value       = one(data.aws_dynamodb_table.fragment_metadata[*].name)
+}
+
 output "log_group" {
   description = "CloudWatch log group"
   value       = aws_cloudwatch_log_group.lore.name

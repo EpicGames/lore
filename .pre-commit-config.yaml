@@ -17,6 +17,25 @@ repos:
         pass_filenames: false
         always_run: true
 
+      # `.internal()` on an error set silently collapses every handleable
+      # variant into `Internal`, so `InternalForbiddenOnErrorSets` makes it an
+      # E0034 ambiguity. rustc's own help text then suggests disambiguating
+      # with `WrapInternal::internal(..)`, which compiles and reinstates the
+      # bug. The guard trait is uncallable by construction; this catches the
+      # one spelling the type system cannot.
+      - id: no-wrapinternal-ufcs
+        name: no UFCS bypass of the .internal() guard
+        language: system
+        # rg exits 0 when it finds a match, so invert it: a hit must fail.
+        # Matches the call form only, so the rustdoc link in ext.rs — which is
+        # `](WrapInternal::internal)`, no open paren after — is not a hit.
+        entry: >-
+          bash -c '! rg -n "\bWrapInternal::internal(_with)?\s*\("
+          --glob "*.rs" --glob "!target/**" .
+          || { echo "Use .forward()/.forward_any(), or Target::internal_with_context() to collapse deliberately."; exit 1; }'
+        pass_filenames: false
+        always_run: true
+
   - repo: https://github.com/EmbarkStudios/cargo-deny
     rev: 0.19.0
     hooks:
@@ -28,7 +47,11 @@ repos:
     rev: v4.6.0
     hooks:
       - id: end-of-file-fixer
+        # We take the SWFS header as-is
+        exclude: ^lore-revision/src/fs/swfs/api_interface/generated/swfs.h$
       - id: trailing-whitespace
+        # We take the SWFS header as-is
+        exclude: ^lore-revision/src/fs/swfs/api_interface/generated/swfs.h$
       - id: check-executables-have-shebangs
       # Ignore for now until executable flag handling is easier in Lore
       # - id: check-shebang-scripts-are-executable
@@ -46,7 +69,8 @@ repos:
     hooks:
       - id: remove-tabs
         # lore-core/native uses clangformat, which expects to use tabs so leave that path alone
-        exclude: lore-core/native
+        # We take the SWFS header as-is
+        exclude: (lore-core/native|^lore-revision/src/fs/swfs/api_interface/generated/swfs.h$)
 
   - repo: https://github.com/shellcheck-py/shellcheck-py
     rev: v0.10.0.1

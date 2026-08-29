@@ -102,7 +102,7 @@ async fn store_record(
     )
     .await
     .map_err(|error| Status::internal(format!("store idempotency record: {error}")))?;
-    Ok(address.hash)
+    Ok(address.address.hash)
 }
 
 async fn load_record(

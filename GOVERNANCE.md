@@ -31,7 +31,7 @@ The Steering Group sets the project's strategic and product direction: roadmap p
 ## How contributions are accepted
 
 1. **Open an issue** — describe what you want to build or fix. For non-trivial changes, wait for a maintainer to weigh in before investing significant effort.
-2. **Discuss** — the issue receives a minimum 48-hour feedback window. For architectural questions, use [Discord](https://discord.gg/QYbNFVFv) or the GitHub Issue itself.
+2. **Discuss** — the issue receives a minimum 48-hour feedback window. For architectural questions, use [Discord](https://discord.gg/E4SFJKRPbg) or the GitHub Issue itself.
 3. **Open a pull request** — follow the guidelines in [CONTRIBUTING.md](CONTRIBUTING.md). Use the PR template.
 4. **Review** — two approvals from Maintainers are required.
 5. **Merge** — a Maintainer merges the PR.

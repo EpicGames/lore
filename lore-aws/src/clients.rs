@@ -30,8 +30,9 @@ pub enum AwsClientError<E> {
     DynamoTableNotFound(String),
     #[error("S3 bucket not found: {0}")]
     BucketNotFound(String),
+    /// Boxed for the reason on [`AwsError::AwsSdkError`].
     #[error("AWS SDK error: {0:?}")]
-    SdkError(#[from] E),
+    SdkError(#[from] Box<E>),
     #[error("Unknown error")]
     Unknown,
 }

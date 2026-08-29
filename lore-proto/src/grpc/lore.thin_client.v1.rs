@@ -37,6 +37,11 @@ pub struct DiffChange {
     /// not the request's repository id.
     #[prost(uint32, tag = "8")]
     pub link_repository_index: u32,
+    /// True when a link change tracks its parent's branch; false for pinned
+    /// links and non-link changes. Only meaningful on a LINK-typed entry; read
+    /// it from the entry for the mount path itself.
+    #[prost(bool, tag = "9")]
+    pub tracking: bool,
 }
 impl ::prost::Name for DiffChange {
     const NAME: &'static str = "DiffChange";
@@ -119,7 +124,7 @@ pub struct TreeNode {
     /// Signature of the revision in the requested repository that most recently
     /// changed this entry. Empty for directories. Descendants of a linked
     /// repository inherit the revision that last changed the link pin.
-    #[prost(bytes = "bytes", tag = "6")]
+    #[prost(bytes = "bytes", tag = "7")]
     pub last_changed_revision_signature: ::prost::bytes::Bytes,
     /// Original size in bytes. For DIRECTORY entries, this is the cumulative size of its descendant files.
     #[prost(uint64, tag = "4")]
@@ -127,6 +132,10 @@ pub struct TreeNode {
     /// File mode for this entry. For possible flags and values, see enum FileMode.
     #[prost(uint64, tag = "5")]
     pub mode: u64,
+    /// True when a link entry tracks its parent's branch; false for pinned links
+    /// and non-link entries.
+    #[prost(bool, tag = "6")]
+    pub tracking: bool,
 }
 impl ::prost::Name for TreeNode {
     const NAME: &'static str = "TreeNode";

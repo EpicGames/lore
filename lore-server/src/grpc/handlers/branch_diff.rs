@@ -6,9 +6,13 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Hash;
 use lore_proto::BranchDiffRequest;
 use lore_proto::BranchDiffResponse;
+use lore_proto::PathDiff;
 use lore_revision::branch;
 use lore_revision::lore::BranchId;
+use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::state::State;
+use lore_revision::state::StateError;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use tonic::Request;
 use tonic::Response;
@@ -17,11 +21,15 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
+use crate::grpc::handlers::path_diff::link_pin_path_diffs;
 use crate::grpc::handlers::path_diff::map_to_conflict;
 use crate::grpc::handlers::path_diff::map_to_path_diff;
+use crate::grpc::link_read_authorizer;
 use crate::util::setup_execution;
 
 #[tracing::instrument(name = "BranchDiff::handle", skip_all)]
@@ -32,6 +40,7 @@ pub async fn handler(
 ) -> Result<Response<BranchDiffResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
+    let authorization = get_authorization(request.extensions()).ok();
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner().clone();
     let branch_source = BranchId::from(req.branch_source);
@@ -46,11 +55,10 @@ pub async fn handler(
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
 
-    let repository = Arc::new(RepositoryContext::new_server_context(
-        immutable_store,
-        mutable_store,
-        repository_id,
-    ));
+    let repository = Arc::new(
+        RepositoryContext::new_server_context(immutable_store, mutable_store, repository_id)
+            .with_link_read(link_read_authorizer(authorization)),
+    );
     LORE_CONTEXT
         .scope(execution, async move {
             branch_diff_handler(
@@ -64,6 +72,34 @@ pub async fn handler(
             .await
         })
         .await
+}
+
+/// Loads the two states a pin comparison needs. A failure fails the diff for
+/// the same reason [`link_pin_path_diffs`] does.
+async fn link_pin_diffs(
+    repository: &Arc<RepositoryContext>,
+    from: Hash,
+    to: Hash,
+    parent_repository_id: RepositoryId,
+) -> Result<Vec<PathDiff>, Status> {
+    if from.is_zero() || to.is_zero() || from == to {
+        return Ok(Vec::new());
+    }
+    let states = async {
+        let state_from = State::deserialize(repository.clone(), from).await?;
+        let state_to = State::deserialize(repository.clone(), to).await?;
+        Ok::<_, StateError>((state_from, state_to))
+    }
+    .await
+    .filter_slow_down()?;
+    let (state_from, state_to) = states.map_err(|err| {
+        warn!(
+            {REPOSITORY_ID} = %repository.id, %from, %to, ?err,
+            "Failed to load states for link pin comparison",
+        );
+        Status::internal(err.to_string())
+    })?;
+    link_pin_path_diffs(repository, &state_from, &state_to, parent_repository_id).await
 }
 
 async fn branch_diff_handler(
@@ -101,6 +137,7 @@ async fn branch_diff_handler(
         })?;
 
     let repository_id = repository.id;
+    let link_repository = repository.clone();
     let result = branch::diff3_collect(
         repository,
         branch_source,
@@ -115,7 +152,13 @@ async fn branch_diff_handler(
     match result {
         Ok(result) => {
             debug!("Found {} changes", result.changes.len());
-            let mut diffs = Vec::with_capacity(result.changes.len());
+            // The changes are base -> source; compare the registries over the
+            // same pair.
+            let pin_diffs =
+                link_pin_diffs(&link_repository, result.base, result.source, repository_id).await?;
+
+            let mut diffs = Vec::with_capacity(result.changes.len() + pin_diffs.len());
+            diffs.extend(pin_diffs);
             for change in &result.changes {
                 if let Some(diff) = map_to_path_diff(change, repository_id).await {
                     diffs.push(diff);
@@ -139,7 +182,7 @@ async fn branch_diff_handler(
         }
         Err(err) => {
             warn!({REPOSITORY_ID} = %repository_id, %branch_source, %branch_target, ?err, "Failed to calculate diff");
-            if err.is_divergent() {
+            if err.is_divergent() || err.is_invalid_arguments() {
                 Err(Status::invalid_argument(err.to_string()))
             } else if err.is_max_history_search_depth() {
                 Err(Status::resource_exhausted(err.to_string()))
@@ -173,7 +216,7 @@ mod test {
         revision_number: u64,
     ) -> Hash {
         let write_token = get_write_token();
-        let state = state::State::new();
+        let state = Arc::new(state::State::new());
         state.set_parent_self(parent);
         state.set_revision_number(revision_number);
 
@@ -198,7 +241,7 @@ mod test {
         revision_number: u64,
     ) -> Hash {
         let write_token = get_write_token();
-        let state = state::State::new();
+        let state = Arc::new(state::State::new());
         state.set_parent_self(parent);
         state.set_revision_number(revision_number);
 
@@ -720,6 +763,216 @@ mod test {
         assert_eq!(
             response, expected,
             "Branch diff identifies the divergence point as base revision when source and target are on divergent chains of the parent branch"
+        );
+    }
+
+    /// Every branch is created from another branch, so two branch stacks always
+    /// share an entry - the default branch at the latest. Stacks that share none
+    /// are an invalid branch configuration, and the diff has to say so rather than
+    /// resolve a base from a search it has no starting point for.
+    #[tokio::test]
+    async fn no_shared_branch_in_stacks_is_rejected() {
+        let repository = random::<Context>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let status = Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository.into(),
+            ));
+
+            let (_main_branch, main_revision) = create_test_main(repository_context.clone()).await;
+
+            // Both stacks name a branch the other side does not carry.
+            let source_branch = create_branch(
+                repository_context.clone(),
+                "branch_source",
+                vec![BranchPoint {
+                    branch: BranchId::from(uuid::Uuid::now_v7()),
+                    revision: main_revision,
+                }],
+            )
+            .await;
+            let target_branch = create_branch(
+                repository_context.clone(),
+                "branch_target",
+                vec![BranchPoint {
+                    branch: BranchId::from(uuid::Uuid::now_v7()),
+                    revision: main_revision,
+                }],
+            )
+            .await;
+
+            let source_revision = push_revision_on_branch(
+                repository_context.clone(),
+                source_branch,
+                main_revision,
+                2,
+            )
+            .await;
+            let target_revision = push_revision_on_branch(
+                repository_context.clone(),
+                target_branch,
+                main_revision,
+                2,
+            )
+            .await;
+
+            let mut request = Request::new(BranchDiffRequest {
+                branch_target: target_branch.into(),
+                branch_source: source_branch.into(),
+                revision_target: Some(target_revision.into()),
+                revision_source: Some(source_revision.into()),
+                autoresolve: false,
+            });
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+
+            handler(request, immutable_store, mutable_store).await.err()
+        }))
+        .await;
+
+        let status = status.expect("Branch diff must refuse stacks that share no branch");
+        assert_eq!(
+            status.code(),
+            tonic::Code::InvalidArgument,
+            "An unusable branch configuration is the caller's argument, not a server fault, got {status:?}"
+        );
+        assert!(
+            status
+                .message()
+                .contains("no common branch in their branch stacks"),
+            "The status must name the branch configuration as the cause, got {:?}",
+            status.message()
+        );
+    }
+
+    /*
+        (main latest)  X            X (branch B latest)
+                       |            |
+                       |           / (branch B)
+                       |          /
+         (main branch) |     X---/ (branch point, on an unrelated root)
+                       |     |
+                       X     X (no shared revision)
+                       |     |
+                       .     .
+    */
+    /// Two branch points on the same branch that share no revision leave both
+    /// searches with nothing to find, so the older branch point is used. It is a
+    /// guess rather than an ancestor, and it is still the answer: the branches
+    /// were created from it, and the alternative - the zero revision - is the
+    /// empty tree, which reports every path in both branches as an add.
+    #[tokio::test]
+    async fn disjoint_histories_fall_back_to_the_older_branch_point() {
+        let repository = random::<Context>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let (base, branch_point) = Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository.into(),
+            ));
+
+            let (main_branch, revision_1) = create_test_main(repository_context.clone()).await;
+
+            let mut main_latest_revision = revision_1;
+            for revision_number in 2..4 {
+                main_latest_revision = push_revision_on_branch(
+                    repository_context.clone(),
+                    main_branch,
+                    main_latest_revision,
+                    revision_number,
+                )
+                .await;
+            }
+
+            // A second root chain on the same branch. The offset revision numbers
+            // keep every signature distinct from the pushed chain, so the two share
+            // no revision at all.
+            let mut orphan_revision = commit_revision_on_branch(
+                repository_context.clone(),
+                main_branch,
+                Hash::default(),
+                11,
+            )
+            .await;
+            orphan_revision = commit_revision_on_branch(
+                repository_context.clone(),
+                main_branch,
+                orphan_revision,
+                12,
+            )
+            .await;
+
+            let source_branch = create_branch(
+                repository_context.clone(),
+                "branch_source",
+                vec![BranchPoint {
+                    branch: main_branch,
+                    revision: main_latest_revision,
+                }],
+            )
+            .await;
+            let target_branch = create_branch(
+                repository_context.clone(),
+                "branch_target",
+                vec![BranchPoint {
+                    branch: main_branch,
+                    revision: orphan_revision,
+                }],
+            )
+            .await;
+
+            let source_revision = push_revision_on_branch(
+                repository_context.clone(),
+                source_branch,
+                main_latest_revision,
+                4,
+            )
+            .await;
+            let target_revision = push_revision_on_branch(
+                repository_context.clone(),
+                target_branch,
+                orphan_revision,
+                13,
+            )
+            .await;
+
+            let mut request = Request::new(BranchDiffRequest {
+                branch_target: target_branch.into(),
+                branch_source: source_branch.into(),
+                revision_target: Some(target_revision.into()),
+                revision_source: Some(source_revision.into()),
+                autoresolve: false,
+            });
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+
+            let response = handler(request, immutable_store, mutable_store)
+                .await
+                .expect("Branch diff must resolve a base for histories that share no revision")
+                .into_inner();
+
+            (Hash::from(response.revision_base), main_latest_revision)
+        }))
+        .await;
+
+        assert_eq!(
+            base, branch_point,
+            "The older of the two branch points is the best answer left once both searches come up empty"
+        );
+        assert!(
+            !base.is_zero(),
+            "A zero base is the empty tree, which conflicts on every path in both branches"
         );
     }
 }

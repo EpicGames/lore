@@ -532,7 +532,7 @@ mod tests {
         )
         .await
         .expect("stream write");
-        let buffer_address = crate::write_content(
+        let buffer_result = crate::write_content(
             store.clone(),
             partition,
             context,
@@ -544,6 +544,7 @@ mod tests {
         )
         .await
         .expect("buffer write");
+        let buffer_address = buffer_result.address;
         let buffer_fragment = store
             .clone()
             .get_metadata(partition, buffer_address)

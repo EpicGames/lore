@@ -51,6 +51,7 @@ use crate::store::immutable_store::FragmentState;
 use crate::store::immutable_store::FragmentStateEntry;
 use crate::store::immutable_store::FragmentsEntry;
 use crate::store::immutable_store::FragmentsQuery;
+use crate::store::immutable_store::PartitionAssociationQuery;
 use crate::store::immutable_store::RowAbsent;
 use crate::store::immutable_store::S3StoreSettings;
 use crate::store::immutable_store::StateUnchanged;
@@ -96,6 +97,9 @@ pub(crate) struct Storage {
     pub(crate) association_deleted: Option<oneshot::Sender<()>>,
     pub(crate) object_reads: usize,
     pub(crate) objects: HashMap<Vec<u8>, StoredObject>,
+    /// Objects returned by `get_object` exactly once before being removed. Not visible to
+    /// `head_object`, so a test can make `head_fragment` fail while `load` still succeeds.
+    pub(crate) objects_once: HashMap<Vec<u8>, StoredObject>,
     pub(crate) associations: HashMap<(Vec<u8>, Vec<u8>), HashMap<String, AttributeValue>>,
     pub(crate) state: HashMap<Vec<u8>, HashMap<String, AttributeValue>>,
     /// Rows in the legacy fragment metadata table (separate from the state table). Only
@@ -239,6 +243,31 @@ impl Fake {
         );
     }
 
+    /// Store an object that `get_object` will return exactly once before removing it.
+    /// Not visible to `head_object`, so `head_fragment` returns 404 while `load` still succeeds.
+    pub(crate) fn put_object_once(&self, hash: Hash, body: &[u8]) {
+        self.lock().objects_once.insert(
+            hash.to_string().into_bytes(),
+            (body.to_vec(), HashMap::new()),
+        );
+    }
+
+    /// Store an object with the `lore-fragment` metadata header encoded from `fragment`.
+    pub(crate) fn put_object_with_fragment_metadata(
+        &self,
+        hash: Hash,
+        body: &[u8],
+        fragment: Fragment,
+    ) {
+        self.lock().objects.insert(
+            hash.to_string().into_bytes(),
+            (
+                body.to_vec(),
+                crate::store::object_metadata::to_object_metadata(&fragment),
+            ),
+        );
+    }
+
     /// Store an object whose metadata is present but unreadable.
     pub(crate) fn put_object_with_damaged_metadata(&self, hash: Hash, body: &[u8]) {
         let mut metadata = HashMap::new();
@@ -307,10 +336,19 @@ pub(crate) fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
     s3.expect_get_object().returning(move |_, key, _| {
         let mut storage = f.lock();
         storage.object_reads += 1;
+        if let Some((body, metadata)) = storage.objects_once.remove(key.as_bytes()) {
+            let len = body.len() as i64;
+            return Ok(GetObjectOutput::builder()
+                .set_body(Some(body.into()))
+                .set_metadata(Some(metadata))
+                .content_length(len)
+                .build());
+        }
         match storage.objects.get(key.as_bytes()) {
             Some((body, metadata)) => Ok(GetObjectOutput::builder()
                 .set_body(Some(body.clone().into()))
                 .set_metadata(Some(metadata.clone()))
+                .content_length(body.len() as i64)
                 .build()),
             None => Err(aws_error(
                 GetObjectError::NoSuchKey(NoSuchKey::builder().build()),
@@ -363,7 +401,7 @@ pub(crate) fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
     dynamodb.expect_get_item().returning(move |table, item, _| {
         if &**table == FRAGMENT_STATE_TABLE_NAME {
             if f.failing(Fault::StateReadTimeout) {
-                return Err(AwsError::AwsSdkError(SdkError::timeout_error(Box::new(
+                return Err(AwsError::sdk_error(SdkError::timeout_error(Box::new(
                     std::io::Error::other("injected timeout"),
                 ))));
             }
@@ -545,6 +583,24 @@ pub(crate) fn wire(fake: &Fake) -> (MockS3Impl, MockDynamoDb) {
         Ok(QueryOutput::builder().count(i32::from(matched)).build())
     });
 
+    let f = fake.clone();
+    dynamodb.expect_query_single().returning(move |_, query| {
+        if f.failing(Fault::AssociationCount) {
+            return Err(throughput_exceeded(
+                QueryError::ProvisionedThroughputExceededException(throttling_exception()),
+            ));
+        }
+
+        let storage = f.lock();
+        let PartitionAssociationQuery(hash, partition) = query;
+        // The service's `begins_with` on a sort key of partition followed by context.
+        let matched = storage.associations.keys().any(|(stored, sort_key)| {
+            stored == hash.data() && sort_key.starts_with(partition.data())
+        });
+
+        Ok(QueryOutput::builder().count(i32::from(matched)).build())
+    });
+
     (s3, dynamodb)
 }
 
@@ -624,7 +680,7 @@ pub(crate) async fn store_with_separate_metadata_table(fake: &Fake) -> Arc<AwsIm
 }
 
 pub(crate) fn aws_error<E>(error: E, status: u16) -> AwsError<SdkError<E, HttpResponse>> {
-    AwsError::AwsSdkError(SdkError::ServiceError(
+    AwsError::sdk_error(SdkError::ServiceError(
         ServiceError::builder()
             .source(error)
             .raw(HttpResponse::new(

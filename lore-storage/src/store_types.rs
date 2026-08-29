@@ -10,6 +10,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio_stream::Stream;
 
+use crate::Context;
 use crate::Fragment;
 use crate::Hash;
 use crate::Partition;
@@ -172,10 +173,25 @@ pub struct StoreMatchResult {
     /// This is what lets a caller holding content already stored elsewhere name a source to copy
     /// from rather than transfer the payload again.
     pub partition: Partition,
+    /// The context the content was found under, completing the source address the partition begins.
+    /// Optional where the partition is not: zero means unnamed, which
+    /// [`ImmutableStore::copy`](crate::immutable_store::ImmutableStore::copy) takes as any
+    /// association the source partition holds.
+    pub context: Context,
     /// Whether the payload is held locally.
     pub stored_local: bool,
     /// Whether the payload is durable.
     pub stored_durable: bool,
+}
+
+impl StoreMatchResult {
+    /// The source address a copy reads from: `hash` under the context this match named, if any.
+    pub fn source_address(&self, hash: Hash) -> crate::Address {
+        crate::Address {
+            hash,
+            context: self.context,
+        }
+    }
 }
 
 #[repr(C)]

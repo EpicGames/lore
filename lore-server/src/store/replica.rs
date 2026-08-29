@@ -8,6 +8,7 @@ use bytes::Bytes;
 use futures::future::join_all;
 use lore_base::lore_spawn;
 use lore_base::types::Address;
+use lore_base::types::Context;
 use lore_base::types::Fragment;
 use lore_base::types::Partition;
 use lore_revision::runtime::execution_context;
@@ -431,6 +432,17 @@ where
     async fn verify(self: Arc<Self>, _heal: bool) -> Result<(), StoreError> {
         Ok(())
     }
+
+    async fn copy(
+        self: Arc<Self>,
+        _source_partition: Partition,
+        _source_address: Address,
+        _destination_partition: Partition,
+        _destination_context: Context,
+        _durable: bool,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::internal("copy not supported on read replica"))
+    }
 }
 
 fn handle_service_response<ResponseType, ClientType>(
@@ -496,6 +508,7 @@ mod tests {
     use tokio::sync::mpsc::Receiver;
 
     use super::*;
+    use crate::protocol::replication_store::copy::ImmutableCopy;
     use crate::protocol::replication_store::get_metadata::GetMetadata;
     use crate::protocol::replication_store::obliterate::Obliterate;
     use crate::protocol::replication_store::obliterate::ObliterateResponse;
@@ -543,6 +556,11 @@ mod tests {
                 &self,
                 request: Query,
             ) -> Result<QueryResponse, ReplicationStoreClientError>;
+
+            async fn copy(
+                &self,
+                request: ImmutableCopy,
+            ) -> Result<(), ReplicationStoreClientError>;
         }
     }
 
@@ -654,6 +672,30 @@ mod tests {
         assert!(matches!(err, StoreError::Internal(_)));
         let msg = format!("{err}");
         assert!(msg.contains("write operations not supported on read replica"));
+    }
+
+    #[tokio::test]
+    async fn copy_returns_error() {
+        let execution = crate::util::setup_execution("test", String::default(), String::default());
+        lore_base::runtime::LORE_CONTEXT
+            .scope(execution, async move {
+                let replica = make_replica().await;
+                let partition: lore_base::types::Partition = rand::random();
+                let (_, address, _) = lore_revision::fragment::generate_random();
+
+                let error = replica
+                    .copy(
+                        partition,
+                        address,
+                        partition,
+                        lore_base::types::Context::default(),
+                        false,
+                    )
+                    .await
+                    .expect_err("copy should not be supported on read replica");
+                assert!(matches!(error, StoreError::Internal(_)));
+            })
+            .await;
     }
 
     mod regenerate_client {
@@ -1059,6 +1101,7 @@ mod tests {
                                 results: vec![StoreMatchResult {
                                     match_made: lore_storage::StoreMatch::MatchPartition,
                                     partition: repository_partition,
+                                    context: Context::default(),
                                     stored_local: false,
                                     stored_durable: false,
                                 }],
@@ -1117,6 +1160,7 @@ mod tests {
                         let result = StoreMatchResult {
                             match_made: random_match.try_into().expect("invalid store match"),
                             partition,
+                            context: Context::default(),
                             stored_local: random(),
                             stored_durable: random(),
                         };

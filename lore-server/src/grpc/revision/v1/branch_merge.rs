@@ -529,6 +529,7 @@ mod tests {
         )
         .await
         .expect("write content")
+        .address
     }
 
     fn put(path: &str, address: Address) -> revision_v1::RevisionCreateOperation {

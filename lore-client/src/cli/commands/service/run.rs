@@ -72,7 +72,8 @@ pub async fn service_main(
         );
     }
 
-    let listener: UdsListener = UdsListener::new().internal("Failed to start listener socket")?;
+    let listener: UdsListener =
+        UdsListener::new().forward::<ServiceMainError>("Failed to start listener socket")?;
 
     if let Some(listening_signal) = listening_signal {
         listening_signal

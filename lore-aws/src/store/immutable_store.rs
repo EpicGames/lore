@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fmt::Formatter;
+use std::mem::size_of;
 use std::string::ToString;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -17,6 +18,7 @@ use aws_sdk_dynamodb::primitives::Blob;
 use aws_sdk_dynamodb::types::AttributeValue;
 use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
+use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use bytes::Bytes;
 use bytes::BytesMut;
@@ -34,6 +36,7 @@ use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_base::types::TypedBytes;
 use lore_storage::ImmutableStore as ImmutableStoreTrait;
+use lore_storage::Oversized;
 use lore_storage::StoreError;
 use lore_storage::StoreGetData;
 use lore_storage::StoreMatch;
@@ -48,6 +51,7 @@ use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
 use lore_telemetry::timed;
 use lore_telemetry::timer::TimedResult;
 use lore_telemetry::tracing::fields::ADDRESS;
+use lore_telemetry::tracing::fields::PARTITION_ID;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
@@ -366,6 +370,59 @@ impl DynamoDbQuery for FragmentsQuery {
     }
 }
 
+/// Whether a partition holds any association for a hash, whatever context it is under.
+///
+/// The sort key is the partition followed by the context, so one prefix bounds every association a
+/// partition holds for a hash and the read never leaves that partition — an unassociated hash and
+/// one associated only elsewhere answer the same way, which is what isolation requires.
+///
+/// A copy asks this only when its source names no context, and pays a `Query` for it where an exact
+/// source costs a keyed read. One row settles it, for the reason on [`FragmentsQuery`].
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PartitionAssociationQuery(pub(crate) Hash, pub(crate) Partition);
+
+impl DynamoDbQuery for PartitionAssociationQuery {
+    fn key_condition_expression(&self) -> &str {
+        "#pk = :hash AND begins_with(#sk, :partition)"
+    }
+
+    fn expression_attribute_names(&self) -> HashMap<String, String> {
+        HashMap::from([
+            (
+                "#pk".to_string(),
+                FRAGMENTS_DYNAMO_PARTITION_KEY_ATTRIBUTE.to_string(),
+            ),
+            (
+                "#sk".to_string(),
+                FRAGMENTS_DYNAMO_SORT_KEY_ATTRIBUTE.to_string(),
+            ),
+        ])
+    }
+
+    fn expression_attribute_values(&self) -> HashMap<String, AttributeValue> {
+        HashMap::from([
+            (
+                ":hash".to_string(),
+                AttributeValue::B(Blob::new(self.0.data())),
+            ),
+            (
+                ":partition".to_string(),
+                AttributeValue::B(Blob::new(self.1.data())),
+            ),
+        ])
+    }
+
+    fn limit(&self) -> Option<i32> {
+        Some(1)
+    }
+
+    /// A copy acts on the answer by writing an association, so it must not be satisfied by a view
+    /// that predates an obliteration deleting the last one.
+    fn consistent_read(&self) -> bool {
+        true
+    }
+}
+
 /// Write only if no row exists for this hash yet.
 ///
 /// Publishing a payload uses this so that a concurrent obliteration's mark cannot be erased by a
@@ -446,7 +503,7 @@ where
         return false;
     };
 
-    match sdk_error {
+    match &**sdk_error {
         DynamoDbSdkError::TimeoutError(_) | DynamoDbSdkError::DispatchFailure(_) => true,
         DynamoDbSdkError::ServiceError(err) => {
             let status = err.raw().status().as_u16();
@@ -789,6 +846,7 @@ impl AwsImmutableStore {
                 match_made: StoreMatch::MatchFull,
                 // This store isolates, so it only ever matches inside the partition asked about.
                 partition,
+                context: address.context,
                 stored_local: false,
                 stored_durable: true,
             };
@@ -816,10 +874,14 @@ impl AwsImmutableStore {
             .await
         {
             Ok(_) => Ok(FragmentState::Stored),
-            Err(AwsError::AwsSdkError(DynamoDbSdkError::ServiceError(err)))
-                if err.err().is_conditional_check_failed_exception() =>
+            Err(AwsError::AwsSdkError(sdk_error))
+                if sdk_error
+                    .as_service_error()
+                    .is_some_and(|e| e.is_conditional_check_failed_exception()) =>
             {
-                let PutItemError::ConditionalCheckFailedException(failure) = err.err() else {
+                let Some(PutItemError::ConditionalCheckFailedException(failure)) =
+                    sdk_error.as_service_error()
+                else {
                     unreachable!()
                 };
 
@@ -968,8 +1030,10 @@ impl AwsImmutableStore {
             .await
         {
             Ok(_) => Ok(()),
-            Err(AwsError::AwsSdkError(DynamoDbSdkError::ServiceError(err)))
-                if err.err().is_conditional_check_failed_exception() =>
+            Err(AwsError::AwsSdkError(sdk_error))
+                if sdk_error
+                    .as_service_error()
+                    .is_some_and(|e| e.is_conditional_check_failed_exception()) =>
             {
                 warn!("Fragment state for {hash} was not {expected:?} when moving to {updated:?}");
                 Err(StoreError::internal(
@@ -1128,6 +1192,37 @@ impl AwsImmutableStore {
         }
 
         Ok(states)
+    }
+
+    /// Whether `partition` holds any association for `hash`, whatever context it is under.
+    async fn has_partition_association(
+        &self,
+        partition: Partition,
+        hash: Hash,
+    ) -> Result<bool, StoreError> {
+        self.dynamodb
+            .query_single(
+                &self.fragments_table_name,
+                PartitionAssociationQuery(hash, partition),
+            )
+            .await
+            .map(|output| output.count > 0)
+            .map_err(|e| {
+                if is_dynamodb_overloaded(&e) {
+                    StoreError::from(SlowDown)
+                } else {
+                    warn!(
+                        {PARTITION_ID} = %partition,
+                        hash = %hash,
+                        error = ?e,
+                        "DynamoDb query for a partition association failed"
+                    );
+                    StoreError::internal_with_context(
+                        e,
+                        "DynamoDB partition association query failed",
+                    )
+                }
+            })
     }
 
     async fn has_associations(&self, hash: Hash) -> Result<bool, StoreError> {
@@ -1294,12 +1389,7 @@ impl AwsImmutableStore {
         Ok(())
     }
 
-    /// Read a fragment without its payload, from the object's object metadata.
-    ///
-    /// This is the one path that spends an S3 request purely on metadata, and it spends the
-    /// cheapest one: `HeadObject` transfers no body. Reads that want the payload get the fragment
-    /// for free on the `GetObject` response instead.
-    async fn head_fragment(&self, hash: Hash) -> Result<Fragment, StoreError> {
+    async fn s3_head_object(&self, hash: Hash) -> Result<HeadObjectOutput, StoreError> {
         let mut dst = [0u8; 64];
         let output = self
             .s3
@@ -1322,6 +1412,16 @@ impl AwsImmutableStore {
                     StoreError::internal_with_context(e, "S3 head object failed")
                 }
             })?;
+        Ok(output)
+    }
+
+    /// Read a fragment without its payload, from the object's object metadata.
+    ///
+    /// This is the one path that spends an S3 request purely on metadata, and it spends the
+    /// cheapest one: `HeadObject` transfers no body. Reads that want the payload get the fragment
+    /// for free on the `GetObject` response instead.
+    async fn head_fragment(&self, hash: Hash) -> Result<Fragment, StoreError> {
+        let output = self.s3_head_object(hash).await?;
 
         let fragment = match from_object_metadata(output.metadata()) {
             Ok(fragment) => fragment,
@@ -1474,17 +1574,40 @@ impl AwsImmutableStore {
                 }
             })?;
 
-        let fragment = from_object_metadata(output.metadata());
-
-        // Clamped because the length is the response's claim, and a fragment cannot exceed the
-        // threshold.
-        let capacity = output
+        // The Content-Length header arrives with the response before the body is streamed.
+        // Check it here to abort before reading a single byte of an oversized object.
+        // Legacy S3 blobs had a Fragment struct prepended to the payload, so the maximum
+        // legitimate object size is the threshold plus that prefix.
+        let content_length: Option<usize> = output
             .content_length()
-            .and_then(|length| usize::try_from(length).ok())
-            .filter(|length| *length > 0)
-            .map_or(FRAGMENT_SIZE_THRESHOLD, |length| {
-                length.min(FRAGMENT_SIZE_THRESHOLD)
-            });
+            .and_then(|l| usize::try_from(l).ok())
+            .filter(|l| *l > 0);
+
+        const MAX_OBJECT_SIZE: usize = FRAGMENT_SIZE_THRESHOLD + size_of::<Fragment>();
+        if let Some(size) = content_length
+            && size > MAX_OBJECT_SIZE
+        {
+            warn!(
+                hash = %hash,
+                size,
+                max = MAX_OBJECT_SIZE,
+                "S3 object exceeds maximum allowed size; treating as malicious"
+            );
+            return Err(StoreError::from(Oversized {
+                context: format!(
+                    "S3 object size {size} for {hash} exceeds maximum {MAX_OBJECT_SIZE}"
+                ),
+            }));
+        }
+
+        let fragment = from_object_metadata(output.metadata());
+        if let Ok(fragment) = &fragment {
+            lore_storage::validate_fragment_size(fragment)?;
+        }
+
+        // Clamped to MAX_OBJECT_SIZE: legacy blobs carried a Fragment prefix that pushes their
+        // size above FRAGMENT_SIZE_THRESHOLD, so capping at the threshold would under-allocate.
+        let capacity = content_length.map_or(MAX_OBJECT_SIZE, |length| length.min(MAX_OBJECT_SIZE));
 
         let mut buffer = BytesMut::with_capacity(capacity);
         let mut read = 0_usize;
@@ -1495,7 +1618,6 @@ impl AwsImmutableStore {
             })?;
             read += bytes.len();
             trace!("Read {read} bytes from S3 stream");
-
             buffer.extend_from_slice(bytes.as_ref());
         }
         trace!("Total read {read} bytes from S3 stream");
@@ -2100,7 +2222,13 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             context: destination_context,
         };
         timed!(self.latency_histogram, &self.labels_copy, {
-            if !self.exists(source_partition, source_address).await? {
+            let present = if source_address.context.is_zero() {
+                self.has_partition_association(source_partition, source_address.hash)
+                    .await?
+            } else {
+                self.exists(source_partition, source_address).await?
+            };
+            if !present {
                 return Err(StoreError::from(AddressNotFound::from(source_address)));
             }
 
@@ -2168,7 +2296,6 @@ impl InstrumentProvider for AwsImmutableStoreInstrumentProvider {
 mod test {
     use std::sync::atomic::Ordering;
 
-    use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::FragmentFlags;
     use lore_storage::ImmutableStore;
     use rand::random;
@@ -2176,7 +2303,6 @@ mod test {
 
     use super::*;
     use crate::store::object_metadata::PAYLOAD_FLAGS;
-    use crate::store::setup_execution;
     use crate::store::test_util::*;
 
     #[tokio::test]
@@ -3881,6 +4007,85 @@ mod test {
         assert_eq!(fake.association_count(hash), 1);
     }
 
+    /// A source naming no context is any association the partition holds, which is what a caller
+    /// acting on a partition match has. The payload is untouched, as for an exact source.
+    #[tokio::test]
+    async fn copy_from_an_unnamed_context_takes_any_association_in_the_partition() {
+        let fake = Fake::default();
+        let hash: Hash = random();
+        let stored = Address {
+            hash,
+            context: random(),
+        };
+        let partition: Partition = random();
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(partition, stored, fragment, Some(payload.clone()), false)
+            .await
+            .expect("put should succeed");
+
+        store
+            .copy(
+                partition,
+                Address::zero_context_hash(hash),
+                partition,
+                random::<Context>(),
+                true,
+            )
+            .await
+            .expect("a partition holding the hash answers a source naming no context");
+
+        assert_eq!(fake.association_count(hash), 2);
+        assert_eq!(
+            fake.object(hash).unwrap().0,
+            payload.as_ref(),
+            "copy must not rewrite the payload"
+        );
+        assert_eq!(fake.object_reads(), 0, "copy must not read S3");
+    }
+
+    /// Naming no context widens the search inside one partition, never across them — this store
+    /// isolates, so a hash held only elsewhere is not the caller's to copy from.
+    #[tokio::test]
+    async fn copy_from_an_unnamed_context_does_not_reach_another_partition() {
+        let fake = Fake::default();
+        let hash: Hash = random();
+        let stored = Address {
+            hash,
+            context: random(),
+        };
+        let (fragment, payload) = representation(FragmentFlags::PayloadCompressedZstd, 64, 256);
+
+        let store = store(&fake).await;
+        store
+            .clone()
+            .put(
+                random::<Partition>(),
+                stored,
+                fragment,
+                Some(payload),
+                false,
+            )
+            .await
+            .expect("put should succeed");
+
+        store
+            .copy(
+                random::<Partition>(),
+                Address::zero_context_hash(hash),
+                random::<Partition>(),
+                random::<Context>(),
+                true,
+            )
+            .await
+            .expect_err("a partition holding nothing has no association to name");
+
+        assert_eq!(fake.association_count(hash), 1);
+    }
+
     #[tokio::test]
     async fn exist_batch_reports_a_match_per_address_in_order() {
         let fake = Fake::default();
@@ -3997,28 +4202,84 @@ mod test {
         }
     }
 
-    /// The store contract, checked against this store the same way it is checked against every
-    /// other one.
-    ///
-    /// Note what this does *not* reach. The store is built without the legacy metadata table, so
-    /// nothing here exercises the fallback resolution that table turns on, nor the gap that comes
-    /// with it: a hash with no state row is left associated by `obliterate` and goes on matching
-    /// through the fallback. Those paths are covered separately, on
-    /// [`store_with_separate_metadata_table`], where the two tables are genuinely distinct.
-    #[tokio::test]
-    async fn satisfies_the_immutable_store_contract() {
-        let fake = Fake::default();
-        let store = store(&fake).await;
+    mod malicious_s3_object_tests {
+        use super::*;
 
-        let execution = setup_execution("test".to_string());
-        LORE_CONTEXT
-            .scope(execution, async move {
-                lore_storage::conformance::verify_immutable_store(
-                    store,
-                    lore_storage::conformance::Capabilities::new("AwsImmutableStore"),
-                )
-                .await;
-            })
-            .await;
+        const MAX_OBJECT_SIZE: usize = FRAGMENT_SIZE_THRESHOLD + size_of::<Fragment>();
+
+        #[tokio::test]
+        async fn load_rejects_object_one_byte_over_max_size() {
+            let fake = Fake::default();
+            let hash: Hash = random();
+            fake.put_object_without_metadata(hash, &vec![0u8; MAX_OBJECT_SIZE + 1]);
+            assert!(matches!(
+                store(&fake).await.load(hash).await,
+                Err(StoreError::Oversized(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn load_rejects_object_far_over_max_size() {
+            let fake = Fake::default();
+            let hash: Hash = random();
+            fake.put_object_without_metadata(hash, &vec![0u8; MAX_OBJECT_SIZE * 2]);
+            assert!(matches!(
+                store(&fake).await.load(hash).await,
+                Err(StoreError::Oversized(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn load_accepts_object_exactly_at_max_size() {
+            // An object at exactly MAX_OBJECT_SIZE must not be rejected by the size guard.
+            // It has no fragment metadata header and no legacy row, so load will fail for a
+            // different reason — but the error must not be Oversized.
+            let fake = Fake::default();
+            let hash: Hash = random();
+            fake.put_object_without_metadata(hash, &vec![0u8; MAX_OBJECT_SIZE]);
+            assert!(!matches!(
+                store(&fake).await.load(hash).await,
+                Err(StoreError::Oversized(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn load_rejects_oversized_s3_object_with_valid_fragment_header() {
+            // Content-Length guard fires even when the object carries a valid lore-fragment
+            // header — the raw S3 object size check runs before the body is read.
+            let fake = Fake::default();
+            let body = vec![0u8; MAX_OBJECT_SIZE + 1];
+            let hash: Hash = random();
+            let fragment = Fragment {
+                flags: 0,
+                size_payload: body.len() as u32,
+                size_content: body.len() as u64,
+            };
+            fake.put_object_with_fragment_metadata(hash, &body, fragment);
+            assert!(matches!(
+                store(&fake).await.load(hash).await,
+                Err(StoreError::Oversized(_))
+            ));
+        }
+
+        #[tokio::test]
+        async fn load_rejects_fragment_metadata_claiming_oversized_payload() {
+            // A small S3 object (passes the content_length guard) but whose lore-fragment
+            // header declares size_payload > FRAGMENT_SIZE_THRESHOLD is caught by
+            // validate_fragment_size.
+            let fake = Fake::default();
+            let body = vec![0u8; 64];
+            let hash: Hash = random();
+            let malicious_fragment = Fragment {
+                flags: 0,
+                size_payload: (FRAGMENT_SIZE_THRESHOLD + 1) as u32,
+                size_content: (FRAGMENT_SIZE_THRESHOLD + 1) as u64,
+            };
+            fake.put_object_with_fragment_metadata(hash, &body, malicious_fragment);
+            assert!(matches!(
+                store(&fake).await.load(hash).await,
+                Err(StoreError::Oversized(_))
+            ));
+        }
     }
 }

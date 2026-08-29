@@ -371,7 +371,7 @@ async fn file_diff3(
         false,
     ))
     .await
-    .internal("Failed to calculate diff")?;
+    .forward::<DiffError>("Failed to calculate diff")?;
 
     let state_base = State::deserialize(repository.clone(), diff_result.base)
         .await
@@ -1126,7 +1126,7 @@ async fn diff_read_file(
         let content = lore_io::IoDriver::global()
             .read_file_bytes(path.as_path())
             .await
-            .internal(&format!("Failed reading file for diff: {}", path.display()))?;
+            .internal_with(|| format!("Failed reading file for diff: {}", path.display()))?;
         return Ok(make_diff_content(&content));
     };
 

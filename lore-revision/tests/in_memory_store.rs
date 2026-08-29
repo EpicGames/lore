@@ -5,6 +5,7 @@ mod tests {
     use std::path::PathBuf;
 
     use bytes::Bytes;
+    use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::lore::*;
     use lore_revision::repository::cache_in_memory_stores;
     use lore_revision::repository::create_client_memory_stores;

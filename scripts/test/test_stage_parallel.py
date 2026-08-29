@@ -2,11 +2,11 @@
 # SPDX-License-Identifier: MIT
 """Smoke tests for parallel multi-path staging.
 
-Builds a large two-level directory tree (thousands of files and directories)
-and stages large, overlapping explicit path sets — with and without ``--scan``,
+Builds directory trees two and three levels deep (into the thousands of files
+and directories) and stages large, overlapping explicit path sets — with and without ``--scan``,
 across add / modify / delete — to exercise the parallel-staging path: input
-normalization (antichain collapse of overlapping paths), sequential pre-creation
-of shared ancestor directories, and the parallel per-target fan-out.
+normalization (antichain collapse of overlapping paths), pre-creation of shared
+ancestor directories a depth at a time, and the parallel per-target fan-out.
 
 Every operation is verified against the exact expected staged set via ``--json``
 status: precisely the files and directories expected, each with the expected
@@ -116,7 +116,7 @@ def test_stage_scan_add_overlapping(new_lore_repo):
 def test_stage_noscan_add_explicit_files(new_lore_repo):
     """Stage every leaf file explicitly, without `--scan`. The targets form a
     file antichain sharing `d*/s*` prefixes, so all shared ancestor directories
-    are pre-created sequentially before the parallel per-file walks. The whole
+    are pre-created a depth at a time before the parallel per-file walks. The whole
     tree (files and their directories) must end up staged exactly once as adds."""
     repo: Lore = new_lore_repo()
     files, tops, subs = _build_tree(repo)
@@ -124,6 +124,113 @@ def test_stage_noscan_add_explicit_files(new_lore_repo):
     repo.stage(sorted(files), offline=True, relative_paths=True)
 
     _assert_staged_exactly(repo, _full_tree_adds(files, tops, subs))
+
+
+# Three directory levels, so the shared ancestors span three depths and the
+# pre-creation runs one with a level above it and a level below it. Kept small:
+# the shape is what matters here, not the width.
+DEEP_DIRS = 2
+DEEP_FILES = 2
+
+
+def _build_deep_tree(repo: Lore):
+    """Write a three-level tree. Returns (files, dirs) with files a dict[path ->
+    content] and dirs the posix directory paths at all three depths."""
+    files: dict[str, str] = {}
+    dirs: list[str] = []
+    for top in range(DEEP_DIRS):
+        for mid in range(DEEP_DIRS):
+            for leaf in range(DEEP_DIRS):
+                directory = f"t{top}/m{mid}/l{leaf}"
+                dirs.extend([f"t{top}", f"t{top}/m{mid}", directory])
+                for index in range(DEEP_FILES):
+                    files[f"{directory}/f{index}.txt"] = f"{top}-{mid}-{leaf}-{index}\n"
+    repo.write_files(files)
+    return files, sorted(set(dirs))
+
+
+@pytest.mark.smoke
+def test_stage_noscan_add_three_ancestor_levels(new_lore_repo):
+    """Stage every leaf file of a three-level tree explicitly. Every directory is
+    shared by two or more targets, so the pre-creation runs three depths rather
+    than the two the other trees here reach, and the middle one has a level on
+    either side of it. The whole tree must end up staged exactly once as adds."""
+    repo: Lore = new_lore_repo()
+    files, dirs = _build_deep_tree(repo)
+
+    repo.stage(sorted(files), offline=True, relative_paths=True)
+
+    expected = {to_posix(p): ("file", "add") for p in files}
+    for directory in dirs:
+        expected[to_posix(directory)] = ("directory", "add")
+    _assert_staged_exactly(repo, expected)
+
+
+def _mixed_case_targets(directory: str) -> list[str]:
+    """Targets under `directory`, in four case variations with two files each.
+
+    Two files per variation so that every variation is itself a shared ancestor
+    and they all land in one depth of the pre-creation — a single target per
+    variation leaves nothing shared for the depth to hold.
+    """
+    top, sub = directory.split("/")
+    variations = [
+        f"{top}/{sub}",
+        f"{top.lower()}/{sub.lower()}",
+        f"{top.upper()}/{sub}",
+        f"{top}/{sub.upper()}",
+    ]
+    return [
+        f"{variation}/{chr(ord('a') + index)}{file}.bin"
+        for index, variation in enumerate(variations)
+        for file in range(2)
+    ]
+
+
+def _mixed_case_files(directory: str) -> dict[str, str]:
+    """The targets as the file system actually holds them, all under `directory`."""
+    return {
+        f"{directory}/{name.rsplit('/', 1)[1]}": f"{name}\n"
+        for name in _mixed_case_targets(directory)
+    }
+
+
+@pytest.mark.smoke
+def test_stage_noscan_targets_in_mixed_case_add(new_lore_repo):
+    """Explicit targets naming one directory in four cases, over a tree holding
+    none of them. A parent holds a single entry of a name, so the shared
+    ancestors settle on one variation and each level gains one directory rather
+    than one per variation."""
+    repo: Lore = new_lore_repo()
+    files = _mixed_case_files("Assets/Meshes")
+    repo.write_files(files)
+
+    repo.stage(_mixed_case_targets("Assets/Meshes"), offline=True, relative_paths=True)
+
+    expected = {to_posix(p): ("file", "add") for p in files}
+    expected["Assets"] = ("directory", "add")
+    expected["Assets/Meshes"] = ("directory", "add")
+    _assert_staged_exactly(repo, expected)
+
+
+@pytest.mark.smoke
+def test_stage_noscan_targets_in_mixed_case_below_a_committed_directory(new_lore_repo):
+    """The same, for a directory added below one the tree already holds. The
+    committed parent is found rather than created whichever way it is cased,
+    and the directory added under it is still added once."""
+    repo: Lore = new_lore_repo()
+    repo.write_files({"Assets/Meshes/base.bin": "base\n"})
+    repo.stage(scan=True, offline=True)
+    repo.commit("base", offline=True)
+
+    added = _mixed_case_files("Assets/New")
+    repo.write_files(added)
+
+    repo.stage(_mixed_case_targets("Assets/New"), offline=True, relative_paths=True)
+
+    expected = {to_posix(p): ("file", "add") for p in added}
+    expected["Assets/New"] = ("directory", "add")
+    _assert_staged_exactly(repo, expected)
 
 
 def _apply_mixed_changes(repo: Lore, files):

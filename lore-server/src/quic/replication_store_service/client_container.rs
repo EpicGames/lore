@@ -254,6 +254,7 @@ mod tests {
     use tokio::sync::mpsc::Receiver;
 
     use super::*;
+    use crate::protocol::replication_store::copy::ImmutableCopy;
     use crate::protocol::replication_store::get::Get;
     use crate::protocol::replication_store::get_metadata::GetMetadata;
     use crate::protocol::replication_store::obliterate::Obliterate;
@@ -279,6 +280,7 @@ mod tests {
             async fn local_get_metadata(&self, request: GetMetadata) -> Result<StoreGetData, ReplicationStoreClientError>;
             async fn query(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError>;
             async fn local_query(&self, request: Query) -> Result<QueryResponse, ReplicationStoreClientError>;
+            async fn copy(&self, request: ImmutableCopy) -> Result<(), ReplicationStoreClientError>;
         }
     }
 

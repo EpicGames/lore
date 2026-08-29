@@ -772,7 +772,7 @@ mod test {
                 .await
                 .expect("serialize metadata");
 
-            let state = State::new();
+            let state = Arc::new(State::new());
             state.set_parent_self(parent);
             state.set_revision_number(n);
             state.set_metadata_hash(metadata_hash);

@@ -1,21 +1,24 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use clap::Args;
 use clap::Subcommand;
 use lore::interface::LoreEvent;
 use lore::interface::LoreGlobalArgs;
 use lore::interface::LoreLinkChangeEventData;
+use lore::interface::LoreLinkEntryEventData;
 use lore::interface::LoreString;
 use lore::link;
 use lore::link::LinkFlags;
 use lore::link::LoreLinkAddArgs;
+use lore::link::LoreLinkInfoArgs;
 use lore::link::LoreLinkListArgs;
 use lore::link::LoreLinkRemoveArgs;
+use lore::link::LoreLinkStagedState;
 use lore::link::LoreLinkUpdateArgs;
 use lore::runtime;
+use parking_lot::Mutex;
 
 use crate::cli::EventCallbackExt;
 use crate::cli::EventCallbackFn;
@@ -77,6 +80,13 @@ pub struct LinkUpdateArgs {
 }
 
 #[derive(Args)]
+pub struct LinkInfoArgs {
+    /// Path in the repository of the link to describe
+    #[clap(value_name = "link_path")]
+    link_path: String,
+}
+
+#[derive(Args)]
 pub struct LinkListArgs {
     /// Only show links with staged changes
     #[clap(long, action)]
@@ -96,6 +106,9 @@ pub enum LinkCommands {
 
     /// List all links in the repository
     List(LinkListArgs),
+
+    /// Show detailed information about the link at the given path
+    Info(LinkInfoArgs),
 }
 
 fn handle_link_add(globals: LoreGlobalArgs, args: &LinkAddArgs) -> u8 {
@@ -210,79 +223,84 @@ fn handle_link_remove(globals: LoreGlobalArgs, args: &LinkRemoveArgs) -> u8 {
     return runtime().block_on(link::remove(globals, unlink_args, callback)) as u8;
 }
 
-fn handle_link_list(globals: LoreGlobalArgs, args: &LinkListArgs) -> u8 {
-    if args.staged {
-        return handle_link_list_staged(globals);
+fn format_link_staged_state(state: LoreLinkStagedState) -> &'static str {
+    match state {
+        LoreLinkStagedState::None => "none",
+        LoreLinkStagedState::Added => "added",
+        LoreLinkStagedState::Removed => "removed",
+        LoreLinkStagedState::Modified => "modified",
     }
+}
 
-    let list_args = LoreLinkListArgs {};
+/// Prints the rows every link listing shares. `link info` adds its own below.
+fn print_link_entry(data: &LoreLinkEntryEventData, branch_name: &str) {
+    println!(
+        "{}Link {}{}",
+        CommonStyles::HEADERS,
+        data.link,
+        anstyle::Reset
+    );
+    println!(
+        "  {}Link path:{} {} (node {})",
+        CommonStyles::HEADERS,
+        anstyle::Reset,
+        data.link_path,
+        data.link_node
+    );
+    println!(
+        "  {}Source path:{} {} (node {})",
+        CommonStyles::HEADERS,
+        anstyle::Reset,
+        data.source_path,
+        data.source_node
+    );
+    let branch_id = data.branch.to_string();
+    let branch = if branch_name.is_empty() || branch_name == branch_id {
+        branch_id
+    } else {
+        format!("{branch_name} ({branch_id})")
+    };
+    println!(
+        "  {}Branch:{} {} [{}]",
+        CommonStyles::HEADERS,
+        anstyle::Reset,
+        branch,
+        if data.tracking != 0 {
+            "tracking"
+        } else {
+            "pinned"
+        }
+    );
+    println!(
+        "  {}Revision:{} {}",
+        CommonStyles::HEADERS,
+        anstyle::Reset,
+        data.revision
+    );
+    println!(
+        "  {}Flags:{} {}",
+        CommonStyles::HEADERS,
+        anstyle::Reset,
+        format_link_flags(data.flags)
+    );
+}
 
-    let has_entries = Arc::new(AtomicBool::new(false));
-    let has_entries_flag = has_entries.clone();
+fn handle_link_info(globals: LoreGlobalArgs, args: &LinkInfoArgs) -> u8 {
+    let info_args = LoreLinkInfoArgs {
+        link_path: LoreString::from(&args.link_path),
+    };
 
+    // Collected rather than printed in the callback: naming the branch is
+    // another interface call, which cannot run while this one is in flight.
+    let info = Arc::new(Mutex::new(None));
+    let info_cb = info.clone();
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
-            LoreEvent::LinkEntry(data) => {
-                println!(
-                    "{}Link {}{}",
-                    CommonStyles::HEADERS,
-                    data.link,
-                    anstyle::Reset
-                );
-                println!(
-                    "  {}Link path:{} {} (node {})",
-                    CommonStyles::HEADERS,
-                    anstyle::Reset,
-                    data.link_path,
-                    data.link_node
-                );
-                println!(
-                    "  {}Source path:{} {} (node {})",
-                    CommonStyles::HEADERS,
-                    anstyle::Reset,
-                    data.source_path,
-                    data.source_node
-                );
-                let branch_name = data.branch_name.to_string();
-                let branch_id = data.branch.to_string();
-                if !branch_name.is_empty() && branch_name != branch_id {
-                    println!(
-                        "  {}Branch:{} {} ({})",
-                        CommonStyles::HEADERS,
-                        anstyle::Reset,
-                        branch_name,
-                        branch_id
-                    );
-                } else {
-                    println!(
-                        "  {}Branch:{} {}",
-                        CommonStyles::HEADERS,
-                        anstyle::Reset,
-                        branch_id
-                    );
-                }
-                println!(
-                    "  {}Revision:{} {}",
-                    CommonStyles::HEADERS,
-                    anstyle::Reset,
-                    data.revision
-                );
-                println!(
-                    "  {}Flags:{} {}",
-                    CommonStyles::HEADERS,
-                    anstyle::Reset,
-                    format_link_flags(data.flags)
-                );
-                println!("");
-                has_entries_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            LoreEvent::LinkInfo(data) => {
+                *info_cb.lock() = Some(data.clone());
             }
-            LoreEvent::Complete(data) => {
-                if !has_entries.load(std::sync::atomic::Ordering::Relaxed) {
-                    println!("No links found in this repository");
-                }
-                if data.status != 0 {
-                    eprintln!("Failed to list links");
-                }
+            LoreEvent::Complete(data) if data.status != 0 => {
+                eprintln!("Failed to read link info");
             }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
@@ -292,12 +310,84 @@ fn handle_link_list(globals: LoreGlobalArgs, args: &LinkListArgs) -> u8 {
             .with_defaults(),
     ));
 
-    return runtime().block_on(link::list(globals, list_args, callback)) as u8;
+    let status = runtime().block_on(link::info(globals.clone(), info_args, callback)) as u8;
+
+    if let Some(data) = info.lock().take() {
+        let mut branches = util::BranchNameResolver::new(globals);
+        let branch_name = branches.name(data.entry.branch, data.entry.link_path.as_str());
+        print_link_entry(&data.entry, &branch_name);
+        if !data.remote_revision.is_zero() {
+            println!(
+                "  {}Remote revision:{} {}",
+                CommonStyles::HEADERS,
+                anstyle::Reset,
+                data.remote_revision
+            );
+        }
+        println!(
+            "  {}Staged:{} {}",
+            CommonStyles::HEADERS,
+            anstyle::Reset,
+            format_link_staged_state(data.staged_state)
+        );
+        println!(
+            "  {}Staged files:{} {}",
+            CommonStyles::HEADERS,
+            anstyle::Reset,
+            data.staged_file_count
+        );
+    }
+
+    return status;
+}
+
+fn handle_link_list(globals: LoreGlobalArgs, args: &LinkListArgs) -> u8 {
+    if args.staged {
+        return handle_link_list_staged(globals);
+    }
+
+    let list_args = LoreLinkListArgs {};
+
+    // Collected rather than printed in the callback: naming the branch is
+    // another interface call, which cannot run while this one is in flight.
+    let entries = Arc::new(Mutex::new(Vec::new()));
+    let entries_cb = entries.clone();
+    let callback = output_formatter().unwrap_or(Some(
+        (Box::new(move |event: &LoreEvent| match event {
+            LoreEvent::LinkEntry(data) => {
+                entries_cb.lock().push(data.clone());
+            }
+            LoreEvent::Complete(data) if data.status != 0 => {
+                eprintln!("Failed to list links");
+            }
+            LoreEvent::Maintenance(data) => {
+                util::handle_maintenance_event(data);
+            }
+            _ => (),
+        }) as EventCallbackFn)
+            .with_defaults(),
+    ));
+
+    let status = runtime().block_on(link::list(globals.clone(), list_args, callback)) as u8;
+
+    let entries = entries.lock().split_off(0);
+    if entries.is_empty() {
+        println!("No links found in this repository");
+        return status;
+    }
+
+    let mut branches = util::BranchNameResolver::new(globals);
+    for entry in &entries {
+        let branch_name = branches.name(entry.branch, entry.link_path.as_str());
+        print_link_entry(entry, &branch_name);
+        println!("");
+    }
+
+    return status;
 }
 
 fn handle_link_list_staged(globals: LoreGlobalArgs) -> u8 {
     use lore::interface::LoreEventCallback;
-    use parking_lot::Mutex;
 
     let discovered_links: Arc<Mutex<Vec<(String, u64)>>> = Arc::new(Mutex::new(Vec::default()));
     let discovered_links_clone = discovered_links.clone();
@@ -434,6 +524,9 @@ pub fn handle_link_commands(cmd: &LinkCommands, globals: LoreGlobalArgs) -> u8 {
         }
         LinkCommands::List(args) => {
             return handle_link_list(globals, args);
+        }
+        LinkCommands::Info(args) => {
+            return handle_link_info(globals, args);
         }
     }
 }

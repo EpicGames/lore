@@ -280,6 +280,10 @@ fn apply_plan(
 /// concurrent `metadata_set` on the same handle cannot interleave its keys into
 /// the middle of this batch — though which of two concurrent batches lands
 /// second, and so wins a shared key, is not ordered.
+///
+/// The handle is claimed even though this edits no tree: that pending buffer is
+/// what a commit clones and then empties, so an edit landing inside a commit would
+/// be recorded and dropped without ever reaching a revision.
 pub async fn metadata_set(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeMetadataSetArgs,
@@ -318,6 +322,7 @@ async fn metadata_set_impl(
         },
         async move |internal: Arc<RevisionTreeInternal>, args: LoreRevisionTreeMetadataSetArgs| {
             let batch_id = args.batch_id;
+            let _access = internal.access_shared().await;
             let result = metadata_set_batch(&internal, &args);
             emit_batch_complete(batch_id, batch_error_code(&result));
             result

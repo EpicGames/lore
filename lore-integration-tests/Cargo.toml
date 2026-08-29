@@ -3,6 +3,19 @@ name = "lore-integration-tests"
 version = "0.1.0"
 edition = "2024"
 publish = false
+# One target for the whole suite, declared below. Autodiscovery would compile
+# every file in tests/ as a test binary of its own, and each is a module of that
+# suite rather than a crate root.
+autotests = false
+
+# The suite runs against the services in compose.yaml, so every test in it is
+# behind `integration_tests`. Naming the feature here keeps a build that does not
+# enable it from linking the target at all, rather than linking a harness that
+# holds no tests.
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+required-features = ["integration_tests"]
 
 [dependencies]
 anyhow = { workspace = true }
@@ -32,9 +45,13 @@ lore-aws = { workspace = true }
 lore-revision = { workspace = true }
 lore-hashicorp = { workspace = true }
 lore-proto = { workspace = true }
-lore-server = { workspace = true, features = ["integration_tests"] }
 uuid = { workspace = true }
 
+[dev-dependencies]
+lore-server = { workspace = true }
+lore-transport = { workspace = true }
+rcgen = { workspace = true }
+
 [features]
-integration_tests = []
+integration_tests = ["lore-server/integration_tests"]
 grpc_integration_tests = ["dep:tokio-stream", "dep:tonic"]

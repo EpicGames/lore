@@ -25,6 +25,11 @@ pub enum KeyType {
     RepositoryId = 5,
     /// Key refers to a repository instance.
     Instance = 6,
+    /// Key maps to an immutable content hash, written by `lore_storage_put_resolved` and read by
+    /// `lore_storage_get_resolved`. Those two commands do not carry a key type on the wire,
+    /// because this is the only one they operate on; a publish large enough to fragment falls
+    /// back to an ordinary mutable store write, which does carry it like any other type.
+    Resolve = 7,
 }
 
 impl TryFrom<u8> for KeyType {
@@ -39,6 +44,7 @@ impl TryFrom<u8> for KeyType {
             4 => Ok(KeyType::RepositoryMetadata),
             5 => Ok(KeyType::RepositoryId),
             6 => Ok(KeyType::Instance),
+            7 => Ok(KeyType::Resolve),
             other => Err(other),
         }
     }

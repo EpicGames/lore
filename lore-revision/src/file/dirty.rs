@@ -778,9 +778,9 @@ pub async fn dirty_move(
 ) -> Result<Hash, DirtyError> {
     let from_path =
         RelativePath::new_from_user_path(repository.require_path()?, from_path.as_str())
-            .forward::<DirtyError>(&format!("Invalid path {from_path}"))?;
+            .forward_with::<DirtyError, _>(|| format!("Invalid path {from_path}"))?;
     let to_path = RelativePath::new_from_user_path(repository.require_path()?, to_path.as_str())
-        .forward::<DirtyError>(&format!("Invalid path {to_path}"))?;
+        .forward_with::<DirtyError, _>(|| format!("Invalid path {to_path}"))?;
 
     if from_path.as_str() == to_path.as_str() {
         return Err(DirtyError::internal("Cannot move a path to itself"));
@@ -797,7 +797,7 @@ pub async fn dirty_move(
     let from_node_link = state
         .find_node_link(repository.clone(), from_path.as_str())
         .await
-        .forward::<DirtyError>(&format!("Path {from_path} does not exist"))?;
+        .forward_with::<DirtyError, _>(|| format!("Path {from_path} does not exist"))?;
 
     let from_block_index = NodeBlock::index(from_node_link.node);
     let from_node_index = Node::index(from_node_link.node);
@@ -994,9 +994,9 @@ pub async fn dirty_copy(
 ) -> Result<Hash, DirtyError> {
     let from_path =
         RelativePath::new_from_user_path(repository.require_path()?, from_path.as_str())
-            .forward::<DirtyError>(&format!("Invalid path {from_path}"))?;
+            .forward_with::<DirtyError, _>(|| format!("Invalid path {from_path}"))?;
     let to_path = RelativePath::new_from_user_path(repository.require_path()?, to_path.as_str())
-        .forward::<DirtyError>(&format!("Invalid path {to_path}"))?;
+        .forward_with::<DirtyError, _>(|| format!("Invalid path {to_path}"))?;
 
     let (state_current, state_staged, _branch) =
         State::deserialize_current_and_staged(repository.clone())
@@ -1009,7 +1009,7 @@ pub async fn dirty_copy(
     let _from_link = state
         .find_node_link(repository.clone(), from_path.as_str())
         .await
-        .forward::<DirtyError>(&format!("Source path {from_path} does not exist"))?;
+        .forward_with::<DirtyError, _>(|| format!("Source path {from_path} does not exist"))?;
 
     // Find destination parent
     let to_parent_path = to_path.parent();

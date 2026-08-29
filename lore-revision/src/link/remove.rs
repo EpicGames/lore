@@ -6,14 +6,18 @@ use lore_error_set::prelude::*;
 
 use super::LinkError;
 use crate::errors::InvalidPath;
+use crate::errors::LocalModifications;
 use crate::errors::NotALink;
 use crate::event;
+use crate::filter::FilterMode;
 use crate::interface::LoreFileAction;
 use crate::link::LoreLinkChangeEventData;
 use crate::lore::Context;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
+use crate::lore::execution_context;
 use crate::lore_debug;
+use crate::lore_warn;
 use crate::node::NodeFlags;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
@@ -78,6 +82,16 @@ pub async fn remove(
 
     let link_id: RepositoryId = link_node.address.context.into();
     let is_staged_add = link_node.is_staged_add();
+
+    if !execution_context().globals().force() {
+        verify_no_local_changes_under_link(
+            repository.clone(),
+            state_current.clone(),
+            state_staged.clone(),
+            &link_path,
+        )
+        .await?;
+    }
 
     // On-disk path is the full link path regardless of nesting.
     let absolute_path = link_path.to_absolute_path(repository.require_path()?);
@@ -157,6 +171,46 @@ pub async fn remove(
         LoreFileAction::Delete,
     ))
     .send();
+
+    Ok(())
+}
+
+/// Removing a link deletes its mounted directory from disk, taking any
+/// uncommitted work inside it with no way back.
+async fn verify_no_local_changes_under_link(
+    repository: Arc<RepositoryContext>,
+    state_current: Arc<State>,
+    state_staged: Arc<State>,
+    link_path: &RelativePath,
+) -> Result<(), LinkError> {
+    // TODO(vri): narrow this to `link_path` once a scoped diff works.
+    // `find_relative_node_link` returns a mount as the parent's own link node,
+    // so `diff_filesystem_ex` has nothing to resolve and walks a node with no
+    // children, reporting every file under the mount as added.
+    let (changes, _stats) = state::diff_filesystem(
+        repository.clone(),
+        state_staged,
+        repository,
+        state_current,
+        None,
+        // Not `Full`: removal deletes the mount with `unlink_recursive`, which
+        // takes ignored files with it, so they have to count as local changes.
+        FilterMode::View,
+        Arc::new(Vec::new()),
+    )
+    .await
+    .forward::<LinkError>("Failed comparing link content with the file system")?;
+
+    if changes
+        .iter()
+        .any(|change| link_path.covers_ignore_case(&change.path))
+    {
+        lore_warn!(
+            "Link at '{}' has locally modified files (use --force to discard)",
+            link_path.as_str()
+        );
+        return Err(LocalModifications.into());
+    }
 
     Ok(())
 }

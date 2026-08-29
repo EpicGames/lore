@@ -84,13 +84,13 @@ where
 
         let state = State::deserialize(repository.clone(), revision)
             .await
-            .internal("deserializing state")?;
+            .forward_any::<FindError>("deserializing state")?;
 
         let metadata = if with_metadata {
             Some(
                 Metadata::deserialize(repository.clone(), state.metadata_hash())
                     .await
-                    .internal("deserializing metadata")?,
+                    .forward_any::<FindError>("deserializing metadata")?,
             )
         } else {
             None
@@ -422,7 +422,7 @@ pub async fn find_impl(
 ) -> Result<(), FindError> {
     let (_current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
         .await
-        .internal("deserializing current anchor")?;
+        .forward_any::<FindError>("deserializing current anchor")?;
 
     let result = match options {
         FindOptions::KeyValue { key, value } => {

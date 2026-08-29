@@ -493,7 +493,6 @@ mod tests {
 
     use std::sync::Arc;
 
-    use lore_base::error::NoRemote;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_revision::dependency::load_dependency_data;
@@ -501,16 +500,14 @@ mod tests {
     use lore_revision::node::Node;
     use lore_revision::node::ROOT_NODE;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::state::State;
     use lore_storage::hash::hash_string;
     use lore_storage::local::immutable_store::LocalImmutableStore;
-    use lore_transport::ProtocolError;
 
     /// Create a fresh state with three file nodes for testing.
     async fn setup_test_state() -> (Arc<RepositoryContext>, Arc<State>, u32, u32, u32) {
         let (_, mutable_store, _) = test_store_create().await.expect("create stores");
-        let repository_id = Context::from(uuid::Uuid::now_v7());
+        let _repository_id = Context::from(uuid::Uuid::now_v7());
         let tempdir = generate_tempdir();
         let path = tempdir.to_path_buf();
 
@@ -522,14 +519,8 @@ mod tests {
         .expect("create immutable store");
 
         let repository = Arc::new(RepositoryContext::new(
-            Some(path.clone()),
-            immutable_store.clone(),
-            mutable_store.clone(),
-            repository_id.into(),
-            lore_revision::instance::InstanceId::default(),
-            Err(ProtocolError::from(NoRemote)),
-            Arc::default(),
-            RepositoryFormat::Lore,
+            default_repository_creation_args(immutable_store.clone(), mutable_store.clone())
+                .with_path(&path),
         ));
 
         let state = Arc::new(State::new());

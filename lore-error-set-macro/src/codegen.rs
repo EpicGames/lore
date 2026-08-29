@@ -364,11 +364,13 @@ fn generate_accessor_methods(
 
     let internal_constructors = quote! {
         /// Reexpose trait method without requiring the trait to be in scope.
+        #[track_caller]
         pub fn internal(msg: impl Into<String>) -> Self {
             <Self as lore_error_set::internal::SupportsInternalError>::internal(msg)
         }
 
         /// Reexpose trait method without requiring the trait to be in scope.
+        #[track_caller]
         pub fn internal_with_context(
             source: impl ::std::error::Error + Send + Sync + 'static,
             context: &str,

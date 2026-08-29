@@ -24,6 +24,7 @@ use lore_revision::interface::LoreString;
 use lore_revision::metadata::Metadata;
 use lore_revision::metadata::MetadataError;
 use lore_revision::metadata::MetadataType;
+use lore_revision::state::State;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -215,13 +216,14 @@ fn resolve_from_pending(
 /// metadata fragment answers nothing, which is not a failure.
 async fn resolve_from_revision(
     internal: &Arc<RevisionTreeInternal>,
+    state: &State,
     entries: &[LoreRevisionTreeMetadataGetEntry],
     resolved: &mut [Resolved],
 ) -> Result<(), MetadataGetError> {
     if !resolved.iter().any(|slot| matches!(slot, Resolved::Absent)) {
         return Ok(());
     }
-    let metadata_hash = internal.state.metadata_hash();
+    let metadata_hash = state.metadata_hash();
     if metadata_hash.is_zero() {
         return Ok(());
     }
@@ -337,7 +339,8 @@ async fn metadata_get_batch(
 
     let mut resolved = resolve_from_pending(&internal, entries);
     if args.include_revision != 0 {
-        resolve_from_revision(&internal, entries, &mut resolved).await?;
+        let access = internal.access_shared().await;
+        resolve_from_revision(&internal, &access.state(), entries, &mut resolved).await?;
     }
     emit_resolved(entries, &resolved);
     Ok(())
@@ -594,7 +597,7 @@ mod tests {
             .serialize(internal.repository_context.clone())
             .await
             .expect("serializing the fragment must succeed");
-        internal.state.set_metadata_hash(hash);
+        internal.state_for_tests().set_metadata_hash(hash);
     }
 
     /// The loaded revision is read only when it is both asked for and needed.
@@ -606,7 +609,7 @@ mod tests {
         let (handle, store_handle_id) = load_handle("md-not-read", partition).await;
         let internal = rt_handle::lookup(handle).expect("the handle must resolve");
         internal
-            .state
+            .state_for_tests()
             .set_metadata_hash(Hash::from_u64(0xdead_beef));
         seed(handle, vec![set_entry(1, "mine", "value")]).await;
 
@@ -775,7 +778,7 @@ mod tests {
         let (handle, store_handle_id) = load_handle("md-unreadable", partition).await;
         let internal = rt_handle::lookup(handle).expect("the handle must resolve");
         internal
-            .state
+            .state_for_tests()
             .set_metadata_hash(Hash::from_u64(0xdead_beef));
 
         let (status, events) = run_get_including_revision(handle, vec![get_entry(20, "any")]).await;

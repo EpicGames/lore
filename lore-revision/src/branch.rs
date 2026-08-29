@@ -28,6 +28,7 @@ use lore_transport::MatchedProtocolError;
 use lore_transport::ProtocolError;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::join;
 use tokio::sync::RwLock;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -55,7 +56,6 @@ use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
 use crate::link;
-use crate::link::LinkFlags;
 use crate::lore::*;
 use crate::lore_debug;
 use crate::lore_drain_tasks;
@@ -82,7 +82,6 @@ use crate::revision::DiffItem;
 use crate::revision::DiffResult;
 use crate::revision::sync;
 use crate::state;
-use crate::state::LinkReference;
 use crate::state::State;
 use crate::state::StateData;
 use crate::state::StateError;
@@ -185,23 +184,33 @@ pub struct LoreBranchDiffNodeData {
     /// Set when the change was merged automatically.
     #[serde(with = "u8_as_bool")]
     pub automerged: u8,
+    /// Previous path of the node when it was moved or copied. Empty otherwise.
+    pub from_path: LoreString,
 }
 
 impl LoreBranchDiffNodeData {
     fn new(node_change: &NodeChange) -> Self {
-        let is_directory_or_module = if node_change.action == FileAction::Delete {
+        let is_directory_or_link = if node_change.action == FileAction::Delete {
             !node_change.from.flags.contains(NodeFlags::File)
         } else {
             !node_change.to.flags.contains(NodeFlags::File)
         };
+        let display_path = |path: &str| -> LoreString {
+            if is_directory_or_link {
+                format!("{path}/").into()
+            } else {
+                path.into()
+            }
+        };
         Self {
             action: LoreFileAction::from(node_change.action),
-            path: if is_directory_or_module {
-                format!("{}/", node_change.path.as_str()).into()
-            } else {
-                node_change.path.as_str().into()
-            },
+            path: display_path(node_change.path.as_str()),
             automerged: node_change.flags.is_conflict_automerged().into(),
+            from_path: node_change
+                .from_path
+                .as_ref()
+                .map(|path| display_path(path.as_str()))
+                .unwrap_or_default(),
         }
     }
 }
@@ -1737,30 +1746,10 @@ async fn create_linked_branches(
         return Ok(current_latest);
     }
 
-    // A repository can be linked at more than one mount path, and the branch has
-    // a single identity within it. Group the mounts by repository so the cascade
-    // creates that branch once instead of racing itself: concurrent creates with
-    // the same branch ID resolve to one winner, and the loser is rejected with
+    // Grouping keeps the cascade from racing itself: concurrent creates with the
+    // same branch ID resolve to one winner, and the loser is rejected with
     // "branch has been advanced by another instance", failing the whole create.
-    let mut link_groups: Vec<(RepositoryId, Vec<LinkReference>)> = Vec::new();
-
-    for link_reference in link_list.iter() {
-        if link_reference.flags & LinkFlags::DisableAutoFollow != 0 {
-            lore_debug!(
-                "Auto follow disabled for link {}",
-                link_reference.repository
-            );
-            continue;
-        }
-
-        match link_groups
-            .iter_mut()
-            .find(|(link_id, _mounts)| *link_id == link_reference.repository)
-        {
-            Some((_link_id, mounts)) => mounts.push(*link_reference),
-            None => link_groups.push((link_reference.repository, vec![*link_reference])),
-        }
-    }
+    let link_groups = link::auto_following_mounts(&link_list);
 
     let mut link_tasks = JoinSet::new();
 
@@ -1967,10 +1956,14 @@ pub async fn delete(
 
     delete_name_to_id(repository.clone(), &branch_name).await?;
 
-    event::LoreEvent::BranchArchive(LoreBranchArchiveEventData {
-        name: branch_name.into(),
-    })
-    .send();
+    // A layer or link archive is a consequence of the outer one, not its own
+    // user-facing event, so reporting each one would read as repeated archives.
+    if !repository.is_layer() && !repository.is_link() {
+        event::LoreEvent::BranchArchive(LoreBranchArchiveEventData {
+            name: branch_name.into(),
+        })
+        .send();
+    }
 
     Ok(())
 }
@@ -1985,12 +1978,18 @@ pub async fn delete_remote(
         .await
         .forward::<BranchError>("Failed to connect to remote revision service")?;
 
-    remote
-        .branch_delete(branch)
-        .await
-        .forward::<BranchError>("Failed to delete branch on remote")?;
-
-    Ok(())
+    // The service answers NOT_FOUND here for one reason only, and callers
+    // distinguish the missing-branch case to decide whether to skip. Left as the
+    // transport's generic NotFound it is indistinguishable from a real failure.
+    match remote.branch_delete(branch).await {
+        Err(err) if err.is_not_found() => Err(BranchError::BranchNotFound(
+            BranchNotFound {
+                branch: branch.to_string(),
+            }
+            .chain_err_from(err, "branch missing on remote"),
+        )),
+        result => result.forward::<BranchError>("Failed to delete branch on remote"),
+    }
 }
 
 pub async fn protect(
@@ -2626,6 +2625,16 @@ pub async fn diff3_with_options(
     )
     .await?;
 
+    // `resolve_diff3_base` is documented never to return this, so reaching it is a
+    // bug rather than a repository state. Refuse anyway: the alternative is a diff
+    // against the empty tree that conflicts on every path in both branches.
+    if base_revision.is_zero() {
+        lore_error!(
+            "Resolved a zero base revision for branch {source_branch} revision {source_revision} and branch {target_branch} revision {target_revision}"
+        );
+        return Err(BranchError::from(Divergent));
+    }
+
     lore_info!(
         "Revision diff base {base_revision} source {source_revision} target {target_revision}"
     );
@@ -2914,10 +2923,25 @@ async fn try_auto_resolve_conflict(
 /// response header) can compute it up front and pass it into
 /// `diff3_streaming` without duplicating the work.
 ///
-/// Returns `Hash::default()` (zero) when no common ancestor exists; the
-/// caller treats that as "disjoint histories" and surfaces an appropriate
-/// error. May raise `BranchError::Divergent` or
-/// `BranchError::MaxHistorySearchDepth` from the divergence search.
+/// Two branches resolve in two steps.
+/// `find_common_ancestor_from_branch_points` reads the stacks for the branch
+/// both sides descend from and the revision on it each side branched at, and
+/// answers from those. `find_common_ancestor_from_merges` then improves on that
+/// answer where a merge has already carried one branch into the other, which the
+/// branch points cannot show.
+///
+/// Exhausting the searches is not fatal. Both branch points sit on the branch the
+/// stacks share, so the older of the two is always available as an answer, and it
+/// is used - with a warning - rather than refusing a diff the caller has no way
+/// to repair. Stacks that share no branch at all are fatal, with
+/// `BranchError::InvalidArguments`: every branch descends from the default
+/// branch, so that is an invalid branch configuration rather than a history the
+/// search failed on.
+///
+/// A branch resolved against itself has no branch points to fall back on, and
+/// fails with `BranchError::Divergent` when its two revisions share no history.
+///
+/// Never returns the zero revision.
 pub async fn resolve_diff3_base(
     repository: Arc<RepositoryContext>,
     source_branch: BranchId,
@@ -2925,13 +2949,11 @@ pub async fn resolve_diff3_base(
     target_branch: BranchId,
     target_revision: Hash,
 ) -> Result<Hash, BranchError> {
-    // Find base revision from branch stack parents and branch points
-    let mut base_revision = Hash::default();
-    if source_branch != target_branch {
-        let mut branch_source_point = Hash::default();
-        let mut branch_target_point = Hash::default();
-        let mut base_branch_point = Hash::default();
+    lore_debug!(
+        "Resolve diff base between source branch {source_branch} revision {source_revision} and target branch {target_branch} revision {target_revision}"
+    );
 
+    let common_ancestor = if source_branch != target_branch {
         let source_stack = if let Ok(branch_metadata) =
             metadata(repository.clone(), source_branch).await
         {
@@ -2984,129 +3006,73 @@ pub async fn resolve_diff3_base(
             vec![]
         };
 
-        for source_parent in source_stack.iter() {
-            if target_branch == source_parent.branch {
-                branch_source_point = source_parent.revision;
-                branch_target_point = target_revision;
-                base_branch_point = target_stack
-                    .first()
-                    .map(|parent| parent.revision)
-                    .unwrap_or_default();
-                break;
+        let Some(common_ancestor) = Box::pin(find_common_ancestor_from_branch_points(
+            repository.clone(),
+            source_branch,
+            source_revision,
+            &source_stack,
+            target_branch,
+            target_revision,
+            &target_stack,
+        ))
+        .await?
+        else {
+            return Err(InvalidArguments {
+                reason: format!(
+                    "source branch {source_branch} and target branch {target_branch} have no common branch in their branch stacks"
+                ),
             }
-        }
-        if branch_source_point.is_zero() {
-            for (target_index, target_parent) in target_stack.iter().enumerate() {
-                if target_parent.branch == source_branch {
-                    branch_target_point = target_parent.revision;
-                    branch_source_point = source_revision;
-                    base_branch_point = source_stack
-                        .first()
-                        .map(|parent| parent.revision)
-                        .unwrap_or_default();
-                    break;
-                }
-                for (source_index, source_parent) in source_stack.iter().enumerate() {
-                    if target_parent.branch == source_parent.branch {
-                        // Found common ancestor branch
-                        branch_source_point = source_parent.revision;
-                        branch_target_point = target_parent.revision;
+            .into());
+        };
 
-                        // Pick the lowest numbered branch point revision as the base point
-                        let next_target_index = target_index + 1;
-                        let next_source_index = source_index + 1;
-                        if next_target_index < target_stack.len()
-                            && next_source_index < source_stack.len()
-                        {
-                            let source_revision = source_stack[next_source_index].revision;
-                            let target_revision = target_stack[next_target_index].revision;
+        lore_debug!("Branch points give common ancestor {common_ancestor}");
 
-                            if source_revision != target_revision
-                                && let Ok(source_state) =
-                                    State::deserialize(repository.clone(), source_revision).await
-                                && let Ok(target_state) =
-                                    State::deserialize(repository.clone(), target_revision).await
-                            {
-                                if source_state.revision_number() < target_state.revision_number() {
-                                    base_branch_point = source_revision;
-                                } else {
-                                    base_branch_point = target_revision;
-                                }
-                            } else {
-                                base_branch_point = source_revision;
-                            }
-                        }
-                        break;
-                    }
-                }
-                if !branch_source_point.is_zero() {
-                    break;
-                }
-            }
-        }
-
-        if !branch_source_point.is_zero() {
-            if branch_source_point != branch_target_point {
-                // Find the common ancestor in this pair of revisions on the common ancestor branch
-                // If the common ancestor cannot be found, use the lowest numbered revision
-                // TODO(mjansson): By keeping branch epochs and sequentially force push, we can
-                //                 avoid trying to detect divergence here if branch points are known
-                //                 to be from the same epoch
-                base_revision = Box::pin(find_divergence_base(
-                    repository.clone(),
-                    branch_source_point,
-                    branch_target_point,
-                    base_branch_point,
-                ))
-                .await?
-                .base_revision;
-            } else {
-                base_revision = branch_source_point;
-            }
-
-            if let Some(found_base_revision) = find_ancestor_revision(
-                repository.clone(),
-                source_branch,
-                source_revision,
-                target_branch,
-                target_revision,
-                base_revision,
-            )
-            .await
-            {
-                base_revision = found_base_revision;
-                lore_debug!(
-                    "Found new base revision from previous merges from source branch, using branch point {base_revision}"
-                );
-            } else {
-                lore_debug!(
-                    "No new base revision from previous merges from source branch found, using branch point {base_revision}"
-                );
-            }
-        }
+        common_ancestor
     } else {
-        let base_branch_point = metadata(repository.clone(), source_branch)
+        let branch_point = metadata(repository.clone(), source_branch)
             .await
-            .and_then(|metadata| {
+            .map(|metadata| {
                 let stack = stack(&metadata);
                 lore_debug!(
                     "Loaded local metadata for source branch {source_branch}, found stack {stack:?}"
                 );
-                stack
-                    .first()
-                    .map(|parent| parent.revision)
-                    .ok_or_else(|| BranchError::internal("Invalid parent"))
+                stack.first().map(|parent| parent.revision)
             })
             .unwrap_or_default();
-
-        base_revision = Box::pin(find_divergence_base(
+        let common_ancestor = Box::pin(find_common_revision_in_history_lines(
             repository.clone(),
             source_revision,
             target_revision,
-            base_branch_point,
         ))
         .await?
-        .base_revision;
+        .or(branch_point)
+        .unwrap_or_default();
+
+        lore_debug!("History lines give common ancestor {common_ancestor}");
+
+        common_ancestor
+    };
+
+    let base_revision = find_common_ancestor_from_merges(
+        repository.clone(),
+        source_branch,
+        source_revision,
+        target_branch,
+        target_revision,
+        common_ancestor,
+    )
+    .await?
+    .unwrap_or(common_ancestor);
+
+    lore_debug!(
+        "Resolved diff base {base_revision} for source branch {source_branch} revision {source_revision} and target branch {target_branch} revision {target_revision}"
+    );
+
+    if base_revision.is_zero() {
+        lore_warn!(
+            "Found no common ancestor between branch {source_branch} revision {source_revision} and branch {target_branch} revision {target_revision}"
+        );
+        return Err(BranchError::from(Divergent));
     }
 
     Ok(base_revision)
@@ -3200,204 +3166,484 @@ pub async fn diff3_collect_with_options(
     Ok(revision::diff_result_from_summary_and_items(summary, items))
 }
 
+/// Where two branches meet according to their branch stacks.
 #[derive(Debug)]
-pub struct RevisionDivergence {
-    pub base_revision: Hash,
-    pub self_distance: usize,
-    pub other_distance: usize,
+struct SharedBranchPoint {
+    /// Branch both sides descend from.
+    branch: BranchId,
+    /// Revision on the shared branch the source side descends from.
+    source_point: Hash,
+    /// Revision on the shared branch the target side descends from.
+    target_point: Hash,
 }
 
-pub async fn find_divergence_base(
+/// Best common ancestor of two branches, for use as the base of a 3-way diff and
+/// as the floor of the search for a better one.
+///
+/// The branch stacks name the branch both sides descend from and the revision on
+/// it each side branched at, matched on branch id alone. From those two points:
+///
+/// * the same revision on both sides is the answer;
+/// * otherwise only the higher numbered one can reach the other by following
+///   parents, so that line is followed back to the lower one;
+/// * failing that the branch was rewritten and the two points sit on lines that
+///   only meet further down, so both lines are followed past the lower point;
+/// * failing that, within the search depth, the lower branch point is returned.
+///
+/// The last case is a best guess rather than a proven ancestor, which is the
+/// right trade: the two points are tens of thousands of revisions apart on a busy
+/// default branch, and the branches were created from that point whatever a
+/// rewrite has since done to the line it sits on.
+///
+/// `None` only when the stacks name no branch in common. Every branch is created
+/// from another, so that is an invalid branch configuration rather than a history
+/// the search failed on, and the caller treats it as fatal.
+async fn find_common_ancestor_from_branch_points(
+    repository: Arc<RepositoryContext>,
+    source_branch: BranchId,
+    source_revision: Hash,
+    source_stack: &[BranchPoint],
+    target_branch: BranchId,
+    target_revision: Hash,
+    target_stack: &[BranchPoint],
+) -> Result<Option<Hash>, BranchError> {
+    lore_debug!(
+        "Find common ancestor from branch points of source branch {source_branch} revision {source_revision} and target branch {target_branch} revision {target_revision}"
+    );
+
+    let Some(shared) = find_shared_branch_point(
+        source_branch,
+        source_revision,
+        source_stack,
+        target_branch,
+        target_revision,
+        target_stack,
+    ) else {
+        return Ok(None);
+    };
+    if shared.source_point == shared.target_point {
+        lore_debug!(
+            "Found common branch {} in the branch stacks, both sides at branch point {}",
+            shared.branch,
+            shared.source_point
+        );
+        return Ok(Some(shared.source_point));
+    }
+
+    let (source_number, target_number) = join!(
+        revision_number_or_zero(repository.clone(), shared.source_point),
+        revision_number_or_zero(repository.clone(), shared.target_point)
+    );
+    lore_debug!(
+        "Found common branch {} in the branch stacks, source branch point {} -> {source_number} and target branch point {} -> {target_number}",
+        shared.branch,
+        shared.source_point,
+        shared.target_point
+    );
+    // Only the higher numbered point can reach the other, a revision's number
+    // being one past its parents'. On equal numbers the source is taken as the
+    // newer and so the target as the older, by definition rather than by
+    // measurement: neither reaches the other, and the target is the side being
+    // diffed into.
+    let (newer_point, newer_number, older_point, older_number) = if source_number >= target_number {
+        (
+            shared.source_point,
+            source_number,
+            shared.target_point,
+            target_number,
+        )
+    } else {
+        (
+            shared.target_point,
+            target_number,
+            shared.source_point,
+            source_number,
+        )
+    };
+
+    // TODO(mjansson): By keeping branch epochs and sequentially force push, we can
+    //                 avoid trying to detect divergence here if branch points are known
+    //                 to be from the same epoch
+    let line_search = if source_number == target_number {
+        // Two revisions of one number are never one another's ancestor, so the
+        // points are divergent on the numbers alone and following the line would
+        // spend its whole budget establishing that.
+        HistoryLineSearch::Diverged
+    } else {
+        Box::pin(find_revision_in_history_line(
+            repository.clone(),
+            newer_point,
+            newer_number,
+            older_point,
+            older_number,
+        ))
+        .await?
+    };
+
+    match line_search {
+        HistoryLineSearch::Reached => return Ok(Some(older_point)),
+        HistoryLineSearch::Diverged => {
+            if let Some(shared_revision) = Box::pin(find_common_revision_in_history_lines(
+                repository,
+                newer_point,
+                older_point,
+            ))
+            .await?
+            {
+                lore_debug!("Branch point lines meet at {shared_revision}");
+                return Ok(Some(shared_revision));
+            }
+        }
+        HistoryLineSearch::Exhausted => {
+            lore_debug!("Skipping the search for where the lines meet, the budget is spent");
+        }
+    }
+
+    lore_warn!(
+        "Found no revision shared by branch point {newer_point} -> {newer_number} and branch point {older_point} -> {older_number} on common branch {}, using {older_point} -> {older_number} as the common ancestor",
+        shared.branch
+    );
+
+    Ok(Some(older_point))
+}
+
+/// Match the two branch stacks to find the branch they share and the revision on
+/// it each side descends from. `None` means the stacks share no branch, which
+/// cannot happen for branches created from one another.
+///
+/// A branch is its own shared branch when the other side's stack names it: the
+/// point on that side is then its tip, since the branch carries all of its own
+/// history.
+fn find_shared_branch_point(
+    source_branch: BranchId,
+    source_revision: Hash,
+    source_stack: &[BranchPoint],
+    target_branch: BranchId,
+    target_revision: Hash,
+    target_stack: &[BranchPoint],
+) -> Option<SharedBranchPoint> {
+    if let Some(source_parent) = source_stack
+        .iter()
+        .find(|source_parent| source_parent.branch == target_branch)
+    {
+        return Some(SharedBranchPoint {
+            branch: target_branch,
+            source_point: source_parent.revision,
+            target_point: target_revision,
+        });
+    }
+
+    for target_parent in target_stack.iter() {
+        if target_parent.branch == source_branch {
+            return Some(SharedBranchPoint {
+                branch: source_branch,
+                source_point: source_revision,
+                target_point: target_parent.revision,
+            });
+        }
+
+        if let Some(source_parent) = source_stack
+            .iter()
+            .find(|source_parent| source_parent.branch == target_parent.branch)
+        {
+            return Some(SharedBranchPoint {
+                branch: target_parent.branch,
+                source_point: source_parent.revision,
+                target_point: target_parent.revision,
+            });
+        }
+    }
+
+    None
+}
+
+async fn revision_number_or_zero(repository: Arc<RepositoryContext>, revision: Hash) -> u64 {
+    match State::deserialize(repository, revision).await {
+        Ok(state) => state.revision_number(),
+        Err(err) => {
+            lore_warn!("Could not read revision {revision} to bound a history search: {err}");
+            0
+        }
+    }
+}
+
+/// Outcome of following one history line back to a revision.
+#[derive(Debug, PartialEq, Eq)]
+enum HistoryLineSearch {
+    /// The line reached the revision, so the two are on one line.
+    Reached,
+    /// The line passed below the revision's number without reaching it, so the
+    /// two are on lines that split somewhere further down.
+    Diverged,
+    /// The walk stopped at its revision budget, which proves neither.
+    Exhausted,
+}
+
+/// Follow `newer_revision`'s history line back to `older_revision` to establish
+/// that the two sit on one line, which makes the older one their base.
+///
+/// Self parents only. A revision merged in from elsewhere is not on this line,
+/// and `find_common_ancestor_from_merges` is what reaches those.
+///
+/// Only this direction can succeed: a revision's number is one past its parents',
+/// so a walk backwards never reaches a higher numbered revision. The walk stops
+/// once the line drops below `older_revision_number`, and after
+/// `MAX_DIVERGENT_HISTORY_LENGTH` revisions.
+///
+/// The two ways of not finding it are worth telling apart.
+/// [`HistoryLineSearch::Diverged`] is a result: the line went past where the
+/// revision would have been. [`HistoryLineSearch::Exhausted`] is an absence of
+/// one, and searching the two lines for where they meet - which is bounded the
+/// same way - cannot do better from there.
+async fn find_revision_in_history_line(
+    repository: Arc<RepositoryContext>,
+    newer_revision: Hash,
+    newer_revision_number: u64,
+    older_revision: Hash,
+    older_revision_number: u64,
+) -> Result<HistoryLineSearch, BranchError> {
+    lore_debug!(
+        "Follow {newer_revision} -> {newer_revision_number} back to {older_revision} -> {older_revision_number}"
+    );
+
+    if newer_revision == older_revision {
+        return Ok(HistoryLineSearch::Reached);
+    }
+
+    let mut line = load_history_line(repository.clone(), newer_revision).await;
+    let mut scanned = 0;
+
+    loop {
+        if line[scanned..].contains(&older_revision) {
+            lore_debug!(
+                "Revision {older_revision} -> {older_revision_number} is on the line from {newer_revision}"
+            );
+            return Ok(HistoryLineSearch::Reached);
+        }
+        scanned = line.len();
+
+        if line.len() >= MAX_DIVERGENT_HISTORY_LENGTH {
+            lore_warn!(
+                "Reached maximum history depth of {MAX_DIVERGENT_HISTORY_LENGTH} following {newer_revision} back to {older_revision}"
+            );
+            return Ok(HistoryLineSearch::Exhausted);
+        }
+
+        if load_additional_history(repository.clone(), &mut line, older_revision_number).await {
+            if line[scanned..].contains(&older_revision) {
+                lore_debug!(
+                    "Revision {older_revision} -> {older_revision_number} is on the line from {newer_revision}"
+                );
+                return Ok(HistoryLineSearch::Reached);
+            }
+
+            lore_debug!(
+                "Line from {newer_revision} passed revision number {older_revision_number} without reaching {older_revision}"
+            );
+            return Ok(HistoryLineSearch::Diverged);
+        }
+    }
+}
+
+/// Follow both history lines back until they meet, for the case where neither
+/// revision is on the other's line because the branch under them was rewritten.
+///
+/// Self parents only, on both sides, so the revision found is where the two lines
+/// converge rather than the newest revision the two can reach through merges.
+///
+/// Both lines are followed to the root revisions, each capped at
+/// `MAX_DIVERGENT_HISTORY_LENGTH`. `Ok(None)` means the cap was reached first, or
+/// that the lines genuinely share nothing.
+async fn find_common_revision_in_history_lines(
     repository: Arc<RepositoryContext>,
     self_revision: Hash,
     other_revision: Hash,
-    base_revision: Hash,
-) -> Result<RevisionDivergence, BranchError> {
-    lore_debug!(
-        "Find base revision from {self_revision} and {other_revision} with given base {base_revision}"
+) -> Result<Option<Hash>, BranchError> {
+    lore_debug!("Follow {self_revision} and {other_revision} back until the lines meet");
+
+    // Both lines are fetched at once. Each is a round trip when the history is not
+    // cached, and neither depends on the other.
+    let (mut self_line, mut other_line) = join!(
+        load_history_line(repository.clone(), self_revision),
+        load_history_line(repository.clone(), other_revision)
     );
 
-    let base_revision_number = State::deserialize(repository.clone(), base_revision)
-        .await
-        .forward::<BranchError>("Failed to deserialize base revision state")?
-        .revision_number();
+    // Each line keeps a lookup of itself, extended as the line is, so a round
+    // tests the revisions it just loaded against everything the other side holds
+    // without rebuilding anything or rewalking a pair.
+    // Spelled out rather than aliased: a type alias naming a `HashSet` with a
+    // hasher is an item cbindgen parses, and it cannot represent a second type
+    // parameter on it.
+    let mut self_lookup: std::collections::HashSet<
+        Hash,
+        std::hash::BuildHasherDefault<RevisionHasher>,
+    > = self_line.iter().copied().collect();
+    let mut other_lookup: std::collections::HashSet<
+        Hash,
+        std::hash::BuildHasherDefault<RevisionHasher>,
+    > = other_line.iter().copied().collect();
 
-    let mut source_reached_base = false;
-    let mut target_reached_base = false;
-
-    lore_debug!("Batch fetch history from {self_revision}");
-    let mut source_revisions = find::batch_load_history(repository.clone(), self_revision).await;
-    if source_revisions.is_empty() {
-        // Try walking history locally
-        let mut load_count = 0;
-        if let Ok(mut state_iter) =
-            state::State::deserialize(repository.clone(), self_revision).await
-        {
-            while !state_iter.parent_self().is_zero()
-                && state_iter.parent_self() != base_revision
-                && load_count < 100
-                && !source_reached_base
-            {
-                let revision_next = state_iter.parent_self();
-                source_revisions.push(revision_next);
-                if let Ok(state_next) =
-                    state::State::deserialize(repository.clone(), revision_next).await
-                {
-                    if state_next.revision_number() <= base_revision_number {
-                        source_reached_base = true;
-                    }
-                    state_iter = state_next;
-                    load_count += 1;
-                } else {
-                    source_reached_base = true;
-                }
-            }
-        }
-    }
-
-    lore_debug!("Batch fetch history from {other_revision}");
-    let mut target_revisions = find::batch_load_history(repository.clone(), other_revision).await;
-    if target_revisions.is_empty() {
-        // Try walking history locally
-        lore_debug!("Found no revision from target, local walk");
-        let mut load_count = 0;
-        if let Ok(mut state_iter) =
-            state::State::deserialize(repository.clone(), other_revision).await
-        {
-            while !state_iter.parent_self().is_zero()
-                && state_iter.parent_self() != base_revision
-                && load_count < 100
-                && !target_reached_base
-            {
-                let revision_next = state_iter.parent_self();
-                target_revisions.push(revision_next);
-                if let Ok(state_next) =
-                    state::State::deserialize(repository.clone(), revision_next).await
-                {
-                    if state_next.revision_number() <= base_revision_number {
-                        target_reached_base = true;
-                    }
-                    state_iter = state_next;
-                    load_count += 1;
-                } else {
-                    target_reached_base = true;
-                }
-            }
-        }
-    }
+    let mut self_ended = false;
+    let mut other_ended = false;
+    let mut self_loaded = 0;
+    let mut other_loaded = 0;
 
     loop {
-        for (source_count, source) in source_revisions.iter().enumerate() {
-            for (target_count, target) in target_revisions.iter().enumerate() {
-                lore_trace!(
-                    "Check source revision {} against target revision {}",
-                    *source,
-                    *target
-                );
-                if *source == *target {
-                    let divergence = RevisionDivergence {
-                        base_revision: *source,
-                        self_distance: source_count,
-                        other_distance: target_count,
-                    };
-                    lore_debug!("Found base revision {divergence:?}");
-                    return Ok(divergence);
-                }
-                if *target == base_revision || target.is_zero() {
-                    target_reached_base = true;
-                    break;
-                }
-            }
+        // Scanning the line rather than the lookup is what makes this the newest
+        // shared revision: the line is in history order, a set is in neither.
+        if let Some(shared) = self_line[self_loaded..]
+            .iter()
+            .find(|revision| other_lookup.contains(*revision))
+            .copied()
+        {
+            return Ok(Some(shared));
+        }
+        if let Some(shared) = other_line[other_loaded..]
+            .iter()
+            .find(|revision| self_lookup.contains(*revision))
+            .copied()
+        {
+            return Ok(Some(shared));
+        }
+        self_loaded = self_line.len();
+        other_loaded = other_line.len();
 
-            if *source == base_revision || source.is_zero() {
-                source_reached_base = true;
-                break;
-            }
-
-            if source_reached_base && target_reached_base {
-                break;
-            }
+        if self_ended && other_ended {
+            return Ok(None);
         }
 
-        if source_reached_base && target_reached_base {
-            lore_debug!("Both history lines reached base revision or revision number");
-            return Ok(RevisionDivergence {
-                base_revision,
-                self_distance: source_revisions.len(),
-                other_distance: target_revisions.len(),
-            });
-        }
-
-        // Exit condition - too many iterations
-        let can_fetch_more_source =
-            source_revisions.len() < MAX_DIVERGENT_HISTORY_LENGTH && !source_reached_base;
-        let can_fetch_more_target =
-            target_revisions.len() < MAX_DIVERGENT_HISTORY_LENGTH && !target_reached_base;
-        if !can_fetch_more_source && !can_fetch_more_target {
+        let extend_self = self_line.len() < MAX_DIVERGENT_HISTORY_LENGTH && !self_ended;
+        let extend_other = other_line.len() < MAX_DIVERGENT_HISTORY_LENGTH && !other_ended;
+        if !extend_self && !extend_other {
             lore_warn!(
-                "Reached maximum history depth of {MAX_DIVERGENT_HISTORY_LENGTH} without finding common base revision, fall back to common branch point {base_revision}"
+                "Reached maximum history depth of {MAX_DIVERGENT_HISTORY_LENGTH} following {self_revision} and {other_revision} back to a shared revision"
             );
-            return Ok(RevisionDivergence {
-                base_revision,
-                self_distance: 0,
-                other_distance: 0,
-            });
+            return Ok(None);
         }
 
-        if !source_reached_base {
-            source_reached_base = load_additional_history(
-                repository.clone(),
-                &mut source_revisions,
-                base_revision,
-                base_revision_number,
-            )
-            .await;
-        }
-
-        if !target_reached_base {
-            target_reached_base = load_additional_history(
-                repository.clone(),
-                &mut target_revisions,
-                base_revision,
-                base_revision_number,
-            )
-            .await;
-        }
+        // Two round trips that need not wait on each other.
+        join!(
+            async {
+                if extend_self {
+                    self_ended =
+                        load_additional_history(repository.clone(), &mut self_line, 0).await;
+                    self_lookup.extend(self_line[self_loaded..].iter().copied());
+                }
+            },
+            async {
+                if extend_other {
+                    other_ended =
+                        load_additional_history(repository.clone(), &mut other_line, 0).await;
+                    other_lookup.extend(other_line[other_loaded..].iter().copied());
+                }
+            }
+        );
     }
 }
 
-async fn load_additional_history(
-    repository: Arc<RepositoryContext>,
-    history: &mut Vec<Hash>,
-    base_revision: Hash,
-    base_revision_number: u64,
-) -> bool {
-    let mut additional = find::batch_load_history(
-        repository.clone(),
-        if let Some(last) = history.last() {
-            *last
-        } else {
-            base_revision
-        },
-    )
-    .await;
+/// A revision hash is already uniformly distributed, so its leading bytes are as
+/// good a bucket index as anything derived from all 32 - and free. Hashing the
+/// hash again is the cost this avoids.
+#[derive(Default)]
+struct RevisionHasher(u64);
 
-    if additional.is_empty() {
-        return true;
+impl std::hash::Hasher for RevisionHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut leading = [0u8; 8];
+        let taken = bytes.len().min(leading.len());
+        leading[..taken].copy_from_slice(&bytes[..taken]);
+        self.0 = u64::from_ne_bytes(leading);
     }
 
-    let Ok(state) = State::deserialize(repository.clone(), *additional.last().unwrap()).await
-    else {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Load a line of revisions from `revision` backwards through self parents. Falls
+/// back to a local walk when the batch load comes back empty, so a repository
+/// with no reachable remote still contributes the line it has cached.
+async fn load_history_line(repository: Arc<RepositoryContext>, revision: Hash) -> Vec<Hash> {
+    let mut history = find::batch_load_history(repository.clone(), revision).await;
+    if !history.is_empty() {
+        // The caller extends this a batch at a time up to the search depth, so
+        // take the growth in one allocation rather than a copy per doubling.
+        history.reserve(MAX_DIVERGENT_HISTORY_LENGTH.saturating_sub(history.len()));
+        return history;
+    }
+
+    lore_debug!("Found no revision from {revision}, walking locally");
+
+    let mut history = Vec::new();
+    let Ok(mut state_iter) = state::State::deserialize(repository.clone(), revision).await else {
+        return history;
+    };
+    history.push(revision);
+
+    while history.len() < find::BATCH_COUNT && !state_iter.parent_self().is_zero() {
+        let revision_next = state_iter.parent_self();
+        let Ok(state_next) = state::State::deserialize(repository.clone(), revision_next).await
+        else {
+            break;
+        };
+        history.push(revision_next);
+        state_iter = state_next;
+    }
+
+    history
+}
+
+/// Whether a line has been followed to or past `floor_revision_number`, leaving
+/// nothing below it worth loading. A line that cannot be read any further counts
+/// as reached for the same reason.
+async fn history_reached_floor(
+    repository: Arc<RepositoryContext>,
+    history: &[Hash],
+    floor_revision_number: u64,
+) -> bool {
+    let Some(oldest) = history.last() else {
         return true;
     };
 
-    if state.revision_number() < base_revision_number {
+    let Ok(state) = State::deserialize(repository, *oldest).await else {
+        return true;
+    };
+
+    state.revision_number() <= floor_revision_number
+}
+
+/// Extend a line with the next batch of older revisions. Returns whether the line
+/// has nothing further worth loading, either because it reached the floor or
+/// because it ran out.
+async fn load_additional_history(
+    repository: Arc<RepositoryContext>,
+    history: &mut Vec<Hash>,
+    floor_revision_number: u64,
+) -> bool {
+    let Some(&last) = history.last() else {
+        return true;
+    };
+
+    let additional = find::batch_load_history(repository.clone(), last).await;
+
+    // `batch_load_history` yields its start revision first, and that revision is
+    // already the tail of `history`. Appending it again both duplicates work for
+    // the caller's comparison and, once the line is exhausted, keeps reporting
+    // progress that does not exist.
+    let fresh = match additional.split_first() {
+        Some((first, rest)) if *first == last => rest,
+        _ => additional.as_slice(),
+    };
+
+    if fresh.is_empty() {
         return true;
     }
 
-    history.append(&mut additional);
+    // Appended before the floor is tested, since this batch still has to be
+    // compared - it can hold the revision being searched for.
+    history.extend_from_slice(fresh);
 
-    false
+    history_reached_floor(repository, history, floor_revision_number).await
 }
 
 struct WalkVisit {
@@ -3405,114 +3651,136 @@ struct WalkVisit {
     target: bool,
 }
 
+/// State shared by every walker of one `find_common_ancestor_from_merges` search.
+struct AncestorWalk {
+    /// Which of the two walks has reached each revision. A revision reached by
+    /// both is a common ancestor.
+    visited: DashMap<Hash, WalkVisit>,
+    /// Highest-numbered revision reached by both walks. Never seeded with the
+    /// caller's floor, so a search that finds nothing stays distinguishable from
+    /// one that finds the floor.
+    common: RwLock<Option<(u64, Hash)>>,
+    /// Revision the walks stop at, from the caller's base revision. Zero
+    /// searches the whole history.
+    floor_revision: Hash,
+    /// Revision number of [`Self::floor_revision`], which the walks may not go
+    /// below.
+    floor_revision_number: u64,
+    /// First read failure that cut a walk short, kept so the search can report
+    /// an incomplete history rather than an absent common ancestor.
+    failure: RwLock<Option<StateError>>,
+}
+
+impl AncestorWalk {
+    fn new(floor_revision: Hash, floor_revision_number: u64) -> Self {
+        Self {
+            visited: DashMap::new(),
+            common: RwLock::new(None),
+            floor_revision,
+            floor_revision_number,
+            failure: RwLock::new(None),
+        }
+    }
+
+    async fn prune_at_or_below(&self) -> u64 {
+        match *self.common.read().await {
+            Some((found_revision_number, _found_revision)) => {
+                std::cmp::max(found_revision_number, self.floor_revision_number)
+            }
+            None => self.floor_revision_number,
+        }
+    }
+}
+
 async fn find_ancestor_walker(
     repository: Arc<RepositoryContext>,
     revision_start: Hash,
-    revision_stop: Hash,
-    visited: Arc<DashMap<Hash, WalkVisit>>,
-    common: Arc<RwLock<Option<(u64, Hash)>>>,
+    walk: Arc<AncestorWalk>,
     is_target: bool,
 ) {
     let mut tasks = JoinSet::new();
 
     let mut revision = revision_start;
     while revision != Hash::default() {
-        if let Ok(state) = state::State::deserialize(repository.clone(), revision).await {
-            // Update bookkeeping on revision visits.
-            //
-            // Guard scope is this statement and no arm awaits, so the concurrent
-            // sibling walkers sharing `visited` cannot build a wait cycle.
-            #[allow(clippy::disallowed_methods)]
-            let both_visited = match visited.entry(revision) {
-                Entry::Occupied(mut visited) => {
-                    let visited = visited.get_mut();
-                    if is_target {
-                        // If encountering a circular dependency, iteration can stop.
-                        if visited.target {
-                            break;
-                        }
-                        visited.target = true;
-                    } else {
-                        // If encountering a circular dependency, iteration can stop.
-                        if visited.source {
-                            break;
-                        }
-                        visited.source = true;
-                    }
-                    visited.source && visited.target
+        let state = match state::State::deserialize(repository.clone(), revision).await {
+            Ok(state) => state,
+            Err(err) => {
+                lore_warn!("Could not deserialize state for {revision} - aborting walk: {err}");
+                let mut failure = walk.failure.write().await;
+                if failure.is_none() {
+                    *failure = Some(err);
                 }
-                Entry::Vacant(entry) => {
-                    entry.insert(WalkVisit {
-                        source: !is_target,
-                        target: is_target,
-                    });
-                    false
-                }
-            };
+                break;
+            }
+        };
 
-            let state_revision = state.revision();
-            let state_revision_number = state.revision_number();
-
-            // Update bookkeeping when encountering a common ancestor with a higher revision number.
-            if both_visited {
-                let mut common = common.write().await;
-
-                if let Some((found_revision_number, _found_revision)) = *common {
-                    if state_revision_number > found_revision_number {
-                        *common = Some((state_revision_number, state_revision));
+        // Guard scope is this statement and no arm awaits, so the concurrent
+        // sibling walkers sharing `visited` cannot build a wait cycle.
+        #[allow(clippy::disallowed_methods)]
+        let both_visited = match walk.visited.entry(revision) {
+            Entry::Occupied(mut visited) => {
+                let visited = visited.get_mut();
+                if is_target {
+                    // If encountering a circular dependency, iteration can stop.
+                    if visited.target {
+                        break;
                     }
+                    visited.target = true;
                 } else {
+                    // If encountering a circular dependency, iteration can stop.
+                    if visited.source {
+                        break;
+                    }
+                    visited.source = true;
+                }
+                visited.source && visited.target
+            }
+            Entry::Vacant(entry) => {
+                entry.insert(WalkVisit {
+                    source: !is_target,
+                    target: is_target,
+                });
+                false
+            }
+        };
+
+        let state_revision = state.revision();
+        let state_revision_number = state.revision_number();
+
+        if both_visited {
+            let mut common = walk.common.write().await;
+
+            if let Some((found_revision_number, _found_revision)) = *common {
+                if state_revision_number > found_revision_number {
                     *common = Some((state_revision_number, state_revision));
                 }
-
-                // If revision has been visited by both the target and source, iteration can stop.
-                break;
+            } else {
+                *common = Some((state_revision_number, state_revision));
             }
 
-            // If a common ancestor with a higher revision number was already found, iteration can stop.
-            {
-                if let Some((found_revision_number, _found_revision)) = *common.read().await
-                    && state_revision_number <= found_revision_number
-                {
-                    break;
-                }
-            }
-
-            // If revision equals the stop revision, iteration can stop.
-            if revision == revision_stop {
-                break;
-            }
-
-            // Walk other parent, if this is a merge.
-            let parent_other = state.parent_other();
-            if parent_other != Hash::default() {
-                lore_spawn!(tasks, {
-                    let repository = repository.clone();
-                    let visited = visited.clone();
-                    let common = common.clone();
-                    async move {
-                        find_ancestor_walker_recurse(
-                            repository,
-                            parent_other,
-                            revision_stop,
-                            visited,
-                            common,
-                            is_target,
-                        )
-                        .await;
-                    }
-                });
-            }
-
-            // Walk self parent.
-            revision = state.parent_self();
-        } else {
-            lore_warn!(
-                "Could not deserialize state for {} - aborting walk",
-                revision
-            );
             break;
         }
+
+        if state_revision_number <= walk.prune_at_or_below().await {
+            break;
+        }
+
+        if revision == walk.floor_revision {
+            break;
+        }
+
+        let parent_other = state.parent_other();
+        if parent_other != Hash::default() {
+            lore_spawn!(tasks, {
+                let repository = repository.clone();
+                let walk = walk.clone();
+                async move {
+                    find_ancestor_walker_recurse(repository, parent_other, walk, is_target).await;
+                }
+            });
+        }
+
+        revision = state.parent_self();
     }
 
     while let Some(_result) = tasks.join_next().await {}
@@ -3521,107 +3789,113 @@ async fn find_ancestor_walker(
 fn find_ancestor_walker_recurse(
     repository: Arc<RepositoryContext>,
     revision_start: Hash,
-    revision_stop: Hash,
-    visited: Arc<DashMap<Hash, WalkVisit>>,
-    common: Arc<RwLock<Option<(u64, Hash)>>>,
+    walk: Arc<AncestorWalk>,
     is_target: bool,
 ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
     Box::pin(find_ancestor_walker(
         repository,
         revision_start,
-        revision_stop,
-        visited,
-        common,
+        walk,
         is_target,
     ))
 }
 
-async fn find_ancestor_revision(
+/// Walk both branches' histories backwards for the newest revision reachable
+/// from both, which is the best available 3-way base.
+///
+/// Both parents, so a revision merged in from elsewhere counts as reachable. That
+/// is what lets this improve on a branch point: a merge that already carried one
+/// branch into the other leaves a revision newer than where they parted.
+///
+/// `base_revision` is a floor, not an answer: the walks stop there and prune any
+/// revision at or below its revision number. Pass `Hash::default()` to search
+/// with no floor.
+///
+/// Returns `Ok(None)` when the walks completed without finding anything above
+/// the floor, so the caller keeps its own base. Returns `Err` when a revision
+/// state could not be read and no common ancestor was found, so a transient read
+/// failure is never reported as an absent common ancestor.
+async fn find_common_ancestor_from_merges(
     repository: Arc<RepositoryContext>,
     source_branch: BranchId,
     source_revision: Hash,
     target_branch: BranchId,
     target_revision: Hash,
     base_revision: Hash,
-) -> Option<Hash> {
+) -> Result<Option<Hash>, BranchError> {
     let mut tasks = JoinSet::new();
 
-    // Bookkeeping to hold if a revision has been visited by the source walk and/or the target walk.
-    let visited: Arc<DashMap<Hash, WalkVisit>> = Arc::new(DashMap::new());
+    let floor_revision_number = match State::deserialize(repository.clone(), base_revision).await {
+        Ok(state) => state.revision_number(),
+        Err(err) => {
+            // Leaves the search unbounded, which still answers correctly but walks
+            // both histories to their root revisions.
+            lore_warn!(
+                "Could not read base revision {base_revision} to bound the common ancestor search: {err}"
+            );
+            0
+        }
+    };
 
-    // Bookkeeping to hold the common ancestor with the highest revision number.
-    let base_revision_number = State::deserialize(repository.clone(), base_revision)
-        .await
-        .map(|state| state.revision_number())
-        .unwrap_or_default();
-    let common: Arc<RwLock<Option<(u64, Hash)>>> =
-        Arc::new(RwLock::new(Some((base_revision_number, base_revision))));
+    lore_debug!(
+        "Find common ancestor from merges of source branch {source_branch} revision {source_revision} and target branch {target_branch} revision {target_revision}, above base revision {base_revision} -> {floor_revision_number}"
+    );
 
-    // Start walking source.
+    let walk = Arc::new(AncestorWalk::new(base_revision, floor_revision_number));
+
     lore_spawn!(tasks, {
         let repository = repository.clone();
-        let visited = visited.clone();
-        let common = common.clone();
+        let walk = walk.clone();
         let is_target = false;
         async move {
             lore_debug!(
                 "Walking backwards on source branch {source_branch} from {source_revision}"
             );
 
-            find_ancestor_walker(
-                repository,
-                source_revision,
-                base_revision,
-                visited,
-                common,
-                is_target,
-            )
-            .await;
+            find_ancestor_walker(repository, source_revision, walk, is_target).await;
         }
     });
 
-    // Start walking target.
     lore_spawn!(tasks, {
         let repository = repository.clone();
-        let visited = visited.clone();
-        let common = common.clone();
+        let walk = walk.clone();
         let is_target = true;
         async move {
             lore_debug!(
                 "Walking backwards on target branch {target_branch} from {target_revision}"
             );
 
-            find_ancestor_walker(
-                repository,
-                target_revision,
-                base_revision,
-                visited,
-                common,
-                is_target,
-            )
-            .await;
+            find_ancestor_walker(repository, target_revision, walk, is_target).await;
         }
     });
 
-    // Wait until both walks are finished.
     while let Some(_result) = tasks.join_next().await {}
 
-    // Process results.
-    if let Some((revision_number, revision)) = *common.read().await {
-        lore_debug!(
-            "Revision {} -> {} found as common ancestor",
-            revision,
-            revision_number
-        );
+    let found = *walk.common.read().await;
+    let failure = walk.failure.write().await.take();
 
-        Some(revision)
-    } else {
-        lore_debug!(
-            "Revision {} used as common ancestor because walk found no result",
-            base_revision
-        );
+    match (found, failure) {
+        (Some((revision_number, revision)), failure) => {
+            if let Some(err) = failure {
+                lore_warn!(
+                    "Revision {revision} -> {revision_number} found as common ancestor, but part of the history could not be read, so a newer common ancestor may exist: {err}"
+                );
+            } else {
+                lore_debug!("Revision {revision} -> {revision_number} found as common ancestor");
+            }
 
-        Some(base_revision)
+            Ok(Some(revision))
+        }
+        (None, Some(err)) => Err(err).forward::<BranchError>(
+            "Failed to read revision history while searching for a common ancestor",
+        ),
+        (None, None) => {
+            lore_debug!(
+                "Walk found no common ancestor newer than revision {base_revision} -> {floor_revision_number}, keeping it as base"
+            );
+
+            Ok(None)
+        }
     }
 }
 
@@ -3658,4 +3932,764 @@ pub fn dispatch_diff_events(diff: &DiffResult) {
     event::LoreEvent::BranchDiffConflictEnd(LoreBranchDiffConflictEndEventData::default()).send();
 
     event::LoreEvent::BranchDiffEnd(LoreBranchDiffEndEventData::default()).send();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::path::RelativePathBuf;
+
+    fn branch_id(byte: u8) -> BranchId {
+        BranchId::from([byte; 16])
+    }
+
+    fn revision(byte: u8) -> Hash {
+        Hash::from([byte; 32])
+    }
+
+    fn branch_point(branch: u8, revision_byte: u8) -> BranchPoint {
+        BranchPoint {
+            branch: branch_id(branch),
+            revision: revision(revision_byte),
+        }
+    }
+
+    /// A branch merging the branch it was created from: the shared branch is the
+    /// target itself, so the target side contributes its tip and the source side
+    /// the revision it branched at.
+    #[test]
+    fn shared_branch_point_when_target_is_a_parent_of_source() {
+        let shared = find_shared_branch_point(
+            branch_id(1),
+            revision(10),
+            &[branch_point(2, 20), branch_point(3, 30)],
+            branch_id(2),
+            revision(21),
+            &[branch_point(3, 30)],
+        )
+        .expect("The target branch is named by the source stack");
+
+        assert_eq!(
+            shared.branch,
+            branch_id(2),
+            "The target branch is the shared one"
+        );
+        assert_eq!(shared.source_point, revision(20));
+        assert_eq!(shared.target_point, revision(21));
+    }
+
+    /// The same relation seen from the other side.
+    #[test]
+    fn shared_branch_point_when_source_is_a_parent_of_target() {
+        let shared = find_shared_branch_point(
+            branch_id(2),
+            revision(21),
+            &[branch_point(3, 30)],
+            branch_id(1),
+            revision(10),
+            &[branch_point(2, 20), branch_point(3, 30)],
+        )
+        .expect("The source branch is named by the target stack");
+
+        assert_eq!(
+            shared.branch,
+            branch_id(2),
+            "The source branch is the shared one"
+        );
+        assert_eq!(shared.source_point, revision(21));
+        assert_eq!(shared.target_point, revision(20));
+    }
+
+    /// Siblings created from the default branch, which is where both stacks end.
+    #[test]
+    fn sibling_branches_of_the_root_branch_meet_at_their_branch_points() {
+        let shared = find_shared_branch_point(
+            branch_id(1),
+            revision(10),
+            &[branch_point(9, 20)],
+            branch_id(2),
+            revision(11),
+            &[branch_point(9, 21)],
+        )
+        .expect("Both stacks name the same branch");
+
+        assert_eq!(
+            shared.branch,
+            branch_id(9),
+            "A third branch both descend from"
+        );
+        assert_eq!(shared.source_point, revision(20));
+        assert_eq!(shared.target_point, revision(21));
+    }
+
+    /// Branch points are matched on branch id, so stacks recording different
+    /// revisions below the shared branch make no difference to which branch is
+    /// shared or which points are returned.
+    #[test]
+    fn stacks_are_matched_on_branch_id_alone() {
+        let shared = find_shared_branch_point(
+            branch_id(1),
+            revision(10),
+            &[branch_point(5, 20), branch_point(9, 30)],
+            branch_id(2),
+            revision(11),
+            &[branch_point(5, 21), branch_point(9, 31)],
+        )
+        .expect("Both stacks name branch 5");
+
+        assert_eq!(shared.source_point, revision(20));
+        assert_eq!(shared.target_point, revision(21));
+    }
+
+    /// The nearest shared branch wins, not the deepest.
+    #[test]
+    fn nearest_shared_branch_is_matched_first() {
+        let shared = find_shared_branch_point(
+            branch_id(1),
+            revision(10),
+            &[branch_point(5, 20), branch_point(9, 30)],
+            branch_id(2),
+            revision(11),
+            &[branch_point(5, 21), branch_point(9, 30)],
+        )
+        .expect("Both stacks name branch 5 and branch 9");
+
+        assert_eq!(
+            shared.source_point,
+            revision(20),
+            "Branch 5 is nearer than branch 9 and has to be the shared branch"
+        );
+    }
+
+    #[test]
+    fn stacks_sharing_no_branch_are_unresolvable() {
+        assert!(
+            find_shared_branch_point(
+                branch_id(1),
+                revision(10),
+                &[branch_point(5, 20)],
+                branch_id(2),
+                revision(11),
+                &[branch_point(6, 21)],
+            )
+            .is_none(),
+            "Stacks naming unrelated branches cannot be resolved"
+        );
+    }
+
+    #[test]
+    fn empty_stacks_are_unresolvable() {
+        assert!(
+            find_shared_branch_point(
+                branch_id(1),
+                revision(10),
+                &[],
+                branch_id(2),
+                revision(11),
+                &[],
+            )
+            .is_none(),
+            "Without stacks there is nothing to match"
+        );
+    }
+
+    /// Run a body with an execution context installed, which the revision store
+    /// reads through `execution_context()`.
+    async fn with_execution<F: Future>(body: F) -> F::Output {
+        let execution = Arc::new(crate::interface::ExecutionContext::new_client(
+            crate::interface::LoreGlobalArgs::default(),
+            crate::relay::EventDispatcher::no_dispatch(),
+        ));
+        lore_base::runtime::LORE_CONTEXT
+            .scope(execution, body)
+            .await
+    }
+
+    /// A repository backed by in-memory stores and no remote, so every read has to
+    /// come from the revisions the test wrote.
+    async fn null_repository() -> Arc<RepositoryContext> {
+        let immutable_store = lore_storage::local::immutable_store::create(
+            None::<&str>,
+            lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
+            false,
+            lore_storage::ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("in-memory immutable store");
+        let mutable_store = lore_storage::local::mutable_store::create(
+            None::<&str>,
+            lore_storage::MutableStoreSettings::default(),
+            immutable_store.clone(),
+        )
+        .await
+        .expect("in-memory mutable store");
+
+        Arc::new(RepositoryContext::new_null_context(
+            immutable_store,
+            mutable_store,
+        ))
+    }
+
+    /// Write a revision carrying nothing but its parent and number, which is all
+    /// the history search reads.
+    async fn write_revision(
+        repository: &Arc<RepositoryContext>,
+        parent: Hash,
+        revision_number: u64,
+    ) -> Hash {
+        let token = repository
+            .try_write_token()
+            .expect("a null context carries a write token");
+        // Behind an `Arc`, as every other holder of a `State` has it: a bare one
+        // is held across the serialize await, which puts the whole of it in this
+        // future rather than a pointer to it.
+        let state = Arc::new(State::new());
+        state.set_parent_self(parent);
+        state.set_revision_number(revision_number);
+        state
+            .serialize(repository.clone(), token)
+            .await
+            .expect("serializing the revision state")
+    }
+
+    /// Write a line of `count` revisions numbered from `first_revision_number`,
+    /// returning them oldest first.
+    async fn write_line(
+        repository: &Arc<RepositoryContext>,
+        parent: Hash,
+        first_revision_number: u64,
+        count: u64,
+    ) -> Vec<Hash> {
+        let mut line = Vec::new();
+        let mut parent = parent;
+        for offset in 0..count {
+            parent = write_revision(repository, parent, first_revision_number + offset).await;
+            line.push(parent);
+        }
+        line
+    }
+
+    /// The branch point of a branch that has not moved since it was created is
+    /// still on the line of the branch it was created from.
+    #[tokio::test]
+    async fn history_line_reaches_the_older_revision() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let line = write_line(&repository, Hash::default(), 1, 3).await;
+
+            let found = find_revision_in_history_line(repository, line[2], 3, line[0], 1)
+                .await
+                .expect("the search must not fail on readable lines");
+
+            assert_eq!(found, HistoryLineSearch::Reached);
+        }))
+        .await;
+    }
+
+    /// Two branch points at the same revision need no search at all.
+    #[tokio::test]
+    async fn history_line_reaches_the_same_revision_on_both_sides() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let line = write_line(&repository, Hash::default(), 1, 2).await;
+
+            let found = find_revision_in_history_line(repository, line[1], 2, line[1], 2)
+                .await
+                .expect("the search must not fail");
+
+            assert_eq!(found, HistoryLineSearch::Reached);
+        }))
+        .await;
+    }
+
+    /// The rewritten-branch shape: two revisions on sibling lines under a common
+    /// parent. The line passes the sibling's number without reaching it, which is
+    /// what tells the caller to go looking for where the lines meet.
+    #[tokio::test]
+    async fn history_line_diverges_from_a_sibling_line() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let shared = write_line(&repository, Hash::default(), 1, 2).await;
+            let newer = write_revision(&repository, shared[1], 13).await;
+            let older = write_revision(&repository, shared[1], 3).await;
+
+            let found = find_revision_in_history_line(repository, newer, 13, older, 3)
+                .await
+                .expect("passing the older revision's number is not a failure");
+
+            assert_eq!(
+                found,
+                HistoryLineSearch::Diverged,
+                "The sibling is not on the line, and claiming it is would put an unproven base in the diff"
+            );
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn history_line_diverges_from_a_line_sharing_no_revision() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let newer = write_line(&repository, Hash::default(), 11, 3).await;
+            let older = write_line(&repository, Hash::default(), 1, 3).await;
+
+            let found = find_revision_in_history_line(
+                repository,
+                *newer.last().unwrap(),
+                13,
+                *older.last().unwrap(),
+                3,
+            )
+            .await
+            .expect("running out of line is not a failure");
+
+            assert_eq!(
+                found,
+                HistoryLineSearch::Diverged,
+                "Reporting a base here would put a revision in the diff that is on neither line"
+            );
+        }))
+        .await;
+    }
+
+    /// Two lines that split under a shared parent meet again at that parent.
+    #[tokio::test]
+    async fn history_lines_meet_where_they_split() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let shared = write_line(&repository, Hash::default(), 1, 2).await;
+            let one = write_revision(&repository, shared[1], 13).await;
+            let other = write_revision(&repository, shared[1], 3).await;
+
+            let met = Box::pin(find_common_revision_in_history_lines(
+                repository, one, other,
+            ))
+            .await
+            .expect("the search must not fail on readable lines");
+
+            assert_eq!(
+                met,
+                Some(shared[1]),
+                "The revision the two lines split at is the newest they share"
+            );
+        }))
+        .await;
+    }
+
+    /// The newest shared revision wins, not the first one reached on either line.
+    #[tokio::test]
+    async fn history_lines_meet_at_the_newest_shared_revision() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let shared = write_line(&repository, Hash::default(), 1, 3).await;
+            let one = write_revision(&repository, shared[2], 13).await;
+            let other = write_revision(&repository, shared[2], 4).await;
+
+            let met = Box::pin(find_common_revision_in_history_lines(
+                repository, one, other,
+            ))
+            .await
+            .expect("the search must not fail on readable lines");
+
+            assert_eq!(met, Some(shared[2]));
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn history_lines_that_share_no_revision_meet_nowhere() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let one = write_line(&repository, Hash::default(), 1, 3).await;
+            let other = write_line(&repository, Hash::default(), 11, 3).await;
+
+            let met = Box::pin(find_common_revision_in_history_lines(
+                repository,
+                *one.last().unwrap(),
+                *other.last().unwrap(),
+            ))
+            .await
+            .expect("running out of line is not a failure");
+
+            assert_eq!(met, None);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn history_lines_that_cannot_be_read_meet_nowhere() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+
+            let met = Box::pin(find_common_revision_in_history_lines(
+                repository,
+                revision(200),
+                revision(201),
+            ))
+            .await
+            .expect("an unreadable line is not a failure of the search");
+
+            assert_eq!(met, None);
+        }))
+        .await;
+    }
+
+    /// A branch that has not moved since it was created: its branch point is still
+    /// on the line of the branch it was created from, so that point is the answer.
+    #[tokio::test]
+    async fn common_ancestor_is_the_branch_point_still_on_the_line() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let main_line = write_line(&repository, Hash::default(), 1, 4).await;
+
+            let found = find_common_ancestor_from_branch_points(
+                repository,
+                branch_id(1),
+                revision(10),
+                &[BranchPoint {
+                    branch: branch_id(9),
+                    revision: main_line[1],
+                }],
+                branch_id(9),
+                main_line[3],
+                &[],
+            )
+            .await
+            .expect("the search must not fail on readable lines");
+
+            assert_eq!(
+                found,
+                Some(main_line[1]),
+                "The branch point is reached by following the shared branch back"
+            );
+        }))
+        .await;
+    }
+
+    /// A rewritten shared branch: the two points sit on lines that split below
+    /// them, and the answer is where those lines meet.
+    #[tokio::test]
+    async fn common_ancestor_is_where_rewritten_lines_meet() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let shared = write_line(&repository, Hash::default(), 1, 2).await;
+            let source_point = write_revision(&repository, shared[1], 13).await;
+            let target_point = write_revision(&repository, shared[1], 3).await;
+
+            let found = find_common_ancestor_from_branch_points(
+                repository,
+                branch_id(1),
+                revision(10),
+                &[BranchPoint {
+                    branch: branch_id(9),
+                    revision: source_point,
+                }],
+                branch_id(2),
+                revision(11),
+                &[BranchPoint {
+                    branch: branch_id(9),
+                    revision: target_point,
+                }],
+            )
+            .await
+            .expect("the search must not fail on readable lines");
+
+            assert_eq!(found, Some(shared[1]));
+        }))
+        .await;
+    }
+
+    /// Branch points of equal revision number cannot reach one another, whatever
+    /// their hashes. The answer still comes from following both lines to where
+    /// they meet, rather than from taking one of the points.
+    #[tokio::test]
+    async fn common_ancestor_of_equal_numbered_points_is_where_lines_meet() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            // Same number, different parents, so the two are distinct revisions
+            // that provably cannot reach one another.
+            let shared = write_line(&repository, Hash::default(), 1, 2).await;
+            let source_point = write_revision(&repository, shared[1], 3).await;
+            let target_point = write_revision(&repository, shared[0], 3).await;
+
+            let found = find_common_ancestor_from_branch_points(
+                repository,
+                branch_id(1),
+                revision(10),
+                &[BranchPoint {
+                    branch: branch_id(9),
+                    revision: source_point,
+                }],
+                branch_id(2),
+                revision(11),
+                &[BranchPoint {
+                    branch: branch_id(9),
+                    revision: target_point,
+                }],
+            )
+            .await
+            .expect("the search must not fail on readable lines");
+
+            assert_eq!(
+                found,
+                Some(shared[0]),
+                "The lines meet at the revision they both descend from"
+            );
+        }))
+        .await;
+    }
+
+    /// Nothing found either way still answers, with the older of the two branch
+    /// points. It is a guess, and it beats refusing a diff the caller cannot
+    /// repair.
+    #[tokio::test]
+    async fn common_ancestor_falls_back_to_the_older_branch_point() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let source_line = write_line(&repository, Hash::default(), 11, 2).await;
+            let target_line = write_line(&repository, Hash::default(), 1, 2).await;
+
+            let found = find_common_ancestor_from_branch_points(
+                repository,
+                branch_id(1),
+                revision(10),
+                &[BranchPoint {
+                    branch: branch_id(9),
+                    revision: source_line[1],
+                }],
+                branch_id(2),
+                revision(11),
+                &[BranchPoint {
+                    branch: branch_id(9),
+                    revision: target_line[1],
+                }],
+            )
+            .await
+            .expect("falling back is not a failure");
+
+            assert_eq!(
+                found,
+                Some(target_line[1]),
+                "The lower numbered branch point is the guess, and it is never zero"
+            );
+        }))
+        .await;
+    }
+
+    /// Stacks naming no branch in common are the one case with no answer, which
+    /// the caller reports as an invalid branch configuration.
+    #[tokio::test]
+    async fn common_ancestor_is_absent_only_for_unshared_stacks() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+
+            let found = find_common_ancestor_from_branch_points(
+                repository,
+                branch_id(1),
+                revision(10),
+                &[BranchPoint {
+                    branch: branch_id(5),
+                    revision: revision(20),
+                }],
+                branch_id(2),
+                revision(11),
+                &[BranchPoint {
+                    branch: branch_id(6),
+                    revision: revision(21),
+                }],
+            )
+            .await
+            .expect("unshared stacks are not a failure of the search");
+
+            assert_eq!(found, None);
+        }))
+        .await;
+    }
+
+    /// An unreadable line cannot be followed, and the search says so rather than
+    /// answering with the revision it was asked to look for.
+    #[tokio::test]
+    async fn history_line_that_cannot_be_read_diverges() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+
+            let found =
+                find_revision_in_history_line(repository, revision(200), 2, revision(201), 1)
+                    .await
+                    .expect("an unreadable line is not a failure of the search");
+
+            assert_eq!(found, HistoryLineSearch::Diverged);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn history_line_of_an_unknown_revision_is_empty() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+
+            assert!(
+                load_history_line(repository, revision(200))
+                    .await
+                    .is_empty(),
+                "A revision that is not stored yields no line to search"
+            );
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reaching_the_floor_needs_a_readable_line_below_it() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let line = write_line(&repository, Hash::default(), 1, 3).await;
+
+            assert!(
+                history_reached_floor(repository.clone(), &[], 0).await,
+                "An empty line has nothing left to load"
+            );
+            assert!(
+                history_reached_floor(repository.clone(), &[revision(200)], 0).await,
+                "A line that cannot be read any further has nothing left to load"
+            );
+            assert!(
+                history_reached_floor(repository.clone(), &line[..1], 1).await,
+                "Revision number 1 is at a floor of 1"
+            );
+            assert!(
+                !history_reached_floor(repository, &line[2..], 1).await,
+                "Revision number 3 is above a floor of 1, so the line can still be followed"
+            );
+        }))
+        .await;
+    }
+
+    /// Extending a line that has reached its root revision adds nothing. Reporting
+    /// progress instead would keep the caller re-comparing the same line until its
+    /// depth limit stopped it.
+    #[tokio::test]
+    async fn extending_an_exhausted_line_reports_it_exhausted() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let line = write_line(&repository, Hash::default(), 1, 2).await;
+            let mut history = vec![line[1], line[0]];
+
+            assert!(
+                load_additional_history(repository.clone(), &mut history, 0).await,
+                "A line followed to its root revision has nothing further to load"
+            );
+            assert_eq!(
+                history,
+                vec![line[1], line[0]],
+                "An exhausted line must not grow"
+            );
+
+            let mut empty = Vec::new();
+            assert!(
+                load_additional_history(repository, &mut empty, 0).await,
+                "There is nothing to extend an empty line from"
+            );
+            assert!(empty.is_empty());
+        }))
+        .await;
+    }
+
+    /// A change between two nodes of one kind, carrying the path a move or copy
+    /// came from.
+    fn node_change(
+        repository: &Arc<RepositoryContext>,
+        state: &Arc<State>,
+        action: FileAction,
+        flags: NodeFlags,
+        path: &str,
+        from_path: Option<&str>,
+    ) -> NodeChange {
+        let side = |node| change::NodeChangeState {
+            repository: repository.clone(),
+            state: state.clone(),
+            node,
+            flags,
+            address: Address::default(),
+        };
+        NodeChange {
+            action,
+            flags: change::Flags::None,
+            from: side(1),
+            to: side(2),
+            path: RelativePathBuf::new().push_and_freeze(path),
+            from_path: from_path.map(|path| RelativePathBuf::new().push_and_freeze(path)),
+        }
+    }
+
+    /// Without the source path a receiver reads a move as an add at the new path
+    /// and cannot tell where the content came from.
+    #[tokio::test]
+    async fn diff_change_carries_the_move_source_path() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let state = Arc::new(State::new());
+            let change = node_change(
+                &repository,
+                &state,
+                FileAction::Move,
+                NodeFlags::File,
+                "new.txt",
+                Some("old.txt"),
+            );
+
+            let data = LoreBranchDiffNodeData::new(&change);
+
+            assert_eq!(data.path.as_str(), "new.txt");
+            assert_eq!(data.from_path.as_str(), "old.txt");
+        }))
+        .await;
+    }
+
+    /// A change that moved nothing maps to the empty string the C API documents,
+    /// not to a dangling pointer a receiver would read past.
+    #[tokio::test]
+    async fn diff_change_without_a_move_reports_no_source_path() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let state = Arc::new(State::new());
+            let change = node_change(
+                &repository,
+                &state,
+                FileAction::Add,
+                NodeFlags::File,
+                "new.txt",
+                None,
+            );
+
+            let data = LoreBranchDiffNodeData::new(&change);
+
+            assert!(data.from_path.is_empty());
+            assert_eq!(data.from_path.as_str(), "");
+        }))
+        .await;
+    }
+
+    /// Both paths of a moved directory get the trailing separator that tells a
+    /// directory from a file, so the two can be compared as they are reported.
+    #[tokio::test]
+    async fn diff_change_marks_a_moved_directory_on_both_paths() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let state = Arc::new(State::new());
+            let change = node_change(
+                &repository,
+                &state,
+                FileAction::Move,
+                NodeFlags::NoFlags,
+                "new",
+                Some("old"),
+            );
+
+            let data = LoreBranchDiffNodeData::new(&change);
+
+            assert_eq!(data.path.as_str(), "new/");
+            assert_eq!(data.from_path.as_str(), "old/");
+        }))
+        .await;
+    }
 }

@@ -52,6 +52,7 @@ use crate::connection::Connection;
 use crate::connection::RECONNECT_MAX_ATTEMPTS;
 use crate::connection::RECONNECT_MAX_DELAY;
 use crate::connection::RECONNECT_START_DELAY;
+use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
 use crate::traits::*;
 use crate::types::*;
@@ -92,11 +93,23 @@ impl GRPCAuth {
         remote_domain: &str,
         identity: &str,
         repository: RepositoryId,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Arc<parking_lot::RwLock<Self>> {
         let remote_domain = remote_domain.to_string();
+        // Read the credentials and take the rotation signal in one step: a
+        // rotation landing during the exchange below has to stay pending, or the
+        // tokens derived here would stand until the next scheduled refresh.
+        let ((identity_token, access_token), rotated) = credentials.tokens_and_signal();
 
-        let (authentication_token, authorization_token, resolved_identity) =
-            auth_exchange(auth_url, &remote_domain, identity, repository).await;
+        let (authentication_token, authorization_token, resolved_identity) = auth_exchange(
+            auth_url,
+            &remote_domain,
+            identity,
+            repository,
+            &identity_token,
+            &access_token,
+        )
+        .await;
 
         let auth = Arc::new(parking_lot::RwLock::new(GRPCAuth {
             remote_domain: remote_domain.clone(),
@@ -112,6 +125,8 @@ impl GRPCAuth {
             remote_domain,
             resolved_identity,
             repository,
+            credentials.clone(),
+            rotated,
         )));
 
         {
@@ -130,11 +145,24 @@ impl GRPCAuth {
         remote_domain: &str,
         identity: &str,
         resource_id: &str,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Arc<parking_lot::RwLock<Self>> {
         let remote_domain = remote_domain.to_string();
+        // Read the credentials and take the rotation signal in one step: a
+        // rotation landing during the exchange below has to stay pending, or the
+        // tokens derived here would stand until the next scheduled refresh.
+        let ((identity_token, access_token), rotated) = credentials.tokens_and_signal();
 
         let (authentication_token, authorization_token, resolved_identity) =
-            auth_exchange_custom_resource(auth_url, &remote_domain, identity, resource_id).await;
+            auth_exchange_custom_resource(
+                auth_url,
+                &remote_domain,
+                identity,
+                resource_id,
+                &identity_token,
+                &access_token,
+            )
+            .await;
 
         let auth = Arc::new(parking_lot::RwLock::new(GRPCAuth {
             remote_domain: remote_domain.clone(),
@@ -151,6 +179,8 @@ impl GRPCAuth {
                 remote_domain,
                 resolved_identity,
                 resource_id.to_string(),
+                credentials.clone(),
+                rotated,
             )
         ));
 
@@ -165,23 +195,61 @@ impl GRPCAuth {
 
 type GRPCAuthRef = Arc<parking_lot::RwLock<GRPCAuth>>;
 
+/// How long a refresher waits before re-deriving its tokens, absent a rotation.
+const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Waits for the next refresh: the interval, or a rotation if one lands first.
+///
+/// The tokens a service client presents live in its `GRPCAuth`, which only a
+/// refresher writes, and the interceptor reads them at request time. Waiting out
+/// the interval after a caller supplies a replacement would leave every request
+/// in between carrying the credential that was just replaced -- so a rotation
+/// cuts the wait short and the tokens are re-derived at once.
+async fn await_refresh(rotated: &mut tokio::sync::watch::Receiver<u64>) {
+    tokio::select! {
+        () = tokio::time::sleep(REFRESH_INTERVAL) => {}
+        result = rotated.changed() => {
+            if result.is_err() {
+                // Unreachable: the refresher owns an `Arc` of the credentials the
+                // sender lives in, so it cannot be dropped first. Waiting out the
+                // interval anyway, because returning here would turn a closed
+                // channel into a busy loop if that ever stopped holding.
+                tokio::time::sleep(REFRESH_INTERVAL).await;
+            } else {
+                lore_debug!("Credentials replaced, refreshing the authorization now");
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn grpc_auth_refresher(
     auth: Weak<parking_lot::RwLock<GRPCAuth>>,
     auth_url: String,
     remote_domain: String,
     identity: String,
     repository: RepositoryId,
+    credentials: Arc<SuppliedCredentials>,
+    mut rotated: tokio::sync::watch::Receiver<u64>,
 ) {
     loop {
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        await_refresh(&mut rotated).await;
 
         // Check if connection is still used
         let Some(auth) = auth.upgrade() else {
             return;
         };
 
-        let (authentication_token, authorization_token, _) =
-            auth_exchange(&auth_url, &remote_domain, &identity, repository).await;
+        let (identity_token, access_token) = credentials.tokens();
+        let (authentication_token, authorization_token, _) = auth_exchange(
+            &auth_url,
+            &remote_domain,
+            &identity,
+            repository,
+            &identity_token,
+            &access_token,
+        )
+        .await;
 
         let mut auth = auth.write();
         auth.authentication_token = authentication_token;
@@ -189,22 +257,33 @@ async fn grpc_auth_refresher(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn grpc_auth_refresher_custom_resource(
     auth: Weak<parking_lot::RwLock<GRPCAuth>>,
     auth_url: String,
     remote_domain: String,
     identity: String,
     resource_id: String,
+    credentials: Arc<SuppliedCredentials>,
+    mut rotated: tokio::sync::watch::Receiver<u64>,
 ) {
     loop {
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        await_refresh(&mut rotated).await;
 
         let Some(auth) = auth.upgrade() else {
             return;
         };
 
-        let (authentication_token, authorization_token, _) =
-            auth_exchange_custom_resource(&auth_url, &remote_domain, &identity, &resource_id).await;
+        let (identity_token, access_token) = credentials.tokens();
+        let (authentication_token, authorization_token, _) = auth_exchange_custom_resource(
+            &auth_url,
+            &remote_domain,
+            &identity,
+            &resource_id,
+            &identity_token,
+            &access_token,
+        )
+        .await;
 
         let mut auth = auth.write();
         auth.authentication_token = authentication_token;
@@ -361,12 +440,17 @@ const GRPCS_PORT_DEFAULT: u16 = 443;
 type AuthUrl = String;
 type UserIdentity = String;
 type ResourceId = String;
+/// Whether the authorization was obtained from credentials a caller supplied.
+/// Keyed on for the same reason the connection is: a call that supplies none
+/// must not be handed authorization obtained from another call's credential,
+/// and vice versa. See `lore_transport::connection::FromSuppliedCredentials`.
+type FromSuppliedCredentials = bool;
 
 pub struct GRPCConnection {
     connection: Weak<Connection>,
     remote_url: Url,
     channel: parking_lot::RwLock<Channel>,
-    auth: DashMap<(AuthUrl, UserIdentity, ResourceId), GRPCAuthRef>,
+    auth: DashMap<(AuthUrl, UserIdentity, ResourceId, FromSuppliedCredentials), GRPCAuthRef>,
     reconnect: AtomicU32,
     reconnector: Semaphore,
 }
@@ -395,29 +479,17 @@ impl GRPCConnection {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> GRPCAuthRef {
         let key = (
             auth_url.to_string(),
             identity.to_string(),
             repository.to_string(),
+            credentials.from_supplied_credentials(),
         );
 
         if let Some(auth_entry) = self.auth.get(&key) {
-            let auth = auth_entry.clone();
-            drop(auth_entry);
-            let (authentication_token, authorization_token, _) = auth_exchange(
-                auth_url,
-                self.remote_url.host_str().unwrap_or_default(),
-                identity,
-                repository,
-            )
-            .await;
-            {
-                let mut current = auth.write();
-                current.authentication_token = authentication_token;
-                current.authorization_token = authorization_token;
-            }
-            return auth;
+            return auth_entry.clone();
         }
 
         let auth = GRPCAuth::new(
@@ -425,6 +497,7 @@ impl GRPCConnection {
             self.remote_url.host_str().unwrap_or_default(),
             identity,
             repository,
+            credentials,
         )
         .await;
 
@@ -441,29 +514,17 @@ impl GRPCConnection {
         auth_url: &str,
         identity: &str,
         resource: &str,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> GRPCAuthRef {
         let key = (
             auth_url.to_string(),
             identity.to_string(),
             resource.to_string(),
+            credentials.from_supplied_credentials(),
         );
 
         if let Some(auth_entry) = self.auth.get(&key) {
-            let auth = auth_entry.clone();
-            drop(auth_entry);
-            let (authentication_token, authorization_token, _) = auth_exchange_custom_resource(
-                auth_url,
-                self.remote_url.host_str().unwrap_or_default(),
-                identity,
-                resource,
-            )
-            .await;
-            {
-                let mut current = auth.write();
-                current.authentication_token = authentication_token;
-                current.authorization_token = authorization_token;
-            }
-            return auth;
+            return auth_entry.clone();
         }
 
         let auth = GRPCAuth::new_for_custom_resource(
@@ -471,6 +532,7 @@ impl GRPCConnection {
             self.remote_url.host_str().unwrap_or_default(),
             identity,
             resource,
+            credentials,
         )
         .await;
 
@@ -677,7 +739,7 @@ pub async fn connect(
         .unwrap_or(parsed_url.port().unwrap_or(default_port).to_string());
 
     let remote = Url::parse(&format!("{scheme}://{host}:{port}"))
-        .internal(&format!("remote {remote_url} is invalid"))?;
+        .internal_with(|| format!("remote {remote_url} is invalid"))?;
 
     let map_lock = lock_connection(&remote).await;
     let connection_lock = if reuse {
@@ -739,7 +801,8 @@ pub async fn storage_client(
     connection: Arc<GRPCConnection>,
     auth_url: &str,
     identity: &str,
-    _repository: RepositoryId,
+    _partition: Partition,
+    credentials: &Arc<SuppliedCredentials>,
 ) -> Result<Arc<dyn Storage>, ProtocolError> {
     lore_trace!("Connecting gRPC storage client");
 
@@ -750,6 +813,7 @@ pub async fn storage_client(
         client: storage_client,
         auth_url: auth_url.to_string(),
         identity: identity.to_string(),
+        credentials: credentials.clone(),
         session_counter: std::sync::atomic::AtomicU32::new(1),
         sessions: DashMap::new(),
     };
@@ -764,6 +828,7 @@ pub async fn revision_client(
     auth_url: &str,
     identity: &str,
     repository: RepositoryId,
+    credentials: &Arc<SuppliedCredentials>,
 ) -> Result<Arc<dyn Revision>, ProtocolError> {
     lore_trace!("Creating gRPC revision client");
 
@@ -771,7 +836,7 @@ pub async fn revision_client(
         connection.channel(),
         repository,
         connection
-            .repository_authz(auth_url, identity, repository)
+            .repository_authz(auth_url, identity, repository, credentials)
             .await,
     );
 
@@ -780,6 +845,7 @@ pub async fn revision_client(
         client: RwLock::new(revision_client),
         auth_url: auth_url.to_string(),
         identity: identity.to_string(),
+        credentials: credentials.clone(),
         repository,
     };
 
@@ -793,6 +859,7 @@ pub async fn admin_client(
     auth_url: &str,
     identity: &str,
     repository: RepositoryId,
+    credentials: &Arc<SuppliedCredentials>,
 ) -> Result<Arc<dyn Admin>, ProtocolError> {
     lore_trace!("Creating gRPC admin client");
 
@@ -800,7 +867,7 @@ pub async fn admin_client(
         connection.channel(),
         repository,
         connection
-            .repository_authz(auth_url, identity, repository)
+            .repository_authz(auth_url, identity, repository, credentials)
             .await,
     );
 
@@ -809,6 +876,7 @@ pub async fn admin_client(
         client: RwLock::new(admin_client),
         auth_url: auth_url.to_string(),
         identity: identity.to_string(),
+        credentials: credentials.clone(),
         repository,
     };
 
@@ -821,13 +889,14 @@ pub async fn repository_client(
     connection: Arc<GRPCConnection>,
     auth_url: &str,
     identity: &str,
+    credentials: &Arc<SuppliedCredentials>,
 ) -> Result<Arc<dyn Repository>, ProtocolError> {
     lore_trace!("Connecting gRPC repository client");
 
     let repository_client = repository_client::RepositoryService::new(
         connection.channel(),
         connection
-            .repository_authz(auth_url, identity, RepositoryId::default())
+            .repository_authz(auth_url, identity, RepositoryId::default(), credentials)
             .await,
     );
 
@@ -836,6 +905,7 @@ pub async fn repository_client(
         client: RwLock::new(repository_client),
         auth_url: auth_url.to_string(),
         identity: identity.to_string(),
+        credentials: credentials.clone(),
     };
 
     lore_trace!("Connecting gRPC repository client complete");
@@ -848,6 +918,7 @@ pub async fn lock_client(
     auth_url: &str,
     identity: &str,
     repository: RepositoryId,
+    credentials: &Arc<SuppliedCredentials>,
 ) -> Result<Arc<dyn Lock>, ProtocolError> {
     lore_trace!("Connecting gRPC lock client");
 
@@ -855,7 +926,7 @@ pub async fn lock_client(
         connection.channel(),
         repository,
         connection
-            .repository_authz(auth_url, identity, repository)
+            .repository_authz(auth_url, identity, repository, credentials)
             .await,
     );
 
@@ -865,6 +936,7 @@ pub async fn lock_client(
         client: RwLock::new(lock_client),
         auth_url: auth_url.to_string(),
         identity: identity.to_string(),
+        credentials: credentials.clone(),
     };
 
     lore_trace!("Connecting gRPC lock client complete");
@@ -889,18 +961,20 @@ pub fn environment_client(
     Ok(Arc::new(environment))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn storage(
     connection: Weak<Connection>,
     remote_url: &str,
     auth_url: &str,
     identity: &str,
-    repository: RepositoryId,
+    partition: Partition,
     index: usize,
+    credentials: &Arc<SuppliedCredentials>,
 ) -> Result<Arc<dyn Storage>, ProtocolError> {
     // We open multiple storage connections, only reuse previous connections for the first
     let reuse = index == 0;
     let connection = connect(connection, remote_url, reuse).await?;
-    storage_client(connection, auth_url, identity, repository).await
+    storage_client(connection, auth_url, identity, partition, credentials).await
 }
 
 pub async fn revision(
@@ -909,9 +983,10 @@ pub async fn revision(
     auth_url: &str,
     identity: &str,
     repository: RepositoryId,
+    credentials: &Arc<SuppliedCredentials>,
 ) -> Result<Arc<dyn Revision>, ProtocolError> {
     let connection = connect(connection, remote_url, true).await?;
-    revision_client(connection, auth_url, identity, repository).await
+    revision_client(connection, auth_url, identity, repository, credentials).await
 }
 
 pub async fn repository(
@@ -919,9 +994,10 @@ pub async fn repository(
     remote_url: &str,
     auth_url: &str,
     identity: &str,
+    credentials: &Arc<SuppliedCredentials>,
 ) -> Result<Arc<dyn Repository>, ProtocolError> {
     let connection = connect(connection, remote_url, true).await?;
-    repository_client(connection, auth_url, identity).await
+    repository_client(connection, auth_url, identity, credentials).await
 }
 
 pub async fn lock(
@@ -930,9 +1006,10 @@ pub async fn lock(
     auth_url: &str,
     identity: &str,
     repository: RepositoryId,
+    credentials: &Arc<SuppliedCredentials>,
 ) -> Result<Arc<dyn Lock>, ProtocolError> {
     let connection = connect(connection, remote_url, true).await?;
-    lock_client(connection, auth_url, identity, repository).await
+    lock_client(connection, auth_url, identity, repository, credentials).await
 }
 
 pub async fn admin(
@@ -941,9 +1018,10 @@ pub async fn admin(
     auth_url: &str,
     identity: &str,
     repository: RepositoryId,
+    credentials: &Arc<SuppliedCredentials>,
 ) -> Result<Arc<dyn Admin>, ProtocolError> {
     let connection = connect(connection, remote_url, true).await?;
-    admin_client(connection, auth_url, identity, repository).await
+    admin_client(connection, auth_url, identity, repository, credentials).await
 }
 
 pub async fn environment(
@@ -977,6 +1055,7 @@ struct GRPCAdmin {
     client: RwLock<admin_client::AdminService>,
     auth_url: String,
     identity: String,
+    credentials: Arc<SuppliedCredentials>,
     repository: RepositoryId,
 }
 
@@ -993,6 +1072,7 @@ impl GRPCAdmin {
                     self.auth_url.as_str(),
                     self.identity.as_str(),
                     self.repository,
+                    &self.credentials,
                 )
                 .await,
         );
@@ -1021,6 +1101,9 @@ struct GRPCStorage {
     auth_url: String,
     /// Identity for token exchange.
     identity: String,
+    /// The credentials supplied for the call in progress, shared so a reconnect
+    /// re-authorizes with what the newest call supplied.
+    credentials: Arc<SuppliedCredentials>,
     /// Client-local session counter for monotonic session IDs.
     session_counter: std::sync::atomic::AtomicU32,
     /// Client-local session map: `session_id` -> context for metadata injection.
@@ -1102,12 +1185,12 @@ impl GRPCStorage {
 impl Storage for GRPCStorage {
     async fn session_start(
         &self,
-        repository: RepositoryId,
+        partition: Partition,
         correlation_id: &str,
     ) -> Result<u32, ProtocolError> {
         let auth = self
             .connection
-            .repository_authz(&self.auth_url, &self.identity, repository)
+            .repository_authz(&self.auth_url, &self.identity, partition, &self.credentials)
             .await;
         let token = auth.read().authorization_token.clone();
 
@@ -1117,7 +1200,7 @@ impl Storage for GRPCStorage {
         self.sessions.insert(
             session_id,
             Arc::new(storage_client::GrpcSessionContext {
-                repository,
+                partition,
                 correlation_id: correlation_id.to_string(),
                 auth_token: token,
             }),
@@ -1151,15 +1234,30 @@ impl Storage for GRPCStorage {
             .await
     }
 
-    async fn presign_downloads(
+    async fn get_resolved(
         &self,
         session_id: u32,
-        addresses: &[Address],
-        expires_in: Duration,
-    ) -> Result<Vec<DirectDownload>, ProtocolError> {
+        key: &Hash,
+        context: &Context,
+        flags: u32,
+    ) -> Result<(Hash, Fragment, Bytes), ProtocolError> {
         let ctx = self.session_context(session_id)?;
         self.client
-            .presign_downloads(&ctx, addresses, expires_in)
+            .get_resolved(session_id, &ctx, key, context, flags)
+            .await
+    }
+
+    async fn put_resolved(
+        &self,
+        session_id: u32,
+        key: &Hash,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<(), ProtocolError> {
+        let ctx = self.session_context(session_id)?;
+        self.client
+            .put_resolved(session_id, &ctx, key, address, fragment, payload)
             .await
     }
 
@@ -1198,7 +1296,7 @@ impl Storage for GRPCStorage {
     async fn copy(
         &self,
         session_id: u32,
-        source_repository: RepositoryId,
+        source_partition: Partition,
         source_address: Address,
         target_context: Context,
     ) -> Result<(), ProtocolError> {
@@ -1207,7 +1305,7 @@ impl Storage for GRPCStorage {
             self.client.copy(
                 session_id,
                 &ctx,
-                source_repository,
+                source_partition,
                 source_address,
                 target_context,
             )
@@ -1261,6 +1359,7 @@ struct GRPCRevision {
     client: RwLock<revision_client::RevisionService>,
     auth_url: String,
     identity: String,
+    credentials: Arc<SuppliedCredentials>,
     repository: RepositoryId,
 }
 
@@ -1277,6 +1376,7 @@ impl GRPCRevision {
                     self.auth_url.as_str(),
                     self.identity.as_str(),
                     self.repository,
+                    &self.credentials,
                 )
                 .await,
         );
@@ -1415,6 +1515,7 @@ struct GRPCRepository {
     client: RwLock<repository_client::RepositoryService>,
     auth_url: String,
     identity: String,
+    credentials: Arc<SuppliedCredentials>,
 }
 
 impl GRPCRepository {
@@ -1429,6 +1530,7 @@ impl GRPCRepository {
                     self.auth_url.as_str(),
                     self.identity.as_str(),
                     RepositoryId::default(),
+                    &self.credentials,
                 )
                 .await,
         );
@@ -1539,6 +1641,7 @@ struct GRPCLock {
     client: RwLock<lock_client::LockService>,
     auth_url: String,
     identity: String,
+    credentials: Arc<SuppliedCredentials>,
     repository: RepositoryId,
 }
 
@@ -1555,6 +1658,7 @@ impl GRPCLock {
                     self.auth_url.as_str(),
                     self.identity.as_str(),
                     self.repository,
+                    &self.credentials,
                 )
                 .await,
         );

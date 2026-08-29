@@ -27,6 +27,7 @@ from lore_server import (
     _wait_for_health_check,
     allocate_free_port,
     generate_server_config,
+    release_reserved_ports,
 )
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,13 @@ def _launch_maintenance_server(server_root, server_env, executable_path):
         platform_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         platform_kwargs["start_new_session"] = True
+
+    # This launches the server itself rather than going through
+    # launch_lore_server, so it owns the release of the port reservations that
+    # allocate_free_port is still holding.  Without it the server cannot bind,
+    # and the "endpoint is not started" assertions below would see our own
+    # reservation and report the port as taken.
+    release_reserved_ports(server_env, label="maintenance server")
 
     server_proc = subprocess.Popen(
         [str(Path(executable_path).expanduser().resolve())],

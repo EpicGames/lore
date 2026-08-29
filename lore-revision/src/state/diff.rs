@@ -12,6 +12,7 @@ use crate::change;
 use crate::change::NodeChangeState;
 use crate::filter::FilterMode;
 use crate::lore::Address;
+use crate::lore::RepositoryId;
 use crate::lore_debug;
 use crate::lore_drain_tasks;
 use crate::lore_trace;
@@ -588,25 +589,37 @@ async fn add_change_for_paired_nodes(
             }
             if !hash_equal || is_staged || is_staged_merge || is_dirty {
                 if to_node.is_link() {
-                    let linked_repository = Arc::new(
-                        to.repository
-                            .to_link_context(to_node.address.context.into())
-                            .await,
-                    );
-                    let linked_state =
-                        State::deserialize(linked_repository.clone(), to_node.address.hash)
-                            .await
-                            .internal("Link error")?;
+                    let link_repository_id: RepositoryId = to_node.address.context.into();
 
-                    let has_staged_children = linked_state
-                        .node_has_staged_children(linked_repository.clone(), to_node.child)
-                        .await?;
+                    let can_read_link = to.repository.can_read_link(link_repository_id);
 
                     // If the link is staged and doesn't have staged children, it's a link update
-                    let recurse_link = if is_staged { has_staged_children } else { true };
+                    let recurse_link = if !can_read_link {
+                        false
+                    } else {
+                        let linked_repository =
+                            Arc::new(to.repository.to_link_context(link_repository_id).await);
+                        let linked_state =
+                            State::deserialize(linked_repository.clone(), to_node.address.hash)
+                                .await
+                                .forward::<StateError>("Link error")?;
+
+                        let has_staged_children = linked_state
+                            .node_has_staged_children(linked_repository.clone(), to_node.child)
+                            .await?;
+
+                        if is_staged { has_staged_children } else { true }
+                    };
 
                     if !recurse_link {
-                        lore_debug!("Diff node {subpath} has no linked changes");
+                        if can_read_link {
+                            lore_debug!("Diff node {subpath} has no linked changes");
+                        } else {
+                            lore_debug!(
+                                "Diff node {subpath} not descended: caller not authorized \
+                                 for linked repository {link_repository_id}"
+                            );
+                        }
                         add_change(
                             from.clone(),
                             to.clone(),

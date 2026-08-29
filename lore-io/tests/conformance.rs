@@ -400,6 +400,158 @@ async fn read_dir_yields_every_child_with_metadata() {
     }
 }
 
+/// A verdict where the platform has a lookup to reach one with, and `None` where it has none:
+/// macOS cannot say anything about a spelling short of the directory read the caller would
+/// otherwise do, so every expectation below collapses to "cannot say" there.
+fn verdict(held: bool) -> Option<bool> {
+    cfg!(any(target_os = "linux", target_family = "windows")).then_some(held)
+}
+
+/// The verdict is about the spelling, not about the file: a name the filesystem holds answers
+/// yes, and a name it does not hold answers no rather than going unanswered. A directory answers
+/// as readily as a file, which matters because most of what a caller resolves a path through is
+/// directories.
+#[tokio::test]
+async fn holds_name_exactly_answers_for_a_name_the_filesystem_holds() {
+    for driver in drivers() {
+        let dir = TempDir::new("holdsname");
+        driver
+            .write_file_bytes(dir.file("Rock.mesh"), Bytes::from_static(b"data"), false)
+            .await
+            .unwrap();
+        driver.create_dir_all(dir.file("Meshes")).await.unwrap();
+
+        assert_eq!(
+            driver.holds_name_exactly(dir.file("Rock.mesh")).await,
+            verdict(true)
+        );
+        assert_eq!(
+            driver.holds_name_exactly(dir.file("Meshes")).await,
+            verdict(true)
+        );
+        assert_eq!(
+            driver.holds_name_exactly(dir.file("absent")).await,
+            verdict(false)
+        );
+        assert_eq!(
+            driver
+                .holds_name_exactly(dir.file("absent").join("Rock.mesh"))
+                .await,
+            verdict(false),
+            "a missing directory holds no children"
+        );
+    }
+}
+
+/// A name that cannot exist must never be answered for by some other file. Win32 hands the last
+/// component to a matcher that reads `*` and `?`, and `<`, `>` and `"` as the legacy DOS
+/// wildcards; none of the five is legal in a Windows filename, and `<` and `"` do match
+/// `Rock.mesh` when passed through.
+#[tokio::test]
+async fn holds_name_exactly_refuses_a_name_that_could_be_read_as_a_pattern() {
+    for driver in drivers() {
+        let dir = TempDir::new("holdsnamewildcard");
+        driver
+            .write_file_bytes(dir.file("Rock.mesh"), Bytes::from_static(b"data"), false)
+            .await
+            .unwrap();
+
+        for pattern in [
+            "*.mesh",
+            "Rock.mes?",
+            "Rock<mesh",
+            "Rock>mesh",
+            "Rock.mesh\"",
+        ] {
+            assert_eq!(
+                driver.holds_name_exactly(dir.file(pattern)).await,
+                verdict(false),
+                "{pattern} names no file"
+            );
+        }
+    }
+}
+
+/// A path that arrives already verbatim carries a `?` in its prefix, and is the shape a caller
+/// that has been anywhere near `MAX_PATH` hands over - `std::fs::canonicalize` returns one, and
+/// the test fixtures in this workspace are built from those. Refusing it would answer no for
+/// every path under such a root.
+#[tokio::test]
+#[cfg(target_family = "windows")]
+async fn holds_name_exactly_answers_for_a_verbatim_path() {
+    for driver in drivers() {
+        let dir = TempDir::new("holdsnameverbatim");
+        driver
+            .write_file_bytes(dir.file("Rock.mesh"), Bytes::from_static(b"data"), false)
+            .await
+            .unwrap();
+
+        let verbatim = PathBuf::from(format!(r"\\?\{}", dir.path.display()));
+        assert_eq!(
+            driver.holds_name_exactly(verbatim.join("Rock.mesh")).await,
+            verdict(true)
+        );
+        assert_eq!(
+            driver.holds_name_exactly(verbatim.join("rock.mesh")).await,
+            verdict(false)
+        );
+    }
+}
+
+/// Only the last component is matched as a pattern; the rest of the path is resolved literally,
+/// so a pattern character in it names a directory that is not there rather than standing in for
+/// one that is.
+#[tokio::test]
+async fn holds_name_exactly_does_not_match_a_pattern_in_a_parent() {
+    for driver in drivers() {
+        let dir = TempDir::new("holdsnameparent");
+        driver.create_dir_all(dir.file("Meshes")).await.unwrap();
+        driver
+            .write_file_bytes(
+                dir.file("Meshes").join("Rock.mesh"),
+                Bytes::from_static(b"data"),
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            driver
+                .holds_name_exactly(dir.file("Mesh*s").join("Rock.mesh"))
+                .await,
+            verdict(false)
+        );
+    }
+}
+
+/// Past `MAX_PATH` the Win32 lookup wants the path rewritten with a verbatim prefix, which this
+/// does not do, so it declines rather than answering wrongly - and the caller reads the directory,
+/// which `std` does prefix. The file is there either way; declining says only that the lookup
+/// could not be the one to say so, which is what `None` is for.
+#[tokio::test]
+#[cfg(target_family = "windows")]
+async fn holds_name_exactly_declines_a_path_beyond_max_path() {
+    for driver in drivers() {
+        let dir = TempDir::new("holdsnamelong");
+        let mut deep = dir.path.clone();
+        while deep.as_os_str().len() < 260 {
+            deep = deep.join("directory-with-a-name-long-enough-to-get-there");
+        }
+        driver.create_dir_all(&deep).await.unwrap();
+        let path = deep.join("Rock.mesh");
+        driver
+            .write_file_bytes(&path, Bytes::from_static(b"data"), false)
+            .await
+            .unwrap();
+
+        assert!(
+            path.exists(),
+            "the file itself must be there to be declined"
+        );
+        assert_eq!(driver.holds_name_exactly(path).await, None);
+    }
+}
+
 /// Permissions round-trip through the driver: what `metadata` reports is what `set_permissions`
 /// accepts back, which is the whole shape callers use since none of them build a mode by hand.
 #[tokio::test]

@@ -4,10 +4,10 @@
 mod tests {
     use std::sync::Arc;
 
-    use lore_base::error::NoRemote;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Address;
+    use lore_base::types::CloneHeapAlloc;
     use lore_base::types::Context;
     use lore_base::types::ZeroHeapAlloc;
     use lore_revision::branch;
@@ -27,11 +27,9 @@ mod tests {
     use lore_revision::node::NodeFlagsV2;
     use lore_revision::repository;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::state::State;
     use lore_storage::hash::hash_string;
     use lore_storage::options::WriteOptions;
-    use lore_transport::ProtocolError;
     use rand::Rng;
     use rand::distr::Alphanumeric;
 
@@ -82,14 +80,12 @@ mod tests {
                 .expect("Failed to create repository");
 
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(path.clone()),
-                    immutable_store.clone(),
-                    mutable_store.clone(),
-                    repository_id,
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(
+                        immutable_store.clone(),
+                        mutable_store.clone(),
+                    )
+                    .with_path(&path)
+                    .with_id(repository_id),
                 ));
 
                 let mut block_v2 = NodeBlockDataV2::new_from_heap_zeroed();
@@ -130,8 +126,9 @@ mod tests {
                 block_v2.node[3].sibling = 0;
                 block_v2.node[3].child = 0;
 
-                let block = NodeBlock::convert_block_v2(repository.clone(), block_v2.clone())
-                    .expect("Failed to convert block");
+                let block =
+                    NodeBlock::convert_block_v2(repository.clone(), block_v2.clone_on_heap())
+                        .expect("Failed to convert block");
 
                 assert_eq!(block.node[0].child, 1, "Conversion failure");
 
@@ -295,14 +292,12 @@ mod tests {
                 .expect("Failed to create repository");
 
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(path.clone()),
-                    immutable_store.clone(),
-                    mutable_store.clone(),
-                    repository_id,
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(
+                        immutable_store.clone(),
+                        mutable_store.clone(),
+                    )
+                    .with_path(path)
+                    .with_id(repository_id),
                 ));
 
                 let mut block_v0 = NodeBlockDataV0::new_from_heap_zeroed();
@@ -405,6 +400,22 @@ mod tests {
                     reader.node_block().flags & NodeBlockFlags::Dirty.as_u32(),
                     0
                 );
+                // The conversion leaves the names in memory with nothing stored
+                // to load them from, which is what `State::serialize` relies on:
+                // it sees a deserialized name table, writes it out as its own
+                // object and records the hash here. That is where a v0 block's
+                // inline names move to the current model - and only if the block
+                // is edited, since serialize walks the dirty blocks. An
+                // untouched v0 block stays v0 in the store and is converted
+                // again on every load.
+                assert!(
+                    deserialized.is_nametable_deserialized(),
+                    "the converted block must carry its name table in memory"
+                );
+                assert!(
+                    reader.node_block().name_table.is_zero(),
+                    "a converted block has no stored name table until it is serialized"
+                );
             }))
             .await
             .expect("Test task failed");
@@ -441,7 +452,7 @@ mod tests {
 
     #[test]
     fn node_name_read_rejects_path_traversal_planted_in_the_name_table() {
-        use bytes::BytesMut;
+        use lore_base::allocator::HeapBuf;
         use lore_revision::node::NodeBlockData;
 
         // A name table can arrive from a fragment written before the store-side
@@ -451,7 +462,7 @@ mod tests {
             data.node_count = 1;
             data.node[0].name_offset = 0;
             data.node[0].name_length = name.len() as u32;
-            let block = NodeBlock::new_with_name(data, BytesMut::from(name.as_bytes()));
+            let block = NodeBlock::new_with_name(data, HeapBuf::from_slice(name.as_bytes()));
 
             assert!(
                 block.node_name_clone(0).is_err(),
@@ -540,14 +551,12 @@ mod tests {
                 .expect("Failed to create repository");
 
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(path.clone()),
-                    immutable_store.clone(),
-                    mutable_store.clone(),
-                    repository_id,
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(
+                        immutable_store.clone(),
+                        mutable_store.clone(),
+                    )
+                    .with_path(&path)
+                    .with_id(repository_id),
                 ));
 
                 let mut block_v2 = NodeBlockDataV2::new_from_heap_zeroed();

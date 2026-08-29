@@ -87,6 +87,36 @@ mod tests {
         assert_eq!(root, "");
     }
 
+    /// `U+0130` folds to two scalars, so an ancestor holding one puts the
+    /// separator below it at a different byte offset in the lowercase form than
+    /// in the written one. A pop that took its offset from one string and applied
+    /// it to the other would cut the wrong place.
+    #[test]
+    fn push_and_pop_below_a_component_whose_fold_is_longer() {
+        let mut buf = RelativePathBuf::new();
+        buf.push("MESH_\u{130}");
+        buf.push("inner");
+        assert_eq!(buf.as_str(), "MESH_\u{130}/inner");
+        assert_eq!(buf.as_lowercase_str(), "mesh_i\u{307}/inner");
+        assert_ne!(
+            buf.as_str().rfind('/'),
+            buf.as_lowercase_str().rfind('/'),
+            "the two forms must disagree on where the separator is, or this proves nothing"
+        );
+
+        buf.pop();
+        assert_eq!(buf.as_str(), "MESH_\u{130}");
+        assert_eq!(buf.as_lowercase_str(), "mesh_i\u{307}");
+
+        buf.push("after");
+        assert_eq!(buf.as_str(), "MESH_\u{130}/after");
+        assert_eq!(
+            buf.as_lowercase_str(),
+            "mesh_i\u{307}/after",
+            "the sibling must not inherit bytes the fold left behind"
+        );
+    }
+
     #[test]
     fn pop_root() {
         let mut buf = RelativePathBuf::new();
@@ -340,6 +370,120 @@ mod tests {
         assert_eq!(dedup(&["x/y/z", "a/b/c", "a/b", "x/y"]), vec!["a/b", "x/y"],);
     }
 
+    /// The single-candidate covering scan is only correct because a path's
+    /// subtree is contiguous in the order it scans. These are the inputs that
+    /// break if that ordering regresses to a plain byte comparison: a sibling
+    /// whose name sorts between a directory and its children, because the
+    /// character it differs by is below `/`.
+    #[test]
+    fn dedup_to_supersets_collapses_across_separator_sort_order() {
+        fn dedup(inputs: &[&str]) -> Vec<String> {
+            let paths: Vec<RelativePath> = inputs
+                .iter()
+                .map(|p| RelativePath::new_from_initial_path(p).expect("Path init failed"))
+                .collect();
+            RelativePath::dedup_to_supersets(paths)
+                .into_iter()
+                .map(|p| p.as_str().to_owned())
+                .collect()
+        }
+
+        // '!' 0x21, '-' 0x2D and '.' 0x2E all sort below the separator '/' 0x2F.
+        assert_eq!(dedup(&["a/b", "a/b.c", "a/b/c"]), vec!["a/b", "a/b.c"]);
+        assert_eq!(dedup(&["a/b/c", "a/b.c", "a/b"]), vec!["a/b", "a/b.c"]);
+        assert_eq!(
+            dedup(&["a", "a!x", "a-y", "a.z", "a/c"]),
+            vec!["a", "a!x", "a-y", "a.z"]
+        );
+        assert_eq!(
+            dedup(&["a/b", "a/b.1", "a/b.2", "a/b/c/d/e"]),
+            vec!["a/b", "a/b.1", "a/b.2"]
+        );
+        assert_eq!(
+            dedup(&["a/b", "a/b.x", "a/b/c", "m/n", "m/n.y", "m/n/o"]),
+            vec!["a/b", "a/b.x", "m/n", "m/n.y"]
+        );
+        assert_eq!(
+            dedup(&["a", "a.1", "a/b", "a/b.2", "a/b/c"]),
+            vec!["a", "a.1"]
+        );
+
+        let leaves: Vec<String> = (0..64).map(|i| format!("p/{i:03}")).collect();
+        let refs: Vec<&str> = leaves.iter().map(String::as_str).collect();
+        assert_eq!(dedup(&refs), leaves);
+
+        let mut with_parent = vec!["p"];
+        with_parent.extend(refs.iter().copied());
+        assert_eq!(dedup(&with_parent), vec!["p"]);
+    }
+
+    /// A file system that distinguishes case holds `Assets` and `assets` side by
+    /// side, while one parent in the tree holds a single entry of a name. Paths
+    /// that differ only in the case of a shared component are brought onto one
+    /// variation, so what follows is never asked to create one entry twice.
+    #[test]
+    fn dedup_to_supersets_unifies_the_case_of_a_shared_component() {
+        fn dedup(inputs: &[&str]) -> Vec<String> {
+            let paths: Vec<RelativePath> = inputs
+                .iter()
+                .map(|p| RelativePath::new_from_initial_path(p).expect("Path init failed"))
+                .collect();
+            RelativePath::dedup_to_supersets(paths)
+                .into_iter()
+                .map(|p| p.as_str().to_owned())
+                .collect()
+        }
+
+        // A shared directory in two case variations: both targets keep their own
+        // leaf, under the one variation of the directory.
+        assert_eq!(
+            dedup(&["assets/second.file", "Assets/first.file"]),
+            vec!["Assets/first.file", "Assets/second.file"]
+        );
+
+        // The same entry in two case variations is one target.
+        assert_eq!(
+            dedup(&["Assets/Rock.mesh", "assets/rock.mesh"]),
+            vec!["Assets/Rock.mesh"]
+        );
+
+        // Each component is settled on its own, at whatever depth it disagrees.
+        assert_eq!(
+            dedup(&["a/B/x", "a/b/y", "A/b/z"]),
+            vec!["a/B/x", "a/B/y", "a/B/z"]
+        );
+
+        // A directory that a target covers takes the covering variation with it.
+        assert_eq!(dedup(&["Assets", "assets/first.file"]), vec!["Assets"]);
+
+        // Collapse and unification interleaved: `a/B/c/x` is brought onto
+        // `A/b/c` and then dropped as covered, and `A/B/d` onto the same case.
+        assert_eq!(
+            dedup(&["A/b/c", "a/B/c/x", "A/B/d"]),
+            vec!["A/b/c", "A/b/d"]
+        );
+
+        // Names that differ by more than case are different entries and keep what
+        // they were given.
+        assert_eq!(dedup(&["a/B", "a/b2"]), vec!["a/B", "a/b2"]);
+        assert_eq!(dedup(&["Foo/x", "bar/Y"]), vec!["Foo/x", "bar/Y"]);
+    }
+
+    /// Node lookup hashes names lowercased, so a path resolved from user input
+    /// can differ in case from the stored paths it is compared against.
+    /// `covers` alone would miss those; the prefix boundary still has to hold.
+    #[test]
+    fn covers_ignore_case() {
+        fn path(value: &str) -> RelativePath {
+            RelativePath::new_from_initial_path(value).expect("Path init failed")
+        }
+
+        assert!(!path("libs/Shared").covers(&"libs/shared/inner.txt"));
+
+        assert!(path("libs/Shared").covers_ignore_case(&path("LIBS/shared/inner.txt")));
+        assert!(!path("libs/Shared").covers_ignore_case(&path("libs/SHARED-extra/inner.txt")));
+    }
+
     #[test]
     fn new_from_user_path() {
         let repository_path = "my_repo";
@@ -385,6 +529,82 @@ mod tests {
         )
         .expect("Failed to create user path");
         assert_eq!(relative_path.as_str(), "test");
+    }
+
+    /// An absolute root in the form the platform holds one. A path the platform
+    /// does not call absolute is resolved against the working directory instead,
+    /// which is not what the tests below cover.
+    #[cfg(target_os = "windows")]
+    const ROOT: &str = r"C:\repo";
+    #[cfg(not(target_os = "windows"))]
+    const ROOT: &str = "/repo";
+
+    fn relative_of(repository_path: &str, user_path: &str) -> String {
+        RelativePathBuf::new_from_user_path(Path::new(repository_path), user_path)
+            .expect("the path is under the repository")
+            .as_str()
+            .to_owned()
+    }
+
+    #[test]
+    fn new_from_user_path_takes_the_repository_off_the_front() {
+        assert_eq!(
+            relative_of(ROOT, &format!("{ROOT}/Assets/Rock.mesh")),
+            "Assets/Rock.mesh"
+        );
+        assert_eq!(
+            relative_of(ROOT, &format!("{}/Assets", ROOT.to_uppercase())),
+            "Assets",
+            "the repository is matched whatever case it is named in"
+        );
+        assert_eq!(
+            relative_of(&format!("{ROOT}/"), &format!("{ROOT}/Assets")),
+            "Assets"
+        );
+        assert_eq!(
+            relative_of(ROOT, &format!("{ROOT}//Assets//Rock.mesh")),
+            "Assets/Rock.mesh"
+        );
+        assert!(relative_of(ROOT, ROOT).is_empty());
+    }
+
+    /// A repository named beyond ASCII is matched on the fold the rest of the
+    /// system uses, which for these characters is the length it already has.
+    #[test]
+    fn new_from_user_path_matches_a_repository_named_beyond_ascii() {
+        let root = format!("{ROOT}/\u{00c5}NGSTR\u{00d6}M");
+        assert_eq!(relative_of(&root, &format!("{root}/Assets")), "Assets");
+        assert_eq!(
+            relative_of(&root, &format!("{ROOT}/\u{00e5}ngstr\u{00f6}m/Assets")),
+            "Assets",
+            "the repository is matched whatever case it is named in"
+        );
+    }
+
+    /// A fold can change the length of a component, so the boundary between the
+    /// repository and what is under it cannot be a byte offset taken from one
+    /// form of the path and applied to the other.
+    #[test]
+    fn new_from_user_path_matches_a_repository_whose_fold_changes_its_length() {
+        let root = format!("{ROOT}/\u{0130}\u{0130}");
+        assert_eq!(
+            relative_of(&root, &format!("{root}/Assets/Rock.mesh")),
+            "Assets/Rock.mesh"
+        );
+    }
+
+    /// The repository is an ancestor of the path or it is nothing to it. A
+    /// directory whose name it merely begins is not one.
+    #[test]
+    fn new_from_user_path_rejects_a_path_under_a_longer_name() {
+        let sibling = format!("{ROOT}sitory/Assets");
+        assert!(RelativePathBuf::new_from_user_path(Path::new(ROOT), &sibling).is_err());
+    }
+
+    #[test]
+    fn new_from_user_path_rejects_a_path_outside_the_repository() {
+        let outside = ROOT.replace("repo", "elsewhere");
+        assert!(RelativePathBuf::new_from_user_path(Path::new(ROOT), &outside).is_err());
     }
 
     // ========================================
@@ -951,6 +1171,125 @@ mod tests {
         assert!(RelativePath::new_from_initial_path("../foo").is_err());
         assert!(RelativePathBuf::new_from_initial_path("..").is_err());
         assert!(RelativePathBuf::new_from_initial_path("../foo").is_err());
+    }
+
+    /// A step up is a step up wherever in the path it stands. A path that walks
+    /// into a subdirectory first reaches just as far above the repository as one
+    /// that starts with the steps, so the front of the path is not where this can
+    /// be decided.
+    #[test]
+    fn new_from_initial_path_rejects_a_step_up_below_the_front() {
+        for name in [
+            "subdir/..",
+            "subdir/../foo",
+            "subdir/../../foo",
+            "subdir/../foo/../..",
+            "subdir/../../../something",
+            "a/b/../../..",
+            "a/b/c/../../../../outside",
+            "subdir/./../../outside",
+            "subdir/dir/..",
+        ] {
+            assert!(
+                RelativePath::new_from_initial_path(name).is_err(),
+                "{name:?} steps above the repository"
+            );
+            assert!(
+                RelativePathBuf::new_from_initial_path(name).is_err(),
+                "{name:?} steps above the repository"
+            );
+        }
+    }
+
+    /// The separator a step up is written with does not decide whether it is one,
+    /// and neither does a leading separator or a repeated one. Each is brought
+    /// onto the canonical form before the path is judged.
+    #[test]
+    fn new_from_initial_path_rejects_a_step_up_however_it_is_written() {
+        for name in [
+            r"..\foo",
+            r"subdir\..\..\outside",
+            r"\..\..\outside",
+            r"subdir\\..\\..\\outside",
+            "subdir//..//..//outside",
+            "/../outside",
+            "/subdir/../../outside",
+            "./../outside",
+            "././../outside",
+        ] {
+            assert!(
+                RelativePath::new_from_initial_path(name).is_err(),
+                "{name:?} steps above the repository"
+            );
+            assert!(
+                RelativePathBuf::new_from_initial_path(name).is_err(),
+                "{name:?} steps above the repository"
+            );
+        }
+    }
+
+    /// Only a component that is `..` entirely is a step up. A name that merely
+    /// begins with two periods, or is made of them, is a name a repository can
+    /// hold, and it is kept as it is at any depth.
+    #[test]
+    fn new_from_initial_path_keeps_a_name_beginning_with_two_periods() {
+        for name in [
+            "..filename",
+            "..hidden.txt",
+            "...",
+            "....",
+            "...filename",
+            "..config/settings.ini",
+            "subdir/..filename",
+            "subdir/nested/..filename",
+            "..a/..b/..c",
+            "name..",
+            "a../b..",
+        ] {
+            let path = RelativePath::new_from_initial_path(name)
+                .unwrap_or_else(|_| panic!("{name:?} is a name, not a step up"));
+            assert_eq!(path.as_str(), name);
+
+            let buf = RelativePathBuf::new_from_initial_path(name)
+                .unwrap_or_else(|_| panic!("{name:?} is a name, not a step up"));
+            assert_eq!(buf.as_str(), name);
+        }
+    }
+
+    /// A name beginning with two periods is not a step up even where the path also
+    /// holds one, so the two are told apart within a single path rather than the
+    /// whole path being judged by what it contains.
+    #[test]
+    fn new_from_initial_path_tells_a_step_up_from_a_name_in_one_path() {
+        assert!(RelativePath::new_from_initial_path("..filename/../outside").is_err());
+        assert!(RelativePath::new_from_initial_path("subdir/../..filename").is_err());
+
+        let path = RelativePath::new_from_initial_path("..dir/..sub/..file")
+            .expect("no component is a step up");
+        assert_eq!(path.as_str(), "..dir/..sub/..file");
+    }
+
+    /// Nothing a constructed path holds is a step up, so no path handed to the
+    /// filesystem reaches outside the repository by being resolved there.
+    #[test]
+    fn new_from_initial_path_leaves_no_step_up_in_the_path() {
+        for name in [
+            "..filename",
+            "subdir/..filename",
+            "...",
+            "a/b/c",
+            r"a\b\..c",
+            "/a//b/",
+            "./a/b",
+        ] {
+            let path = RelativePath::new_from_initial_path(name)
+                .unwrap_or_else(|_| panic!("{name:?} is a path the repository can hold"));
+            assert!(
+                !path.as_str().split('/').any(|component| component == ".."),
+                "{name:?} kept a step up as {:?}",
+                path.as_str()
+            );
+        }
     }
 
     #[test]

@@ -7,7 +7,6 @@ use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::error::LoreResultExt;
 use crate::errors::InvalidArguments;
 use crate::event;
 use crate::event::EventError;
@@ -53,8 +52,8 @@ pub async fn hash(
     let metadata = lore_io::IoDriver::global()
         .metadata(path.as_ref())
         .await
-        .emit_map_err(InvalidArguments {
-            reason: "path does not exist or is not accessible".into(),
+        .map_err(|err| InvalidArguments {
+            reason: format!("path does not exist or is not accessible: {err}"),
         })?;
     if !metadata.is_file() {
         return Err(InvalidArguments {
@@ -66,7 +65,7 @@ pub async fn hash(
     // TODO(mjansson): If this is a file in the repository, get the current address
     let hash = immutable::hash_file(repository.clone(), path.as_ref(), None, None)
         .await
-        .internal("hashing file")?;
+        .forward_any::<HashError>("hashing file")?;
 
     event::LoreEvent::FileHash(LoreFileHashEventData {
         path: LoreString::from_path(path),

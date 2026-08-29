@@ -194,7 +194,9 @@ pub async fn obliterate_address(
         .immutable_store()
         .obliterate(repository.id, address, stats.clone())
         .await
-        .forward::<ObliterateError>(&format!("Failed to obliterate an address: {address}"))?;
+        .forward_with::<ObliterateError, _>(|| {
+            format!("Failed to obliterate an address: {address}")
+        })?;
 
     if let Ok(remote) = repository.remote().await
         && let Ok(admin) = remote.admin(repository.id).await
@@ -202,9 +204,9 @@ pub async fn obliterate_address(
         admin
             .obliterate(address)
             .await
-            .forward::<ObliterateError>(&format!(
-                "Failed to obliterate a remote address: {address}"
-            ))?;
+            .forward_with::<ObliterateError, _>(|| {
+                format!("Failed to obliterate a remote address: {address}")
+            })?;
     }
 
     event::LoreEvent::FileObliterate(LoreFileObliterateEventData {

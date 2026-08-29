@@ -33,6 +33,9 @@ pub const MARKER_FILENAME: &str = "level";
 /// during store open detects this and rolls forward.
 pub const LEVEL_PENDING_FILENAME: &str = "level.pending";
 
+/// Filename prefix of a bucket index file inside a group directory.
+pub const BUCKET_FILENAME_PREFIX: &str = "index_";
+
 /// Filename suffix appended to bucket files during a fan-out commit. Bucket file `index_<bb>`
 /// gets written to `index_<bb>.new` first; the rename to the final name only happens after
 /// every `.new` is on disk and the `level.pending` sentinel has been written.
@@ -127,8 +130,8 @@ pub fn level_for(current_level: usize, b_max: usize, threshold: usize) -> usize 
 /// * `group_path` — the per-group directory (e.g., `<store>/index/<gg>/`).
 ///
 /// # Returns
-/// * `Ok(None)` when no marker file exists; the caller should default to 256 (today's
-///   layout for legacy stores untouched by fan-out-aware code).
+/// * `Ok(None)` when no marker file exists. Such a group is either pre-fan-out or never
+///   written; [`read_group_level`] tells the two apart.
 /// * `Ok(Some(level))` when the marker is present, has a valid magic and version, and
 ///   parses to a level value.
 /// * `Err(io::Error)` for I/O failures, truncated files, mismatched magic, or unsupported
@@ -163,6 +166,35 @@ pub async fn write_level_marker(
     write_level_header_file(&group_path.join(MARKER_FILENAME), level, sync_data).await
 }
 
+/// Number of bytes a bucket file name occupies: the prefix plus two hex digits.
+const BUCKET_FILENAME_LEN: usize = BUCKET_FILENAME_PREFIX.len() + 2;
+
+/// Write `value` as lowercase two-digit hex into the first two bytes of `out`.
+///
+/// Path components are built through this rather than `format!`: on the per-bucket flush and
+/// recovery paths that is one `String` allocated and dropped per bucket, for two bytes.
+pub(crate) fn write_hex_byte(out: &mut [u8], value: u8) {
+    const HEX: [u8; 16] = *b"0123456789abcdef";
+    out[0] = HEX[(value >> 4) as usize];
+    out[1] = HEX[(value & 0x0f) as usize];
+}
+
+/// Append the group directory component for `group_index`: the lowercase 2-digit hex of
+/// `group_index as u8`.
+pub fn push_group_dir(path: &mut PathBuf, group_index: usize) {
+    let mut name = [0u8; 2];
+    write_hex_byte(&mut name, group_index as u8);
+    path.push(std::str::from_utf8(&name).unwrap_or_default());
+}
+
+/// Format the path for a group directory inside an index directory: `<index_path>/<gg>` where
+/// `<gg>` is the lowercase 2-digit hex of `group_index as u8`.
+pub fn group_dir_path(index_path: &Path, group_index: usize) -> PathBuf {
+    let mut path = index_path.to_path_buf();
+    push_group_dir(&mut path, group_index);
+    path
+}
+
 /// Format the path for a bucket index file inside a group directory: `<group_path>/index_<bb>`
 /// where `<bb>` is the lowercase 2-digit hex of `bucket_index as u8`.
 ///
@@ -170,16 +202,95 @@ pub async fn write_level_marker(
 /// * `bucket_index` is cast to `u8`; values ≥ 256 wrap, but `bucket_index` is always in
 ///   `[0, 256)` per the level ladder.
 pub fn bucket_path(group_path: &Path, bucket_index: usize) -> PathBuf {
-    group_path.join(format!("index_{:02x}", bucket_index as u8))
+    let mut name = [0u8; BUCKET_FILENAME_LEN];
+    name[..BUCKET_FILENAME_PREFIX.len()].copy_from_slice(BUCKET_FILENAME_PREFIX.as_bytes());
+    write_hex_byte(
+        &mut name[BUCKET_FILENAME_PREFIX.len()..],
+        bucket_index as u8,
+    );
+    group_path.join(std::str::from_utf8(&name).unwrap_or_default())
+}
+
+/// What a group's directory records about the bucket layout it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupLevel {
+    /// The level marker records this bucket count.
+    Marked(usize),
+    /// Bucket files but no marker: the pre-fan-out layout, entries spread over all
+    /// [`FAN_OUT_LEVEL_MAX`] buckets.
+    PreFanOut,
+    /// Neither marker nor bucket files, so the group has never been written. The level it
+    /// starts at is the caller's to choose.
+    Unwritten,
+}
+
+/// The bucket count a [`GroupLevel::Unwritten`] group starts at.
+///
+/// A fan-out-aware store records the level a group starts at in its level marker, so it may
+/// start anywhere on the ladder. A store still serializing at a pre-fan-out version writes no
+/// marker, so the next open has only the bucket files to go by and reads such a group at
+/// [`FAN_OUT_LEVEL_MAX`]; starting it lower would put its entries where that read cannot find
+/// them.
+pub fn unwritten_group_level(fan_out_aware: bool, initial_fan_out_level: usize) -> usize {
+    if fan_out_aware {
+        initial_fan_out_level
+    } else {
+        FAN_OUT_LEVEL_MAX
+    }
+}
+
+/// Read what `group_path` records about its bucket layout. Any pending fan-out commit must
+/// already have been recovered, or a group caught mid-commit reads as [`GroupLevel::PreFanOut`].
+///
+/// # Returns
+/// * `Ok(GroupLevel)` classifying the group.
+/// * `Err(io::Error)` for the failures [`read_level_marker`] reports.
+pub async fn read_group_level(group_path: &Path) -> std::io::Result<GroupLevel> {
+    match read_level_marker(group_path).await? {
+        Some(level) => Ok(GroupLevel::Marked(level)),
+        None if group_has_buckets(group_path).await => Ok(GroupLevel::PreFanOut),
+        None => Ok(GroupLevel::Unwritten),
+    }
+}
+
+/// Whether `group_path` holds at least one committed bucket file.
+///
+/// A group is serialized as a whole, so this separates a group that has been written
+/// from one that has not. `.new` twins are ignored: they belong to a fan-out commit
+/// that never reached its commit point and record no committed layout.
+///
+/// # Returns
+/// * `true` when the directory holds a file named `index_<bb>`.
+/// * `false` when it holds none, or cannot be read at all.
+async fn group_has_buckets(group_path: &Path) -> bool {
+    let Ok(mut entries) = lore_io::IoDriver::global().read_dir(group_path).await else {
+        return false;
+    };
+    while let Some(entry) = entries.next().await {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Some(name) = entry.file_name.to_str() else {
+            continue;
+        };
+        if name.starts_with(BUCKET_FILENAME_PREFIX) && !name.ends_with(BUCKET_NEW_SUFFIX) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Format the path for the in-progress (`.new`) twin of a bucket index file used during
 /// fan-out commits.
 pub fn bucket_new_path(group_path: &Path, bucket_index: usize) -> PathBuf {
-    group_path.join(format!(
-        "index_{:02x}{}",
-        bucket_index as u8, BUCKET_NEW_SUFFIX
-    ))
+    let mut name = [0u8; BUCKET_FILENAME_LEN + BUCKET_NEW_SUFFIX.len()];
+    name[..BUCKET_FILENAME_PREFIX.len()].copy_from_slice(BUCKET_FILENAME_PREFIX.as_bytes());
+    write_hex_byte(
+        &mut name[BUCKET_FILENAME_PREFIX.len()..],
+        bucket_index as u8,
+    );
+    name[BUCKET_FILENAME_LEN..].copy_from_slice(BUCKET_NEW_SUFFIX.as_bytes());
+    group_path.join(std::str::from_utf8(&name).unwrap_or_default())
 }
 
 /// Read the `level.pending` sentinel in `group_path`, returning the recorded target bucket count.
@@ -603,6 +714,133 @@ mod tests {
             bucket_new_path(dir.path(), 0xab).file_name().unwrap(),
             std::ffi::OsStr::new("index_ab.new")
         );
+    }
+
+    #[test]
+    fn group_dir_path_lowercase_two_digit_hex() {
+        let dir = temp_group_dir();
+        assert_eq!(
+            group_dir_path(dir.path(), 0).file_name().unwrap(),
+            std::ffi::OsStr::new("00")
+        );
+        assert_eq!(
+            group_dir_path(dir.path(), 255).file_name().unwrap(),
+            std::ffi::OsStr::new("ff")
+        );
+    }
+
+    #[test]
+    fn every_path_formatter_agrees_with_hex_formatting() {
+        let dir = temp_group_dir();
+        for index in 0..=255usize {
+            let byte = index as u8;
+            let mut hex = [0u8; 2];
+            write_hex_byte(&mut hex, byte);
+            assert_eq!(std::str::from_utf8(&hex).unwrap(), format!("{byte:02x}"));
+            assert_eq!(
+                group_dir_path(dir.path(), index).file_name().unwrap(),
+                std::ffi::OsStr::new(&format!("{byte:02x}"))
+            );
+            assert_eq!(
+                bucket_path(dir.path(), index).file_name().unwrap(),
+                std::ffi::OsStr::new(&format!("{BUCKET_FILENAME_PREFIX}{byte:02x}"))
+            );
+            assert_eq!(
+                bucket_new_path(dir.path(), index).file_name().unwrap(),
+                std::ffi::OsStr::new(&format!(
+                    "{BUCKET_FILENAME_PREFIX}{byte:02x}{BUCKET_NEW_SUFFIX}"
+                ))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn group_has_buckets_missing_directory_is_false() {
+        let dir = temp_group_dir();
+        assert!(!group_has_buckets(&dir.path().join("absent")).await);
+    }
+
+    #[tokio::test]
+    async fn group_has_buckets_empty_directory_is_false() {
+        let dir = temp_group_dir();
+        assert!(!group_has_buckets(dir.path()).await);
+    }
+
+    #[tokio::test]
+    async fn group_has_buckets_level_files_alone_are_false() {
+        let dir = temp_group_dir();
+        write_level_marker(dir.path(), 32, false).await.unwrap();
+        write_level_pending(dir.path(), 64, false).await.unwrap();
+        assert!(!group_has_buckets(dir.path()).await);
+    }
+
+    #[tokio::test]
+    async fn group_has_buckets_uncommitted_new_twins_alone_are_false() {
+        let dir = temp_group_dir();
+        for bb in 0..4 {
+            std::fs::write(bucket_new_path(dir.path(), bb), [bb as u8; 8]).unwrap();
+        }
+        assert!(!group_has_buckets(dir.path()).await);
+    }
+
+    #[tokio::test]
+    async fn group_has_buckets_committed_bucket_is_true() {
+        let dir = temp_group_dir();
+        std::fs::write(bucket_path(dir.path(), 0x37), b"bucket").unwrap();
+        std::fs::write(bucket_new_path(dir.path(), 0x38), b"twin").unwrap();
+        assert!(group_has_buckets(dir.path()).await);
+    }
+
+    #[test]
+    fn unwritten_group_level_follows_the_initial_level_when_fan_out_aware() {
+        for &level in &LEVEL_LADDER {
+            assert_eq!(unwritten_group_level(true, level), level);
+        }
+    }
+
+    #[test]
+    fn unwritten_group_level_is_max_without_fan_out_awareness() {
+        for &level in &LEVEL_LADDER {
+            assert_eq!(unwritten_group_level(false, level), FAN_OUT_LEVEL_MAX);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_group_level_marker_wins_over_bucket_files() {
+        let dir = temp_group_dir();
+        std::fs::write(bucket_path(dir.path(), 0x37), b"bucket").unwrap();
+        write_level_marker(dir.path(), 64, false).await.unwrap();
+        assert_eq!(
+            read_group_level(dir.path()).await.unwrap(),
+            GroupLevel::Marked(64)
+        );
+    }
+
+    #[tokio::test]
+    async fn read_group_level_buckets_without_marker_are_pre_fan_out() {
+        let dir = temp_group_dir();
+        std::fs::write(bucket_path(dir.path(), 0x37), b"bucket").unwrap();
+        assert_eq!(
+            read_group_level(dir.path()).await.unwrap(),
+            GroupLevel::PreFanOut
+        );
+    }
+
+    #[tokio::test]
+    async fn read_group_level_empty_group_is_unwritten() {
+        let dir = temp_group_dir();
+        assert_eq!(
+            read_group_level(dir.path()).await.unwrap(),
+            GroupLevel::Unwritten
+        );
+    }
+
+    #[tokio::test]
+    async fn read_group_level_propagates_a_corrupt_marker() {
+        let dir = temp_group_dir();
+        std::fs::write(dir.path().join(MARKER_FILENAME), [0xDE; 16]).unwrap();
+        let err = read_group_level(dir.path()).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
     }
 
     #[tokio::test]

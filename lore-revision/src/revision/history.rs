@@ -175,25 +175,28 @@ async fn find_start_revision(
     if let Some(target_branch) = options.branch {
         let branch = branch::load_name_to_id(repository.clone(), target_branch)
             .await
-            .internal("loading branch name")?;
-
-        let remote_latest = if let Ok(remote) = repository.remote().await {
-            branch::load_remote_latest(remote.clone(), repository.id, branch)
-                .await
-                .unwrap_or_default()
-        } else {
-            Hash::default()
-        };
+            .forward::<RevisionHistoryError>("loading branch name")?;
 
         if execution_context().globals().remote() {
-            return Ok((remote_latest, Some(branch)));
+            return Ok((load_remote_latest(repository, branch).await, Some(branch)));
         }
 
         let local_latest = branch::load_latest(repository.clone(), branch)
             .await
             .unwrap_or_default();
 
-        return Ok((local_latest, Some(branch)));
+        // `--local` reports the local branch only, even when it does not exist.
+        if execution_context().globals().local() {
+            return Ok((local_latest, Some(branch)));
+        }
+
+        // Without an explicit location the local branch is preferred, falling
+        // back to the remote when there is no local history.
+        if !local_latest.is_zero() {
+            return Ok((local_latest, Some(branch)));
+        }
+
+        return Ok((load_remote_latest(repository, branch).await, Some(branch)));
     }
 
     let (anchor_signature, anchor_branch) = crate::instance::load_current_anchor(&repository)
@@ -208,17 +211,25 @@ async fn find_start_revision(
     }
 
     if execution_context().globals().remote() {
-        let remote_latest = if let Ok(remote) = repository.remote().await {
-            branch::load_remote_latest(remote.clone(), repository.id, anchor_branch)
-                .await
-                .unwrap_or_default()
-        } else {
-            Hash::default()
-        };
-        return Ok((remote_latest, Some(anchor_branch)));
+        return Ok((
+            load_remote_latest(repository, anchor_branch).await,
+            Some(anchor_branch),
+        ));
     }
 
     Ok((anchor_signature, Some(anchor_branch)))
+}
+
+/// Latest revision of a branch on the remote, or a zero hash when there is no
+/// remote or the branch is unknown to it.
+async fn load_remote_latest(repository: Arc<RepositoryContext>, branch: BranchId) -> Hash {
+    if let Ok(remote) = repository.remote().await {
+        branch::load_remote_latest(remote, repository.id, branch)
+            .await
+            .unwrap_or_default()
+    } else {
+        Hash::default()
+    }
 }
 
 pub async fn history(
@@ -279,12 +290,12 @@ pub async fn history(
                     options.branch.as_deref().unwrap_or_default(),
                 )
                 .await
-                .internal("loading branch name")?
+                .forward::<RevisionHistoryError>("loading branch name")?
             } else {
                 // Take branch from top revision.
                 metadata
                     .get_branch()
-                    .internal("getting branch from metadata")?
+                    .forward::<RevisionHistoryError>("getting branch from metadata")?
             };
 
             event::LoreEvent::RevisionHistory(LoreRevisionHistoryEventData::new(

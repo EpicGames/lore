@@ -6,22 +6,17 @@
 [server.grpc]
 port = 41338
 
+# No [server.quic.certificate] or [server.quic_internal.certificate]: with
+# verify_client_certs = false the certificate only has to satisfy the TLS
+# handshake, and clients reach both endpoints over the unvalidated `lore://` /
+# `quic://` schemes. The server generates an ephemeral self-signed certificate
+# per endpoint at startup, so a test run needs no certificate files at all.
 [server.quic]
 port = 41338
 
-[server.quic.certificate]
-cert_file = "cert.pem"
-pkey_file = "key.pem"
-
 [server.quic_internal]
 enabled = true
-# the certs being generated locally aren't compatible with WebPkiClientVerifier
-# because it is strict about the CA constraint
 verify_client_certs = false
-
-[server.quic_internal.certificate]
-cert_file = "cert.pem"
-pkey_file = "key.pem"
 
 [server.http]
 presigned_url_hmac_key = "32d0bd7711276da5a4d73e1211ba3884ad1819aa0b4727b8ee5d695e9c3199de"

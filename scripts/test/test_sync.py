@@ -13,10 +13,23 @@ from error_types import (
     LocalChanges,
     BranchDivergedError,
     ProtectedError,
+    UnknownLoreError,
 )
+from lore_parsers import parse_status_json, parse_status_summary_json
+from test_utils import to_posix
+
 from lore import Lore
 
 logger = logging.getLogger(__name__)
+
+
+def find_status_entry(entries: list[dict], path: str) -> dict | None:
+    """Find a status entry by path (posix-normalized)."""
+    target = to_posix(path)
+    for entry in entries:
+        if to_posix(entry.get("path", "")) == target:
+            return entry
+    return None
 
 
 @pytest.mark.smoke
@@ -659,3 +672,208 @@ def test_sync_far_behind_with_local_merge_tip_and_remote_merges(new_lore_repo):
     sync_output = repo.sync()
     _assert_clean_fast_forward(sync_output)
     repo.repository_verify()
+
+
+def _read_bytes(repo: Lore, name: str) -> bytes:
+    with repo.open_file(name, "rb") as f:
+        return f.read()
+
+
+@pytest.mark.smoke
+def test_sync_aborted_by_local_change_writes_nothing(new_lore_repo):
+    """A sync verifies every incoming change against the file system before it writes any
+    of them, so a local modification it refuses to overwrite stops the whole sync with the
+    working copy untouched.
+
+    Every file is the same size on both sides, so the refusal rests on comparing content
+    rather than on sizes, and the edit must still be reported afterwards: a sync that
+    aborts may not leave a local change looking as though it had been dealt with.
+    """
+    repo: Lore = new_lore_repo()
+
+    size = 4096
+    names = [f"synced{index}.bin" for index in range(4)]
+    for name in names:
+        with repo.open_file(name, "w+b") as f:
+            f.write(os.urandom(size))
+    repo.stage(scan=True)
+    repo.commit("Base")
+    repo.push()
+
+    clone: Lore = repo.clone()
+
+    # New content of the same size for every file, so sizes settle nothing on either side.
+    for name in names:
+        with repo.open_file(name, "w+b") as f:
+            f.write(os.urandom(size))
+    repo.stage(scan=True)
+    repo.commit("Incoming")
+    repo.push()
+
+    edited = names[0]
+    with clone.open_file(edited, "w+b") as f:
+        f.write(os.urandom(size))
+
+    before = {name: _read_bytes(clone, name) for name in names}
+
+    with pytest.raises(LocalChanges):
+        clone.sync()
+
+    after = {name: _read_bytes(clone, name) for name in names}
+    assert after == before, (
+        "a sync that refuses a local change must not have written any file: "
+        f"{[name for name in names if after[name] != before[name]]} changed"
+    )
+
+    entries = parse_status_json(clone.status(scan=True, json=True, offline=True))
+    assert find_status_entry(entries, edited) is not None, (
+        "the local edit must still be reported after the sync aborts"
+    )
+
+
+@pytest.mark.smoke
+def test_sync_records_modified_times_for_what_it_realizes(new_lore_repo):
+    """A sync establishes what every file it touches holds: the ones it writes by writing
+    them, and the ones that already hold the incoming content by measuring them. Recording
+    the modified time in both cases is what leaves the next scan nothing to measure.
+
+    One file here is written by the sync and one already holds the incoming bytes, so both
+    routes are covered. All are the same size throughout, so a scan that reached for the
+    content would have to measure it.
+    """
+    repo: Lore = new_lore_repo()
+
+    size = 4096
+    written = "written-by-sync.bin"
+    already_held = "already-held.bin"
+    for name in (written, already_held):
+        with repo.open_file(name, "w+b") as f:
+            f.write(os.urandom(size))
+    repo.stage(scan=True)
+    repo.commit("Base")
+    repo.push()
+
+    clone: Lore = repo.clone()
+
+    for name in (written, already_held):
+        with repo.open_file(name, "w+b") as f:
+            f.write(os.urandom(size))
+    repo.stage(scan=True)
+    repo.commit("Incoming")
+    repo.push()
+
+    # Give the clone the incoming bytes for one file ahead of the sync, so that change is
+    # verified against the target node and dropped rather than written.
+    with clone.open_file(already_held, "w+b") as f:
+        f.write(_read_bytes(repo, already_held))
+
+    clone.sync()
+
+    assert repo.compare_file(clone, written)
+    assert repo.compare_file(clone, already_held)
+
+    summary = parse_status_summary_json(
+        clone.status(scan=True, json=True, offline=True)
+    )
+    assert summary is not None, "scan must emit a repositoryStatusSummary event"
+    assert summary["hashChecks"] == 0, (
+        f"a scan after a sync must measure no file it touched, got {summary}"
+    )
+    assert summary["mtimeMatches"] == 2, summary
+
+
+@pytest.mark.smoke
+def test_dry_run_sync_records_no_modified_times(new_lore_repo):
+    """A dry run leaves the current revision where it was, so no modified time it takes
+    describes the revision the working copy is on.
+
+    The clone edits a file to exactly the incoming content, which is what makes the dry run
+    reach the point of establishing that the file matches the node it would sync to. That
+    node is not the one the clone is on, so recording the time would answer the next scan
+    about the wrong node and hide the edit from status, from stage and from every commit.
+    """
+    repo: Lore = new_lore_repo()
+
+    size = 4096
+    name = "dry-run-probe.bin"
+    with repo.open_file(name, "w+b") as f:
+        f.write(os.urandom(size))
+    repo.stage(scan=True)
+    repo.commit("Base")
+    repo.push()
+
+    clone: Lore = repo.clone()
+
+    incoming = os.urandom(size)
+    with repo.open_file(name, "w+b") as f:
+        f.write(incoming)
+    repo.stage(scan=True)
+    repo.commit("Incoming")
+    repo.push()
+
+    # Same size and the same content as the incoming revision, so the file differs from the
+    # revision the clone is on while matching the one it would sync to.
+    with clone.open_file(name, "w+b") as f:
+        f.write(incoming)
+
+    before = parse_status_json(clone.status(scan=True, json=True, offline=True))
+    assert find_status_entry(before, name) is not None, (
+        "the local edit must be reported before the dry run"
+    )
+
+    clone.sync(dry_run=True)
+
+    after = clone.status(scan=True, json=True, offline=True)
+    assert find_status_entry(parse_status_json(after), name) is not None, (
+        "the local edit must still be reported after a dry run"
+    )
+    summary = parse_status_summary_json(after)
+    assert summary is not None, "scan must emit a repositoryStatusSummary event"
+    assert summary["mtimeMatches"] == 0, (
+        f"a dry run may not leave a recorded time answering for the file, got {summary}"
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="file permissions do not deny reads on Windows"
+)
+def test_sync_reports_a_file_it_cannot_read(new_lore_repo):
+    """A file the sync cannot read compares as unmodified, so the incoming change is applied
+    and the write is what fails. The failure must name the file rather than report local
+    changes or quietly leave the file behind its revision.
+
+    The file is edited to the same size as the incoming one first, so nothing about the
+    outcome rests on the sizes differing.
+    """
+    repo: Lore = new_lore_repo()
+
+    size = 4096
+    name = "unreadable.bin"
+    with repo.open_file(name, "w+b") as f:
+        f.write(os.urandom(size))
+    repo.stage(scan=True)
+    repo.commit("Base")
+    repo.push()
+
+    clone: Lore = repo.clone()
+
+    with repo.open_file(name, "w+b") as f:
+        f.write(os.urandom(size))
+    repo.stage(scan=True)
+    repo.commit("Incoming")
+    repo.push()
+
+    clone_file_path = os.path.join(clone.path, name)
+    with clone.open_file(name, "w+b") as f:
+        f.write(os.urandom(size))
+    os.chmod(clone_file_path, 0o000)
+    try:
+        with pytest.raises(UnknownLoreError) as failure:
+            clone.sync()
+        message = str(failure.value)
+        assert f"Failed to sync file {name}" in message, (
+            f"the failure must name the file it could not read, got {message}"
+        )
+    finally:
+        os.chmod(clone_file_path, 0o644)

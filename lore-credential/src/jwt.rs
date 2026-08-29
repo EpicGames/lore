@@ -52,18 +52,37 @@ impl JWTUserInfo {
     }
 }
 
-pub async fn user_info<P>(auth_url: &str, identity: &str, token_filter: P) -> Option<UserInfo>
+pub async fn user_info<P>(
+    auth_url: &str,
+    identity: &str,
+    token_filter: P,
+    identity_token: &str,
+    access_token: &str,
+) -> Option<UserInfo>
 where
     P: FnMut(&&IdentityToken) -> bool,
 {
     lore_debug!("Get user {identity} info from {auth_url}");
 
-    let Ok(token) = crate::token_store::load_user_token(auth_url, identity, token_filter).await
+    let Ok(token) = crate::token_store::load_user_token(
+        auth_url,
+        identity,
+        token_filter,
+        identity_token,
+        access_token,
+    )
+    .await
     else {
         return None;
     };
 
     user_info_from_token(token)
+}
+
+pub fn identity_from_token(token: &str) -> String {
+    user_info_from_token(token.to_string())
+        .map(|info| info.id)
+        .unwrap_or_default()
 }
 
 pub fn insecure_decode_token(
@@ -123,4 +142,25 @@ pub fn verify_jwt_usage_for_remote(
     Err(JwtUsageError::internal(format!(
         "JWT 'aud' does not specify remote domain '{remote_domain}'"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `{"iss":"lore","sub":"alice","name":"Alice","exp":2000000000,"aud":["example.com"]}`
+    const ALICE_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
+
+    #[test]
+    fn identity_from_jwt_is_its_subject() {
+        assert_eq!(identity_from_token(ALICE_TOKEN), "alice");
+    }
+
+    #[test]
+    fn identity_from_undecodable_token_is_empty() {
+        assert!(identity_from_token("").is_empty());
+        assert!(identity_from_token("not-a-jwt").is_empty());
+        // Well-formed base64 segments that are not JWT claims.
+        assert!(identity_from_token("aaaa.bbbb.cccc").is_empty());
+    }
 }

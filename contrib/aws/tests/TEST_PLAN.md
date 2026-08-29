@@ -37,7 +37,7 @@ From the Lore repo root:
 
 ```bash
 cd /path/to/lore
-docker buildx build --platform linux/arm64 -f lore-server/Dockerfile -t loreserver:v0.8.3 --load .
+docker buildx build --platform linux/arm64 -f lore-server/Dockerfile -t loreserver:v0.8.7 --load .
 ```
 
 If building on an x86 host, register QEMU first:
@@ -57,7 +57,7 @@ docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
 ### 0.2 Verify image architecture
 
 ```bash
-docker inspect loreserver:v0.8.3 --format '{{.Architecture}}'
+docker inspect loreserver:v0.8.7 --format '{{.Architecture}}'
 ```
 
 **Expected:**
@@ -82,10 +82,10 @@ aws ecr create-repository --repository-name loreserver --region us-west-2 \
 ```bash
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 REGION=us-west-2
-ECR_URI="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/loreserver:v0.8.3"
+ECR_URI="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/loreserver:v0.8.7"
 
 aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin "$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
-docker tag loreserver:v0.8.3 "$ECR_URI"
+docker tag loreserver:v0.8.7 "$ECR_URI"
 docker push "$ECR_URI"
 ```
 
@@ -93,7 +93,7 @@ docker push "$ECR_URI"
 
 ```bash
 aws ecr describe-images --repository-name loreserver --region us-west-2 \
-  --query 'imageDetails[?imageTags[0]==`v0.8.3`].{tag:imageTags[0],pushed:imagePushedAt}' \
+  --query 'imageDetails[?imageTags[0]==`v0.8.7`].{tag:imageTags[0],pushed:imagePushedAt}' \
   --output table
 ```
 
@@ -105,7 +105,7 @@ aws ecr describe-images --repository-name loreserver --region us-west-2 \
 +------------------------------------+---------+
 |               pushed               |   tag   |
 +------------------------------------+---------+
-|  <today's date>                    |  v0.8.3 |
+|  <today's date>                    |  v0.8.7 |
 +------------------------------------+---------+
 ```
 
@@ -113,7 +113,7 @@ One row with today's date confirms the image landed. If empty — the push faile
 
 ### 0.5 Create terraform.tfvars
 
-> **Requires:** `$ECR_URI` set from Phase 0.4. If running in a fresh shell, reconstruct it: `ECR_URI="<ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/loreserver:v0.8.3"`
+> **Requires:** `$ECR_URI` set from Phase 0.4. If running in a fresh shell, reconstruct it: `ECR_URI="<ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/loreserver:v0.8.7"`
 
 ```bash
 cd contrib/aws
@@ -439,7 +439,7 @@ Clone complete in X.XXs
 
 Both MD5 hashes must be identical (same hex string on both lines).
 
-✅ **What this validates:** The primary server stores data durably (S3 for fragments, DynamoDB for metadata) and serves it back with byte-for-byte integrity.
+✅ **What this validates:** The primary server stores data durably (S3 for fragment payloads, DynamoDB for associations and fragment state) and serves it back with byte-for-byte integrity.
 
 ---
 
@@ -537,7 +537,7 @@ done
 
 **Expected:**
 - `*-fragments`: items (fragment associations)
-- `*-metadata`: items (fragment metadata)
+- `*-fragment-state`: items (fragment state, one row per hash)
 - `*-mutable`: items (branch pointers)
 - `*-locks`: 0 (no active locks expected)
 

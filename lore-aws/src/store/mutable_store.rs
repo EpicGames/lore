@@ -41,7 +41,6 @@ use crate::dynamodb::ConditionParts;
 use crate::dynamodb::DynamoDb;
 use crate::dynamodb::DynamoDbPutCondition;
 use crate::dynamodb::DynamoDbQuery;
-use crate::dynamodb::error::SdkError as DynamoDbSdkError;
 
 pub const MUTABLE_STORE_DYNAMO_PARTITION_KEY_ATTRIBUTE: &str = "repository_id";
 pub const MUTABLE_STORE_DYNAMO_SORT_KEY_ATTRIBUTE: &str = "key";
@@ -109,33 +108,40 @@ struct CompareAndSwapCondition {
 
 impl CompareAndSwapCondition {
     fn new(expected: Hash) -> Result<Self, StoreError> {
-        const KEY_ALIAS: &str = "#k";
         const VALUE_ATTRIBUTE_ALIAS: &str = "#v";
         const VALUE_PLACEHOLDER: &str = ":value";
 
         let mut expression_names: HashMap<String, String> = HashMap::new();
         let mut expression_values: HashMap<String, AttributeValue> = HashMap::new();
 
+        let expected_value: AttributeValue = serde_dynamo::to_attribute_value(expected).map_err(|e| {
+            warn!("Failed to convert expected value: {expected:?} to dynamo attribute value map: {e:?}");
+            StoreError::internal_with_context(e, "Failed to serialize expected hash for DynamoDB condition")
+        })?;
+
+        expression_names.insert(
+            VALUE_ATTRIBUTE_ALIAS.to_string(),
+            MUTABLE_STORE_VALUE_ATTRIBUTE.to_string(),
+        );
+        expression_values.insert(VALUE_PLACEHOLDER.to_string(), expected_value);
+
+        // When expected is zero the caller treats "absent" and "stored zero" as equivalent
+        // starting states. The condition must match both:
+        //   - the value attribute is missing entirely (row was never written, or was deleted)
+        //   - the value attribute is present but equals zero (e.g. written by branch initialization)
+        //
+        // The previous condition (`attribute_not_exists(pk) AND attribute_not_exists(sk)`)
+        // only matched the first case. When E.G. `branch::create` is called for a default branch
+        // with no commits it writes {value=0000…} via compare_and_swap(expected=0, value=0),
+        // creating the row. Subsequent pushes then call compare_and_swap(expected=0, value=X)
+        // and found the condition failing (row exists), DynamoDB returning the existing
+        // {value=0000…} via AllOld, and the code incorrectly interpreting previous==expected
+        // as a successful swap — silently dropping the write.
         let condition_expression = if expected.is_zero() {
-            expression_names.insert(
-                KEY_ALIAS.to_string(),
-                MUTABLE_STORE_DYNAMO_SORT_KEY_ATTRIBUTE.to_string(),
-            );
             format!(
-                "attribute_not_exists({MUTABLE_STORE_DYNAMO_PARTITION_KEY_ATTRIBUTE}) and attribute_not_exists({KEY_ALIAS})"
+                "attribute_not_exists({VALUE_ATTRIBUTE_ALIAS}) OR {VALUE_ATTRIBUTE_ALIAS} = {VALUE_PLACEHOLDER}"
             )
         } else {
-            let expected_value: AttributeValue = serde_dynamo::to_attribute_value(expected).map_err(|e| {
-                warn!("Failed to convert expected value: {expected:?} to dynamo attribute value map: {e:?}");
-                StoreError::internal_with_context(e, "Failed to serialize expected hash for DynamoDB condition")
-            })?;
-
-            expression_names.insert(
-                VALUE_ATTRIBUTE_ALIAS.to_string(),
-                MUTABLE_STORE_VALUE_ATTRIBUTE.to_string(),
-            );
-            expression_values.insert(VALUE_PLACEHOLDER.to_string(), expected_value);
-
             format!("{VALUE_ATTRIBUTE_ALIAS} = {VALUE_PLACEHOLDER}")
         };
 
@@ -275,7 +281,11 @@ impl AwsMutableStore {
                     warn!("Failed to deserialize dynamodb item: {av_map:?} into mutable store entry: {e:?}");
                     StoreError::internal_with_context(e, "failed to deserialize dynamodb item into mutable store entry")
                 })?;
-                if let Some(value) = item.value {
+                if let Some(value) = item.value
+                    // match the local store implementation - if the value is zero
+                    // then treat as AddressNotFound
+                    && !value.is_zero()
+                {
                     Ok(value)
                 } else {
                     Err(StoreError::from(AddressNotFound::from(
@@ -371,10 +381,14 @@ impl AwsMutableStore {
 
         match result {
             Ok(_) => Ok(expected),
-            Err(AwsError::AwsSdkError(DynamoDbSdkError::ServiceError(err)))
-                if err.err().is_conditional_check_failed_exception() =>
+            Err(AwsError::AwsSdkError(sdk_error))
+                if sdk_error
+                    .as_service_error()
+                    .is_some_and(|e| e.is_conditional_check_failed_exception()) =>
             {
-                if let PutItemError::ConditionalCheckFailedException(e) = err.err() {
+                if let Some(PutItemError::ConditionalCheckFailedException(e)) =
+                    sdk_error.as_service_error()
+                {
                     match e.item() {
                         Some(item) => {
                             let entry: MutableStoreEntry =
@@ -859,7 +873,7 @@ mod test {
                     .expect("failed to create CompareAndSwap condition")),
             )
             .return_once(move |_, _, _| {
-                Err(AwsError::AwsSdkError(SdkError::ServiceError(
+                Err(AwsError::sdk_error(SdkError::ServiceError(
                     aws_smithy_runtime_api::client::result::ServiceError::builder()
                         .source(PutItemError::ConditionalCheckFailedException(
                             ConditionalCheckFailedException::builder()
@@ -912,7 +926,7 @@ mod test {
                     .expect("failed to create CompareAndSwap condition")),
             )
             .return_once(move |_, _, _| {
-                Err(AwsError::AwsSdkError(SdkError::ServiceError(
+                Err(AwsError::sdk_error(SdkError::ServiceError(
                     aws_smithy_runtime_api::client::result::ServiceError::builder()
                         .source(PutItemError::ConditionalCheckFailedException(
                             ConditionalCheckFailedException::builder()
@@ -934,6 +948,58 @@ mod test {
         // get back an empty hash.
         assert_eq!(
             Hash::default(),
+            store
+                .compare_and_swap(repository.into(), hash, expected, value, key_type)
+                .await
+                .expect("should not have returned an error")
+        );
+    }
+
+    /// Regression test: pushing to a default branch whose LATEST key was initialised to
+    /// {value=0000…} by `branch::create` must succeed, not silently no-op.
+    ///
+    /// Previously the zero-expected CAS condition was `attribute_not_exists(pk) AND
+    /// attribute_not_exists(sk)`, which fails when the row already exists. `DynamoDB` then
+    /// returns the existing item via `AllOld`; the code saw `previous == expected == 0` and
+    /// incorrectly treated the failed swap as a success, leaving the branch pointer unadvanced.
+    #[tokio::test]
+    async fn test_compare_and_swap_zero_expected_with_existing_zero_value() {
+        let hash = random::<Hash>();
+        let value = random::<Hash>();
+        let expected = Hash::default(); // zero — "no previous value"
+
+        let repository = random::<Context>();
+
+        let mut dynamodb_mock = MockDynamoDb::default();
+
+        let key_type = KeyType::BranchId;
+        let typed_hash = AwsMutableStore::typed_key(hash, key_type);
+
+        let item: HashMap<String, AttributeValue> =
+            serde_dynamo::to_item(MutableStoreEntry::new(repository, typed_hash).with_value(value))
+                .unwrap();
+
+        // DynamoDB succeeds: `attribute_not_exists(#v) OR #v = :expected(0)` matches
+        // a row whose value attribute is zero.
+        dynamodb_mock
+            .expect_put_item_conditional()
+            .with(
+                eq(Arc::<str>::from(MUTABLE_STORE_TABLE_NAME)),
+                eq(item.clone()),
+                eq(CompareAndSwapCondition::new(expected)
+                    .expect("failed to create CompareAndSwap condition")),
+            )
+            .return_once(move |_, _, _| {
+                Ok(PutItemOutput::builder().set_attributes(Some(item)).build())
+            });
+
+        let store = initialize_mutable_store(dynamodb_mock).await;
+        let store = Arc::new(store);
+
+        // The swap must be reported as successful (returning the expected zero hash) and
+        // the new value must have been written — i.e. no false-positive no-op.
+        assert_eq!(
+            expected,
             store
                 .compare_and_swap(repository.into(), hash, expected, value, key_type)
                 .await

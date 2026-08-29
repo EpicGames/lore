@@ -416,7 +416,8 @@ mod tests {
             None,
         )
         .await
-        .expect("write content");
+        .expect("write content")
+        .address;
         let mut metadata = Metadata::new();
         metadata.set_branch(branch_id).expect("set branch");
         let metadata_hash = metadata

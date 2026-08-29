@@ -241,4 +241,27 @@ impl GrpcInternalServerBuilder<WantsAddress> {
             .await??;
         Ok(())
     }
+
+    /// Serve on a socket the caller already bound; see
+    /// [`super::server::GrpcServerBuilder::serve_with_listener`], which this mirrors.
+    pub async fn serve_with_listener(
+        self,
+        listener: std::net::TcpListener,
+        signal: impl Future<Output = ()> + Send + 'static,
+    ) -> anyhow::Result<()> {
+        lore_spawn_net!(async move {
+            listener.set_nonblocking(true)?;
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            self.0
+                .router
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    signal,
+                )
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+        Ok(())
+    }
 }

@@ -111,23 +111,46 @@ pub fn read_options_from_repository(repository: &RepositoryContext) -> ReadOptio
 // Session resolution helper
 // ---------------------------------------------------------------------------
 
-/// Build a lazily-resolved storage session for a repository context. The
-/// underlying server-side session is established only when the session is
-/// actually used — local-only command paths never drive the connect.
-fn resolve_session(repository: &Arc<RepositoryContext>) -> Arc<StorageSession> {
+/// A storage session for a repository context, or `None` where the context holds
+/// no remote and nothing can come of one.
+///
+/// The session is lazy: the server-side session is established only when it is
+/// actually used, so a command that reads and writes nothing remotely never drives
+/// the connect. It stays lazy rather than resolving here because the read path
+/// recovers a rotated server session map by invalidating the session and retrying
+/// that same one, and only a lazy session resolves again — see
+/// [`StorageSession::is_lazy`].
+///
+/// The correlation id is read here rather than inside the resolver because the
+/// resolver runs wherever the read or write ends up, which is not necessarily
+/// under this command's execution context.
+fn resolve_session(repository: &Arc<RepositoryContext>) -> Option<Arc<StorageSession>> {
+    if repository.is_offline() {
+        return None;
+    }
     let repository = repository.clone();
     let correlation_id = crate::lore::execution_context()
         .globals()
         .correlation_id
         .to_string();
-    Arc::new(StorageSession::pending(move || {
+    Some(Arc::new(StorageSession::pending(move || {
         let repository = repository.clone();
         let correlation_id = correlation_id.clone();
-        async move {
-            let remote = repository.remote().await?;
-            remote.session(repository.id, &correlation_id).await
-        }
-    }))
+        async move { pooled_session(&repository, &correlation_id).await }
+    })))
+}
+
+/// A pick from the pool the repository context holds, resolving it on first use.
+///
+/// Going through [`RepositoryContext::session_pool`] rather than the connection is
+/// the point: the connection's own lookup owns a key and re-pins the pool, and
+/// every call in a command carries the same key, so all of them land on the one
+/// shard it hashes to.
+async fn pooled_session(
+    repository: &Arc<RepositoryContext>,
+    correlation_id: &str,
+) -> Result<Arc<StorageSession>, ProtocolError> {
+    Ok(repository.session_pool(correlation_id).await?.pick())
 }
 
 // ---------------------------------------------------------------------------
@@ -202,7 +225,7 @@ pub async fn load_raw(
     address: Address,
     options: ReadOptions,
 ) -> Result<(Fragment, Bytes), ImmutableError> {
-    let session = Some(resolve_session(&repository));
+    let session = resolve_session(&repository);
 
     lore_storage::load_fragment(
         repository.immutable_store(),
@@ -244,7 +267,7 @@ pub async fn read_stream_range(
 ) -> Result<(u64, Range<u64>), ImmutableError> {
     let store = repository.immutable_store();
     let partition = repository.id;
-    let session = Some(resolve_session(&repository));
+    let session = resolve_session(&repository);
     let range = range
         .map(|range| {
             let start = usize::try_from(range.start)
@@ -290,7 +313,7 @@ pub async fn read(
 ) -> Result<Bytes, ImmutableError> {
     let store = repository.immutable_store();
     let partition = repository.id;
-    let session = Some(resolve_session(&repository));
+    let session = resolve_session(&repository);
     lore_storage::read(store, partition, address, range, options, session)
         .await
         .map(|(_fragment, bytes)| bytes)
@@ -306,7 +329,7 @@ pub async fn read_into(
 ) -> Result<(), ImmutableError> {
     let store = repository.immutable_store();
     let partition = repository.id;
-    let session = Some(resolve_session(&repository));
+    let session = resolve_session(&repository);
     lore_storage::read_into(store, partition, address, range, slice, options, session)
         .await
         .forward("reading immutable data")
@@ -324,7 +347,7 @@ pub async fn read_into_file(
     let store = repository.immutable_store();
     let partition = repository.id;
     let temp_ext = crate::repository::TEMP_FILE_EXTENSION;
-    let session = Some(resolve_session(&repository));
+    let session = resolve_session(&repository);
     lore_storage::read_into_file(
         store, partition, address, path, temp_ext, range, options, session,
     )
@@ -373,7 +396,7 @@ pub async fn store_raw_with_tracker(
     tracker: Option<Arc<lore_storage::write_tracker::WriteTracker>>,
 ) -> Result<Address, ImmutableError> {
     let session = if remote_write {
-        Some(resolve_session(&repository))
+        resolve_session(&repository)
     } else {
         None
     };
@@ -417,7 +440,7 @@ pub async fn write_with_tracker(
     tracker: Option<Arc<lore_storage::write_tracker::WriteTracker>>,
 ) -> Result<Address, ImmutableError> {
     let session = if flags.remote_write {
-        Some(resolve_session(&repository))
+        resolve_session(&repository)
     } else {
         None
     };
@@ -432,6 +455,7 @@ pub async fn write_with_tracker(
         None,
     )
     .await
+    .map(|written| written.address)
     .forward("writing immutable content")
 }
 
@@ -455,7 +479,7 @@ pub async fn write_from_file_with_tracker(
     tracker: Option<Arc<lore_storage::write_tracker::WriteTracker>>,
 ) -> Result<(Address, u64), ImmutableError> {
     let session = if flags.remote_write {
-        Some(resolve_session(&repository))
+        resolve_session(&repository)
     } else {
         None
     };
@@ -469,6 +493,7 @@ pub async fn write_from_file_with_tracker(
         tracker,
     )
     .await
+    .map(|written| (written.address, written.size_content))
     .forward("writing immutable content from file")
 }
 
@@ -488,6 +513,26 @@ pub async fn hash_file(
     )
     .await
     .forward("hashing file")
+}
+
+/// Whether `path` still holds the content `previous` addresses, fetching fragment metadata
+/// but never content payloads.
+pub async fn file_matches(
+    repository: Arc<RepositoryContext>,
+    path: impl AsRef<Path>,
+    previous: Address,
+    previous_size: Option<usize>,
+) -> Result<lore_storage::FileMatch, ImmutableError> {
+    lore_storage::file_matches(
+        repository.immutable_store(),
+        repository.id,
+        path,
+        previous,
+        previous_size,
+        None,
+    )
+    .await
+    .forward("comparing file against stored content")
 }
 
 // ---------------------------------------------------------------------------
@@ -755,7 +800,7 @@ where
         repository: Arc<RepositoryContext>,
         address: Address,
         cache: bool,
-    ) -> Result<Box<SelfType>, ImmutableError> {
+    ) -> Result<lore_base::allocator::HeapBox<SelfType>, ImmutableError> {
         let mut elem = SelfType::new_from_heap_zeroed();
         let slice = unsafe {
             std::slice::from_raw_parts_mut(
@@ -803,3 +848,146 @@ pub trait WriteToImmutable: zerocopy::IntoBytes + zerocopy::Immutable + std::mar
 
 impl<T> WriteToImmutable for T where T: zerocopy::IntoBytes + zerocopy::Immutable + std::marker::Send
 {}
+
+#[cfg(test)]
+mod session_tests {
+    use std::future::Future;
+
+    use lore_base::runtime::LORE_CONTEXT;
+
+    use super::*;
+    use crate::interface::ExecutionContext;
+    use crate::interface::LoreGlobalArgs;
+    use crate::relay::EventDispatcher;
+    use crate::repository::RemoteState;
+
+    /// A context carrying the given remote state, on in-memory stores so
+    /// everything but the remote is valid.
+    async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
+        let (immutable, mutable) = crate::repository::create_client_memory_stores()
+            .await
+            .expect("in-memory stores should be creatable");
+        Arc::new(RepositoryContext::new_with_state(
+            None,
+            immutable,
+            mutable,
+            crate::lore::RepositoryId::default(),
+            crate::instance::InstanceId::default(),
+            state,
+            Arc::default(),
+            crate::repository::RepositoryFormat::Lore,
+            None,
+        ))
+    }
+
+    /// Run `body` under an execution context, which is where the correlation id a
+    /// session is attributed to comes from.
+    async fn under_execution_context<T>(body: impl Future<Output = T>) -> T {
+        let execution = Arc::new(ExecutionContext::new_client(
+            LoreGlobalArgs::default(),
+            EventDispatcher::no_dispatch(),
+        ));
+        LORE_CONTEXT.scope(execution, body).await
+    }
+
+    /// An address nothing has stored, so a read of it reaches the point where a
+    /// session would have been used.
+    fn absent_address() -> Address {
+        Address {
+            hash: Hash::from([0xa5u8; 32]),
+            context: Context::from([0xa5u8; 16]),
+        }
+    }
+
+    /// A pool for the context to hold, with the strong reference left to the caller
+    /// and the one session in it to compare a pick against. That session is never
+    /// resolved: the test asks which pool answered, not what it yields.
+    fn held_pool() -> (Arc<lore_transport::SessionPool>, Arc<StorageSession>) {
+        let session = Arc::new(StorageSession::pending(|| async {
+            Err(ProtocolError::internal(
+                "a pooled session this test never resolves",
+            ))
+        }));
+        (
+            Arc::new(lore_transport::SessionPool::new(vec![session.clone()])),
+            session,
+        )
+    }
+
+    /// What a read or write ends up using comes from the pool the context holds.
+    /// This context's connect has failed, so reaching the pool at all is proof the
+    /// session was not looked up through the connection per call.
+    #[tokio::test]
+    async fn a_pooled_session_comes_from_the_pool_the_context_holds() {
+        let context =
+            context_with_state(RemoteState::Failed(ProtocolError::from(Disconnected))).await;
+        let (pool, pooled) = held_pool();
+        context.set_session_pool(&pool);
+
+        let session = pooled_session(&context, "correlation")
+            .await
+            .expect("the pool the context holds answers, remote or no remote");
+        assert!(Arc::ptr_eq(&session, &pooled));
+    }
+
+    /// A context with no remote has nothing a session could resolve to, so the
+    /// read and write paths take their local-only route rather than carrying one
+    /// per fragment and failing it.
+    #[tokio::test]
+    async fn an_offline_context_resolves_no_session() {
+        let context = context_with_state(RemoteState::Offline).await;
+        let session = under_execution_context(async { resolve_session(&context) }).await;
+        assert!(session.is_none());
+    }
+
+    /// A failed connect is an answer a session carries, so one is still built: the
+    /// failure belongs in the error the read or write reports.
+    #[tokio::test]
+    async fn a_failed_connect_still_resolves_a_session() {
+        let context =
+            context_with_state(RemoteState::Failed(ProtocolError::from(Disconnected))).await;
+        let session = under_execution_context(async { resolve_session(&context) })
+            .await
+            .expect("a context that is not offline resolves a session");
+        assert!(
+            session.is_lazy(),
+            "the read path invalidates the session and retries that same one, \
+             which only a lazy session resolves again"
+        );
+    }
+
+    /// A write on a context with no remote stores locally and reports success,
+    /// which is what a write carrying a session reported: the upload's outcome only
+    /// sets the durable flag, it never fails the write.
+    #[tokio::test]
+    async fn a_write_on_an_offline_context_stores_locally() {
+        let context = context_with_state(RemoteState::Offline).await;
+        let payload = Bytes::from_static(b"content with no remote to go to");
+        let address = under_execution_context(write(
+            context.clone(),
+            Context::from([0x5au8; 16]),
+            payload.clone(),
+            WriteOptions::default().with_remote_write(),
+        ))
+        .await
+        .expect("a write with no remote still stores locally");
+
+        let stored = under_execution_context(read(context, address, None, ReadOptions::default()))
+            .await
+            .expect("what was stored reads back");
+        assert_eq!(stored, payload);
+    }
+
+    /// Skipping the session on an offline context reports what carrying one
+    /// reported: a resolver finding no remote maps to the address not being found,
+    /// which is what no session at all reports.
+    #[tokio::test]
+    async fn a_miss_on_an_offline_context_reports_the_address_not_found() {
+        let context = context_with_state(RemoteState::Offline).await;
+        let err =
+            under_execution_context(load_raw(context, absent_address(), ReadOptions::default()))
+                .await
+                .expect_err("nothing was ever stored under that address");
+        assert!(err.is_address_not_found(), "reported {err:?}");
+    }
+}

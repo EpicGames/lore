@@ -109,6 +109,7 @@ fn v1_thin_client_field_shapes() {
         content_to: _,
         automerged: _,
         link_repository_index: _,
+        tracking: _,
     } = DiffChange::default();
     let DiffConflict {
         change_from: _,
@@ -126,6 +127,7 @@ fn v1_thin_client_field_shapes() {
         last_changed_revision_signature: _,
         size: _,
         mode: _,
+        tracking: _,
     } = TreeNode::default();
 
     // Revision + nested Parent + Metadata

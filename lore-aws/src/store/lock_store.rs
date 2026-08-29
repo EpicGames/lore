@@ -821,7 +821,7 @@ mod test {
         dynamodb_mock
             .expect_transact_write_items()
             .return_once(move |_| {
-                Err(AwsError::AwsSdkError(SdkError::ServiceError(
+                Err(AwsError::sdk_error(SdkError::ServiceError(
                     ServiceError::builder()
                         .source(TransactWriteItemsError::TransactionCanceledException(
                             TransactionCanceledException::builder()
@@ -899,7 +899,7 @@ mod test {
         dynamodb_mock
             .expect_transact_write_items()
             .return_once(move |_| {
-                Err(AwsError::AwsSdkError(SdkError::ServiceError(
+                Err(AwsError::sdk_error(SdkError::ServiceError(
                     ServiceError::builder()
                         .source(TransactWriteItemsError::TransactionCanceledException(
                             TransactionCanceledException::builder()
@@ -1006,7 +1006,7 @@ mod test {
         dynamodb_mock
             .expect_transact_write_items()
             .return_once(move |_| {
-                Err(AwsError::AwsSdkError(SdkError::ServiceError(
+                Err(AwsError::sdk_error(SdkError::ServiceError(
                     ServiceError::builder()
                         .source(TransactWriteItemsError::TransactionCanceledException(
                             TransactionCanceledException::builder()
@@ -1734,7 +1734,7 @@ mod test {
         dynamodb_mock
             .expect_query_paginated()
             .return_once(move |_, _: LockQuery| {
-                Err(AwsError::AwsSdkError(SdkError::ServiceError(
+                Err(AwsError::sdk_error(SdkError::ServiceError(
                     ServiceError::builder()
                         .source(QueryError::ResourceNotFoundException(
                             ResourceNotFoundException::builder()
@@ -1793,7 +1793,7 @@ mod test {
 
         dynamodb_mock.expect_transact_write_items().return_once(
             move |_: Vec<TransactWriteItem>| {
-                Err(AwsError::AwsSdkError(SdkError::ServiceError(
+                Err(AwsError::sdk_error(SdkError::ServiceError(
                     ServiceError::builder()
                         .source(TransactWriteItemsError::TransactionCanceledException(
                             TransactionCanceledException::builder()
@@ -1850,7 +1850,7 @@ mod test {
 
         dynamodb_mock.expect_transact_write_items().return_once(
             move |_: Vec<TransactWriteItem>| {
-                Err(AwsError::AwsSdkError(SdkError::ServiceError(
+                Err(AwsError::sdk_error(SdkError::ServiceError(
                     ServiceError::builder()
                         .source(TransactWriteItemsError::ResourceNotFoundException(
                             ResourceNotFoundException::builder()
@@ -1899,7 +1899,7 @@ mod test {
 
         dynamodb_mock.expect_transact_write_items().return_once(
             move |_: Vec<TransactWriteItem>| {
-                Err(AwsError::AwsSdkError(SdkError::ServiceError(
+                Err(AwsError::sdk_error(SdkError::ServiceError(
                     ServiceError::builder()
                         .source(TransactWriteItemsError::TransactionCanceledException(
                             TransactionCanceledException::builder()

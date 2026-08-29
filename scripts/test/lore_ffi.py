@@ -7,6 +7,19 @@ observes exactly the API-level behavior an SDK consumer sees — including
 return codes for calls whose errors the CLI's human-oriented output layer
 never surfaces.
 
+Run as a script, this module is the driver a test invokes as a subprocess:
+
+    python lore_ffi.py <library-path> <repository-path> [user-id...]
+
+exiting with the call's FFI code. Tests go through
+`Lore.auth_user_info_capi()` rather than importing `LoreLibrary` directly:
+loading the library into the pytest process would leak its global state
+(connection and authz caches, the tokio runtime, a panic hook) across every
+test sharing that xdist worker, let a panic in the library take the worker
+down with it, and force environment setup through the worker's own `os.environ`.
+Importing this module for its constants is safe — nothing loads the library
+until `LoreLibrary` is constructed.
+
 Only the types needed by the tests are bound. Struct layouts mirror the
 cbindgen-generated `lore.h` next to the built library; the synchronous entry
 points return `0` on success or the failing error's FFI code (see
@@ -29,9 +42,11 @@ from ctypes import (
 from pathlib import Path
 
 # FFI codes from lore-base/src/error.rs (`#[ffi_code(...)]`), which the
-# header does not export as constants.
-NOT_AUTHENTICATED = 12
-NOT_SUPPORTED = 18
+# header does not export as constants. That module allocates codes in blocks
+# by error group: 16-27 is authentication and authorization, 3-15 is input and
+# validation.
+NOT_AUTHENTICATED = 16
+NOT_SUPPORTED = 9
 
 
 def library_filename() -> str:
@@ -59,6 +74,7 @@ class LoreGlobalArgs(Structure):
 
     _fields_ = [
         ("repository_path", LoreString),
+        ("working_directory", LoreString),
         ("correlation_id", LoreString),
         ("identity", LoreString),
         ("force", c_uint8),
@@ -79,6 +95,8 @@ class LoreGlobalArgs(Structure):
         ("store_keep_alive_seconds", c_uint64),
         ("sync_data", c_uint8),
         ("cache", c_uint8),
+        ("identity_token", LoreString),
+        ("access_token", LoreString),
     ]
 
 
@@ -126,3 +144,18 @@ class LoreLibrary:
         return self._lib.lore_auth_user_info(
             ctypes.byref(globals_args), ctypes.byref(args), no_callback
         )
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print(
+            "usage: lore_ffi.py <library-path> <repository-path> [user-id...]",
+            file=sys.stderr,
+        )
+        return 2
+    library_path, repository_path, *user_ids = argv
+    return LoreLibrary(library_path).auth_user_info(repository_path, user_ids)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

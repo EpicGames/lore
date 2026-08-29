@@ -77,6 +77,16 @@ pub struct LoreCli {
     #[clap(global = true, long, action)]
     pub identity: Option<String>,
 
+    /// Use given authentication token instead of one from the secure store. Acts
+    /// as the identity the token was issued to
+    #[clap(global = true, long, value_name = "token", conflicts_with = "identity")]
+    pub identity_token: Option<String>,
+
+    /// Use given authorization token instead of exchanging one with the
+    /// authentication service
+    #[clap(global = true, long, value_name = "token", conflicts_with = "identity")]
+    pub access_token: Option<String>,
+
     /// Avoid using compression
     #[clap(global = true, hide = true, long, action)]
     pub nocompress: bool,
@@ -359,6 +369,8 @@ pub fn lore_globals_from_args(cli: &LoreCli) -> LoreGlobalArgs {
         cache: cli.cache.into(),
 
         identity: cli.identity.clone().into(),
+        identity_token: cli.identity_token.clone().into(),
+        access_token: cli.access_token.clone().into(),
 
         search_limit: cli.search_limit.unwrap_or_default() as u32,
         search_nearest: cli.search_nearest.into(),

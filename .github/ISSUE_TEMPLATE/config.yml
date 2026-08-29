@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Feature ideas & discussion
+    url: https://discord.gg/E4SFJKRPbg
+    about: "Discuss feature ideas with the team and community in the #feature-requests channel on Discord."
+  - name: Help & questions
+    url: https://discord.gg/E4SFJKRPbg
+    about: "Ask usage questions and get help in the #support-requests channel on Discord."
+  - name: Lore Enhancement Proposals (LEPs)
+    url: https://github.com/EpicGames/lore/blob/main/docs/proposals/README.md
+    about: Large or cross-cutting changes start as an enhancement proposal, not an issue.

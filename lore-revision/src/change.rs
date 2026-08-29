@@ -7,6 +7,7 @@ use lore_error_set::prelude::*;
 
 use crate::bitflagsops;
 use crate::lore::Address;
+use crate::lore::RepositoryId;
 use crate::node::*;
 use crate::repository::RepositoryContext;
 use crate::state::State;
@@ -154,12 +155,7 @@ impl NodeChangeState {
     }
 
     pub async fn subtree(&self, node_id: NodeID) -> Self {
-        let Ok(node) = self
-            .state
-            .node(self.repository.clone(), node_id)
-            .await
-            .internal("Node not found")
-        else {
+        let Ok(node) = self.state.node(self.repository.clone(), node_id).await else {
             return self.invalid();
         };
         NodeChangeState {
@@ -187,6 +183,43 @@ pub struct NodeChange {
 }
 
 impl NodeChange {
+    /// The side the change resolves to: `from` for a delete, `to` otherwise.
+    pub fn resolved_side(&self) -> &NodeChangeState {
+        match self.action {
+            FileAction::Delete => &self.from,
+            _ => &self.to,
+        }
+    }
+
+    /// Repository a consumer must fetch this change's content from. A link
+    /// node's content is the revision it points at, which lives in the target
+    /// repository rather than the one the change was walked from.
+    pub fn content_repository_id(&self) -> RepositoryId {
+        let side = self.resolved_side();
+        if side.flags.contains(NodeFlags::Link) {
+            side.address.context.into()
+        } else {
+            side.repository.id
+        }
+    }
+
+    /// True when the resolved side is a link node following its parent's branch.
+    /// An unresolvable link reference falls back to pinned.
+    pub async fn is_tracking_link(&self) -> bool {
+        let side = self.resolved_side();
+        if !side.flags.contains(NodeFlags::Link) {
+            return false;
+        }
+        side.state
+            .link_find(
+                side.repository.clone(),
+                side.address.context.into(),
+                side.node,
+            )
+            .await
+            .is_ok_and(|link_reference| link_reference.is_tracking())
+    }
+
     pub fn reverse(&mut self) {
         // Reverse add/delete/copy - other actions are transitive
         if self.action == FileAction::Delete {

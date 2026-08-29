@@ -24,7 +24,9 @@ use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_tree::LoreRevisionTreeCommitCompleteEventData;
 use lore_revision::interface::LoreError;
 use lore_revision::metadata::Metadata;
+use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
+use lore_revision::state::State;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -32,6 +34,7 @@ use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
 use crate::revision_tree::call::revision_tree_call;
+use crate::revision_tree::handle::ExclusiveAccess;
 use crate::revision_tree::handle::IN_MEMORY_MARKER;
 use crate::revision_tree::handle::LoreRevisionTree;
 use crate::revision_tree::handle::RevisionTreeInternal;
@@ -129,13 +132,19 @@ fn emit_commit_complete(
 /// handle stays usable: the state now *is* the new revision, so previously
 /// captured node ids still resolve and further edits commit on top.
 ///
-/// A failure the call is rejected on — nothing staged, an unusable branch, a tree
-/// the validator refuses, or a branch tip that has already moved — writes nothing
-/// and leaves the handle usable, so a caller can fix the call and retry. A failure
-/// once the freeze has begun leaves the tree part-frozen and **poisons the
-/// handle**: every subsequent call returns `LORE_ERROR_CODE_INVALID_ARGUMENTS`,
-/// and the recovery path is to close it, load a fresh handle against the new tip,
-/// re-apply the edits and commit again.
+/// **A commit is all-or-nothing against the handle.** Either it succeeds and the
+/// state is consistent on the new revision, or it fails and the state is consistent
+/// on the state it had before the call. A failure the call is rejected on — nothing
+/// staged, an unusable branch, a tree the validator refuses, or a branch tip that has
+/// already moved — writes nothing at all. A failure once the freeze has begun leaves a
+/// part-frozen tree, which is discarded and rebuilt from a snapshot taken before the
+/// freeze started: the handle comes back on the revision it was on, dirty, with the
+/// edits still staged and still committable. Either way the recovery is to fix what
+/// the terminal reported and retry **on the same handle** — no close, no reload, no
+/// re-applying edits.
+///
+/// The one failure that still poisons is a restore that itself fails, leaving the
+/// handle on a tree neither committed nor restored. It reports `INTERNAL` saying so.
 ///
 /// Neither a tip collision nor an empty commit has a `LoreErrorCode` of its own, so
 /// both report `INTERNAL` with the reason in the completion detail — the same codes
@@ -150,20 +159,22 @@ fn emit_commit_complete(
 /// there is simply nothing to send it to, and the commit still reports success.
 /// Per-call flags that contradict the store's bound flags reject the call.
 ///
-/// **Two commits in flight on one handle must agree about `remote_write`.** The
-/// resolved value is applied to the handle's shared repository context, so
-/// concurrent calls that disagree can each observe the other's — one uploading when
-/// it asked not to, or not uploading when it asked to, with neither call failing.
-/// Unlike the tip race below there is no compare-and-swap to decide it. Serialize
-/// such commits, or give them separate handles. The value also outlives the call:
-/// the handle carries whatever the last commit resolved.
+/// **The commit holds the handle for the length of the call**, so no other call on it
+/// runs while the tree is being frozen — an edit issued concurrently lands wholly
+/// before the commit reads the tree or wholly after it finishes. Two commits on one
+/// handle serialize, so the second sees what the first published rather than racing
+/// it, and `metadata_set` can no longer lose an edit to the commit's metadata clone.
+/// A commit on a large tree therefore blocks reads on that handle for its duration,
+/// and a caller whose event callback re-enters the API on the same handle deadlocks —
+/// which the callback contract already forbids.
 ///
-/// Concurrent commits on one handle are not serialized against each other; the tip
-/// compare-and-swap decides which one publishes and the loser fails with the tip
+/// `remote_write` is resolved onto the handle's shared repository context, so the
+/// value outlives the call: the handle carries whatever the last commit resolved.
+///
+/// Commits from *different* handles, or different processes, still race: the tip
+/// compare-and-swap decides which one publishes and the loser fails carrying the tip
 /// the winner set, having possibly left orphan tree blocks behind. They are
-/// content-addressed and no revision references them. Do not call `metadata_set`
-/// while a commit is in flight on the same handle: edits arriving between the
-/// commit's metadata clone and its post-success reset are lost.
+/// content-addressed and no revision references them.
 pub async fn commit(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeCommitArgs,
@@ -210,6 +221,13 @@ fn resolve_upload(
     Ok(remote_write != 0 && !effective.no_remote)
 }
 
+/// Freeze and publish the revision, holding the handle exclusively for the call.
+///
+/// The upload flag is written to the handle's shared repository context after the
+/// claim rather than before: a second commit resolving its own value while this one
+/// runs is the race the exclusive access exists to remove. Resolving the flags stays
+/// outside the claim, where a contradiction is rejected without waiting for the
+/// handle.
 async fn commit_revision(
     internal: Arc<RevisionTreeInternal>,
     args: LoreRevisionTreeCommitArgs,
@@ -228,15 +246,16 @@ async fn commit_revision(
             return Err(error);
         }
     };
-    internal.repository_context.set_disable_upload(!upload);
-
     let repository_context = internal.repository_context.clone();
-    let current_revision = internal.state.revision();
+    let mut access = internal.access_exclusive().await;
+    internal.repository_context.set_disable_upload(!upload);
+    let state = access.state();
+    let current_revision = state.revision();
     let metadata = internal.pending_metadata.read().clone();
 
     let branch = match resolve_commit_branch(
         repository_context.clone(),
-        internal.state.clone(),
+        state.clone(),
         &metadata,
         current_revision,
     )
@@ -260,7 +279,7 @@ async fn commit_revision(
     match commit_in_memory_revision(
         repository_context.clone(),
         &token,
-        internal.state.clone(),
+        state.clone(),
         metadata,
         current_revision,
         branch,
@@ -270,32 +289,89 @@ async fn commit_revision(
         Ok(revision) => {
             *internal.pending_metadata.write() = Metadata::default();
             emit_commit_complete(id, revision, Hash::default(), LoreErrorCode::None);
-            emit_commit_telemetry(&internal, branch, revision, current_revision);
+            emit_commit_telemetry(
+                &internal,
+                state.revision_number(),
+                branch,
+                revision,
+                current_revision,
+            );
             Ok(())
         }
         Err(failure) => {
-            if failure.tree_mutated {
-                internal.invalid.store(true, Ordering::Release);
-            }
             let branch_advanced = failure.error.is_branch_advanced();
             let new_tip_hash = if branch_advanced {
-                lore_revision::branch::load_latest(repository_context, branch)
+                lore_revision::branch::load_latest(repository_context.clone(), branch)
                     .await
                     .unwrap_or_default()
             } else {
                 Hash::default()
             };
-            let error = map_commit_error(failure.error);
+            let restore_from = failure.restore_from;
+            let mut error = map_commit_error(failure.error);
+            if !restore_from.is_zero()
+                && let Err(restore_failure) = restore_tree(
+                    &internal,
+                    &mut access,
+                    repository_context,
+                    restore_from,
+                    current_revision,
+                    &error,
+                )
+                .await
+            {
+                error = restore_failure;
+            }
             emit_commit_complete(id, Hash::default(), new_tip_hash, commit_error_code(&error));
             Err(error)
         }
     }
 }
 
+/// Put the tree back the way it was before the freeze started rewriting it.
+///
+/// The part-frozen state is discarded rather than repaired: the snapshot is
+/// deserialized into a new `State` and takes its place. `serialize` left the snapshot's
+/// signature on itself and cleared its dirty flag, so both are restored — a handle with
+/// unserialized edits sitting on the revision it was loaded at is exactly the state the
+/// caller had.
+///
+/// A failure here is the one case that still poisons: the handle is holding a tree
+/// neither committed nor restored, and no further call can be trusted against it. It
+/// reports `cause` alongside its own failure, because that is what the caller would
+/// have had to fix and it is otherwise lost behind the restore.
+async fn restore_tree(
+    internal: &Arc<RevisionTreeInternal>,
+    access: &mut ExclusiveAccess<'_>,
+    repository_context: Arc<RepositoryContext>,
+    restore_from: Hash,
+    current_revision: Hash,
+    cause: &CommitVerbError,
+) -> Result<(), CommitVerbError> {
+    let restored = match State::deserialize(repository_context, restore_from).await {
+        Ok(restored) => restored,
+        Err(error) => {
+            internal.invalid.store(true, Ordering::Release);
+            return Err(CommitVerbError::internal_with_context(
+                error,
+                &format!(
+                    "the handle is unusable: restoring the tree failed after the commit failed \
+                     with: {cause}"
+                ),
+            ));
+        }
+    };
+    restored.set_revision(current_revision);
+    restored.mark_dirty();
+    access.replace(restored);
+    Ok(())
+}
+
 /// Emit the revision event file-system commit consumers already subscribe to, so a
 /// pipeline watching `RevisionCommit*` sees revisions from this surface too.
 fn emit_commit_telemetry(
     internal: &RevisionTreeInternal,
+    revision_number: u64,
     branch: BranchId,
     revision: Hash,
     parent: Hash,
@@ -304,7 +380,7 @@ fn emit_commit_telemetry(
         repository: internal.repository,
         branch,
         revision,
-        revision_number: internal.state.revision_number(),
+        revision_number,
         parent,
         parent_other: Hash::default(),
     })
@@ -344,6 +420,7 @@ mod tests {
     use lore_revision::interface::LoreNodeType;
     use lore_revision::interface::LoreString;
     use lore_revision::metadata::BRANCH;
+    use lore_revision::metadata::MESSAGE;
     use lore_revision::node::NodeID;
     use lore_revision::node::ROOT_NODE;
     use lore_revision::state::State;
@@ -358,6 +435,9 @@ mod tests {
     use crate::revision_tree::metadata_set::LoreRevisionTreeMetadataSetArgs;
     use crate::revision_tree::metadata_set::LoreRevisionTreeMetadataSetEntry;
     use crate::revision_tree::metadata_set::metadata_set;
+    use crate::revision_tree::modify::LoreRevisionTreeModifyArgs;
+    use crate::revision_tree::modify::LoreRevisionTreeModifyEntry;
+    use crate::revision_tree::modify::modify;
     use crate::storage::handle as storage_handle;
     use crate::storage::store::in_memory_for_tests;
 
@@ -464,8 +544,17 @@ mod tests {
         rt_handle::REGISTRY
             .get(&handle.handle_id)
             .expect("handle registered")
-            .state
-            .clone()
+            .state_for_tests()
+    }
+
+    fn pending_metadata_keys(handle: LoreRevisionTree) -> usize {
+        let entry = rt_handle::REGISTRY
+            .get(&handle.handle_id)
+            .expect("handle registered");
+        let pending = entry.pending_metadata.read();
+        let mut count = 0usize;
+        pending.walk(|_, _, _| count += 1);
+        count
     }
 
     fn is_poisoned(handle: LoreRevisionTree) -> bool {
@@ -476,9 +565,15 @@ mod tests {
             .load(AtomicOrdering::Acquire)
     }
 
-    /// Add one file under the root. `content_hash` of zero produces the node
-    /// `rehash_directory` refuses, which is the reachable post-freeze failure.
-    async fn add_file(handle: LoreRevisionTree, entry_id: u64, name: &str, content_hash: u64) {
+    /// Add one file under the root, returning its node id. `content_hash` of zero
+    /// produces the node `rehash_directory` refuses, which is the reachable post-freeze
+    /// failure.
+    async fn add_file(
+        handle: LoreRevisionTree,
+        entry_id: u64,
+        name: &str,
+        content_hash: u64,
+    ) -> NodeID {
         let sink = make_sink();
         let status = add(
             LoreGlobalArgs::default(),
@@ -504,6 +599,67 @@ mod tests {
         .await;
         let events = sink.lock().unwrap().clone();
         assert_eq!(status, 0, "adding {name} must succeed, got {events:?}");
+        events
+            .iter()
+            .find_map(|event| match event {
+                Captured::AddComplete(id, node_id, _) if *id == entry_id => Some(*node_id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("adding {name} must report a node id, got {events:?}"))
+    }
+
+    /// Give a leaf a content address, so a tree the rehash refused can be corrected.
+    async fn modify_file(
+        handle: LoreRevisionTree,
+        entry_id: u64,
+        node_id: NodeID,
+        content_hash: u64,
+    ) {
+        let sink = make_sink();
+        let status = modify(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeModifyArgs {
+                batch_id: 700 + entry_id,
+                handle,
+                entries: LoreArray::from_vec(vec![LoreRevisionTreeModifyEntry {
+                    entry_id,
+                    node_id,
+                    mode: 0o644,
+                    size: 12,
+                    address: Address {
+                        hash: Hash::from_u64(content_hash),
+                        context: Context::default(),
+                    },
+                }]),
+            },
+            make_callback(sink.clone()),
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        assert_eq!(status, 0, "modifying the node must succeed, got {events:?}");
+    }
+
+    async fn set_message(handle: LoreRevisionTree, message: &str) {
+        let sink = make_sink();
+        let status = metadata_set(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeMetadataSetArgs {
+                batch_id: 810,
+                handle,
+                entries: LoreArray::from_vec(vec![LoreRevisionTreeMetadataSetEntry {
+                    entry_id: 2,
+                    key: LoreString::from_str(MESSAGE),
+                    value: LoreMetadata::String(LoreString::from_str(message)),
+                }]),
+            },
+            make_callback(sink.clone()),
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        assert_eq!(
+            status, 0,
+            "setting the message must succeed, got {events:?}"
+        );
     }
 
     async fn set_branch(handle: LoreRevisionTree, branch: BranchId) {
@@ -634,7 +790,11 @@ mod tests {
     async fn commit_on_unknown_handle_emits_commit_complete_with_invalid_arguments() {
         let (status, events) = run_commit(LoreRevisionTree::INVALID, 6).await;
 
-        assert_eq!(status, 1, "committing an unknown handle must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "committing an unknown handle must fail"
+        );
         let (revision, new_tip, code) = commit_outcome(&events, 6);
         assert_eq!(code, LoreErrorCode::InvalidArguments, "got {events:?}");
         assert!(revision.is_zero() && new_tip.is_zero(), "got {events:?}");
@@ -687,7 +847,8 @@ mod tests {
         let (status, events) = run_commit(handle, 10).await;
 
         assert_eq!(
-            status, 1,
+            status,
+            InvalidArguments::FFI_CODE,
             "an initial revision needs a branch, got {events:?}"
         );
         let (_revision, _new_tip, code) = commit_outcome(&events, 10);
@@ -700,35 +861,143 @@ mod tests {
         release(handle, store_handle_id);
     }
 
-    /// A file whose content address is zero is a tree the push-side validator
-    /// refuses. It gets that far only after the freeze has cleared flags and
-    /// discarded, so the tree can no longer be trusted and the handle is poisoned.
+    /// The atomicity contract, on the one failure that reaches past the freeze: a file
+    /// whose content address is zero gets past the validator, which checks no
+    /// addresses, and the rehash refuses it once flags have been cleared and nodes
+    /// discarded. The handle must come back on the revision it was on, dirty, with the
+    /// edits still staged and still committable — not poisoned.
+    ///
+    /// The handle commits once first so the restored revision is a real one rather than
+    /// the zero hash an empty handle would report either way.
     #[tokio::test]
-    async fn a_tree_the_rehash_refuses_poisons_the_handle() {
+    async fn a_commit_the_rehash_refuses_restores_the_pre_commit_state() {
         let (handle, store_handle_id) =
-            load_handle("commit-poison", Partition::from([0x44u8; 16])).await;
+            load_handle("commit-restore", Partition::from([0x44u8; 16])).await;
         let branch = Context::from(uuid::Uuid::now_v7());
-        add_file(handle, 1, "a.bin", 0).await;
+        add_file(handle, 1, "a.bin", 0x11).await;
         set_branch(handle, branch).await;
+        let (first_status, first_events) = run_commit(handle, 11).await;
+        assert_eq!(
+            first_status, 0,
+            "the first revision must commit, got {first_events:?}"
+        );
+        let (published, _, _) = commit_outcome(&first_events, 11);
 
-        let (status, events) = run_commit(handle, 11).await;
+        let node_id = add_file(handle, 2, "b.bin", 0).await;
+        set_message(handle, "the message must survive").await;
+        let (status, events) = run_commit(handle, 12).await;
 
         assert_eq!(
             status, -1,
             "a tree with a zero content hash must not commit, got {events:?}"
         );
-        let (revision, _new_tip, code) = commit_outcome(&events, 11);
+        let (revision, _new_tip, code) = commit_outcome(&events, 12);
         assert_eq!(code, LoreErrorCode::Internal, "got {events:?}");
         assert!(revision.is_zero(), "got {events:?}");
         assert!(
-            is_poisoned(handle),
-            "a failure past the freeze must poison the handle"
+            !is_poisoned(handle),
+            "a restored handle must not be poisoned"
         );
 
-        let (retry_status, retry_events) = run_commit(handle, 12).await;
+        let state = handle_state(handle);
         assert_eq!(
-            retry_status, 1,
-            "a poisoned handle must reject every call, got {retry_events:?}"
+            state.revision(),
+            published,
+            "the restored state must sit on the revision the handle was on"
+        );
+        assert!(
+            state.is_dirty(),
+            "the restored state carries unserialized edits again"
+        );
+        assert_eq!(
+            pending_metadata_keys(handle),
+            1,
+            "a failed commit must not consume the pending metadata"
+        );
+
+        modify_file(handle, 3, node_id, 0x22).await;
+        let (retry_status, retry_events) = run_commit(handle, 13).await;
+        assert_eq!(
+            retry_status, 0,
+            "the restored tree must commit once corrected, got {retry_events:?}"
+        );
+        let (second, _, _) = commit_outcome(&retry_events, 13);
+        assert!(
+            retry_events.contains(&Captured::CommitRevision(second, published, branch, 2)),
+            "the retry must chain onto the revision the restore came back to, got {retry_events:?}"
+        );
+
+        release(handle, store_handle_id);
+    }
+
+    /// A metadata edit must not land inside a commit: the commit clones the pending
+    /// metadata and empties it on success, so an edit arriving between those two points
+    /// would be recorded on the handle and then dropped without reaching any revision.
+    /// The claim `metadata_set` takes is what makes that impossible, and this pins it at
+    /// the lock, since a race cannot be scheduled deterministically.
+    #[tokio::test]
+    async fn a_metadata_edit_cannot_land_inside_a_commit() {
+        let (handle, store_handle_id) =
+            load_handle("commit-metadata-exclusion", Partition::from([0x4du8; 16])).await;
+        let internal = rt_handle::REGISTRY
+            .get(&handle.handle_id)
+            .expect("handle registered")
+            .clone();
+
+        let commit_claim = internal.access_exclusive().await;
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            set_message(handle, "must wait for the commit"),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "a metadata edit must not run while a commit holds the handle"
+        );
+        drop(commit_claim);
+
+        set_message(handle, "lands once the commit is done").await;
+        assert_eq!(
+            pending_metadata_keys(handle),
+            1,
+            "the edit must land once the handle is free"
+        );
+
+        release(handle, store_handle_id);
+    }
+
+    /// The exclusion the atomicity rests on, at the lock rather than through a race:
+    /// while a commit holds the handle no other call can take it, and every call can
+    /// again once it lets go.
+    #[tokio::test]
+    async fn a_commit_holds_the_handle_against_every_other_call() {
+        let (handle, store_handle_id) =
+            load_handle("commit-exclusive", Partition::from([0x4cu8; 16])).await;
+        let internal = rt_handle::REGISTRY
+            .get(&handle.handle_id)
+            .expect("handle registered")
+            .clone();
+
+        let commit_claim = internal.access_exclusive().await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                internal.access_shared()
+            )
+            .await
+            .is_err(),
+            "a commit holding the handle must block every other call"
+        );
+        drop(commit_claim);
+
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                internal.access_shared()
+            )
+            .await
+            .is_ok(),
+            "the handle must be usable again once the commit lets go"
         );
 
         release(handle, store_handle_id);
@@ -860,7 +1129,8 @@ mod tests {
         .await;
 
         assert_eq!(
-            status, 1,
+            status,
+            InvalidArguments::FFI_CODE,
             "local=1 with remote=1 must reject the commit, got {events:?}"
         );
         let (revision, new_tip, code) = commit_outcome(&events, 17);

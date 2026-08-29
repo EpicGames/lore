@@ -1,9 +1,14 @@
 [package]
 name = "lore-proto"
 # Crate version is used for proto-artifactory workflow
-version = "0.1.61"
+version = "0.1.62"
 edition = "2024"
 publish = false
+
+[lib]
+# The generated bindings hold no unit tests; the suites in tests/ are their own
+# targets. Set this back to build a harness for unit tests.
+test = false
 
 [dependencies]
 lore-base = { workspace = true }

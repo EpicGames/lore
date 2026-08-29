@@ -211,11 +211,16 @@ pub struct PathDiff {
     #[prost(bool, tag = "3")]
     pub automerged: bool,
     /// Repository the changed content resolves under; empty when it is the
-    /// request's own repository.
+    /// request's own repository. A link pin update is reported as one LINK-typed
+    /// entry for the mount path plus the linked repository's per-file changes
+    /// remapped under it, and every one of those entries carries the linked
+    /// repository here. A consumer fetching content for such an entry MUST
+    /// target this repository, not the request's repository id.
     #[prost(bytes = "bytes", tag = "4")]
     pub link_partition: ::prost::bytes::Bytes,
     /// True when a link change tracks its parent's branch; false for pinned
-    /// links and non-link changes.
+    /// links and non-link changes. Only meaningful on a LINK-typed entry; read
+    /// it from the entry for the mount path itself.
     #[prost(bool, tag = "5")]
     pub tracking: bool,
 }

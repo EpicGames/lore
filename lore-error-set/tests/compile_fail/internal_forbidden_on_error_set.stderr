@@ -1,0 +1,18 @@
+error[E0034]: multiple applicable items in scope
+  --> tests/compile_fail/internal_forbidden_on_error_set.rs:39:12
+   |
+39 |     result.internal("collapsing an error set")
+   |            ^^^^^^^^ multiple `internal` found
+   |
+   = note: candidate #1 is defined in an impl of the trait `lore_error_set::prelude::InternalForbiddenOnErrorSets` for the type `Result<T, E>`
+   = note: candidate #2 is defined in an impl of the trait `lore_error_set::prelude::WrapInternal` for the type `Result<T, E>`
+help: disambiguate the method for candidate #1
+   |
+39 -     result.internal("collapsing an error set")
+39 +     lore_error_set::prelude::InternalForbiddenOnErrorSets::internal(result, "collapsing an error set")
+   |
+help: disambiguate the method for candidate #2
+   |
+39 -     result.internal("collapsing an error set")
+39 +     lore_error_set::prelude::WrapInternal::internal(result, "collapsing an error set")
+   |

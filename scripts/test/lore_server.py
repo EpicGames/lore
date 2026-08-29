@@ -68,13 +68,18 @@ class _XdistControllerCleanup:
 # ---------------------------------------------------------------------------
 
 
-# Ports this process has handed out but that no server has bound yet. The probe
-# sockets are closed before the caller launches anything — the topology and
-# replication fixtures allocate three ports up front and then spend a while
-# writing configs and copying keys before any server binds — so without this
-# the OS (or the fixed-range scan below) can legitimately hand the same number
-# to the next caller.
+# Ports this process has handed out, whether or not a server has bound them
+# yet. Entries are never removed: a released reservation is still spoken for by
+# the server about to launch on it, so it must not be offered again.
 _handed_out_ports: set[int] = set()
+
+# Ports handed out whose TCP+UDP probe sockets are still held open, keyed by
+# port number. Holding the sockets turns the probe into a real reservation: the
+# fixtures allocate their ports up front and then spend a while writing configs
+# before any server binds, and the OS refuses the number to anyone else — other
+# xdist workers included — for that whole window. `release_reserved_ports`
+# hands the port back immediately before the launch.
+_reserved_ports: dict[int, tuple[socket.socket, socket.socket]] = {}
 
 # Ephemeral draws come first: they are the OS's own opinion of what is free.
 # They are drawn in batches because holding several sockets at once forces the
@@ -142,13 +147,18 @@ def _is_excluded_port(port: int) -> bool:
     return any(start <= port <= end for start, end in _excluded_port_ranges())
 
 
-def _probe_port(host: str, port: int) -> OSError | None:
-    """Bind `port` for both TCP and UDP; None if both succeed, else the error.
+def _reserve_port(
+    host: str, port: int
+) -> tuple[socket.socket, socket.socket] | OSError:
+    """Bind `port` for both TCP and UDP; the held sockets, or the bind error.
 
     gRPC (TCP) and QUIC (UDP) share one port number, so a TCP-only probe is not
     enough: on Windows a TCP-free port can be reserved for UDP, failing the
-    QUIC bind with WSAEACCES. Both sockets are held at the same time so a port
+    QUIC bind with WSAEACCES. Both sockets are bound at the same time so a port
     that is only free for one protocol at a time is rejected.
+
+    On success the caller owns both sockets and must keep them open until the
+    server is about to bind the port, then close them.
     """
     tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -157,11 +167,10 @@ def _probe_port(host: str, port: int) -> OSError | None:
         tcp.bind((host, port))
         udp.bind((host, port))
     except OSError as e:
-        return e
-    finally:
         tcp.close()
         udp.close()
-    return None
+        return e
+    return tcp, udp
 
 
 def _set_exclusive_addr(*socks: socket.socket) -> None:
@@ -215,6 +224,11 @@ def allocate_free_port(host: str = "127.0.0.1") -> int:
 
     Ports known to be OS-excluded, and ports this process already handed out,
     are skipped without a probe.
+
+    The returned port stays bound by this process until the server that will
+    use it is launched, so nothing else can claim it in the meantime. Callers
+    that launch through `launch_lore_server` get that release for free;
+    anything launching a server itself must call `release_reserved_ports`.
     """
     assert host == "127.0.0.1", (
         f"allocate_free_port only supports 127.0.0.1, got {host!r}"
@@ -227,11 +241,12 @@ def allocate_free_port(host: str = "127.0.0.1") -> int:
         if port in _handed_out_ports or _is_excluded_port(port):
             return False
         probes += 1
-        err = _probe_port(host, port)
-        if err is not None:
-            last_err = err
+        reserved = _reserve_port(host, port)
+        if isinstance(reserved, OSError):
+            last_err = reserved
             return False
         _handed_out_ports.add(port)
+        _reserved_ports[port] = reserved
         return True
 
     remaining = _EPHEMERAL_ATTEMPTS
@@ -268,6 +283,53 @@ def allocate_free_port(host: str = "127.0.0.1") -> int:
     )
 
 
+# Endpoint port variables, and whether the endpoint listens on UDP. The two
+# internal endpoints deliberately share one number: gRPC internal speaks TCP,
+# QUIC internal speaks UDP.
+_SERVER_PORT_KEYS = (
+    ("LORE__SERVER__HTTP__PORT", False),
+    ("LORE__SERVER__GRPC__PORT", False),
+    ("LORE__SERVER__QUIC__PORT", True),
+    ("LORE__SERVER__GRPC_INTERNAL__PORT", False),
+    ("LORE__SERVER__QUIC_INTERNAL__PORT", True),
+)
+
+
+def _server_ports(server_env) -> dict[int, tuple[str, bool]]:
+    """Map each distinct port in `server_env` to a naming key and whether any
+    endpoint on it needs UDP. Endpoints sharing a number collapse to one entry
+    and the UDP requirement is the union, so a shared port is never checked as
+    TCP-only just because the TCP endpoint came first."""
+    ports: dict[int, tuple[str, bool]] = {}
+    for port_key, udp in _SERVER_PORT_KEYS:
+        port = int(server_env[port_key])
+        label, needs_udp = ports.get(port, (port_key, False))
+        ports[port] = (label, needs_udp or udp)
+    return ports
+
+
+def release_reserved_ports(server_env, label: str = "") -> None:
+    """Hand this server's ports back to the OS immediately before it launches.
+
+    Ports come from `allocate_free_port`, which keeps them bound so no other
+    process can take the number while the caller writes configs. The server
+    cannot bind a port we are still holding, so the reservation has to be
+    dropped here — as late as possible, to keep the unprotected window down to
+    the gap between this call and the server's own bind.
+
+    A port with no reservation was either supplied on the command line or
+    already released by an earlier launch on the same ports, so it is probed
+    instead: nothing has been holding it and a stale server may own it.
+    """
+    for port, (port_key, udp) in _server_ports(server_env).items():
+        reserved = _reserved_ports.pop(port, None)
+        if reserved is None:
+            _check_port_free("127.0.0.1", port, label=f"{label} ({port_key})", udp=udp)
+            continue
+        for sock in reserved:
+            sock.close()
+
+
 def generate_server_config(request, tmp_path_factory, ports: dict):
     def copy_server_configs(base_dir: Path, dest_dir: Path) -> None:
         cfg_src = base_dir / "lore-server" / "config"
@@ -275,16 +337,6 @@ def generate_server_config(request, tmp_path_factory, ports: dict):
         cfg_dst.mkdir(parents=True, exist_ok=True)
         for name in ("default.toml", "gha.toml"):
             shutil.copy2(cfg_src / name, cfg_dst / name)
-
-    def copy_server_keys(key_dir, server_dir):
-        shutil.copy2(
-            key_dir / request.config.getoption("--lore-server-creds-key-path"),
-            server_dir / "key.pem",
-        )
-        shutil.copy2(
-            key_dir / request.config.getoption("--lore-server-creds-cert-path"),
-            server_dir / "cert.pem",
-        )
 
     test_base_directory = request.config.getoption("--test-base-directory")
     if test_base_directory is None:
@@ -296,14 +348,6 @@ def generate_server_config(request, tmp_path_factory, ports: dict):
     server_root.mkdir(parents=True, exist_ok=True)
 
     copy_server_configs(test_base_directory, server_root)
-    try:
-        copy_server_keys(test_base_directory, server_root)
-    except Exception as e:
-        logger.error(
-            f"Could not copy openssl keys: {e}, generating keys and trying again"
-        )
-        generate_ssl_cert()
-        copy_server_keys(test_base_directory, server_root)
 
     rust_log = request.config.getoption("--lore-server-log-level")
 
@@ -318,6 +362,17 @@ def generate_server_config(request, tmp_path_factory, ports: dict):
             "LORE__SERVER__GRPC__PORT": str(ports["grpc"]),
             "LORE__SERVER__GRPC_INTERNAL__PORT": str(ports["internal"]),
             "LORE__SERVER__HTTP__PORT": str(ports["http"]),
+            # Bind loopback rather than the shipped 0.0.0.0. Ports are reserved
+            # on 127.0.0.1, so this makes the reservation cover exactly the
+            # address the server goes on to bind — a port free on loopback but
+            # taken on another interface would otherwise pass the reservation
+            # and then fail the server's wildcard bind. It also keeps a test
+            # server off the machine's other interfaces.
+            "LORE__SERVER__QUIC__HOST": "127.0.0.1",
+            "LORE__SERVER__QUIC_INTERNAL__HOST": "127.0.0.1",
+            "LORE__SERVER__GRPC__HOST": "127.0.0.1",
+            "LORE__SERVER__GRPC_INTERNAL__HOST": "127.0.0.1",
+            "LORE__SERVER__HTTP__HOST": "127.0.0.1",
             "LORE_ENV": "gha",
         }
     )
@@ -334,22 +389,6 @@ def launch_lore_server(server_root, server_env, executable_path):
     print()
     print(f"Launching server '{server_name}' in '{server_root}'")
 
-    # Fail fast if any of our ports is no longer usable. The QUIC ports carry
-    # the replication traffic over UDP, which a TCP-only check cannot cover.
-    for port_key, udp in (
-        ("LORE__SERVER__HTTP__PORT", False),
-        ("LORE__SERVER__GRPC__PORT", False),
-        ("LORE__SERVER__QUIC__PORT", True),
-        ("LORE__SERVER__QUIC_INTERNAL__PORT", True),
-        ("LORE__SERVER__GRPC_INTERNAL__PORT", False),
-    ):
-        _check_port_free(
-            "127.0.0.1",
-            server_env[port_key],
-            label=f"{server_name} ({port_key})",
-            udp=udp,
-        )
-
     http_port = server_env["LORE__SERVER__HTTP__PORT"]
 
     server_binary_path: Path = Path(executable_path).expanduser().resolve(strict=False)
@@ -359,6 +398,8 @@ def launch_lore_server(server_root, server_env, executable_path):
         platform_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         platform_kwargs["start_new_session"] = True
+
+    release_reserved_ports(server_env, label=server_name)
 
     server_proc = subprocess.Popen(
         [str(server_binary_path)],
@@ -489,13 +530,13 @@ def _get_shared_tmp_dir(tmp_path_factory) -> Path:
 
 
 def _check_port_free(host, port, label="", udp=False):
-    """Verify that the given port is still usable before we launch on it.
+    """Verify that the given port is usable before we launch on it.
 
-    Ports are allocated well before the server binds them, so a stale server
-    (or another process) can take one in between. Raises ServerException if a
-    TCP connection succeeds, which means something is already listening. With
-    `udp`, also confirms the number is still UDP-bindable — the only way to
-    catch a QUIC port that has become unusable, since there is nothing to
+    Used for ports fixed on the command line, which nothing has been holding —
+    a stale server from a previous session, or any other process, may own one.
+    Raises ServerException if a TCP connection succeeds, which means something
+    is already listening. With `udp`, also confirms the number is UDP-bindable
+    — the only way to catch an unusable QUIC port, since there is nothing to
     connect to over UDP.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -631,36 +672,3 @@ def _wait_for_grpc_port(host, port, retries=20, delay=0.5):
     raise ServerException(
         f"gRPC port {port} did not become ready after {retries} attempts."
     )
-
-
-# TODO(jamie): This should be converted to portable python code instead of using a subprocess
-def generate_ssl_cert():
-    import platform
-    import subprocess
-
-    current_os = platform.system()
-    if current_os == "Darwin":
-        config = ["-config", "/System/Library/OpenSSL/openssl.cnf"]
-    else:
-        config = []
-
-    cmd = [
-        "openssl",
-        "req",
-        *config,
-        "-x509",
-        "-newkey",
-        "rsa:4096",
-        "-keyout",
-        "key.pem",
-        "-out",
-        "cert.pem",
-        "-sha256",
-        "-days",
-        "3650",
-        "-nodes",
-        "-subj",
-        "/C=XX/ST=NC/L=Cary/O=EpicGames/OU=UCS/CN=URCQD",
-    ]
-
-    subprocess.check_call(cmd)

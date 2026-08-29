@@ -10,6 +10,7 @@ import pytest
 from error_types import (
     LinkPinDivergedError,
     LocalChanges,
+    LocalModificationsError,
     NestedLinkError,
     NotALinkError,
     NothingStagedError,
@@ -17,6 +18,14 @@ from error_types import (
     PathExistLinkError,
 )
 from lore_parsers import parse_jsonl, parse_status_json
+from thin_client import (
+    ACTION_ADD,
+    ACTION_DELETE,
+    NODE_TYPE_FILE,
+    NODE_TYPE_LINK,
+    revision_diff,
+    revision_tree,
+)
 
 from lore import Lore
 
@@ -2638,6 +2647,174 @@ def test_link_add_on_branch_merge_start_preserves_link_flags(new_lore_repo):
     ), f"Merged fixed link should keep tracking 'main'.\nGot: {link_output}"
 
 
+_DEFAULT_LINK_MOUNT = "vendor/lib"
+_DEFAULT_PARENT_FILE = "README.txt"
+
+
+def _make_parent_with_link(
+    new_lore_repo,
+    link_path: str = _DEFAULT_LINK_MOUNT,
+    link_files: dict | None = None,
+    parent_files: dict | None = None,
+    **link_add_kwargs,
+):
+    """Returns (parent_repo, link_repo) with the link committed and pushed."""
+    parent_repo: Lore = new_lore_repo()
+    link_repo: Lore = new_lore_repo()
+
+    parent_repo.write_commit_push(
+        "Baseline",
+        parent_files or {_DEFAULT_PARENT_FILE: "baseline\n"},
+    )
+    link_repo.write_commit_push(
+        "Initial linked content", link_files or {"linked.txt": "linked content\n"}
+    )
+
+    parent_repo.link_add(link_path, link_repo.get_id(), "/", **link_add_kwargs)
+    parent_repo.commit("Add link")
+    parent_repo.push()
+    return parent_repo, link_repo
+
+
+@pytest.mark.smoke
+def test_link_remove_keeps_uncommitted_local_edit(new_lore_repo):
+    link_path = "libs/shared"
+    edited_file = f"{link_path}/deep/inner.txt"
+    parent_repo, _link_repo = _make_parent_with_link(
+        new_lore_repo, link_path, {"deep/inner.txt": "pinned content\n"}
+    )
+
+    parent_repo.write_files({edited_file: "locally edited\n"})
+
+    with pytest.raises(LocalModificationsError):
+        parent_repo.link_remove(link_path)
+
+    assert parent_repo.file_exists(edited_file)
+    with parent_repo.open_file(edited_file) as f:
+        assert f.read() == "locally edited\n"
+    assert link_path in parent_repo.link_list(), (
+        "A refused remove must leave the link in place"
+    )
+
+
+@pytest.mark.smoke
+def test_link_remove_keeps_staged_local_edit(new_lore_repo):
+    """A staged edit is still uncommitted, and unlinking would take it with it."""
+    link_path = "libs/shared"
+    edited_file = f"{link_path}/deep/inner.txt"
+    parent_repo, _link_repo = _make_parent_with_link(
+        new_lore_repo, link_path, {"deep/inner.txt": "pinned content\n"}
+    )
+
+    parent_repo.write_files({edited_file: "locally edited\n"})
+    parent_repo.stage(edited_file)
+
+    with pytest.raises(LocalModificationsError):
+        parent_repo.link_remove(link_path)
+
+    with parent_repo.open_file(edited_file) as f:
+        assert f.read() == "locally edited\n"
+
+
+@pytest.mark.smoke
+def test_link_remove_keeps_untracked_file_under_mount(new_lore_repo):
+    """Unlinking deletes the mount wholesale, untracked files included."""
+    link_path = "libs/shared"
+    untracked_file = f"{link_path}/deep/scratch.txt"
+    parent_repo, _link_repo = _make_parent_with_link(
+        new_lore_repo, link_path, {"deep/inner.txt": "pinned content\n"}
+    )
+
+    parent_repo.write_files({untracked_file: "not tracked yet\n"})
+
+    with pytest.raises(LocalModificationsError):
+        parent_repo.link_remove(link_path)
+
+    assert parent_repo.file_exists(untracked_file)
+
+
+@pytest.mark.smoke
+def test_link_remove_refuses_when_path_case_differs(new_lore_repo):
+    """Node lookup is case-insensitive, so the guard has to be too."""
+    link_path = "libs/shared"
+    edited_file = f"{link_path}/deep/inner.txt"
+    parent_repo, _link_repo = _make_parent_with_link(
+        new_lore_repo, link_path, {"deep/inner.txt": "pinned content\n"}
+    )
+
+    parent_repo.write_files({edited_file: "locally edited\n"})
+
+    with pytest.raises(LocalModificationsError):
+        parent_repo.link_remove("libs/SHARED")
+
+    with parent_repo.open_file(edited_file) as f:
+        assert f.read() == "locally edited\n"
+
+
+@pytest.mark.smoke
+def test_link_remove_force_discards_local_edit(new_lore_repo):
+    link_path = "libs/shared"
+    edited_file = f"{link_path}/deep/inner.txt"
+    parent_repo, _link_repo = _make_parent_with_link(
+        new_lore_repo, link_path, {"deep/inner.txt": "pinned content\n"}
+    )
+
+    parent_repo.write_files({edited_file: "locally edited\n"})
+
+    parent_repo.link_remove(link_path, force=True)
+
+    assert not parent_repo.file_exists(edited_file), (
+        "A forced remove must discard the edited file with the mount"
+    )
+    assert "No links found in this repository" in parent_repo.link_list()
+
+
+@pytest.mark.smoke
+def test_link_remove_ignores_changes_outside_the_mount(new_lore_repo):
+    """The guard scans the whole working tree, so it must filter to the mount."""
+    link_path = "libs/shared"
+    parent_repo, _link_repo = _make_parent_with_link(
+        new_lore_repo, link_path, {"deep/inner.txt": "pinned content\n"}
+    )
+
+    parent_repo.write_files(
+        {
+            "README.txt": "edited outside the mount\n",
+            "libs/shared-extra/sibling.txt": "a path sharing the mount prefix\n",
+        }
+    )
+
+    parent_repo.link_remove(link_path)
+
+    assert "No links found in this repository" in parent_repo.link_list()
+    assert parent_repo.file_exists("libs/shared-extra/sibling.txt")
+
+
+@pytest.mark.smoke
+def test_link_remove_keeps_ignored_file_under_mount(new_lore_repo):
+    """Ignoring a file says it is not Lore's to track, not that it is worthless
+    - a key or a local config is exactly the sort of thing that gets ignored,
+    and removal takes the whole mount with it.
+    """
+    link_path = "libs/shared"
+    ignored_file = f"{link_path}/deep/local.key"
+    parent_repo, _link_repo = _make_parent_with_link(
+        new_lore_repo, link_path, {"deep/inner.txt": "pinned content\n"}
+    )
+
+    with parent_repo.open_file(parent_repo.ignore_file(), "w+") as ignore_file:
+        ignore_file.write("*.key\n")
+    parent_repo.write_commit_push("Add ignore file", {"placeholder.txt": "x\n"})
+    parent_repo.write_files({ignored_file: "secret\n"})
+
+    with pytest.raises(LocalModificationsError):
+        parent_repo.link_remove(link_path)
+
+    assert parent_repo.file_exists(ignored_file), (
+        "An ignored file must survive a refused remove"
+    )
+
+
 @pytest.mark.smoke
 def test_link_remove_on_branch_merge_start(new_lore_repo):
     """A link removed on a branch is gone from the registry after merging."""
@@ -4450,6 +4627,280 @@ def test_link_list_staged_no_changes(new_lore_repo):
     output = urc.link_list(staged=True)
     assert "No linked repositories with staged changes" in output, (
         f"Expected no-links message, got: {output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_info_reports_link_details(new_lore_repo):
+    """`lore link info <mount_path>` reports the linked repository, its mount
+    and source paths, the resolved branch, the pinned revision and no staged
+    change for an untouched link.
+    """
+    link_repo: Lore = new_lore_repo()
+    link_repo.write_commit_push("Initial link", {"sub/link-file.txt": "link content\n"})
+    pinned_revision = link_repo.branch_info().local_latest
+
+    urc: Lore = new_lore_repo()
+    urc.write_commit_push("Initial main", {"main.txt": "main content\n"})
+
+    link_path = "libs/shared"
+    urc.link_add(link_path, link_repo.get_id(), "/sub")
+    urc.commit("Add link")
+    urc.push()
+
+    output = urc.link_info(link_path)
+
+    assert link_repo.get_id() in output, (
+        f"link info must report the linked repository id.\nOutput:\n{output}"
+    )
+    assert f"Link path: {link_path}" in output, (
+        f"link info must report the mount path.\nOutput:\n{output}"
+    )
+    assert "Source path: sub" in output, (
+        f"link info must report the source path inside the link.\nOutput:\n{output}"
+    )
+    assert "Branch: main" in output, (
+        f"link info must report the resolved branch name.\nOutput:\n{output}"
+    )
+    assert f"Revision: {pinned_revision}" in output, (
+        f"link info must report the pinned revision.\nOutput:\n{output}"
+    )
+    assert "Flags: None" in output, (
+        f"link info must report the link flags.\nOutput:\n{output}"
+    )
+    assert "Staged: none" in output, (
+        f"link info must report no staged change for an untouched link.\nOutput:\n{output}"
+    )
+    assert "Staged files: 0" in output, (
+        f"link info must report zero staged files for an untouched link.\n"
+        f"Output:\n{output}"
+    )
+    assert f"Remote revision: {pinned_revision}" in output, (
+        f"link info must report the remote latest revision of the resolved "
+        f"branch.\nOutput:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_info_reports_staged_pin_update(new_lore_repo):
+    """`lore link info` reports an uncommitted pin bump as a staged update."""
+    link_repo: Lore = new_lore_repo()
+    link_repo.write_commit_push("v1", {"link-file.txt": "v1\n"})
+    pin_v1 = link_repo.branch_info().local_latest
+
+    link_repo.write_commit_push("v2", {"link-file.txt": "v2\n"})
+    pin_v2 = link_repo.branch_info().local_latest
+
+    urc: Lore = new_lore_repo()
+    urc.write_commit_push("Initial main", {"main.txt": "main content\n"})
+
+    link_path = "linked"
+    urc.link_add(link_path, link_repo.get_id(), "/", pin=pin_v1)
+    urc.commit("Add link")
+    urc.push()
+
+    urc.link_update(link_path, pin=pin_v2)
+
+    output = urc.link_info(link_path)
+
+    assert "Staged: modified" in output, (
+        f"link info must report an uncommitted pin bump as a staged update.\n"
+        f"Output:\n{output}"
+    )
+    assert f"Revision: {pin_v2}" in output, (
+        f"link info must report the newly staged pin.\nOutput:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_info_errors_for_non_link_path(new_lore_repo):
+    """`lore link info` on a path that is not a link fails with a clear error."""
+    urc: Lore = new_lore_repo()
+    urc.write_commit_push("Initial main", {"regular-dir/file.txt": "content\n"})
+
+    with pytest.raises(NotALinkError):
+        urc.link_info("regular-dir")
+
+
+@pytest.mark.smoke
+def test_link_info_counts_staged_files_inside_link(new_lore_repo):
+    """`lore link info` counts staged files inside the link, not just the pin."""
+    link_repo: Lore = new_lore_repo()
+    link_repo.write_commit_push(
+        "Initial link", {"sub/one.txt": "one\n", "sub/two.txt": "two\n"}
+    )
+
+    urc: Lore = new_lore_repo()
+    urc.write_commit_push("Initial main", {"main.txt": "main content\n"})
+
+    link_path = "libs/shared"
+    urc.link_add(link_path, link_repo.get_id(), "/sub")
+    urc.commit("Add link")
+    urc.push()
+
+    assert "Staged files: 0" in urc.link_info(link_path)
+
+    urc.write_files({f"{link_path}/one.txt": "one modified\n"})
+    urc.stage(f"{link_path}/one.txt")
+
+    output = urc.link_info(link_path)
+
+    assert "Staged files: 1" in output, (
+        f"link info must count a staged file inside the link.\nOutput:\n{output}"
+    )
+    assert "Staged: modified" in output, (
+        f"a link with staged content inside it must report a staged update.\n"
+        f"Output:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_info_reports_staged_add(new_lore_repo):
+    """`lore link info` reports an uncommitted `link add` as a staged addition
+    with no staged files inside it yet.
+    """
+    link_repo: Lore = new_lore_repo()
+    link_repo.write_commit_push("Initial link", {"link-file.txt": "content\n"})
+
+    urc: Lore = new_lore_repo()
+    urc.write_commit_push("Initial main", {"main.txt": "main content\n"})
+
+    link_path = "libs/shared"
+    urc.link_add(link_path, link_repo.get_id(), "/")
+
+    output = urc.link_info(link_path)
+
+    assert "Staged: added" in output, (
+        f"link info must report an uncommitted link add as a staged addition.\n"
+        f"Output:\n{output}"
+    )
+    assert "Staged files: 0" in output, (
+        f"a link staged for addition has no staged files inside it.\nOutput:\n{output}"
+    )
+    assert "Source path: /" in output, (
+        f"link info must report a root source path as `/`.\nOutput:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_info_reports_staged_removal(new_lore_repo):
+    """`lore link info` reports an uncommitted `link remove` as a staged
+    removal, describing it from the committed registry entry that staging the
+    removal dropped, and does not count files inside a link that is going away.
+    """
+    link_repo: Lore = new_lore_repo()
+    link_repo.write_commit_push("Initial link", {"link-file.txt": "content\n"})
+    pinned_revision = link_repo.branch_info().local_latest
+
+    urc: Lore = new_lore_repo()
+    urc.write_commit_push("Initial main", {"main.txt": "main content\n"})
+
+    link_path = "libs/shared"
+    urc.link_add(link_path, link_repo.get_id(), "/")
+    urc.commit("Add link")
+    urc.push()
+
+    urc.link_remove(link_path)
+
+    output = urc.link_info(link_path)
+
+    assert "Staged: removed" in output, (
+        f"link info must report an uncommitted link remove as a staged "
+        f"removal.\nOutput:\n{output}"
+    )
+    assert "Staged files: 0" in output, (
+        f"a link staged for removal must not count files inside it.\nOutput:\n{output}"
+    )
+    assert f"Revision: {pinned_revision}" in output, (
+        f"link info must still report the pin of a link staged for removal.\n"
+        f"Output:\n{output}"
+    )
+    assert "Branch: main" in output, (
+        f"link info must still report the branch of a link staged for removal.\n"
+        f"Output:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_info_reports_nested_link_with_full_path(new_lore_repo):
+    """`lore link info` on a link inside another link reports the mount path
+    relative to this repository, not to the intermediate linked repository.
+    """
+    repo_a, _repo_b, repo_c, _b_mount, nested_mount = _build_nested_link_repos_at(
+        new_lore_repo, "libs/vendor/b", "c"
+    )
+
+    output = repo_a.link_info(nested_mount)
+
+    assert f"Link path: {nested_mount}" in output, (
+        f"link info must report a nested link's full mount path.\nOutput:\n{output}"
+    )
+    assert repo_c.get_id() in output, (
+        f"link info must report the innermost linked repository.\nOutput:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_info_omits_remote_revision_when_local(new_lore_repo):
+    """`lore link info --local` omits the remote revision rather than reaching
+    for the remote, and still reports everything held locally.
+    """
+    link_repo: Lore = new_lore_repo()
+    link_repo.write_commit_push("Initial link", {"link-file.txt": "content\n"})
+
+    urc: Lore = new_lore_repo()
+    urc.write_commit_push("Initial main", {"main.txt": "main content\n"})
+
+    link_path = "libs/shared"
+    urc.link_add(link_path, link_repo.get_id(), "/")
+    urc.commit("Add link")
+    urc.push()
+
+    output = urc.link_info(link_path, local=True)
+
+    assert "Remote revision:" not in output, (
+        f"link info --local must not report a remote revision.\nOutput:\n{output}"
+    )
+    assert link_repo.get_id() in output, (
+        f"link info --local must still report the linked repository.\nOutput:\n{output}"
+    )
+    assert f"Link path: {link_path}" in output, (
+        f"link info --local must still report the mount path.\nOutput:\n{output}"
+    )
+    assert "Staged: none" in output, (
+        f"link info --local must still report the staged state.\nOutput:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_info_distinguishes_tracking_from_pinned_branch(new_lore_repo):
+    """`lore link info` distinguishes a link that follows its parent's branch
+    from one pinned to an explicit branch.
+    """
+    tracking_target: Lore = new_lore_repo()
+    tracking_target.write_commit_push("Initial", {"a.txt": "a\n"})
+
+    pinned_target: Lore = new_lore_repo()
+    pinned_target.write_commit_push("Initial", {"b.txt": "b\n"})
+
+    urc: Lore = new_lore_repo()
+    urc.write_commit_push("Initial main", {"main.txt": "main content\n"})
+
+    urc.link_add("libs/tracking", tracking_target.get_id(), "/")
+    urc.link_add("libs/pinned", pinned_target.get_id(), "/", disable_branching=True)
+    urc.commit("Add links")
+    urc.push()
+
+    tracking_output = urc.link_info("libs/tracking")
+    pinned_output = urc.link_info("libs/pinned")
+
+    assert "[tracking]" in tracking_output, (
+        f"a link following its parent's branch must report as tracking.\n"
+        f"Output:\n{tracking_output}"
+    )
+    assert "[pinned]" in pinned_output, (
+        f"a link with an explicit branch must report as pinned.\n"
+        f"Output:\n{pinned_output}"
     )
 
 
@@ -7452,6 +7903,213 @@ def test_link_diff_file_removed_in_linked_repo(new_lore_repo):
     )
 
 
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+_DIFF_ACTIONS = frozenset({"A", "D", "M", "V", "C"})
+
+
+def _parse_revision_diff(output: str) -> list[tuple[str, str]]:
+    """Parse `lore revision diff` output into (action, path) pairs.
+
+    The CLI colourizes the action letter, so ANSI escapes are stripped first.
+    """
+    entries: list[tuple[str, str]] = []
+    for raw_line in _ANSI_ESCAPE.sub("", output).splitlines():
+        parts = raw_line.strip().split(" ", 1)
+        if len(parts) == 2 and parts[0] in _DIFF_ACTIONS:
+            entries.append((parts[0], parts[1].strip()))
+    return entries
+
+
+@pytest.mark.smoke
+def test_link_pin_update_revision_diff_reports_link_and_content(new_lore_repo):
+    """A pin update must surface both the link itself and the linked
+    repository's file changes.
+
+    The contract for the "pin updated" case:
+
+      - the link path is reported as a modification (the pin moved),
+      - the linked repository's changed files are reported under the mount
+        path,
+      - an unrelated parent-side change in the same revision is still
+        reported.
+    """
+    link_repo: Lore = new_lore_repo()
+    with link_repo.open_file("a.txt", "w+") as f:
+        f.writelines(["v1\n"])
+    link_repo.make_dirs("sub")
+    with link_repo.open_file("sub/b.txt", "w+") as f:
+        f.writelines(["b1\n"])
+    link_repo.stage(scan=True)
+    link_repo.commit("v1")
+    link_repo.push()
+    pin_v1 = link_repo.branch_info().local_latest
+
+    # v2 modifies one mounted file and adds another.
+    with link_repo.open_file("a.txt", "w+") as f:
+        f.writelines(["v2\n"])
+    with link_repo.open_file("sub/c.txt", "w+") as f:
+        f.writelines(["c1\n"])
+    link_repo.stage(scan=True)
+    link_repo.commit("v2 modifies a.txt and adds sub/c.txt")
+    link_repo.push()
+    pin_v2 = link_repo.branch_info().local_latest
+
+    parent_repo, _ = _make_parent_repo_with_baseline(new_lore_repo)
+    link_path = "libs/shared"
+
+    parent_repo.link_add(link_path, link_repo.get_id(), "/", pin=pin_v1)
+    parent_repo.commit("Add link@v1")
+    parent_repo.push()
+    pre_update_revision = parent_repo.branch_info().local_latest
+
+    # The pin update has to come first: `lore link update` refuses to run once
+    # a scan has marked the mount point dirty.
+    parent_repo.link_update(link_path, pin=pin_v2)
+    with parent_repo.open_file("README.txt", "w+") as f:
+        f.writelines(["baseline touched on this revision\n"])
+    parent_repo.stage("README.txt")
+    parent_repo.commit("Bump link to v2 and touch README")
+    parent_repo.push()
+
+    output = parent_repo.revision_diff(pre_update_revision, no_pager=True)
+    entries = _parse_revision_diff(output)
+    paths = {path: action for action, path in entries}
+
+    assert paths.get(link_path) == "M", (
+        f"`lore revision diff` must report the link path {link_path!r} as a "
+        "modification when its pin moved, so a consumer can tell the pin "
+        f"changed and which paths belong to the link.\nOutput:\n{output}"
+    )
+    assert paths.get(f"{link_path}/a.txt") == "M", (
+        "`lore revision diff` must report the modified file inside the "
+        f"linked repository under the mount path.\nOutput:\n{output}"
+    )
+    assert paths.get(f"{link_path}/sub/c.txt") == "A", (
+        "`lore revision diff` must report the file added inside the linked "
+        f"repository under the mount path.\nOutput:\n{output}"
+    )
+    assert paths.get("README.txt") == "M", (
+        "`lore revision diff` must still report the parent's own change in a "
+        f"revision that also moved a link pin.\nOutput:\n{output}"
+    )
+    assert f"{link_path}/sub/b.txt" not in paths, (
+        "`lore revision diff` must not report unchanged files inside the "
+        f"linked repository.\nOutput:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_pin_update_revision_diff_reports_link_when_content_identical(
+    new_lore_repo,
+):
+    """A pin bump that leaves the mounted subtree byte-identical must still
+    be visible in `lore revision diff`.
+
+    Setup mirrors `test_link_update_diff_reports_link_only`: the parent mounts
+    only `mounted/`, and between the two pins nothing inside it changes, so the
+    content walk finds nothing. Without an entry for the link node the diff
+    comes back empty, reading as "this revision changed nothing".
+    """
+    link_repo: Lore = new_lore_repo()
+    link_repo.make_dirs("mounted")
+    with link_repo.open_file("mounted/stable.txt", "w+") as f:
+        f.writelines(["stable mounted content\n"])
+    link_repo.make_dirs("outside")
+    with link_repo.open_file("outside/v1.txt", "w+") as f:
+        f.writelines(["outside v1\n"])
+    link_repo.stage(scan=True)
+    link_repo.commit("v1 with mounted/ + outside/")
+    link_repo.push()
+    pin_v1 = link_repo.branch_info().local_latest
+
+    with link_repo.open_file("outside/v2.txt", "w+") as f:
+        f.writelines(["outside v2\n"])
+    link_repo.stage(scan=True)
+    link_repo.commit("v2 changes only outside/")
+    link_repo.push()
+    pin_v2 = link_repo.branch_info().local_latest
+
+    parent_repo, _ = _make_parent_repo_with_baseline(new_lore_repo)
+    link_path = "libs/shared"
+
+    parent_repo.link_add(link_path, link_repo.get_id(), "/mounted", pin=pin_v1)
+    parent_repo.commit("Add link at v1, mounting mounted/")
+    parent_repo.push()
+    pre_update_revision = parent_repo.branch_info().local_latest
+
+    parent_repo.link_update(link_path, pin=pin_v2)
+    parent_repo.commit("Bump link pin to v2 (no mounted/ change)")
+    parent_repo.push()
+
+    output = parent_repo.revision_diff(pre_update_revision, no_pager=True)
+    entries = _parse_revision_diff(output)
+    paths = {path: action for action, path in entries}
+
+    assert paths.get(link_path) == "M", (
+        "`lore revision diff` must report the link path as a modification "
+        "when the pin moved, even though no mounted file changed. Otherwise "
+        f"the revision looks empty.\nOutput:\n{output}"
+    )
+    under_link = [path for path in paths if path.startswith(f"{link_path}/")]
+    assert not under_link, (
+        "`lore revision diff` must not report any file under the link path "
+        f"when the mounted subtree is unchanged. Got: {under_link}"
+        f"\nOutput:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_add_remove_revision_diff_reports_link_only(new_lore_repo):
+    """Adding or removing a link is reported as a single entry for the link
+    path; the mounted contents are never expanded into per-file changes.
+
+    Guards the asymmetry with the pin-update tests above: only an *updated*
+    link expands into the linked repository's changes.
+    """
+    link_repo, pinned_revision = _make_link_target_repo(
+        new_lore_repo, "shared.txt", "main content\n"
+    )
+    parent_repo, baseline_revision = _make_parent_repo_with_baseline(new_lore_repo)
+
+    link_path = "libs/shared"
+    linked_file = f"{link_path}/shared.txt"
+
+    parent_repo.link_add(link_path, link_repo.get_id(), "/", pin=pinned_revision)
+    parent_repo.commit("Add link libs/shared")
+    parent_repo.push()
+    post_add_revision = parent_repo.branch_info().local_latest
+
+    add_output = parent_repo.revision_diff(baseline_revision, no_pager=True)
+    add_paths = {path: action for action, path in _parse_revision_diff(add_output)}
+
+    assert add_paths.get(link_path) == "A", (
+        f"Adding a link must report {link_path!r} as an addition."
+        f"\nOutput:\n{add_output}"
+    )
+    assert linked_file not in add_paths, (
+        "Adding a link must not expand the mounted contents into per-file "
+        f"additions.\nOutput:\n{add_output}"
+    )
+
+    parent_repo.link_remove(link_path)
+    parent_repo.commit("Remove link libs/shared")
+    parent_repo.push()
+
+    remove_output = parent_repo.revision_diff(post_add_revision, no_pager=True)
+    remove_paths = {
+        path: action for action, path in _parse_revision_diff(remove_output)
+    }
+
+    assert remove_paths.get(link_path) == "D", (
+        f"Removing a link must report {link_path!r} as a deletion."
+        f"\nOutput:\n{remove_output}"
+    )
+    assert linked_file not in remove_paths, (
+        "Removing a link must not expand the previously mounted contents "
+        f"into per-file deletions.\nOutput:\n{remove_output}"
+    )
+
+
 @pytest.mark.smoke
 def test_nested_link_probe(new_lore_repo):
     """Add a nested link (a link whose path is inside another link).
@@ -8033,24 +8691,6 @@ def test_nested_link_commit_message(new_lore_repo):
     )
 
 
-def _build_parent_with_link(new_lore_repo, mount: str = "vendor/lib"):
-    """Parent repo with one auto-follow link mounted at `mount`.
-
-    Returns (parent, link_repo, mount).
-    """
-    parent: Lore = new_lore_repo()
-    parent.write_commit_push("Initial parent", {"parent.txt": "parent content\n"})
-
-    link_repo: Lore = new_lore_repo()
-    link_repo.write_commit_push("Initial link", {"linked.txt": "linked content\n"})
-
-    parent.link_add(mount, link_repo.get_id(), "/")
-    parent.commit("Add link")
-    parent.push()
-
-    return parent, link_repo, mount
-
-
 @pytest.mark.smoke
 def test_link_branch_create_reuses_existing_link_branch_id(new_lore_repo):
     """Branch creation succeeds when the linked repo already holds the
@@ -8061,7 +8701,7 @@ def test_link_branch_create_reuses_existing_link_branch_id(new_lore_repo):
     the parent branch is created, and the linked branch keeps its identity
     and its latest revision.
     """
-    parent, link_repo, _mount = _build_parent_with_link(new_lore_repo)
+    parent, link_repo = _make_parent_with_link(new_lore_repo)
 
     branch_id = "5b9c1d2e3f4a4b5c8d9e0f1a2b3c4d5e"
     branch_name = "shared-feature"
@@ -8106,7 +8746,7 @@ def test_link_branch_create_reports_reuse_in_event(new_lore_repo):
     and that branch's latest revision, so a caller can tell an adopted branch
     from a freshly created one without parsing text output.
     """
-    parent, link_repo, mount = _build_parent_with_link(new_lore_repo)
+    parent, link_repo = _make_parent_with_link(new_lore_repo)
 
     branch_id = "3d4e5f60718293a4b5c6d7e8f9a0b1c2"
     branch_name = "evented-feature"
@@ -8125,8 +8765,9 @@ def test_link_branch_create_reports_reuse_in_event(new_lore_repo):
     assert event["reused"] is True, (
         f"Event must mark the branch as reused.\nGot: {event}"
     )
-    assert event["linkPath"] == mount, (
-        f"Event must name the mount path.\nExpected: {mount}\nGot: {event['linkPath']}"
+    assert event["linkPath"] == _DEFAULT_LINK_MOUNT, (
+        f"Event must name the mount path.\nExpected: {_DEFAULT_LINK_MOUNT}\n"
+        f"Got: {event['linkPath']}"
     )
     assert event["linkRepository"] == link_repo.get_id(), (
         "Event must name the linked repository holding the reused branch.\n"
@@ -8155,7 +8796,7 @@ def test_link_branch_create_reports_creation_in_event(new_lore_repo):
     The cascade reports an outcome for every link it touches, not only the
     reuse case, so a caller sees what happened in each linked repository.
     """
-    parent, link_repo, mount = _build_parent_with_link(new_lore_repo)
+    parent, link_repo = _make_parent_with_link(new_lore_repo)
 
     branch_name = "fresh-feature"
     output = parent.branch_create(branch_name, json=True)
@@ -8168,8 +8809,9 @@ def test_link_branch_create_reports_creation_in_event(new_lore_repo):
     assert event["reused"] is False, (
         f"Event must mark the branch as newly created.\nGot: {event}"
     )
-    assert event["linkPath"] == mount, (
-        f"Event must name the mount path.\nExpected: {mount}\nGot: {event['linkPath']}"
+    assert event["linkPath"] == _DEFAULT_LINK_MOUNT, (
+        f"Event must name the mount path.\nExpected: {_DEFAULT_LINK_MOUNT}\n"
+        f"Got: {event['linkPath']}"
     )
     assert event["linkRepository"] == link_repo.get_id(), (
         f"Event must name the linked repository.\nGot: {event['linkRepository']}"
@@ -8226,7 +8868,7 @@ def test_link_branch_create_reuses_link_branch_id_under_other_name(new_lore_repo
     Adoption is keyed on the branch ID, so a linked branch created earlier
     under a different name is reused as-is rather than renamed or recreated.
     """
-    parent, link_repo, _mount = _build_parent_with_link(new_lore_repo)
+    parent, link_repo = _make_parent_with_link(new_lore_repo)
 
     branch_id = "7a1b2c3d4e5f6071829304a5b6c7d8e9"
     link_branch_name = "link-local-name"
@@ -8261,7 +8903,7 @@ def test_link_branch_create_commits_onto_reused_link_branch(new_lore_repo):
     on top of a pre-existing linked branch, a commit through the mount path
     advances that same linked branch.
     """
-    parent, link_repo, mount = _build_parent_with_link(new_lore_repo)
+    parent, link_repo = _make_parent_with_link(new_lore_repo)
 
     branch_id = "1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f"
     branch_name = "adopted-feature"
@@ -8272,7 +8914,7 @@ def test_link_branch_create_commits_onto_reused_link_branch(new_lore_repo):
 
     parent.branch_create(branch_name, id=branch_id)
 
-    mounted_file = f"{mount}/through-mount.txt"
+    mounted_file = f"{_DEFAULT_LINK_MOUNT}/through-mount.txt"
     with parent.open_file(mounted_file, "w+") as f:
         f.write("written through the mount\n")
     parent.stage(scan=True)
@@ -8301,7 +8943,7 @@ def test_link_update_after_reusing_link_branch_pulls_branch_head(new_lore_repo):
     Those become available the moment the link is updated, which is the normal
     way a pin advances.
     """
-    parent, link_repo, mount = _build_parent_with_link(new_lore_repo)
+    parent, link_repo = _make_parent_with_link(new_lore_repo)
 
     branch_id = "2f3e4d5c6b7a8908172635445362718f"
     branch_name = "ahead-feature"
@@ -8314,11 +8956,11 @@ def test_link_update_after_reusing_link_branch_pulls_branch_head(new_lore_repo):
 
     parent.branch_create(branch_name, id=branch_id)
 
-    parent.link_update(mount)
+    parent.link_update(_DEFAULT_LINK_MOUNT)
     parent.commit("Update link to adopted branch head")
     parent.push()
 
-    assert parent.file_exists(f"{mount}/ahead.txt"), (
+    assert parent.file_exists(f"{_DEFAULT_LINK_MOUNT}/ahead.txt"), (
         "link update must materialise content from the reused branch's head"
     )
 
@@ -8410,4 +9052,817 @@ def test_push_names_parent_branch_for_parent_revision(new_lore_repo):
         f"the parent's branch 'test', but it named '{end_match.group(1)}'. "
         f"'{disambiguated_child_branch}' is the child's branch, which exists only "
         f"in the linked repository.\nPush output:\n{push_output}"
+    )
+
+
+def _remote_branch_entries(repo: Lore) -> list[dict]:
+    """Remote branch list entries for a repository.
+
+    Archived branches are deliberately not requested. The remote leg reports
+    every entry as unarchived and the client asks for archived branches to be
+    excluded, so an archived branch is absent from this list entirely rather than
+    present with a flag set — its absence is the signal, and asking for archived
+    entries would only cost an extra scan.
+
+    Read from JSON rather than the text parser because the text form drops the
+    branch id, and the id is what branch creation shares between a parent branch
+    and the branch it creates in a linked repository.
+    """
+    output = repo.branch_list(json=True)
+    return [
+        e for e in parse_jsonl(output, "branchListEntry") if e["location"] == "remote"
+    ]
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_leaves_child_branch(new_lore_repo):
+    """Archiving a branch in a parent does not remove the linked repository's.
+
+    Branch create cascades into the linked repository using the same branch ID.
+    Archiving in the parent then touches only the parent.
+    """
+    parent, link_repo = _make_parent_with_link(new_lore_repo)
+
+    # Branch create switches the parent onto the new branch and cascades.
+    parent.branch_create("feature")
+    parent_branch_id = parent.branch_info("feature").id
+
+    cascaded = [
+        e for e in _remote_branch_entries(link_repo) if e["name"] == "feature"
+    ]
+    assert len(cascaded) == 1, (
+        f"Branch create should cascade one 'feature' branch into the linked "
+        f"repository, got {cascaded}"
+    )
+    assert cascaded[0]["id"] == parent_branch_id, (
+        f"Cascaded branch should carry the parent branch ID {parent_branch_id}, "
+        f"got {cascaded[0]['id']}"
+    )
+
+    # The current branch cannot be archived, so step off it first.
+    parent.branch_switch("main")
+    parent.branch_archive("feature")
+
+    assert not parent.has_branch("feature"), (
+        "Archived branch should be gone from the parent's branch list"
+    )
+
+    survivor = [
+        e for e in _remote_branch_entries(link_repo) if e["name"] == "feature"
+    ]
+    assert len(survivor) == 1, (
+        f"The linked repository should keep its branch when the parent "
+        f"archives, got {survivor}"
+    )
+    assert survivor[0]["id"] == parent_branch_id, (
+        "The linked branch should be untouched by the parent archive, ID included"
+    )
+
+
+@pytest.mark.smoke
+def test_link_archived_parent_branch_does_not_disturb_link_resolution(new_lore_repo):
+    """An archived parent branch is inert while the linked branch still exists.
+
+    A link is pinned to a revision in the parent's state, not to a branch name,
+    so switch, sync and link resolution never go through the archived branch.
+    """
+    parent, link_repo = _make_parent_with_link(new_lore_repo)
+
+    # A sibling branch to switch through after the archive, so the switch is a
+    # real branch change rather than a switch onto the current branch.
+    parent.branch_create("sibling")
+    parent.branch_switch("main")
+
+    parent.branch_create("feature")
+    parent.write_commit_push(
+        "Commit inside the link mount on feature",
+        {f"{_DEFAULT_LINK_MOUNT}/on-feature.txt": "written on the feature branch\n"},
+    )
+
+    parent.branch_switch("main")
+    parent.branch_archive("feature")
+
+    assert any(e["name"] == "feature" for e in _remote_branch_entries(link_repo)), (
+        "Precondition: the linked branch outlives the parent's archive"
+    )
+
+    # main is unaffected: the link still resolves and its content is present.
+    parent.sync()
+    assert parent.file_exists(f"{_DEFAULT_LINK_MOUNT}/linked.txt"), (
+        "Linked content should still be present on main after archiving another branch"
+    )
+    assert not parent.file_exists(f"{_DEFAULT_LINK_MOUNT}/on-feature.txt"), (
+        "main should see its own pinned revision of the link, not the archived branch's"
+    )
+
+    links = parent.link_list()
+    assert link_repo.get_id() in links, (
+        f"Link should still resolve after the archive: {links}"
+    )
+    assert "[Error]" not in links, f"link list should not report an error: {links}"
+
+    # Switching away and back still works with the archived branch present.
+    parent.branch_switch("sibling")
+    parent.branch_switch("main")
+    assert parent.branch_list().current_branch == "main", (
+        "Branch switch should work with an archived branch present"
+    )
+
+
+@pytest.mark.smoke
+def test_link_stage_move_on_mount_is_refused(new_lore_repo):
+    """Renaming a link mount is refused, and the link survives the attempt.
+
+    `stage move` does not perform the rename itself, so the on-disk move has to
+    happen first; without it the command fails on the missing destination with a
+    generic os error and never reaches any node checks.
+
+    The refusal is not link-aware: it is the generic non-directory guard, which
+    fires because a mount is not a directory node — the same message a plain
+    tracked file produces when moved onto a directory. So the message is not
+    asserted here, and it will change if renaming a mount is ever implemented. The
+    load-bearing assertions are the link registry checks below: the mount is still
+    registered at its original path, and the rename was not recorded.
+    """
+    parent, link_repo = _make_parent_with_link(new_lore_repo)
+
+    parent.move(_DEFAULT_LINK_MOUNT, "vendor/renamed")
+    output = parent.stage_move(_DEFAULT_LINK_MOUNT, "vendor/renamed", check=False)
+
+    assert "[Error]" in output, (
+        f"Renaming a link mount should not succeed, got: {output}"
+    )
+
+    # The link is intact and still registered at its original path.
+    links = parent.link_list()
+    assert link_repo.get_id() in links, (
+        f"Link should survive a refused stage move: {links}"
+    )
+    assert _DEFAULT_LINK_MOUNT in links or _DEFAULT_LINK_MOUNT.replace("/", "\\") in links, (
+        f"Link path should be unchanged after a refused stage move: {links}"
+    )
+    assert "vendor/renamed" not in links and "vendor\\renamed" not in links, (
+        f"The rename should not be recorded against the link: {links}"
+    )
+
+
+
+# ---------------------------------------------------------------------------
+# Link tracking on the thin-client wire.
+# ---------------------------------------------------------------------------
+
+
+def _wire_identity(repo: Lore) -> tuple[bytes, bytes]:
+    """The repository id and latest revision signature as the raw bytes the
+    thin-client wire expects."""
+    latest = repo.branch_info().local_latest
+    assert len(latest) == 64, f"Expected a full revision signature, got {latest!r}"
+    return bytes.fromhex(repo.get_id()), bytes.fromhex(latest)
+
+
+def _mount_changes(changes: list, link_path: str) -> list:
+    """Every diff entry describing the link node at `link_path`."""
+    return [
+        change
+        for change in changes
+        if change.path == link_path and change.node_type == NODE_TYPE_LINK
+    ]
+
+
+@pytest.mark.smoke
+def test_thin_client_tree_discriminates_tracking_from_pinned(
+    new_lore_repo, lore_grpc_target
+):
+    """One tree holding both link kinds and a plain file: only the link left on
+    its parent's branch reports tracking. Asserting all three off a single
+    response is what proves the field is populated rather than left at its
+    default."""
+    tracking_source = _commit_initial_main(new_lore_repo, "inner.txt")
+    pinned_source = _commit_initial_main(new_lore_repo, "inner.txt")
+    repo = _commit_initial_main(new_lore_repo, "own.txt")
+
+    repo.link_add("tracked", tracking_source.get_id(), "/")
+    repo.link_add("pinned", pinned_source.get_id(), "/", disable_branching=True)
+    repo.commit()
+    repo.push()
+
+    repository_id, signature = _wire_identity(repo)
+    nodes = {
+        node.path: node
+        for node in revision_tree(lore_grpc_target, repository_id, signature)
+    }
+    for path in ("tracked", "pinned", "own.txt"):
+        assert path in nodes, f"{path} missing from tree: {sorted(nodes)}"
+
+    assert nodes["tracked"].node_type == NODE_TYPE_LINK, (
+        f"Mount path must be reported as a link, got {nodes['tracked']}"
+    )
+    assert nodes["tracked"].tracking, (
+        f"A link following its parent's branch must report tracking, "
+        f"got {nodes['tracked']}"
+    )
+
+    assert nodes["pinned"].node_type == NODE_TYPE_LINK, (
+        f"Mount path must be reported as a link, got {nodes['pinned']}"
+    )
+    assert nodes["pinned"].tracking is False, (
+        f"A link pinned to its own branch must report tracking False, "
+        f"got {nodes['pinned']}"
+    )
+
+    assert nodes["own.txt"].node_type == NODE_TYPE_FILE, (
+        f"Parent's own file must be reported as a file, got {nodes['own.txt']}"
+    )
+    assert nodes["own.txt"].tracking is False, (
+        f"Tracking is a link property, so a file must report False, "
+        f"got {nodes['own.txt']}"
+    )
+
+
+@pytest.mark.smoke
+def test_thin_client_diff_reports_tracking_on_added_link(
+    new_lore_repo, lore_grpc_target
+):
+    """Adding a tracking link is reported as a tracking link entry on the
+    thin-client revision diff."""
+    link_repo = _commit_initial_main(new_lore_repo, "inner.txt")
+    repo = _commit_initial_main(new_lore_repo, "own.txt")
+
+    repository_id, before = _wire_identity(repo)
+
+    link_path = "linked"
+    repo.link_add(link_path, link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+
+    _, after = _wire_identity(repo)
+    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+
+    mount_changes = _mount_changes(changes, link_path)
+    assert mount_changes, f"Mount path must be reported as a link entry, got {changes}"
+    assert all(change.action == ACTION_ADD for change in mount_changes), (
+        f"A newly mounted link must be reported as an add, got {mount_changes}"
+    )
+    assert all(change.tracking for change in mount_changes), (
+        f"A link following its parent's branch must report tracking, "
+        f"got {mount_changes}"
+    )
+
+
+@pytest.mark.smoke
+def test_thin_client_diff_reports_tracking_on_removed_link(
+    new_lore_repo, lore_grpc_target
+):
+    """Removing a tracking link reports tracking on the delete entry. A delete
+    resolves against the "from" side, the only action that does."""
+    link_repo = _commit_initial_main(new_lore_repo, "inner.txt")
+    repo = _commit_initial_main(new_lore_repo, "own.txt")
+
+    link_path = "linked"
+    repo.link_add(link_path, link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+
+    repository_id, before = _wire_identity(repo)
+
+    repo.link_remove(link_path)
+    repo.commit()
+    repo.push()
+
+    _, after = _wire_identity(repo)
+    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+
+    mount_changes = _mount_changes(changes, link_path)
+    assert mount_changes, f"Mount path must be reported as a link entry, got {changes}"
+    assert all(change.action == ACTION_DELETE for change in mount_changes), (
+        f"A removed link must be reported as a delete, got {mount_changes}"
+    )
+    assert all(change.tracking for change in mount_changes), (
+        f"A link following its parent's branch must report tracking, "
+        f"got {mount_changes}"
+    )
+
+
+@pytest.mark.smoke
+def test_thin_client_diff_reports_tracking_on_moved_pin(
+    new_lore_repo, lore_grpc_target
+):
+    """Committing content through a tracking link moves its pin, and the pin
+    move is reported as a tracking link entry on the thin-client revision
+    diff, while the parent's own file change is not."""
+    link_repo = _commit_initial_main(new_lore_repo, "inner.txt")
+    repo = _commit_initial_main(new_lore_repo, "own.txt")
+
+    link_path = "linked"
+    repo.link_add(link_path, link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+
+    repository_id, before = _wire_identity(repo)
+
+    with repo.open_file(os.path.join(link_path, "inner.txt"), "w+") as output_file:
+        output_file.writelines(["linked content, revised\n"])
+    with repo.open_file("own.txt", "w+") as output_file:
+        output_file.writelines(["parent content, revised\n"])
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
+
+    _, after = _wire_identity(repo)
+    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+
+    mount_changes = _mount_changes(changes, link_path)
+    assert mount_changes, (
+        f"Moved pin must be reported as a link entry for the mount path, got {changes}"
+    )
+    assert all(change.tracking for change in mount_changes), (
+        f"A link following its parent's branch must report tracking, "
+        f"got {mount_changes}"
+    )
+
+    own_changes = [change for change in changes if change.path == "own.txt"]
+    assert own_changes, f"Parent's own file change missing from diff: {changes}"
+    assert all(change.tracking is False for change in own_changes), (
+        f"Tracking is a link property, so a file change must report False, "
+        f"got {own_changes}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Link partitions on the thin-client wire.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.smoke
+def test_thin_client_diff_partitions_added_link_under_linked_repository(
+    new_lore_repo, lore_grpc_target
+):
+    """A newly mounted link is the only diff entry for its mount path, and the
+    content it names is a revision of the linked repository, so the entry must
+    be partitioned there for a consumer to find that revision."""
+    link_repo = _commit_initial_main(new_lore_repo, "inner.txt")
+    repo = _commit_initial_main(new_lore_repo, "own.txt")
+
+    repository_id, before = _wire_identity(repo)
+
+    link_path = "linked"
+    repo.link_add(link_path, link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+
+    _, after = _wire_identity(repo)
+    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+
+    mount_changes = _mount_changes(changes, link_path)
+    assert mount_changes, f"Mount path must be reported as a link entry, got {changes}"
+    assert all(change.action == ACTION_ADD for change in mount_changes), (
+        f"A newly mounted link must be reported as an add, got {mount_changes}"
+    )
+    assert all(change.partition == link_repo.get_id() for change in mount_changes), (
+        f"A link entry's content is a revision of the linked repository "
+        f"{link_repo.get_id()}, so it must be partitioned there, got {mount_changes}"
+    )
+
+
+@pytest.mark.smoke
+def test_thin_client_diff_partitions_removed_link_under_linked_repository(
+    new_lore_repo, lore_grpc_target
+):
+    """A removed link names the revision it was pinned to, which still lives in
+    the linked repository, so the delete entry must be partitioned there. A
+    delete resolves against the "from" side, the only action that does."""
+    link_repo = _commit_initial_main(new_lore_repo, "inner.txt")
+    repo = _commit_initial_main(new_lore_repo, "own.txt")
+
+    link_path = "linked"
+    repo.link_add(link_path, link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+
+    repository_id, before = _wire_identity(repo)
+
+    repo.link_remove(link_path)
+    repo.commit()
+    repo.push()
+
+    _, after = _wire_identity(repo)
+    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+
+    mount_changes = _mount_changes(changes, link_path)
+    assert mount_changes, f"Mount path must be reported as a link entry, got {changes}"
+    assert all(change.action == ACTION_DELETE for change in mount_changes), (
+        f"A removed link must be reported as a delete, got {mount_changes}"
+    )
+    assert all(change.partition == link_repo.get_id() for change in mount_changes), (
+        f"A removed link's content is the revision of the linked repository "
+        f"{link_repo.get_id()} it was pinned to, so it must be partitioned there, "
+        f"got {mount_changes}"
+    )
+
+
+@pytest.mark.smoke
+def test_thin_client_diff_partitions_moved_pin_under_linked_repository(
+    new_lore_repo, lore_grpc_target
+):
+    """Committing through a link moves its pin, and every entry the diff reports
+    for the mount path must agree on the linked repository as its partition,
+    while the parent's own file stays in the parent's."""
+    link_repo = _commit_initial_main(new_lore_repo, "inner.txt")
+    repo = _commit_initial_main(new_lore_repo, "own.txt")
+
+    link_path = "linked"
+    repo.link_add(link_path, link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+
+    repository_id, before = _wire_identity(repo)
+
+    with repo.open_file(os.path.join(link_path, "inner.txt"), "w+") as output_file:
+        output_file.writelines(["linked content, revised\n"])
+    with repo.open_file("own.txt", "w+") as output_file:
+        output_file.writelines(["parent content, revised\n"])
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
+
+    _, after = _wire_identity(repo)
+    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+
+    mount_changes = _mount_changes(changes, link_path)
+    assert mount_changes, (
+        f"Moved pin must be reported as a link entry for the mount path, got {changes}"
+    )
+    assert all(change.partition == link_repo.get_id() for change in mount_changes), (
+        f"A moved pin names revisions of the linked repository "
+        f"{link_repo.get_id()}, so every entry for the mount path must be "
+        f"partitioned there, got {mount_changes}"
+    )
+
+    own_changes = [change for change in changes if change.path == "own.txt"]
+    assert own_changes, f"Parent's own file change missing from diff: {changes}"
+    assert all(change.partition == repo.get_id() for change in own_changes), (
+        f"The parent's own file lives in {repo.get_id()}, so its change must be "
+        f"partitioned there, got {own_changes}"
+    )
+
+
+@pytest.mark.smoke
+def test_thin_client_diff_partitions_each_link_under_its_own_repository(
+    new_lore_repo, lore_grpc_target
+):
+    """Two links added in one commit take separate partition indices, and each
+    mount entry resolves to the repository it mounts."""
+    first_repo = _commit_initial_main(new_lore_repo, "first.txt")
+    second_repo = _commit_initial_main(new_lore_repo, "second.txt")
+    repo = _commit_initial_main(new_lore_repo, "own.txt")
+
+    repository_id, before = _wire_identity(repo)
+
+    repo.link_add("first", first_repo.get_id(), "/")
+    repo.link_add("second", second_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+
+    _, after = _wire_identity(repo)
+    changes = revision_diff(lore_grpc_target, repository_id, before, after)
+
+    for link_path, link_repo in (("first", first_repo), ("second", second_repo)):
+        mount_changes = _mount_changes(changes, link_path)
+        assert mount_changes, (
+            f"Mount path {link_path} must be reported as a link entry, got {changes}"
+        )
+        assert all(
+            change.partition == link_repo.get_id() for change in mount_changes
+        ), (
+            f"Mount path {link_path} mounts {link_repo.get_id()}, so its entries "
+            f"must be partitioned there, got {mount_changes}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Branch archive cascading into links.
+# ---------------------------------------------------------------------------
+
+
+def _setup_repo_with_two_links(new_lore_repo):
+    """Set up a parent repo with two links (sec, thr) and content in each.
+
+    Returns (parent_repo, second_repo, third_repo).
+    """
+    repo: Lore = new_lore_repo()
+    second_repo: Lore = new_lore_repo(repo.name + "_second")
+    third_repo: Lore = new_lore_repo(repo.name + "_third")
+
+    repo.write_commit_push(None, {"main.txt": b"main content"})
+    second_repo.write_commit_push(None, {"second.txt": b"second content"})
+    third_repo.write_commit_push(None, {"third.txt": b"third content"})
+
+    repo.link_add("sec", second_repo.get_id(), "/")
+    repo.link_add("thr", third_repo.get_id(), "/")
+    repo.commit("add links")
+    repo.push()
+    return repo, second_repo, third_repo
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_leaves_link_by_default(new_lore_repo):
+    """`branch archive` touches only the repository it ran in."""
+    repo, link_repo = _make_parent_with_link(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    assert link_repo.branch_list().has_remote_branch("feature"), (
+        "Expected branch create to cascade into the linked repository"
+    )
+
+    repo.branch_switch("main")
+    repo.branch_archive("feature")
+
+    assert sorted(repo.branch_list().remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    )
+    assert link_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the link branch to be left alone, got: {link_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_include_links(new_lore_repo):
+    """`--include-links` archives the branch in the linked repository too, so
+    the link is left with exactly the branches it had before the create.
+    """
+    repo, link_repo = _make_parent_with_link(new_lore_repo)
+
+    branches_before = sorted(link_repo.branch_list().remote_branches)
+
+    repo.branch_create("feature")
+    repo.push()
+    assert link_repo.branch_list().has_remote_branch("feature"), (
+        "Expected branch create to cascade into the linked repository"
+    )
+
+    repo.branch_switch("main")
+    repo.branch_archive("feature", include_links=True)
+
+    assert sorted(repo.branch_list().remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    )
+    assert sorted(link_repo.branch_list().remote_branches) == branches_before, (
+        f"Expected link branches {branches_before}, got: {link_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_multiple_links(new_lore_repo):
+    """`--include-links` archives the branch in every configured link."""
+    repo, second_repo, third_repo = _setup_repo_with_two_links(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    for link in (second_repo, third_repo):
+        assert link.branch_list().has_remote_branch("feature"), (
+            f"Expected branch create to cascade into {link.name}"
+        )
+
+    repo.branch_switch("main")
+    repo.branch_archive("feature", include_links=True)
+
+    for link in (second_repo, third_repo):
+        assert sorted(link.branch_list().remote_branches) == ["main"], (
+            f"Expected only 'main' remaining in {link.name}, got: {link.branch_list()}"
+        )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_single_link(new_lore_repo):
+    """`--link <path>` archives the branch in that link and no other."""
+    repo, second_repo, third_repo = _setup_repo_with_two_links(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    repo.branch_archive("feature", link="sec")
+
+    assert sorted(second_repo.branch_list().remote_branches) == ["main"], (
+        f"Expected the scoped link to be archived, got: {second_repo.branch_list()}"
+    )
+    assert third_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the other link to be left alone, got: {third_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_unknown_link_errors(new_lore_repo):
+    """`--link` naming a path that is not a link is an error, not a silent no-op."""
+    repo, link_repo = _make_parent_with_link(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    output = repo.branch_archive("feature", link=_DEFAULT_PARENT_FILE, check=False)
+
+    assert "not a link" in output.lower(), (
+        f"Expected a non-link path to be reported, got: {output}"
+    )
+    assert link_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the link to be left alone, got: {link_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_link_flags_conflict(new_lore_repo):
+    """`--include-links` and `--link` are mutually exclusive."""
+    repo, link_repo = _make_parent_with_link(new_lore_repo)
+
+    output = repo.branch_archive(
+        "feature", include_links=True, link=_DEFAULT_LINK_MOUNT, check=False
+    )
+
+    assert "cannot be used with" in output.lower(), (
+        f"Expected clap to reject the flag combination, got: {output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_local_keeps_link_remote(new_lore_repo):
+    """`--local --include-links` archives the link's local cache only, leaving
+    the link's remote branch in place.
+    """
+    repo, link_repo = _make_parent_with_link(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+
+    repo.branch_switch("main")
+    repo.branch_archive("feature", local=True, include_links=True)
+
+    assert sorted(repo.branch_list().local_branches) == ["main"], (
+        f"Expected only 'main' remaining locally, got: {repo.branch_list()}"
+    )
+    assert link_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the link remote branch to remain, got: {link_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_tolerates_already_archived_link(new_lore_repo):
+    """Archiving a branch a link already archived is not an error."""
+    repo, link_repo = _make_parent_with_link(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    link_repo.branch_switch("main")
+    link_repo.branch_archive("feature")
+
+    repo.branch_archive("feature", include_links=True)
+
+    assert sorted(repo.branch_list().remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    )
+    assert sorted(link_repo.branch_list().remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the link, got: {link_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_reports_once(new_lore_repo):
+    """Archiving reports a single branch, not one line per link."""
+    repo, second_repo, third_repo = _setup_repo_with_two_links(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    output = repo.branch_archive("feature", include_links=True)
+
+    assert output.count("Archived branch") == 1, (
+        f"Expected one archive line for the outer repository, got: {output}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_current_leaves_links(new_lore_repo):
+    """Refusing to archive the current branch leaves the links alone."""
+    repo, link_repo = _make_parent_with_link(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+
+    repo.branch_archive("feature", include_links=True, check=False)
+
+    assert link_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the link branch to be untouched, got: {link_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_skips_auto_follow_disabled_link(new_lore_repo):
+    """A link with auto-follow disabled never received the branch from the
+    create cascade, so `--include-links` leaves its branches as they were.
+    """
+    repo, link_repo = _make_parent_with_link(new_lore_repo, disable_branching=True)
+
+    branches_before = sorted(link_repo.branch_list().remote_branches)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    repo.branch_archive("feature", include_links=True)
+
+    assert sorted(repo.branch_list().remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    )
+    assert sorted(link_repo.branch_list().remote_branches) == branches_before, (
+        f"Expected link branches {branches_before}, got: {link_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_single_auto_follow_disabled_link_errors(new_lore_repo):
+    """Naming an auto-follow-disabled link with `--link` is refused, rather than
+    deleting a branch the create cascade never put there.
+    """
+    repo, link_repo = _make_parent_with_link(new_lore_repo, disable_branching=True)
+
+    branches_before = sorted(link_repo.branch_list().remote_branches)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    output = repo.branch_archive("feature", link=_DEFAULT_LINK_MOUNT, check=False)
+
+    assert "does not follow the parent's branches" in output.lower(), (
+        f"Expected the opted-out link to be reported, got: {output}"
+    )
+    assert sorted(link_repo.branch_list().remote_branches) == branches_before, (
+        f"Expected link branches {branches_before}, got: {link_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_include_links_reaches_nested_link(new_lore_repo):
+    """`--include-links` descends into a link nested inside another link.
+
+    `branch create` only seeds the top level, so the nested repository holds no
+    branch to remove; the cascade is observed reaching it through the debug log
+    rather than through a branch that disappears.
+    """
+    repo_a, repo_b, repo_c, _b_mount, _nested_mount = _build_nested_link_repos(
+        new_lore_repo
+    )
+
+    nested_before = sorted(repo_c.branch_list().remote_branches)
+
+    repo_a.branch_create("feature")
+    repo_a.push()
+    assert repo_b.branch_list().has_remote_branch("feature"), (
+        f"Expected create to cascade into the top-level link, got: {repo_b.branch_list()}"
+    )
+
+    repo_a.branch_switch("main")
+    output = repo_a.branch_archive("feature", include_links=True, level="debug")
+
+    assert repo_c.get_id() in output, (
+        f"Expected the cascade to reach nested link {repo_c.get_id()}, got: {output}"
+    )
+    assert sorted(repo_c.branch_list().remote_branches) == nested_before, (
+        f"Expected nested link branches {nested_before}, got: {repo_c.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_link_branch_archive_repository_linked_twice(new_lore_repo):
+    """A repository mounted at two paths is archived once and reaches the
+    branches it had before the create.
+    """
+    repo: Lore = new_lore_repo()
+    link_repo: Lore = new_lore_repo(repo.name + "_link")
+
+    repo.write_commit_push(None, {"main.txt": b"main content"})
+    link_repo.write_commit_push(None, {"link.txt": b"link content"})
+
+    repo.link_add("first", link_repo.get_id(), "/")
+    repo.link_add("second", link_repo.get_id(), "/")
+    repo.commit("add links")
+    repo.push()
+
+    branches_before = sorted(link_repo.branch_list().remote_branches)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    output = repo.branch_archive("feature", include_links=True)
+
+    assert output.count("Archived branch") == 1, (
+        f"Expected one archive line for the outer repository, got: {output}"
+    )
+    assert sorted(link_repo.branch_list().remote_branches) == branches_before, (
+        f"Expected link branches {branches_before}, got: {link_repo.branch_list()}"
     )

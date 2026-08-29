@@ -154,6 +154,7 @@ pub struct ProtocolErrorInfo {
     pub is_appropriate_for_logging: bool,
 }
 
+/// Compiled for `integration_tests` too, so the suite can stand up a real QUIC storage server.
 #[cfg(any(test, feature = "integration_tests"))]
 pub mod tests {
     use std::env;

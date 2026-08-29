@@ -11,6 +11,7 @@ import random
 import shutil
 import string
 import subprocess
+import sys
 import typing
 import uuid
 from collections.abc import Iterable
@@ -200,6 +201,17 @@ class Lore:
             return ".urcignore"
         return ".loreignore"
 
+    def _subprocess_env(self) -> dict[str, str]:
+        """Environment for any subprocess this repository drives."""
+        env = os.environ.copy()
+        for k, v in self.environment_vars.items():
+            env[k] = v
+        env["LORE_GLOBAL_PATH"] = self.global_dir
+        # Isolate the auth token store per test so a developer's
+        # locally cached credentials don't leak into smoke runs.
+        env.setdefault("LORE_AUTH_PATH", self.global_dir)
+        return env
+
     def run(
         self,
         urc_args: list[str] | None = None,
@@ -278,13 +290,7 @@ class Lore:
         max_attempts = 3
         while True:
             try:
-                env = os.environ.copy()
-                for k, v in self.environment_vars.items():
-                    env[k] = v
-                env["LORE_GLOBAL_PATH"] = self.global_dir
-                # Isolate the auth token store per test so a developer's
-                # locally cached credentials don't leak into smoke runs.
-                env.setdefault("LORE_AUTH_PATH", self.global_dir)
+                env = self._subprocess_env()
                 output = subprocess.run(
                     command_args,
                     capture_output=True,
@@ -733,8 +739,24 @@ class Lore:
             **kwargs,
         )
 
-    def branch_archive(self, branch: str | None = None, **kwargs: Unpack[GlobalOptions]):
-        return self.run(["branch", "archive"] + ([branch] if branch else []), **kwargs)
+    def branch_archive(
+        self,
+        branch: str | None = None,
+        include_layers: bool = False,
+        layer: str | None = None,
+        include_links: bool = False,
+        link: str | None = None,
+        **kwargs: Unpack[GlobalOptions],
+    ):
+        return self.run(
+            ["branch", "archive"]
+            + ([branch] if branch else [])
+            + (["--include-layers"] if include_layers else [])
+            + (["--layer", layer] if layer else [])
+            + (["--include-links"] if include_links else [])
+            + (["--link", link] if link else []),
+            **kwargs,
+        )
 
     def branch_reset(
         self,
@@ -1644,14 +1666,49 @@ class Lore:
             **kwargs,
         )
 
-    def auth_user_info(
-        self, remote_url: str | None = None, **kwargs: Unpack[GlobalOptions]
-    ):
-        return self.run(
-            ["auth", "user-info"]
-            + (["--remote-url", remote_url] if remote_url else []),
-            **kwargs,
+    def auth_user_info_capi(
+        self, library_path: str, user_ids: str | list[str] | None = None
+    ) -> int:
+        """Resolve user IDs through the public C API, returning the FFI code.
+
+        `authUserInfo` has no CLI surface — the commands that resolve display
+        names discard failures — so this drives `liblore` directly, the same
+        entry point the SDK binds. The call runs in a subprocess so it reads
+        this repository's isolated auth and global directories, and so a crash
+        in the library fails this test rather than the whole pytest worker.
+        """
+        if user_ids is None:
+            user_ids = []
+        elif isinstance(user_ids, str):
+            user_ids = [user_ids]
+
+        command_args = [
+            sys.executable,
+            str(Path(__file__).with_name("lore_ffi.py")),
+            library_path,
+            self.path,
+            *user_ids,
+        ]
+        command_string = " ".join(command_args)
+        logger.info("Executing Lore C API driver: %s", command_string)
+        # Run from the repository, as `run()` does: repository discovery falls
+        # back to the working directory, and the checkout pytest runs from is
+        # itself a repository — inheriting that cwd would let a bad repository
+        # path silently resolve somewhere else.
+        result = subprocess.run(
+            command_args,
+            capture_output=True,
+            text=True,
+            env=self._subprocess_env(),
+            cwd=self.path if os.path.isdir(self.path) else None,
         )
+        logger.info(
+            "Lore C API driver (%s) exited %s, output:\n%s",
+            command_string,
+            result.returncode,
+            result.stdout + result.stderr,
+        )
+        return result.returncode
 
     def layer_add(
         self,
@@ -1751,6 +1808,16 @@ class Lore:
     ):
         return self.run(
             ["link", "list"] + (["--staged"] if staged else []),
+            **kwargs,
+        )
+
+    def link_info(
+        self,
+        link_path: str,
+        **kwargs: Unpack[GlobalOptions],
+    ):
+        return self.run(
+            ["link", "info", self._fix_path(link_path)],
             **kwargs,
         )
 

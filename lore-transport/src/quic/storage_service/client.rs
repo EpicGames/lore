@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -22,12 +21,11 @@ use lore_base::lore_trace;
 use lore_base::lore_warn;
 use lore_base::types::Address;
 use lore_base::types::Context;
-use lore_base::types::DirectDownload;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_base::types::HealResult;
 use lore_base::types::KeyType;
-use lore_base::types::RepositoryId;
+use lore_base::types::Partition;
 use lore_base::types::VerifyResult;
 use lore_error_set::prelude::*;
 use tokio::sync::Semaphore;
@@ -52,6 +50,7 @@ use super::super::storage_service::Command;
 use super::super::storage_service::MAX_CHUNK_SIZE;
 use super::super::storage_service::auth::StorageClientAuth;
 use crate::connection::Connection;
+use crate::connection::SuppliedCredentials;
 use crate::direct_download::DirectDownloadBatcher;
 use crate::error::ProtocolError;
 use crate::quic::client::CongestionAlgorithm;
@@ -70,7 +69,8 @@ pub struct StorageClient {
     auth_url: String,
     recipient_domain: String,
     identity: String,
-    repository: RepositoryId,
+    credentials: Arc<SuppliedCredentials>,
+    partition: Partition,
     counter: AtomicUsize,
     quic: Arc<QuicConnection>,
     connection_establish: Semaphore,
@@ -101,8 +101,9 @@ impl StorageClient {
         auth_url: &str,
         recipient_domain: &str,
         identity: &str,
-        repository: RepositoryId,
+        partition: Partition,
         quinn: quinn::Connection,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Self {
         let quic = QuicConnection::with_v4(quinn, MAX_CHUNK_SIZE, true);
         StorageClient {
@@ -113,7 +114,8 @@ impl StorageClient {
             auth_url: auth_url.to_string(),
             recipient_domain: recipient_domain.to_string(),
             identity: identity.to_string(),
-            repository,
+            credentials: credentials.clone(),
+            partition,
             quic: Arc::new(quic),
             connection_establish: Semaphore::new(1),
             counter: AtomicUsize::new(0),
@@ -123,19 +125,21 @@ impl StorageClient {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn connect(
         connection: Weak<Connection>,
         remote_url: &str,
         remote_domain: String,
         auth_url: &str,
         identity: &str,
-        repository: RepositoryId,
+        partition: Partition,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Self, ProtocolError> {
         let auth_adapter = Arc::new(StorageClientAuth {
             recipient_domain: remote_domain.clone(),
             auth_url: auth_url.to_string(),
             identity: identity.to_string(),
-            repository,
+            partition,
         });
         let transport_config = TransportConfig {
             max_bytes_bandwidth_per_second: MAX_BYTES_BANDWIDTH_PER_SEC,
@@ -144,7 +148,7 @@ impl StorageClient {
             initial_cwnd: None,
         };
 
-        lore_trace!("QUIC connecting to {remote_url} for repository {repository}");
+        lore_trace!("QUIC connecting to {remote_url} for partition {partition}");
 
         let start = Instant::now();
 
@@ -169,8 +173,9 @@ impl StorageClient {
             auth_url,
             &remote_domain,
             identity,
-            repository,
+            partition,
             quinn,
+            credentials,
         );
 
         lore_trace!(
@@ -183,14 +188,14 @@ impl StorageClient {
             .create_initial_stream()
             .await
             .internal_with(|| {
-                format!("creating initial QUIC stream to {remote_url} for repository {repository}")
+                format!("creating initial QUIC stream to {remote_url} for partition {partition}")
             })?;
 
         auth_adapter.initial_authorize(storage.quic.clone()).await?;
         storage.quic.stream_count.store(1, Ordering::Relaxed);
 
         lore_debug!(
-            "QUIC connection {connection_id} to {remote_url} for repository {repository} complete in {}ms",
+            "QUIC connection {connection_id} to {remote_url} for partition {partition} complete in {}ms",
             start.elapsed().as_millis()
         );
 
@@ -279,16 +284,22 @@ impl ServiceClient for StorageClient {
 impl Storage for StorageClient {
     async fn session_start(
         &self,
-        repository: RepositoryId,
+        partition: Partition,
         correlation_id: &str,
     ) -> Result<u32, ProtocolError> {
-        // Fetch auth token via token exchange (cached if already exchanged)
+        // Fetch auth token via token exchange (cached if already exchanged).
+        // The credentials are read here, not at construction: the server checks
+        // storage authorization at each session start, so a session opened later
+        // must present whatever the newest call supplied.
         let token = if !self.auth_url.is_empty() {
+            let (identity_token, access_token) = self.credentials.tokens();
             let (_, authorization_token, _) = crate::auth::exchange::auth_exchange(
                 &self.auth_url,
                 &self.recipient_domain,
                 &self.identity,
-                repository,
+                partition,
+                &identity_token,
+                &access_token,
             )
             .await;
             authorization_token
@@ -298,12 +309,12 @@ impl Storage for StorageClient {
         let token_bytes = token.as_bytes();
 
         // Build Authorize start payload:
-        // action(1=0) + repository_id(16) + corr_len(1) + corr(N) + token_len(2, u16 LE) + token(M)
+        // action(1=0) + partition_id(16) + corr_len(1) + corr(N) + token_len(2, u16 LE) + token(M)
         let corr_bytes = correlation_id.as_bytes();
         let mut payload =
             BytesMut::with_capacity(1 + 16 + 1 + corr_bytes.len() + 2 + token_bytes.len());
         payload.put_u8(0); // action = start
-        payload.extend_from_slice(repository.as_bytes());
+        payload.extend_from_slice(partition.as_bytes());
         payload.put_u8(corr_bytes.len() as u8);
         payload.extend_from_slice(corr_bytes);
         payload.extend_from_slice(&(token_bytes.len() as u16).to_le_bytes());
@@ -399,89 +410,54 @@ impl Storage for StorageClient {
         Ok((fragment, payload))
     }
 
-    async fn presign_downloads(
+    /// Response framing: resolved `Hash` (32) ++ `Fragment` (16) ++ payload.
+    async fn get_resolved(
         &self,
         session_id: u32,
-        addresses: &[Address],
-        expires_in: Duration,
-    ) -> Result<Vec<DirectDownload>, ProtocolError> {
-        const MAX_BATCH: usize = lore_base::types::FRAGMENT_SIZE_EXPECTED / size_of::<Address>();
-        if addresses.len() > MAX_BATCH {
-            return Err(ProtocolError::internal(format!(
-                "presign_download: invalid address batch count: {}",
-                addresses.len()
-            )));
-        }
-        if addresses.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut request =
-            BytesMut::with_capacity(size_of::<u64>() + std::mem::size_of_val(addresses));
-        request.put_u64_le(expires_in.as_secs());
-        request.extend_from_slice(addresses.as_bytes());
-        let request = request.freeze();
+        key: &Hash,
+        context: &Context,
+        flags: u32,
+    ) -> Result<(Hash, Fragment, Bytes), ProtocolError> {
+        let tail = flags.to_le_bytes();
 
         let mut payload =
-            send_normal_with_reconnect(self, Command::PresignDownload, session_id, || {
-                [Bytes::default(), request.clone()]
+            send_normal_with_reconnect(self, Command::GetResolved, session_id, || {
+                [
+                    Bytes::default(),
+                    Bytes::from_owner(*key),
+                    Bytes::from_owner(*context),
+                    Bytes::copy_from_slice(&tail),
+                ]
             })
             .await?;
 
-        if payload.len() < size_of::<u32>() {
-            return Err(ProtocolError::internal(
-                "presign_download: invalid server response",
-            ));
-        }
-        let count =
-            u32::from_le_bytes(payload.split_to(size_of::<u32>())[..].try_into().unwrap()) as usize;
-
-        let mut downloads = Vec::with_capacity(count);
-        for _ in 0..count {
-            let fixed_len =
-                size_of::<Address>() + size_of::<Fragment>() + size_of::<u64>() + size_of::<u32>();
-            if payload.len() < fixed_len {
-                return Err(ProtocolError::internal(
-                    "presign_download: truncated response record",
-                ));
-            }
-
-            let address = Address::from(&payload.split_to(size_of::<Address>()));
-            let fragment_bytes = payload.split_to(size_of::<Fragment>());
-            let fragment = unsafe { fragment_bytes.as_ptr().cast::<Fragment>().read_unaligned() };
-            if let Err(reason) = lore_base::types::validate_fragment_response(&fragment) {
-                return Err(ProtocolError::internal(format!(
-                    "presign_download: invalid fragment {fragment:?}: {reason}"
-                )));
-            }
-            let expires_at_epoch_seconds =
-                u64::from_le_bytes(payload.split_to(size_of::<u64>())[..].try_into().unwrap());
-            let url_len =
-                u32::from_le_bytes(payload.split_to(size_of::<u32>())[..].try_into().unwrap())
-                    as usize;
-            if payload.len() < url_len {
-                return Err(ProtocolError::internal(
-                    "presign_download: truncated URL in response record",
-                ));
-            }
-            let url = String::from_utf8(payload.split_to(url_len).to_vec())
-                .map_err(|err| ProtocolError::internal_with_context(err, "presign_download url"))?;
-
-            downloads.push(DirectDownload {
-                address,
-                fragment,
-                url,
-                expires_at_epoch_seconds,
-            });
+        let prefix = size_of::<Hash>() + size_of::<Fragment>();
+        if payload.len() < prefix {
+            return Err(ProtocolError::internal(format!(
+                "get_resolved: Invalid server response, expected at least {prefix} bytes got {}",
+                payload.len()
+            )));
         }
 
-        if !payload.is_empty() {
-            return Err(ProtocolError::internal(
-                "presign_download: trailing response bytes",
-            ));
+        let resolved_bytes = payload.split_to(size_of::<Hash>());
+        let resolved = Hash::from(&resolved_bytes[..]);
+
+        let fragment_bytes = payload.split_to(size_of::<Fragment>());
+        let fragment = unsafe { fragment_bytes.as_ptr().cast::<Fragment>().read_unaligned() };
+
+        if let Err(reason) = lore_base::types::validate_fragment_response(&fragment) {
+            return Err(ProtocolError::internal(format!(
+                "get_resolved: invalid fragment {fragment:?}: {reason}"
+            )));
+        }
+        if payload.len() != fragment.size_payload as usize {
+            return Err(ProtocolError::internal(format!(
+                "get_resolved: Invalid server payload for fragment {fragment:?}, got {} bytes",
+                payload.len()
+            )));
         }
 
-        Ok(downloads)
+        Ok((resolved, fragment, payload))
     }
 
     async fn get_metadata(
@@ -583,6 +559,29 @@ impl Storage for StorageClient {
         .map(|_| ())
     }
 
+    /// Request framing: `put`'s, with the mutable key prepended — key (32) ++ `Address` (48) ++
+    /// `Fragment` (16) ++ payload, keeping the 96-byte header a multiple of four.
+    async fn put_resolved(
+        &self,
+        session_id: u32,
+        key: &Hash,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<(), ProtocolError> {
+        send_normal_with_reconnect(self, Command::PutResolved, session_id, || {
+            [
+                Bytes::default(),
+                Bytes::from_owner(*key),
+                Bytes::from_owner(address),
+                Bytes::from_owner(fragment),
+                payload.clone().unwrap_or_default(),
+            ]
+        })
+        .await
+        .map(|_| ())
+    }
+
     async fn query(&self, session_id: u32, address: &[Address]) -> Result<Bytes, ProtocolError> {
         const MAX_BATCH: usize = lore_base::types::FRAGMENT_SIZE_EXPECTED / size_of::<Address>();
         let address_count = address.len();
@@ -644,17 +643,17 @@ impl Storage for StorageClient {
     async fn copy(
         &self,
         session_id: u32,
-        source_repository: RepositoryId,
+        source_partition: Partition,
         source_address: Address,
         target_context: Context,
     ) -> Result<(), ProtocolError> {
-        // Wire payload layout for Copy is: source_repository (16) + source_address (32+16) +
+        // Wire payload layout for Copy is: source_partition (16) + source_address (32+16) +
         // target_context (16) = 80 bytes. The target_context tail allows the destination's
         // dedup tag to differ from the source's without transferring the payload.
         send_normal_with_reconnect(self, Command::Copy, session_id, || {
             [
                 Bytes::default(),
-                Bytes::from_owner(source_repository),
+                Bytes::from_owner(source_partition),
                 Bytes::from_owner(source_address),
                 Bytes::from_owner(target_context),
             ]

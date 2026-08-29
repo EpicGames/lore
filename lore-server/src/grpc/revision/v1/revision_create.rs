@@ -1008,7 +1008,8 @@ mod tests {
                 None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .address;
             let new_address = lore_storage::write_content(
                 immutable_store.clone(),
                 repository_id,
@@ -1020,7 +1021,8 @@ mod tests {
                 None,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .address;
             let new_fragment = immutable_store
                 .clone()
                 .get_metadata(repository_id, new_address)
