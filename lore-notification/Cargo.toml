@@ -4,6 +4,10 @@ edition = "2024"
 version.workspace = true
 publish = false
 
+[lib]
+# The crate holds no unit tests. Set this back to build a harness for them.
+test = false
+
 [dependencies]
 async-trait = { workspace = true }
 tonic = { workspace = true }

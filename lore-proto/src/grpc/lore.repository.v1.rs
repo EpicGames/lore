@@ -10,7 +10,8 @@ pub struct RepositoryCreateRequest {
     pub id: ::prost::bytes::Bytes,
     /// Human-readable repository name. Must satisfy the validation rules in
     /// `lore-revision::repository::is_valid_name` and must not collide with
-    /// any existing repository.
+    /// any existing repository: `/`-separated segments of ASCII alphanumerics,
+    /// `-`, `_` and `.`, where no segment is empty or starts with `.`.
     #[prost(string, tag = "2")]
     pub name: ::prost::alloc::string::String,
     /// Free-form description, stored verbatim in the repository metadata.

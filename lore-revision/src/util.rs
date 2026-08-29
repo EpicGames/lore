@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 pub mod collect_stream;
+pub mod config;
 pub mod encoding;
 pub mod fs;
 pub mod inflight;

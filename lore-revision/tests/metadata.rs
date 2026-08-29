@@ -4,7 +4,6 @@
 mod tests {
     use std::sync::Arc;
 
-    use lore_base::error::NoRemote;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::Address;
     use lore_base::types::Context;
@@ -13,8 +12,6 @@ mod tests {
     use lore_revision::metadata::Metadata;
     use lore_revision::metadata::MetadataError;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
-    use lore_transport::ProtocolError;
     use rand::random;
 
     include!("helper.rs");
@@ -23,17 +20,9 @@ mod tests {
         let (immutable, mutable, _execution) = test_store_create()
             .await
             .expect("Failed to create stores for metadata test");
-        let repository_id = Context::from(uuid::Uuid::now_v7());
         let tempdir = generate_tempdir();
         Arc::new(RepositoryContext::new(
-            Some(tempdir.to_path_buf()),
-            immutable,
-            mutable,
-            repository_id.into(),
-            lore_revision::instance::InstanceId::default(),
-            Err(ProtocolError::from(NoRemote)),
-            Arc::default(),
-            RepositoryFormat::Lore,
+            default_repository_creation_args(immutable, mutable).with_path(tempdir.path()),
         ))
     }
 

@@ -134,7 +134,7 @@ pub async fn acquire(
     } else {
         let resolved = branch::resolve(repository.clone(), options.branch.as_str())
             .await
-            .internal("Invalid branch")?;
+            .forward::<AcquireError>("Invalid branch")?;
         resolved.id
     };
 

@@ -11,6 +11,7 @@ pub mod fragment_engine;
 pub mod fragment_flags;
 pub mod fs_util;
 pub mod gc_event;
+pub mod mutable_conformance;
 
 use std::sync::OnceLock;
 
@@ -118,6 +119,8 @@ pub use read::read;
 pub use read::read_into;
 pub use read::read_into_file;
 pub use read::read_raw;
+pub use read::read_resolved;
+pub use read::read_resolved_stream;
 pub use read::read_stream;
 pub use read::remote_fetch_inflight;
 pub use read::write_all_to_file;
@@ -146,17 +149,22 @@ pub use types::deserialize_context;
 pub use types::deserialize_hash;
 /// Serde field-level helpers for hex encoding. Use with `#[serde(serialize_with = "...")]`.
 pub use types::serialize_hex;
+pub use write::FileMatch;
 pub use write::StoreResult;
 pub use write::content_write_inflight;
 pub use write::content_write_peak;
+pub use write::file_matches;
 pub use write::hash_file;
+pub use write::remote_copies;
 pub use write::reset_content_write_peak;
+pub use write::reset_remote_copies;
 pub use write::store_fragment;
 pub use write::store_raw_local;
 pub use write::stored_in_flight;
 pub use write::write_content;
 pub use write::write_from_file;
 pub use write::write_raw;
+pub use write::write_resolved;
 
 /// Retry waiter with exponential backoff and jitter.
 pub struct Retry {

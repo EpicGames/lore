@@ -13,7 +13,7 @@ This example uses **c8gd.8xlarge** Graviton instances (32 vCPU, 64 GB RAM, 1.9 T
 From the Lore repo root:
 
 ```sh
-docker buildx build --platform linux/arm64 -f lore-server/Dockerfile -t loreserver:v0.8.3 --load .
+docker buildx build --platform linux/arm64 -f lore-server/Dockerfile -t loreserver:v0.8.7 --load .
 ```
 
 > If building on an x86 host, [register QEMU](https://docs.docker.com/build/building/multi-platform/#qemu) first:
@@ -24,8 +24,8 @@ Push to ECR (replace `<ACCOUNT_ID>` and `<REGION>`):
 ```sh
 aws ecr get-login-password --region <REGION> | docker login --username AWS --password-stdin <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com
 aws ecr create-repository --repository-name loreserver --region <REGION>
-docker tag loreserver:v0.8.3 <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/loreserver:v0.8.3
-docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/loreserver:v0.8.3
+docker tag loreserver:v0.8.7 <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/loreserver:v0.8.7
+docker push <ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com/loreserver:v0.8.7
 ```
 
 ### 2. Deploy
@@ -39,7 +39,7 @@ Edit `terraform.tfvars`:
 
 ```hcl
 region          = "us-west-2"
-container_image = "<ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/loreserver:v0.8.3"
+container_image = "<ACCOUNT_ID>.dkr.ecr.us-west-2.amazonaws.com/loreserver:v0.8.7"
 allowed_cidrs   = ["10.0.0.0/8"]  # Your VPC or VPN CIDR
 ```
 
@@ -158,8 +158,21 @@ See `tests/TEST_PLAN.md` for the manual equivalent with AWS resource validation.
 | Faster edge startup | Consider adding a startup probe that polls `primary.lore.internal` before starting loreserver |
 | Presigned URLs | Already configured via HMAC key in Secrets Manager |
 | Production hardening | Add `deletion_protection_enabled = true` to DynamoDB tables |
+| Objects stored before v0.8.7 | Set `fragment_metadata_table` to the existing metadata table (see below) |
 
 Full server configuration: [Lore Server config reference](https://epicgames.github.io/lore/reference/lore-server-config/)
+
+### Upgrading a deployment that predates v0.8.7
+
+A fragment now travels on the S3 object that carries it, described by the `-fragment-state` table rather than the old `-metadata` table. A stack applied from an earlier revision of this example has objects written the old way, and only its metadata table can describe them.
+
+Nothing here creates that table any more, and `storage.tf` drops it from Terraform state without destroying it. Point the server back at it so those objects stay readable:
+
+```hcl
+fragment_metadata_table = "lore-metadata"  # the table your earlier apply created
+```
+
+The server reads it only for an object carrying no metadata of its own. Once every such object has been rewritten, unset the variable — an object with no metadata is then reported as damaged rather than described from a row that may not be about it.
 
 ## Destroy
 

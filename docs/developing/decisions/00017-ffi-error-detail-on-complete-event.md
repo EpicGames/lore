@@ -82,6 +82,12 @@ The decision has three parts:
 
 ## More Information
 
-The error code values are not yet stable to branch on. A table that maps each error code to a name ships in later work. Until then, treat `error_code` as opaque: test it for `0` versus non-zero, but do not hard-code specific values.
+This ADR originally closed by saying the code values were not yet stable to branch on, that a table mapping each code to a name would ship in later work, and that `error_code` should be treated as opaque until then. That work has since landed, so the caveat no longer applies.
 
-See the FFI error reporting contract in [docs/developing/code-standards/errors.md](../code-standards/errors.md).
+`lore-base/src/error.rs` is the registry. Every code is allocated from a block that groups errors by the kind of failure they report, so a consumer can branch on a block range when it only cares about the category, or on an exact value when it cares about the specific error. The allocation rules forbid renumbering an existing code to close a gap, so a value a consumer branches on does not move under it; a new error type takes a free code from its group's block.
+
+Delivering the table reallocated the values once. A consumer pinned to a code from before that work must update — the numbering in use when this ADR was written is not the numbering that ships now.
+
+Codes are also process exit statuses: the CLI returns the failing error's code from `main` as `ExitCode::from(code as u8)`. The allocation therefore keeps every block clear of the values the shell and the OS already spend on something else, so a code can never be confused with a signal death or a shell error.
+
+See the FFI error reporting contract and the allocation table in [docs/developing/code-standards/errors.md](../code-standards/errors.md).

@@ -434,6 +434,7 @@ pub async fn restore(
     // propagating the rehash result so no spawned leader outlives the
     // function holding references to local state.
     let rehash_tracker = std::sync::Arc::new(lore_storage::write_tracker::WriteTracker::new());
+    let modified_times = std::sync::Arc::new(crate::state::RecordedModifiedTimes::default());
     let rehash_result = commit::commit_files_and_rehash(
         repository.clone(),
         token.share(),
@@ -444,6 +445,7 @@ pub async fn restore(
         std::sync::Arc::new(std::collections::HashMap::new()),
         current_branch,
         rehash_tracker.clone(),
+        modified_times.clone(),
     )
     .await;
     let drain_result = rehash_tracker.await_all().await;
@@ -569,6 +571,8 @@ pub async fn restore(
     crate::instance::store_current_anchor(&repository, revision)
         .await
         .forward::<RestoreError>("storing current revision anchor")?;
+
+    modified_times.store(repository.clone()).await;
 
     let _ = crate::instance::delete_staged_anchor(&repository).await;
 

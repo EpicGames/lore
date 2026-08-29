@@ -153,7 +153,7 @@ impl NameTable {
             read_options_from_repository(&repository).with_priority(),
         )
         .await
-        .internal("deserializing name table")?;
+        .forward_any::<NameTableError>("deserializing name table")?;
 
         // For now bound the size of the name table, since it is deprecated and not in active use
         let mut entry_buffer = BytesMut::from(
@@ -166,7 +166,7 @@ impl NameTable {
                     .with_priority(),
             )
             .await
-            .internal("reading name table entry buffer")?,
+            .forward_any::<NameTableError>("reading name table entry buffer")?,
         );
 
         // Align entry buffer count to a prime
@@ -189,7 +189,7 @@ impl NameTable {
                     .with_priority(),
             )
             .await
-            .internal("reading name table data buffer")?,
+            .forward_any::<NameTableError>("reading name table data buffer")?,
         );
 
         Ok(NameTable {

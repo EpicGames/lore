@@ -108,6 +108,7 @@ pub async fn resolve_user_info(
         .collect();
 
     let execution = execution_context();
+    let globals = execution.globals();
     let current_user_id = execution.user_id().await;
 
     // Fast path: if the current user id is in the list and a local JWT token
@@ -121,9 +122,14 @@ pub async fn resolve_user_info(
     let (has_current_user, mut remaining_ids) =
         strip_current_user(user_ids_vec, current_user_id.as_str());
     if has_current_user {
-        if let Some(user_info) =
-            lore_credential::user_info(&auth_url, current_user_id.as_str(), vulnerable_all_tokens())
-                .await
+        if let Some(user_info) = lore_credential::user_info(
+            &auth_url,
+            current_user_id.as_str(),
+            vulnerable_all_tokens(),
+            globals.identity_token(),
+            globals.access_token(),
+        )
+        .await
         {
             lore_debug!("User info fast path: current user resolved from local token");
             LoreEvent::AuthUserInfo(LoreAuthUserInfoEventData {
@@ -154,6 +160,8 @@ pub async fn resolve_user_info(
         current_user_id.as_str(),
         repository.id,
         get_domain_or_empty(&auth_url),
+        globals.identity_token(),
+        globals.access_token(),
     )
     .await
     .forward::<UserInfoError>("Failed authorization token exchange")?;
@@ -248,6 +256,56 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn supplied_token_describes_only_the_identity_the_call_acts_as() {
+        use std::sync::Arc;
+
+        use lore_base::runtime::LORE_CONTEXT;
+
+        use crate::interface::ExecutionContext;
+        use crate::interface::LoreGlobalArgs;
+        use crate::relay::EventDispatcher;
+
+        /// `{"iss":"lore","sub":"alice","name":"Alice","exp":2000000000,"aud":["example.com"]}`
+        const ALICE_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
+
+        // `identity` is what `LoreGlobalArgs::validate` derives from the token.
+        let globals = LoreGlobalArgs {
+            identity: "alice".into(),
+            identity_token: ALICE_TOKEN.into(),
+            ..Default::default()
+        };
+        let execution = Arc::new(ExecutionContext::new_client(
+            globals,
+            EventDispatcher::no_dispatch(),
+        ));
+
+        // An empty auth URL keeps the token store out of this: a lookup there
+        // fails before it reads anything, so whatever comes back can only have
+        // come from the supplied token.
+        let resolved = LORE_CONTEXT
+            .scope(execution, async {
+                resolve_local_user_info("", &["alice".to_string(), "bob".to_string()]).await
+            })
+            .await;
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].id, "alice");
+        assert_eq!(
+            resolved[0]
+                .local_user_info
+                .as_ref()
+                .map(|info| info.token.as_str()),
+            Some(ALICE_TOKEN),
+            "the identity the call acts as is described by the supplied token"
+        );
+        assert_eq!(resolved[1].id, "bob");
+        assert!(
+            resolved[1].local_user_info.is_none(),
+            "another user must not be described by this call's token"
+        );
+    }
+
     #[test]
     fn strip_removes_every_occurrence_of_current_user() {
         // The fast path emits one event for the current user; the remote
@@ -326,10 +384,26 @@ fn display_name(info: &lore_credential::UserInfo) -> String {
 /// authorization exchange scoped to a repository.
 pub async fn resolve_local_user_info(auth_url: &str, user_ids: &[String]) -> Vec<ResolvedIdentity> {
     let mut results = vec![];
+    let execution = execution_context();
+    let globals = execution.globals();
+    let own_identity = globals.identity().unwrap_or_default();
 
     for user_id in user_ids {
-        if let Some(info) =
-            lore_credential::user_info(auth_url, user_id, vulnerable_all_tokens()).await
+        // Pass an empty pre-populated tokens to user_info, if not querying your own info
+        let (identity_token, access_token) = if user_id == own_identity {
+            (globals.identity_token(), globals.access_token())
+        } else {
+            ("", "")
+        };
+
+        if let Some(info) = lore_credential::user_info(
+            auth_url,
+            user_id,
+            vulnerable_all_tokens(),
+            identity_token,
+            access_token,
+        )
+        .await
         {
             let name = display_name(&info);
             results.push(ResolvedIdentity {
@@ -369,14 +443,20 @@ pub async fn user_display_name(
     let auth_url = remote.auth_url().to_string();
 
     let execution = execution_context();
+    let globals = execution.globals();
     let user_id = execution.user_id().await;
 
     // Safe to use vulnerable_all_tokens here: this is a local JWT decode for
     // the current user's own identity — the token is not sent over the network.
     if user_id == id
-        && let Some(user_info) =
-            lore_credential::user_info(auth_url.as_str(), user_id.as_str(), vulnerable_all_tokens())
-                .await
+        && let Some(user_info) = lore_credential::user_info(
+            auth_url.as_str(),
+            user_id.as_str(),
+            vulnerable_all_tokens(),
+            globals.identity_token(),
+            globals.access_token(),
+        )
+        .await
     {
         return Ok(user_info.name);
     }
@@ -388,6 +468,8 @@ pub async fn user_display_name(
         user_id.as_str(),
         repository.id,
         get_domain_or_empty(&auth_url),
+        globals.identity_token(),
+        globals.access_token(),
     )
     .await
     .forward::<UserInfoError>("Failed authorization token exchange")?;
@@ -443,7 +525,9 @@ pub async fn user_id(
         .forward::<UserInfoError>("Not connected")?;
     let auth_url = remote.auth_url().to_string();
 
-    let current_user_id = execution_context().user_id().await;
+    let execution = execution_context();
+    let globals = execution.globals();
+    let current_user_id = execution.user_id().await;
 
     // Obtain an authorization token from the authentication token
     lore_debug!("Get authorization token for identity {current_user_id} using auth url {auth_url}",);
@@ -452,6 +536,8 @@ pub async fn user_id(
         current_user_id.as_str(),
         repository.id,
         get_domain_or_empty(&auth_url),
+        globals.identity_token(),
+        globals.access_token(),
     )
     .await
     .forward::<UserInfoError>("Failed authorization token exchange")?;

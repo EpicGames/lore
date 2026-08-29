@@ -83,6 +83,7 @@ failure_generator = []
 seeding = []
 trace_log = ["lore-base/trace_log"]
 vfs = []
+swfs = []
 
 [[test]]
 name = "compile_fail"

@@ -10,16 +10,13 @@ mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
-    use lore_base::error::NoRemote;
     use lore_revision::branch::BranchLatestHistory;
     use lore_revision::immutable;
     use lore_revision::immutable::ReadFromImmutable;
     use lore_revision::immutable::read_options_from_repository;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
     use lore_storage::local::immutable_store::ImmutableStoreSettings;
     use lore_storage::options::WriteOptions;
-    use lore_transport::ProtocolError;
     use rand::Rng;
     use rand::random;
 
@@ -82,14 +79,9 @@ mod tests {
                 let context = random::<Context>();
 
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(dir.as_path().to_path_buf()),
-                    immutable_store,
-                    mutable_store,
-                    repository,
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(immutable_store, mutable_store)
+                        .with_path(dir.as_path())
+                        .with_id(repository),
                 ));
 
                 let options = immutable::read_options_from_repository(&repository);
@@ -1025,14 +1017,9 @@ mod tests {
                 let repository = random::<RepositoryId>();
 
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(dir.as_path().to_path_buf()),
-                    immutable_store,
-                    mutable_store,
-                    repository,
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(immutable_store, mutable_store)
+                        .with_path(dir.as_path())
+                        .with_id(repository),
                 ));
 
                 let zero_address = Address::zero_context_hash(Hash::default());
@@ -1078,14 +1065,9 @@ mod tests {
                 let context = random::<Context>();
 
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(dir.as_path().to_path_buf()),
-                    immutable_store,
-                    mutable_store,
-                    repository_id,
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(immutable_store, mutable_store)
+                        .with_path(dir.as_path())
+                        .with_id(repository_id),
                 ));
 
                 // 2 MiB of random data with 256-byte fixed chunks creates ~8192
@@ -1150,14 +1132,9 @@ mod tests {
                 let context = random::<Context>();
 
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(dir.as_path().to_path_buf()),
-                    immutable_store,
-                    mutable_store,
-                    repository_id,
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(immutable_store, mutable_store)
+                        .with_path(dir.as_path())
+                        .with_id(repository_id),
                 ));
 
                 let payload_size = 2 * 1024 * 1024;
@@ -1172,7 +1149,8 @@ mod tests {
                     .expect("Failed writing to store");
 
                 // Read via stream and collect all buffers
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(64);
+                let (tx, mut rx) =
+                    tokio::sync::mpsc::channel::<Result<Bytes, lore_storage::StorageError>>(64);
                 let options = immutable::read_options_from_repository(&repository);
                 let content_length =
                     immutable::read_stream(repository.clone(), address, None, options, tx)
@@ -1183,6 +1161,7 @@ mod tests {
 
                 let mut reassembled = Vec::with_capacity(payload_size);
                 while let Some(chunk) = rx.recv().await {
+                    let chunk = chunk.expect("stream reported a mid-stream failure");
                     reassembled.extend_from_slice(chunk.as_ref());
                 }
 
@@ -1209,14 +1188,9 @@ mod tests {
                 let context = random::<Context>();
 
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(dir.as_path().to_path_buf()),
-                    immutable_store,
-                    mutable_store,
-                    repository_id,
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(immutable_store, mutable_store)
+                        .with_path(dir.as_path())
+                        .with_id(repository_id),
                 ));
 
                 // 1 MiB of random data — standard chunking produces a 1-level tree

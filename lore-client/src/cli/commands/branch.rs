@@ -320,6 +320,22 @@ pub struct BranchArchiveArgs {
     /// Name of the branch to archive
     #[clap(value_name = "branch")]
     branch: String,
+
+    /// Also archive the branch in every configured layer
+    #[clap(long, action, conflicts_with = "layer")]
+    include_layers: bool,
+
+    /// Also archive the branch in the layer at the given mount path
+    #[clap(long, value_name = "path", conflicts_with = "include_layers")]
+    layer: Option<String>,
+
+    /// Also archive the branch in every configured link
+    #[clap(long, action, conflicts_with = "link")]
+    include_links: bool,
+
+    /// Also archive the branch in the link at the given mount path
+    #[clap(long, value_name = "path", conflicts_with = "include_links")]
+    link: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -589,7 +605,10 @@ fn handle_branch_create(globals: LoreGlobalArgs, args: &BranchCreateArgs) -> u8 
 fn handle_branch_info(globals: LoreGlobalArgs, args: &BranchInfoArgs) -> u8 {
     let branch = LoreString::from(&args.name);
 
-    let info_args = LoreBranchInfoArgs { branch };
+    let info_args = LoreBranchInfoArgs {
+        branch,
+        link: LoreString::default(),
+    };
 
     let description = Arc::new(Mutex::new(None));
     let description_cb = description.clone();
@@ -639,8 +658,9 @@ fn handle_branch_info(globals: LoreGlobalArgs, args: &BranchInfoArgs) -> u8 {
             data.latest_remote
         );
         if !data.stack.is_empty() {
+            let mut branches = util::BranchNameResolver::new(globals.clone());
             for (index, entry) in data.stack.as_slice().iter().enumerate() {
-                let name = resolve_branch_name(&globals, entry.branch);
+                let name = branches.name(entry.branch, "");
                 println!(
                     "  {}{}{}{}{} at {}",
                     CommonStyles::HEADERS,
@@ -686,24 +706,6 @@ fn handle_branch_info(globals: LoreGlobalArgs, args: &BranchInfoArgs) -> u8 {
     }
 
     return status;
-}
-
-fn resolve_branch_name(globals: &LoreGlobalArgs, id: Context) -> String {
-    let info_args = LoreBranchInfoArgs {
-        branch: LoreString::from(id.to_string().as_str()),
-    };
-    let name = Arc::new(Mutex::new(None));
-    let name_cb = name.clone();
-    let callback: lore::interface::LoreEventCallback = Some(
-        (Box::new(move |event: &LoreEvent| {
-            if let LoreEvent::BranchInfo(data) = event {
-                *name_cb.lock() = Some(data.name.to_string());
-            }
-        }) as EventCallbackFn)
-            .with_defaults(),
-    );
-    runtime().block_on(branch::info(globals.clone(), info_args, callback));
-    name.lock().take().unwrap_or(id.to_string())
 }
 
 fn handle_branch_switch(globals: LoreGlobalArgs, args: &BranchSwitchArgs) -> u8 {
@@ -891,15 +893,14 @@ pub fn handle_branch_push(globals: LoreGlobalArgs, args: &BranchPushArgs) -> u8 
                     data.local_revision
                 );
             }
-            LoreEvent::BranchPushRevisionPushBegin(data) => {
-                if data.local_revision != data.remote_revision {
+            LoreEvent::BranchPushRevisionPushBegin(data)
+                if data.local_revision != data.remote_revision => {
                     println!(
                         "Pushing {} to branch {}",
                         data.local_revision,
                         name_of(data.repository, data.branch)
                     );
                 }
-            }
             LoreEvent::BranchPushRevisionPushUpdate(data) => {
                 println!(
                     "Revision assigned number {} and rewritten to {}",
@@ -1407,15 +1408,15 @@ pub fn handle_branch_list(globals: LoreGlobalArgs, args: &BranchListArgs) -> u8 
                     }
                 }
             }
-            LoreEvent::Complete(_) => {
-                if warn_on_missing_remote && !remote_seen.load(std::sync::atomic::Ordering::Relaxed)
-                {
-                    println!(
-                        "{}Warning: Could not query remote branch list{}",
-                        LogStyles::WARNING,
-                        anstyle::Reset,
-                    );
-                }
+            LoreEvent::Complete(_)
+                if warn_on_missing_remote
+                    && !remote_seen.load(std::sync::atomic::Ordering::Relaxed) =>
+            {
+                println!(
+                    "{}Warning: Could not query remote branch list{}",
+                    LogStyles::WARNING,
+                    anstyle::Reset,
+                );
             }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
@@ -1554,6 +1555,10 @@ pub fn handle_branch_unprotect(globals: LoreGlobalArgs, args: &BranchUnprotectAr
 pub fn handle_branch_archive(globals: LoreGlobalArgs, args: &BranchArchiveArgs) -> u8 {
     let archive_args = LoreBranchArchiveArgs {
         branch: LoreString::from(&args.branch),
+        layer: LoreString::from(args.layer.as_deref().unwrap_or("")),
+        include_layers: u8::from(args.include_layers),
+        link: LoreString::from(args.link.as_deref().unwrap_or("")),
+        include_links: u8::from(args.include_links),
     };
 
     let callback = output_formatter().unwrap_or(Some(

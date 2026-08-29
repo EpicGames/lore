@@ -719,6 +719,7 @@ mod tests {
     use lore_base::error::PluginInitError;
     use lore_base::lore_spawn;
     use lore_base::types::Address;
+    use lore_base::types::Context;
     use lore_base::types::Fragment;
     use lore_base::types::Hash;
     use lore_base::types::KeyType;
@@ -833,6 +834,17 @@ mod tests {
 
         async fn verify(self: Arc<Self>, _heal: bool) -> Result<(), StoreError> {
             Ok(())
+        }
+
+        async fn copy(
+            self: Arc<Self>,
+            _source_partition: Partition,
+            _source_address: Address,
+            _destination_partition: Partition,
+            _destination_context: Context,
+            _durable: bool,
+        ) -> Result<(), StoreError> {
+            Err(StoreError::internal("Copy not supported by this store"))
         }
     }
 

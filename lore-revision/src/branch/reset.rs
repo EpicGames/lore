@@ -8,7 +8,6 @@ use serde::Serialize;
 
 use crate::branch;
 use crate::branch::BranchLatestStatus;
-use crate::error::LoreResultExt;
 use crate::errors::*;
 use crate::event::EventError;
 use crate::event::LoreEvent;
@@ -152,9 +151,14 @@ pub async fn reset(
 
     let branch = branch::resolve(repository.clone(), branch.as_str())
         .await
-        .emit_map_err(ResetError::from(BranchNotFound {
-            branch: branch.clone(),
-        }))?;
+        .map_err(|err| {
+            ResetError::BranchNotFound(
+                BranchNotFound {
+                    branch: branch.clone(),
+                }
+                .chain_err_from(err, "resolving branch"),
+            )
+        })?;
 
     let branch_metadata = branch::metadata(repository.clone(), branch.id)
         .await

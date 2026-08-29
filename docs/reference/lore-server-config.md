@@ -68,12 +68,12 @@ Environment-variable overrides apply last, after every file layer, so they win o
 
 With no config files loaded, the server runs as a self-contained, single-node instance, substituting ephemeral local artifacts for what a production deployment would configure. It logs each substitution so the choice is visible.
 
-- **TLS certificate.** When the public-facing QUIC endpoint has no certificate, the server writes a self-signed certificate for `localhost`, `127.0.0.1`, and `::1` to `<temp>/lore-server/<endpoint>-cert.pem` (and `-key.pem`). It's untrusted, regenerated on every restart, and for local development only.
+- **TLS certificate.** When a QUIC endpoint that does not require mutual TLS has no certificate, the server writes a self-signed certificate for `localhost`, `127.0.0.1`, and `::1` to `<temp>/lore-server/<endpoint>-<pid>-cert.pem` (and `-key.pem`), where `<pid>` is the server's process id. It's untrusted, regenerated on every restart, and for local development only.
 - **Local store path.** When a local store has no `path`, it uses `<temp>/lore-server`. Because that path is fixed, a later run reopens the same directory and reuses whatever the previous run left.
 - **Presigned URL feature.** When `presigned_url_hmac_key` is absent, the feature starts disabled.
 
 > [!NOTE]
-> `<temp>` is the OS temporary directory (`$TMPDIR` or `/tmp` on Linux; a per-user `/var/folders/…` path on macOS). The server always uses the same fixed subdirectory, `<temp>/lore-server`, so the paths above are stable across runs.
+> `<temp>` is the OS temporary directory (`$TMPDIR` or `/tmp` on Linux; a per-user `/var/folders/…` path on macOS). The server always uses the same fixed subdirectory, `<temp>/lore-server`, so the store path above is stable across runs. Certificate file names carry the process id so that servers sharing a machine cannot overwrite each other's certificate; they are not stable across runs, and old pairs are left behind rather than cleaned up.
 
 <!-- -->
 
@@ -110,7 +110,7 @@ The `[server]` table and its sub-tables configure the network endpoints and grac
 
 #### Certificate block
 
-Each QUIC endpoint takes an optional `[server.quic.certificate]` (or `[server.quic_internal.certificate]`) block. When omitted on the public endpoint, the server generates an ephemeral certificate (see [Zero-config defaults](#zero-config-defaults)). The block as a whole is optional, but when it is present `cert_file` and `pkey_file` are both required — only `cert_chain` is individually optional.
+Each QUIC endpoint takes an optional `[server.quic.certificate]` (or `[server.quic_internal.certificate]`) block. A configured block is always used as given. When it is omitted, the server generates an ephemeral certificate (see [Zero-config defaults](#zero-config-defaults)) on the public endpoint, and on the internal endpoint when `verify_client_certs = false` — there the certificate only has to satisfy the handshake, since no client is being verified. The internal endpoint with `verify_client_certs = true` has no such fallback: mutual TLS is the authentication, so a missing certificate fails startup. The block as a whole is optional, but when it is present `cert_file` and `pkey_file` are both required — only `cert_chain` is individually optional.
 
 | Field | Default | Description |
 | --- | --- | --- |
@@ -137,10 +137,43 @@ Each QUIC endpoint takes an optional `[server.quic.certificate]` (or `[server.qu
 | `presigned_url_min_ttl_seconds` | `1` | Minimum lifetime a presigned URL may request. |
 | `presigned_url_default_ttl_seconds` | `3600` | Default presigned URL lifetime. |
 | `presigned_url_max_ttl_seconds` | `86400` | Maximum presigned URL lifetime. |
+| `presigned_url_extra_content_types` | `[]` | Content types added to the default set. See below. |
+| `presigned_url_denied_content_types` | `[]` | Content types removed from that set. See below. |
 
 #### `presigned_url_hmac_key`
 
 This field is optional. When it's absent, the server starts with the presigned URL feature disabled and logs `Presigned URL feature disabled (presigned_url_hmac_key not configured)`. When it's set, the value must be valid hexadecimal that decodes to at least 32 bytes — generate one with `openssl rand -hex 32`. An invalid or too-short key stops the server from starting. Set this only for deployments that hand out presigned URLs, and use a fresh key per deployment.
+
+#### Presigned URL content types
+
+Redeemed content is served only with a `Content-Type` on an allowlist. A type off the allowlist is rejected at mint with 400 and coerced to `application/octet-stream` at redeem.
+
+Both fields are additive: they build on the default set rather than replacing it, so adding one type does not require restating the others. The default set is `application/octet-stream`, `binary/octet-stream`, `image/png`, `image/jpeg`, `image/gif`, `image/webp`, `application/pdf`, and `text/plain`. Both fields default to empty, so a config that sets neither gets exactly that set.
+
+```toml
+[server.http]
+presigned_url_extra_content_types = ["application/zip", "audio/mpeg"]
+presigned_url_denied_content_types = ["application/pdf"]
+```
+
+Removals apply after additions, so a type named in both fields is not allowed. Denying every default type is valid. The server logs the resolved set at startup.
+
+Some types can never be allowed, because a browser executes them as a document and redeemed bytes are caller-supplied: `text/html`, `application/xhtml+xml`, `image/svg+xml`, `text/xml`, `application/xml`, `application/xslt+xml`, `text/javascript`, `application/javascript`, and `application/ecmascript`. Naming one in `presigned_url_extra_content_types` stops the server from starting; naming one in `presigned_url_denied_content_types` has no effect.
+
+Each entry must be a bare `type/subtype` drawn from the RFC 9110 token character set. Any of the following stops the server from starting:
+
+| Rejected entry | Example |
+| --- | --- |
+| Empty or whitespace-only | `""` |
+| A parameter | `text/plain; charset=utf-8` |
+| A comma-joined list | `image/png,image/gif` |
+| A wildcard | `image/*`, `*/*` |
+| Whitespace inside the value | `text / html`, `image/pn g` |
+| A control character or any non-ASCII character | `image/pñg` |
+| Not exactly one `type` and one `subtype` | `png`, `image/`, `image/png/extra` |
+
+> [!NOTE]
+> These are array fields, so they cannot be set through a `LORE__` environment variable, and a later config layer replaces the whole array rather than merging it.
 
 ### gRPC endpoints
 

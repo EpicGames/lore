@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
 use std::io::Write;
@@ -8,6 +9,7 @@ use std::path::PathBuf;
 use std::str;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::RwLock;
 
 use base64::prelude::BASE64_STANDARD;
 use base64::prelude::Engine as _;
@@ -34,24 +36,22 @@ use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::Mutex;
 use toml;
-use zerocopy::IntoBytes;
 
 use crate::jwt::domain_in_root_domains;
 use crate::util::get_domain_or_empty;
 
-const TAG_LEN: usize = 16;
-const NONCE_SIZE_U32: usize = 4;
-const ENCRYPTION_KEY_TARGET: &str = "lore_encryption_key";
+/// Secure-store service these secrets live under.
+const SERVICE_NAME: &str = "org.lore";
+
+/// Secure-store account holding the encryption key, and the stem of its
+/// on-disk fallback file. Distinct from the name earlier versions used: they
+/// store a different blob layout under the old name, and would overwrite this
+/// one with it whenever both fall back to disk.
+const ENCRYPTION_KEY_TARGET: &str = "tokenstore_encryption_key";
 
 #[error_set]
 pub enum TokenStoreError {
     TokenNotFound,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
-pub struct Encryption {
-    key: Vec<u8>,
-    nonce: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -115,7 +115,7 @@ fn token_map() -> &'static Mutex<Option<TokenMap>> {
     TOKEN_MAP.get_or_init(|| Mutex::new(None))
 }
 
-/// Base directory holding the auth store files (`tokens.toml` and the
+/// Base directory holding the auth store files (`tokenstore.toml` and the
 /// encryption-key fallback). The `LORE_AUTH_PATH` environment variable
 /// overrides the default per-user configuration directory.
 fn base_path(create_dir: bool) -> Result<PathBuf, TokenStoreError> {
@@ -144,9 +144,13 @@ fn base_path(create_dir: bool) -> Result<PathBuf, TokenStoreError> {
     Ok(path.to_path_buf())
 }
 
+/// Path to the token store. Earlier versions used `tokens.toml` in the same
+/// directory and seal tokens in a layout this one does not read; that file is
+/// left alone rather than migrated, so the two can coexist without either
+/// resetting the other's tokens.
 fn token_map_path(create_dir: bool) -> Result<PathBuf, TokenStoreError> {
     let path = base_path(create_dir)?;
-    Ok(path.join("tokens.toml"))
+    Ok(path.join("tokenstore.toml"))
 }
 
 /// Information about a stored identity token.
@@ -252,7 +256,7 @@ pub async fn load_all_identities(
     Ok(result)
 }
 
-/// Clear token map and tokens.toml file.
+/// Clear token map and token store file.
 pub async fn reset_tokens() -> Result<(), TokenStoreError> {
     let token_map = token_map();
     let mut store = token_map.lock().await;
@@ -289,7 +293,7 @@ async fn lock_store_file(path: &Path) -> Result<FSLock, TokenStoreError> {
     })
 }
 
-/// Cross-process guard for `tokens.toml`, creating the store directory so
+/// Cross-process guard for `tokenstore.toml`, creating the store directory so
 /// the lock sidecar can be placed next to the file.
 async fn lock_token_map() -> Result<FSLock, TokenStoreError> {
     lock_store_file(token_map_path(true)?.as_path()).await
@@ -304,7 +308,7 @@ fn reload_token_map(guard: &FSLock, store: &mut Option<TokenMap>) {
     }
 }
 
-/// Loads `tokens.toml`. The `_guard` parameter proves the caller holds the
+/// Loads `tokenstore.toml`. The `_guard` parameter proves the caller holds the
 /// cross-process store lock for the duration of the read.
 fn load_token_map(_guard: &FSLock) -> Result<TokenMap, TokenStoreError> {
     let path = token_map_path(false)?;
@@ -342,7 +346,7 @@ fn load_token_map(_guard: &FSLock) -> Result<TokenMap, TokenStoreError> {
     Ok(config)
 }
 
-/// Stores `tokens.toml`. The `_guard` parameter proves the caller holds the
+/// Stores `tokenstore.toml`. The `_guard` parameter proves the caller holds the
 /// cross-process store lock for the duration of the write.
 fn store_token_map(_guard: &FSLock, token_map: &TokenMap) -> Result<(), TokenStoreError> {
     let path = token_map_path(true)?;
@@ -390,18 +394,16 @@ fn store_fallback_path(name: &str, create_dir: bool) -> Result<PathBuf, TokenSto
     Ok(path.join(format!("sec-{name}")))
 }
 
-static KEYRING_ENTRY: OnceLock<Option<Arc<keyring::Entry>>> = OnceLock::new();
+static KEYRING_ENTRIES: OnceLock<RwLock<HashMap<String, Arc<keyring::Entry>>>> = OnceLock::new();
 
-/// In-memory cache of the loaded encryption key + next-use nonce counter.
+/// In-memory cache of the loaded encryption key.
 ///
-/// The encryption key is invariant for the lifetime of the secure-store
-/// entry; only the nonce advances on each encrypt. Caching avoids hitting
-/// the OS keyring on every encrypt/decrypt and serializes the encrypt path
-/// so two concurrent encrypts cannot reserve the same nonce (AES-GCM nonce
-/// reuse is a key-recovery vulnerability).
-static ENCRYPTION_CACHE: OnceLock<Mutex<Option<Encryption>>> = OnceLock::new();
+/// The key is invariant for the lifetime of the secure-store entry, so it is
+/// read once per process. Nonces are drawn at random per seal and travel with
+/// the sealed token, so nothing here has to be written back.
+static ENCRYPTION_CACHE: OnceLock<Mutex<Option<Vec<u8>>>> = OnceLock::new();
 
-fn encryption_cache() -> &'static Mutex<Option<Encryption>> {
+fn encryption_cache() -> &'static Mutex<Option<Vec<u8>>> {
     ENCRYPTION_CACHE.get_or_init(|| Mutex::new(None))
 }
 
@@ -410,7 +412,7 @@ const SECURE_STORE_MSG: &str =
 
 #[cfg(target_os = "macos")]
 fn new_keyring_entry(target: &str) -> Result<keyring::Entry, TokenStoreError> {
-    keyring::Entry::new_with_target("User", "com.epicgames.urc", target).map_err(|e| {
+    keyring::Entry::new_with_target("User", SERVICE_NAME, target).map_err(|e| {
         lore_warn!("{SECURE_STORE_MSG}: {e}");
         TokenStoreError::internal_with_context(e, SECURE_STORE_MSG)
     })
@@ -418,18 +420,28 @@ fn new_keyring_entry(target: &str) -> Result<keyring::Entry, TokenStoreError> {
 
 #[cfg(not(target_os = "macos"))]
 fn new_keyring_entry(target: &str) -> Result<keyring::Entry, TokenStoreError> {
-    keyring::Entry::new_with_target(target, "com.epicgames.urc", "identity").map_err(|e| {
+    keyring::Entry::new_with_target(target, SERVICE_NAME, "identity").map_err(|e| {
         lore_warn!("{SECURE_STORE_MSG}: {e}");
         TokenStoreError::internal_with_context(e, SECURE_STORE_MSG)
     })
 }
 
+/// Returns the (cached) keyring entry for `target`. Entries are cached per
+/// target: a single cache slot would pin whichever target was requested first
+/// and hand that entry back for every other target.
 fn keyring_entry(target: &str) -> Result<Arc<keyring::Entry>, TokenStoreError> {
-    KEYRING_ENTRY
-        .get_or_init(|| new_keyring_entry(target).ok().map(Arc::new))
-        .as_ref()
-        .ok_or_else(|| TokenStoreError::internal(SECURE_STORE_MSG))
-        .map(Arc::clone)
+    let entries = KEYRING_ENTRIES.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Ok(cache) = entries.read()
+        && let Some(entry) = cache.get(target)
+    {
+        return Ok(Arc::clone(entry));
+    }
+
+    let entry = Arc::new(new_keyring_entry(target)?);
+    if let Ok(mut cache) = entries.write() {
+        cache.insert(target.to_string(), Arc::clone(&entry));
+    }
+    Ok(entry)
 }
 
 pub async fn store_user_token(
@@ -523,7 +535,7 @@ pub async fn store_user_token(
 ///
 /// filter - You almost certainly want to filter out tokens that are invalid for the domain you want
 /// to use them against. See comment at top of `urc-core::auth` - Check Token Recipient
-pub async fn load_user_token<P>(
+pub async fn load_user_token_from_store<P>(
     auth_endpoint: &str,
     identity: &str,
     mut base_filter: P,
@@ -577,6 +589,33 @@ where
         Some(token) => decrypt_token(token).await,
         None => Err(TokenNotFound.into()),
     }
+}
+
+/// Load the authentication token for `identity`, preferring one the caller
+/// supplied over the shared store.
+pub async fn load_user_token<P>(
+    auth_endpoint: &str,
+    identity: &str,
+    base_filter: P,
+    identity_token: &str,
+    access_token: &str,
+) -> Result<String, TokenStoreError>
+where
+    P: FnMut(&&IdentityToken) -> bool,
+{
+    if !identity_token.is_empty() {
+        lore_debug!("Using the supplied identity token for {identity}");
+        return Ok(identity_token.to_string());
+    }
+
+    if !access_token.is_empty() {
+        lore_debug!(
+            "Only an access token was supplied, not reading an authentication token from the store for {identity}"
+        );
+        return Err(TokenNotFound.into());
+    }
+
+    load_user_token_from_store(auth_endpoint, identity, base_filter).await
 }
 
 /// Returns true if `remote` is the base `auth_url` or a resource-scoped entry
@@ -856,169 +895,192 @@ pub async fn load_refresh_token(
 
 async fn encrypt_token(user_token: &str) -> Result<String, TokenStoreError> {
     lore_trace!("Encrypting user token");
+    let key = get_token_encryption_key().await?;
+    seal_token(&key, user_token)
+}
 
-    // Hold the cache lock across read -> reserve nonce -> persist -> update,
-    // so concurrent encrypts cannot seal two blobs with the same nonce.
-    let mut guard = encryption_cache().lock().await;
-    if guard.is_none() {
-        *guard = Some(load_or_init_encryption().await?);
-    }
-    let encryption = guard.as_ref().expect("just initialized").clone();
-    let new_nonce = encryption.nonce + 1;
-    // Persist before updating the cache: a failed write leaves the cache at
-    // the old nonce so the next attempt retries with the same value, rather
-    // than skipping ahead and risking nonce reuse on a later success.
-    set_secret_in_store(
-        ENCRYPTION_KEY_TARGET,
-        get_encryption_key_with_nonce(encryption.key.clone(), new_nonce),
-    )
-    .await?;
-    *guard = Some(Encryption {
-        key: encryption.key.clone(),
-        nonce: new_nonce,
-    });
-    drop(guard);
+async fn decrypt_token(token: String) -> Result<String, TokenStoreError> {
+    lore_trace!("Decrypting user token");
+    let key = get_token_encryption_key().await?;
+    open_token(&key, &token)
+}
 
-    let mut sealing_key = generate_sealing_key(encryption.clone())?;
-    let mut encrypted_token = user_token.as_bytes().to_vec();
-    encrypted_token.extend_from_slice(&[0u8; TAG_LEN]);
+/// Seals a token as `nonce || ciphertext || tag`, under a 96-bit nonce drawn
+/// fresh for each call.
+///
+/// Nothing is written back to the secure store: a random nonce needs no
+/// persisted counter, and rewriting the keyring entry on every encrypt made
+/// each lore process re-authorize against the OS keychain (and, on macOS,
+/// prompt once per binary and per rebuild).
+fn seal_token(key: &[u8], user_token: &str) -> Result<String, TokenStoreError> {
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    SystemRandom::new().fill(&mut nonce_bytes).map_err(|e| {
+        lore_warn!("Failed to generate token nonce: {e}");
+        TokenStoreError::internal_with_context(e, "Failed to encrypt user token")
+    })?;
 
+    let mut sealing_key =
+        SealingKey::new(unbound_key(key)?, SingleNonceSequence(Some(nonce_bytes)));
+    let mut sealed = user_token.as_bytes().to_vec();
     sealing_key
-        .seal_in_place_append_tag(Aad::empty(), &mut encrypted_token)
+        .seal_in_place_append_tag(Aad::empty(), &mut sealed)
         .map_err(|e| {
             lore_warn!("Failed to encrypt user token: {e}");
             TokenStoreError::internal_with_context(e, "Failed to encrypt user token")
         })?;
 
-    // Add nonce to front of encoded token.
-    let mut encrypted_token_with_nonce = encryption.nonce.as_bytes().to_vec();
-    encrypted_token_with_nonce.append(&mut encrypted_token);
+    let mut blob = Vec::with_capacity(NONCE_LEN + sealed.len());
+    blob.extend_from_slice(&nonce_bytes);
+    blob.append(&mut sealed);
 
-    // Encode to base 64 for cleaner storage.
-    Ok(BASE64_STANDARD.encode(encrypted_token_with_nonce))
+    Ok(BASE64_STANDARD.encode(blob))
 }
 
-async fn decrypt_token(token: String) -> Result<String, TokenStoreError> {
-    lore_trace!("Decrypting user token");
-    let encryption = get_token_encryption_key().await?;
-
-    // Decode the base 64 value before decrypting aes.
-    let encrypted_token_with_nonce = BASE64_STANDARD.decode(token).map_err(|e| {
+/// Opens a token sealed by [`seal_token`].
+fn open_token(key: &[u8], token: &str) -> Result<String, TokenStoreError> {
+    let blob = BASE64_STANDARD.decode(token).map_err(|e| {
         lore_warn!("Failed to decrypt user token: {e}");
         TokenStoreError::internal_with_context(e, "Failed to decrypt user token")
     })?;
 
-    // Get nonce from front of encoded token and use that to generate opening key.
-    let (nonce_bytes, encrypted_token) = encrypted_token_with_nonce.split_at(NONCE_SIZE_U32);
-    let nonce: [u8; NONCE_SIZE_U32] = nonce_bytes.try_into().map_err(|e| {
+    let Some((nonce_bytes, sealed)) = blob.split_at_checked(NONCE_LEN) else {
+        lore_warn!("Failed to decrypt user token: malformed token blob");
+        return Err(TokenStoreError::internal("Failed to decrypt user token"));
+    };
+    let nonce = nonce_bytes.try_into().map_err(|e| {
         lore_warn!("Failed to decrypt user token: {e}");
         TokenStoreError::internal_with_context(e, "Failed to decrypt user token")
     })?;
-    let nonce_val = u32::from_le_bytes(nonce);
 
-    let mut opening_key = generate_opening_key(Encryption {
-        key: encryption.key,
-        nonce: nonce_val,
-    })?;
-
-    let mut decrypted_token = opening_key
-        .open_in_place(Aad::empty(), &mut encrypted_token.to_vec())
+    let mut opening_key = OpeningKey::new(unbound_key(key)?, SingleNonceSequence(Some(nonce)));
+    let decrypted = opening_key
+        .open_in_place(Aad::empty(), &mut sealed.to_vec())
         .map_err(|e| {
             lore_warn!("Failed to decrypt user token: {e}");
             TokenStoreError::internal_with_context(e, "Failed to decrypt user token")
         })?
         .to_vec();
 
-    // Truncate the empty values that are due to the in place tag usage.
-    if decrypted_token.len() >= TAG_LEN {
-        decrypted_token.truncate(decrypted_token.len() - TAG_LEN);
-    }
-
-    String::from_utf8(decrypted_token).map_err(|e| {
+    String::from_utf8(decrypted).map_err(|e| {
         lore_warn!("Failed to decrypt user token: {e}");
         TokenStoreError::internal_with_context(e, "Failed to decrypt user token")
     })
 }
 
-async fn get_token_encryption_key() -> Result<Encryption, TokenStoreError> {
-    // Decrypt-side accessor: returns the cached key (loading from the secure
-    // store on first use). Decrypt does not mutate the nonce, so holding
-    // the lock briefly to clone is enough — concurrent decrypts run in
-    // parallel after the first load.
+/// Returns the cached encryption key, loading it from the secure store on
+/// first use.
+async fn get_token_encryption_key() -> Result<Vec<u8>, TokenStoreError> {
     let mut guard = encryption_cache().lock().await;
     if guard.is_none() {
-        *guard = Some(load_or_init_encryption().await?);
+        *guard = Some(load_or_init_encryption_key().await?);
     }
     Ok(guard.as_ref().expect("just initialized").clone())
 }
 
-/// Loads the encryption key from the secure store, generating and persisting
-/// a new one (and resetting any existing tokens) if no key is stored.
+/// Loads the encryption key from the secure store.
+///
+/// A new key is generated (which resets every stored token, since they can no
+/// longer be opened) only when the store reports that no key is there, or that
+/// what is there is unusable. A store that exists but cannot be read yields an
+/// error instead: treating a denied or cancelled keychain prompt as "no key"
+/// would rotate the key and log every other lore process out.
+///
 /// Callers must serialize this with respect to other writers — it is intended
 /// to be invoked only while holding the [`ENCRYPTION_CACHE`] lock.
-async fn load_or_init_encryption() -> Result<Encryption, TokenStoreError> {
-    let encryption_key_nonce = get_secret_from_store(ENCRYPTION_KEY_TARGET).await?;
-    if let Ok(encryption) = get_encryption(encryption_key_nonce) {
-        return Ok(encryption);
+async fn load_or_init_encryption_key() -> Result<Vec<u8>, TokenStoreError> {
+    let stored = get_secret_from_store(ENCRYPTION_KEY_TARGET).await?;
+    if let Some(key) = stored.as_deref().and_then(encryption_key_from_stored) {
+        return Ok(key);
     }
 
     lore_debug!(
         "Encryption key not found in secure store or fallback, generate new key and reset tokens"
     );
 
-    let encryption_key_nonce = generate_encryption_key_nonce();
+    let key = generate_encryption_key()?;
     reset_tokens().await?;
+    set_secret_in_store(ENCRYPTION_KEY_TARGET, key.clone()).await?;
 
-    // Set encryption key nonce.
-    set_secret_in_store(ENCRYPTION_KEY_TARGET, encryption_key_nonce.clone()).await?;
-
-    get_encryption(encryption_key_nonce)
+    Ok(key)
 }
 
-fn get_encryption(encryption_key_nonce: Vec<u8>) -> Result<Encryption, TokenStoreError> {
-    if encryption_key_nonce.len() > NONCE_SIZE_U32 {
-        let (nonce_bytes, encryption_key_bytes) = encryption_key_nonce.split_at(NONCE_SIZE_U32);
-        let nonce: [u8; NONCE_SIZE_U32] = nonce_bytes.try_into().map_err(|e| {
-            lore_warn!("Failed to decrypt user token: {e}");
-            TokenStoreError::internal_with_context(e, "Failed to decrypt user token")
-        })?;
-        let nonce_val = u32::from_le_bytes(nonce);
-        Ok(Encryption {
-            key: encryption_key_bytes.to_vec(),
-            nonce: nonce_val,
-        })
-    } else {
-        Err(TokenStoreError::internal("Failed to decrypt user token"))
+/// Checks that a secure-store blob is a key of the right size. Blobs written
+/// by earlier versions carry a nonce counter ahead of the key and so fail
+/// here, but they live under a different target and are never read.
+fn encryption_key_from_stored(stored: &[u8]) -> Option<Vec<u8>> {
+    (stored.len() == AES_256_GCM.key_len()).then(|| stored.to_vec())
+}
+
+/// Reports a secret the store does not hold.
+///
+/// A secure store that could not be read is not the same as one holding no
+/// secret, so an earlier read failure surfaces here as an error: reporting
+/// absence would let the caller replace a key that is merely out of reach, and
+/// invalidate every token the real key still protects.
+fn secret_absent(
+    secure_store_error: Option<TokenStoreError>,
+) -> Result<Option<Vec<u8>>, TokenStoreError> {
+    match secure_store_error {
+        Some(err) => Err(err),
+        None => Ok(None),
     }
 }
 
-async fn get_secret_from_store(target: &str) -> Result<Vec<u8>, TokenStoreError> {
-    if use_secure_store()
-        && let Ok(entry) = keyring_entry(target)
-    {
-        // A locked keychain blocks until the user answers a prompt.
-        let loaded = lore_base::lore_spawn_blocking!(move || entry.get_secret())
-            .await
-            .map_err(|e| {
-                TokenStoreError::internal_with_context(e, "Secure store read task failed")
-            })?;
-        match loaded {
-            Ok(secret) => {
-                lore_trace!("Loaded secret from secure store {target}");
-                return Ok(secret);
-            }
-            Err(err) => {
-                lore_debug!("Failed to load secret from secure store {target}: {err}");
-            }
+/// Reads a secret from the OS secure store, if there is a usable one.
+///
+/// `Ok(None)` means the store holds no such secret, or that no secure store is
+/// available at all; `Err` carries the failure of a store that exists but
+/// could not be read, for [`secret_absent`] to weigh.
+async fn secret_from_secure_store(target: &str) -> Result<Option<Vec<u8>>, TokenStoreError> {
+    if !use_secure_store() {
+        return Ok(None);
+    }
+    let Ok(entry) = keyring_entry(target) else {
+        return Ok(None);
+    };
+
+    // A locked keychain blocks until the user answers a prompt.
+    let loaded = lore_base::lore_spawn_blocking!(move || entry.get_secret())
+        .await
+        .map_err(|e| TokenStoreError::internal_with_context(e, "Secure store read task failed"))?;
+
+    match loaded {
+        Ok(secret) => {
+            lore_trace!("Loaded secret from secure store {target}");
+            Ok(Some(secret))
+        }
+        Err(keyring::Error::NoEntry) => {
+            lore_debug!("No secret in secure store {target}");
+            Ok(None)
+        }
+        Err(err) => {
+            lore_warn!("Failed to load secret from secure store {target}: {err}");
+            Err(TokenStoreError::internal_with_context(
+                err,
+                "Failed to load secret from secure storage",
+            ))
         }
     }
+}
+
+/// Reads a secret from the secure store, falling back to the on-disk copy.
+///
+/// `Ok(None)` means the secret is genuinely absent from both — see
+/// [`secret_absent`] for how an unreadable secure store is distinguished from
+/// an empty one.
+async fn get_secret_from_store(target: &str) -> Result<Option<Vec<u8>>, TokenStoreError> {
+    let secure_store_error = match secret_from_secure_store(target).await {
+        Ok(Some(secret)) => return Ok(Some(secret)),
+        Ok(None) => None,
+        Err(err) => Some(err),
+    };
 
     let path = store_fallback_path(target, false).map_err(|e| {
         lore_warn!("Failed to make fallback path: {e}");
         TokenStoreError::internal_with_context(e, "Failed to make fallback path")
     })?;
     if !path.exists() {
-        return Ok(Vec::default());
+        return secret_absent(secure_store_error);
     }
     let _guard = lock_store_file(path.as_path()).await?;
     let mut options = store_open_options();
@@ -1026,7 +1088,7 @@ async fn get_secret_from_store(target: &str) -> Result<Vec<u8>, TokenStoreError>
     let mut secret_file = match options.open(path.as_path()) {
         Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Vec::default());
+            return secret_absent(secure_store_error);
         }
         Err(err) => {
             lore_warn!("Failed to read secret from fallback path: {err}");
@@ -1049,10 +1111,10 @@ async fn get_secret_from_store(target: &str) -> Result<Vec<u8>, TokenStoreError>
         lore_warn!("Failed to read secret from fallback path: {e}");
         TokenStoreError::internal_with_context(e, "Failed to read secret from fallback path")
     })?;
-    Ok(secret)
+    Ok(Some(secret))
 }
 
-async fn set_secret_in_store(target: &str, secret: Vec<u8>) -> Result<Vec<u8>, TokenStoreError> {
+async fn set_secret_in_store(target: &str, secret: Vec<u8>) -> Result<(), TokenStoreError> {
     if use_secure_store()
         && let Ok(entry) = keyring_entry(target)
     {
@@ -1072,9 +1134,11 @@ async fn set_secret_in_store(target: &str, secret: Vec<u8>) -> Result<Vec<u8>, T
             .is_ok()
         {
             lore_trace!("Stored secret in secure store {target}");
-            return Ok(secret);
+            return Ok(());
         }
-        // If we fallback to disk storage, ensure further get calls use this
+        // SAFETY: `set_var` races with concurrent environment access in other
+        // threads. Redirecting subsequent reads to the fallback file is worth
+        // that risk here: the alternative is silently losing the secret.
         unsafe {
             std::env::set_var("LORE_AUTH_STORE", "fallback");
         }
@@ -1099,56 +1163,38 @@ async fn set_secret_in_store(target: &str, secret: Vec<u8>) -> Result<Vec<u8>, T
             TokenStoreError::internal_with_context(e, "Failed to write secret to fallback path")
         })?;
     lore_trace!("Stored secret in insecure fallback path {}", path.display());
-    Ok(secret)
+    Ok(())
 }
 
-fn generate_encryption_key_nonce() -> Vec<u8> {
-    let rand = SystemRandom::new();
+/// Draws a new key. A failure here is propagated rather than ignored: the
+/// buffer starts zeroed and is the right length either way, so a discarded
+/// error would hand back an all-zero key that every later check accepts.
+fn generate_encryption_key() -> Result<Vec<u8>, TokenStoreError> {
     let mut key_bytes = vec![0; AES_256_GCM.key_len()];
-    let _ = rand.fill(&mut key_bytes);
+    SystemRandom::new().fill(&mut key_bytes).map_err(|e| {
+        lore_warn!("Failed to generate encryption key: {e}");
+        TokenStoreError::internal_with_context(e, "Failed to generate encryption key")
+    })?;
     lore_debug!("Generated new encryption key");
-    get_encryption_key_with_nonce(key_bytes, 1)
+    Ok(key_bytes)
 }
 
-fn get_encryption_key_with_nonce(key: Vec<u8>, nonce: u32) -> Vec<u8> {
-    let mut encryption_key_with_nonce = nonce.as_bytes().to_vec();
-    encryption_key_with_nonce.append(&mut key.clone());
-    encryption_key_with_nonce
-}
-
-fn generate_sealing_key(
-    encryption: Encryption,
-) -> Result<SealingKey<CounterNonceSequence>, TokenStoreError> {
-    let unbound_key = UnboundKey::new(&AES_256_GCM, &encryption.key).map_err(|e| {
+fn unbound_key(key: &[u8]) -> Result<UnboundKey, TokenStoreError> {
+    UnboundKey::new(&AES_256_GCM, key).map_err(|e| {
         lore_warn!("Failed to create unbound key: {e}");
         TokenStoreError::internal_with_context(e, "Failed to create unbound key")
-    })?;
-    let nonce_sequence = CounterNonceSequence(encryption.nonce);
-    let sealing_key = SealingKey::new(unbound_key, nonce_sequence);
-    Ok(sealing_key)
+    })
 }
 
-fn generate_opening_key(
-    encryption: Encryption,
-) -> Result<OpeningKey<CounterNonceSequence>, TokenStoreError> {
-    let unbound_key = UnboundKey::new(&AES_256_GCM, &encryption.key).map_err(|e| {
-        lore_warn!("Failed to create unbound key: {e}");
-        TokenStoreError::internal_with_context(e, "Failed to create unbound key")
-    })?;
-    let nonce_sequence = CounterNonceSequence(encryption.nonce);
-    let opening_key = OpeningKey::new(unbound_key, nonce_sequence);
-    Ok(opening_key)
-}
-
-struct CounterNonceSequence(u32);
-impl NonceSequence for CounterNonceSequence {
+/// Yields one caller-supplied nonce and refuses to advance again, so a key
+/// built from it can never seal or open twice under the same nonce.
+struct SingleNonceSequence(Option<[u8; NONCE_LEN]>);
+impl NonceSequence for SingleNonceSequence {
     fn advance(&mut self) -> Result<Nonce, Unspecified> {
-        let mut nonce_bytes = vec![0; NONCE_LEN];
-
-        let bytes = self.0.to_be_bytes();
-        nonce_bytes[8..].copy_from_slice(&bytes);
-
-        Nonce::try_assume_unique_for_key(&nonce_bytes)
+        self.0
+            .take()
+            .map(Nonce::assume_unique_for_key)
+            .ok_or(Unspecified)
     }
 }
 
@@ -1158,7 +1204,7 @@ mod tests {
 
     #[test]
     fn refresh_token_serde_default_none() {
-        // Old tokens.toml format without refresh_token field
+        // Old store format without refresh_token field
         let toml_str = r#"
 user_id = "user-1"
 token = "encrypted-token"
@@ -1189,7 +1235,7 @@ acceptable_root_domains = ["example.com"]
 
     #[test]
     fn identity_token_without_refresh_backward_compat() {
-        // Simulates an old tokens.toml file structure
+        // Simulates an old store file structure
         let toml_str = r#"
 [[remotes]]
 remote = "https://auth.example.com"
@@ -1229,6 +1275,65 @@ token = "tok-b"
             deserialized.remotes[0].token[0].refresh_token.as_deref(),
             Some("refresh-tok")
         );
+    }
+
+    #[test]
+    fn encryption_key_from_stored_accepts_a_bare_key() {
+        let key = generate_encryption_key().unwrap();
+        assert_eq!(key.len(), AES_256_GCM.key_len());
+        assert_eq!(encryption_key_from_stored(&key).as_ref(), Some(&key));
+    }
+
+    #[test]
+    fn encryption_key_from_stored_rejects_malformed() {
+        assert!(encryption_key_from_stored(&[]).is_none());
+        assert!(encryption_key_from_stored(&[0u8; 16]).is_none());
+        // The layout earlier versions wrote: a nonce counter ahead of the key.
+        assert!(encryption_key_from_stored(&[0u8; 4 + 32]).is_none());
+    }
+
+    #[test]
+    fn seal_and_open_token_round_trip() {
+        let key = generate_encryption_key().unwrap();
+        let sealed = seal_token(&key, "a-user-token").unwrap();
+        assert_eq!(open_token(&key, &sealed).unwrap(), "a-user-token");
+    }
+
+    #[test]
+    fn seal_token_prefixes_the_nonce() {
+        let key = generate_encryption_key().unwrap();
+        let blob = BASE64_STANDARD
+            .decode(seal_token(&key, "a-user-token").unwrap())
+            .unwrap();
+        assert_eq!(blob.len(), NONCE_LEN + "a-user-token".len() + 16);
+    }
+
+    #[test]
+    fn seal_token_draws_a_fresh_nonce_each_time() {
+        let key = generate_encryption_key().unwrap();
+        let first = seal_token(&key, "a-user-token").unwrap();
+        let second = seal_token(&key, "a-user-token").unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn open_token_rejects_short_blobs() {
+        let key = generate_encryption_key().unwrap();
+        let short = BASE64_STANDARD.encode([0u8; NONCE_LEN - 1]);
+        assert!(open_token(&key, &short).is_err());
+    }
+
+    #[test]
+    fn open_token_rejects_a_foreign_key() {
+        let sealed = seal_token(&generate_encryption_key().unwrap(), "a-user-token").unwrap();
+        assert!(open_token(&generate_encryption_key().unwrap(), &sealed).is_err());
+    }
+
+    #[test]
+    fn single_nonce_sequence_refuses_second_advance() {
+        let mut sequence = SingleNonceSequence(Some([0u8; NONCE_LEN]));
+        assert!(sequence.advance().is_ok());
+        assert!(sequence.advance().is_err());
     }
 
     #[test]
@@ -1300,5 +1405,52 @@ token = "tok-b"
             "https://auth.example.com/not-a-resource",
             "https://auth.example.com"
         ));
+    }
+
+    /// A supplied token is passed through untouched, so it need not be a JWT.
+    const SUPPLIED_TOKEN: &str = "supplied-authentication-token";
+
+    #[tokio::test]
+    async fn supplied_identity_token_is_used_without_the_store() {
+        // No auth endpoint and no store entry: the supplied token is returned on
+        // its own, where a store read would report TokenNotFound.
+        let token = load_user_token(
+            "",
+            "alice",
+            tokens_only_for_recipient_domain("nowhere.example".to_string()),
+            SUPPLIED_TOKEN,
+            "",
+        )
+        .await
+        .expect("the supplied token is used as given");
+        assert_eq!(token, SUPPLIED_TOKEN);
+
+        // An access token alongside it changes nothing: the identity token is
+        // still the authentication token to use.
+        let token = load_user_token(
+            "",
+            "alice",
+            tokens_only_for_recipient_domain("nowhere.example".to_string()),
+            SUPPLIED_TOKEN,
+            "supplied-access-token",
+        )
+        .await
+        .expect("the supplied token is used as given");
+        assert_eq!(token, SUPPLIED_TOKEN);
+    }
+
+    #[tokio::test]
+    async fn no_supplied_token_reads_the_store() {
+        // Nothing supplied, so this is a plain store read, which has no entry
+        // for an empty endpoint.
+        let result = load_user_token(
+            "",
+            "alice",
+            tokens_only_for_recipient_domain("nowhere.example".to_string()),
+            "",
+            "",
+        )
+        .await;
+        assert!(result.is_err());
     }
 }

@@ -23,7 +23,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.7-nightly"
+version = "0.9.1-nightly"
 
 [workspace.dependencies]
 lore = { path = "lore" }
@@ -169,12 +169,26 @@ zerocopy = { version = "0.8.26", features = [
 
 # Note: we currently control debug symbol splitting in .cargo/config.toml
 
+# Unoptimized builds, and the `test` profile that inherits from this one. Every
+# test target links the whole workspace, so full DWARF is copied into each of
+# them: it dominates link time, the size of the target directory and the
+# linker's peak memory. Line tables keep file and line in a backtrace, which is
+# what a failing test reports, and drop the type and variable information a
+# debugger would use.
+[profile.dev]
+debug = "line-tables-only"
+
 # Fast build suitable for local development
 [profile.release]
 debug = "line-tables-only"
 incremental = true
 debug-assertions = true
 panic = "abort"
+
+# Faster to build than the `release` profile, for rapid iteration when debugging
+[profile.iteration]
+inherits = "release"
+lto = "off"
 
 # The actual release build
 [profile.release-lto]

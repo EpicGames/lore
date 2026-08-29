@@ -104,7 +104,7 @@ pub async fn dump_node(
         let node_name = state
             .node_name_ref(repository.clone(), node_id)
             .await
-            .internal("Failed to get node name")?;
+            .forward::<StateError>("Failed to get node name")?;
         subpath.push(node_name);
 
         let type_data = if node.is_directory() {

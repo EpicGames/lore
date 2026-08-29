@@ -2093,8 +2093,8 @@ async fn write_random_file(driver: &IoDriver, path: &Path, size: u64) {
     let chunk = 1024 * 1024;
     let mut rng = XorShift::new(0x5eed ^ size);
     let mut template = vec![0u8; chunk];
-    for word in template.chunks_exact_mut(8) {
-        word.copy_from_slice(&rng.next().to_le_bytes());
+    for word in template.as_chunks_mut::<8>().0 {
+        *word = rng.next().to_le_bytes();
     }
     // The tail matters: a size derived from a measured rate is not a whole number of chunks, and
     // a file written short by the remainder ends a phase in `UnexpectedEof` rather than a result.

@@ -72,6 +72,7 @@ pub enum LoreCommand {
     LockFileRelease(crate::lock::LoreLockFileReleaseArgs),
     LinkAdd(crate::link::LoreLinkAddArgs),
     LinkRemove(crate::link::LoreLinkRemoveArgs),
+    LinkInfo(crate::link::LoreLinkInfoArgs),
     LinkList(crate::link::LoreLinkListArgs),
     LinkUpdate(crate::link::LoreLinkUpdateArgs),
     RepositoryClone(crate::repository::LoreRepositoryCloneArgs),
@@ -153,10 +154,13 @@ pub enum LoreCommand {
     RevisionTreeAdd(crate::revision_tree::add::LoreRevisionTreeAddArgs),
     RevisionTreeDelete(crate::revision_tree::delete::LoreRevisionTreeDeleteArgs),
     RevisionTreeModify(crate::revision_tree::modify::LoreRevisionTreeModifyArgs),
+    RevisionTreeMove(crate::revision_tree::move_node::LoreRevisionTreeMoveArgs),
     RevisionTreeMetadataSet(crate::revision_tree::metadata_set::LoreRevisionTreeMetadataSetArgs),
     RevisionTreeMetadataGet(crate::revision_tree::metadata_get::LoreRevisionTreeMetadataGetArgs),
     RevisionTreeMetadataClear(
         crate::revision_tree::metadata_clear::LoreRevisionTreeMetadataClearArgs,
     ),
     RevisionTreeCommit(crate::revision_tree::commit::LoreRevisionTreeCommitArgs),
+    StorageGetResolved(crate::storage::get_resolved::LoreStorageGetResolvedArgs),
+    StoragePutResolved(crate::storage::put_resolved::LoreStoragePutResolvedArgs),
 }

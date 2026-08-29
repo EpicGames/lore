@@ -71,6 +71,14 @@ impl EventError for DispatchError {
 /// before the returned future resolves — no background work outlives a
 /// data verb. Use `JoinSet` / `join_all` to await spawned futures before
 /// returning.
+///
+/// The verb reaches the handle's tree through
+/// [`access_shared`](crate::revision_tree::handle::RevisionTreeInternal::access_shared) or
+/// [`access_exclusive`](crate::revision_tree::handle::RevisionTreeInternal::access_exclusive),
+/// which is where a call states whether it can share the handle. This helper does not
+/// take that lock: a verb holds it for as long as it uses the state, and taking it here
+/// as well would deadlock, since `tokio::sync::RwLock` is write-preferring and a second
+/// read waits behind a queued writer.
 pub(crate) async fn revision_tree_call<Arg, T, F, Fut, ResT, ErrT, M>(
     globals: LoreGlobalArgs,
     callback: LoreEventCallback,

@@ -147,7 +147,7 @@ mod tests {
                 .expect("Could not create main branch");
 
                 // Create a state with a file node at the root
-                let state = state::State::new();
+                let state = Arc::new(state::State::new());
                 state.set_parent_self(Hash::default());
                 state.set_revision_number(1);
 
@@ -231,7 +231,7 @@ mod tests {
                 .expect("Could not create main branch");
 
                 // Create a state with only the root directory (no children)
-                let state = state::State::new();
+                let state = Arc::new(state::State::new());
                 state.set_parent_self(Hash::default());
                 state.set_revision_number(1);
 
@@ -307,7 +307,7 @@ mod tests {
                 .await
                 .expect("Could not create main branch");
 
-                let state = state::State::new();
+                let state = Arc::new(state::State::new());
                 state.set_parent_self(Hash::default());
                 state.set_revision_number(1);
 
@@ -411,7 +411,7 @@ mod tests {
         .await
         .expect("Could not create main branch");
 
-        let state = state::State::new();
+        let state = Arc::new(state::State::new());
         state.set_parent_self(Hash::default());
         state.set_revision_number(1);
 

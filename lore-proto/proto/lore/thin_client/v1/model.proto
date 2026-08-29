@@ -84,6 +84,10 @@ message DiffChange {
   // fetch for this change MUST target the corresponding partition,
   // not the request's repository id.
   uint32 link_repository_index = 8;
+  // True when a link change tracks its parent's branch; false for pinned
+  // links and non-link changes. Only meaningful on a LINK-typed entry; read
+  // it from the entry for the mount path itself.
+  bool tracking = 9;
 }
 
 // Pair of per-path changes describing a 3-way merge conflict at a single
@@ -125,6 +129,9 @@ message TreeNode {
   uint64 size = 4;
   // File mode for this entry. For possible flags and values, see enum FileMode.
   uint64 mode = 5;
+  // True when a link entry tracks its parent's branch; false for pinned links
+  // and non-link entries.
+  bool tracking = 6;
 }
 
 // Self-describing revision record. Carries the resolved RevisionIdentifier

@@ -205,13 +205,11 @@ fn validate_feature_config(settings: &Settings) -> Result<(), config::ConfigErro
 }
 
 fn trace_config_error_to_config(err: TraceConfigError) -> config::ConfigError {
-    if let Some(out_of_range) = err.as_out_of_range() {
-        return config::ConfigError::Message(format!(
-            "telemetry.traces.{} value {} is outside [0.0, 1.0]",
-            out_of_range.field, out_of_range.value
-        ));
+    match err {
+        TraceConfigError::OutOfRange { field, value } => config::ConfigError::Message(format!(
+            "telemetry.traces.{field} value {value} is outside [0.0, 1.0]"
+        )),
     }
-    config::ConfigError::Message(format!("telemetry.traces validation failed: {err}"))
 }
 
 ///
@@ -271,6 +269,13 @@ pub struct HttpSettings {
     pub presigned_url_default_ttl_seconds: u64,
     #[serde(default = "HttpSettings::default_presigned_url_max_ttl_seconds")]
     pub presigned_url_max_ttl_seconds: u64,
+    /// Added to the built-in set of `Content-Type` values redeemed content may be
+    /// served with. Browser-executable types are refused at startup.
+    #[serde(default)]
+    pub presigned_url_extra_content_types: Vec<String>,
+    /// Removed from that set, after the extra types.
+    #[serde(default)]
+    pub presigned_url_denied_content_types: Vec<String>,
 }
 
 impl HttpSettings {
@@ -515,6 +520,50 @@ mod tests {
     use crate::plugins::PluginRegistry;
     use crate::store::resolve_plugin_config_with_fallback;
     use crate::topology::TopologyProvider;
+
+    /// Every required `[server.http]` field, so a test can add just the key it
+    /// cares about.
+    const MINIMAL_HTTP_SETTINGS: &str = r#"
+        enabled = false
+        host = "127.0.0.1"
+        max_file_size = 1024
+        port = 8080
+        request_timeout_seconds = 30
+        request_body_timeout_seconds = 30
+        available_interval_seconds = 5
+        available_timeout_seconds = 30
+        store_health_check = false
+    "#;
+
+    fn http_settings(extra_keys: &str) -> HttpSettings {
+        toml::from_str(&format!("{MINIMAL_HTTP_SETTINGS}\n{extra_keys}\n"))
+            .expect("[server.http] should deserialize")
+    }
+
+    /// Both keys absent means an empty policy, which resolves to the built-in set.
+    #[test]
+    fn presign_content_type_lists_default_to_empty() {
+        let http = http_settings("");
+        assert!(http.presigned_url_extra_content_types.is_empty());
+        assert!(http.presigned_url_denied_content_types.is_empty());
+    }
+
+    #[test]
+    fn presign_extra_content_types_are_read() {
+        let http = http_settings(
+            r#"presigned_url_extra_content_types = ["application/zip", "audio/mpeg"]"#,
+        );
+        assert_eq!(
+            http.presigned_url_extra_content_types,
+            ["application/zip", "audio/mpeg"]
+        );
+    }
+
+    #[test]
+    fn presign_denied_content_types_are_read() {
+        let http = http_settings(r#"presigned_url_denied_content_types = ["application/pdf"]"#);
+        assert_eq!(http.presigned_url_denied_content_types, ["application/pdf"]);
+    }
 
     #[test]
     fn test_settings_with_plugin_sections() {

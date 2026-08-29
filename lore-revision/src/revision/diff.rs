@@ -13,6 +13,7 @@ use crate::errors::*;
 use crate::event;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
+use crate::link;
 use crate::lore::Address;
 use crate::lore::Hash;
 use crate::node::INVALID_NODE;
@@ -38,6 +39,8 @@ pub struct LoreRevisionDiffFileEventData {
     pub old_address: Address,
     /// Address of the file content on the target side.
     pub new_address: Address,
+    /// Previous path of the file when it was moved or copied. Empty otherwise.
+    pub from_path: LoreString,
 }
 
 impl LoreRevisionDiffFileEventData {
@@ -49,6 +52,7 @@ impl LoreRevisionDiffFileEventData {
             new_is_file: new_is_file.into(),
             old_address: change.from.address,
             new_address: change.to.address,
+            from_path: change.from_path.as_ref().map(|path| path.as_str()).into(),
         }
     }
 
@@ -107,6 +111,25 @@ pub enum DiffError {
 
 impl crate::event::EventError for DiffError {}
 
+/// A request scoped *inside* a link asks for that subtree, so the link's own
+/// entry is left out.
+fn link_path_in_scope(link_path: &str, paths: Option<&[RelativePath]>) -> bool {
+    let Some(paths) = paths else {
+        return true;
+    };
+    if paths.is_empty() {
+        return true;
+    }
+    paths.iter().any(|path| {
+        let prefix = path.as_str();
+        prefix.is_empty()
+            || link_path == prefix
+            || link_path
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
 /// Calculate the difference between two revisions, as the set of changes that describe
 /// going from revision 'source' to revision 'target', optionally filtered by a set of paths
 pub async fn diff(
@@ -123,11 +146,43 @@ pub async fn diff(
         .forward::<DiffError>("deserializing target state")?;
 
     let (_, mut diff) = collect_stream_with_summary(|tx| {
-        diff::diff_revision_paths(repository.clone(), state_source, state_target, paths, tx)
+        diff::diff_revision_paths(
+            repository.clone(),
+            state_source.clone(),
+            state_target.clone(),
+            paths.clone(),
+            tx,
+        )
     })
     .await
     .forward::<DiffError>("diffing states")?;
     change::sort_by_path(&mut diff);
+
+    let pin_changes = link::diff_link_pins(repository.clone(), &state_source, &state_target)
+        .await
+        .forward::<DiffError>("diffing link pins")?;
+    for pin_change in pin_changes {
+        if !link_path_in_scope(&pin_change.link_path, paths.as_deref()) {
+            continue;
+        }
+        event::LoreEvent::RevisionDiffFile(LoreRevisionDiffFileEventData {
+            path: LoreString::from(pin_change.link_path.as_str()),
+            action: LoreFileAction::Keep,
+            old_is_file: 0,
+            new_is_file: 0,
+            old_address: Address {
+                hash: pin_change.revision_from,
+                context: pin_change.link_repository.into(),
+            },
+            new_address: Address {
+                hash: pin_change.revision_to,
+                context: pin_change.link_repository.into(),
+            },
+            from_path: LoreString::default(),
+        })
+        .send();
+    }
+
     for change in diff {
         let mut old_is_file = false;
         if change.from.node != INVALID_NODE {
@@ -160,4 +215,69 @@ pub async fn diff(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::str::FromStr;
+
+    use super::*;
+
+    fn paths(values: &[&str]) -> Vec<RelativePath> {
+        values
+            .iter()
+            .map(|value| RelativePath::from_str(value).expect("valid path"))
+            .collect()
+    }
+
+    #[test]
+    fn unfiltered_diff_includes_every_link() {
+        assert!(link_path_in_scope("libs/shared", None));
+        assert!(link_path_in_scope("libs/shared", Some(&[])));
+    }
+
+    #[test]
+    fn link_at_the_requested_path_is_in_scope() {
+        assert!(link_path_in_scope(
+            "libs/shared",
+            Some(&paths(&["libs/shared"]))
+        ));
+    }
+
+    #[test]
+    fn link_below_the_requested_path_is_in_scope() {
+        assert!(link_path_in_scope("libs/shared", Some(&paths(&["libs"]))));
+    }
+
+    /// A request scoped inside a link asks for that subtree, not for the
+    /// link's own entry.
+    #[test]
+    fn request_inside_a_link_excludes_the_link_itself() {
+        assert!(!link_path_in_scope(
+            "libs/shared",
+            Some(&paths(&["libs/shared/sub"]))
+        ));
+    }
+
+    #[test]
+    fn unrelated_requested_path_excludes_the_link() {
+        assert!(!link_path_in_scope("libs/shared", Some(&paths(&["docs"]))));
+    }
+
+    /// A sibling sharing a name prefix is not a parent directory.
+    #[test]
+    fn sibling_prefix_does_not_put_a_link_in_scope() {
+        assert!(!link_path_in_scope(
+            "libs/shared",
+            Some(&paths(&["libs/sha"]))
+        ));
+    }
+
+    #[test]
+    fn any_matching_requested_path_puts_the_link_in_scope() {
+        assert!(link_path_in_scope(
+            "libs/shared",
+            Some(&paths(&["docs", "libs"]))
+        ));
+    }
 }

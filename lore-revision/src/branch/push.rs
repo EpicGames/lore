@@ -12,6 +12,7 @@ use lore_base::types::BranchPoint;
 use lore_error_set::prelude::*;
 use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
+use lore_transport::quic::storage_service::QueryStatus;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinError;
@@ -31,6 +32,7 @@ use crate::interface::LoreString;
 use crate::layer;
 use crate::lore::Address;
 use crate::lore::BranchId;
+use crate::lore::Fragment;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
 use crate::lore::execution_context;
@@ -40,6 +42,7 @@ use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::state;
 use crate::state::State;
+use crate::store::StoreMatch;
 use crate::util::serde::u8_as_bool;
 
 /// Data for the event sent when a branch push starts.
@@ -334,23 +337,23 @@ pub async fn push(
     )
     .await?;
 
-    if let Ok(layers) = layer::list(repository.clone()).await {
-        for layer in layers {
-            let repository = Arc::new(repository.to_layer_context(layer.repository).await);
-            let state_current = State::deserialize(repository.clone(), layer.current)
-                .await
-                .forward::<PushError>("deserializing layer state")?;
+    for (layer, repository) in layer::list_with_context(repository.clone())
+        .await
+        .unwrap_or_default()
+    {
+        let state_current = State::deserialize(repository.clone(), layer.current)
+            .await
+            .forward::<PushError>("deserializing layer state")?;
 
-            collect_fragments_and_push(
-                repository.clone(),
-                token,
-                options.clone(),
-                state_current,
-                branch,
-                layer.current,
-            )
-            .await?;
-        }
+        collect_fragments_and_push(
+            repository.clone(),
+            token,
+            options.clone(),
+            state_current,
+            branch,
+            layer.current,
+        )
+        .await?;
     }
 
     let state_current = State::deserialize(repository.clone(), local_latest)
@@ -860,7 +863,6 @@ async fn collect_fragments_and_push(
 
         // Push new latest to remote
         let current_remote = remote_latest;
-        let current_number;
         let mut response_message = None;
 
         if !dry_run && remote_latest != current_revision {
@@ -928,7 +930,6 @@ async fn collect_fragments_and_push(
 
                 remote_latest = response.revision;
                 current_latest = response.revision;
-                current_number = response.revision_number;
 
                 event::LoreEvent::BranchPushRevisionPushEnd(
                     LoreBranchPushRevisionPushEndEventData {
@@ -936,7 +937,7 @@ async fn collect_fragments_and_push(
                         branch,
                         old_remote_revision: current_remote,
                         new_remote_revision: current_latest,
-                        new_remote_revision_number: current_number,
+                        new_remote_revision_number: response.revision_number,
                         message: response.message.unwrap_or_default().into(),
                         fast_forward_merged: 1,
                     },
@@ -973,17 +974,14 @@ async fn collect_fragments_and_push(
 
             remote_latest = response.revision;
             current_latest = response.revision;
-            current_number = State::deserialize(repository.clone(), current_latest)
-                .await
-                .forward::<PushError>("deserializing current latest state")?
-                .revision_number();
         } else {
             current_latest = current_revision;
-            current_number = State::deserialize(repository.clone(), current_latest)
-                .await
-                .forward::<PushError>("deserializing current latest state")?
-                .revision_number();
         }
+
+        let current_number = State::deserialize(repository.clone(), current_latest)
+            .await
+            .forward::<PushError>("deserializing current latest state")?
+            .revision_number();
 
         event::LoreEvent::BranchPushRevisionPushEnd(LoreBranchPushRevisionPushEndEventData {
             repository: repository.id,
@@ -1047,13 +1045,51 @@ pub const RETRY_START_DURATION: u64 = 100;
 pub const RETRY_MAX_DURATION: u64 = 10_000;
 pub const RETRY_MAX_ATTEMPTS: usize = 10;
 
+/// What the peer answered about the fragments a push is about to send, split by what it takes to
+/// register each one.
+///
+/// A full match needs nothing and appears in neither list. The rest divide by whether the peer
+/// already holds the bytes: it either has to be sent them, or it has an association for the same
+/// hash and can duplicate that instead.
+#[derive(Debug, Default)]
+pub(crate) struct PushQueryResult {
+    /// The peer holds nothing for these, so their payloads have to be transferred.
+    pub absent: Vec<Address>,
+    /// The partition already holds these hashes under another context, so an association can be
+    /// duplicated rather than the payload sent again.
+    pub copyable: Vec<Address>,
+}
+
+impl PushQueryResult {
+    pub fn len(&self) -> usize {
+        self.absent.len() + self.copyable.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.absent.is_empty() && self.copyable.is_empty()
+    }
+}
+
+/// Sort one batch's answers into what the peer needs from us: nothing for an association it
+/// already holds, a duplicated association where it holds the hash under another context, and the
+/// payload where it holds neither.
+fn classify_query_batch(batch: &[Address], statuses: &Bytes, queried: &mut PushQueryResult) {
+    for (address, status) in batch.iter().zip(statuses.iter()) {
+        match QueryStatus::from(*status) {
+            QueryStatus::ExistFullMatch => {}
+            QueryStatus::ExistPartitionMatch => queried.copyable.push(*address),
+            QueryStatus::NotFound => queried.absent.push(*address),
+        }
+    }
+}
+
 pub(crate) async fn push_query(
     storage: Arc<StorageSession>,
     addresses: Vec<Address>,
     max_batch_size: Option<usize>,
-) -> Result<Vec<Address>, PushError> {
+) -> Result<PushQueryResult, PushError> {
     if addresses.is_empty() {
-        return Ok(addresses);
+        return Ok(PushQueryResult::default());
     }
 
     let address_count = addresses.len();
@@ -1064,7 +1100,7 @@ pub(crate) async fn push_query(
     let mut remain = addresses;
 
     let mut failure = None;
-    let mut missing = vec![];
+    let mut queried = PushQueryResult::default();
     let mut retry =
         crate::util::time::retry(RETRY_START_DURATION, RETRY_MAX_DURATION, RETRY_MAX_ATTEMPTS);
     let max_batch_size = if let Some(max_batch_size) = max_batch_size
@@ -1078,16 +1114,12 @@ pub(crate) async fn push_query(
     fn handle_join_result(
         result: Result<(Vec<Address>, Result<Bytes, ProtocolError>), JoinError>,
         remain: &mut Vec<Address>,
-        missing: &mut Vec<Address>,
+        queried: &mut PushQueryResult,
     ) -> Result<(), PushError> {
         let (mut batch, result) = result.internal("query task panicked")?;
         match result {
             Ok(result) => {
-                for (index, value) in result.iter().enumerate() {
-                    if *value != 0 && index < batch.len() {
-                        missing.push(batch[index]);
-                    }
-                }
+                classify_query_batch(&batch, &result, queried);
                 Ok(())
             }
             Err(ProtocolError::SlowDown(_)) => {
@@ -1117,13 +1149,13 @@ pub(crate) async fn push_query(
                 && tasks.len() > MAX_TASK_COUNT
                 && let Some(result) = tasks.join_next().await
             {
-                failure = handle_join_result(result, remain.as_mut(), missing.as_mut()).err();
+                failure = handle_join_result(result, remain.as_mut(), &mut queried).err();
             }
         }
 
         while let Some(result) = tasks.join_next().await {
             if failure.is_none() {
-                failure = handle_join_result(result, remain.as_mut(), missing.as_mut()).err();
+                failure = handle_join_result(result, remain.as_mut(), &mut queried).err();
             }
         }
 
@@ -1138,22 +1170,75 @@ pub(crate) async fn push_query(
         }
     }
 
-    missing.sort_unstable();
-    missing.dedup();
+    queried.absent.sort_unstable();
+    queried.absent.dedup();
+    queried.copyable.sort_unstable();
+    queried.copyable.dedup();
 
     lore_debug!(
-        "Queried {} fragments, {} missing",
+        "Queried {} fragments, {} to upload, {} the peer can duplicate an association for",
         address_count,
-        missing.len()
+        queried.absent.len(),
+        queried.copyable.len()
     );
 
-    Ok(missing)
+    Ok(queried)
 }
 
+/// Record locally that the peer holds this address, which is what keeps the next push from
+/// offering it again.
+async fn mark_durable(repository: &Arc<RepositoryContext>, address: Address, fragment: Fragment) {
+    let mut fragment = fragment;
+    fragment.flags |= fragment::FragmentFlags::PayloadStoredDurable;
+    let _ = repository
+        .immutable_store()
+        .put(repository.id, address, fragment, None, false)
+        .await;
+}
+
+/// Ask the peer to duplicate an association it already holds for this hash, reporting whether it
+/// did.
+///
+/// The source names no context because the query did not say which one the peer matched under —
+/// only that the partition holds the hash — and that is exactly what a zero source context asks
+/// for. A refusal costs the round trip and leaves the payload to be uploaded as before.
+async fn duplicate_association(
+    repository: &Arc<RepositoryContext>,
+    storage: &Arc<StorageSession>,
+    address: Address,
+) -> bool {
+    if !storage.can_copy_from(repository.id).await {
+        return false;
+    }
+    if let Err(err) = storage
+        .copy(
+            repository.id,
+            Address::zero_context_hash(address.hash),
+            address.context,
+        )
+        .await
+    {
+        lore_debug!("Copy of {address} refused ({err:?}), uploading instead");
+        return false;
+    }
+
+    if let Ok(data) = repository
+        .immutable_store()
+        .get_metadata(repository.id, address)
+        .await
+        && data.match_made == StoreMatch::MatchFull
+    {
+        mark_durable(repository, address, data.fragment).await;
+    }
+    true
+}
+
+/// Register every fragment the peer is missing, transferring a payload only where it has no
+/// association to duplicate.
 pub(crate) async fn push_fragments(
     repository: Arc<RepositoryContext>,
     storage: Arc<StorageSession>,
-    fragments: Vec<Address>,
+    fragments: PushQueryResult,
     stats: Arc<PushStatistics>,
 ) -> Result<(), PushError> {
     if fragments.is_empty() {
@@ -1164,13 +1249,18 @@ pub(crate) async fn push_fragments(
 
     stats
         .fragment_count
-        .store(fragments.len(), Ordering::Relaxed);
+        .store(fragment_count, Ordering::Relaxed);
 
     const MAX_PARALLEL_PUT: usize = 10000;
 
+    let PushQueryResult { absent, copyable } = fragments;
     let mut tasks: JoinSet<Result<(), PushError>> = JoinSet::new();
     let mut failure = None;
-    for address in fragments {
+    for (address, duplicable) in copyable
+        .into_iter()
+        .map(|address| (address, true))
+        .chain(absent.into_iter().map(|address| (address, false)))
+    {
         if address.hash.is_zero() {
             debug_assert!(
                 !address.hash.is_zero(),
@@ -1183,6 +1273,11 @@ pub(crate) async fn push_fragments(
         let storage = storage.clone();
         let stats = stats.clone();
         lore_spawn!(tasks, async move {
+            if duplicable && duplicate_association(&repository, &storage, address).await {
+                stats.fragment_complete.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+
             let (fragment, payload) = immutable::load_raw_store_retry(
                 repository.immutable_store(),
                 repository.id,
@@ -1208,13 +1303,7 @@ pub(crate) async fn push_fragments(
                 .bytes_transferred
                 .fetch_add(payload_size, Ordering::Relaxed);
 
-            // Mark as durably stored in local store
-            let mut fragment = fragment;
-            fragment.flags |= fragment::FragmentFlags::PayloadStoredDurable;
-            let _ = repository
-                .immutable_store()
-                .put(repository.id, address, fragment, None, false)
-                .await;
+            mark_durable(&repository, address, fragment).await;
 
             stats.fragment_complete.fetch_add(1, Ordering::Relaxed);
 
@@ -1254,4 +1343,87 @@ pub(crate) async fn push_fragments(
     lore_debug!("Pushed {} fragments", fragment_count);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What the push does with a fragment is decided entirely by the status byte the peer answered
+    /// with, so this is where the copy path is chosen or missed.
+    mod classify {
+        use super::*;
+
+        fn address(seed: u8) -> Address {
+            Address {
+                hash: Hash::from([seed; 32]),
+                context: crate::lore::Context::from([seed; 16]),
+            }
+        }
+
+        fn classify(statuses: &[u8]) -> PushQueryResult {
+            let batch: Vec<Address> = (0..statuses.len() as u8).map(address).collect();
+            let mut queried = PushQueryResult::default();
+            classify_query_batch(&batch, &Bytes::copy_from_slice(statuses), &mut queried);
+            queried
+        }
+
+        #[test]
+        fn an_association_the_peer_holds_needs_nothing() {
+            let queried = classify(&[QueryStatus::ExistFullMatch as u8]);
+            assert!(queried.is_empty());
+        }
+
+        /// The change this path exists for: the partition holds the hash, so the peer is asked to
+        /// duplicate the association rather than sent the payload it already has.
+        #[test]
+        fn a_partition_match_is_copied_rather_than_uploaded() {
+            let queried = classify(&[QueryStatus::ExistPartitionMatch as u8]);
+            assert_eq!(queried.copyable, vec![address(0)]);
+            assert!(queried.absent.is_empty());
+        }
+
+        #[test]
+        fn a_miss_is_uploaded() {
+            let queried = classify(&[QueryStatus::NotFound as u8]);
+            assert_eq!(queried.absent, vec![address(0)]);
+            assert!(queried.copyable.is_empty());
+        }
+
+        /// A status the client does not know must not be read as "the peer has it" — that would
+        /// drop the fragment from the push and leave the revision unreadable on the peer.
+        #[test]
+        fn an_unknown_status_is_uploaded() {
+            let queried = classify(&[2, 7, 255]);
+            assert_eq!(queried.absent.len(), 3);
+            assert!(queried.copyable.is_empty());
+        }
+
+        #[test]
+        fn a_batch_is_split_by_status_in_order() {
+            let queried = classify(&[
+                QueryStatus::NotFound as u8,
+                QueryStatus::ExistFullMatch as u8,
+                QueryStatus::ExistPartitionMatch as u8,
+                QueryStatus::NotFound as u8,
+                QueryStatus::ExistPartitionMatch as u8,
+            ]);
+            assert_eq!(queried.absent, vec![address(0), address(3)]);
+            assert_eq!(queried.copyable, vec![address(2), address(4)]);
+            assert_eq!(queried.len(), 4);
+        }
+
+        /// Each status answers the address at its own position, so a batch where only some entries
+        /// are copyable must not shift the rest.
+        #[test]
+        fn statuses_line_up_with_the_addresses_they_answer() {
+            let queried = classify(&[
+                QueryStatus::ExistPartitionMatch as u8,
+                QueryStatus::ExistFullMatch as u8,
+                QueryStatus::NotFound as u8,
+            ]);
+            assert_eq!(queried.copyable, vec![address(0)]);
+            assert_eq!(queried.absent, vec![address(2)]);
+        }
+    }
 }

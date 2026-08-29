@@ -186,7 +186,7 @@ mod test {
             // from it (the parent validator rejects zero-revision parents
             // unless the parent is the repository's default branch, which
             // the test fixture doesn't initialise).
-            let state = state::State::new();
+            let state = Arc::new(state::State::new());
             state.set_parent_self(Hash::default());
             state.set_revision_number(1);
             let state_hash = state

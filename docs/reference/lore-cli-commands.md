@@ -213,6 +213,8 @@ This page is generated from `lore --markdown-help` (CLI `0.8.2-nightly+31`). Eve
 * `--remote` — Use remote data
 * `--local` — Use local data
 * `--identity <IDENTITY>` — Use given identity
+* `--identity-token <token>` — Use given authentication token instead of one from the secure store. Acts as the identity the token was issued to
+* `--access-token <token>` — Use given authorization token instead of exchanging one with the authentication service. On its own it acts as the identity the token was issued to, and operations needing an authentication token fail rather than falling back to the secure store
 * `--max-connections <MAX_CONNECTIONS>` — Set maximum number of parallel connections
 * `--file-count-limit <count>` — Set maximum number of parallel files opened
 * `--file-size-limit <size>` — Set maximum total size in bytes of parallel files opened

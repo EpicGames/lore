@@ -441,8 +441,13 @@ impl Metadata {
 
     pub fn to_u64(value: &[u8]) -> Result<u64, MetadataError> {
         if value.len() == std::mem::size_of::<u64>() {
+            // Spelled as an explicit `TryFrom` so the error type is resolved
+            // here. Left to inference it stays an inference variable, and
+            // `.internal()` then matches both `WrapInternal` and the
+            // error-set guard, which is an ambiguity rather than a real
+            // finding: the error is `TryFromSliceError`, a foreign type.
             Ok(u64::from_le_bytes(
-                value.try_into().internal("metadata type mismatch")?,
+                <[u8; 8]>::try_from(value).internal("metadata type mismatch")?,
             ))
         } else {
             Err(MetadataError::internal("metadata type mismatch"))

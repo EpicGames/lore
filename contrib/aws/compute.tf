@@ -181,7 +181,7 @@ resource "aws_ecs_task_definition" "lore" {
         { name = "LORE__SERVER__HTTP__PRESIGNED_URL_HMAC_KEY", valueFrom = aws_secretsmanager_secret.hmac.arn },
       ]
 
-      environment = [
+      environment = concat([
         { name = "LORE_ENV", value = "docker" },
         { name = "LORE_CONFIG_PATH", value = "/etc/lore/config" },
 
@@ -212,10 +212,16 @@ resource "aws_ecs_task_definition" "lore" {
         # AWS plugin config
         { name = "LORE__PLUGINS__AWS__IMMUTABLE_STORE__S3_BUCKET", value = aws_s3_bucket.fragments.id },
         { name = "LORE__PLUGINS__AWS__IMMUTABLE_STORE__DYNAMODB_FRAGMENTS_TABLE", value = aws_dynamodb_table.fragments.name },
-        { name = "LORE__PLUGINS__AWS__IMMUTABLE_STORE__DYNAMODB_METADATA_TABLE", value = aws_dynamodb_table.metadata.name },
+        { name = "LORE__PLUGINS__AWS__IMMUTABLE_STORE__DYNAMODB_FRAGMENT_STATE_TABLE", value = aws_dynamodb_table.fragment_state.name },
         { name = "LORE__PLUGINS__AWS__MUTABLE_STORE__DYNAMODB_TABLE", value = aws_dynamodb_table.mutable.name },
         { name = "LORE__PLUGINS__AWS__LOCK_STORE__DYNAMODB_TABLE", value = aws_dynamodb_table.locks.name },
-      ]
+        ],
+        # Set only where objects predating fragment metadata on the S3 object may still
+        # exist. Unset, an object carrying no metadata is damaged rather than merely old.
+        [for table in data.aws_dynamodb_table.fragment_metadata : {
+          name  = "LORE__PLUGINS__AWS__IMMUTABLE_STORE__DYNAMODB_FRAGMENT_METADATA_TABLE"
+          value = table.name
+      }])
 
       logConfiguration = {
         logDriver = "awslogs"

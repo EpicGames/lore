@@ -101,7 +101,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -112,7 +112,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1460,7 +1460,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -1558,7 +1558,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1865,9 +1865,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.14"
+version = "0.4.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "171fefbc92fe4a4de27e0698d6a5b392d6a0e333506bc49133760b3bcf948733"
+checksum = "ef8e5e5a340588f4452631496976cf8636d4a7ecf600239fdc27615d2530bc16"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -2444,7 +2444,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "lore"
-version = "0.8.7-nightly"
+version = "0.9.1-nightly"
 dependencies = [
  "anyhow",
  "bitcode",
@@ -2481,7 +2481,7 @@ dependencies = [
 
 [[package]]
 name = "lore-aws"
-version = "0.8.7-nightly"
+version = "0.9.1-nightly"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -2523,7 +2523,7 @@ dependencies = [
 
 [[package]]
 name = "lore-base"
-version = "0.8.7-nightly"
+version = "0.9.1-nightly"
 dependencies = [
  "anyhow",
  "backtrace",
@@ -2553,7 +2553,7 @@ dependencies = [
 
 [[package]]
 name = "lore-chaos-client"
-version = "0.8.7-nightly"
+version = "0.9.1-nightly"
 dependencies = [
  "anyhow",
  "clap",
@@ -2570,7 +2570,7 @@ dependencies = [
 
 [[package]]
 name = "lore-client"
-version = "0.8.7-nightly"
+version = "0.9.1-nightly"
 dependencies = [
  "anstream 0.6.21",
  "anstyle",
@@ -2594,7 +2594,7 @@ dependencies = [
 
 [[package]]
 name = "lore-credential"
-version = "0.8.7-nightly"
+version = "0.9.1-nightly"
 dependencies = [
  "base64 0.22.1",
  "jsonwebtoken",
@@ -2609,7 +2609,6 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "url",
  "windows-sys 0.61.2",
- "zerocopy",
 ]
 
 [[package]]
@@ -2632,7 +2631,7 @@ dependencies = [
 
 [[package]]
 name = "lore-hashicorp"
-version = "0.8.7-nightly"
+version = "0.9.1-nightly"
 dependencies = [
  "async-trait",
  "lore-base",
@@ -2668,7 +2667,9 @@ dependencies = [
  "lore-revision",
  "lore-server",
  "lore-storage",
+ "lore-transport",
  "rand",
+ "rcgen",
  "reqwest",
  "ring",
  "rs-consul",
@@ -2687,7 +2688,7 @@ dependencies = [
 
 [[package]]
 name = "lore-io"
-version = "0.8.7-nightly"
+version = "0.9.1-nightly"
 dependencies = [
  "bytes",
  "futures",
@@ -2701,7 +2702,7 @@ dependencies = [
 
 [[package]]
 name = "lore-macro"
-version = "0.8.7-nightly"
+version = "0.9.1-nightly"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2710,7 +2711,7 @@ dependencies = [
 
 [[package]]
 name = "lore-notification"
-version = "0.8.7-nightly"
+version = "0.9.1-nightly"
 dependencies = [
  "async-trait",
  "lore-base",
@@ -2726,7 +2727,7 @@ dependencies = [
 
 [[package]]
 name = "lore-proto"
-version = "0.1.61"
+version = "0.1.62"
 dependencies = [
  "lore-base",
  "prost",
@@ -2738,7 +2739,7 @@ dependencies = [
 
 [[package]]
 name = "lore-revision"
-version = "0.8.7-nightly"
+version = "0.9.1-nightly"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2802,7 +2803,7 @@ dependencies = [
 
 [[package]]
 name = "lore-server"
-version = "0.8.7-nightly"
+version = "0.9.1-nightly"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2846,6 +2847,7 @@ dependencies = [
  "prost-types",
  "quinn",
  "rand",
+ "rcgen",
  "reqwest",
  "ring",
  "rustls",
@@ -2857,6 +2859,7 @@ dependencies = [
  "socket2",
  "sysinfo",
  "temp-env",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-metrics",
@@ -2881,7 +2884,7 @@ dependencies = [
 
 [[package]]
 name = "lore-storage"
-version = "0.8.7-nightly"
+version = "0.9.1-nightly"
 dependencies = [
  "async-trait",
  "bitflags",
@@ -2917,7 +2920,7 @@ dependencies = [
 
 [[package]]
 name = "lore-telemetry"
-version = "0.8.7-nightly"
+version = "0.9.1-nightly"
 dependencies = [
  "axum",
  "http 1.4.0",
@@ -2939,7 +2942,7 @@ dependencies = [
 
 [[package]]
 name = "lore-transport"
-version = "0.8.7-nightly"
+version = "0.9.1-nightly"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -3122,7 +3125,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3989,7 +3992,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4403,14 +4406,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
 name = "spin"
-version = "0.10.0"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d5fe4ccb98d9c292d56fec89a5e07da7fc4cf0dc11e156b41793132775d3e591"
+checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
 
 [[package]]
 name = "spinning_top"
@@ -4536,7 +4539,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5449,7 +5452,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

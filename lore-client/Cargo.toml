@@ -27,6 +27,7 @@ windows-sys = { workspace = true, features = ["Win32_System_Console", "Win32_Net
 [features]
 default = []
 oodle = ["lore/oodle"]
+swfs = ["lore/swfs"]
 
 [build-dependencies]
 vergen = { workspace = true }

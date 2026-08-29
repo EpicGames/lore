@@ -16,7 +16,6 @@ use crate::branch::BranchLatestStatus;
 use crate::branch::merge;
 use crate::branch::merge::MergeType;
 use crate::change::NodeChange;
-use crate::error::LoreErrorExt;
 use crate::errors::*;
 use crate::event::EventError;
 use crate::event::LoreEvent;
@@ -25,7 +24,7 @@ use crate::find;
 use crate::fs::filesystem_provider::FilesystemProvider;
 use crate::fs::filesystem_provider::FsError;
 use crate::fs::filesystem_provider::InstanceOperation;
-use crate::fs::filesystem_provider::StaticDispatchInstanceOperation;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::history;
 use crate::interface::LoreBranchLocation;
 use crate::interface::LoreError;
@@ -50,9 +49,11 @@ use crate::repository::RepositoryWriteToken;
 use crate::repository::THEIRS_SUFFIX;
 use crate::revision;
 use crate::state;
+use crate::state::RecordedModifiedTimes;
 use crate::state::State;
 use crate::util;
 use crate::util::path::RelativePath;
+use crate::util::path::RepositoryPath;
 use crate::util::serde::u8_as_bool;
 
 /// Source and target revisions selected for a sync.
@@ -257,10 +258,10 @@ pub async fn sync(
     let branch_id = if current_branch.is_zero() {
         let repository_metadata = repository::metadata_hash(repository.clone())
             .await
-            .internal("Failed to load repository metadata")?;
+            .forward::<SyncError>("Failed to load repository metadata")?;
         let repository_metadata = repository::metadata(repository.clone(), repository_metadata)
             .await
-            .internal("Failed to load repository metadata")?;
+            .forward::<SyncError>("Failed to load repository metadata")?;
         lore_debug!(
             "Currently not on a branch, default to {} {}",
             repository_metadata.default_branch_name,
@@ -418,7 +419,7 @@ pub async fn sync(
             revision = remote_latest;
             location = LoreBranchLocation::Remote;
         } else {
-            return SyncError::from(NoRemote).emit();
+            return Err(SyncError::from(NoRemote));
         }
     }
 
@@ -541,7 +542,9 @@ pub async fn sync(
                 merge_options,
             ))
             .await
-            .internal("Synchronizing with local changes failed to merge with remote revision")?;
+            .forward::<SyncError>(
+                "Synchronizing with local changes failed to merge with remote revision",
+            )?;
 
             let state_staged = State::deserialize(repository.clone(), revision_staged)
                 .await
@@ -584,7 +587,7 @@ pub async fn sync(
     }
 
     // Safe to handle error when cache task has finished
-    result?;
+    let modified_times = result?;
 
     if !layer_revisions.is_empty() {
         Box::pin(sync_layers(
@@ -626,6 +629,9 @@ pub async fn sync(
         crate::instance::store_current_anchor(&repository, revision)
             .await
             .forward::<SyncError>("Failed to serialize current revision anchor")?;
+
+        modified_times.store(repository.clone()).await;
+
         state::rebase_staged_anchor(repository.clone(), revision)
             .await
             .forward::<SyncError>("Failed to rebase staged anchor")?;
@@ -645,7 +651,7 @@ pub async fn sync(
                 BranchLatestStatus::Convergent,
             )
             .await
-            .internal("Failed to store revision as current branch latest")?;
+            .forward::<SyncError>("Failed to store revision as current branch latest")?;
 
             branch::store_last_sync(repository, branch_id, revision).await;
         }
@@ -675,15 +681,14 @@ async fn sync_load_layer_list(
         // Detached sync - layers are handled separately by the caller
         return Ok((layer_revisions, nearest_revision));
     }
-    if let Ok(layers) = layer::list(repository.clone()).await {
+    if let Ok(layers) = layer::list_with_context(repository.clone()).await {
         // Check which matching revision to sync to for each layer
         // TODO(mjansson): Task parallelize this for multiple layers
         // TODO(mjansson): Handle multiple nearest matches for main revision
         if !layers.is_empty() {
             lore_info!("Resolving layer revisions");
         }
-        for layer in layers.iter() {
-            let module = Arc::new(repository.to_layer_context(layer.repository).await);
+        for (layer, module) in layers.iter() {
             let Ok(layer_latest) = layer::latest_revision(module.clone(), branch_id).await else {
                 // No revision on this branch yet (e.g. newly created branch),
                 // skip layer sync - files stay at current state
@@ -714,10 +719,9 @@ async fn sync_load_layer_list(
                 if let Some(nearest_revision) = nearest_revision
                     && main_revision != nearest_revision
                 {
-                    return SyncError::internal(
+                    return Err(SyncError::internal(
                         "Layers have diverging matching main repository revisions",
-                    )
-                    .emit();
+                    ));
                 }
                 nearest_revision.replace(main_revision);
             }
@@ -741,15 +745,15 @@ async fn sync_reject_staged_layers(
     layer_revisions: &[(Layer, Hash)],
 ) -> Result<(), SyncError> {
     for (layer, layer_revision) in layer_revisions {
-        if layer.staged.is_zero()
-            || layer.staged == layer.current
-            || *layer_revision == layer.current
-        {
+        let Some(staged) = layer.staged_revision() else {
+            continue;
+        };
+        if *layer_revision == layer.current {
             continue;
         }
 
         let layer_repository = Arc::new(repository.to_layer_context(layer.repository).await);
-        let state_staged = state::State::deserialize(layer_repository.clone(), layer.staged)
+        let state_staged = state::State::deserialize(layer_repository.clone(), staged)
             .await
             .forward::<SyncError>("Failed to deserialize layer staged state")?;
         if state_staged
@@ -853,48 +857,67 @@ async fn sync_layers(
     Ok(())
 }
 
+/// Drops the times an operation collected, for a caller that does not know which revision
+/// the operation leaves current.
+fn discard_modified_times<T>((result, modified_times): (T, RecordedModifiedTimes)) -> T {
+    modified_times.discard();
+    result
+}
+
+/// Runs `callback` against a filesystem operation, returning its result alongside the
+/// modified times the operation collected.
+///
+/// The times are only true once the revision the operation realized is the current one, so a
+/// caller that advances the current revision stores them and every other caller discards
+/// them.
 async fn shim_with_operation<T>(
     filesystem: Arc<dyn FilesystemProvider>,
     changes_made: bool,
-    callback: impl AsyncFnOnce(Arc<StaticDispatchInstanceOperation>) -> T,
-) -> Result<T, FsError> {
+    callback: impl AsyncFnOnce(Arc<InstanceOperationImpl>) -> T,
+) -> Result<(T, RecordedModifiedTimes), FsError> {
     let operation = filesystem.begin_operation().await?;
     let result = callback(operation.clone()).await;
+    let modified_times = operation.take_modified_times();
     operation.finalize(changes_made).await?;
-    Ok(result)
+    Ok((result, modified_times))
 }
 
+/// Realizes `state_target` over the working copy, returning the modified times of the files
+/// it wrote for the caller to store once the target revision is the current one.
 async fn sync_realize(
     repository: Arc<RepositoryContext>,
     state_current: Arc<State>,
     state_target: Arc<State>,
     options: SyncOptions,
-) -> Result<(), SyncError> {
-    shim_with_operation(repository.file_system(), false, async |operation| {
-        Box::pin(crate::fs::realize::realize_state(
-            repository,
-            operation,
-            state_current,
-            state_target,
-            options,
-        ))
-        .await
-    })
-    .await?
+) -> Result<RecordedModifiedTimes, SyncError> {
+    let (result, modified_times) =
+        shim_with_operation(repository.file_system(), false, async |operation| {
+            Box::pin(crate::fs::realize::realize_state(
+                repository,
+                operation,
+                state_current,
+                state_target,
+                options,
+            ))
+            .await
+        })
+        .await?;
+    result?;
+    Ok(modified_times)
 }
 
 #[derive(Clone)]
-pub struct SyncVerifyArgs<Operation: InstanceOperation + 'static> {
+pub struct SyncVerifyArgs {
     pub changes: Arc<Vec<NodeChange>>,
     pub repository_current: Arc<RepositoryContext>,
-    pub operation: Arc<Operation>,
+    pub operation: Arc<InstanceOperationImpl>,
     pub state_current: Arc<State>,
     pub options: Arc<SyncOptions>,
 }
 
 pub async fn sync_verify_filesystem(
     _repository: Arc<RepositoryContext>,
-    args: Arc<SyncVerifyArgs<impl InstanceOperation>>,
+    args: Arc<SyncVerifyArgs>,
 ) -> Result<Arc<Vec<NodeChange>>, SyncError> {
     crate::fs::realize::verify_filesystem_for_changes(args).await
 }
@@ -928,7 +951,8 @@ pub async fn verify_filesystem(
         ))
         .await
     })
-    .await?
+    .await
+    .map(discard_modified_times)?
 }
 
 #[derive(Default)]
@@ -988,7 +1012,8 @@ pub async fn realize_changes(
         )
         .await
     })
-    .await?
+    .await
+    .map(discard_modified_times)?
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1018,19 +1043,27 @@ pub async fn realize_conflicts(
         )
         .await
     })
-    .await?
+    .await
+    .map(discard_modified_times)?
 }
 
+/// Writes `node`'s content to `path`, collecting the modified time it lands with into
+/// `modified_times` for the caller to record once it knows the revision that leaves current.
 pub async fn realize_file(
     repository: Arc<RepositoryContext>,
-    path: &RelativePath,
+    path: RelativePath,
     node: Node,
     stats: Arc<SyncRealizeStats>,
+    modified_times: &RecordedModifiedTimes,
 ) -> Result<(), SyncError> {
-    shim_with_operation(repository.file_system(), false, async |operation| {
-        crate::fs::realize::realize_file(repository, operation, path, node, stats).await
-    })
-    .await?
+    let path = RepositoryPath::from_relative(&repository, path)?;
+    let (result, realized_times) =
+        shim_with_operation(repository.file_system(), false, async |operation| {
+            crate::fs::realize::realize_file(repository, operation, &path, node, stats).await
+        })
+        .await?;
+    modified_times.absorb(realized_times);
+    result
 }
 
 pub async fn realize_scratch_file(
@@ -1042,7 +1075,8 @@ pub async fn realize_scratch_file(
     shim_with_operation(repository.file_system(), false, async |operation| {
         crate::fs::realize::realize_scratch_file(repository, operation, path, node, stats).await
     })
-    .await?
+    .await
+    .map(discard_modified_times)?
 }
 
 pub async fn exist_merge_mine_theirs_base(absolute_path: impl AsRef<Path>) -> bool {

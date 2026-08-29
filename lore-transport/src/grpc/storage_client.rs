@@ -3,6 +3,7 @@
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use bytes::BufMut;
@@ -21,7 +22,7 @@ use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_base::types::HealResult;
 use lore_base::types::KeyType;
-use lore_base::types::RepositoryId;
+use lore_base::types::Partition;
 use lore_base::types::VerifyResult;
 use lore_error_set::prelude::*;
 use lore_proto::lore::model::v1 as model_v1;
@@ -38,6 +39,22 @@ use super::PARTITION_ID_KEY;
 use super::REPOSITORY_ID_KEY;
 use crate::error::ProtocolError;
 
+/// Translate a response's in-band `status` into a [`ProtocolError`], or `None` when the item
+/// succeeded. Absence means `OK`, so a peer that predates the field reads as success.
+fn item_status_error(
+    status: Option<&lore_proto::lore::model::v1::ItemStatus>,
+) -> Option<ProtocolError> {
+    let status = status?;
+    let code = tonic::Code::from_i32(status.code as i32);
+    if code == tonic::Code::Ok {
+        return None;
+    }
+    Some(ProtocolError::from(tonic::Status::new(
+        code,
+        status.message.clone(),
+    )))
+}
+
 const STREAM_WRITE_BUFFER_SIZE: usize = 32 * 1024;
 const INFLIGHT_COMMAND_LIMIT: usize = 10000;
 
@@ -52,7 +69,7 @@ const MAX_STREAM_REISSUES: usize = 8;
 /// Session context for gRPC metadata injection. Cached at `session_start` time.
 #[derive(Clone)]
 pub struct GrpcSessionContext {
-    pub repository: RepositoryId,
+    pub partition: Partition,
     pub correlation_id: String,
     pub auth_token: String,
 }
@@ -68,6 +85,8 @@ enum Verb {
     GetMetadata,
     Put,
     Copy,
+    GetResolved,
+    PutResolved,
 }
 
 impl Verb {
@@ -77,6 +96,8 @@ impl Verb {
             Verb::GetMetadata => "get_metadata",
             Verb::Put => "put",
             Verb::Copy => "copy",
+            Verb::GetResolved => "get_resolved",
+            Verb::PutResolved => "put_resolved",
         }
     }
 }
@@ -394,6 +415,16 @@ pub struct StorageService {
     get_streams: StreamCache<Address, (model_v1::Fragment, Bytes)>,
     put_streams: StreamCache<storage_v1::PutRequest, ()>,
     copy_streams: StreamCache<storage_v1::CopyRequest, ()>,
+    /// Correlates resolved requests with their responses; never handed out as zero, which the
+    /// server treats as uncorrelatable and stream-fatal.
+    resolved_counter: AtomicU64,
+    /// The resolved verbs correlate by `request_id`, not by address: one key can resolve to any
+    /// content, so the address is an answer rather than a question. They carry their own reader
+    /// instead of `pump_responses`.
+    get_resolved_streams:
+        StreamCache<storage_v1::GetResolvedRequest, Arc<storage_v1::GetResolvedResponse>>,
+    put_resolved_streams:
+        StreamCache<storage_v1::PutResolvedRequest, Arc<storage_v1::PutResolvedResponse>>,
     get_put_limiter: Semaphore,
 }
 
@@ -401,11 +432,11 @@ fn inject_metadata<T>(request: &mut tonic::Request<T>, ctx: &GrpcSessionContext)
     let md = request.metadata_mut();
     md.insert_bin(
         PARTITION_ID_KEY,
-        tonic::metadata::BinaryMetadataValue::from_bytes(ctx.repository.data()),
+        tonic::metadata::BinaryMetadataValue::from_bytes(ctx.partition.data()),
     );
     md.insert_bin(
         REPOSITORY_ID_KEY,
-        tonic::metadata::BinaryMetadataValue::from_bytes(ctx.repository.data()),
+        tonic::metadata::BinaryMetadataValue::from_bytes(ctx.partition.data()),
     );
     if !ctx.correlation_id.is_empty()
         && let Ok(val) = MetadataValue::from_str(&ctx.correlation_id)
@@ -427,6 +458,9 @@ impl StorageService {
             get_streams: StreamCache::new(),
             put_streams: StreamCache::new(),
             copy_streams: StreamCache::new(),
+            resolved_counter: AtomicU64::new(0),
+            get_resolved_streams: StreamCache::new(),
+            put_resolved_streams: StreamCache::new(),
             get_put_limiter: Semaphore::new(INFLIGHT_COMMAND_LIMIT),
         }
     }
@@ -437,6 +471,10 @@ impl StorageService {
         self.get_streams.remove(session_id, Verb::GetMetadata);
         self.put_streams.remove(session_id, Verb::Put);
         self.copy_streams.remove(session_id, Verb::Copy);
+        self.get_resolved_streams
+            .remove(session_id, Verb::GetResolved);
+        self.put_resolved_streams
+            .remove(session_id, Verb::PutResolved);
     }
 
     pub async fn get(
@@ -624,14 +662,14 @@ impl StorageService {
         &self,
         session_id: u32,
         ctx: &GrpcSessionContext,
-        source_repository: RepositoryId,
+        source_partition: Partition,
         source_address: Address,
         target_context: Context,
     ) -> Result<(), ProtocolError> {
         lore_debug!(
-            "gRPC copy fragment: {} from repository {} (target context {})",
+            "gRPC copy fragment: {} from partition {} (target context {})",
             source_address,
-            source_repository,
+            source_partition,
             target_context
         );
 
@@ -642,7 +680,7 @@ impl StorageService {
             .internal("permit acquire")?;
 
         let request = storage_v1::CopyRequest {
-            source_repository_id: Bytes::copy_from_slice(source_repository.data()),
+            source_repository_id: Bytes::copy_from_slice(source_partition.data()),
             source_address: Some(source_address.into()),
             target_context: Bytes::copy_from_slice(zerocopy::IntoBytes::as_bytes(&target_context)),
         };
@@ -749,6 +787,293 @@ impl StorageService {
     /// A failure to open the RPC keeps its real status rather than becoming a disconnect: it
     /// applies equally to everything queued behind it, and an `Unauthenticated` or
     /// `Unimplemented` there should reach the caller instead of being replayed.
+    /// Reader for a resolved stream, correlating by `request_id`.
+    ///
+    /// `pump_responses` keys on the address the server echoes back, which the resolved verbs
+    /// cannot use: the address is what the request is asking for, not what identifies it. The
+    /// `opened` flag and the drain on exit follow the same contract as the address-keyed verbs,
+    /// so a stream that dies mid-flight fails its waiters rather than leaving them parked.
+    pub async fn get_resolved(
+        &self,
+        session_id: u32,
+        ctx: &GrpcSessionContext,
+        key: &Hash,
+        context: &Context,
+        flags: u32,
+    ) -> Result<(Hash, Fragment, Bytes), ProtocolError> {
+        let key_address = Address {
+            hash: *key,
+            context: *context,
+        };
+        lore_debug!("gRPC get_resolved key: {}", key_address);
+
+        let request_id = self
+            .resolved_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let request = storage_v1::GetResolvedRequest {
+            request_id,
+            key: Some(key_address.into()),
+            flags,
+        };
+
+        let _permit = self
+            .get_put_limiter
+            .acquire()
+            .await
+            .internal("permit acquire")?;
+
+        let res = self
+            .get_resolved_streams
+            .request((session_id, Verb::GetResolved), request, || {
+                self.spawn_get_resolved_stream(ctx)
+            })
+            .await?;
+
+        if res.resolved.len() != size_of::<Hash>() {
+            lore_error!(
+                "Invalid get_resolved response, resolved hash is {} bytes, expected {}",
+                res.resolved.len(),
+                size_of::<Hash>()
+            );
+            return Err(ProtocolError::internal(
+                "get_resolved: Invalid resolved hash length",
+            ));
+        }
+
+        let Some(fragment) = res.fragment else {
+            lore_error!("Invalid get_resolved response, missing fragment");
+            return Err(ProtocolError::internal("get_resolved: Missing fragment"));
+        };
+
+        let fragment = Fragment {
+            flags: fragment.flags,
+            size_payload: fragment.size_payload,
+            size_content: fragment.size_content,
+        };
+
+        if let Err(reason) = lore_base::types::validate_fragment_response(&fragment) {
+            lore_error!("Invalid fragment in get_resolved response {fragment:?}: {reason}");
+            return Err(ProtocolError::internal(format!(
+                "get_resolved: invalid fragment: {reason}"
+            )));
+        }
+        if res.payload.len() != fragment.size_payload as usize {
+            lore_error!(
+                "Fragment payload is invalid in get_resolved response: {} bytes, expected {}",
+                res.payload.len(),
+                fragment.size_payload
+            );
+            return Err(ProtocolError::internal("get_resolved: Invalid payload"));
+        }
+
+        Ok((Hash::from(&res.resolved[..]), fragment, res.payload.clone()))
+    }
+
+    pub async fn put_resolved(
+        &self,
+        session_id: u32,
+        ctx: &GrpcSessionContext,
+        key: &Hash,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<(), ProtocolError> {
+        lore_debug!("gRPC put_resolved key: {} -> {}", key, address);
+
+        let request_id = self
+            .resolved_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let request = storage_v1::PutResolvedRequest {
+            request_id,
+            key: Bytes::from_owner(*key),
+            address: Some(address.into()),
+            fragment: Some(fragment.into()),
+            payload: payload.unwrap_or_default(),
+        };
+
+        let _permit = self
+            .get_put_limiter
+            .acquire()
+            .await
+            .internal("permit acquire")?;
+
+        self.put_resolved_streams
+            .request((session_id, Verb::PutResolved), request, || {
+                self.spawn_put_resolved_stream(ctx)
+            })
+            .await
+            .map(|_| ())
+    }
+
+    fn spawn_get_resolved_stream(
+        &self,
+        ctx: &GrpcSessionContext,
+    ) -> StreamHandle<storage_v1::GetResolvedRequest, Arc<storage_v1::GetResolvedResponse>> {
+        let mut client = StorageServiceClient::new(self.connection.channel());
+        let (tx, mut rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
+        let handle = Arc::new(StreamState {
+            sender: tx,
+            opened: AtomicBool::new(false),
+        });
+        let state = handle.clone();
+        let pending = Arc::new(DashMap::<
+            u64,
+            oneshot::Sender<Result<Arc<storage_v1::GetResolvedResponse>, ProtocolError>>,
+        >::new());
+
+        let request_pending = pending.clone();
+        let requests = async_stream::stream! {
+            while let Some((request, sender)) = rx.recv().await {
+                let request: storage_v1::GetResolvedRequest = request;
+                request_pending.insert(request.request_id, sender);
+                yield request;
+            }
+        };
+
+        let ctx = ctx.clone();
+        lore_spawn_net!(async move {
+            let mut req = tonic::Request::new(requests);
+            inject_metadata(&mut req, &ctx);
+
+            let drain = |err: ProtocolError| {
+                let ids: Vec<u64> = pending.iter().map(|entry| *entry.key()).collect();
+                for id in ids {
+                    if let Some((_, sender)) = pending.remove(&id) {
+                        let _ = sender.send(Err(err.clone()));
+                    }
+                }
+            };
+
+            let mut responses = match client.get_resolved(req).await {
+                Ok(response) => {
+                    state.opened.store(true, Ordering::Relaxed);
+                    response.into_inner()
+                }
+                Err(status) => {
+                    lore_debug!("{} request failed: {status}", Verb::GetResolved.label());
+                    drain(ProtocolError::from(status));
+                    return;
+                }
+            };
+
+            while let Some(response) = responses.next().await {
+                match response {
+                    Ok(response) => {
+                        let Some((_, sender)) = pending.remove(&response.request_id) else {
+                            lore_error!(
+                                "{} unexpected result for request_id {}",
+                                Verb::GetResolved.label(),
+                                response.request_id
+                            );
+                            continue;
+                        };
+                        let result = match item_status_error(response.status.as_ref()) {
+                            Some(err) => Err(err),
+                            None => Ok(Arc::new(response)),
+                        };
+                        let _ = sender.send(result);
+                    }
+                    Err(status) => {
+                        drain(ProtocolError::from(status));
+                        return;
+                    }
+                }
+            }
+
+            drain(ProtocolError::internal(
+                "get_resolved: stream closed before responding",
+            ));
+        });
+
+        handle
+    }
+
+    /// See [`StorageService::spawn_get_resolved_stream`]; the write side, same correlation.
+    fn spawn_put_resolved_stream(
+        &self,
+        ctx: &GrpcSessionContext,
+    ) -> StreamHandle<storage_v1::PutResolvedRequest, Arc<storage_v1::PutResolvedResponse>> {
+        let mut client = StorageServiceClient::new(self.connection.channel());
+        let (tx, mut rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
+        let handle = Arc::new(StreamState {
+            sender: tx,
+            opened: AtomicBool::new(false),
+        });
+        let state = handle.clone();
+        let pending = Arc::new(DashMap::<
+            u64,
+            oneshot::Sender<Result<Arc<storage_v1::PutResolvedResponse>, ProtocolError>>,
+        >::new());
+
+        let request_pending = pending.clone();
+        let requests = async_stream::stream! {
+            while let Some((request, sender)) = rx.recv().await {
+                let request: storage_v1::PutResolvedRequest = request;
+                request_pending.insert(request.request_id, sender);
+                yield request;
+            }
+        };
+
+        let ctx = ctx.clone();
+        lore_spawn_net!(async move {
+            let mut req = tonic::Request::new(requests);
+            inject_metadata(&mut req, &ctx);
+
+            let drain = |err: ProtocolError| {
+                let ids: Vec<u64> = pending.iter().map(|entry| *entry.key()).collect();
+                for id in ids {
+                    if let Some((_, sender)) = pending.remove(&id) {
+                        let _ = sender.send(Err(err.clone()));
+                    }
+                }
+            };
+
+            let mut responses = match client.put_resolved(req).await {
+                Ok(response) => {
+                    state.opened.store(true, Ordering::Relaxed);
+                    response.into_inner()
+                }
+                Err(status) => {
+                    lore_debug!("{} request failed: {status}", Verb::PutResolved.label());
+                    drain(ProtocolError::from(status));
+                    return;
+                }
+            };
+
+            while let Some(response) = responses.next().await {
+                match response {
+                    Ok(response) => {
+                        let Some((_, sender)) = pending.remove(&response.request_id) else {
+                            lore_error!(
+                                "{} unexpected result for request_id {}",
+                                Verb::PutResolved.label(),
+                                response.request_id
+                            );
+                            continue;
+                        };
+                        let result = match item_status_error(response.status.as_ref()) {
+                            Some(err) => Err(err),
+                            None => Ok(Arc::new(response)),
+                        };
+                        let _ = sender.send(result);
+                    }
+                    Err(status) => {
+                        drain(ProtocolError::from(status));
+                        return;
+                    }
+                }
+            }
+
+            drain(ProtocolError::internal(
+                "put_resolved: stream closed before responding",
+            ));
+        });
+
+        handle
+    }
+
     fn spawn_get_stream(
         &self,
         ctx: &GrpcSessionContext,
@@ -1041,6 +1366,42 @@ mod tests {
             Err(Status::unimplemented("not used by this test"))
         }
 
+        type GetResolvedStream = ResponseStream<storage_v1::GetResolvedResponse>;
+
+        async fn get_resolved(
+            &self,
+            request: Request<Streaming<storage_v1::GetResolvedRequest>>,
+        ) -> Result<Response<Self::GetResolvedStream>, Status> {
+            let mut requests = request.into_inner();
+            let stream = async_stream::stream! {
+                while let Some(Ok(req)) = requests.next().await {
+                    yield Ok(storage_v1::GetResolvedResponse {
+                        request_id: req.request_id,
+                        ..Default::default()
+                    });
+                }
+            };
+            Ok(Response::new(Box::pin(stream) as Self::GetResolvedStream))
+        }
+
+        type PutResolvedStream = ResponseStream<storage_v1::PutResolvedResponse>;
+
+        async fn put_resolved(
+            &self,
+            request: Request<Streaming<storage_v1::PutResolvedRequest>>,
+        ) -> Result<Response<Self::PutResolvedStream>, Status> {
+            let mut requests = request.into_inner();
+            let stream = async_stream::stream! {
+                while let Some(Ok(req)) = requests.next().await {
+                    yield Ok(storage_v1::PutResolvedResponse {
+                        request_id: req.request_id,
+                        ..Default::default()
+                    });
+                }
+            };
+            Ok(Response::new(Box::pin(stream) as Self::PutResolvedStream))
+        }
+
         type PutStream = ResponseStream<storage_v1::PutResponse>;
 
         async fn put(
@@ -1106,7 +1467,7 @@ mod tests {
 
     fn test_context() -> GrpcSessionContext {
         GrpcSessionContext {
-            repository: RepositoryId::from(Context::from([0x11u8; 16])),
+            partition: Partition::from(Context::from([0x11u8; 16])),
             correlation_id: "rotation-test".to_string(),
             auth_token: String::new(),
         }
@@ -1385,6 +1746,7 @@ mod tests {
             client: StorageService::new(connection.clone()),
             auth_url: String::new(),
             identity: String::new(),
+            credentials: Arc::new(super::super::SuppliedCredentials::default()),
             session_counter: std::sync::atomic::AtomicU32::new(1),
             sessions: DashMap::new(),
         };

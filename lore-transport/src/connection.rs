@@ -74,26 +74,85 @@ pub fn add(scheme: &str, protocol: Arc<dyn Protocol>) -> Result<(), ProtocolErro
     Ok(())
 }
 
+/// Whether the connection was opened for a call working from credentials it
+/// supplied. Part of the key so the two never share: a call that supplies none
+/// is asking to be authorized the usual way, and must not end up presenting
+/// another call's credential, nor hand its own store-resolved one to a call that
+/// supplied its own. A boolean rather than the credential itself, because
+/// rotating a supplied token must not cost a new connection -- the shared
+/// [`SuppliedCredentials`] carries a rotation within one mode.
+type FromSuppliedCredentials = bool;
+
 #[allow(clippy::type_complexity)]
-/// Connections are keyed by `(remote_url, identity)`. Storage uses per-session auth,
+/// Connections are keyed by `(remote_url, identity, from_supplied_credentials)`. Storage uses per-session auth,
 /// and non-storage services (revision, admin, lock) are created lazily per-repository
 /// with per-repository authz tokens.
-static CONNECTION_MAP: Mutex<Option<HashMap<(String, String), Arc<Connection>>>> = Mutex::new(None);
+static CONNECTION_MAP: Mutex<
+    Option<HashMap<(String, String, FromSuppliedCredentials), Arc<Connection>>>,
+> = Mutex::new(None);
 
-pub fn find_connection(remote_url: &str, identity: &str) -> Option<Arc<Connection>> {
+/// Whether a cached connection answers for `remote_url` in this mode, for the
+/// fallback that serves a caller who has not resolved an identity yet.
+///
+/// The mode has to match even here: a call working from the token store must not
+/// be handed a connection opened for one that supplied its own credentials, and
+/// the fallback is the one path that does not compare the whole key.
+/// Whether a lookup naming no identity may settle for matching on URL and mode
+/// alone, rather than on the full key.
+///
+/// Only a call working from the token store may. The identity it will resolve is
+/// deterministic for a given URL and store, so any entry under that URL is the
+/// one it would have opened anyway.
+///
+/// A call that supplied its own credentials is the opposite case: whose
+/// connection sits under that URL depends on whose token opened it, and the URL
+/// says nothing about that. Reusing it would run this call against the previous
+/// caller's connection and be authorized as *their* identity -- refusing to write
+/// this call's credentials to it does not help, because the connection is still
+/// the one returned. The identity is knowable here, since `connect_impl` resolves
+/// it from the supplied token, so such a call goes and resolves it and matches on
+/// the exact key instead of guessing.
+fn may_match_on_url_alone(
+    identity: &str,
+    from_supplied_credentials: FromSuppliedCredentials,
+) -> bool {
+    identity.is_empty() && !from_supplied_credentials
+}
+
+fn matches_url_and_mode(
+    key: &(String, String, FromSuppliedCredentials),
+    remote_url: &str,
+    from_supplied_credentials: FromSuppliedCredentials,
+) -> bool {
+    let (url, _identity, supplied) = key;
+    url == remote_url && *supplied == from_supplied_credentials
+}
+
+pub fn find_connection(
+    remote_url: &str,
+    identity: &str,
+    from_supplied_credentials: FromSuppliedCredentials,
+) -> Option<Arc<Connection>> {
     let mut map = CONNECTION_MAP.lock();
     let map = map.as_mut()?;
 
-    // When the caller supplies an identity, require an exact key match. This is the
-    // hot path after the first auth exchange has cached the resolved entry.
-    if !identity.is_empty() {
-        let key = (remote_url.to_string(), identity.to_string());
-        if let Some(connection) = map.get(&key) {
-            if !connection.stale.load(Ordering::Relaxed) {
-                return Some(connection.clone());
-            }
-            map.remove(&key);
+    // An exact key match, which is the hot path once the first auth exchange has
+    // cached the resolved entry. An identity-less call takes this too: it only
+    // matches an entry that also resolved no identity, such as one opened against
+    // a server that does not authenticate.
+    let key = (
+        remote_url.to_string(),
+        identity.to_string(),
+        from_supplied_credentials,
+    );
+    if let Some(connection) = map.get(&key) {
+        if !connection.stale.load(Ordering::Relaxed) {
+            return Some(connection.clone());
         }
+        map.remove(&key);
+    }
+
+    if !may_match_on_url_alone(identity, from_supplied_credentials) {
         return None;
     }
 
@@ -103,17 +162,30 @@ pub fn find_connection(remote_url: &str, identity: &str) -> Option<Arc<Connectio
     // re-enters `connect_impl` and re-issues `EnvironmentService/Get` even though
     // the Connection would be reused by the inner lookup after auth_exchange.
     map.iter()
-        .find(|((u, _), c)| u == remote_url && !c.stale.load(Ordering::Relaxed))
+        .find(|(key, c)| {
+            matches_url_and_mode(key, remote_url, from_supplied_credentials)
+                && !c.stale.load(Ordering::Relaxed)
+        })
         .map(|(_, c)| c.clone())
 }
 
-pub fn add_connection(remote_url: &str, identity: &str, connection: Arc<Connection>) {
+pub fn add_connection(
+    remote_url: &str,
+    identity: &str,
+    from_supplied_credentials: FromSuppliedCredentials,
+    connection: Arc<Connection>,
+) {
+    let key = (
+        remote_url.to_string(),
+        identity.to_string(),
+        from_supplied_credentials,
+    );
     let mut map = CONNECTION_MAP.lock();
     if let Some(map) = map.as_mut() {
-        map.insert((remote_url.to_string(), identity.to_string()), connection);
+        map.insert(key, connection);
     } else {
         let mut hashmap = HashMap::new();
-        hashmap.insert((remote_url.to_string(), identity.to_string()), connection);
+        hashmap.insert(key, connection);
         map.replace(hashmap);
     }
 }
@@ -173,37 +245,80 @@ pub fn parse(remote_url: &str) -> Result<(Url, Arc<dyn Protocol>), ProtocolError
         .internal_with(|| format!("remote {remote_url} is invalid"))?;
 
     let protocol = parsed_url.scheme();
-    let protocol = find(protocol).internal_with(|| format!("remote {remote_url} is invalid"))?;
+    let protocol = find(protocol)
+        .forward_with::<ProtocolError, _>(|| format!("remote {remote_url} is invalid"))?;
 
     Ok((parsed_url, protocol))
 }
 
+/// Whether a failed `session_start` settles the question for this connection's identity, so asking
+/// again before the identity changes is a round trip that can only fail the same way.
+///
+/// Only a refusal does. Everything else — a disconnect, backpressure, an internal fault — says the
+/// answer was not obtained rather than that it is no.
+fn refusal_is_final(err: &ProtocolError) -> bool {
+    err.is_not_authorized() || err.is_not_authenticated()
+}
+
+/// `identity_token` and `access_token` are the credentials the caller supplied
+/// for this call, empty when they supplied none. A reused connection adopts
+/// them, so the services it already built -- and the background token refreshers
+/// -- present what this call supplied rather than a credential a previous call
+/// left behind. See [`SuppliedCredentials`].
 pub async fn connect(
     remote_url: &str,
     identity: &str,
     repository: RepositoryId,
     max_connections: usize,
+    identity_token: &str,
+    access_token: &str,
 ) -> Result<Arc<Connection>, ProtocolError> {
     let (remote_url, protocol) = parse(remote_url)?;
 
     // Try early out by reusing a known existing connection
     let identity = identity.to_string();
-    if let Some(connection) = find_connection(remote_url.as_str(), identity.as_str()) {
+    let from_supplied_credentials = !identity_token.is_empty() || !access_token.is_empty();
+    if let Some(connection) = find_connection(
+        remote_url.as_str(),
+        identity.as_str(),
+        from_supplied_credentials,
+    ) {
+        // A match with credentials to adopt is a match on the full key -- see
+        // `may_match_on_url_alone` -- so this writes to the connection belonging
+        // to the identity the call acts as. The check restates that at the point
+        // of the write rather than relying on the lookup for it.
+        if !identity.is_empty() {
+            connection.credentials.update(identity_token, access_token);
+        }
         return Ok(connection);
     }
 
+    let identity_token = identity_token.to_string();
+    let access_token = access_token.to_string();
     Box::pin(async move {
-        connect_impl(protocol, remote_url, identity, repository, max_connections).await
+        connect_impl(
+            protocol,
+            remote_url,
+            identity,
+            repository,
+            max_connections,
+            identity_token,
+            access_token,
+        )
+        .await
     })
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn connect_impl(
     protocol: Arc<dyn Protocol>,
     remote_url: Url,
     identity: String,
     repository: RepositoryId,
     max_connections: usize,
+    identity_token: String,
+    access_token: String,
 ) -> Result<Arc<Connection>, ProtocolError> {
     let remote_domain = lore_credential::domain_from_url_or_url(&remote_url);
 
@@ -217,6 +332,7 @@ async fn connect_impl(
         .get()
         .await
         .forward::<ProtocolError>("failed to get environment config")?;
+    lore_debug!("Server environment config from {remote_url}: {environment:?}");
 
     let auth_url = environment
         .endpoint
@@ -228,7 +344,15 @@ async fn connect_impl(
     if !auth_url.is_empty() {
         // Ensure we are authenticated if there is an auth url defined in the environment
         if identity.is_empty() {
-            let (_, _, resolved) = auth_exchange(&auth_url, &remote_domain, "", repository).await;
+            let (_, _, resolved) = auth_exchange(
+                &auth_url,
+                &remote_domain,
+                "",
+                repository,
+                &identity_token,
+                &access_token,
+            )
+            .await;
             identity = resolved;
 
             if identity.is_empty() {
@@ -241,27 +365,59 @@ async fn connect_impl(
                 }
                 return Err(ProtocolError::from(lore_base::error::NotAuthenticated));
             }
-        } else {
+        } else if access_token.is_empty() {
+            // With an access token there is no authentication token to find:
+            // the caller authorizes with what they supplied, and the services
+            // that need an authentication token fail where they use it rather
+            // than failing the whole connection here.
             lore_credential::token_store::load_user_token(
                 &auth_url,
                 &identity,
                 lore_credential::token_store::tokens_only_for_recipient_domain(
                     remote_domain.clone(),
                 ),
+                &identity_token,
+                &access_token,
             )
             .await
-            .internal("loading user token")?;
+            .map_err(|err| {
+                // A configured identity with no stored token is the normal
+                // logged-out state (login saves the identity to the repo
+                // config; logout removes only the tokens) — report it as
+                // NotAuthenticated rather than an internal failure.
+                if err.is_token_not_found() {
+                    lore_debug!("No token stored for identity {identity} at {auth_url}");
+                    ProtocolError::from(lore_base::error::NotAuthenticated)
+                } else {
+                    ProtocolError::internal_with_context(err, "loading user token")
+                }
+            })?;
         }
     }
 
-    if let Some(connection) = find_connection(remote_url.as_str(), identity.as_str()) {
+    let from_supplied_credentials = !identity_token.is_empty() || !access_token.is_empty();
+    if let Some(connection) = find_connection(
+        remote_url.as_str(),
+        identity.as_str(),
+        from_supplied_credentials,
+    ) {
+        // As above. An unauthenticated server leaves the identity unresolved even
+        // here, and that entry is shared with every other call that resolved none.
+        if !identity.is_empty() {
+            connection
+                .credentials
+                .update(&identity_token, &access_token);
+        }
         return Ok(connection);
     }
+
+    let credentials = Arc::new(SuppliedCredentials::new(&identity_token, &access_token));
 
     let connection = Arc::new(Connection {
         remote_url: remote_url.clone(),
         auth_url: auth_url.clone(),
         identity: identity.clone(),
+        credentials: credentials.clone(),
         protocol: protocol.clone(),
         environment,
         storage_ready: ServiceReady::new(),
@@ -299,11 +455,18 @@ async fn connect_impl(
             if !repository.is_zero() {
                 if !auth_url.is_empty() {
                     lore_trace!("Token exchange for identity {identity} for {auth_url}");
-                    if let Err(err) =
-                        auth::exchange::exchange(&auth_url, &identity, repository, remote_domain)
-                            .await
-                            .inspect_err(|err| lore_debug!("Auth exchange failed: {err}"))
-                            .forward::<ProtocolError>("authorization failure")
+                    let (identity_token, access_token) = connection.credentials().tokens();
+                    if let Err(err) = auth::exchange::exchange(
+                        &auth_url,
+                        &identity,
+                        repository,
+                        remote_domain,
+                        &identity_token,
+                        &access_token,
+                    )
+                    .await
+                    .inspect_err(|err| lore_debug!("Auth exchange failed: {err}"))
+                    .forward::<ProtocolError>("authorization failure")
                     {
                         connection.storage_ready.complete(Err(err.clone()));
                         connection.revision_ready.complete(Err(err.clone()));
@@ -359,6 +522,7 @@ async fn connect_impl(
                             identity.as_str(),
                             repository,
                             index,
+                            connection.credentials(),
                         )
                         .await;
                     match result {
@@ -419,6 +583,7 @@ async fn connect_impl(
                                 auth_url.as_str(),
                                 identity.as_str(),
                                 repository,
+                                connection.credentials(),
                             )
                             .await;
                         match result {
@@ -449,6 +614,7 @@ async fn connect_impl(
                                 auth_url.as_str(),
                                 identity.as_str(),
                                 repository,
+                                connection.credentials(),
                             )
                             .await;
                         match result {
@@ -482,6 +648,7 @@ async fn connect_impl(
                             repository_service_url.as_str(),
                             auth_url.as_str(),
                             identity.as_str(),
+                            connection.credentials(),
                         )
                         .await;
                     match result {
@@ -507,9 +674,108 @@ async fn connect_impl(
         });
     }
 
-    add_connection(remote_url.as_str(), identity.as_str(), connection.clone());
+    add_connection(
+        remote_url.as_str(),
+        identity.as_str(),
+        from_supplied_credentials,
+        connection.clone(),
+    );
 
     Ok(connection)
+}
+
+/// The credentials a call supplied, shared by everything a connection builds.
+///
+/// Read at the moment of use rather than captured when the connection opened,
+/// because a long-lived process rotates tokens while the connection outlives any
+/// one of them, and both transports check authorization against whatever the
+/// client presents at the time: gRPC verifies the header on every request, and
+/// storage verifies at `session_start`. A credential snapshot taken at open
+/// would go stale and could not be replaced without dropping the connection.
+///
+/// Empty strings mean the caller supplied nothing and credentials are resolved
+/// the usual way.
+#[derive(Debug)]
+pub struct SuppliedCredentials {
+    tokens: parking_lot::RwLock<(String, String)>,
+    /// Bumped whenever the pair changes, so the background refreshers can act on
+    /// a rotation instead of waiting out their interval. A `watch` rather than a
+    /// `Notify` because a connection has one refresher per authorization it
+    /// holds -- the repository service, each repository, each custom resource --
+    /// and every one of them has to see the change. `notify_one` would wake a
+    /// single refresher, and `notify_waiters` would miss any that happened to be
+    /// mid-exchange; a `watch` receiver keeps the pending change until it is read.
+    generation: tokio::sync::watch::Sender<u64>,
+}
+
+impl Default for SuppliedCredentials {
+    /// No credentials supplied: everything is resolved the usual way.
+    fn default() -> Self {
+        Self::new("", "")
+    }
+}
+
+impl SuppliedCredentials {
+    pub fn new(identity_token: &str, access_token: &str) -> Self {
+        Self {
+            tokens: parking_lot::RwLock::new((
+                identity_token.to_string(),
+                access_token.to_string(),
+            )),
+            generation: tokio::sync::watch::Sender::new(0),
+        }
+    }
+
+    /// The credentials to derive a token from, and a handle reporting when they
+    /// are replaced.
+    ///
+    /// Taken together on purpose. Deriving a token is slow -- it can take an
+    /// exchange with the auth service -- and the connection is already
+    /// discoverable while that runs, so a caller can rotate the credentials
+    /// in between. A `watch` receiver counts the value present at subscription as
+    /// seen, so subscribing after reading would mark that rotation seen and leave
+    /// the token derived from the stale pair standing until the next scheduled
+    /// refresh. Subscribing under the read lock closes the window: `update` takes
+    /// the write lock, so it cannot land between the two.
+    pub fn tokens_and_signal(&self) -> ((String, String), tokio::sync::watch::Receiver<u64>) {
+        let tokens = self.tokens.read();
+        let rotated = self.generation.subscribe();
+        (tokens.clone(), rotated)
+    }
+
+    /// Whether a caller supplied these credentials, as opposed to leaving them
+    /// to be resolved from the token store. Stable for the life of a connection:
+    /// a call that supplies nothing never reaches a connection opened for one
+    /// that did, and `update` ignores an empty pair.
+    pub fn from_supplied_credentials(&self) -> bool {
+        let tokens = self.tokens.read();
+        !tokens.0.is_empty() || !tokens.1.is_empty()
+    }
+
+    /// The credentials to use now, as `(identity_token, access_token)`.
+    pub fn tokens(&self) -> (String, String) {
+        self.tokens.read().clone()
+    }
+
+    /// Adopts the credentials a later call supplied, so the services this
+    /// connection already built stop presenting a credential the caller has
+    /// replaced. The most recent call to supply any wins; a call that supplies
+    /// none leaves what is there, since it is asking for the usual resolution
+    /// rather than for the connection to forget what it was given.
+    pub fn update(&self, identity_token: &str, access_token: &str) {
+        if identity_token.is_empty() && access_token.is_empty() {
+            return;
+        }
+        let mut tokens = self.tokens.write();
+        if tokens.0 != identity_token || tokens.1 != access_token {
+            lore_debug!("Adopting the credentials supplied for this call");
+            *tokens = (identity_token.to_string(), access_token.to_string());
+            drop(tokens);
+            // Only on a real change: a call repeating the credentials it already
+            // supplied costs nothing, while a rotation reaches every refresher.
+            self.generation.send_modify(|generation| *generation += 1);
+        }
+    }
 }
 
 /// Multi-waiter "set once" completion signal. Each per-service connect
@@ -565,6 +831,10 @@ pub struct Connection {
     pub remote_url: Url,
     pub auth_url: String,
     pub identity: String,
+    /// The credentials supplied for the call in progress, shared with every
+    /// service this connection built so a later call's fresher ones take effect
+    /// without reconnecting.
+    credentials: Arc<SuppliedCredentials>,
     pub environment: EnvironmentConfig,
     protocol: Arc<dyn Protocol>,
     /// Per-service readiness. Signalled by each subtask on completion (or
@@ -589,7 +859,7 @@ pub struct Connection {
     /// Pinning the pool keeps every session it owns alive across operations
     /// within a command, avoiding session start/stop churn between calls.
     /// Cleared by the caller (e.g. `repository_call`) when the API call completes.
-    session_cache: dashmap::DashMap<(RepositoryId, String), Arc<SessionPool>>,
+    session_cache: dashmap::DashMap<(Partition, String), Arc<SessionPool>>,
     connector: tokio::sync::Mutex<Option<Connector>>,
     pub stale: std::sync::atomic::AtomicBool,
 }
@@ -622,6 +892,12 @@ impl Connection {
 
     pub fn identity(&self) -> &str {
         self.identity.as_str()
+    }
+
+    /// The credentials supplied for the call in progress. Hand this to anything
+    /// that authorizes later, so it reads them at the time it needs them.
+    pub fn credentials(&self) -> &Arc<SuppliedCredentials> {
+        &self.credentials
     }
 
     /// Mark the connection failed and unregister it from the connection cache.
@@ -724,7 +1000,7 @@ impl Connection {
         Ok(connections[counter].clone())
     }
 
-    /// Creates or reuses a `SessionPool` for the given repository and correlation
+    /// Creates or reuses a `SessionPool` for the given partition and correlation
     /// ID, returning a round-robin-picked session from it. The pool is pinned in
     /// the connection's session cache so the `Weak` in `StorageConnector` stays
     /// upgradeable for subsequent calls within the same command, keeping every
@@ -732,25 +1008,62 @@ impl Connection {
     /// `release_session()` when the API call completes to release the pool.
     pub async fn session(
         self: &Arc<Self>,
-        repository: RepositoryId,
+        partition: Partition,
         correlation_id: &str,
     ) -> Result<Arc<StorageSession>, ProtocolError> {
+        Ok(self.session_pool(partition, correlation_id).await?.pick())
+    }
+
+    /// The pool of sessions for `(partition, correlation_id)`, pinned here so the
+    /// connector's `Weak` to it stays upgradeable.
+    ///
+    /// A caller that needs one session per unit of work — a commit needs one per
+    /// file — should hold the pool and [`pick`](SessionPool::pick) from it rather
+    /// than calling [`session`](Self::session) each time. Every call owns a key to
+    /// look the pool up by, twice over, so a caller in a loop allocates two strings
+    /// an iteration and every iteration hashes to the same shard of both maps.
+    pub async fn session_pool(
+        self: &Arc<Self>,
+        partition: Partition,
+        correlation_id: &str,
+    ) -> Result<Arc<SessionPool>, ProtocolError> {
         self.ensure_storage_connected().await?;
         let connector = self.storage_connector()?;
-        let (session, pool) = connector
-            .session(repository, correlation_id, self.clone())
+        let pool = connector
+            .session_pool(partition, correlation_id, self.clone())
             .await?;
-        self.session_cache
-            .insert((repository, correlation_id.to_string()), pool);
-        Ok(session)
+        self.pin_session_pool(partition, correlation_id, &pool);
+        Ok(pool)
+    }
+
+    /// Pin `pool` for `(partition, correlation_id)`, unless that is where it is
+    /// pinned already, so a caller in a loop takes the shard's read lock rather
+    /// than its write lock.
+    ///
+    /// The read guard is released before the insert: holding one across a write to
+    /// the same map deadlocks.
+    fn pin_session_pool(
+        &self,
+        partition: Partition,
+        correlation_id: &str,
+        pool: &Arc<SessionPool>,
+    ) {
+        let key = (partition, correlation_id.to_string());
+        let pinned = self
+            .session_cache
+            .get(&key)
+            .is_some_and(|entry| Arc::ptr_eq(entry.value(), pool));
+        if !pinned {
+            self.session_cache.insert(key, pool.clone());
+        }
     }
 
     /// Unpin a cached session pool so its `Weak` in `StorageConnector` can
     /// expire. The pool's `Drop` releases every `Arc<StorageSession>` it owns,
     /// each of which sends `session_stop` to the server.
-    pub fn release_session(&self, repository: RepositoryId, correlation_id: &str) {
+    pub fn release_session(&self, partition: Partition, correlation_id: &str) {
         self.session_cache
-            .remove(&(repository, correlation_id.to_string()));
+            .remove(&(partition, correlation_id.to_string()));
     }
 
     /// Drop every pinned `SessionPool`. Once no other strong refs hold the
@@ -766,30 +1079,42 @@ impl Connection {
         self.session_cache.clear();
     }
 
-    /// Ensure the server's per-connection `authorized_repos` set contains `repository`,
-    /// without leaving a session pinned. Fast-paths via the connector's
+    /// Ensure the server's per-connection `authorized_repos` set contains `partition`,
+    /// without leaving a pool pinned. Fast-paths via the connector's
     /// `authorized_partitions` cache: if a previous `session_start` already registered
-    /// `repository` on every underlying connection, no wire calls happen. Otherwise a
-    /// fresh session is started (which fans `session_start` across all connections in
+    /// `partition` on every underlying connection, no wire calls happen. Otherwise a
+    /// fresh pool is started (which fans `session_start` across all connections in
     /// parallel) and immediately released; the server keeps `authorized_repos` permanent
-    /// for the connection's lifetime, so the registration outlives the session.
+    /// for the connection's lifetime, so the registration outlives the sessions.
     pub async fn ensure_partition_authorized(
         self: &Arc<Self>,
-        repository: RepositoryId,
+        partition: Partition,
         correlation_id: &str,
     ) -> Result<(), ProtocolError> {
         self.ensure_storage_connected().await?;
         let connector = self.storage_connector()?;
-        if connector.is_partition_authorized(repository) {
+        if connector.is_partition_authorized(partition) {
             return Ok(());
         }
-        // Drive the slow path through `session()` so the `authorized_partitions` insert
-        // and the standard race-resolution / pool bookkeeping all run. We immediately
-        // drop the returned `StorageSession` and release the cache entry — the call's
+        if connector.is_partition_refused(partition) {
+            return Err(ProtocolError::from(lore_base::error::NotAuthorized));
+        }
+        // Drive the slow path through `session_pool()` so the `authorized_partitions`
+        // insert and the standard race-resolution / pool bookkeeping all run. We
+        // immediately drop the returned pool and release the cache entry — the call's
         // only purpose was to register authz, not to keep a live session.
-        let _session = self.session(repository, correlation_id).await?;
-        self.release_session(repository, correlation_id);
-        Ok(())
+        match self.session_pool(partition, correlation_id).await {
+            Ok(_pool) => {
+                self.release_session(partition, correlation_id);
+                Ok(())
+            }
+            Err(err) => {
+                if refusal_is_final(&err) {
+                    connector.mark_partition_refused(partition);
+                }
+                Err(err)
+            }
+        }
     }
 
     pub async fn revision(
@@ -808,6 +1133,7 @@ impl Connection {
                 self.auth_url.as_str(),
                 self.identity.as_str(),
                 repository,
+                &self.credentials,
             )
             .await?;
         self.revision.insert(repository, revision.clone());
@@ -840,6 +1166,7 @@ impl Connection {
                 self.auth_url.as_str(),
                 self.identity.as_str(),
                 repository,
+                &self.credentials,
             )
             .await?;
         self.admin.insert(repository, admin.clone());
@@ -862,6 +1189,7 @@ impl Connection {
                 self.auth_url.as_str(),
                 self.identity.as_str(),
                 repository,
+                &self.credentials,
             )
             .await?;
         self.lock.insert(repository, lock.clone());
@@ -870,11 +1198,14 @@ impl Connection {
 
     pub async fn connect_module(&self, module: RepositoryId) -> Result<Arc<Self>, ProtocolError> {
         // TODO(vri): UCS-19226 - Links: Connection reuse for already connected links
+        let (identity_token, access_token) = self.credentials.tokens();
         connect(
             self.remote_url.as_str(),
             self.identity.as_str(),
             module,
             MAX_STORAGE_CONNECTIONS,
+            &identity_token,
+            &access_token,
         )
         .await
     }
@@ -896,10 +1227,19 @@ impl Protocol for LoreProtocol {
         remote_url: &str,
         auth_url: &str,
         identity: &str,
-        repository: RepositoryId,
+        partition: Partition,
         _index: usize,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Storage>, ProtocolError> {
-        quic::storage(connection, remote_url, auth_url, identity, repository).await
+        quic::storage(
+            connection,
+            remote_url,
+            auth_url,
+            identity,
+            partition,
+            credentials,
+        )
+        .await
     }
 
     async fn revision(
@@ -909,8 +1249,17 @@ impl Protocol for LoreProtocol {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Revision>, ProtocolError> {
-        grpc::revision(connection, remote_url, auth_url, identity, repository).await
+        grpc::revision(
+            connection,
+            remote_url,
+            auth_url,
+            identity,
+            repository,
+            credentials,
+        )
+        .await
     }
 
     async fn repository(
@@ -919,8 +1268,9 @@ impl Protocol for LoreProtocol {
         remote_url: &str,
         auth_url: &str,
         identity: &str,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Repository>, ProtocolError> {
-        grpc::repository(connection, remote_url, auth_url, identity).await
+        grpc::repository(connection, remote_url, auth_url, identity, credentials).await
     }
 
     async fn admin(
@@ -930,8 +1280,17 @@ impl Protocol for LoreProtocol {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Admin>, ProtocolError> {
-        grpc::admin(connection, remote_url, auth_url, identity, repository).await
+        grpc::admin(
+            connection,
+            remote_url,
+            auth_url,
+            identity,
+            repository,
+            credentials,
+        )
+        .await
     }
 
     async fn lock(
@@ -941,8 +1300,17 @@ impl Protocol for LoreProtocol {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Lock>, ProtocolError> {
-        grpc::lock(connection, remote_url, auth_url, identity, repository).await
+        grpc::lock(
+            connection,
+            remote_url,
+            auth_url,
+            identity,
+            repository,
+            credentials,
+        )
+        .await
     }
 
     async fn environment(
@@ -966,11 +1334,18 @@ impl Protocol for GRPCProtocol {
         remote_url: &str,
         auth_url: &str,
         identity: &str,
-        repository: RepositoryId,
+        partition: Partition,
         index: usize,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Storage>, ProtocolError> {
         grpc::storage(
-            connection, remote_url, auth_url, identity, repository, index,
+            connection,
+            remote_url,
+            auth_url,
+            identity,
+            partition,
+            index,
+            credentials,
         )
         .await
     }
@@ -982,8 +1357,17 @@ impl Protocol for GRPCProtocol {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Revision>, ProtocolError> {
-        grpc::revision(connection, remote_url, auth_url, identity, repository).await
+        grpc::revision(
+            connection,
+            remote_url,
+            auth_url,
+            identity,
+            repository,
+            credentials,
+        )
+        .await
     }
 
     async fn repository(
@@ -992,8 +1376,9 @@ impl Protocol for GRPCProtocol {
         remote_url: &str,
         auth_url: &str,
         identity: &str,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Repository>, ProtocolError> {
-        grpc::repository(connection, remote_url, auth_url, identity).await
+        grpc::repository(connection, remote_url, auth_url, identity, credentials).await
     }
 
     async fn admin(
@@ -1003,8 +1388,17 @@ impl Protocol for GRPCProtocol {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Admin>, ProtocolError> {
-        grpc::admin(connection, remote_url, auth_url, identity, repository).await
+        grpc::admin(
+            connection,
+            remote_url,
+            auth_url,
+            identity,
+            repository,
+            credentials,
+        )
+        .await
     }
 
     async fn lock(
@@ -1014,8 +1408,17 @@ impl Protocol for GRPCProtocol {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Lock>, ProtocolError> {
-        grpc::lock(connection, remote_url, auth_url, identity, repository).await
+        grpc::lock(
+            connection,
+            remote_url,
+            auth_url,
+            identity,
+            repository,
+            credentials,
+        )
+        .await
     }
 
     async fn environment(
@@ -1032,7 +1435,210 @@ mod tests {
     use lore_base::error::*;
 
     use super::*;
+
+    /// A long-lived process rotates the credentials it supplies. The connection
+    /// outlives any one of them, so the services it already built have to see
+    /// the newest ones -- the server checks gRPC authorization on every request
+    /// and storage authorization at each session start, so what matters is what
+    /// the client presents at the time, not what it was given when it connected.
+    /// The fallback for a caller with no identity yet must not cross modes: a
+    /// call working from the token store would otherwise be handed a connection
+    /// opened for one that supplied its own credentials, and be authorized by
+    /// them. Same user either way, but each asked to be authorized a particular
+    /// way.
+    #[test]
+    fn the_no_identity_fallback_does_not_cross_credential_modes() {
+        let remote = "lores://mode-isolation.test.invalid";
+        let stored = (remote.to_string(), "alice".to_string(), false);
+        let supplied = (remote.to_string(), "alice".to_string(), true);
+
+        assert!(matches_url_and_mode(&stored, remote, false));
+        assert!(matches_url_and_mode(&supplied, remote, true));
+
+        assert!(
+            !matches_url_and_mode(&supplied, remote, false),
+            "a store-mode call must not be given a supplied-credential connection"
+        );
+        assert!(
+            !matches_url_and_mode(&stored, remote, true),
+            "a supplied-credential call must not be given a store-mode connection"
+        );
+
+        assert!(!matches_url_and_mode(
+            &stored,
+            "lores://elsewhere.invalid",
+            false
+        ));
+    }
+
+    /// A call that supplied its own credentials must never be matched on URL
+    /// alone.
+    ///
+    /// Which connection sits under a URL in that mode depends on whose token
+    /// opened it. If Alice's supplied-credential connection is cached and a
+    /// caller then supplies Bob's token, matching on the URL would run Bob's call
+    /// against Alice's connection and authorize it as Alice -- declining to write
+    /// Bob's credentials onto it does not help, since it is still the connection
+    /// the call gets. Such a call resolves its identity from the token it
+    /// supplied and matches the full key instead.
+    #[test]
+    fn a_call_supplying_credentials_is_never_matched_on_url_alone() {
+        assert!(
+            !may_match_on_url_alone("", true),
+            "an identity-less supplied-credential call must resolve its identity, \
+             not borrow whichever connection shares the URL"
+        );
+        assert!(!may_match_on_url_alone("bob", true));
+
+        // The store-mode shortcut stands: the identity such a call resolves is
+        // fixed by the URL and the store, so the entry there is its own.
+        assert!(may_match_on_url_alone("", false));
+        assert!(
+            !may_match_on_url_alone("alice", false),
+            "a named identity is matched on the full key either way"
+        );
+    }
+
+    /// The mode a connection was opened in, which keys it apart from the other.
+    #[test]
+    fn credentials_report_whether_a_caller_supplied_them() {
+        assert!(!SuppliedCredentials::default().from_supplied_credentials());
+        assert!(SuppliedCredentials::new("an-identity-token", "").from_supplied_credentials());
+        assert!(SuppliedCredentials::new("", "an-access-token").from_supplied_credentials());
+    }
+
+    #[test]
+    fn a_later_call_replaces_the_credentials_the_services_read() {
+        let credentials = SuppliedCredentials::new("first-identity", "first-access");
+        assert_eq!(
+            credentials.tokens(),
+            ("first-identity".to_string(), "first-access".to_string())
+        );
+
+        credentials.update("second-identity", "second-access");
+
+        assert_eq!(
+            credentials.tokens(),
+            ("second-identity".to_string(), "second-access".to_string()),
+            "the newest credentials are the ones handed out"
+        );
+    }
+
+    /// A rotation has to reach the refreshers, or the tokens a service client
+    /// already presents would go on being the replaced ones until the next
+    /// scheduled refresh.
+    ///
+    /// It has to reach a refresher whose signal was taken alongside the earlier
+    /// credentials too: deriving a token from them can take an exchange with the
+    /// auth service, and the connection is discoverable while that runs, so this
+    /// is the rotation most in need of reporting.
+    #[test]
+    fn replacing_the_credentials_signals_the_refreshers() {
+        let credentials = SuppliedCredentials::new("first-identity", "");
+        let ((identity_token, _), rotated) = credentials.tokens_and_signal();
+        assert_eq!(identity_token, "first-identity");
+        assert!(
+            !rotated.has_changed().expect("the sender outlives this"),
+            "nothing to report before a rotation"
+        );
+
+        credentials.update("second-identity", "");
+
+        assert!(
+            rotated.has_changed().expect("the sender outlives this"),
+            "the refreshers must be told the credentials were replaced"
+        );
+    }
+
+    /// A call repeating the credentials already in place is not a rotation, and
+    /// must not send every refresher off to re-derive tokens that have not
+    /// changed.
+    #[test]
+    fn repeating_the_same_credentials_signals_nothing() {
+        let credentials = SuppliedCredentials::new("an-identity-token", "an-access-token");
+        let (_, rotated) = credentials.tokens_and_signal();
+
+        credentials.update("an-identity-token", "an-access-token");
+        assert!(!rotated.has_changed().expect("the sender outlives this"));
+
+        // Nor does a call that supplies nothing at all.
+        credentials.update("", "");
+        assert!(!rotated.has_changed().expect("the sender outlives this"));
+    }
+
+    /// A call that supplies nothing is asking for the usual resolution, not for
+    /// the connection to forget what it was given. Clearing here would strip the
+    /// credential from every service the connection already built.
+    #[test]
+    fn a_call_supplying_nothing_leaves_the_credentials_alone() {
+        let credentials = SuppliedCredentials::new("an-identity-token", "");
+
+        credentials.update("", "");
+
+        assert_eq!(
+            credentials.tokens(),
+            ("an-identity-token".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn no_credentials_supplied_reads_as_empty() {
+        let credentials = SuppliedCredentials::default();
+        assert_eq!(credentials.tokens(), (String::new(), String::new()));
+    }
     use crate::MatchedProtocolError;
+
+    /// A copy naming a source partition asks whether it may before it tries, and a `false` costs a
+    /// `session_start`. Latching the answer bounds that at one per partition — but only for the
+    /// failure that is actually about the claim, or a disconnect would disable a legitimate source
+    /// for as long as the connection lives.
+    mod refusal_is_final {
+        use super::*;
+
+        #[test]
+        fn a_refusal_settles_it() {
+            assert!(super::super::refusal_is_final(&ProtocolError::from(
+                NotAuthorized
+            )));
+            assert!(super::super::refusal_is_final(&ProtocolError::from(
+                NotAuthenticated
+            )));
+        }
+
+        #[test]
+        fn anything_else_is_worth_asking_again() {
+            for err in [
+                ProtocolError::from(Disconnected),
+                ProtocolError::from(SlowDown),
+                ProtocolError::from(Maintenance),
+                ProtocolError::from(NotFound),
+                ProtocolError::internal("transport blew up"),
+            ] {
+                assert!(
+                    !super::super::refusal_is_final(&err),
+                    "{err:?} says the answer was not obtained, not that it is no"
+                );
+            }
+        }
+    }
+
+    /// The refusal is remembered so the round trip is paid once, and retired by the success that
+    /// proves it no longer holds.
+    #[test]
+    fn a_refusal_lasts_until_a_session_start_succeeds() {
+        let connector = crate::session::StorageConnector::new(Vec::new());
+        let partition = Partition::from([0x7au8; 16]);
+
+        assert!(!connector.is_partition_refused(partition));
+
+        connector.mark_partition_refused(partition);
+        assert!(connector.is_partition_refused(partition));
+        assert!(!connector.is_partition_authorized(partition));
+
+        connector.mark_partition_authorized(partition);
+        assert!(!connector.is_partition_refused(partition));
+        assert!(connector.is_partition_authorized(partition));
+    }
 
     #[test]
     fn not_supported_to_tonic_status() {

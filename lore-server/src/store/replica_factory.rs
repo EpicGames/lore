@@ -157,29 +157,22 @@ impl ReplicationStoreTargetFactory {
             None
         };
 
-        let rtt_ms;
-        let congestion_algorithm;
-        match peer_info.locality {
-            Locality::SameRegion => {
-                rtt_ms = 10;
-                // Communication within a region will have no packet loss
-                // so we don't need to worry about Cubic's aggressive ramp down
-                // of cwnd in the event of packet loss - we don't see it happening.
-                // The benefit of Cubic is that it only adjusts the cwnd in the event of
-                // packet loss. So quiet periods of time don't inadvertently scale down
-                // the cwnd then get blindsided by a large get/put message causing latency spikes.
-                // We want same region replication to be as fast as possible
-                congestion_algorithm = CongestionAlgorithm::Cubic;
-            }
-            Locality::OtherRegion => {
-                // todo(plockhart) configure expected_rtt_ms based off latency to replication target
-                rtt_ms = DEFAULT_EXPECTED_RTT_MS;
-                // We see packet loss in cross region communication. Bbr readjusts the cwnd within
-                // a few cycles of RTT, much faster than Cubic at recoverying from packet loss, at
-                // the expensive that periodically the internals of the algorithm ramp down cwnd
-                // based off bandwidth usage (which means quiet periods inadvertently reduce cwnd)
-                congestion_algorithm = CongestionAlgorithm::Bbr;
-            }
+        let (rtt_ms, congestion_algorithm) = match peer_info.locality {
+            // Communication within a region will have no packet loss
+            // so we don't need to worry about Cubic's aggressive ramp down
+            // of cwnd in the event of packet loss - we don't see it happening.
+            // The benefit of Cubic is that it only adjusts the cwnd in the event of
+            // packet loss. So quiet periods of time don't inadvertently scale down
+            // the cwnd then get blindsided by a large get/put message causing latency spikes.
+            // We want same region replication to be as fast as possible
+            Locality::SameRegion => (10, CongestionAlgorithm::Cubic),
+            // todo(plockhart) configure expected_rtt_ms based off latency to replication target
+            //
+            // We see packet loss in cross region communication. Bbr readjusts the cwnd within
+            // a few cycles of RTT, much faster than Cubic at recoverying from packet loss, at
+            // the expensive that periodically the internals of the algorithm ramp down cwnd
+            // based off bandwidth usage (which means quiet periods inadvertently reduce cwnd)
+            Locality::OtherRegion => (DEFAULT_EXPECTED_RTT_MS, CongestionAlgorithm::Bbr),
         };
 
         let mut factory =

@@ -292,7 +292,9 @@ async fn info_path(
                             Some(node.size as usize),
                         )
                         .await
-                        .forward::<InfoError>(&format!("Failed to hash local file: {path}"))?;
+                        .forward_with::<InfoError, _>(|| {
+                            format!("Failed to hash local file: {path}")
+                        })?;
                     }
                 }
             } else {
@@ -421,7 +423,9 @@ async fn calculate_local_filtered_size_hash(
                     Some(node.size as usize),
                 )
                 .await
-                .forward::<InfoError>(&format!("Failed to hash local file: {relative_path}"))?
+                .forward_with::<InfoError, _>(|| {
+                    format!("Failed to hash local file: {relative_path}")
+                })?
             } else {
                 Hash::default()
             };
@@ -523,7 +527,7 @@ fn calculate_local_size_recurse(
                 let mut local_size_tasks = JoinSet::new();
                 let mut list = util::fs::list_directory(absolute_path)
                     .await
-                    .internal(&format!("Failed to list directory: {relative_path}"))?;
+                    .internal_with(|| format!("Failed to list directory: {relative_path}"))?;
 
                 while let Some(entry) = list.next().await {
                     let Some(item) = util::fs::file_list_item(entry) else {

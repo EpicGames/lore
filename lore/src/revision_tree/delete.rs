@@ -568,8 +568,10 @@ async fn delete_batch(
         return Ok(());
     }
     let context = internal.repository_context.clone();
-    let planned = plan_entries(&internal.state, &context, args.entries.as_slice()).await?;
-    apply_plan(internal.state.clone(), context, planned).await
+    let access = internal.access_shared().await;
+    let state = access.state();
+    let planned = plan_entries(&state, &context, args.entries.as_slice()).await?;
+    apply_plan(state, context, planned).await
 }
 
 async fn delete_impl(
@@ -827,7 +829,7 @@ mod tests {
         for node_id in node_ids {
             let block_index = lore_revision::node::NodeBlock::index(*node_id);
             let block = internal
-                .state
+                .state_for_tests()
                 .block(internal.repository_context.clone(), block_index)
                 .await
                 .expect("the block must be readable");
@@ -1303,7 +1305,7 @@ mod tests {
     async fn file_id_of(handle: LoreRevisionTree, node_id: NodeID) -> Context {
         let internal = rt_handle::lookup(handle).expect("the handle must resolve");
         internal
-            .state
+            .state_for_tests()
             .node(internal.repository_context.clone(), node_id)
             .await
             .expect("the node must be readable")
@@ -1317,7 +1319,7 @@ mod tests {
     async fn marks_of(handle: LoreRevisionTree, node_id: NodeID) -> (u32, u16) {
         let internal = rt_handle::lookup(handle).expect("the handle must resolve");
         let node = internal
-            .state
+            .state_for_tests()
             .node(internal.repository_context.clone(), node_id)
             .await
             .expect("the node must be readable");
@@ -1377,7 +1379,7 @@ mod tests {
         let internal = rt_handle::lookup(handle).expect("the handle must resolve");
         for (ancestor, label) in [(nested, "parent"), (directory, "grandparent")] {
             let node = internal
-                .state
+                .state_for_tests()
                 .node(internal.repository_context.clone(), ancestor)
                 .await
                 .expect("the ancestor must be readable");
@@ -1823,12 +1825,16 @@ mod tests {
             |_: &u64| {},
             async move |internal: Arc<RevisionTreeInternal>, call_id: u64| {
                 let entries = vec![entry(10, doomed), entry(11, intact)];
-                let planned =
-                    plan_entries(&internal.state, &internal.repository_context, &entries).await?;
+                let planned = plan_entries(
+                    &internal.state_for_tests(),
+                    &internal.repository_context,
+                    &entries,
+                )
+                .await?;
 
                 let block_index = lore_revision::node::NodeBlock::index(doomed);
                 let block = internal
-                    .state
+                    .state_for_tests()
                     .block(internal.repository_context.clone(), block_index)
                     .await
                     .expect("the block must be readable");
@@ -1837,7 +1843,7 @@ mod tests {
                     .discard_node(block_index, lore_revision::node::Node::index(doomed));
 
                 let result = apply_plan(
-                    internal.state.clone(),
+                    internal.state_for_tests(),
                     internal.repository_context.clone(),
                     planned,
                 )

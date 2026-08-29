@@ -100,13 +100,13 @@ resource "aws_iam_role_policy" "task_dynamodb" {
         "dynamodb:DescribeTable",
         "dynamodb:TransactWriteItems",
       ]
-      Resource = [
+      Resource = concat([
         aws_dynamodb_table.fragments.arn,
-        aws_dynamodb_table.metadata.arn,
+        aws_dynamodb_table.fragment_state.arn,
         aws_dynamodb_table.mutable.arn,
         aws_dynamodb_table.locks.arn,
         "${aws_dynamodb_table.locks.arn}/index/*",
-      ]
+      ], data.aws_dynamodb_table.fragment_metadata[*].arn)
     }]
   })
 }

@@ -23,7 +23,7 @@ override_data {
 }
 
 variables {
-  container_image = "123456789012.dkr.ecr.us-west-2.amazonaws.com/loreserver:v0.8.3"
+  container_image = "123456789012.dkr.ecr.us-west-2.amazonaws.com/loreserver:v0.8.7"
   allowed_cidrs   = ["10.0.0.0/8"]
   region          = "us-west-2"
   name            = "lore"
@@ -62,8 +62,13 @@ run "storage_schemas_correct" {
   }
 
   assert {
-    condition     = aws_dynamodb_table.metadata.hash_key == "hash"
-    error_message = "Metadata table hash key must be 'hash'"
+    condition     = aws_dynamodb_table.fragment_state.hash_key == "hash"
+    error_message = "Fragment state table hash key must be 'hash'"
+  }
+
+  assert {
+    condition     = aws_dynamodb_table.fragment_state.range_key == null
+    error_message = "Fragment state table must have no range key"
   }
 
   assert {
@@ -79,6 +84,40 @@ run "storage_schemas_correct" {
   assert {
     condition     = aws_dynamodb_table.locks.range_key == "repositoryBranch"
     error_message = "Locks table range key must be 'repositoryBranch'"
+  }
+}
+
+# Container definitions are unknown until apply, so the primary's environment cannot be
+# asserted here — the lookup these runs check is what feeds it.
+run "no_fragment_metadata_table_by_default" {
+  command = plan
+
+  assert {
+    condition     = length(data.aws_dynamodb_table.fragment_metadata) == 0
+    error_message = "A new deployment must not look up a fragment metadata table"
+  }
+
+  assert {
+    condition     = output.fragment_metadata_table == null
+    error_message = "A new deployment must not configure the primary with a fragment metadata table"
+  }
+}
+
+run "existing_fragment_metadata_table_adopted" {
+  command = plan
+
+  variables {
+    fragment_metadata_table = "lore-metadata"
+  }
+
+  assert {
+    condition     = data.aws_dynamodb_table.fragment_metadata[0].name == "lore-metadata"
+    error_message = "The existing table must be looked up, not created"
+  }
+
+  assert {
+    condition     = output.fragment_metadata_table == "lore-metadata"
+    error_message = "Setting fragment_metadata_table must configure the primary to read it"
   }
 }
 

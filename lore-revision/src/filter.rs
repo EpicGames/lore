@@ -48,6 +48,61 @@ pub struct FilterLine {
 #[error_set]
 pub enum FilterError {}
 
+/// A path [`Filter::excludes`] matches against, in the forms a match reads.
+///
+/// A walk that builds a path up a component at a time asks about the buffer it
+/// builds it in; every other caller asks about a finished path. Only `excludes`
+/// is asked from both, so only `excludes` takes this.
+pub trait FilterPath {
+    /// Whether the path names nothing.
+    fn is_empty(&self) -> bool;
+
+    /// The path as it is written.
+    fn as_str(&self) -> &str;
+
+    /// The path folded to lowercase, which the globs are matched against.
+    fn as_lowercase_str(&self) -> &str;
+
+    /// The last component of the lowercase form.
+    fn name_lowercase(&self) -> &str;
+}
+
+impl FilterPath for RelativePath {
+    fn is_empty(&self) -> bool {
+        RelativePath::is_empty(self)
+    }
+
+    fn as_str(&self) -> &str {
+        RelativePath::as_str(self)
+    }
+
+    fn as_lowercase_str(&self) -> &str {
+        RelativePath::as_lowercase_str(self)
+    }
+
+    fn name_lowercase(&self) -> &str {
+        RelativePath::name_lowercase(self)
+    }
+}
+
+impl FilterPath for RelativePathBuf {
+    fn is_empty(&self) -> bool {
+        RelativePathBuf::is_empty(self)
+    }
+
+    fn as_str(&self) -> &str {
+        RelativePathBuf::as_str(self)
+    }
+
+    fn as_lowercase_str(&self) -> &str {
+        RelativePathBuf::as_lowercase_str(self)
+    }
+
+    fn name_lowercase(&self) -> &str {
+        RelativePathBuf::name_lowercase(self)
+    }
+}
+
 pub fn load(
     ignore_path: impl AsRef<Path>,
     view_path: impl AsRef<Path>,
@@ -207,7 +262,7 @@ impl FilterInstance {
             for part in path_parts.iter() {
                 subpath.push(part);
                 self.lines.push(FilterLine {
-                    glob: subpath.as_str().to_lowercase(),
+                    glob: subpath.as_lowercase_str().to_owned(),
                     negated: true,
                     directory: true,
                     generated: true,
@@ -254,7 +309,7 @@ impl FilterInstance {
     /// could at most match to no effect. Such lines are skipped before the glob
     /// match, which avoids evaluating inclusion lines while not yet excluded and
     /// exclusion lines while already excluded.
-    pub fn excludes(&self, path: &RelativePath, is_directory: bool) -> bool {
+    pub fn excludes(&self, path: &impl FilterPath, is_directory: bool) -> bool {
         if path.is_empty() || path.as_str() == "." {
             return false;
         }
@@ -340,7 +395,7 @@ bitflags! {
 bitflagsops!(FilterMode, u16);
 
 impl Filter {
-    pub fn excludes(&self, path: &RelativePath, is_directory: bool, mode: FilterMode) -> bool {
+    pub fn excludes(&self, path: &impl FilterPath, is_directory: bool, mode: FilterMode) -> bool {
         if path.is_empty() {
             return false;
         }

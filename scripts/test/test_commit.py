@@ -4,6 +4,8 @@ import logging
 import os
 
 import pytest
+from error_types import UnknownLoreError
+from lore_parsers import parse_jsonl, parse_status_json, parse_status_summary_json
 
 from lore import Lore
 
@@ -362,3 +364,94 @@ def test_commit_dry_run(new_lore_repo):
     )
 
     repo.repository_verify(offline=True)
+
+
+@pytest.mark.smoke
+def test_failed_commit_records_no_modified_times(new_lore_repo):
+    """A commit reads every file it commits and records the modified time it read each at,
+    but those times describe the revision it is building, not the one the working copy is
+    on. A commit that fails partway leaves the working copy on the previous revision, so
+    none of the times it took may answer for any file.
+
+    Both files are edited without changing size, so only a content comparison tells the
+    edits from the committed bytes. Recording per file as it is read would leave the file
+    that was fragmented before the failure answering from a time no revision backs, and the
+    edit disappears from status and from every later commit.
+    """
+    repo: Lore = new_lore_repo()
+
+    size = 4096
+    committed = "committed-first.bin"
+    removed = "removed-before-commit.bin"
+    removed_content = os.urandom(size)
+    with repo.open_file(committed, "w+b") as f:
+        f.write(os.urandom(size))
+    with repo.open_file(removed, "w+b") as f:
+        f.write(removed_content)
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    revision_before = parse_jsonl(
+        repo.status(json=True, offline=True), "repositoryStatusRevision"
+    )[-1]["revisionNumber"]
+
+    # Same sizes, new content.
+    for name in (committed, removed):
+        with repo.open_file(name, "w+b") as f:
+            f.write(os.urandom(size))
+    repo.stage(scan=True, offline=True)
+
+    # Removing a staged file fails the commit where it reads that file's metadata, after
+    # the other one has been fragmented. Unlike a killed process, this exits cleanly, so
+    # anything written to the mutable store along the way is flushed and survives.
+    os.remove(os.path.join(repo.path, removed))
+    with pytest.raises(UnknownLoreError):
+        repo.commit(offline=True)
+
+    # Put the committed bytes back. `reset` cannot do it while the file is staged, and
+    # unstaging would drop it from the retry altogether, so the content is restored
+    # directly: the file stays staged but holds what the current revision addresses, and
+    # the retry has to recognise from its content that it is not a change.
+    with repo.open_file(removed, "w+b") as f:
+        f.write(removed_content)
+
+    revision_after = parse_jsonl(
+        repo.status(json=True, offline=True), "repositoryStatusRevision"
+    )[-1]["revisionNumber"]
+    assert revision_after == revision_before, (
+        "the failed commit must not have produced a revision, "
+        f"was {revision_before}, now {revision_after}"
+    )
+
+    summary = parse_status_summary_json(
+        repo.status(scan=True, json=True, offline=True)
+    )
+    assert summary is not None, "scan must emit a repositoryStatusSummary event"
+    assert summary["mtimeMatches"] == 0, (
+        "no file may be answered by a modified time the failed commit took, as the working "
+        f"copy is still on the revision before it, got {summary}"
+    )
+
+    output = repo.commit(json=True, offline=True)
+    commit_end = parse_jsonl(output, "revisionCommitEnd")
+    assert commit_end, "commit must emit a revisionCommitEnd event"
+    count = commit_end[-1]["count"]
+    assert count["fileTotal"] == 2, (
+        f"the retry must still carry both staged files, got {count}"
+    )
+    assert count["fileModifyCount"] == 1, (
+        f"only {committed} still differs; the restored file matches the revision it is "
+        f"committed against and is not a modification, got {count}"
+    )
+
+    revision_committed = parse_jsonl(
+        repo.status(json=True, offline=True), "repositoryStatusRevision"
+    )[-1]["revisionNumber"]
+    assert revision_committed == revision_before + 1, (
+        f"the retry must produce one revision, was {revision_before}, "
+        f"now {revision_committed}"
+    )
+
+    assert not parse_status_json(repo.status(scan=True, json=True, offline=True)), (
+        "the working copy must be clean once the retry has committed"
+    )

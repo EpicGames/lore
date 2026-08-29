@@ -5,8 +5,6 @@ use std::sync::Arc;
 use lore_error_set::prelude::*;
 
 use super::MetadataErrors;
-use crate::error::LoreResultExt;
-use crate::errors::InvalidArguments;
 use crate::event;
 use crate::lore::execution_context;
 use crate::metadata;
@@ -27,13 +25,11 @@ pub async fn get_revision(
             execution_context().globals().search_location(),
         )
         .await
-        .emit_map_err(InvalidArguments {
-            reason: "invalid revision".into(),
-        })?
+        .forward::<MetadataErrors>("resolving revision")?
     } else {
         let (current_revision, _current_branch) = crate::instance::load_current_anchor(&repository)
             .await
-            .internal("deserializing current anchor")?;
+            .forward::<MetadataErrors>("deserializing current anchor")?;
         crate::instance::load_staged_revision(&repository)
             .await
             .ok()
@@ -62,13 +58,11 @@ pub async fn get_file(
             execution_context().globals().search_location(),
         )
         .await
-        .emit_map_err(InvalidArguments {
-            reason: "invalid revision".into(),
-        })?
+        .forward::<MetadataErrors>("resolving revision")?
     } else {
         let (current_revision, _current_branch) = crate::instance::load_current_anchor(&repository)
             .await
-            .internal("deserializing current anchor")?;
+            .forward::<MetadataErrors>("deserializing current anchor")?;
         crate::instance::load_staged_revision(&repository)
             .await
             .ok()

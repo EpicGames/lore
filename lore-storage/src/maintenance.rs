@@ -736,6 +736,7 @@ mod tests {
             committed_level: std::sync::atomic::AtomicUsize::new(
                 crate::local::fan_out::FAN_OUT_LEVEL_MAX,
             ),
+            flush_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             packstore: PackStore::new(Some(tempdir.to_path_buf()), 1, None),
             flush: tokio::sync::Mutex::new(JoinSet::new()),
         });

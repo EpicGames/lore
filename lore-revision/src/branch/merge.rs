@@ -12,6 +12,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
 
+use crate::MAX_CONCURRENT_TREE_TASKS;
 use crate::branch;
 use crate::branch::push::PushStatistics;
 use crate::branch::push::push_fragments;
@@ -78,6 +79,7 @@ use crate::state::LinkMergeEntry;
 use crate::state::State;
 use crate::state::StateNodeChildrenWithNameIterator;
 use crate::util::path::RelativePath;
+use crate::util::path::RelativePathBuf;
 use crate::util::serde::u8_as_bool;
 
 /// Data for the event sent when a branch merge starts.
@@ -1025,7 +1027,7 @@ async fn enumerate_eligible_links(
 
     // This loop is sequential. The per-link awaits (`node_path`, `node`,
     // `to_link_context`, `check_link_merge_eligible`) are independent and
-    // could fan out via `JoinSet`/`MAX_TASK_COUNT` for workspaces with many
+    // could fan out via `JoinSet`/`MAX_CONCURRENT_TREE_TASKS` for workspaces with many
     // links. Deferred — N is small in practice for current users.
     let mut eligible_links = Vec::new();
     for link_reference in &link_list {
@@ -1942,8 +1944,6 @@ pub async fn apply_diff(
         .await
         .forward::<MergeError>("deserializing diff base state")?;
 
-    // Queue up to a given number of parallel tasks to verify filesystem
-    const MAX_TASK_COUNT: usize = 1000;
     let mut tasks = JoinSet::new();
     let mut failure = None;
     for change in diff.changes.iter() {
@@ -1968,7 +1968,7 @@ pub async fn apply_diff(
                 .forward::<MergeError>("verifying filesystem for change")
             }
         });
-        while tasks.len() > MAX_TASK_COUNT
+        while tasks.len() > MAX_CONCURRENT_TREE_TASKS
             && let Some(result) = tasks.join_next().await
         {
             let result = result
@@ -2025,7 +2025,7 @@ pub async fn apply_diff(
                 .forward::<MergeError>("verifying filesystem for conflict")
             }
         });
-        while tasks.len() > MAX_TASK_COUNT
+        while tasks.len() > MAX_CONCURRENT_TREE_TASKS
             && let Some(result) = tasks.join_next().await
         {
             let result = result
@@ -2350,7 +2350,7 @@ pub(crate) async fn check_and_capture_dirty_for_merge(
         state_staged.clone(),
         repository.clone(),
         crate::node::ROOT_NODE,
-        RelativePath::new(),
+        RelativePathBuf::new(),
         &mut paths,
     )
     .await
@@ -3907,6 +3907,7 @@ async fn merge_into_link(
     // propagating the rehash result so no spawned leader outlives the
     // function holding references to local state.
     let rehash_tracker = std::sync::Arc::new(lore_storage::write_tracker::WriteTracker::new());
+    let modified_times = std::sync::Arc::new(crate::state::RecordedModifiedTimes::default());
     let rehash_result = commit::commit_files_and_rehash(
         repository.clone(),
         token.share(),
@@ -3917,10 +3918,12 @@ async fn merge_into_link(
         std::sync::Arc::new(std::collections::HashMap::new()),
         target_branch,
         rehash_tracker.clone(),
+        modified_times.clone(),
     )
     .await;
     let drain_result = rehash_tracker.await_all().await;
     rehash_result.forward::<MergeError>("rehashing commit")?;
+    modified_times.discard();
     drain_result.forward::<MergeError>("draining rehash tracker")?;
 
     let state_new = state_staged;
@@ -4257,6 +4260,7 @@ pub async fn merge_into(
     // propagating the rehash result so no spawned leader outlives the
     // function holding references to local state.
     let rehash_tracker = std::sync::Arc::new(lore_storage::write_tracker::WriteTracker::new());
+    let modified_times = std::sync::Arc::new(crate::state::RecordedModifiedTimes::default());
     let rehash_result = commit::commit_files_and_rehash(
         repository.clone(),
         token.share(),
@@ -4267,10 +4271,12 @@ pub async fn merge_into(
         std::sync::Arc::new(std::collections::HashMap::new()),
         current_branch,
         rehash_tracker.clone(),
+        modified_times.clone(),
     )
     .await;
     let drain_result = rehash_tracker.await_all().await;
     rehash_result.forward::<MergeError>("rehashing commit")?;
+    modified_times.discard();
     drain_result.forward::<MergeError>("draining rehash tracker")?;
     lore_debug!("Rehashed state");
 

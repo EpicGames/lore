@@ -27,6 +27,7 @@ use lore::interface::LoreRepositoryStatusArgs;
 use lore::interface::LoreRepositoryStoreImmutableQueryArgs;
 use lore::interface::LoreRepositoryVerifyFragmentArgs;
 use lore::interface::LoreRepositoryVerifyStateArgs;
+use lore::interface::LoreSharedStoreMode;
 use lore::interface::LoreString;
 use lore::repository;
 use lore::repository::LoreRepositoryDeleteArgs;
@@ -883,7 +884,11 @@ pub fn handle_repository_create(globals: LoreGlobalArgs, args: &RepositoryCreate
         repository_url: url.into(),
         id: LoreString::from(&args.id),
         description: LoreString::from(&args.description),
-        use_shared_store: args.use_shared_store as u8,
+        use_shared_store: if args.use_shared_store {
+            LoreSharedStoreMode::Enabled
+        } else {
+            LoreSharedStoreMode::Inherit
+        },
         shared_store_path: args.shared_store_path.as_ref().into(),
     };
 
@@ -996,7 +1001,11 @@ pub fn handle_repository_clone(globals: LoreGlobalArgs, args: &RepositoryCloneAr
         layer: args.layer.as_ref().into(),
         layer_metadata: args.layer_metadata.as_ref().into(),
         prefetch: args.prefetch.as_ref().into(),
-        use_shared_store: args.use_shared_store as u8,
+        use_shared_store: if args.use_shared_store {
+            LoreSharedStoreMode::Enabled
+        } else {
+            LoreSharedStoreMode::Inherit
+        },
         shared_store_path: args.shared_store_path.as_ref().into(),
         no_tracking: args.no_tracking.into(),
         root_files: LoreArray::from_vec(

@@ -58,18 +58,6 @@ def pytest_addoption(parser):
         help="The host name Lore Server has",
     )
     parser.addoption(
-        "--lore-server-creds-key-path",
-        action="store",
-        default="key.pem",
-        help="The path to key.pem in the test directory",
-    )
-    parser.addoption(
-        "--lore-server-creds-cert-path",
-        action="store",
-        default="cert.pem",
-        help="The path to cert.pem in the test directory",
-    )
-    parser.addoption(
         "--lore-remote-url",
         action="store",
         default=None,
@@ -332,13 +320,14 @@ def lore_server_executable_path(request):
 
 
 @pytest.fixture(scope="session")
-def lore_library(request):
+def lore_library_path(request):
     """
-    Loads the public Lore C API library (`liblore`) for tests that need to
+    Locates the public Lore C API library (`liblore`) for tests that need to
     observe API-level behavior the CLI does not surface. Skips if the library
-    was not built alongside the client binary.
+    was not built alongside the client binary. Returns the path rather than a
+    loaded library: tests drive it out of process via `auth_user_info_capi`.
     """
-    from lore_ffi import LoreLibrary, library_filename
+    from lore_ffi import library_filename
 
     library_path = os.getenv("LORE_LIBRARY_PATH")
     if not library_path:
@@ -352,7 +341,7 @@ def lore_library(request):
             "set LORE_LIBRARY_PATH to run C API tests"
         )
 
-    return LoreLibrary(library_path)
+    return library_path
 
 
 @pytest.fixture(scope="session")
@@ -375,6 +364,14 @@ def lore_remote_url(request, lore_main_server_ports):
     # TODO: Seems like having this set as an env var is required for repo creation?
     os.environ["LORE_REMOTE_URL"] = remote_url
     return remote_url
+
+
+@pytest.fixture(scope="session")
+def lore_grpc_target(request, lore_main_server_ports):
+    """`host:port` of the main loreserver's public gRPC endpoint, for tests that
+    call an RPC the CLI does not expose."""
+    host = request.config.getoption("--lore-server-hostname")
+    return f"{host}:{lore_main_server_ports['grpc']}"
 
 
 @pytest.fixture(scope="session")

@@ -12,6 +12,15 @@ use std::fmt;
 use lore_error_set::error_set;
 use lore_error_set::FfiError;
 
+/// Opts this test module in to `#[ffi_code(N)]`.
+///
+/// The derive expands to a reference to this name, so only a module that
+/// declares it can allocate a code — in the workspace proper that is
+/// `lore-base/src/error.rs` and nowhere else. These fixtures exercise the
+/// macro itself and their codes never reach an FFI boundary, so they declare
+/// their own marker rather than joining the registry.
+fn __ffi_code_registry_marker() {}
+
 // ---------------------------------------------------------------------------
 // Discrete error types with FfiError derive
 // ---------------------------------------------------------------------------

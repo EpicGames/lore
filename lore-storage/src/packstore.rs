@@ -96,16 +96,14 @@ impl PackStore {
                 IoDriver::global()
                     .create_dir_all(&path)
                     .await
-                    .internal(&format!(
-                        "Failed to create packstore directory {}",
-                        path.display()
-                    ))?;
+                    .internal_with(|| {
+                        format!("Failed to create packstore directory {}", path.display())
+                    })?;
             }
 
-            let paths = std::fs::read_dir(&path).internal(&format!(
-                "Failed to read packstore directory {}",
-                path.display()
-            ))?;
+            let paths = std::fs::read_dir(&path).internal_with(|| {
+                format!("Failed to read packstore directory {}", path.display())
+            })?;
             let mut packfile_count = 0;
             for entry in paths {
                 let Ok(entry) = entry else {
@@ -158,17 +156,15 @@ impl PackStore {
                 let file = IoDriver::global()
                     .open(file_path.as_path(), &file_options)
                     .await
-                    .internal(&format!(
-                        "Failed opening packstore file {}",
-                        file_path.display()
-                    ))?;
+                    .internal_with(|| {
+                        format!("Failed opening packstore file {}", file_path.display())
+                    })?;
                 let file_size = file
                     .metadata()
                     .await
-                    .internal(&format!(
-                        "Failed reading packstore file size {}",
-                        file_path.display()
-                    ))?
+                    .internal_with(|| {
+                        format!("Failed reading packstore file size {}", file_path.display())
+                    })?
                     .len();
 
                 let file = PackFile {
@@ -237,10 +233,9 @@ impl PackStore {
                 let file = IoDriver::global()
                     .open(file_path.as_path(), &file_options)
                     .await
-                    .internal(&format!(
-                        "Failed opening packstore file {}",
-                        file_path.display()
-                    ))?;
+                    .internal_with(|| {
+                        format!("Failed opening packstore file {}", file_path.display())
+                    })?;
 
                 PackFile {
                     id,

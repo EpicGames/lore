@@ -652,53 +652,38 @@ pub trait ZeroHeapAlloc<SelfType = Self>
 where
     SelfType: zerocopy::FromBytes,
 {
-    fn new_from_heap_zeroed() -> Box<Self>
+    /// Heap this type's boxed values are taken from, or `None` for the global
+    /// allocator.
+    ///
+    /// The value comes back as a [`crate::allocator::HeapBox`], which releases
+    /// it through this same allocator. That is not an implementation detail an
+    /// override may work around: a dedicated rpmalloc heap counts every thread
+    /// as its owner, so a free that skips the heap corrupts it — see
+    /// [`crate::allocator::node_block_allocator`].
+    fn heap_allocator() -> Option<&'static (dyn std::alloc::GlobalAlloc + Sync)> {
+        None
+    }
+
+    fn new_from_heap_zeroed() -> crate::allocator::HeapBox<Self>
     where
-        Self: Sized,
+        Self: Sized + zerocopy::FromBytes,
     {
-        let layout = std::alloc::Layout::new::<Self>();
-        debug_assert!(layout.size() > 0);
-
-        #[allow(clippy::undocumented_unsafe_blocks)]
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout).cast::<Self>() };
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-
-        #[allow(clippy::undocumented_unsafe_blocks)]
-        unsafe {
-            Box::from_raw(ptr)
-        }
+        crate::allocator::HeapBox::new_zeroed_in(Self::heap_allocator())
     }
 }
 
 pub trait CloneHeapAlloc: zerocopy::IntoBytes + zerocopy::Immutable {
-    fn clone_on_heap(&self) -> Box<Self>
+    /// Heap this type's boxed clones are taken from, or `None` for the global
+    /// allocator. Same contract as [`ZeroHeapAlloc::heap_allocator`].
+    fn heap_allocator() -> Option<&'static (dyn std::alloc::GlobalAlloc + Sync)> {
+        None
+    }
+
+    fn clone_on_heap(&self) -> crate::allocator::HeapBox<Self>
     where
         Self: Sized,
     {
-        let layout = std::alloc::Layout::new::<Self>();
-        debug_assert!(layout.size() > 0);
-
-        #[allow(clippy::undocumented_unsafe_blocks)]
-        let ptr = unsafe { std::alloc::alloc(layout).cast::<Self>() };
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-
-        #[allow(clippy::undocumented_unsafe_blocks)]
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.as_bytes().as_ptr(),
-                ptr.cast::<u8>(),
-                layout.size(),
-            );
-        }
-
-        #[allow(clippy::undocumented_unsafe_blocks)]
-        unsafe {
-            Box::from_raw(ptr)
-        }
+        crate::allocator::HeapBox::copy_from_in(self, <Self as CloneHeapAlloc>::heap_allocator())
     }
 }
 

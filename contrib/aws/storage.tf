@@ -68,12 +68,13 @@ resource "aws_dynamodb_table" "fragments" {
 }
 
 # =============================================================================
-# DynamoDB — Fragment metadata (hash-only key, no sort key)
+# DynamoDB — Fragment state (hash-only key, no sort key)
+# A row's presence means the hash exists; the row also carries obliteration state.
 # Key schema from lore-aws/src/store/immutable_store.rs
 # =============================================================================
 
-resource "aws_dynamodb_table" "metadata" {
-  name         = "${local.name}-metadata"
+resource "aws_dynamodb_table" "fragment_state" {
+  name         = "${local.name}-fragment-state"
   billing_mode = "PAY_PER_REQUEST"
   hash_key     = "hash"
 
@@ -85,6 +86,36 @@ resource "aws_dynamodb_table" "metadata" {
   point_in_time_recovery { enabled = true }
 
   tags = local.tags
+}
+
+# =============================================================================
+# DynamoDB — Fragment metadata (legacy, adopted rather than created)
+#
+# The fragment now travels on the S3 object, so a new deployment has no metadata
+# table and needs none. A deployment holding objects written before that change
+# still does: set var.fragment_metadata_table to the table it already has and the
+# server falls back to it for objects carrying no metadata of their own.
+#
+# This is a lookup, not a resource — the table is never created here, and the plan
+# fails if the named one does not exist.
+# =============================================================================
+
+data "aws_dynamodb_table" "fragment_metadata" {
+  count = var.fragment_metadata_table == null ? 0 : 1
+  name  = var.fragment_metadata_table
+}
+
+# Earlier revisions of this example created the metadata table themselves, as
+# aws_dynamodb_table.metadata. Dropping that resource would destroy the table on the
+# next apply, taking with it the only description of every object stored the old way.
+# This drops it from state and leaves the table standing; adopt it through
+# var.fragment_metadata_table. Delete this block once applied.
+removed {
+  from = aws_dynamodb_table.metadata
+
+  lifecycle {
+    destroy = false
+  }
 }
 
 # =============================================================================

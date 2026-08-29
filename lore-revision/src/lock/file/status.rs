@@ -139,7 +139,7 @@ pub async fn status(
     } else {
         let resolved = branch::resolve(repository.clone(), options.branch.as_str())
             .await
-            .internal("Invalid branch")?;
+            .forward::<StatusError>("Invalid branch")?;
         resolved.id
     };
 

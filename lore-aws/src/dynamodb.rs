@@ -115,9 +115,9 @@ pub struct ConditionParts {
 
 #[derive(Default)]
 pub struct ScanConfig {
-    segment: Option<i32>,
-    total_segments: Option<i32>,
-    limit: Option<i32>,
+    pub segment: Option<i32>,
+    pub total_segments: Option<i32>,
+    pub limit: Option<i32>,
 }
 
 impl ScanConfig {
@@ -261,7 +261,7 @@ impl DynamoDbImpl {
             Err(SdkError::ServiceError(err)) if err.err().is_resource_not_found_exception() => {
                 Ok(false)
             }
-            Err(e) => Err(AwsError::AwsSdkError(e)),
+            Err(e) => Err(AwsError::sdk_error(e)),
         }
     }
 
@@ -293,7 +293,7 @@ impl DynamoDbImpl {
             )
             .await
             .output
-            .map_err(AwsError::AwsSdkError)
+            .map_err(AwsError::sdk_error)
     }
 
     pub async fn batch_get_item(
@@ -408,7 +408,7 @@ impl DynamoDbImpl {
                         );
                     }
                 }
-                Err(e) => return Err(AwsError::AwsSdkError(e)),
+                Err(e) => return Err(AwsError::sdk_error(e)),
             }
         }
 
@@ -442,7 +442,7 @@ impl DynamoDbImpl {
         )
         .await
         .output
-        .map_err(AwsError::AwsSdkError)
+        .map_err(AwsError::sdk_error)
     }
 
     #[tracing::instrument(name = "DynamoDbImpl::put_item_conditional", skip_all)]
@@ -493,7 +493,7 @@ impl DynamoDbImpl {
             )
             .await
             .output
-            .map_err(AwsError::AwsSdkError)
+            .map_err(AwsError::sdk_error)
     }
 
     #[tracing::instrument(name = "DynamoDbImpl::delete_item", skip_all)]
@@ -523,7 +523,7 @@ impl DynamoDbImpl {
             )
             .await
             .output
-            .map_err(AwsError::AwsSdkError)
+            .map_err(AwsError::sdk_error)
     }
 
     #[allow(clippy::doc_markdown)]
@@ -585,7 +585,7 @@ impl DynamoDbImpl {
 
             match result.output {
                 Ok(r) => output.push(r),
-                Err(e) => return Err(AwsError::AwsSdkError(e)),
+                Err(e) => return Err(AwsError::sdk_error(e)),
             }
         }
 
@@ -694,7 +694,7 @@ impl DynamoDbImpl {
                         );
                     }
                 }
-                Err(e) => return Err(AwsError::AwsSdkError(e)),
+                Err(e) => return Err(AwsError::sdk_error(e)),
             }
         }
 
@@ -754,7 +754,7 @@ impl DynamoDbImpl {
 
                 Ok(r)
             }
-            Err(e) => return Err(AwsError::AwsSdkError(e)),
+            Err(e) => return Err(AwsError::sdk_error(e)),
         }
     }
 
@@ -793,7 +793,7 @@ impl DynamoDbImpl {
             )
             .await
             .output
-            .map_err(AwsError::AwsSdkError)?;
+            .map_err(AwsError::sdk_error)?;
 
         let items = output.items.unwrap_or_default();
         let last_evaluated_key = output.last_evaluated_key.filter(|key| !key.is_empty());

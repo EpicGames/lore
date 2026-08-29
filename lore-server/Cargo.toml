@@ -81,6 +81,8 @@ vergen = { workspace = true }
 [dev-dependencies]
 ctor = { workspace = true }
 axum-test = "18.1.0"
+rcgen = { workspace = true }
+tempfile = "3.21"
 http-body = "1.0.1"
 http-body-util = "0.1.3"
 indexmap = { workspace = true }

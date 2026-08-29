@@ -15,9 +15,8 @@ use lore_proto::lore::thin_client::v1::RevisionDiffResponse;
 use lore_proto::lore::thin_client::v1::revision_diff_response::Payload;
 use lore_revision::branch;
 use lore_revision::branch::BranchError;
-use lore_revision::change::FileAction;
-use lore_revision::change::NodeChange;
 use lore_revision::diff::diff_revision_paths;
+use lore_revision::link;
 use lore_revision::lore::BranchId;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
@@ -38,11 +37,15 @@ use tracing::warn;
 
 use super::helpers::diff_conflict_from_pair;
 use super::helpers::identifier_for_signature;
+use super::helpers::link_pin_change_to_diff_change;
 use super::helpers::node_change_to_diff_change;
 use super::helpers::resolve_to_identifier;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
+use crate::grpc::link_read_authorizer;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
@@ -113,6 +116,7 @@ pub async fn handler(
 ) -> Result<Response<RevisionDiffStream>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
+    let authorization = get_authorization(request.extensions()).ok();
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner();
 
@@ -129,11 +133,10 @@ pub async fn handler(
     let autoresolve = req.autoresolve;
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
-    let repository = Arc::new(RepositoryContext::new_server_context(
-        immutable_store,
-        mutable_store,
-        repository_id,
-    ));
+    let repository = Arc::new(
+        RepositoryContext::new_server_context(immutable_store, mutable_store, repository_id)
+            .with_link_read(link_read_authorizer(authorization)),
+    );
 
     LORE_CONTEXT
         .scope(execution, async move {
@@ -306,6 +309,24 @@ async fn run_two_way(
 ) -> Result<(), Status> {
     let (from_state, to_state) = load_state_pair(repository, from_sig, to_sig).await?;
 
+    // Compared before the header goes out so a failure aborts the call rather
+    // than truncating a stream that has already started. Streaming the content
+    // changes alone would claim no pin moved, which the consumer cannot
+    // distinguish from a pin that genuinely did not move.
+    let pin_changes = link::diff_link_pins(repository.clone(), &from_state, &to_state)
+        .await
+        .filter_slow_down()?
+        .map_err(|err| {
+            warn!(
+                {REPOSITORY_ID} = %repository.id,
+                from = %from_sig,
+                to = %to_sig,
+                ?err,
+                "Failed to compare link pins",
+            );
+            Status::internal(err.to_string())
+        })?;
+
     // Header first, before opening the producer's sender so a failure in
     // the producer setup surfaces before any header is emitted.
     let header = thin_client_v1::RevisionDiffHeader {
@@ -317,6 +338,24 @@ async fn run_two_way(
         signature_base: None,
     };
     send_header(tx, header).await?;
+
+    // Emitted ahead of the walk so a consumer sees a link before its contents.
+    let mut partitions = PartitionTable::new(repository.id);
+    for pin_change in &pin_changes {
+        let index = match partitions
+            .resolve_or_announce(pin_change.link_repository, tx)
+            .await
+        {
+            Ok(index) => index,
+            Err(SendOutcome::ReceiverDropped) => return Ok(()),
+            Err(SendOutcome::Sent) => unreachable!("resolve_or_announce returns Sent only via Ok"),
+        };
+        let payload = Payload::Change(link_pin_change_to_diff_change(pin_change, index));
+        match send_payload(tx, payload).await {
+            SendOutcome::Sent => {}
+            SendOutcome::ReceiverDropped => return Ok(()),
+        }
+    }
 
     // End-to-end streaming: bounded channel between the diff producer and
     // an adaptor loop that forwards each NodeChange onto the gRPC wire
@@ -330,8 +369,6 @@ async fn run_two_way(
     let producer = lore_spawn!(async move {
         diff_revision_paths(repo_clone, from_state, to_state, None, producer_tx).await
     });
-
-    let mut partitions = PartitionTable::new(repository.id);
     while let Some(item) = producer_rx.recv().await {
         let change = item.map_err(|err| {
             warn!(
@@ -344,14 +381,14 @@ async fn run_two_way(
             warn_error_to_status(&err, |e| Status::internal(e.to_string()))
         })?;
         let index = match partitions
-            .resolve_or_announce(surviving_repository_id(&change), tx)
+            .resolve_or_announce(change.content_repository_id(), tx)
             .await
         {
             Ok(index) => index,
             Err(SendOutcome::ReceiverDropped) => return Ok(()),
             Err(SendOutcome::Sent) => unreachable!("resolve_or_announce returns Sent only via Ok"),
         };
-        let payload = Payload::Change(node_change_to_diff_change(&change, index));
+        let payload = Payload::Change(node_change_to_diff_change(&change, index).await);
         match send_payload(tx, payload).await {
             SendOutcome::Sent => {}
             SendOutcome::ReceiverDropped => return Ok(()),
@@ -420,6 +457,8 @@ async fn run_three_way(
                 );
                 if err.is_divergent() {
                     Status::failed_precondition(err.to_string())
+                } else if err.is_invalid_arguments() {
+                    Status::invalid_argument(err.to_string())
                 } else if err.is_max_history_search_depth() {
                     Status::resource_exhausted(err.to_string())
                 } else {
@@ -485,7 +524,7 @@ async fn run_three_way(
         let payload = match item {
             DiffItem::Change(change) => {
                 let index = match partitions
-                    .resolve_or_announce(surviving_repository_id(&change), tx)
+                    .resolve_or_announce(change.content_repository_id(), tx)
                     .await
                 {
                     Ok(index) => index,
@@ -494,11 +533,11 @@ async fn run_three_way(
                         unreachable!("resolve_or_announce returns Sent only via Ok")
                     }
                 };
-                Payload::Change(node_change_to_diff_change(&change, index))
+                Payload::Change(node_change_to_diff_change(&change, index).await)
             }
             DiffItem::Conflict(pair) => {
                 let index_from = match partitions
-                    .resolve_or_announce(surviving_repository_id(&pair.0), tx)
+                    .resolve_or_announce(pair.0.content_repository_id(), tx)
                     .await
                 {
                     Ok(index) => index,
@@ -508,7 +547,7 @@ async fn run_three_way(
                     }
                 };
                 let index_to = match partitions
-                    .resolve_or_announce(surviving_repository_id(&pair.1), tx)
+                    .resolve_or_announce(pair.1.content_repository_id(), tx)
                     .await
                 {
                     Ok(index) => index,
@@ -517,7 +556,7 @@ async fn run_three_way(
                         unreachable!("resolve_or_announce returns Sent only via Ok")
                     }
                 };
-                Payload::Conflict(diff_conflict_from_pair(&pair, index_from, index_to))
+                Payload::Conflict(diff_conflict_from_pair(&pair, index_from, index_to).await)
             }
         };
         match send_payload(tx, payload).await {
@@ -699,19 +738,8 @@ impl PartitionTable {
     }
 }
 
-/// Repository of the side that survives the change: `from` for a
-/// delete, `to` otherwise. This is the partition its content lives in.
-fn surviving_repository_id(change: &NodeChange) -> RepositoryId {
-    match change.action {
-        FileAction::Delete => change.from.repository.id,
-        _ => change.to.repository.id,
-    }
-}
-
 #[cfg(test)]
 mod test {
-    use std::str::FromStr;
-
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::BranchPoint;
     use lore_proto::lore::thin_client::v1::revision_diff_request::QueryFrom;
@@ -771,7 +799,7 @@ mod test {
             .serialize(repository.clone())
             .await
             .expect("serialize metadata");
-        let state = state::State::new();
+        let state = Arc::new(state::State::new());
         state.set_parent_self(parent);
         state.set_revision_number(revision_number);
         state.set_metadata_hash(metadata_hash);
@@ -1697,65 +1725,6 @@ mod test {
         assert!(
             !table.entries.contains_key(&linked),
             "failed announcement must not poison the table",
-        );
-    }
-
-    #[tokio::test]
-    async fn surviving_repository_id_picks_from_for_delete_to_otherwise() {
-        // Construct two contexts with distinct ids; place `from` and `to`
-        // in different repositories and verify the helper picks the
-        // correct side based on FileAction.
-        let parent_id = RepositoryId::from(uuid::Uuid::now_v7());
-        let linked_id = RepositoryId::from(uuid::Uuid::now_v7());
-        let (immutable_store, mutable_store, _) = test_store_create().await.expect("test stores");
-        let parent_ctx = Arc::new(RepositoryContext::new_server_context(
-            immutable_store.clone(),
-            mutable_store.clone(),
-            parent_id,
-        ));
-        let linked_ctx = Arc::new(RepositoryContext::new_server_context(
-            immutable_store,
-            mutable_store,
-            linked_id,
-        ));
-        let state = Arc::new(state::State::new());
-        let address = lore_storage::Address::default();
-
-        let make = |action: lore_revision::change::FileAction| NodeChange {
-            action,
-            path: lore_revision::util::path::RelativePath::from_str("p").unwrap(),
-            from_path: None,
-            flags: lore_revision::change::Flags::None,
-            from: lore_revision::change::NodeChangeState {
-                node: 1,
-                repository: linked_ctx.clone(),
-                state: state.clone(),
-                address,
-                flags: NodeFlags::File,
-            },
-            to: lore_revision::change::NodeChangeState {
-                node: 2,
-                repository: parent_ctx.clone(),
-                state: state.clone(),
-                address,
-                flags: NodeFlags::File,
-            },
-        };
-
-        assert_eq!(
-            surviving_repository_id(&make(lore_revision::change::FileAction::Delete)),
-            linked_id,
-            "Delete surfaces the from side",
-        );
-        assert_eq!(
-            surviving_repository_id(&make(lore_revision::change::FileAction::Add)),
-            parent_id,
-            "Add surfaces the to side",
-        );
-        assert_eq!(
-            surviving_repository_id(&make(lore_revision::change::FileAction::Keep)),
-            parent_id,
-            "Keep surfaces the to side",
         );
     }
 }

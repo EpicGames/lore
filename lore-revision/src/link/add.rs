@@ -9,6 +9,7 @@ use crate::branch;
 use crate::errors::InvalidPath;
 use crate::event;
 use crate::filter::FilterMode;
+use crate::fs::filesystem_provider::InstanceOperation;
 use crate::interface::LoreFileAction;
 use crate::link;
 use crate::link::LinkFlags;
@@ -24,6 +25,7 @@ use crate::repository;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::repository::clone;
+use crate::repository::clone::CloneContext;
 use crate::repository::clone::CloneStats;
 use crate::repository::clone::LoreRepositoryCloneBeginEventData;
 use crate::repository::clone::LoreRepositoryCloneCountData;
@@ -34,6 +36,7 @@ use crate::state::State;
 use crate::state::StateNodeChildrenIterator;
 use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
+use crate::util::path::RepositoryPath;
 
 pub async fn add(
     repository: Arc<RepositoryContext>,
@@ -217,11 +220,11 @@ pub async fn add(
         ));
     }
 
-    let absolute_path = link_path.to_absolute_path(repository.require_path()?);
+    let clone_path = RepositoryPath::from_relative(&repository, link_path.clone())?;
 
     // If a directory already exists, make sure it doesn't have any children
     let link_path_exists = match lore_io::IoDriver::global()
-        .read_dir(absolute_path.as_path())
+        .read_dir(clone_path.absolute())
         .await
     {
         Ok(mut entries) => {
@@ -234,7 +237,7 @@ pub async fn add(
             {
                 return Err(LinkError::internal(format!(
                     "Link path already has children {}",
-                    absolute_path.display()
+                    clone_path.absolute().display()
                 )));
             }
             true
@@ -277,7 +280,7 @@ pub async fn add(
         if !node.is_directory() {
             return Err(LinkError::internal(format!(
                 "Link path is already a link {}",
-                absolute_path.display()
+                clone_path.absolute().display()
             )));
         }
 
@@ -295,7 +298,7 @@ pub async fn add(
         {
             return Err(LinkError::internal(format!(
                 "Link path already has children {}",
-                absolute_path.display()
+                clone_path.absolute().display()
             )));
         }
     };
@@ -304,26 +307,18 @@ pub async fn add(
     let mut remainder_parent = remainder_path.clone();
     remainder_parent.pop();
 
-    let mut parent_path = link_path.clone();
-    parent_path.pop();
-
-    if !parent_path.is_empty() {
-        let parent_absolute_path = parent_path.to_absolute_path(repository.require_path()?);
-
+    if let Some(parent_path) = clone_path.absolute().parent() {
         if lore_io::IoDriver::global()
-            .metadata(parent_absolute_path.as_path())
+            .metadata(parent_path)
             .await
             .is_err()
         {
-            lore_debug!("Creating directory {parent_absolute_path:?}");
+            lore_debug!("Creating directory {:?}", parent_path);
             lore_io::IoDriver::global()
-                .create_dir_all(parent_absolute_path.as_path())
+                .create_dir_all(parent_path)
                 .await
                 .internal_with(|| {
-                    format!(
-                        "Failed to create directory {}",
-                        parent_absolute_path.display()
-                    )
+                    format!("Failed to create directory {}", parent_path.display())
                 })?;
         }
 
@@ -347,6 +342,7 @@ pub async fn add(
                 },
                 None, // No link tracking when adding links
                 None, // No layer mask
+                None, // Prefixes resolved for the outer repository do not apply
             ))
             .await
             .forward::<LinkError>("Failed staging the link node")?;
@@ -354,11 +350,16 @@ pub async fn add(
     }
 
     if !link_path_exists {
-        lore_debug!("Creating directory {link_path}");
+        lore_debug!("Creating directory {}", link_path);
         lore_io::IoDriver::global()
-            .create_dir_all(absolute_path.as_path())
+            .create_dir_all(clone_path.absolute())
             .await
-            .internal_with(|| format!("Failed to create directory {}", absolute_path.display()))?;
+            .internal_with(|| {
+                format!(
+                    "Failed to create directory {}",
+                    clone_path.absolute().display()
+                )
+            })?;
     }
 
     lore_debug!("Staging link node");
@@ -410,7 +411,7 @@ pub async fn add(
         .await
         .forward::<LinkError>("Not connected")?;
 
-    lore_debug!("Clone link in {link_path}");
+    lore_debug!("Clone link in {}", link_path);
 
     event::LoreEvent::RepositoryCloneBegin(LoreRepositoryCloneBeginEventData {
         repository: link.id,
@@ -421,18 +422,27 @@ pub async fn add(
     .send();
 
     let stats = Arc::new(CloneStats::default());
-    clone::clone_node(
-        link.clone(),
-        storage,
-        link_state,
-        absolute_path,
-        source_path,
-        link_node_link.node,
-        Arc::default(), /* Default options */
-        stats.clone(),
-    )
-    .await
-    .forward::<LinkError>("Failed cloning target link")?;
+    let operation = link
+        .file_system()
+        .begin_operation()
+        .await
+        .forward::<LinkError>("Failed to start operation")?;
+    let clone_ctx = CloneContext {
+        repository: link.clone(),
+        state: link_state,
+        operation: operation.clone(),
+        options: Arc::default(),
+        stats: stats.clone(),
+        modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
+    };
+
+    clone::clone_node(clone_ctx, storage, clone_path, link_node_link.node)
+        .await
+        .forward::<LinkError>("Failed cloning target link")?;
+    operation
+        .finalize(true)
+        .await
+        .forward::<LinkError>("Failed cloning target layer")?;
 
     event::LoreEvent::RepositoryCloneEnd(LoreRepositoryCloneEndEventData {
         branch: branch_name.into(),

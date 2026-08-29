@@ -6,6 +6,8 @@ pub mod presigned;
 pub mod repositories;
 pub mod security_headers;
 pub mod server;
+#[cfg(test)]
+pub(crate) mod test_utils;
 pub mod tracing;
 
 use ::tracing::debug;

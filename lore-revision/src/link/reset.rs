@@ -5,7 +5,6 @@ use std::sync::Arc;
 use lore_error_set::prelude::*;
 
 use super::LinkError;
-use crate::error::LoreResultExt;
 use crate::link;
 use crate::link::LinkFlags;
 use crate::lore::Hash;
@@ -51,9 +50,7 @@ pub(crate) async fn reset_staged_add_link(
 
     util::fs::unlink_recursive(absolute_path.as_path())
         .await
-        .emit_map_err(LinkError::internal(
-            "Failed to remove realized link directory",
-        ))?;
+        .internal("removing the realized link directory")?;
 
     if let Some(committed_node_id) = committed_directory_node {
         // Restore the committed directory: recreate the empty placeholder on
@@ -62,9 +59,7 @@ pub(crate) async fn reset_staged_add_link(
         lore_io::IoDriver::global()
             .create_dir_all(absolute_path.as_path())
             .await
-            .emit_map_err(LinkError::internal(
-                "Failed to recreate placeholder directory",
-            ))?;
+            .internal("recreating the placeholder directory")?;
 
         let block_index = NodeBlock::index(committed_node_id);
         let node_index = Node::index(committed_node_id);
@@ -135,7 +130,7 @@ pub(crate) async fn reset_staged_remove_link(
     lore_io::IoDriver::global()
         .create_dir_all(absolute_path.as_path())
         .await
-        .emit_map_err(LinkError::internal("Failed to recreate link directory"))?;
+        .internal("recreating the link directory")?;
 
     let linked_repository = Arc::new(repository.to_link_context(link_id).await);
     link::realize_link_pin_change(

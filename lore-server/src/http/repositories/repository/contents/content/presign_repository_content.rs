@@ -239,11 +239,13 @@ mod tests {
 
     use super::call_is_service_account;
     use crate::auth::jwt::AuthorizationToken;
+    use crate::http::security_headers::ContentTypePolicy;
     use crate::http::server::LoreHttpServerSettings;
-    use crate::http::server::PresignConfig;
     use crate::http::server::ServerHealth;
     use crate::http::server::ServerState;
     use crate::http::server::create_router;
+    use crate::http::test_utils::content_type_policy;
+    use crate::http::test_utils::presign_config_with_policy;
     use crate::store::test_store_create;
 
     fn token_with_service_account(is_service_account: Option<bool>) -> AuthorizationToken {
@@ -279,21 +281,17 @@ mod tests {
         assert!(call_is_service_account(&None));
     }
 
-    fn test_presign_config() -> PresignConfig {
-        let key_bytes = [0u8; 32];
-        PresignConfig {
-            hmac_key: ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key_bytes),
-            key_id: "test_key_id_1234".to_string(),
-            min_ttl_seconds: 1,
-            default_ttl_seconds: 3600,
-            max_ttl_seconds: 86400,
-            content_type_allowlist: crate::http::security_headers::ContentTypeAllowlist::default(),
-        }
+    async fn mint(body: serde_json::Value) -> axum_test::TestResponse {
+        mint_with_policy(body, ContentTypePolicy::default()).await
     }
 
-    /// Posts `body` to the mint endpoint against a fresh store; the address does
-    /// not exist, so requests that pass validation reach the existence check.
-    async fn mint(body: serde_json::Value) -> axum_test::TestResponse {
+    /// Posts `body` to the mint endpoint of a server whose allowlist comes from
+    /// `policy`. The store is fresh, so the address does not exist and requests
+    /// that pass validation reach the existence check.
+    async fn mint_with_policy(
+        body: serde_json::Value,
+        policy: ContentTypePolicy,
+    ) -> axum_test::TestResponse {
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
         LORE_CONTEXT
@@ -308,7 +306,7 @@ mod tests {
                     mutable_store,
                     jwt_verifier: None,
                     max_file_size: 100,
-                    presign_config: Some(test_presign_config()),
+                    presign_config: Some(presign_config_with_policy(policy)),
                 };
                 let settings = LoreHttpServerSettings::test_default();
                 let server =
@@ -339,6 +337,31 @@ mod tests {
     #[tokio::test]
     async fn returns_400_for_disallowed_content_type() {
         let response = mint(json!({"content_type": "text/html"})).await;
+        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A type added through config passes the allowlist, so it reaches the
+    /// existence check and returns 404 rather than 400.
+    #[tokio::test]
+    async fn accepts_configured_extra_content_type() {
+        let response = mint_with_policy(
+            json!({"content_type": "application/zip"}),
+            content_type_policy(&["application/zip"], &[]),
+        )
+        .await;
+
+        assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+    }
+
+    /// A built-in type removed through config is rejected at mint.
+    #[tokio::test]
+    async fn returns_400_for_configured_denied_content_type() {
+        let response = mint_with_policy(
+            json!({"content_type": "application/pdf"}),
+            content_type_policy(&[], &["application/pdf"]),
+        )
+        .await;
+
         assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
     }
 

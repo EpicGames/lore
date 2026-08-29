@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lore_base::types::RepositoryId;
+use lore_base::types::Partition;
 
 use super::super::QuicClientError;
 use super::super::client::AuthAdapter;
@@ -22,7 +22,7 @@ pub struct StorageClientAuth {
     #[allow(dead_code)]
     pub identity: String,
     #[allow(dead_code)]
-    pub repository: RepositoryId,
+    pub partition: Partition,
 }
 
 #[async_trait]

@@ -130,7 +130,6 @@ use crate::layer::LoreLayerRemoveEventData;
 use crate::layer::LoreLayerStagedEntryEventData;
 use crate::link::LoreLinkBranchCreateEventData;
 use crate::link::LoreLinkChangeEventData;
-use crate::link::LoreLinkEntryEventData;
 use crate::link::list::LoreLinkStagedEntryEventData;
 use crate::lock::file::acquire::LoreLockFileAcquireBeginEventData;
 use crate::lock::file::acquire::LoreLockFileAcquireEventData;
@@ -140,6 +139,9 @@ use crate::lock::file::release::LoreLockFileReleaseBeginEventData;
 use crate::lock::file::release::LoreLockFileReleaseEventData;
 use crate::lock::file::status::LoreLockFileStatusBeginEventData;
 use crate::lock::file::status::LoreLockFileStatusEventData;
+use crate::lore::BranchId;
+use crate::lore::Hash;
+use crate::lore::RepositoryId;
 use crate::lore::execution_context;
 use crate::metadata::Metadata;
 use crate::metadata::MetadataError;
@@ -272,6 +274,69 @@ pub struct LoreProgressEventData {
     pub _unused: u32,
 }
 
+/// cbindgen:prefix-with-name
+/// cbindgen:rename-all=ScreamingSnakeCase
+#[repr(C)]
+/// Staged change to a link itself, as opposed to content inside it.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LoreLinkStagedState {
+    /// The link carries no staged change.
+    None = 0,
+    /// The link was added and is not committed yet.
+    Added = 1,
+    /// The link was removed and the removal is not committed yet.
+    Removed = 2,
+    /// The link's pin was changed and is not committed yet.
+    Modified = 3,
+}
+
+/// Data for an event describing a single link in a repository. Carries the
+/// branch identifier rather than its name; a consumer that wants the name
+/// resolves it, so listing links costs no branch metadata reads.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreLinkEntryEventData {
+    /// Identifier of the repository the link points to.
+    pub link: RepositoryId,
+    /// Identifier of the link node in the parent repository.
+    pub link_node: u32,
+    /// Path of the link within the parent repository.
+    pub link_path: LoreString,
+    /// Identifier of the source node in the linked repository.
+    pub source_node: u32,
+    /// Path of the source within the linked repository.
+    pub source_path: LoreString,
+    /// Identifier of the branch the link is pinned to.
+    pub branch: BranchId,
+    /// Set when the link follows its parent's branch instead of being pinned to
+    /// an explicit one, in which case `branch` is the branch it resolved to.
+    #[serde(with = "crate::util::serde::u8_as_bool")]
+    pub tracking: u8,
+    /// Hash of the revision the link is pinned to.
+    pub revision: Hash,
+    /// Link flags.
+    pub flags: u32,
+}
+
+/// Data for an event describing a single link in detail: everything `LinkEntry`
+/// reports, plus the state only `link info` gathers.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreLinkInfoEventData {
+    /// The link as `LinkEntry` reports it.
+    pub entry: LoreLinkEntryEventData,
+    /// Hash of the remote latest revision of the pinned branch, zero when the
+    /// remote was not consulted.
+    pub remote_revision: Hash,
+    /// Staged change to the link itself.
+    pub staged_state: LoreLinkStagedState,
+    /// Number of staged files inside the linked repository.
+    pub staged_file_count: u64,
+}
+
 /// Borrowed byte slice handed to callbacks.
 ///
 /// The pointer is valid only for the duration of the callback that receives
@@ -343,10 +408,16 @@ impl<'de> serde::Deserialize<'de> for LoreBytes {
 /// common cases cheaply without parsing the companion `LORE_EVENT_ERROR`
 /// detail.
 ///
-/// Numbered independently of the general library error code that a `Complete`
-/// event's status carries: `NONE`, `INVALID_ARGUMENTS` and `ADDRESS_NOT_FOUND`
-/// happen to share its values, `INTERNAL` (3 against -1) and `SLOW_DOWN`
-/// (4 against 5) do not. Compare a code from an event only against this enum.
+/// The values are the error codes themselves, taken from the registry in
+/// `lore_base::error`, so a code read from a per-item event means the same
+/// thing as the code on `Complete.status`. This enum names the subset a
+/// per-item event can carry; it is not a second numbering.
+///
+/// The variant order is the serialized wire format, not the numbering. Serde
+/// encodes a variant by its declaration index in a non-self-describing format,
+/// and `LoreEvent` crosses the service boundary in one, so reordering these
+/// would silently redecode old payloads as different errors. Add new variants
+/// at the end and change discriminants in place.
 ///
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
@@ -357,14 +428,26 @@ pub enum LoreErrorCode {
     #[default]
     None = 0,
     /// The arguments supplied to the operation were invalid.
-    InvalidArguments = 1,
+    InvalidArguments = 3,
     /// A content-addressable object could not be found in any store.
-    AddressNotFound = 2,
+    AddressNotFound = 80,
     /// An internal error occurred.
-    Internal = 3,
+    Internal = -1,
     /// The backing store is overloaded; the caller should retry later.
-    SlowDown = 4,
+    SlowDown = 31,
 }
+
+// cbindgen cannot evaluate a const in a discriminant position — it drops the
+// enum and emits an incomplete type — so the codes above are written out.
+// These tie them back to the registry at compile time: a code that moves in
+// `lore-base` fails the build here rather than silently leaving this enum
+// describing the old numbering.
+const _: () = assert!(LoreErrorCode::Internal as i32 == lore_error_set::Internal::FFI_CODE);
+const _: () =
+    assert!(LoreErrorCode::InvalidArguments as i32 == lore_base::error::InvalidArguments::FFI_CODE);
+const _: () = assert!(LoreErrorCode::SlowDown as i32 == lore_base::error::SlowDown::FFI_CODE);
+const _: () =
+    assert!(LoreErrorCode::AddressNotFound as i32 == lore_base::error::AddressNotFound::FFI_CODE);
 
 /// Data for an error event.
 #[repr(C)]
@@ -923,6 +1006,8 @@ pub enum LoreEvent {
     LinkChange(LoreLinkChangeEventData),
     /// One entry in a link listing.
     LinkEntry(LoreLinkEntryEventData),
+    /// Detailed information about a single link.
+    LinkInfo(LoreLinkInfoEventData),
     /// The start of a file lock acquire report.
     LockFileAcquireBegin(LoreLockFileAcquireBeginEventData),
     /// A file concerning the lock acquire report.
@@ -1252,7 +1337,7 @@ mod error_detail_tests {
 
     // A concrete `#[error_set]` error used to exercise the constructor. Its
     // `NotFound` variant wraps `lore_base::error::NotFound`, which carries FFI
-    // code 13, so the detail's `error_code` has a known, non-internal value to
+    // code 79, so the detail's `error_code` has a known, non-internal value to
     // assert against.
     #[error_set]
     enum SampleError {
@@ -1486,5 +1571,36 @@ mod metadata_event_tests {
             decoded.value,
             LoreMetadata::String(crate::interface::LoreString::from("text"))
         );
+    }
+}
+
+#[cfg(test)]
+mod wire_format_tests {
+    use super::LoreErrorCode;
+
+    /// Serde encodes an enum variant by its declaration index, not by its
+    /// explicit discriminant, and `LoreEvent` crosses the service boundary in
+    /// bitcode — a non-self-describing format. These bytes are the wire
+    /// contract: reorder the variants and a peer on an older build has its
+    /// payloads decode as different errors, silently. The discriminants are
+    /// free to change; the order is not. New variants go at the end.
+    #[test]
+    fn variant_order_is_pinned_to_the_wire_format() {
+        for (variant, encoded) in [
+            (LoreErrorCode::None, [0u8]),
+            (LoreErrorCode::InvalidArguments, [1]),
+            (LoreErrorCode::AddressNotFound, [2]),
+            (LoreErrorCode::Internal, [3]),
+            (LoreErrorCode::SlowDown, [4]),
+        ] {
+            assert_eq!(
+                bitcode::serialize(&variant).expect("serialize"),
+                encoded,
+                "{variant:?} moved in declaration order; a payload from an \
+                 older peer would decode as a different error"
+            );
+            let decoded: LoreErrorCode = bitcode::deserialize(&encoded).expect("deserialize");
+            assert_eq!(decoded, variant, "decoding {encoded:?} must be stable");
+        }
     }
 }

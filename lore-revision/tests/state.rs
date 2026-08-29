@@ -6,22 +6,18 @@ mod tests {
 
     use std::sync::Arc;
 
-    use lore_base::error::NoRemote;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Address;
     use lore_base::types::CloneHeapAlloc;
-    use lore_base::types::Context;
     use lore_base::types::ZeroHeapAlloc;
     use lore_revision::node::*;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::state::State;
     use lore_revision::state::StateData;
     use lore_revision::state::collect_new_fragments;
     use lore_storage::hash::hash_string;
     use lore_storage::local::immutable_store::LocalImmutableStore;
-    use lore_transport::ProtocolError;
     use zerocopy::IntoBytes;
 
     include!("helper.rs");
@@ -49,11 +45,197 @@ mod tests {
         assert_eq!(cloned.as_bytes(), block.as_bytes());
     }
 
+    /// A state can be serialized more than once, and the second write carries the edits
+    /// made between the two.
+    ///
+    /// Every link in that chain is asserted: `serialize` releases the blocks it wrote, so
+    /// an edit after it finds them clean, registers itself and marks the state dirty
+    /// again; the second `serialize` then has something to write and returns a signature
+    /// of its own; and the edit is read back out of that signature, because a serialize
+    /// that wrote nothing returns the first signature and is otherwise indistinguishable
+    /// from one that worked.
+    #[tokio::test]
+    async fn serialize_twice_writes_the_edits_made_between() {
+        let (_immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+                let immutable_store = LocalImmutableStore::new(
+                    None,
+                    lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("Failed to create store");
+                let write_token =
+                    lore_revision::repository::RepositoryWriteToken::acquire(path.as_path()).await;
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path),
+                    )
+                    .with_write_token(write_token.share()),
+                );
+
+                let state = Arc::new(State::new());
+                state
+                    .node_add(
+                        repository.clone(),
+                        ROOT_NODE,
+                        Node {
+                            name_hash: hash_string("first"),
+                            ..Default::default()
+                        },
+                        "first",
+                    )
+                    .await
+                    .expect("Failed to add the first node");
+                let first = state
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize");
+
+                let second_node = state
+                    .node_add(
+                        repository.clone(),
+                        ROOT_NODE,
+                        Node {
+                            name_hash: hash_string("second"),
+                            ..Default::default()
+                        },
+                        "second",
+                    )
+                    .await
+                    .expect("Failed to add the second node");
+                assert!(
+                    state.is_dirty(),
+                    "an edit after a serialize must mark the state dirty again"
+                );
+
+                let second = state
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize again");
+                assert_ne!(
+                    first, second,
+                    "a state with a new edit must serialize to a new signature"
+                );
+
+                let restored = State::deserialize(repository.clone(), second)
+                    .await
+                    .expect("Failed to deserialize");
+                let node = restored
+                    .node(repository, second_node)
+                    .await
+                    .expect("Failed to read the node back");
+                assert_eq!(
+                    node.name_hash,
+                    hash_string("second"),
+                    "the second serialize must carry the edit made after the first"
+                );
+            }))
+            .await
+            .expect("Task failed");
+    }
+
+    /// The block that goes into the store has to be the block that is in
+    /// memory, byte for byte: `State::serialize` writes it straight from its
+    /// lock, so anything the runtime keeps in the block - the dirty flag above
+    /// all - would otherwise be written out with it.
+    #[tokio::test]
+    async fn a_serialized_block_is_the_block_in_memory() {
+        let (_immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+                let immutable_store = LocalImmutableStore::new(
+                    None,
+                    lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("Failed to create store");
+                let write_token =
+                    lore_revision::repository::RepositoryWriteToken::acquire(path.as_path()).await;
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path),
+                    )
+                    .with_write_token(write_token.share()),
+                );
+
+                let state = Arc::new(State::new());
+                state
+                    .node_add(
+                        repository.clone(),
+                        ROOT_NODE,
+                        Node {
+                            name_hash: hash_string("only"),
+                            ..Default::default()
+                        },
+                        "only",
+                    )
+                    .await
+                    .expect("Failed to add the node");
+                let signature = state
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("Failed to serialize");
+
+                let live = state
+                    .block(repository.clone(), 0)
+                    .await
+                    .expect("Failed to read the block back in memory");
+                assert!(
+                    !live.read().is_dirty(),
+                    "serialize must release the blocks it wrote"
+                );
+                assert_eq!(
+                    live.read().node_block().flags & NODE_BLOCK_RUNTIME_FLAGS,
+                    0,
+                    "the runtime flags must be held outside the block data"
+                );
+
+                let restored = State::deserialize(repository.clone(), signature)
+                    .await
+                    .expect("Failed to deserialize");
+                let stored = restored
+                    .block(repository.clone(), 0)
+                    .await
+                    .expect("Failed to read the block back from the store");
+
+                assert_eq!(
+                    stored.read().node_block().flags & NODE_BLOCK_RUNTIME_FLAGS,
+                    0,
+                    "the runtime flags must not reach the store"
+                );
+                assert_eq!(
+                    live.read().node_block().as_bytes(),
+                    stored.read().node_block().as_bytes(),
+                    "the stored block must be the in-memory block byte for byte"
+                );
+            }))
+            .await
+            .expect("Task failed");
+    }
+
     #[tokio::test]
     async fn collect_new_name_fragments() {
         let (_immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
-        let repository_id = Context::from(uuid::Uuid::now_v7());
 
         #[allow(clippy::disallowed_methods)]
         runtime()
@@ -73,14 +255,11 @@ mod tests {
                     lore_revision::repository::RepositoryWriteToken::acquire(path.as_path()).await;
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id.into(),
-                        lore_revision::instance::InstanceId::default(),
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -306,7 +485,6 @@ mod tests {
 
         let (_, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
-        let repository_id = Context::from(uuid::Uuid::now_v7());
 
         #[allow(clippy::disallowed_methods)]
         runtime()
@@ -322,14 +500,8 @@ mod tests {
                 .expect("Failed to create immutable store");
 
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(path),
-                    immutable_store,
-                    mutable_store,
-                    repository_id.into(),
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(immutable_store, mutable_store)
+                        .with_path(&path),
                 ));
 
                 // A non-zero hash that was never written to the store.
@@ -345,13 +517,678 @@ mod tests {
             .await
             .expect("Test task failed");
     }
+
+    /// Run `body` against a fresh in-memory state, inside the execution scope the
+    /// state edits read their globals from. Nothing here serializes, so the
+    /// repository needs no path and no write token.
+    async fn with_state<F, Fut>(body: F)
+    where
+        F: FnOnce(Arc<RepositoryContext>, Arc<State>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let (_immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let immutable_store = LocalImmutableStore::new(
+                    None,
+                    lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("Failed to create store");
+                let repository = Arc::new(RepositoryContext::new(
+                    default_repository_creation_args(immutable_store, mutable_store),
+                ));
+                body(repository, Arc::new(State::new())).await;
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Add a node of `flags` under `parent`, carrying a file id of its own so a move
+    /// can be shown to keep it.
+    async fn add_node(
+        repository: &Arc<RepositoryContext>,
+        state: &Arc<State>,
+        parent: NodeID,
+        name: &str,
+        flags: NodeFlags,
+    ) -> NodeID {
+        state
+            .node_add(
+                repository.clone(),
+                parent,
+                Node {
+                    flags: flags.bits(),
+                    name_hash: hash_string(name),
+                    address: Address {
+                        hash: lore_base::types::Hash::from_u64(7),
+                        context: lore_base::types::Context::from(uuid::Uuid::now_v7()),
+                    },
+                    ..Default::default()
+                },
+                name,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("Failed to add node {name}: {error}"))
+    }
+
+    /// The hash comes back from the record the walk read for the child, so it has
+    /// to be the hash of that child's name, for the same children in the same
+    /// order as the walk that reports ids alone.
+    #[tokio::test]
+    async fn children_with_name_hash_report_the_hash_of_every_child_name() {
+        with_state(|repository, state| async move {
+            let names = ["first", "second", "third", "fourth"];
+            for name in names {
+                add_node(&repository, &state, ROOT_NODE, name, NodeFlags::File).await;
+            }
+
+            let children = state
+                .node_children(repository.clone(), ROOT_NODE)
+                .await
+                .expect("Failed to walk the children");
+            let with_name_hash = state
+                .node_children_with_name_hash(repository.clone(), ROOT_NODE)
+                .await
+                .expect("Failed to walk the children with their name hash");
+
+            assert_eq!(
+                with_name_hash
+                    .iter()
+                    .map(|&(node, _)| node)
+                    .collect::<Vec<_>>(),
+                children,
+                "the children and their order must be what the walk without the hash reports"
+            );
+
+            let mut reported: Vec<u64> = with_name_hash.iter().map(|&(_, hash)| hash).collect();
+            reported.sort_unstable();
+            let mut expected: Vec<u64> = names.iter().map(|name| hash_string(name)).collect();
+            expected.sort_unstable();
+            assert_eq!(
+                reported, expected,
+                "every child must report the hash of the name it was added under"
+            );
+        })
+        .await;
+    }
+
+    /// A child is prepended, so the search for what was linked in since a head
+    /// was seen covers everything ahead of that head and stops there: it finds
+    /// the new children and never the ones the caller already holds.
+    #[tokio::test]
+    async fn a_search_since_a_head_covers_what_was_linked_in_ahead_of_it() {
+        with_state(|repository, state| async move {
+            let held = add_node(&repository, &state, ROOT_NODE, "held", NodeFlags::File).await;
+            let added = add_node(&repository, &state, ROOT_NODE, "added", NodeFlags::File).await;
+
+            let since_held = |name: &str| {
+                let repository = repository.clone();
+                let state = state.clone();
+                let name_hash = hash_string(name);
+                async move {
+                    state
+                        .find_subnode_added_since(repository, ROOT_NODE, Some(held), name_hash)
+                        .await
+                        .expect("Failed to search the children added since")
+                }
+            };
+
+            assert_eq!(
+                since_held("added").await,
+                Some(added),
+                "a child linked in after the head was seen is ahead of it"
+            );
+            assert_eq!(
+                since_held("held").await,
+                None,
+                "the head itself is where the search stops, so what it holds is not reported"
+            );
+            assert_eq!(
+                since_held("never").await,
+                None,
+                "a name no child carries is not reported"
+            );
+            assert_eq!(
+                state
+                    .find_subnode_added_since(
+                        repository.clone(),
+                        ROOT_NODE,
+                        None,
+                        hash_string("held")
+                    )
+                    .await
+                    .expect("Failed to search the children added since"),
+                Some(held),
+                "a caller holding no children has the whole chain searched"
+            );
+        })
+        .await;
+    }
+
+    /// Children linked in since a head was seen that do not all fit in the block
+    /// that head sits in: the search crosses into the block it started from and
+    /// only then reaches the head it stops at.
+    #[tokio::test]
+    async fn a_search_since_a_head_crosses_blocks_before_it_reaches_the_head() {
+        with_state(|repository, state| async move {
+            let mut head = ROOT_NODE;
+            for index in 0..BLOCK_NODE_COUNT - 64 {
+                head = add_node(
+                    &repository,
+                    &state,
+                    ROOT_NODE,
+                    &format!("held-{index:05}"),
+                    NodeFlags::File,
+                )
+                .await;
+            }
+            let mut added = Vec::new();
+            for index in 0..128 {
+                added.push(
+                    add_node(
+                        &repository,
+                        &state,
+                        ROOT_NODE,
+                        &format!("added-{index:05}"),
+                        NodeFlags::File,
+                    )
+                    .await,
+                );
+            }
+            assert!(
+                state.block_count() > 1,
+                "the children added since must reach past the block the head sits in"
+            );
+
+            let since_head = |name: String| {
+                let repository = repository.clone();
+                let state = state.clone();
+                async move {
+                    state
+                        .find_subnode_added_since(
+                            repository,
+                            ROOT_NODE,
+                            Some(head),
+                            hash_string(&name),
+                        )
+                        .await
+                        .expect("Failed to search the children added since")
+                }
+            };
+
+            assert_eq!(
+                since_head("added-00127".to_string()).await,
+                added.last().copied(),
+                "the child linked in last heads the chain"
+            );
+            assert_eq!(
+                since_head("added-00000".to_string()).await,
+                added.first().copied(),
+                "a child linked in before the block boundary is still reached"
+            );
+            assert_eq!(
+                since_head(format!("held-{:05}", BLOCK_NODE_COUNT - 65)).await,
+                None,
+                "the head is where the search stops"
+            );
+            assert_eq!(
+                since_head("held-00000".to_string()).await,
+                None,
+                "nothing behind the head is reached"
+            );
+        })
+        .await;
+    }
+
+    /// A directory holding more children than one node block takes: the walk
+    /// reads a run of siblings under one lock on the block they share and takes
+    /// the next block where the run ends, which a directory inside a single
+    /// block never reaches.
+    #[tokio::test]
+    async fn children_spanning_node_blocks_are_all_reported_with_their_hash() {
+        with_state(|repository, state| async move {
+            let names: Vec<String> = (0..BLOCK_NODE_COUNT + 64)
+                .map(|index| format!("child-{index}"))
+                .collect();
+            let mut added: Vec<(NodeID, u64)> = Vec::with_capacity(names.len());
+            for name in &names {
+                let node = add_node(&repository, &state, ROOT_NODE, name, NodeFlags::File).await;
+                added.push((node, hash_string(name)));
+            }
+            assert!(
+                state.block_count() > 1,
+                "the children must span more than one node block for this to reach the walk \
+                 that takes the next one"
+            );
+
+            let mut reported = state
+                .node_children_with_name_hash(repository.clone(), ROOT_NODE)
+                .await
+                .expect("Failed to walk the children with their name hash");
+
+            assert_eq!(
+                reported.len(),
+                added.len(),
+                "the walk must report every child, including those past the first block"
+            );
+            reported.sort_unstable();
+            added.sort_unstable();
+            assert_eq!(
+                reported, added,
+                "every child must carry the hash of its own name, whichever block holds it"
+            );
+        })
+        .await;
+    }
+
+    /// Reparenting rewrites the chain the node sat in, and the node it is unlinked from
+    /// is whichever one points at it: this is the case where that is a sibling rather
+    /// than the parent, which the parent's own `child` pointer never exercises.
+    #[tokio::test]
+    async fn move_node_unlinks_from_the_middle_of_a_sibling_chain() {
+        with_state(|repository, state| async move {
+            let source = add_node(&repository, &state, ROOT_NODE, "src", NodeFlags::NoFlags).await;
+            let destination =
+                add_node(&repository, &state, ROOT_NODE, "dst", NodeFlags::NoFlags).await;
+            let first = add_node(&repository, &state, source, "first", NodeFlags::File).await;
+            let middle = add_node(&repository, &state, source, "middle", NodeFlags::File).await;
+            let last = add_node(&repository, &state, source, "last", NodeFlags::File).await;
+
+            state
+                .move_node(repository.clone(), middle, destination, "middle")
+                .await
+                .expect("Failed to move the middle child");
+
+            assert_eq!(
+                state
+                    .node_children(repository.clone(), source)
+                    .await
+                    .expect("Failed to walk the source chain"),
+                vec![last, first],
+                "the chain the node left must close over it, keeping its order"
+            );
+            assert_eq!(
+                state
+                    .node_children(repository.clone(), destination)
+                    .await
+                    .expect("Failed to walk the destination chain"),
+                vec![middle],
+                "the node must be the destination's only child"
+            );
+            assert_eq!(
+                state
+                    .node(repository.clone(), middle)
+                    .await
+                    .expect("Failed to read the moved node")
+                    .parent,
+                destination,
+                "the moved node must point at the parent it arrived at"
+            );
+        })
+        .await;
+    }
+
+    /// A move keeps the node: the same slot, the same file id, the same children —
+    /// which is what makes the record a move rather than a delete and an add. The
+    /// subtree is recorded as moved with it, since its paths change.
+    #[tokio::test]
+    async fn move_node_renames_in_place_and_keeps_identity() {
+        with_state(|repository, state| async move {
+            let directory =
+                add_node(&repository, &state, ROOT_NODE, "before", NodeFlags::NoFlags).await;
+            let child =
+                add_node(&repository, &state, directory, "child.bin", NodeFlags::File).await;
+            let before = state
+                .node(repository.clone(), directory)
+                .await
+                .expect("Failed to read the directory");
+            state
+                .node_mark_staged(
+                    repository.clone(),
+                    directory,
+                    NodeFlags::NoFlags,
+                    NodeFlags::NoFlags,
+                )
+                .await
+                .expect("Failed to settle the directory");
+            state
+                .node_mark_staged(
+                    repository.clone(),
+                    child,
+                    NodeFlags::NoFlags,
+                    NodeFlags::NoFlags,
+                )
+                .await
+                .expect("Failed to settle the child");
+
+            state
+                .move_node(repository.clone(), directory, ROOT_NODE, "after")
+                .await
+                .expect("Failed to rename the directory");
+
+            let after = state
+                .node(repository.clone(), directory)
+                .await
+                .expect("Failed to read the directory back");
+            assert_eq!(
+                state
+                    .node_name_clone(repository.clone(), directory)
+                    .await
+                    .expect("Failed to read the name"),
+                "after",
+                "the stored name must be the new one"
+            );
+            assert_eq!(
+                after.name_hash,
+                hash_string("after"),
+                "the name hash must follow the stored name, which the commit verifier checks"
+            );
+            assert_eq!(
+                after.address.context, before.address.context,
+                "the file id must survive the rename"
+            );
+            assert!(
+                after.is_staged_move(),
+                "the node must carry the move for the commit to record"
+            );
+            assert_eq!(
+                state
+                    .node_children(repository.clone(), directory)
+                    .await
+                    .expect("Failed to walk the children"),
+                vec![child],
+                "the children come along without being relinked"
+            );
+            assert!(
+                state
+                    .node(repository.clone(), child)
+                    .await
+                    .expect("Failed to read the child")
+                    .is_staged_move(),
+                "a child's path changed with its parent's, so it is recorded as moved too"
+            );
+        })
+        .await;
+    }
+
+    /// A node whose parent pointer names a directory it is not a child of cannot be
+    /// unlinked, and the move fails there — after every check has passed. Nothing may be
+    /// half-written at that point: the node must be where it was, under the name it had,
+    /// and the chain it really sits in must still be whole.
+    #[tokio::test]
+    async fn move_node_that_cannot_unlink_writes_nothing() {
+        with_state(|repository, state| async move {
+            let source = add_node(&repository, &state, ROOT_NODE, "src", NodeFlags::NoFlags).await;
+            let destination =
+                add_node(&repository, &state, ROOT_NODE, "dst", NodeFlags::NoFlags).await;
+            let first = add_node(&repository, &state, source, "first.bin", NodeFlags::File).await;
+            let second = add_node(&repository, &state, source, "second.bin", NodeFlags::File).await;
+
+            // Point the node at a parent whose chain does not hold it, which is the shape
+            // a broken hierarchy takes and the one the unlink refuses to guess at.
+            let block = state
+                .block(repository.clone(), NodeBlock::index(second))
+                .await
+                .expect("Failed to read the block");
+            block.write().node(Node::index(second)).parent = destination;
+
+            let failure = state
+                .move_node(repository.clone(), second, ROOT_NODE, "second.bin")
+                .await
+                .expect_err("a node missing from its parent's chain cannot be moved");
+            assert!(
+                failure.to_string().contains("not in the child chain"),
+                "the failure must name what it could not do, got {failure}"
+            );
+
+            // Read the links rather than walking them: the fixture's own corruption is
+            // what a chain walk refuses, and it is the links this has to pin.
+            let source_node = state
+                .node(repository.clone(), source)
+                .await
+                .expect("Failed to read the source");
+            let moved_node = state
+                .node(repository.clone(), second)
+                .await
+                .expect("Failed to read the node");
+            let destination_node = state
+                .node(repository.clone(), destination)
+                .await
+                .expect("Failed to read the destination");
+            assert_eq!(
+                source_node.child, second,
+                "the chain the node really sits in must still start at it"
+            );
+            assert_eq!(moved_node.sibling, first, "and must still run through it");
+            assert!(
+                destination_node.child().is_none(),
+                "and the node must not have been linked in anywhere else"
+            );
+            assert_eq!(
+                state
+                    .node_name_clone(repository.clone(), second)
+                    .await
+                    .expect("Failed to read the name"),
+                "second.bin",
+                "nor renamed on the way to a failure"
+            );
+        })
+        .await;
+    }
+
+    /// The reason a refused move gave. Several distinct rules all report invalid
+    /// arguments, so a test that only asserts "some error" cannot tell which one fired —
+    /// or notice when a later change makes a different one fire first.
+    async fn move_failure(
+        repository: &Arc<RepositoryContext>,
+        state: &Arc<State>,
+        node_id: NodeID,
+        destination_parent_id: NodeID,
+        dst_name: &str,
+    ) -> String {
+        state
+            .move_node(repository.clone(), node_id, destination_parent_id, dst_name)
+            .await
+            .expect_err("the move must be refused")
+            .to_string()
+    }
+
+    /// The checks that are about a node's *staging state* rather than the tree's shape. The
+    /// verb refuses all three before the primitive sees them, so these are what any other
+    /// `lore-revision` caller gets — and what stops a move recording a path change for a
+    /// node that is on its way out.
+    #[tokio::test]
+    async fn move_node_rejects_a_node_the_revision_is_letting_go() {
+        with_state(|repository, state| async move {
+            let destination =
+                add_node(&repository, &state, ROOT_NODE, "dst", NodeFlags::NoFlags).await;
+            let deleted = add_node(
+                &repository,
+                &state,
+                ROOT_NODE,
+                "deleted.bin",
+                NodeFlags::File,
+            )
+            .await;
+            let discarded = add_node(
+                &repository,
+                &state,
+                ROOT_NODE,
+                "discarded.bin",
+                NodeFlags::File,
+            )
+            .await;
+            let doomed_parent =
+                add_node(&repository, &state, ROOT_NODE, "doomed", NodeFlags::NoFlags).await;
+            let mover =
+                add_node(&repository, &state, ROOT_NODE, "mover.bin", NodeFlags::File).await;
+
+            state
+                .node_delete(repository.clone(), deleted)
+                .await
+                .expect("Failed to stage the deletion");
+            state
+                .node_delete(repository.clone(), doomed_parent)
+                .await
+                .expect("Failed to stage the destination's deletion");
+            lore_revision::state::node_discard_patch(
+                state.clone(),
+                repository.clone(),
+                discarded,
+                |_node_id, _flags| {},
+            )
+            .await
+            .expect("Failed to discard the node");
+
+            let reason =
+                move_failure(&repository, &state, deleted, destination, "deleted.bin").await;
+            assert!(
+                reason.contains("staged for deletion"),
+                "a node staged for deletion is leaving the revision, not moving in it: {reason}"
+            );
+            let reason =
+                move_failure(&repository, &state, discarded, destination, "discarded.bin").await;
+            assert!(
+                reason.contains("discarded"),
+                "a discarded node is gone; its slot reads back as an empty directory: {reason}"
+            );
+            let reason = move_failure(&repository, &state, mover, doomed_parent, "mover.bin").await;
+            assert!(
+                reason.contains("would go with it"),
+                "a destination staged for deletion would take the moved node with it: {reason}"
+            );
+
+            assert_eq!(
+                state
+                    .node(repository.clone(), mover)
+                    .await
+                    .expect("Failed to read the node")
+                    .parent,
+                ROOT_NODE,
+                "every rejection must leave the node where it was"
+            );
+            assert!(
+                state
+                    .node_children(repository.clone(), destination)
+                    .await
+                    .expect("Failed to walk the destination")
+                    .is_empty(),
+                "and the destination empty"
+            );
+        })
+        .await;
+    }
+
+    /// The rejections that are properties of the tree rather than of one call, each
+    /// refused before anything is relinked.
+    #[tokio::test]
+    async fn move_node_rejects_what_would_break_the_tree() {
+        with_state(|repository, state| async move {
+            let directory =
+                add_node(&repository, &state, ROOT_NODE, "dir", NodeFlags::NoFlags).await;
+            let nested =
+                add_node(&repository, &state, directory, "nested", NodeFlags::NoFlags).await;
+            let file = add_node(&repository, &state, ROOT_NODE, "leaf.bin", NodeFlags::File).await;
+
+            let reason = move_failure(&repository, &state, ROOT_NODE, directory, "root").await;
+            assert!(
+                reason.contains("does not name a movable node"),
+                "the root is the revision itself and has no parent to move it under: {reason}"
+            );
+            let reason = move_failure(&repository, &state, directory, nested, "dir").await;
+            assert!(
+                reason.contains("descendants"),
+                "a node moved into its own subtree takes the subtree out of the tree: {reason}"
+            );
+            let reason = move_failure(&repository, &state, directory, directory, "dir").await;
+            assert!(
+                reason.contains("descendants"),
+                "and so does a node moved into itself: {reason}"
+            );
+            let reason = move_failure(&repository, &state, file, file, "leaf.bin").await;
+            assert!(
+                reason.contains("not a directory"),
+                "only a directory holds children: {reason}"
+            );
+            let reason = move_failure(&repository, &state, file, ROOT_NODE, "leaf.bin").await;
+            assert!(
+                reason.contains("already under that parent by that name"),
+                "a move that changes nothing would record a move the tree never made: {reason}"
+            );
+            let reason = move_failure(&repository, &state, file, ROOT_NODE, "with/slash").await;
+            assert!(
+                reason.contains("not storable"),
+                "a name the name table would refuse is caught before anything is relinked: {reason}"
+            );
+
+            assert_eq!(
+                state
+                    .node(repository.clone(), directory)
+                    .await
+                    .expect("Failed to read the directory")
+                    .parent,
+                ROOT_NODE,
+                "every rejection must leave the tree as it was"
+            );
+            assert_eq!(
+                state
+                    .node_children(repository.clone(), ROOT_NODE)
+                    .await
+                    .expect("Failed to walk the root"),
+                vec![file, directory],
+                "including the chain a relink would have rewritten"
+            );
+        })
+        .await;
+    }
+
+    /// The name check belongs to the caller, as it does on `node_add`: a batch caller
+    /// has to hold a name against the tree its whole batch produces, which this cannot
+    /// see. Two siblings under one name is what the commit's validator refuses.
+    #[tokio::test]
+    async fn move_node_leaves_the_name_check_to_the_caller() {
+        with_state(|repository, state| async move {
+            let destination =
+                add_node(&repository, &state, ROOT_NODE, "dst", NodeFlags::NoFlags).await;
+            add_node(
+                &repository,
+                &state,
+                destination,
+                "taken.bin",
+                NodeFlags::File,
+            )
+            .await;
+            let node_id =
+                add_node(&repository, &state, ROOT_NODE, "taken.bin", NodeFlags::File).await;
+
+            state
+                .move_node(repository.clone(), node_id, destination, "taken.bin")
+                .await
+                .expect("the primitive moves what it is told to move");
+
+            assert_eq!(
+                state
+                    .node_children(repository.clone(), destination)
+                    .await
+                    .expect("Failed to walk the destination")
+                    .len(),
+                2,
+                "both children are there under one name, for the caller's check to have \
+                 prevented"
+            );
+        })
+        .await;
+    }
 }
 
 mod single_file_compare_result_tests {
     use std::path::Path;
     use std::sync::Arc;
 
-    use lore_base::error::NoRemote;
     use lore_base::types::Address;
     use lore_base::types::Context;
     use lore_base::types::Hash;
@@ -359,18 +1196,17 @@ mod single_file_compare_result_tests {
     use lore_revision::change::FileAction;
     use lore_revision::change::NodeChange;
     use lore_revision::change::NodeChangeState;
-    use lore_revision::filter::Filter;
     use lore_revision::node::INVALID_NODE;
     use lore_revision::node::NodeFlags;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::state::SingleFileCompareResult;
     use lore_revision::state::State;
     use lore_revision::state::detect_and_coalesce_moves;
     use lore_revision::util::path::RelativePath;
     use lore_storage::local::immutable_store;
     use lore_storage::local::mutable_store;
-    use lore_transport::ProtocolError;
+
+    use crate::tests::default_repository_creation_args;
 
     #[test]
     fn debug_format_displays_variant_names() {
@@ -443,24 +1279,18 @@ mod single_file_compare_result_tests {
         )
         .await
         .expect("Failed to create store");
-        Arc::new(RepositoryContext::new(
-            None,
-            immutable.clone(),
-            Arc::new(
-                mutable_store::LocalMutableStore::new(
-                    None::<&Path>,
-                    lore_storage::MutableStoreSettings::default(),
-                    immutable,
-                )
-                .await
-                .expect("Failed to create store"),
-            ),
-            Context::default().into(),
-            lore_revision::instance::InstanceId::default(),
-            Err(ProtocolError::from(NoRemote)),
-            Arc::new(Filter::default()),
-            RepositoryFormat::Lore,
-        ))
+        let mutable = Arc::new(
+            mutable_store::LocalMutableStore::new(
+                None::<&Path>,
+                lore_storage::MutableStoreSettings::default(),
+                immutable.clone(),
+            )
+            .await
+            .expect("Failed to create store"),
+        );
+        Arc::new(RepositoryContext::new(default_repository_creation_args(
+            immutable, mutable,
+        )))
     }
 
     #[tokio::test]
@@ -798,17 +1628,18 @@ mod single_file_compare_result_tests {
     }
 }
 
-/// Tests for `is_file_modified` chunking compatibility: files stored with
-/// old-style fragmentation (multiple 64 KiB chunks) must be recognized as
-/// unmodified when the current chunking threshold (256 KiB) would hash them
-/// as a single buffer.
+/// Tests for `is_file_modified` against objects whose stored fragmentation is not the one
+/// the current chunker would produce — here multiple 64 KiB chunks. Replaying the stored
+/// list is the only comparison that holds, since a commit may reuse a previous
+/// fragmentation and the stored hash is then a function of that history too.
 mod is_file_modified_chunking_compat {
     #![allow(clippy::disallowed_methods)] // Test fixture writes; not subject to repository write-token discipline.
 
+    use std::future::Future;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use bytes::Bytes;
-    use lore_base::error::NoRemote;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::Address;
     use lore_base::types::Context;
@@ -820,10 +1651,8 @@ mod is_file_modified_chunking_compat {
     use lore_revision::node::Node;
     use lore_revision::node::NodeFlags;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
-    use lore_revision::state::is_file_modified;
+    use lore_revision::state::file_modification;
     use lore_revision::util::path::RelativePath;
-    use lore_transport::ProtocolError;
     use rand::Rng;
     use zerocopy::IntoBytes;
 
@@ -901,11 +1730,15 @@ mod is_file_modified_chunking_compat {
         list_address
     }
 
-    /// 128 KiB file stored as two 64 KiB chunks (old chunking strategy).
-    /// The file on disk is unmodified — `is_file_modified` must detect this
-    /// via content comparison despite the hash mismatch.
-    #[tokio::test]
-    async fn unmodified_128k_file_with_legacy_two_chunk_fragmentation() {
+    /// Runs `body` on a repository rooted in a fresh temporary directory, inside the
+    /// execution context the store operations read.
+    ///
+    /// The directory outlives `body`, which is what lets it write the files to hash.
+    async fn on_a_repository<Body, Run>(body: Body)
+    where
+        Body: FnOnce(Arc<RepositoryContext>, PathBuf, Context) -> Run,
+        Run: Future<Output = ()>,
+    {
         let tempdir = generate_tempdir();
         let dir = tempdir.path().to_path_buf();
 
@@ -913,169 +1746,690 @@ mod is_file_modified_chunking_compat {
             test_store_create().await.expect("Failed to create stores");
 
         LORE_CONTEXT
-            .scope(execution.clone(), async move {
-                let mut rng = rand::rng();
+            .scope(execution, async move {
                 let context: Context = rand::random();
-                let repository_id = rand::random();
-
                 let repository = Arc::new(RepositoryContext::new(
-                    Some(dir.as_path().to_path_buf()),
-                    immutable_store,
-                    mutable_store,
-                    repository_id,
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
+                    default_repository_creation_args(immutable_store, mutable_store)
+                        .with_path(dir.as_path())
+                        .with_id(rand::random()),
                 ));
 
-                // Generate 128 KiB of random content
-                let content_size = 128 * 1024;
-                let content: Vec<u8> = (0..content_size)
-                    .map(|_| rng.random_range(0..=255u8))
-                    .collect();
-
-                // Store as two 64 KiB chunks (simulating old chunking strategy)
-                let root_address =
-                    store_as_legacy_chunks(&repository, context, &content, 64 * 1024).await;
-
-                // Write the identical content to a file on disk
-                let file_path = dir.join("test_file_128k.bin");
-                std::fs::write(&file_path, &content).expect("Failed to write test file");
-
-                let metadata = std::fs::metadata(&file_path).expect("Failed to get metadata");
-                let relative_path =
-                    RelativePath::new_from_initial_path("test_file_128k.bin").unwrap();
-
-                // Build a Node referencing the legacy chunked address
-                let node = Node {
-                    flags: NodeFlags::File.bits(),
-                    size: content_size as u64,
-                    address: root_address,
-                    ..Default::default()
-                };
-
-                // is_file_modified should detect content equality despite hash mismatch
-                let (mtime, size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
-                let (modified, new_hash) = is_file_modified(
-                    repository.clone(),
-                    &node,
-                    mtime,
-                    size,
-                    &relative_path,
-                    true, // force hash check
-                )
-                .await
-                .expect("is_file_modified failed");
-
-                assert!(
-                    !modified,
-                    "128 KiB file with legacy two-chunk fragmentation should NOT be detected as modified"
-                );
-
-                // The returned hash (computed with current chunking) must differ
-                // from the stored legacy fragment-list hash — this confirms the
-                // content comparison fallback was actually exercised.
-                assert_ne!(
-                    new_hash, root_address.hash,
-                    "Returned hash should differ from legacy chunked hash"
-                );
-                assert!(
-                    !new_hash.is_zero(),
-                    "Returned hash should be non-zero"
-                );
-
-                // The new hash should be a direct hash of the full content
-                let expected_hash = Hash::hash_buffer(&content);
-                assert_eq!(
-                    new_hash, expected_hash,
-                    "Returned hash should be the new CDC-based single-buffer hash"
-                );
+                body(repository, dir, context).await;
             })
             .await;
     }
 
-    /// 640 KiB file stored as ten 64 KiB chunks. Verifies that rehashing
-    /// reuses the previous chunk fragmentation — each chunk is validated
-    /// individually and the stored root hash is returned unchanged.
+    /// `size` bytes of random content, which no chunker collapses into fewer chunks than
+    /// the sizes it is stored under.
+    fn random_content(size: usize) -> Vec<u8> {
+        let mut rng = rand::rng();
+        (0..size).map(|_| rng.random_range(0..=255u8)).collect()
+    }
+
+    /// A buffer hash is tried first for a file this size and misses here, because the stored
+    /// object is a list no buffer hash can equal. The miss settles nothing, so the stored
+    /// list is walked and recognises the content.
+    #[tokio::test]
+    async fn a_buffer_hash_miss_falls_through_to_the_stored_list() {
+        on_a_repository(|repository, dir, context| async move {
+            let size = 128 * 1024;
+            let content = random_content(size);
+            let address = store_as_legacy_chunks(&repository, context, &content, 64 * 1024).await;
+            let path = dir.join("small.bin");
+            std::fs::write(&path, &content).expect("Failed to write small file");
+
+            assert_ne!(
+                Hash::hash_buffer(&content),
+                address.hash,
+                "a buffer hash cannot equal a fragment list hash"
+            );
+            assert_eq!(
+                immutable::file_matches(repository.clone(), path.as_path(), address, Some(size))
+                    .await
+                    .expect("Failed to compare small file"),
+                lore_storage::FileMatch::Match,
+                "the stored list holds this content whatever the buffer hash says"
+            );
+        })
+        .await;
+    }
+
+    /// The fall-through walks the stored list rather than assuming the buffer hash miss was
+    /// the answer, so it still reports a small file whose content really did change.
+    #[tokio::test]
+    async fn a_modified_small_file_differs_through_the_stored_list() {
+        on_a_repository(|repository, dir, context| async move {
+            let size = 128 * 1024;
+            let content = random_content(size);
+            let address = store_as_legacy_chunks(&repository, context, &content, 64 * 1024).await;
+
+            let mut modified = content.clone();
+            modified[size / 2] ^= 0xff;
+            let path = dir.join("small.bin");
+            std::fs::write(&path, &modified).expect("Failed to write small file");
+
+            assert_eq!(
+                immutable::file_matches(repository.clone(), path.as_path(), address, Some(size))
+                    .await
+                    .expect("Failed to compare small file"),
+                lore_storage::FileMatch::Differs,
+            );
+        })
+        .await;
+    }
+
+    /// A clone into a directory of existing files starts with an empty store, so there is no
+    /// stored fragmentation to measure the file against. Hashing it under the current
+    /// chunking is what recognises it, reading nothing but the file.
+    #[tokio::test]
+    async fn a_large_file_is_recognised_with_nothing_in_the_store() {
+        on_a_repository(|repository, dir, context| async move {
+            let size = 1_234_567;
+            let content = random_content(size);
+            let path = dir.join("large.bin");
+            std::fs::write(&path, &content).expect("Failed to write large file");
+
+            let (address, _) = immutable::write_from_file(
+                repository.clone(),
+                path.as_path(),
+                context,
+                lore_storage::WriteOptions::default().no_remote_write(),
+            )
+            .await
+            .expect("Failed to store large file");
+
+            let (empty_immutable, empty_mutable, _) =
+                test_store_create().await.expect("Failed to create stores");
+            let empty = Arc::new(RepositoryContext::new(
+                default_repository_creation_args(empty_immutable, empty_mutable)
+                    .with_path(dir.as_path())
+                    .with_id(rand::random()),
+            ));
+
+            assert_eq!(
+                immutable::file_matches(empty, path.as_path(), address, Some(size))
+                    .await
+                    .expect("Failed to compare large file"),
+                lore_storage::FileMatch::Match,
+                "the current chunking reproduces the address it was stored under"
+            );
+        })
+        .await;
+    }
+
+    /// Above the threshold the file is measured against the stored object's own chunking,
+    /// which is what settles a difference without reading any stored content.
+    #[tokio::test]
+    async fn a_modified_large_file_differs_against_the_stored_chunking() {
+        on_a_repository(|repository, dir, context| async move {
+            let size = 640 * 1024;
+            let content = random_content(size);
+            let address = store_as_legacy_chunks(&repository, context, &content, 64 * 1024).await;
+
+            let mut modified = content.clone();
+            modified[size / 2] ^= 0xff;
+            let path = dir.join("large.bin");
+            std::fs::write(&path, &modified).expect("Failed to write large file");
+
+            assert_eq!(
+                immutable::file_matches(repository.clone(), path.as_path(), address, Some(size))
+                    .await
+                    .expect("Failed to compare large file"),
+                lore_storage::FileMatch::Differs,
+            );
+        })
+        .await;
+    }
+
+    /// The verdict has to reach `is_file_modified`, which is the caller that would otherwise
+    /// read the whole stored object to reach the same answer.
+    #[tokio::test]
+    async fn a_modified_fragmented_file_is_reported_modified() {
+        on_a_repository(|repository, dir, context| async move {
+            let size = 640 * 1024;
+            let content = random_content(size);
+            let address = store_as_legacy_chunks(&repository, context, &content, 64 * 1024).await;
+
+            let mut modified = content.clone();
+            modified[size / 2] ^= 0xff;
+            let path = dir.join("large.bin");
+            std::fs::write(&path, &modified).expect("Failed to write large file");
+
+            let metadata = std::fs::metadata(&path).expect("Failed to get metadata");
+            let (mtime, file_size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
+            let node = Node {
+                flags: NodeFlags::File.bits(),
+                size: size as u64,
+                address,
+                ..Default::default()
+            };
+
+            let is_modified = file_modification(
+                repository.clone(),
+                &node,
+                mtime,
+                file_size,
+                &RelativePath::new_from_initial_path("large.bin").unwrap(),
+                true,
+            )
+            .await
+            .expect("file_modification failed")
+            .is_modified();
+
+            assert!(is_modified, "a file with one byte changed is modified");
+        })
+        .await;
+    }
+
+    /// 128 KiB file stored as two 64 KiB chunks under the old strategy, unmodified on disk.
+    /// Under the current threshold one fragment would cover it, so the buffer hash misses and
+    /// the stored list is what recognises the content.
+    #[tokio::test]
+    async fn unmodified_128k_file_with_legacy_two_chunk_fragmentation() {
+        on_a_repository(|repository, dir, context| async move {
+            let content_size = 128 * 1024;
+            let content = random_content(content_size);
+            let root_address =
+                store_as_legacy_chunks(&repository, context, &content, 64 * 1024).await;
+
+            let file_path = dir.join("test_file_128k.bin");
+            std::fs::write(&file_path, &content).expect("Failed to write test file");
+
+            let metadata = std::fs::metadata(&file_path).expect("Failed to get metadata");
+            let relative_path = RelativePath::new_from_initial_path("test_file_128k.bin").unwrap();
+            let node = Node {
+                flags: NodeFlags::File.bits(),
+                size: content_size as u64,
+                address: root_address,
+                ..Default::default()
+            };
+
+            let (mtime, size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
+            let modified =
+                file_modification(repository.clone(), &node, mtime, size, &relative_path, true)
+                    .await
+                    .expect("file_modification failed")
+            .is_modified();
+
+            assert!(
+                !modified,
+                "128 KiB file with legacy two-chunk fragmentation should NOT be detected as modified"
+            );
+        })
+        .await;
+    }
+
+    /// 640 KiB file stored as ten 64 KiB chunks. Each chunk is validated against the stored
+    /// list individually, so the file is recognised without reading any stored content.
     #[tokio::test]
     async fn unmodified_640k_file_reuses_previous_chunk_fragmentation() {
-        let tempdir = generate_tempdir();
-        let dir = tempdir.path().to_path_buf();
+        on_a_repository(|repository, dir, context| async move {
+            let content_size = 640 * 1024;
+            let content = random_content(content_size);
+            let root_address =
+                store_as_legacy_chunks(&repository, context, &content, 64 * 1024).await;
 
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
+            let file_path = dir.join("test_file_640k.bin");
+            std::fs::write(&file_path, &content).expect("Failed to write test file");
 
-        LORE_CONTEXT
-            .scope(execution.clone(), async move {
-                let mut rng = rand::rng();
-                let context: Context = rand::random();
-                let repository_id = rand::random();
+            let metadata = std::fs::metadata(&file_path).expect("Failed to get metadata");
+            let relative_path = RelativePath::new_from_initial_path("test_file_640k.bin").unwrap();
+            let node = Node {
+                flags: NodeFlags::File.bits(),
+                size: content_size as u64,
+                address: root_address,
+                ..Default::default()
+            };
 
-                let repository = Arc::new(RepositoryContext::new(
-                    Some(dir.as_path().to_path_buf()),
-                    immutable_store,
-                    mutable_store,
-                    repository_id,
-                    lore_revision::instance::InstanceId::default(),
-                    Err(ProtocolError::from(NoRemote)),
-                    Arc::default(),
-                    RepositoryFormat::Lore,
-                ));
+            let (mtime, size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
+            let modified =
+                file_modification(repository.clone(), &node, mtime, size, &relative_path, true)
+                    .await
+                    .expect("file_modification failed")
+            .is_modified();
 
-                // Generate 640 KiB of random content
-                let content_size = 640 * 1024;
-                let content: Vec<u8> = (0..content_size)
-                    .map(|_| rng.random_range(0..=255u8))
-                    .collect();
+            assert!(
+                !modified,
+                "640 KiB file with legacy ten-chunk fragmentation should NOT be detected as modified"
+            );
+        })
+        .await;
+    }
+}
 
-                // Store as ten 64 KiB chunks (simulating old chunking strategy)
-                let root_address =
-                    store_as_legacy_chunks(&repository, context, &content, 64 * 1024).await;
+mod block_single_flight {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::time::Duration;
 
-                // Write the identical content to a file on disk
-                let file_path = dir.join("test_file_640k.bin");
-                std::fs::write(&file_path, &content).expect("Failed to write test file");
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_base::runtime::runtime;
+    use lore_base::types::Address;
+    use lore_base::types::Context;
+    use lore_base::types::Fragment;
+    use lore_base::types::Hash;
+    use lore_base::types::Partition;
+    use lore_base::types::TypedBytes;
+    use lore_revision::immutable;
+    use lore_revision::interface::ExecutionContext;
+    use lore_revision::node::Node;
+    use lore_revision::node::NodeFileMetadata;
+    use lore_revision::node::NodeFileMetadataBlock;
+    use lore_revision::node::ROOT_NODE;
+    use lore_revision::node::node_to_file_metadata;
+    use lore_revision::repository::RepositoryContext;
+    use lore_revision::repository::RepositoryWriteToken;
+    use lore_revision::state::State;
+    use lore_storage::ImmutableStore;
+    use lore_storage::MutableStore;
+    use lore_storage::StoreError;
+    use lore_storage::StoreGetData;
+    use lore_storage::StoreMatchResult;
+    use lore_storage::StoreObliterateStats;
+    use lore_storage::hash::hash_string;
+    use lore_storage::local::immutable_store::LocalImmutableStore;
 
-                let metadata = std::fs::metadata(&file_path).expect("Failed to get metadata");
-                let relative_path =
-                    RelativePath::new_from_initial_path("test_file_640k.bin").unwrap();
+    use crate::tests::RepositoryContextCreationArgsExt;
+    use crate::tests::TempDir;
+    use crate::tests::default_repository_creation_args;
+    use crate::tests::generate_tempdir;
+    use crate::tests::test_store_create;
 
-                // Build a Node referencing the legacy chunked address
-                let node = Node {
-                    flags: NodeFlags::File.bits(),
-                    size: content_size as u64,
-                    address: root_address,
-                    ..Default::default()
-                };
+    /// Tasks per burst. Large enough that a store read per task is unmistakable
+    /// next to the handful the state needs whatever the concurrency.
+    const BURST: usize = 32;
 
-                // is_file_modified should detect content equality despite hash mismatch
-                let (mtime, size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
-                let (modified, new_hash) = is_file_modified(
-                    repository.clone(),
-                    &node,
-                    mtime,
-                    size,
-                    &relative_path,
-                    true, // force hash check
+    /// How long each payload read is held open. Every task in a burst arrives
+    /// inside this window, so a state that does not gate its block reads does
+    /// them all, rather than losing a race it would usually win by accident.
+    const READ_DELAY: Duration = Duration::from_millis(50);
+
+    /// Counts the payload reads reaching the store underneath, per address, and
+    /// paces them.
+    struct CountingStore {
+        inner: Arc<dyn ImmutableStore>,
+        reads: Mutex<BTreeMap<Address, u32>>,
+    }
+
+    impl CountingStore {
+        fn take_reads(&self) -> BTreeMap<Address, u32> {
+            std::mem::take(&mut *self.reads.lock().expect("Read counter poisoned"))
+        }
+    }
+
+    impl std::fmt::Debug for CountingStore {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "CountingStore")
+        }
+    }
+
+    #[async_trait]
+    impl ImmutableStore for CountingStore {
+        async fn get(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreGetData, StoreError> {
+            *self
+                .reads
+                .lock()
+                .expect("Read counter poisoned")
+                .entry(address)
+                .or_default() += 1;
+            tokio::time::sleep(READ_DELAY).await;
+            self.inner.clone().get(partition, address).await
+        }
+
+        async fn get_metadata(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+        ) -> Result<StoreGetData, StoreError> {
+            self.inner.clone().get_metadata(partition, address).await
+        }
+
+        async fn query(
+            self: Arc<Self>,
+            partition: Partition,
+            addresses: &[Address],
+            results: &mut [StoreMatchResult],
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .query(partition, addresses, results)
+                .await
+        }
+
+        async fn put(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+            fragment: Fragment,
+            payload: Option<Bytes>,
+            force: bool,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .put(partition, address, fragment, payload, force)
+                .await
+        }
+
+        async fn obliterate(
+            self: Arc<Self>,
+            partition: Partition,
+            address: Address,
+            stats: Arc<StoreObliterateStats>,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .obliterate(partition, address, stats)
+                .await
+        }
+
+        async fn evict(
+            self: Arc<Self>,
+            max_capacity: usize,
+            sync_data: bool,
+            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+        ) -> Result<usize, StoreError> {
+            self.inner
+                .clone()
+                .evict(max_capacity, sync_data, sink)
+                .await
+        }
+
+        async fn compact(
+            self: Arc<Self>,
+            max_size: usize,
+            at: Option<usize>,
+            sync_data: bool,
+            sink: Option<lore_storage::gc_event::GcEventSinkRef>,
+        ) -> Result<Option<usize>, StoreError> {
+            self.inner
+                .clone()
+                .compact(max_size, at, sync_data, sink)
+                .await
+        }
+
+        async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
+            self.inner.clone().compact_resume_at().await
+        }
+
+        async fn compact_stop(self: Arc<Self>) {
+            self.inner.clone().compact_stop().await;
+        }
+
+        fn max_query_batch(&self) -> Option<usize> {
+            self.inner.max_query_batch()
+        }
+
+        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+            self.inner.clone().flush(sync_data).await
+        }
+
+        async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
+            self.inner.clone().verify(heal).await
+        }
+
+        async fn copy(
+            self: Arc<Self>,
+            source_partition: Partition,
+            source_address: Address,
+            destination_partition: Partition,
+            destination_context: Context,
+            durable: bool,
+        ) -> Result<(), StoreError> {
+            self.inner
+                .clone()
+                .copy(
+                    source_partition,
+                    source_address,
+                    destination_partition,
+                    destination_context,
+                    durable,
                 )
                 .await
-                .expect("is_file_modified failed");
+        }
+    }
 
-                assert!(
-                    !modified,
-                    "640 KiB file with legacy ten-chunk fragmentation should NOT be detected as modified"
-                );
+    /// A repository over a counting store, and a state written into it carrying
+    /// one node block and one file metadata block.
+    struct Seed {
+        _tempdir: TempDir,
+        store: Arc<CountingStore>,
+        repository: Arc<RepositoryContext>,
+        signature: Hash,
+        block_index: usize,
+        /// Store address of the node block, so a burst can be held to reading
+        /// that address once rather than to a total that says nothing about
+        /// which block was read.
+        node_block: Address,
+        /// Store address of the file metadata block.
+        metadata_block: Address,
+    }
 
-                // For files > 256 KiB, hash_file validates each chunk against
-                // the previous fragment list and returns the stored root hash
-                // when all chunks match. The content comparison fallback is NOT
-                // needed here — the chunk-level validation succeeds directly.
+    /// Store address of block `block_index` in the address list rooted at `list`.
+    async fn block_address(
+        repository: &Arc<RepositoryContext>,
+        list: Hash,
+        block_index: usize,
+    ) -> Address {
+        let bytes = immutable::read(
+            repository.clone(),
+            Address::zero_context_hash(list),
+            None,
+            immutable::read_options_from_repository(repository),
+        )
+        .await
+        .expect("Failed to read a block address list");
+        Address::zero_context_hash(bytes.as_type_slice::<Hash>()[block_index])
+    }
+
+    async fn seeded_repository(mutable_store: Arc<dyn MutableStore>) -> Seed {
+        let tempdir = generate_tempdir();
+        let path = tempdir.to_path_buf();
+
+        let store = Arc::new(CountingStore {
+            inner: LocalImmutableStore::new(
+                None,
+                lore_storage::local::immutable_store::ImmutableStoreSettings::default(),
+            )
+            .await
+            .expect("Failed to create store"),
+            reads: Mutex::default(),
+        });
+
+        let write_token = RepositoryWriteToken::acquire(path.as_path()).await;
+        let repository = Arc::new(
+            RepositoryContext::new(
+                default_repository_creation_args(store.clone(), mutable_store).with_path(&path),
+            )
+            .with_write_token(write_token.share()),
+        );
+
+        let state = State::new();
+        let node = state
+            .node_add(
+                repository.clone(),
+                ROOT_NODE,
+                Node {
+                    name_hash: hash_string("first"),
+                    ..Default::default()
+                },
+                "first",
+            )
+            .await
+            .expect("Failed to add a node");
+
+        let metadata_node = node_to_file_metadata(node);
+        let block_index = NodeFileMetadataBlock::index(metadata_node);
+        let metadata_block = state
+            .block_file_metadata(repository.clone(), block_index)
+            .await
+            .expect("Failed to read the file metadata block");
+        {
+            let mut writer = metadata_block.write();
+            writer.node(NodeFileMetadata::index(metadata_node)).metadata = Hash::from_u64(9);
+            writer.mark_dirty();
+        }
+        state.block_file_metadata_modified(metadata_block, block_index);
+        state.mark_dirty();
+
+        let signature = state
+            .serialize(repository.clone(), &write_token)
+            .await
+            .expect("Failed to serialize");
+
+        let tree = State::deserialize(repository.clone(), signature)
+            .await
+            .expect("Failed to deserialize state")
+            .tree(repository.clone())
+            .await
+            .expect("Failed to load the tree");
+
+        Seed {
+            node_block: block_address(&repository, tree.hash_node, block_index).await,
+            metadata_block: block_address(&repository, tree.hash_file_metadata, block_index).await,
+            _tempdir: tempdir,
+            store,
+            repository,
+            signature,
+            block_index,
+        }
+    }
+
+    /// Payload reads per address, taken while [`BURST`] tasks all ask one freshly
+    /// deserialized state for the same block.
+    ///
+    /// The tree is loaded before counting starts, because it has a check-then-read
+    /// of its own that the burst would otherwise measure instead.
+    ///
+    /// Blocks are held until the counts are taken, as a walk holds one it is
+    /// descending through. A file metadata block is published only as a `Weak`, so
+    /// a burst that dropped each block on arrival would read it again for the next
+    /// task whatever the gate does.
+    async fn reads_during_burst<F, Fut, T>(
+        seed: &Seed,
+        execution: &Arc<ExecutionContext>,
+        read: F,
+    ) -> BTreeMap<Address, u32>
+    where
+        F: Fn(Arc<State>, Arc<RepositoryContext>) -> Fut + Copy + Send + 'static,
+        Fut: std::future::Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let state = State::deserialize(seed.repository.clone(), seed.signature)
+            .await
+            .expect("Failed to deserialize state");
+        state
+            .tree(seed.repository.clone())
+            .await
+            .expect("Failed to load the tree");
+
+        seed.store.take_reads();
+
+        let mut tasks = Vec::with_capacity(BURST);
+        for _ in 0..BURST {
+            let state = state.clone();
+            let repository = seed.repository.clone();
+            #[allow(clippy::disallowed_methods)]
+            tasks.push(
+                runtime().spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                    read(state, repository).await
+                })),
+            );
+        }
+        let mut held = Vec::with_capacity(BURST);
+        for task in tasks {
+            held.push(task.await.expect("Block read task failed"));
+        }
+
+        let reads = seed.store.take_reads();
+        drop(held);
+        reads
+    }
+
+    /// Every walk descending through a block that is not resident wants it at the
+    /// same time, and deserializing one is a store read and a decompress. The
+    /// burst must cost the store one read of that block.
+    #[tokio::test]
+    async fn concurrent_readers_of_a_node_block_read_it_once() {
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let spawn_execution = execution.clone();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let seed = Box::pin(seeded_repository(mutable_store)).await;
+                let block_index = seed.block_index;
+
+                let reads = reads_during_burst(
+                    &seed,
+                    &spawn_execution,
+                    move |state: Arc<State>, repository: Arc<RepositoryContext>| async move {
+                        state
+                            .block(repository, block_index)
+                            .await
+                            .expect("Failed to read the node block")
+                    },
+                )
+                .await;
+
                 assert_eq!(
-                    new_hash, root_address.hash,
-                    "Returned hash should equal the stored hash (chunk validation path)"
+                    reads.get(&seed.node_block).copied(),
+                    Some(1),
+                    "{BURST} readers of one node block must read it once"
                 );
-            })
-            .await;
+                assert!(
+                    reads.values().all(|&count| count == 1),
+                    "the burst must read nothing twice, got {reads:?}"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// The file metadata block is reached the same way and is far larger, and it
+    /// draws on the same permits, so it owes the same guarantee.
+    #[tokio::test]
+    async fn concurrent_readers_of_a_file_metadata_block_read_it_once() {
+        let (_, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let spawn_execution = execution.clone();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let seed = Box::pin(seeded_repository(mutable_store)).await;
+                let block_index = seed.block_index;
+
+                let reads = reads_during_burst(
+                    &seed,
+                    &spawn_execution,
+                    move |state: Arc<State>, repository: Arc<RepositoryContext>| async move {
+                        state
+                            .block_file_metadata(repository, block_index)
+                            .await
+                            .expect("Failed to read the file metadata block")
+                    },
+                )
+                .await;
+
+                assert_eq!(
+                    reads.get(&seed.metadata_block).copied(),
+                    Some(1),
+                    "{BURST} readers of one file metadata block must read it once"
+                );
+                assert!(
+                    reads.values().all(|&count| count == 1),
+                    "the burst must read nothing twice, got {reads:?}"
+                );
+            }))
+            .await
+            .expect("Test task failed");
     }
 }

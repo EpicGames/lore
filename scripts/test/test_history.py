@@ -214,6 +214,67 @@ def test_history_only_branch(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_history_branch_remote_fallback(new_lore_repo):
+    repo: Lore = new_lore_repo()
+
+    text_file = "text.txt"
+
+    # A couple of revisions on main so the branch has a branch point
+    for i in range(2):
+        with repo.open_file(text_file, "w+") as f:
+            f.write(f"Main content {i}\n")
+        repo.stage(scan=True)
+        repo.commit(f"Main commit {i + 1}", local=True)
+
+    repo.push()
+
+    # A branch that the clone below will only ever know from the remote
+    repo.branch_create("remote-only")
+    repo.branch_switch("remote-only")
+
+    for i in range(3):
+        with repo.open_file(text_file, "w+") as f:
+            f.write(f"Remote content {i}\n")
+        repo.stage(scan=True)
+        repo.commit(f"Remote commit {i + 1}", local=True)
+
+    repo.push()
+
+    remote_head = repo.history(branch="remote-only")[-1].signature
+
+    # The clone only syncs main, so it has no local history for "remote-only"
+    clone = repo.clone()
+
+    # --local pins the lookup to the local branch, which does not exist here
+    assert clone.history(branch="remote-only", local=True) == [], (
+        "--local should not fall back to the remote branch"
+    )
+
+    # Without a location flag the missing local branch falls back to the remote
+    fallback = clone.history(branch="remote-only")
+    assert fallback, "expected remote history for a branch missing locally"
+    assert fallback[-1].signature == remote_head
+    assert clone.history(branch="remote-only", remote=True)[-1].signature == remote_head
+
+    # `history --branch <name>` matches `branch switch <name>; history`
+    clone.branch_switch("remote-only")
+    assert [entry.signature for entry in clone.history()] == [
+        entry.signature for entry in fallback
+    ]
+
+    # Now that the branch exists locally the local tip wins over the remote tip
+    with clone.open_file(text_file, "w+") as f:
+        f.write("Local only content\n")
+    clone.stage(scan=True)
+    clone.commit("Local only commit", local=True)
+
+    local_head = clone.history(branch="remote-only")[-1].signature
+    assert local_head != remote_head, "expected the unpushed local revision"
+    assert clone.history(branch="remote-only", remote=True)[-1].signature == remote_head
+    assert clone.history(branch="remote-only", local=True)[-1].signature == local_head
+
+
+@pytest.mark.smoke
 def test_history_date_filter(new_lore_repo):
     repo: Lore = new_lore_repo()
 

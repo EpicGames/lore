@@ -32,12 +32,14 @@ use crate::repository;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::repository::clone;
+use crate::repository::clone::CloneContext;
 use crate::revision::sync;
 use crate::revision::sync::SyncOptions;
 use crate::revision::sync::SyncRealizeStats;
 use crate::state;
 use crate::state::State;
 use crate::util::path::RelativePath;
+use crate::util::path::RepositoryPath;
 
 #[error_set]
 pub enum LayerError {
@@ -191,9 +193,9 @@ struct LayerConfig {
 }
 
 async fn load_config(config_path: impl AsRef<Path>) -> Result<LayerConfig, LayerError> {
-    Ok(crate::global::load_config(config_path)
+    crate::util::config::load(config_path)
         .await
-        .internal("Failed to load configuration")?)
+        .forward::<LayerError>("Failed to load configuration")
 }
 
 async fn save_config(
@@ -201,13 +203,9 @@ async fn save_config(
     config_path: impl AsRef<Path>,
     config: &LayerConfig,
 ) -> Result<(), LayerError> {
-    let config_string = toml::to_string_pretty(&config).internal("Failed to save configuration")?;
-
-    lore_io::IoDriver::global()
-        .write_file_bytes(config_path, bytes::Bytes::from(config_string), false)
+    crate::util::config::save(config, config_path)
         .await
-        .internal("Failed to save configuration")?;
-    Ok(())
+        .forward::<LayerError>("Failed to save configuration")
 }
 
 pub fn layer_config_path(repository_path: impl AsRef<Path>) -> PathBuf {
@@ -223,6 +221,15 @@ pub struct LayerState {
 }
 
 impl Layer {
+    /// The layer's staged revision, if it holds staging distinct from `current`.
+    ///
+    /// A zero pin means the layer was never staged; a pin equal to `current`
+    /// means the stage has since been committed or reverted. Neither carries
+    /// staged nodes, so both read as "no staged revision".
+    pub fn staged_revision(&self) -> Option<Hash> {
+        (!self.staged.is_zero() && self.staged != self.current).then_some(self.staged)
+    }
+
     pub async fn deserialize_current_and_staged(
         &self,
         repository: Arc<RepositoryContext>,
@@ -233,12 +240,11 @@ impl Layer {
             .await
             .forward::<LayerError>("Failed deserializing state")?;
 
-        let state_staged = if !self.staged.is_zero() {
-            State::deserialize(repository.clone(), self.staged)
+        let state_staged = match self.staged_revision() {
+            Some(staged) => State::deserialize(repository.clone(), staged)
                 .await
-                .forward::<LayerError>("Failed deserializing state")?
-        } else {
-            state_current.clone()
+                .forward::<LayerError>("Failed deserializing state")?,
+            None => state_current.clone(),
         };
 
         Ok(LayerState {
@@ -402,7 +408,7 @@ pub async fn add(
         staged: Hash::default(),
     });
 
-    let absolute_path = target_path.to_absolute_path(repository.require_path()?);
+    let target_path = RepositoryPath::from_relative(&repository, target_path)?;
 
     // Materialize layer
     lore_debug!("Connecting remote storage");
@@ -416,7 +422,7 @@ pub async fn add(
         .forward::<LayerError>("Not connected")?;
 
     event::LoreEvent::LayerAdd(LoreLayerAddEventData {
-        target_path: LoreString::from(&target_path),
+        target_path: LoreString::from(target_path.relative().clone()),
         source_repository: layer_repository.id,
         source_path: LoreString::from(&source_path),
         metadata: metadata.into(),
@@ -426,25 +432,33 @@ pub async fn add(
 
     // Ensure the target path exist to clone into
     lore_io::IoDriver::global()
-        .create_dir_all(&absolute_path)
+        .create_dir_all(target_path.absolute())
         .await
         .internal("Failed to create the target directory for layer")?;
 
-    clone::clone_node(
-        layer_repository.clone(),
-        layer_storage,
-        layer_state,
-        absolute_path,
-        source_path,
-        layer_node_link.node,
-        Arc::new(clone::CloneOptions {
+    let layer_operation = layer_repository
+        .file_system()
+        .begin_operation()
+        .await
+        .forward::<LayerError>("Failed to start operation")?;
+    let clone_ctx = CloneContext {
+        repository: layer_repository.clone(),
+        state: layer_state,
+        operation: layer_operation.clone(),
+        options: Arc::new(clone::CloneOptions {
             ignore_existing: false,
             ..Default::default()
         }),
-        Arc::default(), /* Default stats */
-    )
-    .await
-    .forward::<LayerError>("Failed cloning target layer")?;
+        stats: Arc::default(),
+        modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
+    };
+    clone::clone_node(clone_ctx, layer_storage, target_path, layer_node_link.node)
+        .await
+        .forward::<LayerError>("Failed cloning target layer")?;
+    layer_operation
+        .finalize(true)
+        .await
+        .forward::<LayerError>("Failed to finalize operation")?;
 
     save_config(
         token,
@@ -503,10 +517,16 @@ pub async fn remove(
     let layer_index = resolve_layer_index(&config.layers, target_path.as_str(), source_repository)?;
     let layer = config.layers[layer_index].clone();
 
-    let layer_repository = Arc::new(repository.to_layer_context(layer.repository).await);
-    let layer_state = State::deserialize(layer_repository.clone(), layer.current)
-        .await
-        .forward::<LayerError>("Failed to deserialize layer state")?;
+    // Walk the staged state, not `current`: a staged add exists only there, so
+    // walking `current` would leave it on disk as untracked debris once the
+    // layer is gone.
+    let LayerState {
+        repository: layer_repository,
+        state_staged: layer_state,
+        ..
+    } = layer
+        .deserialize_current_and_staged(repository.clone())
+        .await?;
 
     let source_path = RelativePath::new_from_initial_path(layer.source_path.as_str())
         .forward_with::<LayerError, _>(|| {
@@ -517,7 +537,13 @@ pub async fn remove(
         .await
         .forward::<LayerError>("Failed to locate layer source node")?;
 
-    let force = execution_context().globals().force();
+    let staged_file_count = state::count_staged_files(
+        layer_repository.clone(),
+        layer_state.clone(),
+        source_node_link.node,
+    )
+    .await;
+
     let mut tracked_files: Vec<RelativePath> = Vec::new();
     let mut tracked_directories: Vec<RelativePath> = Vec::new();
     let mut modified: Vec<String> = Vec::new();
@@ -533,12 +559,23 @@ pub async fn remove(
     )
     .await?;
 
-    if !modified.is_empty() && !force {
-        lore_warn!(
-            "Layer at '{}' has locally modified files (use --force to discard): {}",
-            target_path.as_str(),
-            modified.join(", ")
-        );
+    // Both reasons are reported before returning so a layer that is both staged
+    // and modified does not hide one behind the other across two --force runs.
+    let force = execution_context().globals().force();
+    if !force && (staged_file_count > 0 || !modified.is_empty()) {
+        if staged_file_count > 0 {
+            lore_warn!(
+                "Layer at '{}' has {staged_file_count} staged file(s) (use --force to discard)",
+                target_path.as_str()
+            );
+        }
+        if !modified.is_empty() {
+            lore_warn!(
+                "Layer at '{}' has locally modified files (use --force to discard): {}",
+                target_path.as_str(),
+                modified.join(", ")
+            );
+        }
         return Err(LocalModifications.into());
     }
 
@@ -600,7 +637,7 @@ pub async fn remove(
         source_repository: layer.repository,
         source_path: LoreString::from_str(&layer.source_path),
         revision: layer.current,
-        forced: (force && modified_count > 0) as u8,
+        forced: (force && (modified_count > 0 || staged_file_count > 0)) as u8,
         purged: purge as u8,
         file_count,
         directory_count,
@@ -653,24 +690,26 @@ fn walk_layer_subtree<'a>(
                     modified,
                 )
                 .await?;
-            } else {
+            } else if !child_node.is_staged_delete() {
                 let absolute = child_path.to_absolute_path(layer_repository.require_path()?);
                 match lore_io::IoDriver::global().metadata(&absolute).await {
                     Ok(metadata) if metadata.is_file() => {
                         let (file_mtime, file_size) =
                             crate::util::fs::file_mtime_and_size(&metadata);
-                        let is_modified = state::is_file_modified(
-                            layer_repository.clone(),
-                            &child_node,
-                            file_mtime,
-                            file_size,
-                            &child_path,
-                            true,
-                        )
-                        .await
-                        .map_or(true, |(m, _)| m);
-                        if is_modified {
-                            modified.push(child_path.as_str().to_string());
+                        if !child_node.is_staged() {
+                            let is_modified = state::file_modification(
+                                layer_repository.clone(),
+                                &child_node,
+                                file_mtime,
+                                file_size,
+                                &child_path,
+                                true,
+                            )
+                            .await
+                            .map_or(true, |modification| modification.is_modified());
+                            if is_modified {
+                                modified.push(child_path.as_str().to_string());
+                            }
                         }
                         tracked_files.push(child_path);
                     }
@@ -697,6 +736,24 @@ pub async fn list(repository: Arc<RepositoryContext>) -> Result<Vec<Layer>, Laye
     Ok(config.layers)
 }
 
+/// For operations that cascade into every configured layer.
+///
+/// Each context costs its own connection until UCS-19226 lands, so they are
+/// opened concurrently rather than one handshake after another.
+pub async fn list_with_context(
+    repository: Arc<RepositoryContext>,
+) -> Result<Vec<(Layer, Arc<RepositoryContext>)>, LayerError> {
+    let layers = list(repository.clone()).await?;
+    Ok(futures::future::join_all(layers.into_iter().map(|layer| {
+        let repository = repository.clone();
+        async move {
+            let context = Arc::new(repository.to_layer_context(layer.repository).await);
+            (layer, context)
+        }
+    }))
+    .await)
+}
+
 /// Information about a layer with staged changes, including the count of files
 /// modified since the layer's `current` revision.
 #[derive(Clone, Debug)]
@@ -718,11 +775,11 @@ pub async fn list_staged(
     let layers = list(repository.clone()).await?;
     let mut result = Vec::new();
     for layer in layers {
-        if layer.staged.is_zero() || layer.staged == layer.current {
+        let Some(staged) = layer.staged_revision() else {
             continue;
-        }
+        };
         let layer_repository = Arc::new(repository.to_layer_context(layer.repository).await);
-        let staged_state = State::deserialize(layer_repository.clone(), layer.staged)
+        let staged_state = State::deserialize(layer_repository.clone(), staged)
             .await
             .forward::<LayerError>("Failed to deserialize layer staged state")?;
 
@@ -731,7 +788,7 @@ pub async fn list_staged(
             .find_node_link(layer_repository.clone(), &layer.source_path)
             .await
             .forward::<LayerError>("Failed to locate layer source node")?;
-        let staged_file_count = count_staged_files(
+        let staged_file_count = state::count_staged_files(
             layer_repository.clone(),
             staged_state,
             source_node_link.node,
@@ -758,46 +815,6 @@ pub async fn list_staged(
         result.push(info);
     }
     Ok(result)
-}
-
-async fn count_staged_files(
-    repository: Arc<RepositoryContext>,
-    state: Arc<State>,
-    node_id: NodeID,
-) -> u64 {
-    let mut count = 0u64;
-    let children = match crate::state::StateNodeChildrenIterator::new(
-        state.clone(),
-        repository.clone(),
-        node_id,
-    )
-    .await
-    {
-        Ok(iter) => iter,
-        Err(err) => {
-            lore_warn!("Failed to iterate children for layer staged file count: {err}");
-            return 0;
-        }
-    };
-
-    let mut iter = children;
-    while let Ok(Some((child_id, child_node))) = iter.next().await {
-        if !child_node.is_staged() {
-            continue;
-        }
-        if child_node.is_file() {
-            count += 1;
-        } else if child_node.is_directory() {
-            count += Box::pin(count_staged_files(
-                repository.clone(),
-                state.clone(),
-                child_id,
-            ))
-            .await;
-        }
-    }
-
-    count
 }
 
 pub async fn sync(

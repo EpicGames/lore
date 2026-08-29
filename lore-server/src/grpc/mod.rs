@@ -32,6 +32,7 @@ pub mod tower;
 pub use admin_service::LoreAdminService;
 pub use grpc_internal_server::GrpcInternalServerBuilder;
 use lore_base::types::Context;
+use lore_revision::link::LinkError;
 use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::MetadataError;
 use lore_revision::repository::RepositoryWriteToken;
@@ -462,6 +463,17 @@ pub trait FilterSlowDownExt<T, E> {
 
 impl<T> FilterSlowDownExt<T, StateError> for Result<T, StateError> {
     fn filter_slow_down(self) -> Result<Result<T, StateError>, Status> {
+        if let Err(err) = &self
+            && err.is_slow_down()
+        {
+            return Err(Status::resource_exhausted(err.to_string()));
+        }
+        Ok(self)
+    }
+}
+
+impl<T> FilterSlowDownExt<T, LinkError> for Result<T, LinkError> {
+    fn filter_slow_down(self) -> Result<Result<T, LinkError>, Status> {
         if let Err(err) = &self
             && err.is_slow_down()
         {

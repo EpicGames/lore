@@ -107,7 +107,7 @@ impl S3Impl {
             Err(SdkError::ServiceError(err)) if err.err().is_not_found() => Ok(false),
             Err(e) => {
                 warn!("Failed to check if bucket exists: {e}");
-                Err(AwsError::AwsSdkError(e))
+                Err(AwsError::sdk_error(e))
             }
         }
     }
@@ -136,7 +136,7 @@ impl S3Impl {
             )
             .await
             .output
-            .map_err(AwsError::AwsSdkError)
+            .map_err(AwsError::sdk_error)
     }
 
     #[tracing::instrument(name = "S3Impl::head_object", skip_all)]
@@ -159,7 +159,7 @@ impl S3Impl {
             )
             .await
             .output
-            .map_err(AwsError::AwsSdkError)
+            .map_err(AwsError::sdk_error)
     }
 
     #[tracing::instrument(name = "S3Impl::get_object", skip_all)]
@@ -189,7 +189,7 @@ impl S3Impl {
             )
             .await
             .output
-            .map_err(AwsError::AwsSdkError)
+            .map_err(AwsError::sdk_error)
     }
 
     /// Store an object, optionally attaching object metadata carried as `x-amz-meta-*` headers.
@@ -224,7 +224,7 @@ impl S3Impl {
             )
             .await
             .output
-            .map_err(AwsError::AwsSdkError)
+            .map_err(AwsError::sdk_error)
     }
 
     pub async fn list_versions(
@@ -246,7 +246,7 @@ impl S3Impl {
             )
             .await
             .output
-            .map_err(AwsError::AwsSdkError)
+            .map_err(AwsError::sdk_error)
     }
 
     #[tracing::instrument(name = "S3Impl::delete_object", skip_all)]
@@ -271,7 +271,7 @@ impl S3Impl {
             )
             .await
             .output
-            .map_err(AwsError::AwsSdkError)
+            .map_err(AwsError::sdk_error)
     }
 
     pub fn sdk_client(&self) -> &s3::Client {

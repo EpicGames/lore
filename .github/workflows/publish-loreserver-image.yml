@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Publish loreserver image
+
+# Stub. Manual trigger only, so the workflow is registered on the default
+# branch and can be dispatched against a pull request branch. The multi-arch
+# build of lore-server/Dockerfile, the push to
+# ghcr.io/epicgames/lore/loreserver and keyless cosign signing land in a
+# follow-up pull request.
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: publish-loreserver-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish
+    runs-on: ubuntu-latest
+    steps:
+      # TODO: build, push and sign the multi-arch image.
+      - name: Publish
+        run: echo "publish-loreserver-image stub — no build or publish yet"

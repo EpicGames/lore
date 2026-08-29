@@ -2919,3 +2919,111 @@ def test_dirty_add_repeated_is_idempotent(new_lore_repo):
     repo.dirty(added, offline=True)
     check("second dirty, plain status")
     check("second dirty, --check-dirty", check_dirty=True)
+
+
+@pytest.mark.smoke
+def test_scan_answers_from_recorded_mtime_after_commit(new_lore_repo):
+    """A commit reads and hashes every file it commits, and records the modified time it
+    read each at. The next scan must answer from those times: a repository that has just
+    been committed has nothing left to measure.
+
+    Without the recording the scan re-hashes the whole tree to reach the answer the commit
+    already had, which the summary reports as a hash check per file.
+    """
+    repo: Lore = new_lore_repo()
+
+    file_count = 8
+    for index in range(file_count):
+        with repo.open_file(f"recorded{index}.bin", "w+b") as f:
+            f.write(os.urandom(4096))
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    summary = parse_status_summary_json(repo.status(scan=True, json=True, offline=True))
+    assert summary is not None, "scan must emit a repositoryStatusSummary event"
+    assert summary["hashChecks"] == 0, (
+        f"a scan straight after a commit must measure no file, got {summary}"
+    )
+    assert summary["mtimeMatches"] == file_count, (
+        f"every committed file should be answered by its recorded time, got {summary}"
+    )
+    assert summary["modifies"] == 0, summary
+
+
+@pytest.mark.smoke
+def test_scan_hashes_a_same_size_edit(new_lore_repo):
+    """An edit that keeps the file's size cannot be settled by the size comparison, so the
+    scan has to measure the content against the node to tell it from an untouched file.
+
+    Asserting the hash check happened is what separates this from a size-changing edit,
+    which any comparison would catch.
+    """
+    repo: Lore = new_lore_repo()
+
+    file_count = 8
+    for index in range(file_count):
+        with repo.open_file(f"sized{index}.bin", "w+b") as f:
+            f.write(os.urandom(4096))
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    with repo.open_file("sized3.bin", "w+b") as f:
+        f.write(os.urandom(4096))
+
+    output = repo.status(scan=True, json=True, offline=True)
+    entry = find_status_entry(parse_status_json(output), "sized3.bin")
+    assert entry is not None, "a same-size edit must be reported by the scan"
+    assert entry["flagDirty"] is True, entry
+
+    summary = parse_status_summary_json(output)
+    assert summary is not None, "scan must emit a repositoryStatusSummary event"
+    assert summary["modifies"] == 1, summary
+    assert summary["hashChecks"] == 1, (
+        f"the edited file must be measured, not decided by size, got {summary}"
+    )
+    assert summary["mtimeMatches"] == file_count - 1, (
+        f"the untouched files should still be answered by recorded time, got {summary}"
+    )
+
+
+@pytest.mark.smoke
+def test_scan_records_mtime_after_hash_check(new_lore_repo):
+    """A file restored to its committed content has a new modified time, so the recorded
+    one no longer vouches for it and the scan measures it. Establishing the match is what
+    lets the scan record the new time, so the next scan answers without measuring again.
+
+    Without that recording the file is measured on every scan for as long as it is neither
+    written nor committed.
+    """
+    repo: Lore = new_lore_repo()
+
+    original = os.urandom(4096)
+    with repo.open_file("reverted.bin", "w+b") as f:
+        f.write(original)
+    with repo.open_file("untouched.bin", "w+b") as f:
+        f.write(os.urandom(4096))
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    # Same size, different content, then the committed bytes back again. The content
+    # matches the node once more but the modified time has moved on twice.
+    with repo.open_file("reverted.bin", "w+b") as f:
+        f.write(os.urandom(4096))
+    with repo.open_file("reverted.bin", "w+b") as f:
+        f.write(original)
+
+    output = repo.status(scan=True, json=True, offline=True)
+    assert find_status_entry(parse_status_json(output), "reverted.bin") is None, (
+        "a file restored to its committed content is not a change"
+    )
+    summary = parse_status_summary_json(output)
+    assert summary is not None, "scan must emit a repositoryStatusSummary event"
+    assert summary["hashChecks"] == 1, (
+        f"the restored file must be measured to establish the match, got {summary}"
+    )
+
+    summary = parse_status_summary_json(repo.status(scan=True, json=True, offline=True))
+    assert summary["hashChecks"] == 0, (
+        f"the established match must be recorded, sparing the next scan, got {summary}"
+    )
+    assert summary["mtimeMatches"] == 2, summary

@@ -11,8 +11,8 @@ from error_types import (
     DeleteDefaultError,
     DeleteProtectedError,
     LocalChanges,
+    LoreException,
     NotFound,
-    UnknownLoreError,
     ZeroRevisionError,
 )
 from lore_parsers import parse_branch_list_json, parse_jsonl
@@ -1417,3 +1417,67 @@ def test_branch_info_remote_local_flags(new_lore_repo):
         "--remote in a second instance must report archived=true once the "
         "branch is gone from the remote"
     )
+
+
+@pytest.mark.smoke
+def test_branch_archive_missing_remote_branch_is_quiet(new_lore_repo):
+    """Archiving converges quietly when the remote branch is already gone."""
+    repo: Lore = new_lore_repo()
+    text_file = "file.txt"
+
+    repo.write_commit_push("Initial commit", {text_file: ["Line one\n"]})
+
+    # A branch that was created offline never reached the remote, so the
+    # remote side of the archive has nothing to delete.
+    repo.branch_create("never-pushed", offline=True)
+    repo.branch_switch("main", offline=True)
+
+    output = repo.branch_archive("never-pushed")
+    assert "Archived branch never-pushed" in output, (
+        "Archiving a never-pushed branch should report the local archive"
+    )
+    assert "[Error]" not in output, (
+        f"Archiving a never-pushed branch should not report an error; got {output}"
+    )
+
+    # A branch another client already archived is the same convergence, seen
+    # from a second instance that still holds the branch locally.
+    repo.branch_create("archived-elsewhere")
+    repo.write_commit_push("Branch commit", {text_file: ["Line one\nBranch\n"]})
+    repo.branch_switch("main")
+
+    other = repo.clone()
+    other.branch_switch("archived-elsewhere")
+    other.branch_switch("main")
+
+    repo.branch_archive("archived-elsewhere")
+
+    output = other.branch_archive("archived-elsewhere")
+    assert "Archived branch archived-elsewhere" in output, (
+        "Archiving a remotely archived branch should report the local archive"
+    )
+    assert "[Error]" not in output, (
+        f"Archiving a remotely archived branch should not report an error; got {output}"
+    )
+
+
+@pytest.mark.smoke
+def test_branch_archive_unreachable_remote_fails(new_lore_repo):
+    """A remote that cannot be reached fails the archive instead of passing silently."""
+    # Nothing listens on port 1, so the connection is refused rather than
+    # left to time out.
+    repo: Lore = new_lore_repo(create_repo=False, remote_url="lore://127.0.0.1:1/")
+    repo.repository_create(offline=True)
+
+    with repo.open_file("base.txt", "w+") as f:
+        f.write("base v1\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit("v1", offline=True)
+
+    repo.branch_create("unreachable-remote", offline=True)
+    repo.branch_switch("main", offline=True)
+
+    # The local archive succeeds, but the remote branch could not be archived
+    # and the connection failure is not a not-found, so the command must fail.
+    with pytest.raises(LoreException):
+        repo.branch_archive("unreachable-remote")

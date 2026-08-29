@@ -346,7 +346,7 @@ pub mod test {
     /// which the test fixture doesn't initialise).
     async fn seed_revision(repository_context: &Arc<RepositoryContext>, branch: BranchId) -> Hash {
         let write_token = get_write_token();
-        let state = state::State::new();
+        let state = Arc::new(state::State::new());
         state.set_parent_self(Hash::default());
         state.set_revision_number(1);
         let state_hash = state

@@ -435,27 +435,21 @@ impl DependencyData {
         }
 
         let magic = u32::from_le_bytes(
-            buffer[0..4]
-                .try_into()
-                .internal("dependency blob too short")?,
+            <[u8; 4]>::try_from(&buffer[0..4]).internal("dependency blob too short")?,
         );
         if magic != MAGIC {
             return Err(Internal::msg("dependency blob bad magic").into());
         }
 
         let version = u32::from_le_bytes(
-            buffer[4..8]
-                .try_into()
-                .internal("dependency blob too short")?,
+            <[u8; 4]>::try_from(&buffer[4..8]).internal("dependency blob too short")?,
         );
         if version != VERSION {
             return Err(Internal::msg("dependency blob unsupported version").into());
         }
 
         let entry_count = u32::from_le_bytes(
-            buffer[8..12]
-                .try_into()
-                .internal("dependency blob too short")?,
+            <[u8; 4]>::try_from(&buffer[8..12]).internal("dependency blob too short")?,
         ) as usize;
 
         // Bound entry_count by what the buffer can physically hold before
@@ -481,15 +475,13 @@ impl DependencyData {
             }
 
             let node_id = u32::from_le_bytes(
-                buffer[offset..offset + 4]
-                    .try_into()
+                <[u8; 4]>::try_from(&buffer[offset..offset + 4])
                     .internal("dependency blob truncated entry")?,
             );
             offset += 4;
 
             let tag_count = u16::from_le_bytes(
-                buffer[offset..offset + 2]
-                    .try_into()
+                <[u8; 2]>::try_from(&buffer[offset..offset + 2])
                     .internal("dependency blob truncated entry")?,
             ) as usize;
             offset += 4; // tag_count(2) + reserved(2)
@@ -512,8 +504,7 @@ impl DependencyData {
                 }
 
                 let tag_length = u16::from_le_bytes(
-                    buffer[offset..offset + 2]
-                        .try_into()
+                    <[u8; 2]>::try_from(&buffer[offset..offset + 2])
                         .internal("dependency blob truncated tag")?,
                 ) as usize;
                 offset += 2;
@@ -583,7 +574,7 @@ pub async fn load_dependency_data(
     let metadata_block = state
         .block_file_metadata(repository.clone(), metadata_block_index)
         .await
-        .internal("loading metadata block")?;
+        .forward::<DependencyError>("loading metadata block")?;
 
     let metadata_hash = {
         let block_reader = metadata_block.read();
@@ -596,7 +587,7 @@ pub async fn load_dependency_data(
 
     let metadata = Metadata::deserialize(repository.clone(), metadata_hash)
         .await
-        .internal("deserializing metadata")?;
+        .forward::<DependencyError>("deserializing metadata")?;
 
     let (value_bytes, metadata_type) = match metadata.get_typed(key) {
         Ok(result) => result,
@@ -612,14 +603,14 @@ pub async fn load_dependency_data(
     match metadata_type {
         MetadataType::Binary => Ok(DependencyData::deserialize(value_bytes)?),
         MetadataType::Address => {
-            let address =
-                Metadata::to_address(value_bytes).internal("parsing dependency address")?;
+            let address = Metadata::to_address(value_bytes)
+                .forward::<DependencyError>("parsing dependency address")?;
             let options = immutable::read_options_from_repository(&repository)
                 .with_cache()
                 .with_max_content_size(DEPENDENCY_BLOB_MAX_SIZE as u64);
             let blob = immutable::read(repository, address, None, options)
                 .await
-                .internal("reading dependency blob from immutable store")?;
+                .forward::<DependencyError>("reading dependency blob from immutable store")?;
             Ok(DependencyData::deserialize(&blob)?)
         }
         _ => Err(Internal::msg("unexpected metadata type for dependency key").into()),
@@ -662,7 +653,7 @@ pub async fn store_dependency_data(
     let metadata_block = state
         .block_file_metadata(repository.clone(), metadata_block_index)
         .await
-        .internal("loading metadata block for store")?;
+        .forward::<DependencyError>("loading metadata block for store")?;
 
     loop {
         let metadata_hash = {
@@ -675,7 +666,7 @@ pub async fn store_dependency_data(
         } else {
             Metadata::deserialize(repository.clone(), metadata_hash)
                 .await
-                .internal("deserializing metadata for store")?
+                .forward::<DependencyError>("deserializing metadata for store")?
         };
 
         if data.is_empty() {
@@ -685,7 +676,7 @@ pub async fn store_dependency_data(
             if blob.len() <= DEPENDENCY_INLINE_THRESHOLD {
                 metadata
                     .set_binary(key, &blob)
-                    .internal("setting inline dependency blob")?;
+                    .forward::<DependencyError>("setting inline dependency blob")?;
             } else {
                 let address = immutable::write(
                     repository.clone(),
@@ -695,17 +686,17 @@ pub async fn store_dependency_data(
                         .with_local_cache_priority(),
                 )
                 .await
-                .internal("writing dependency blob to immutable store")?;
+                .forward::<DependencyError>("writing dependency blob to immutable store")?;
                 metadata
                     .set_address(key, address)
-                    .internal("setting dependency address in metadata")?;
+                    .forward::<DependencyError>("setting dependency address in metadata")?;
             }
         }
 
         let metadata_hash_updated = metadata
             .serialize(repository.clone())
             .await
-            .internal("serializing metadata")?;
+            .forward::<DependencyError>("serializing metadata")?;
 
         let dirtied = {
             let mut block_writer = metadata_block.write();

@@ -56,7 +56,12 @@ def test_obliterate(new_lore_repo, tmp_path_factory):
     assert "Store match : 0" in output, (
         "First multi-reference file still resolves after being obliterated"
     )
-    assert ": 100" not in output, "Obliterated fragment was described rather than reported absent"
+    # The whole line, not `": 100"`: a bare substring matches an address that
+    # happens to begin `100`, which one dumped fragment in 4,096 does, and the
+    # content is random.
+    assert "Store match : 100" not in output, (
+        "Obliterated fragment was described rather than reported absent"
+    )
 
     # Obliterate second multi-reference file
     output = repo.file_obliterate(path=multi_reference_file_two, offline=True)
@@ -85,7 +90,12 @@ def test_obliterate(new_lore_repo, tmp_path_factory):
     assert "Store match : 0" in output, (
         "Multi-fragment file still resolves after being obliterated"
     )
-    assert ": 100" not in output, "Obliterated fragment was described rather than reported absent"
+    # The whole line, not `": 100"`: a bare substring matches an address that
+    # happens to begin `100`, which one dumped fragment in 4,096 does, and the
+    # content is random.
+    assert "Store match : 100" not in output, (
+        "Obliterated fragment was described rather than reported absent"
+    )
 
     # Check whether there are files staged after obliteration
     output = repo.repository_status(offline=True)

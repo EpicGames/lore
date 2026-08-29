@@ -128,8 +128,10 @@ async fn node_info_impl(
                 return Err(invalid("node id is invalid"));
             }
 
-            let Ok(node) = internal
-                .state
+            let access = internal.access_shared().await;
+            let state = access.state();
+
+            let Ok(node) = state
                 .node(internal.repository_context.clone(), node_id)
                 .await
             else {
@@ -140,8 +142,7 @@ async fn node_info_impl(
             let name = if node_id == ROOT_NODE {
                 String::new()
             } else {
-                match internal
-                    .state
+                match state
                     .node_name_clone(internal.repository_context.clone(), node_id)
                     .await
                 {
@@ -173,7 +174,7 @@ async fn node_info_impl(
                 id,
                 node_id,
                 repository: internal.repository,
-                revision: internal.state.revision(),
+                revision: state.revision(),
                 name: LoreString::from(name.as_str()),
                 parent_id: node.parent,
                 kind,
@@ -280,7 +281,7 @@ mod tests {
         let entry = rt_handle::REGISTRY
             .get(&handle.handle_id)
             .expect("handle registered");
-        (entry.state.clone(), entry.repository_context.clone())
+        (entry.state_for_tests(), entry.repository_context.clone())
     }
 
     /// Add a file under root with explicit metadata so the record fields can be
@@ -469,7 +470,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "an invalid node id must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "an invalid node id must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let data = node_info_event(&events)
             .expect("a failure must still emit the node info terminal carrying the id");
@@ -480,7 +485,7 @@ mod tests {
             "got {events:?}"
         );
         assert_eq!(data.node_id, INVALID_NODE);
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
 
         release(handle, store_handle_id);
     }
@@ -500,7 +505,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "an unknown handle must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "an unknown handle must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let data = node_info_event(&events)
             .expect("a handle miss must still emit the node info terminal carrying the id");
@@ -510,7 +519,7 @@ mod tests {
             LoreErrorCode::InvalidArguments,
             "got {events:?}"
         );
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
     }
 
     #[tokio::test]
@@ -530,7 +539,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "a node id past any allocated block must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "a node id past any allocated block must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let data = node_info_event(&events)
             .expect("a failure must still emit the node info terminal carrying the id");
@@ -540,7 +553,7 @@ mod tests {
             LoreErrorCode::InvalidArguments,
             "an unreadable node id must report InvalidArguments, got {events:?}"
         );
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
 
         release(handle, store_handle_id);
     }
@@ -564,7 +577,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "an unallocated node id must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "an unallocated node id must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let data = node_info_event(&events)
             .expect("a failure must still emit the node info terminal carrying the id");
@@ -574,7 +591,7 @@ mod tests {
             LoreErrorCode::InvalidArguments,
             "a non-root node with an empty name must report InvalidArguments, got {events:?}"
         );
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
 
         release(handle, store_handle_id);
     }

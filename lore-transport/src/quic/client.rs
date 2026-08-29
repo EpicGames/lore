@@ -649,8 +649,9 @@ fn client_crypto_config(
 
         // load custom ca
         if let Some(ca_path) = &certificate_settings.custom_ca {
-            let ca_certs = load_certs(ca_path)
-                .internal_with(|| format!("loading CA certificate from {}", ca_path.display()))?;
+            let ca_certs = load_certs(ca_path).forward_with::<ProtocolError, _>(|| {
+                format!("loading CA certificate from {}", ca_path.display())
+            })?;
             for cert in ca_certs {
                 let _ = cert_store.add(cert);
             }
@@ -662,28 +663,30 @@ fn client_crypto_config(
 
     let mut cfg = if let Some(client_certs) = certificate_settings.client {
         // Load client certificate(s)
-        let mut certs = load_certs(&client_certs.cert_file).internal_with(|| {
-            format!(
-                "loading client certificate from {}",
-                client_certs.cert_file.display()
-            )
-        })?;
+        let mut certs =
+            load_certs(&client_certs.cert_file).forward_with::<ProtocolError, _>(|| {
+                format!(
+                    "loading client certificate from {}",
+                    client_certs.cert_file.display()
+                )
+            })?;
 
         // Append chain if provided
         if let Some(chain_path) = &certificate_settings.custom_ca {
-            let chain_certs = load_certs(chain_path).internal_with(|| {
+            let chain_certs = load_certs(chain_path).forward_with::<ProtocolError, _>(|| {
                 format!("loading certificate chain from {}", chain_path.display())
             })?;
             certs.extend(chain_certs);
         }
 
         // Load private key
-        let key = load_private_key(&client_certs.pkey_file).internal_with(|| {
-            format!(
-                "loading private key from {}",
-                client_certs.pkey_file.display()
-            )
-        })?;
+        let key =
+            load_private_key(&client_certs.pkey_file).forward_with::<ProtocolError, _>(|| {
+                format!(
+                    "loading private key from {}",
+                    client_certs.pkey_file.display()
+                )
+            })?;
 
         client_builder
             .with_client_auth_cert(certs, key)

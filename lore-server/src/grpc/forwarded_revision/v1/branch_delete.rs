@@ -97,7 +97,7 @@ mod test {
         .await
         .expect("Could not create main branch");
 
-        let state = lore_revision::state::State::new();
+        let state = Arc::new(lore_revision::state::State::new());
         state.set_parent_self(Hash::default());
         state.set_revision_number(1);
         let state_hash = state

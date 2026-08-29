@@ -6,9 +6,11 @@ readme = "README.md"
 classifiers = ["Private :: Do Not Upload"]
 requires-python = ">=3.13"
 dependencies = [
+    "cryptography>=44.0.0",
     "grpcio>=1.81.0",
     "pytest>=8.4.2",
     "pytest-json-ctrf>=0.3.6",
+    "pytest-timeout>=2.4.0",
     "pytest-xdist>=3.8.0",
 ]
 
@@ -25,3 +27,15 @@ markers = [
     "smoke: marks as smoke test",
     "slow: marks as a slow running test",
 ]
+# A test that hangs used to take the whole run with it. Nothing in this suite
+# bounds how long a lore command may take - the helper calls `subprocess.run`
+# without a timeout - so a client that never returns is a test that never
+# returns, and CI ends up killing the job with no indication of which test it
+# was. Ten minutes is far above anything here: all 856 tests finish in 19
+# minutes across four workers, so a test reaching this is stuck rather than slow.
+timeout = 600
+# Dumped a minute before that, while the process is still alive, because the
+# stack of every thread is what says *where* it is stuck rather than only that it
+# is. The dump reaches the controller's log even under xdist, where the kill that
+# follows is what names the test: `worker 'gwN' crashed while running <test>`.
+faulthandler_timeout = 540

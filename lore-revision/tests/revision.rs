@@ -4,33 +4,28 @@
 mod tests {
     use std::sync::Arc;
 
-    use lore_base::error::NoRemote;
     use lore_base::runtime::LORE_CONTEXT;
-    use lore_base::types::Context;
+    use lore_base::types::Address;
+    use lore_revision::change;
+    use lore_revision::change::NodeChange;
+    use lore_revision::change::NodeChangeState;
     use lore_revision::lore::RepositoryId;
+    use lore_revision::node::NodeFlags;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::revision;
     use lore_revision::revision::ResolveSearchLocation;
+    use lore_revision::revision::diff::LoreRevisionDiffFileEventData;
     use lore_revision::state::State;
-    use lore_transport::ProtocolError;
+    use lore_revision::util::path::RelativePathBuf;
 
     include!("helper.rs");
 
     async fn make_repo_context() -> Arc<RepositoryContext> {
         let (immutable, mutable, _execution) =
             test_store_create().await.expect("Failed to create stores");
-        let repository_id = Context::from(uuid::Uuid::now_v7());
         let tempdir = generate_tempdir();
         Arc::new(RepositoryContext::new(
-            Some(tempdir.to_path_buf()),
-            immutable,
-            mutable,
-            repository_id.into(),
-            lore_revision::instance::InstanceId::default(),
-            Err(ProtocolError::from(NoRemote)),
-            Arc::default(),
-            RepositoryFormat::Lore,
+            default_repository_creation_args(immutable, mutable).with_path(tempdir.path()),
         ))
     }
 
@@ -141,6 +136,80 @@ mod tests {
                     .await
                     .expect("Diff failed");
                 */
+            })
+            .await;
+    }
+
+    fn diff_change(
+        repository: &Arc<RepositoryContext>,
+        state: &Arc<State>,
+        action: change::FileAction,
+        path: &str,
+        from_path: Option<&str>,
+    ) -> NodeChange {
+        let side = |node| NodeChangeState {
+            repository: repository.clone(),
+            state: state.clone(),
+            node,
+            flags: NodeFlags::NoFlags,
+            address: Address::default(),
+        };
+        NodeChange {
+            action,
+            flags: change::Flags::None,
+            from: side(1),
+            to: side(2),
+            path: RelativePathBuf::new().push_and_freeze(path),
+            from_path: from_path.map(|path| RelativePathBuf::new().push_and_freeze(path)),
+        }
+    }
+
+    // Without the source path the receiver sees a move as an add at the new path
+    // and cannot reproduce it, so the event has to carry it across.
+    #[tokio::test]
+    async fn diff_file_event_carries_move_from_path() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repository = make_repo_context().await;
+                let state = Arc::new(State::new());
+                let change = diff_change(
+                    &repository,
+                    &state,
+                    change::FileAction::Move,
+                    "new.txt",
+                    Some("old.txt"),
+                );
+
+                let data = LoreRevisionDiffFileEventData::from_node_change(&change, true, true);
+
+                assert_eq!(data.path.as_str(), "new.txt");
+                assert_eq!(data.from_path.as_str(), "old.txt");
+            })
+            .await;
+    }
+
+    // A change with no source path maps to the empty string the C API documents,
+    // not to a dangling pointer a receiver would read past.
+    #[tokio::test]
+    async fn diff_file_event_from_path_empty_without_move() {
+        let execution = setup_test_execution();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repository = make_repo_context().await;
+                let state = Arc::new(State::new());
+                let change = diff_change(
+                    &repository,
+                    &state,
+                    change::FileAction::Add,
+                    "new.txt",
+                    None,
+                );
+
+                let data = LoreRevisionDiffFileEventData::from_node_change(&change, false, true);
+
+                assert!(data.from_path.is_empty());
+                assert_eq!(data.from_path.as_str(), "");
             })
             .await;
     }

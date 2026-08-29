@@ -6,7 +6,6 @@ mod tests {
 
     use std::sync::Arc;
 
-    use lore_base::error::NoRemote;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Address;
@@ -14,11 +13,9 @@ mod tests {
     use lore_base::types::Hash;
     use lore_revision::node::*;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::state::State;
     use lore_storage::hash::hash_string;
     use lore_storage::local::immutable_store::LocalImmutableStore;
-    use lore_transport::ProtocolError;
 
     include!("helper.rs");
 
@@ -35,14 +32,7 @@ mod tests {
         let write_token = lore_revision::repository::RepositoryWriteToken::acquire(path).await;
         Arc::new(
             RepositoryContext::new(
-                Some(path.to_path_buf()),
-                immutable_store,
-                mutable_store,
-                Context::from(uuid::Uuid::now_v7()).into(),
-                lore_revision::instance::InstanceId::default(),
-                Err(ProtocolError::from(NoRemote)),
-                Arc::default(),
-                RepositoryFormat::Lore,
+                default_repository_creation_args(immutable_store, mutable_store).with_path(path),
             )
             .with_write_token(write_token.share()),
         )

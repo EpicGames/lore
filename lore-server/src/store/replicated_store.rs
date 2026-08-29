@@ -9,6 +9,7 @@ use bytes::Bytes;
 use futures::future::join_all;
 use lore_base::lore_spawn;
 use lore_base::types::Address;
+use lore_base::types::Context;
 use lore_base::types::Fragment;
 use lore_base::types::FragmentFlags;
 use lore_base::types::Partition;
@@ -32,6 +33,7 @@ use tracing::error;
 use tracing::instrument;
 use tracing::warn;
 
+use crate::protocol::replication_store::copy::ImmutableCopy;
 use crate::protocol::replication_store::get::Get;
 use crate::protocol::replication_store::get_metadata::GetMetadata;
 use crate::protocol::replication_store::header::ReplicationHeader;
@@ -500,6 +502,55 @@ where
     async fn verify(self: Arc<Self>, _heal: bool) -> Result<(), StoreError> {
         Ok(())
     }
+
+    #[lore_macro::lore_instrument]
+    #[instrument(name = "ReplicatedStore::Copy", skip_all)]
+    async fn copy(
+        self: Arc<Self>,
+        source_partition: Partition,
+        source_address: Address,
+        destination_partition: Partition,
+        destination_context: Context,
+        durable: bool,
+    ) -> Result<(), StoreError> {
+        let meta = ServiceRequestMeta {
+            client_epoch: self.client_container.epoch(),
+            address: Some(source_address),
+        };
+
+        let store = self.clone();
+        let service_result = async move {
+            let context = execution_context();
+            let request = ImmutableCopy {
+                header: ReplicationHeader {
+                    correlation_id: uuid::Uuid::try_parse(
+                        context.globals().correlation_id.as_str(),
+                    )
+                    .unwrap_or_default(),
+                    repository: destination_partition.into(),
+                },
+                source_partition,
+                source_address,
+                destination_context,
+                durable,
+            };
+            let client = store.client_container.client().read().await;
+            client.copy(request).await
+        }
+        .observe(
+            self.instruments
+                .immutable_operation_latency_histogram
+                .clone(),
+            self.instruments
+                .provider
+                .get_labels_for_operation_context("copy"),
+            observe_client_interaction(),
+        )
+        .await
+        .output;
+
+        handle_service_response(service_result, self, meta)
+    }
 }
 
 fn handle_service_response<ResponseType, ClientType>(
@@ -573,6 +624,7 @@ mod tests {
     use tokio::sync::mpsc::Receiver;
 
     use super::*;
+    use crate::protocol::replication_store::copy::ImmutableCopy;
     use crate::protocol::replication_store::get_metadata::GetMetadata;
     use crate::protocol::replication_store::obliterate::ObliterateResponse;
     use crate::protocol::replication_store::put::Put;
@@ -624,6 +676,11 @@ mod tests {
                 &self,
                 request: Query,
             ) -> Result<QueryResponse, ReplicationStoreClientError>;
+
+            async fn copy(
+                &self,
+                request: ImmutableCopy,
+            ) -> Result<(), ReplicationStoreClientError>;
         }
     }
 
@@ -1156,6 +1213,7 @@ mod tests {
                         let result = StoreMatchResult {
                             match_made: random_match.try_into().expect("invalid store match"),
                             partition,
+                            context: lore_base::types::Context::default(),
                             stored_local: random(),
                             stored_durable: random(),
                         };
@@ -1299,6 +1357,7 @@ mod tests {
                                 results: vec![StoreMatchResult {
                                     match_made: lore_storage::StoreMatch::MatchPartition,
                                     partition,
+                                    context: lore_base::types::Context::default(),
                                     stored_local: false,
                                     stored_durable: false,
                                 }],
@@ -1560,6 +1619,167 @@ mod tests {
                         .await
                         .expect_err("get should fail");
                     assert!(matches!(error, StoreError::SlowDown(_)));
+                })
+                .await;
+        }
+    }
+
+    mod copy {
+        use lore_base::runtime::LORE_CONTEXT;
+        use lore_base::types::Context;
+        use lore_revision::fragment;
+        use mockall::predicate::eq;
+        use rand::random;
+
+        use super::*;
+
+        #[tokio::test]
+        async fn copy_sends_quic_copy_message_to_remote() {
+            let correlation_id = uuid::Uuid::new_v4();
+            let execution = crate::util::setup_execution(
+                "test",
+                correlation_id.as_hyphenated().to_string(),
+                String::default(),
+            );
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let source_partition: Partition = random();
+                    let (_, source_address, _) = fragment::generate_random();
+                    let destination_partition: Partition = random();
+                    let destination_context: Context = random();
+
+                    let (tx, rx) = mpsc::channel(1);
+                    let factory = ChannelFactory { rx: rx.into() };
+
+                    let mut client = make_mock_client();
+                    client
+                        .expect_copy()
+                        .with(eq(ImmutableCopy {
+                            header: ReplicationHeader {
+                                correlation_id,
+                                repository: destination_partition.into(),
+                            },
+                            source_partition,
+                            source_address,
+                            destination_context,
+                            durable: false,
+                        }))
+                        .returning(|_| Ok(()));
+
+                    tx.send(Ok(client)).await.unwrap();
+                    let store = ReplicatedStore::new(
+                        Arc::new(factory),
+                        make_client_container_config(),
+                        Duration::from_secs(60),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .expect("Creation should work");
+
+                    store
+                        .copy(
+                            source_partition,
+                            source_address,
+                            destination_partition,
+                            destination_context,
+                            false,
+                        )
+                        .await
+                        .expect("copy should succeed");
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn copy_forwards_durable_flag() {
+            let correlation_id = uuid::Uuid::new_v4();
+            let execution = crate::util::setup_execution(
+                "test",
+                correlation_id.as_hyphenated().to_string(),
+                String::default(),
+            );
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let source_partition: Partition = random();
+                    let (_, source_address, _) = fragment::generate_random();
+                    let destination_partition: Partition = random();
+                    let destination_context: Context = random();
+
+                    let (tx, rx) = mpsc::channel(1);
+                    let factory = ChannelFactory { rx: rx.into() };
+
+                    let mut client = make_mock_client();
+                    client
+                        .expect_copy()
+                        .withf(|req| req.durable)
+                        .returning(|_| Ok(()));
+
+                    tx.send(Ok(client)).await.unwrap();
+                    let store = ReplicatedStore::new(
+                        Arc::new(factory),
+                        make_client_container_config(),
+                        Duration::from_secs(60),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .expect("Creation should work");
+
+                    store
+                        .copy(
+                            source_partition,
+                            source_address,
+                            destination_partition,
+                            destination_context,
+                            true,
+                        )
+                        .await
+                        .expect("copy should succeed");
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn copy_propagates_service_error() {
+            let execution =
+                crate::util::setup_execution("test", String::default(), String::default());
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let source_partition: Partition = random();
+                    let (_, source_address, _) = fragment::generate_random();
+                    let destination_partition: Partition = random();
+                    let destination_context: Context = random();
+
+                    let (tx, rx) = mpsc::channel(1);
+                    let factory = ChannelFactory { rx: rx.into() };
+
+                    let mut client = make_mock_client();
+                    client.expect_copy().returning(|_| {
+                        Err(ReplicationStoreClientError::ServiceError(
+                            ReplicationServiceErrorCode::AddressNotFound,
+                        ))
+                    });
+
+                    tx.send(Ok(client)).await.unwrap();
+                    let store = ReplicatedStore::new(
+                        Arc::new(factory),
+                        make_client_container_config(),
+                        Duration::from_secs(60),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .expect("Creation should work");
+
+                    let error = store
+                        .copy(
+                            source_partition,
+                            source_address,
+                            destination_partition,
+                            destination_context,
+                            false,
+                        )
+                        .await
+                        .expect_err("copy should fail on service error");
+                    assert!(matches!(error, StoreError::AddressNotFound(_)));
                 })
                 .await;
         }

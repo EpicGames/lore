@@ -54,42 +54,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_missing_payload() {
-        let execution = setup_test_execution();
-        LORE_CONTEXT
-            .scope(execution, async move {
-                let store = LocalImmutableStore::new(
-                    None,
-                    lore_storage::local::immutable_store::ImmutableStoreSettings {
-                        allow_partial_fragment: false,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("Failed to create store");
-
-                let repository = RepositoryId::from([0; 16]);
-                let address = Address {
-                    context: repository.into(),
-                    hash: Hash::default(),
-                };
-                let fragment = Fragment {
-                    flags: 0,
-                    size_payload: 100,
-                    size_content: 1000,
-                };
-                let entry = store
-                    .store(repository, address, fragment, None, false)
-                    .await;
-                assert!(
-                    entry.is_err(),
-                    "Store in empty store with no payload did not fail with expected error"
-                );
-            })
-            .await;
-    }
-
-    #[tokio::test]
     async fn store_single_item() {
         let execution = setup_test_execution();
         LORE_CONTEXT
@@ -153,7 +117,6 @@ mod tests {
             .scope(execution, async move {
                 let mut rng = rand::rng();
                 let store = LocalImmutableStore::new(None, lore_storage::local::immutable_store::ImmutableStoreSettings{
-                        allow_partial_fragment: false,
                         protect_local_fragment: false,
                         ..Default::default()
                     })
@@ -325,10 +288,9 @@ mod tests {
                     let result = store.clone()
                         .store(other_repository, address, fragment, None, false)
                         .await;
-                    assert!(result.is_err());
                     assert!(
-                    result.is_err(),
-                    "Repeated store with different repository and no payload did not give expected payload needed error");
+                    result.is_ok(),
+                    "Repeated store with different repository and no payload should succeed");
 
                     let entry = store
                         .find(other_repository, address)
@@ -336,8 +298,8 @@ mod tests {
                         .expect("Failed query after store");
                     assert_eq!(
                     entry.matching,
-                    StoreMatch::MatchHash,
-                    "Repeated store with different repository and payload did not match hash only as expected");
+                    StoreMatch::MatchFull,
+                    "Repeated store with different repository and payload did not MatchFull as expected");
                     assert_eq!(
                         entry.data.size_payload, fragment.size_payload,
                         "Repository deduplication did not return identical fragment details as expected"
@@ -969,7 +931,6 @@ mod tests {
                 let store = LocalImmutableStore::new(
                     None,
                     lore_storage::local::immutable_store::ImmutableStoreSettings {
-                        allow_partial_fragment: true,
                         ..Default::default()
                     },
                 )

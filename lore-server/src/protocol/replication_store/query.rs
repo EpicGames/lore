@@ -6,6 +6,7 @@ use bytes::Buf;
 use bytes::Bytes;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
+use lore_base::types::Context;
 use lore_base::types::Partition;
 use lore_base::types::TypedBytes;
 use lore_base::types::VecBytes;
@@ -37,8 +38,9 @@ pub const BASE_REQUEST_SIZE: usize = size_of::<ReplicationHeader>() + size_of::<
 /// Wire size of one serialised [`StoreMatchResult`]:
 ///   1 byte  — `match_made`
 ///  16 bytes — partition
+///  16 bytes — context
 ///   1 byte  — flags: bit 0 = `stored_local`, bit 1 = `stored_durable`
-const RESULT_WIRE_SIZE: usize = 1 + size_of::<Partition>() + 1;
+const RESULT_WIRE_SIZE: usize = 1 + size_of::<Partition>() + size_of::<Context>() + 1;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Query {
@@ -82,6 +84,7 @@ impl QueryResponse {
         for r in self.results {
             buf.push(r.match_made.into());
             buf.extend_from_slice(r.partition.as_bytes());
+            buf.extend_from_slice(r.context.as_bytes());
             buf.push((r.stored_local as u8) | ((r.stored_durable as u8) << 1));
         }
         vec![Bytes::from(buf)]
@@ -107,6 +110,7 @@ impl QueryResponse {
             bytes.advance(1);
 
             let partition: Partition = bytes.split_to(size_of::<Partition>()).into();
+            let context: Context = bytes.split_to(size_of::<Context>()).into();
 
             let flags = bytes[0];
             bytes.advance(1);
@@ -116,6 +120,7 @@ impl QueryResponse {
             results.push(StoreMatchResult {
                 match_made,
                 partition,
+                context,
                 stored_local,
                 stored_durable,
             });
@@ -303,18 +308,21 @@ pub mod tests {
                     StoreMatchResult {
                         match_made: StoreMatch::MatchNone,
                         partition: random::<Partition>(),
+                        context: random::<Context>(),
                         stored_local: false,
                         stored_durable: false,
                     },
                     StoreMatchResult {
                         match_made: StoreMatch::MatchHash,
                         partition: random::<Partition>(),
+                        context: random::<Context>(),
                         stored_local: true,
                         stored_durable: false,
                     },
                     StoreMatchResult {
                         match_made: StoreMatch::MatchFull,
                         partition: random::<Partition>(),
+                        context: random::<Context>(),
                         stored_local: true,
                         stored_durable: true,
                     },

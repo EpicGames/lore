@@ -326,6 +326,12 @@ impl PsyncDriver {
             .await
     }
 
+    pub(crate) async fn holds_name_exactly(&self, path: PathBuf) -> Option<bool> {
+        SyscallPool::global()
+            .submit(move || holds_name_exactly_impl(&path))
+            .await
+    }
+
     pub(crate) async fn file_metadata(
         &self,
         file: Arc<File>,
@@ -402,6 +408,158 @@ impl PsyncDriver {
             })
             .await
     }
+}
+
+// A case-sensitive filesystem holds the name it was given, so a path that
+// resolves is a path spelled the way the filesystem holds it, and one that does
+// not is a name it does not hold - either way an answer. Following links matches
+// what a caller asking about a name would do with the path next; a dangling one
+// answers `Some(false)` and is left to the directory read.
+#[cfg(target_os = "linux")]
+fn holds_name_exactly_impl(path: &std::path::Path) -> Option<bool> {
+    Some(std::fs::metadata(path).is_ok())
+}
+
+/// Characters the Win32 lookup reads as a pattern rather than as themselves:
+/// the two wildcards, and the three legacy DOS ones the NT matcher still takes
+/// (`<` for `DOS_STAR`, `>` for `DOS_QM`, `"` for `DOS_DOT`; `<` and `"` do
+/// match `Rock.mesh` when passed through). None is legal in a Windows path, so
+/// a path holding one names nothing.
+///
+/// UTF-16 gives no non-ASCII character an ASCII unit, so this reads the same
+/// before or after the conversion.
+///
+/// Skipping those is an optimisation, not the safeguard: what a pattern matched
+/// would be some other name and so fails the comparison below regardless. It
+/// saves the two syscalls spent finding that out.
+#[cfg(target_family = "windows")]
+fn is_pattern_unit(unit: u16) -> bool {
+    u8::try_from(unit).is_ok_and(|byte| matches!(byte, b'*' | b'?' | b'<' | b'>' | b'"'))
+}
+
+/// Units of path the lookup is willing to build.
+///
+/// A plain path is capped at `MAX_PATH` by the call itself: past that it wants
+/// the `\\?\` verbatim prefix, which is a rewrite of the path rather than a
+/// longer buffer - `lore_base::fs::win_path` does that, and lore-io does not
+/// depend on lore-base. A path that arrives already verbatim may be longer, so
+/// there is room for one, and anything past even that goes unanswered and is
+/// left to the directory read, which `std` prefixes on its own.
+#[cfg(target_family = "windows")]
+const PATH_UNITS: usize = 512;
+
+/// The path length the plain lookup is defined for, terminator included. Past it
+/// the call fails on a path that is perfectly well there, which is a fact about
+/// the call and not about the name - so a longer path is declined rather than
+/// answered, and only a verbatim one is carried through.
+#[cfg(target_family = "windows")]
+const MAX_PATH_UNITS: usize = 260;
+
+// `FindFirstFileExW` resolves the path and reports the name as the filesystem
+// holds it, which is compared in place: the caller wants a verdict, and building
+// an `OsString` to compare and drop is the allocation this exists to avoid.
+// `FindExInfoBasic` leaves the 8.3 name it would otherwise fill in unqueried.
+#[cfg(target_family = "windows")]
+fn holds_name_exactly_impl(path: &std::path::Path) -> Option<bool> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::FindClose;
+    use windows_sys::Win32::Storage::FileSystem::FindExInfoBasic;
+    use windows_sys::Win32::Storage::FileSystem::FindExSearchNameMatch;
+    use windows_sys::Win32::Storage::FileSystem::FindFirstFileExW;
+    use windows_sys::Win32::Storage::FileSystem::WIN32_FIND_DATAW;
+
+    // A path ending in a root or in `..` names no child, so there is no spelling
+    // to hold.
+    let Some(name) = path.file_name() else {
+        return Some(false);
+    };
+
+    // Only the last component is matched as a pattern - the rest of the path is
+    // resolved literally, and a pattern character in it simply resolves to
+    // nothing - so only the last component is checked, which is also the
+    // shorter scan by far. Checking the whole path would refuse every verbatim
+    // `\\?\` one over the `?` in its prefix.
+    if name.encode_wide().any(is_pattern_unit) {
+        return Some(false);
+    }
+
+    let mut wide = [0u16; PATH_UNITS];
+    let mut length = 0;
+    for unit in path.as_os_str().encode_wide() {
+        // Longer than the lookup is built for, which says nothing about the name.
+        if length == wide.len() - 1 {
+            return None;
+        }
+        // An interior null would truncate the path the call sees, which would
+        // make it answer about a different path than the one it was handed -
+        // and no path a filesystem holds carries one.
+        if unit == 0 {
+            return Some(false);
+        }
+        wide[length] = unit;
+        length += 1;
+    }
+    wide[length] = 0;
+
+    // A path that arrives with the verbatim prefix is handed to the call as it
+    // is and is not held to `MAX_PATH`; one without it is, and rewriting it into
+    // a verbatim one is not this function's to do.
+    let verbatim = matches!(
+        path.components().next(),
+        Some(std::path::Component::Prefix(prefix)) if prefix.kind().is_verbatim()
+    );
+    if !verbatim && length >= MAX_PATH_UNITS {
+        return None;
+    }
+
+    let mut found = std::mem::MaybeUninit::<WIN32_FIND_DATAW>::uninit();
+    // SAFETY: the path is null-terminated and the structure is writable for the
+    // size the call fills in. The search takes no filter, which is what
+    // `FindExSearchNameMatch` with a null filter means.
+    let handle = unsafe {
+        FindFirstFileExW(
+            wide.as_ptr(),
+            FindExInfoBasic,
+            found.as_mut_ptr().cast(),
+            FindExSearchNameMatch,
+            std::ptr::null(),
+            0,
+        )
+    };
+    // The lookup ran and matched nothing, which is an answer about the spelling:
+    // whatever the reason - no such name, no such directory, no access to it -
+    // the caller reads the directory next and gets the reason from there.
+    if handle == INVALID_HANDLE_VALUE {
+        return Some(false);
+    }
+    // SAFETY: the call succeeded, so it initialized the structure, and the
+    // handle it returned is closed once and not used again.
+    let found = unsafe {
+        let found = found.assume_init();
+        FindClose(handle);
+        found
+    };
+
+    let end = found
+        .cFileName
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(found.cFileName.len());
+    Some(
+        name.encode_wide()
+            .eq(found.cFileName[..end].iter().copied()),
+    )
+}
+
+// macOS holds one spelling and answers lookups in any other, as Windows does,
+// but without a call that is cheaper than reading the directory the caller
+// would otherwise read. There is nothing to answer with that is not that read,
+// so it does not answer.
+#[cfg(not(any(target_os = "linux", target_family = "windows")))]
+fn holds_name_exactly_impl(_path: &std::path::Path) -> Option<bool> {
+    None
 }
 
 #[cfg(target_family = "unix")]

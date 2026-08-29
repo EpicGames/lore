@@ -40,7 +40,7 @@ pub async fn remove_file_dependencies(
 ) -> Result<RemoveResult, DependencyError> {
     let (current_revision, _current_branch) = crate::instance::load_current_anchor(&repository)
         .await
-        .internal("deserializing current anchor")?;
+        .forward::<DependencyError>("deserializing current anchor")?;
     let staged_revision = crate::instance::load_staged_revision(&repository)
         .await
         .ok()
@@ -49,7 +49,7 @@ pub async fn remove_file_dependencies(
 
     let state = state::State::deserialize(repository.clone(), staged_revision)
         .await
-        .internal("deserializing state")?;
+        .forward::<DependencyError>("deserializing state")?;
 
     let mut removed = 0usize;
 

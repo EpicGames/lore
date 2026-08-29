@@ -71,6 +71,11 @@
 //! assert!(err.is_not_found());
 //! ```
 
+// Hidden from rustdoc so the prelude is the discoverable path. `WrapInternal`
+// only guards against silent variant-collapse when it is in scope alongside
+// `InternalForbiddenOnErrorSets`, and a glob of the prelude is the one import
+// that guarantees both. Still importable — hiding it is a signpost, not a lock.
+#[doc(hidden)]
 pub mod ext;
 pub mod ffi;
 pub mod internal;
@@ -83,7 +88,11 @@ pub use lore_error_set_macro::error_set;
 pub use lore_error_set_macro::FfiError;
 
 // Re-export core types at crate root for convenience.
-pub use crate::ext::{ForwardStrict, ResultExt, WrapInternal};
+pub use crate::ext::{ForwardAny, ForwardStrict, ResultExt};
+// Hidden, and deliberately paired: importing `WrapInternal` by itself skips the
+// `.internal()` guard. Prefer `use lore_error_set::prelude::*`.
+#[doc(hidden)]
+pub use crate::ext::{InternalForbiddenOnErrorSets, WrapInternal};
 pub use crate::ffi::FfiError;
 pub use crate::internal::Internal;
 pub use crate::location::Location;
@@ -115,7 +124,12 @@ pub mod prelude {
     pub use lore_error_set_macro::error_set;
     pub use lore_error_set_macro::FfiError;
 
+    pub use crate::ext::ForwardAny;
     pub use crate::ext::ForwardStrict;
+    // `InternalForbiddenOnErrorSets` and `WrapInternal` are a pair: the guard
+    // turns `.internal()` on an error set into a compile error only while both
+    // are in scope. Removing either one silently reopens the hole.
+    pub use crate::ext::InternalForbiddenOnErrorSets;
     pub use crate::ext::ResultExt;
     pub use crate::ext::WrapInternal;
     pub use crate::ffi::FfiError;

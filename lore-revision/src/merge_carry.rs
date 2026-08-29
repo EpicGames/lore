@@ -106,7 +106,7 @@ pub async fn store(
             .with_max_size_chunk(),
     )
     .await
-    .internal("Failed to write merge dirty-tracking blob")?;
+    .forward_any::<UnhandledError>("Failed to write merge dirty-tracking blob")?;
 
     let (key, key_type) = carry_key(&repository);
     let handle = repository
@@ -115,7 +115,7 @@ pub async fn store(
     handle
         .store(repository.id, key, address.hash, key_type)
         .await
-        .internal("Failed to store merge dirty-tracking key")?;
+        .forward_any::<UnhandledError>("Failed to store merge dirty-tracking key")?;
 
     lore_debug!(
         "Stored merge dirty-tracking carry: {} paths, parents {} / {}",
@@ -207,7 +207,7 @@ pub async fn delete(repository: Arc<RepositoryContext>) -> Result<(), UnhandledE
     handle
         .store(repository.id, key, Hash::default(), key_type)
         .await
-        .internal("Failed to clear merge dirty-tracking key")?;
+        .forward_any::<UnhandledError>("Failed to clear merge dirty-tracking key")?;
     Ok(())
 }
 

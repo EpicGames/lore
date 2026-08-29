@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use lore_error_set::Internal;
 use lore_error_set::prelude::*;
 use lore_storage::immutable_store::sanitise_fragment_behavior_flags;
 use lore_transport::Admin;
@@ -15,7 +14,6 @@ use lore_transport::StorageSession;
 use tokio::sync::Mutex;
 
 use super::StoreObliterateStats;
-use crate::error::LoreResultExt;
 use crate::errors::AddressNotFound;
 use crate::lore::Address;
 use crate::lore::Context;
@@ -66,10 +64,9 @@ impl RemoteImmutableStore {
             partition,
         )
         .await
-        .emit_map_err(Internal::msg(format!(
-            "Unable to connect to remote store at {}",
-            self.remote_url
-        )))?;
+        .forward_with::<StoreError, _>(|| {
+            format!("connecting to remote store at {}", self.remote_url)
+        })?;
         lock.insert(partition, connection.clone());
         Ok(connection)
     }
@@ -80,11 +77,7 @@ impl RemoteImmutableStore {
         connection
             .session(partition, &correlation_id)
             .await
-            .emit_map_err(Internal::msg(format!(
-                "Unable to create session to remote store at {}",
-                self.remote_url
-            )))
-            .map_err(StoreError::from)
+            .forward_with(|| format!("creating session to remote store at {}", self.remote_url))
     }
 
     pub async fn admin(&self, partition: Partition) -> Result<Arc<dyn Admin>, StoreError> {
@@ -93,11 +86,7 @@ impl RemoteImmutableStore {
             connection
                 .admin(partition)
                 .await
-                .emit_map_err(Internal::msg(format!(
-                    "Unable to connect to remote store at {}",
-                    self.remote_url
-                )))
-                .map_err(StoreError::from)
+                .forward_with(|| format!("connecting to remote store at {}", self.remote_url))
         } else {
             let connection = protocol::connect(
                 self.remote_url.as_str(),
@@ -105,19 +94,14 @@ impl RemoteImmutableStore {
                 partition,
             )
             .await
-            .emit_map_err(Internal::msg(format!(
-                "Unable to connect to remote store at {}",
-                self.remote_url
-            )))?;
+            .forward_with::<StoreError, _>(|| {
+                format!("connecting to remote store at {}", self.remote_url)
+            })?;
             lock.insert(partition, connection.clone());
             connection
                 .admin(partition)
                 .await
-                .emit_map_err(Internal::msg(format!(
-                    "Unable to connect to remote store at {}",
-                    self.remote_url
-                )))
-                .map_err(StoreError::from)
+                .forward_with(|| format!("connecting to remote store at {}", self.remote_url))
         }
     }
 }
@@ -142,7 +126,7 @@ impl store::ImmutableStore for RemoteImmutableStore {
         let status = session
             .query(addresses)
             .await
-            .emit_map_err(Internal::msg("Remote store failed"))?;
+            .forward::<StoreError>("querying remote store")?;
 
         if status.len() != addresses.len() {
             lore_warn!(
@@ -153,7 +137,8 @@ impl store::ImmutableStore for RemoteImmutableStore {
             return Err(StoreError::internal("Remote store failed"));
         }
 
-        for (byte, result) in status.iter().zip(results.iter_mut()) {
+        for ((byte, result), address) in status.iter().zip(results.iter_mut()).zip(addresses.iter())
+        {
             let match_made = match byte {
                 0 => StoreMatch::MatchFull,
                 1 => StoreMatch::MatchPartition,
@@ -168,6 +153,11 @@ impl store::ImmutableStore for RemoteImmutableStore {
                     // Never anything but the partition asked about: the peer resolves within it,
                     // and a match found anywhere else collapses to absence before it is sent.
                     partition,
+                    context: if match_made == StoreMatch::MatchFull {
+                        address.context
+                    } else {
+                        Context::default()
+                    },
                     stored_local: false,
                     stored_durable: true,
                 }
@@ -339,10 +329,9 @@ impl RemoteMutableStore {
                 partition,
             )
             .await
-            .emit_map_err(Internal::msg(format!(
-                "Unable to connect to remote store at {}",
-                self.remote_url
-            )))?;
+            .forward_with::<StoreError, _>(|| {
+                format!("connecting to remote store at {}", self.remote_url)
+            })?;
             lock.insert(partition, connection.clone());
             connection
         };
@@ -351,11 +340,7 @@ impl RemoteMutableStore {
         connection
             .session(partition, &correlation_id)
             .await
-            .emit_map_err(Internal::msg(format!(
-                "Unable to create session to remote store at {}",
-                self.remote_url
-            )))
-            .map_err(StoreError::from)
+            .forward_with(|| format!("creating session to remote store at {}", self.remote_url))
     }
 }
 

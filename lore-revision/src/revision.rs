@@ -873,9 +873,14 @@ async fn find_last_modified_revision(
                     return Ok((state_parent.revision(), state_parent.revision_number()));
                 }
             }
+
+            let parent_revision = state_current.parent_self();
+            if parent_revision.is_zero() {
+                break;
+            }
+
             state_parent = state_current.clone();
-            state_current =
-                State::deserialize(repository.clone(), state_current.parent_self()).await?;
+            state_current = State::deserialize(repository.clone(), parent_revision).await?;
         }
 
         lore_debug!(

@@ -27,7 +27,8 @@
 //!    further, to the store's query scope, because a level is something to act on with another
 //!    operation rather than bytes owed here.
 //! 5. **A match names where it was found, and prefers where it was asked.** Another partition is
-//!    named only when the one asked about holds nothing.
+//!    named only when the one asked about holds nothing. The context may be left unnamed, but a
+//!    named one is an association `copy` will read from.
 //!
 //! # Known violations
 //!
@@ -72,10 +73,20 @@ pub enum Check {
     BatchResultsLineUp,
     /// A hash held by both the partition asked about and another names the one asked about.
     MatchPrefersTheAskedPartition,
+    /// The source a partition match names can be copied from, whether or not it named a context.
+    NamedSourceCanBeCopied,
     /// Obliterating one reference leaves the others readable.
     ObliterationLeavesSiblingsReadable,
     /// A fragment stored without its payload is reported and described, but not served.
     MetadataOnlyIsDescribedNotServed,
+    /// `get` and `get_metadata` agree on the stored payload's `size_content` and `size_payload`.
+    GetFragmentMatchesMetadata,
+    /// After a put with payload, the query result reports `stored_local` or `stored_durable`.
+    StoredPayloadIsAccountedFor,
+    /// After a copy, `get` on the destination serves the same bytes as the original.
+    CopiedAddressIsServable,
+    /// After a copy, `get` on the source still serves the original bytes.
+    CopySourceRemainsReadable,
 }
 
 /// What the store under test can do, so the battery runs the subset that applies.
@@ -88,6 +99,9 @@ pub struct Capabilities {
     pub can_put: bool,
     /// Whether the store accepts `obliterate`.
     pub can_obliterate: bool,
+    /// Whether the store accepts `copy`. The trait defaults it to unsupported, so a store that
+    /// takes the default reports a level no caller can act on and is exempted rather than failed.
+    pub can_copy: bool,
     /// Whether answers from this store cross a trust boundary. A hash held only by a partition the
     /// caller has no claim to is another tenant's content, and its existence is not the caller's to
     /// learn, so such a store must report nothing rather than a weak match.
@@ -113,6 +127,7 @@ impl Capabilities {
             label,
             can_put: true,
             can_obliterate: true,
+            can_copy: true,
             over_wire: false,
             miss_poisons_session: false,
             stores_metadata_only: false,
@@ -127,6 +142,11 @@ impl Capabilities {
 
     pub fn no_obliterate(mut self) -> Self {
         self.can_obliterate = false;
+        self
+    }
+
+    pub fn no_copy(mut self) -> Self {
+        self.can_copy = false;
         self
     }
 
@@ -202,6 +222,16 @@ pub async fn verify_immutable_store(store: Arc<dyn ImmutableStore>, caps: Capabi
     );
     settle(
         &caps,
+        Check::GetFragmentMatchesMetadata,
+        get_and_get_metadata_report_the_same_fragment(&store, &caps).await,
+    );
+    settle(
+        &caps,
+        Check::StoredPayloadIsAccountedFor,
+        stored_content_is_accounted_for(&store, &caps).await,
+    );
+    settle(
+        &caps,
         Check::OtherContextNeverMatchesFully,
         another_context_in_the_same_partition_never_matches_fully(&store, &caps).await,
     );
@@ -216,6 +246,24 @@ pub async fn verify_immutable_store(store: Arc<dyn ImmutableStore>, caps: Capabi
         Check::MatchPrefersTheAskedPartition,
         a_match_prefers_the_partition_it_was_asked_about(&store, &caps).await,
     );
+
+    if caps.can_copy {
+        settle(
+            &caps,
+            Check::NamedSourceCanBeCopied,
+            the_source_a_match_names_can_be_copied_from(&store, &caps).await,
+        );
+        settle(
+            &caps,
+            Check::CopiedAddressIsServable,
+            a_copied_address_is_servable(&store, &caps).await,
+        );
+        settle(
+            &caps,
+            Check::CopySourceRemainsReadable,
+            a_copy_leaves_the_source_readable(&store, &caps).await,
+        );
+    }
 
     if caps.stores_metadata_only {
         settle(
@@ -349,6 +397,12 @@ async fn assert_absent(
         "{context}: query named a source partition for content it did not match"
     );
 
+    require_eq!(
+        resolved.context,
+        Context::default(),
+        "{context}: query named a source context for content it did not match"
+    );
+
     match store.clone().get_metadata(partition, address).await {
         Ok(result) => {
             require_eq!(
@@ -402,6 +456,12 @@ async fn a_stored_address_matches_fully(
         resolved.partition,
         partition,
         "a full match must name the partition it was found in"
+    );
+    require!(
+        resolved.context == address.context || resolved.context.is_zero(),
+        "a full match named {:?} as the context it was found under, but the association it matched \
+         is the one asked about",
+        resolved.context
     );
 
     let metadata = store
@@ -480,6 +540,13 @@ async fn another_context_in_the_same_partition_never_matches_fully(
             resolved.partition,
             partition,
             "a match inside the partition asked about named a different one as its source"
+        );
+        require!(
+            resolved.context == address.context || resolved.context.is_zero(),
+            "a partition match named {:?} as its context, but the only association the store holds \
+             for this hash is under {:?}",
+            resolved.context,
+            address.context
         );
     }
 
@@ -671,6 +738,53 @@ async fn a_match_prefers_the_partition_it_was_asked_about(
     Ok(())
 }
 
+/// What a partition match is for. The level says the payload is already in the partition, so the
+/// address can be registered with a copy rather than a transfer — which is only true if the source
+/// the match names is one the store will copy from.
+///
+/// Both forms are exercised: the source as reported, and the same source with its context dropped,
+/// which is what a caller has when the answer named no context. A store may under-report the level
+/// and is exempt then, since a caller reading `MatchNone` transfers the payload as before.
+async fn the_source_a_match_names_can_be_copied_from(
+    store: &Arc<dyn ImmutableStore>,
+    caps: &Capabilities,
+) -> Result<(), String> {
+    let (partition, address, payload, fragment) = unique_content();
+    store_content(store, partition, address, fragment, payload).await?;
+
+    let wanted = Address {
+        hash: address.hash,
+        context: Context::from(rand::random::<[u8; 16]>()),
+    };
+    let resolved = query_one(store, partition, wanted)
+        .await
+        .map_err(|err| format!("query failed on {}: {err:?}", caps.label))?;
+    if resolved.match_made != StoreMatch::MatchPartition {
+        return Ok(());
+    }
+
+    for source in [
+        resolved.source_address(address.hash),
+        Address::zero_context_hash(address.hash),
+    ] {
+        store
+            .clone()
+            .copy(resolved.partition, source, partition, wanted.context, false)
+            .await
+            .map_err(|err| {
+                format!("a partition match named {source} as a source, which copy refused: {err:?}")
+            })?;
+    }
+
+    require_eq!(
+        best_match(store, partition, wanted, caps).await?,
+        StoreMatch::MatchFull,
+        "the address a copy registered does not resolve to the association it created"
+    );
+
+    Ok(())
+}
+
 /// Clause 3 meets clause 4. Obliteration removes one reference, not the content: another context
 /// still holding the hash reads as before, while the obliterated one is gone through every method.
 async fn obliterating_one_reference_leaves_the_others_readable(
@@ -768,6 +882,162 @@ async fn a_metadata_only_entry_is_described_but_not_served(
         store.clone().get(partition, address).await.is_err(),
         "get returned something for a fragment whose payload was never stored — the layer above \
          reads that failure as its signal to fetch from upstream"
+    );
+
+    Ok(())
+}
+
+/// Clause 4 applied across the two read methods. `get` and `get_metadata` both describe the same
+/// stored payload and must agree on what it is. A store that reads `size_content` from one
+/// backend for `get_metadata` and from another for `get` will diverge when those backends fall
+/// out of sync — this pins the agreement rather than assuming it.
+async fn get_and_get_metadata_report_the_same_fragment(
+    store: &Arc<dyn ImmutableStore>,
+    caps: &Capabilities,
+) -> Result<(), String> {
+    let (partition, address, payload, fragment) = unique_content();
+    store_content(store, partition, address, fragment, payload).await?;
+
+    let described = store
+        .clone()
+        .get_metadata(partition, address)
+        .await
+        .map_err(|err| format!("get_metadata failed on {}: {err:?}", caps.label))?;
+
+    let (served_fragment, _bytes) = store
+        .clone()
+        .get(partition, address)
+        .await
+        .and_then(StoreGetData::into_payload)
+        .map_err(|err| format!("get failed on {}: {err:?}", caps.label))?;
+
+    require_eq!(
+        described.fragment.size_content,
+        served_fragment.size_content,
+        "get_metadata and get reported different size_content for the same stored payload"
+    );
+    require_eq!(
+        described.fragment.size_payload,
+        served_fragment.size_payload,
+        "get_metadata and get reported different size_payload for the same stored payload"
+    );
+
+    Ok(())
+}
+
+/// Clause 1 applied to the durability bookkeeping. A full match promises the association is real
+/// and the representation is present; `stored_local` and `stored_durable` say where. A store that
+/// reports a full match while clearing both flags has hidden whether the payload is available
+/// locally, durably, or nowhere — callers use those flags to decide whether to fetch again.
+async fn stored_content_is_accounted_for(
+    store: &Arc<dyn ImmutableStore>,
+    caps: &Capabilities,
+) -> Result<(), String> {
+    let (partition, address, payload, fragment) = unique_content();
+    store_content(store, partition, address, fragment, payload).await?;
+
+    let resolved = query_one(store, partition, address)
+        .await
+        .map_err(|err| format!("query failed on {}: {err:?}", caps.label))?;
+
+    require_eq!(
+        resolved.match_made,
+        StoreMatch::MatchFull,
+        "stored content must report a full match (prerequisite for durability check)"
+    );
+    require!(
+        resolved.stored_local || resolved.stored_durable,
+        "a full match for stored content must set stored_local or stored_durable: \
+         stored_local={}, stored_durable={}",
+        resolved.stored_local,
+        resolved.stored_durable
+    );
+
+    Ok(())
+}
+
+/// A copy creates an association the store can serve, not just one it can report. The partner
+/// check `NamedSourceCanBeCopied` establishes that the copy operation succeeds and that `query`
+/// reports a full match afterwards. This check establishes that `get` also returns the original
+/// bytes — a store that registers the `DynamoDB` row without arranging for the payload to be
+/// accessible satisfies `NamedSourceCanBeCopied` and breaks this one.
+async fn a_copied_address_is_servable(
+    store: &Arc<dyn ImmutableStore>,
+    caps: &Capabilities,
+) -> Result<(), String> {
+    let (partition, address, payload, fragment) = unique_content();
+    store_content(store, partition, address, fragment, payload.clone()).await?;
+
+    let wanted = Address {
+        hash: address.hash,
+        context: Context::from(rand::random::<[u8; 16]>()),
+    };
+    let resolved = query_one(store, partition, wanted)
+        .await
+        .map_err(|err| format!("query failed on {}: {err:?}", caps.label))?;
+
+    if resolved.match_made != StoreMatch::MatchPartition {
+        // Under-reporting is allowed; if the store does not offer the copy shortcut a caller
+        // transfers the payload instead, which is always safe. Skip rather than fail.
+        return Ok(());
+    }
+
+    let source = resolved.source_address(address.hash);
+    store
+        .clone()
+        .copy(resolved.partition, source, partition, wanted.context, false)
+        .await
+        .map_err(|err| format!("copy from a named source failed: {err:?}"))?;
+
+    let (_frag, served) = store
+        .clone()
+        .get(partition, wanted)
+        .await
+        .and_then(StoreGetData::into_payload)
+        .map_err(|err| format!("get on a copied address failed: {err:?}"))?;
+
+    require!(
+        served.as_ref() == payload.as_ref(),
+        "get on a copied address returned different bytes than were originally stored"
+    );
+
+    Ok(())
+}
+
+/// A copy is a new registration, not a move. The local store test
+/// `copy_same_partition_new_context_adopts_payload_without_transfer` demonstrates this: after
+/// copying from a source address to a new context, `get` on the source returns the same bytes as
+/// before. A store that removes or poisons the source entry after a copy would break every caller
+/// that holds an existing reference to that address.
+async fn a_copy_leaves_the_source_readable(
+    store: &Arc<dyn ImmutableStore>,
+    caps: &Capabilities,
+) -> Result<(), String> {
+    let (partition, address, payload, fragment) = unique_content();
+    store_content(store, partition, address, fragment, payload.clone()).await?;
+
+    let destination_context = Context::from(rand::random::<[u8; 16]>());
+    store
+        .clone()
+        .copy(partition, address, partition, destination_context, false)
+        .await
+        .map_err(|err| {
+            format!(
+                "copy from the stored address failed on {}: {err:?}",
+                caps.label
+            )
+        })?;
+
+    let (_frag, source_bytes) = store
+        .clone()
+        .get(partition, address)
+        .await
+        .and_then(StoreGetData::into_payload)
+        .map_err(|err| format!("get on source after copy failed on {}: {err:?}", caps.label))?;
+
+    require!(
+        source_bytes.as_ref() == payload.as_ref(),
+        "get on the source address returned different bytes after copying from it"
     );
 
     Ok(())

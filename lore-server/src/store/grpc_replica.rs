@@ -11,6 +11,7 @@ use dashmap::DashMap;
 use lore_base::error::SlowDown;
 use lore_base::lore_spawn;
 use lore_base::types::Address;
+use lore_base::types::Context;
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 use lore_base::types::Fragment;
 use lore_base::types::Partition;
@@ -641,6 +642,17 @@ impl ImmutableStore for GrpcReplica {
 
     async fn verify(self: Arc<Self>, _heal: bool) -> Result<(), StoreError> {
         Ok(())
+    }
+
+    async fn copy(
+        self: Arc<Self>,
+        _source_partition: Partition,
+        _source_address: Address,
+        _destination_partition: Partition,
+        _destination_context: Context,
+        _durable: bool,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::internal("copy not supported on grpc replica"))
     }
 }
 

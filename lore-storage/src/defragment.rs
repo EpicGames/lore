@@ -15,6 +15,7 @@ use tokio::sync::SemaphorePermit;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::mpsc::channel;
+use tokio::task::JoinError;
 use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 
@@ -42,7 +43,13 @@ pub enum DefragmentSink {
     /// `size` is the expected content length, used to reject out-of-range offsets.
     File { file: IoFile, size: usize },
     /// Stream buffers in content order to a caller-provided channel.
-    Stream { sender: Sender<Bytes> },
+    ///
+    /// The item is a `Result` so a failure partway through the tree reaches the consumer as the
+    /// final item rather than only the log. Without it the channel simply closes early and a
+    /// truncated read is indistinguishable from a complete one.
+    Stream {
+        sender: Sender<Result<Bytes, StorageError>>,
+    },
 }
 
 /// A fetched payload on its way to the write sink: target offset, bytes, and the
@@ -213,6 +220,37 @@ fn wanted_entries(
     Ok(wanted)
 }
 
+/// Stops a launcher and waits for it, discarding whatever it has already loaded.
+///
+/// Closing the queue is what stops a launcher, and dropping the receiver is what closes it.
+/// The drop must come first: a launcher parked on a full queue never reaches the push that
+/// would tell it to stop. Nothing is cancelled to make that happen, and nothing may be — a
+/// fetch part way through writing a request would leave the stream it is writing to in a state
+/// its peer cannot make sense of. Dropping a `JoinHandle` detaches its task rather than
+/// aborting it, so the loads already queued or in flight each finish the request they are in
+/// the middle of and release their permit as they go. Their payloads are discarded, which is
+/// the point.
+async fn join_launcher<T>(
+    queue_rx: Receiver<T>,
+    launcher: JoinHandle<Result<(), StorageError>>,
+) -> Result<(), StorageError> {
+    drop(queue_rx);
+    launcher
+        .await
+        .map_err(|e| StorageError::internal_with_context(e, "stream queue join"))
+        .and_then(|r| r)
+}
+
+/// Whether the pipeline the walk feeds has gone.
+///
+/// Checked before each load, because the walk descends by fetching list nodes and would
+/// otherwise go on fetching them for a queue nobody reads. A walk that stops for this reason
+/// reports success: there is no caller left for a failure to reach, and the leaves it has not
+/// sent are ones nobody asked to be sent.
+fn walk_abandoned(leaf_tx: &Sender<LeafReference>) -> bool {
+    leaf_tx.is_closed()
+}
+
 /// Walks one level of the tree, dispatching to the leaf or intermediate walker by peeking at
 /// the first entry the read reaches.
 ///
@@ -239,6 +277,10 @@ async fn walk_fragment_level(
     remote_session: Option<Arc<StorageSession>>,
     depth: usize,
 ) -> Result<(), StorageError> {
+    if walk_abandoned(leaf_tx) {
+        return Ok(());
+    }
+
     if depth > MAX_FRAGMENT_TREE_DEPTH {
         return Err(StorageError::internal(format!(
             "fragment tree recursion depth exceeded {MAX_FRAGMENT_TREE_DEPTH}"
@@ -563,6 +605,10 @@ async fn walk_intermediate_level(
     // The index travels with its handle so the sublist that arrives is checked against the
     // parent entry it actually came from, rather than against a position recounted here.
     while let Some((index, handle)) = prefetch_rx.recv().await {
+        if walk_abandoned(leaf_tx) {
+            break;
+        }
+
         let (sub_frag, sub_buf) = match handle
             .await
             .map_err(|e| StorageError::internal_with_context(e, "load task join"))
@@ -630,12 +676,7 @@ async fn walk_intermediate_level(
         result = result.and(subresult);
     }
 
-    let launcher_result = launcher
-        .await
-        .map_err(|e| StorageError::internal_with_context(e, "stream queue join"))
-        .and_then(|r| r);
-
-    result.and(launcher_result)
+    result.and(join_launcher(prefetch_rx, launcher).await)
 }
 
 /// Unordered fetch pool for file targets.
@@ -659,16 +700,15 @@ async fn fetch_unordered(
     let mut tasks = JoinSet::new();
     let mut result = Ok(());
 
-    while let Some(leaf) = leaf_rx.recv().await {
-        if result.is_err() {
-            break;
-        }
-
-        let permit_count = fragment_permit_count(leaf.expected_size as usize);
-        let permit = semaphore
-            .acquire_many(permit_count)
-            .await
-            .map_err(|e| StorageError::internal_with_context(e, "permit"))?;
+    while let Some(leaf) = next_leaf(&mut leaf_rx, &data_tx).await {
+        let permit = match reserve_leaf_budget(semaphore, &data_tx, leaf.expected_size).await {
+            Ok(Some(permit)) => permit,
+            Ok(None) => break,
+            Err(e) => {
+                result = Err(e);
+                break;
+            }
+        };
 
         let tx = data_tx.clone();
         let offset = leaf.target_offset as usize;
@@ -707,9 +747,8 @@ async fn fetch_unordered(
             // Narrowed only after the whole leaf has been loaded and checked. `slice` is a
             // view onto the same allocation, so a clipped leaf costs no copy.
             let buffer = buffer.slice(clip.start as usize..clip.end as usize);
-            tx.send((offset, buffer, permit))
-                .await
-                .map_err(|_err| StorageError::internal("stream send failed"))
+            send_to_sink(&tx, (offset, buffer, permit)).await;
+            Ok(())
         });
 
         // Collect any completed tasks
@@ -719,6 +758,9 @@ async fn fetch_unordered(
                     .map_err(|e| StorageError::internal_with_context(e, "task failure"))
                     .and_then(|r| r),
             );
+        }
+        if result.is_err() {
+            break;
         }
     }
 
@@ -734,6 +776,73 @@ async fn fetch_unordered(
     result
 }
 
+/// A fetched payload and the memory permit it is accounted against.
+type FetchResult = Result<(Bytes, SemaphorePermit<'static>), StorageError>;
+
+/// The next leaf to fetch, or `None` once there are none left or nobody is left to fetch for.
+///
+/// `queue_tx` is the channel the pool feeds, watched alongside the walker because a pool learns
+/// it has been abandoned from a send that fails, and it has nothing to send while it is waiting
+/// for a leaf. Both pools spawn their fetches rather than awaiting them, so waiting for a leaf
+/// is the state a pool spends its time in, and a walk blocked on a peer would otherwise hold
+/// the pipeline open behind it.
+async fn next_leaf<T>(
+    leaf_rx: &mut Receiver<LeafReference>,
+    queue_tx: &Sender<T>,
+) -> Option<LeafReference> {
+    tokio::select! {
+        leaf = leaf_rx.recv() => leaf,
+        () = queue_tx.closed() => None,
+    }
+}
+
+/// Reserves budget for one leaf, or `None` if the pipeline was abandoned while waiting.
+///
+/// The wait for budget is a pool's other parking spot, and it can be a long one: the permits
+/// are held by payloads the consumer has yet to take. Rechecking after it means an abandoned
+/// pool stops before spawning a fetch nobody will read rather than after.
+async fn reserve_leaf_budget<T>(
+    semaphore: &'static Semaphore,
+    queue_tx: &Sender<T>,
+    expected_size: u64,
+) -> Result<Option<SemaphorePermit<'static>>, StorageError> {
+    let permit = semaphore
+        .acquire_many(fragment_permit_count(expected_size as usize))
+        .await
+        .map_err(|e| StorageError::internal_with_context(e, "permit"))?;
+    Ok((!queue_tx.is_closed()).then_some(permit))
+}
+
+/// Hands a payload to the caller, reporting whether the caller has gone.
+///
+/// A send that fails means the receiver is gone: a content comparison that has already found a
+/// difference, a reader that stopped early. That is not a failure of this pipeline, and there
+/// is nobody left to report one to, so it is reported as abandonment rather than as an error.
+/// The permit is released here rather than at load, so the budget bounds the pipeline.
+async fn send_payload(
+    sender: &Sender<Result<Bytes, StorageError>>,
+    buffer: Bytes,
+    permit: SemaphorePermit<'static>,
+) -> bool {
+    let abandoned = sender.send(Ok(buffer)).await.is_err();
+    drop(permit);
+    abandoned
+}
+
+/// Hands a fetched leaf to the write sink.
+///
+/// The permit travels inside the message rather than being released here, so the payload stays
+/// accounted for until the write task that owns it has written it.
+///
+/// A send that fails is discarded rather than reported. [`write_to_file`] reads to the end
+/// of the channel unless it has already failed, so a sink that has gone is a sink that has an
+/// error of its own to report, and that error is the one saying what went wrong. Raising a
+/// second one here would mask it, since [`defragment_pipeline`] takes the first of the three it
+/// combines. The pool learns the sink has gone from [`next_leaf`].
+async fn send_to_sink(sender: &DataSender, message: DataMessage) {
+    let _abandoned = sender.send(message).await;
+}
+
 /// Ordered fetch pool for streaming targets.
 ///
 /// Every payload carries its memory permit from the load until it is handed to the
@@ -744,7 +853,7 @@ async fn fetch_ordered_and_stream(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     leaf_rx: Receiver<LeafReference>,
-    sender: Sender<Bytes>,
+    sender: Sender<Result<Bytes, StorageError>>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
 ) -> Result<(), StorageError> {
@@ -765,7 +874,7 @@ async fn fetch_ordered_and_stream_from(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     mut leaf_rx: Receiver<LeafReference>,
-    sender: Sender<Bytes>,
+    sender: Sender<Result<Bytes, StorageError>>,
     options: ReadOptions,
     remote_session: Option<Arc<StorageSession>>,
 ) -> Result<(), StorageError> {
@@ -774,7 +883,6 @@ async fn fetch_ordered_and_stream_from(
 
     // Sized so it never binds before the budget does; every payload in it holds a permit.
     let max_tasks = FRAGMENT_BUDGET_KIB / FRAGMENT_MINIMUM_COST_KIB as usize;
-    type FetchResult = Result<(Bytes, SemaphorePermit<'static>), StorageError>;
     let (fetch_queue_tx, mut fetch_queue_rx) = channel::<JoinHandle<FetchResult>>(max_tasks);
 
     // Launcher: read leaf refs from walker, spawn fetch tasks, push handles
@@ -782,12 +890,12 @@ async fn fetch_ordered_and_stream_from(
         let store = store.clone();
         let remote_session = remote_session.clone();
         lore_base::lore_spawn!(async move {
-            while let Some(leaf) = leaf_rx.recv().await {
-                let permit_count = fragment_permit_count(leaf.expected_size as usize);
-                let permit = semaphore
-                    .acquire_many(permit_count)
-                    .await
-                    .map_err(|e| StorageError::internal_with_context(e, "permit"))?;
+            while let Some(leaf) = next_leaf(&mut leaf_rx, &fetch_queue_tx).await {
+                let Some(permit) =
+                    reserve_leaf_budget(semaphore, &fetch_queue_tx, leaf.expected_size).await?
+                else {
+                    break;
+                };
 
                 let subaddress = Address {
                     context: leaf.context,
@@ -835,38 +943,26 @@ async fn fetch_ordered_and_stream_from(
             .and_then(|r| r)
         {
             Ok((buffer, permit)) => {
-                if result.is_ok() {
-                    result = sender
-                        .send(buffer)
-                        .await
-                        .map_err(|_err| StorageError::internal("stream send failed"));
+                if send_payload(&sender, buffer, permit).await {
+                    break;
                 }
-                // Released here, not at load, so the budget bounds the pipeline.
-                drop(permit);
             }
             Err(e) => {
-                result = result.and(Err(e));
+                result = Err(e);
+                break;
             }
         }
     }
 
-    result.and(
-        launcher
-            .await
-            .map_err(|e| StorageError::internal_with_context(e, "stream queue join"))
-            .and_then(|r| r),
-    )
+    result.and(join_launcher(fetch_queue_rx, launcher).await)
 }
 
-/// Write sink for file targets.
-async fn write_to_sink(sink: DefragmentSink, data_rx: DataReceiver) -> Result<(), StorageError> {
-    match sink {
-        DefragmentSink::File { file, size } => write_to_sink_file(file, size, data_rx).await,
-        DefragmentSink::Stream { .. } => {
-            debug_assert!(false, "write_to_sink called with Stream sink");
-            Ok(())
-        }
-    }
+/// The outcome of a pipeline stage, with a task that did not run to completion counted as a
+/// failure of the stage it was running.
+fn joined(stage: Result<Result<(), StorageError>, JoinError>) -> Result<(), StorageError> {
+    stage
+        .map_err(|e| StorageError::internal_with_context(e, "task failure"))
+        .and_then(|r| r)
 }
 
 /// Drains `(offset, data, permit)` messages from the fetch pool and writes each
@@ -898,7 +994,7 @@ async fn write_to_sink(sink: DefragmentSink, data_rx: DataReceiver) -> Result<()
 /// a zero-filled hole, indistinguishable from content. Every payload for the whole file
 /// passes through here, which makes this the one place that can see the total. The walker's
 /// tiling checks mean it should never fire, which is the point of having it.
-async fn write_to_sink_file(
+async fn write_to_file(
     file: IoFile,
     size: usize,
     mut data_rx: DataReceiver,
@@ -999,59 +1095,43 @@ pub async fn defragment_pipeline(
         session_walker,
     ));
 
-    if let DefragmentSink::Stream { sender } = sink {
-        // Ordered fetch -> stream directly to caller's channel
-        let store_fetch = store.clone();
-        let session_fetch = remote_session.clone();
-        let fetcher = lore_base::lore_spawn!(fetch_ordered_and_stream(
-            store_fetch,
-            partition,
-            leaf_rx,
-            sender,
-            options,
-            session_fetch,
-        ));
+    match sink {
+        DefragmentSink::Stream { sender } => {
+            let store_fetch = store.clone();
+            let session_fetch = remote_session.clone();
+            let fetcher = lore_base::lore_spawn!(fetch_ordered_and_stream(
+                store_fetch,
+                partition,
+                leaf_rx,
+                sender,
+                options,
+                session_fetch,
+            ));
 
-        let (walk_result, fetch_result) = tokio::join!(walker, fetcher);
-        walk_result
-            .map_err(|e| StorageError::internal_with_context(e, "task failure"))
-            .and_then(|r| r)
-            .and(
-                fetch_result
-                    .map_err(|e| StorageError::internal_with_context(e, "task failure"))
-                    .and_then(|r| r),
-            )
-    } else {
-        // Unordered fetch -> data channel -> write sink
-        let (data_tx, data_rx) = channel::<DataMessage>(PIPELINE_DATA_CHANNEL_SIZE);
+            let (walk_result, fetch_result) = tokio::join!(walker, fetcher);
+            joined(walk_result).and(joined(fetch_result))
+        }
+        DefragmentSink::File { file, size } => {
+            let (data_tx, data_rx) = channel::<DataMessage>(PIPELINE_DATA_CHANNEL_SIZE);
 
-        let store_fetch = store.clone();
-        let session_fetch = remote_session.clone();
-        let fetcher = lore_base::lore_spawn!(fetch_unordered(
-            store_fetch,
-            partition,
-            leaf_rx,
-            data_tx,
-            options,
-            session_fetch,
-        ));
+            let store_fetch = store.clone();
+            let session_fetch = remote_session.clone();
+            let fetcher = lore_base::lore_spawn!(fetch_unordered(
+                store_fetch,
+                partition,
+                leaf_rx,
+                data_tx,
+                options,
+                session_fetch,
+            ));
 
-        let writer = lore_base::lore_spawn!(write_to_sink(sink, data_rx));
+            let writer = lore_base::lore_spawn!(write_to_file(file, size, data_rx));
 
-        let (walk_result, fetch_result, write_result) = tokio::join!(walker, fetcher, writer);
-        walk_result
-            .map_err(|e| StorageError::internal_with_context(e, "task failure"))
-            .and_then(|r| r)
-            .and(
-                fetch_result
-                    .map_err(|e| StorageError::internal_with_context(e, "task failure"))
-                    .and_then(|r| r),
-            )
-            .and(
-                write_result
-                    .map_err(|e| StorageError::internal_with_context(e, "task failure"))
-                    .and_then(|r| r),
-            )
+            let (walk_result, fetch_result, write_result) = tokio::join!(walker, fetcher, writer);
+            joined(walk_result)
+                .and(joined(fetch_result))
+                .and(joined(write_result))
+        }
     }
 }
 
@@ -1485,7 +1565,7 @@ mod tests {
         }
     }
 
-    mod write_to_sink_file {
+    mod write_to_file {
         //! Direct unit tests for the file write sink's runtime bounds check.
         //!
         //! In the full pipeline the leaf contiguity check in `fetch_unordered`
@@ -1525,7 +1605,7 @@ mod tests {
             send_one(&tx, 30, Bytes::from(vec![0xEF; SIZE - 30])).await;
             drop(tx);
 
-            super::super::write_to_sink_file(file.clone(), SIZE, rx)
+            super::super::write_to_file(file.clone(), SIZE, rx)
                 .await
                 .expect("in-bounds write");
 
@@ -1545,7 +1625,7 @@ mod tests {
             send_one(&tx, 40, Bytes::from(vec![0xAB; SIZE - 40])).await;
             drop(tx);
 
-            let err = super::super::write_to_sink_file(file, SIZE, rx)
+            let err = super::super::write_to_file(file, SIZE, rx)
                 .await
                 .expect_err("a hole should be rejected");
             assert!(
@@ -1562,7 +1642,7 @@ mod tests {
             send_one(&tx, 95, Bytes::from(vec![0u8; 10])).await; // 95 + 10 > 100
             drop(tx);
 
-            let err = super::super::write_to_sink_file(file, SIZE, rx)
+            let err = super::super::write_to_file(file, SIZE, rx)
                 .await
                 .expect_err("OOB should be rejected");
             assert!(
@@ -1579,7 +1659,7 @@ mod tests {
             send_one(&tx, SIZE, Bytes::from(vec![0u8; 1])).await;
             drop(tx);
 
-            super::super::write_to_sink_file(file, SIZE, rx)
+            super::super::write_to_file(file, SIZE, rx)
                 .await
                 .expect_err("offset==size with data should be rejected");
         }
@@ -1592,7 +1672,7 @@ mod tests {
             send_one(&tx, usize::MAX - 5, Bytes::from(vec![0u8; 10])).await;
             drop(tx);
 
-            let err = super::super::write_to_sink_file(file, SIZE, rx)
+            let err = super::super::write_to_file(file, SIZE, rx)
                 .await
                 .expect_err("offset + len overflow rejected");
             assert!(
@@ -1612,6 +1692,7 @@ mod tests {
         use zerocopy::IntoBytes;
 
         use super::*;
+        use crate::StoreError;
         use crate::hash;
         use crate::local::immutable_store::ImmutableStoreSettings;
         use crate::local::immutable_store::LocalImmutableStore;
@@ -1743,6 +1824,613 @@ mod tests {
             assert!(
                 err.to_string().contains("does not match expected"),
                 "unexpected error: {err}"
+            );
+        }
+
+        /// A consumer that stops reading is not a failure.
+        ///
+        /// `is_file_content_equal` streams a stored object and compares it with
+        /// the file on disk, and stops at the first chunk that differs - which is
+        /// the common case, since it only runs when the hashes already disagree.
+        /// The pipeline behind it then has nowhere to send the chunks it has
+        /// already fetched. That is not an error: there is none to deliver, since
+        /// the consumer it would go to is the one that left, and none to log, for
+        /// an operation that has done nothing wrong.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_stream_whose_consumer_stops_reading_is_not_a_failure() {
+            let (_dir, store) = make_store().await;
+            let partition = Partition::from([0x0A; 16]);
+            let context = Context::from([0x0A; 16]);
+
+            // Enough leaves that the pipeline still has sends to make once the
+            // consumer has taken its one chunk and gone.
+            let mut refs = Vec::new();
+            let mut offset = 0u64;
+            for index in 0..16u8 {
+                let (address, _) = put_leaf(&store, partition, context, vec![index; 1024]).await;
+                refs.push(FragmentReference {
+                    hash: address.hash,
+                    offset_content: offset,
+                });
+                offset += 1024;
+            }
+            let root_address = put_list(&store, partition, context, &refs, offset).await;
+
+            let options = ReadOptions::default().no_verify().with_decompress();
+            let (root_fragment, root_buffer) =
+                crate::read::load_fragment(store.clone(), partition, root_address, options, None)
+                    .await
+                    .expect("load root list");
+
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+            let pipeline = defragment_pipeline(
+                store.clone(),
+                partition,
+                root_address,
+                root_fragment,
+                root_buffer,
+                0..offset,
+                DefragmentSink::Stream { sender },
+                options,
+                None,
+            );
+            let consumer = async move {
+                receiver
+                    .recv()
+                    .await
+                    .expect("first chunk")
+                    .expect("first chunk is not an error");
+                // Dropped here, the way a comparison that has seen enough drops it.
+            };
+
+            let (result, ()) = tokio::join!(pipeline, consumer);
+            result.expect("an abandoned stream is not a failure");
+        }
+
+        /// An abandoned pipeline stops asking for leaves, rather than fetching the
+        /// rest of the object into a queue nobody will read.
+        ///
+        /// The pipeline returning is what proves it: it only returns once its
+        /// launcher has, and the launcher only stops when the queue it pushes into
+        /// closes. After that the leaf channel is dropped, so a further push into
+        /// it must fail. The launcher is left waiting on the leaf channel rather
+        /// than on the queue, which is the state it spends its time in and the one
+        /// a push cannot reach it in. The timeout is there so that a pipeline which
+        /// goes on waiting for leaves fails the test instead of hanging it.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_abandoned_stream_stops_asking_for_leaves() {
+            const PAYLOAD: usize = 100;
+
+            let (_dir, store) = make_store().await;
+            let partition = Partition::from([0x0B; 16]);
+            let context = Context::from([0x0B; 16]);
+
+            let (leaf_tx, leaf_rx) = channel::<LeafReference>(1);
+            let (data_tx, mut data_rx) = channel::<Result<Bytes, StorageError>>(1);
+            let pipeline = lore_base::lore_spawn!(fetch_ordered_and_stream(
+                store.clone(),
+                partition,
+                leaf_rx,
+                data_tx,
+                ReadOptions::default().no_verify(),
+                None,
+            ));
+
+            // Enough queued that the pipeline has something to send after the
+            // consumer has taken its one payload and gone.
+            let mut first_hash = None;
+            for index in 0..4usize {
+                let (address, _) =
+                    put_leaf(&store, partition, context, vec![index as u8; PAYLOAD]).await;
+                first_hash.get_or_insert(address.hash);
+                leaf_tx
+                    .send(LeafReference {
+                        hash: address.hash,
+                        target_offset: (index * PAYLOAD) as u64,
+                        expected_size: PAYLOAD as u64,
+                        clip: 0..PAYLOAD as u64,
+                        context,
+                    })
+                    .await
+                    .expect("queue leaf");
+            }
+
+            data_rx
+                .recv()
+                .await
+                .expect("first payload")
+                .expect("first payload is not an error");
+            drop(data_rx);
+
+            let joined = tokio::time::timeout(std::time::Duration::from_secs(30), pipeline)
+                .await
+                .expect("the pipeline must return once its consumer is gone")
+                .expect("pipeline join");
+            joined.expect("an abandoned stream is not a failure");
+
+            assert!(
+                leaf_tx
+                    .send(LeafReference {
+                        hash: first_hash.expect("a leaf was queued"),
+                        target_offset: 0,
+                        expected_size: PAYLOAD as u64,
+                        clip: 0..PAYLOAD as u64,
+                        context,
+                    })
+                    .await
+                    .is_err(),
+                "the pipeline must stop taking leaves once its consumer is gone"
+            );
+        }
+
+        /// Waits until the pool has taken every leaf, where `capacity` is the channel's whole
+        /// capacity and so holding all of it means the channel is empty.
+        ///
+        /// Awaited rather than sampled. The pool runs on the runtime `lore_spawn!` selects, so
+        /// nothing this task does gives it time, and its one blocking step is a budget acquire
+        /// against a semaphore the whole process shares. Reserving the capacity parks on the
+        /// channel's own wakeup, which the pool triggers as it takes each leaf, so the wait
+        /// lasts as long as the pool needs rather than as long as a fixed number of polls.
+        async fn drain_leaf_channel(leaf_tx: &Sender<LeafReference>, capacity: usize) {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                leaf_tx.reserve_many(capacity),
+            )
+            .await
+            .expect("the pool must take every queued leaf before the sink goes")
+            .expect("the leaf channel must stay open while the pool runs");
+        }
+
+        /// The file pool stops asking for leaves once its sink has gone, and reports nothing.
+        ///
+        /// [`write_to_file`] reads to the end of the channel unless it has already failed,
+        /// so a sink that lets go is a sink with an error of its own to report, and a second one
+        /// raised here would mask it: [`defragment_pipeline`] combines the three results with
+        /// `and`, which keeps the first.
+        ///
+        /// The sink is dropped only once every queued leaf has been taken and the pool has had
+        /// time to park, which is what makes this a test of the wait on the leaf channel rather
+        /// than of the budget recheck. With a leaf still in the channel the recheck reaches the
+        /// same answer one leaf later, and a pool that had stopped watching its sink would pass.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_abandoned_write_sink_stops_the_fetch_pool() {
+            const PAYLOAD: usize = 100;
+            const LEAVES: usize = 4;
+
+            let (_dir, store) = make_store().await;
+            let partition = Partition::from([0x0E; 16]);
+            let context = Context::from([0x0E; 16]);
+
+            let (leaf_tx, leaf_rx) = channel::<LeafReference>(LEAVES);
+            let (data_tx, mut data_rx) = channel::<DataMessage>(1);
+            let pool = lore_base::lore_spawn!(fetch_unordered(
+                store.clone(),
+                partition,
+                leaf_rx,
+                data_tx,
+                ReadOptions::default().no_verify(),
+                None,
+            ));
+
+            // Enough queued that the pool has sends left to make once the sink has taken its
+            // one payload and gone.
+            let mut first_hash = None;
+            for index in 0..LEAVES {
+                let (address, _) =
+                    put_leaf(&store, partition, context, vec![index as u8; PAYLOAD]).await;
+                first_hash.get_or_insert(address.hash);
+                leaf_tx
+                    .send(LeafReference {
+                        hash: address.hash,
+                        target_offset: (index * PAYLOAD) as u64,
+                        expected_size: PAYLOAD as u64,
+                        clip: 0..PAYLOAD as u64,
+                        context,
+                    })
+                    .await
+                    .expect("queue leaf");
+            }
+
+            drop(data_rx.recv().await.expect("first payload"));
+            drain_leaf_channel(&leaf_tx, LEAVES).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(data_rx);
+
+            tokio::time::timeout(std::time::Duration::from_secs(30), pool)
+                .await
+                .expect("the pool must return once its sink is gone")
+                .expect("pool join")
+                .expect("an abandoned write sink is not a failure of the pool feeding it");
+
+            assert!(
+                leaf_tx
+                    .send(LeafReference {
+                        hash: first_hash.expect("a leaf was queued"),
+                        target_offset: 0,
+                        expected_size: PAYLOAD as u64,
+                        clip: 0..PAYLOAD as u64,
+                        context,
+                    })
+                    .await
+                    .is_err(),
+                "the pool must stop taking leaves once its sink is gone"
+            );
+        }
+
+        /// A reservation that completes after its queue has closed hands back nothing to spend.
+        ///
+        /// The whole budget is held until after the queue is gone, so the permit can only be
+        /// granted once it is. That is the interleaving the recheck exists for: a pool waiting
+        /// for budget cannot be told by a send that it has been abandoned, having nothing to
+        /// send until it has the budget to fetch what it would send.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_reservation_completing_after_its_queue_closed_yields_nothing() {
+            const PAYLOAD: u64 = 100;
+
+            let cost = fragment_permit_count(PAYLOAD as usize);
+            let budget: &'static Semaphore = Box::leak(Box::new(Semaphore::new(cost as usize)));
+            let held = budget
+                .acquire_many(cost)
+                .await
+                .expect("hold the whole budget");
+
+            let (queue_tx, queue_rx) = channel::<LeafReference>(1);
+            let reserve = lore_base::lore_spawn!(async move {
+                reserve_leaf_budget(budget, &queue_tx, PAYLOAD).await
+            });
+
+            drop(queue_rx);
+            drop(held);
+
+            let permit = reserve
+                .await
+                .expect("reservation join")
+                .expect("waiting for budget is not an error");
+            assert!(
+                permit.is_none(),
+                "a reservation for a queue that has closed must hand back no budget to spend"
+            );
+        }
+
+        /// A write that fails reports its own error, not the fetch pool's view of it.
+        ///
+        /// [`defragment_pipeline`] combines the walk, fetch and write results with `and`, which
+        /// keeps the first of them, so a pool treating a departed sink as its own failure stands
+        /// in front of the error naming the cause. The sink is given room for one leaf so it
+        /// rejects an offset past that, and there are more leaves than the data channel holds so
+        /// the pool still has sends outstanding when the sink goes.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_failed_write_reports_the_sinks_error_and_not_the_pools() {
+            const PAYLOAD: usize = 64;
+            let leaves = PIPELINE_DATA_CHANNEL_SIZE + 16;
+
+            let (dir, store) = make_store().await;
+            let partition = Partition::from([0x0F; 16]);
+            let context = Context::from([0x0F; 16]);
+
+            let mut refs = Vec::with_capacity(leaves);
+            let mut offset = 0u64;
+            for index in 0..leaves {
+                let (address, _) =
+                    put_leaf(&store, partition, context, vec![index as u8; PAYLOAD]).await;
+                refs.push(FragmentReference {
+                    hash: address.hash,
+                    offset_content: offset,
+                });
+                offset += PAYLOAD as u64;
+            }
+            let root_address = put_list(&store, partition, context, &refs, offset).await;
+
+            let options = ReadOptions::default().no_verify().with_decompress();
+            let (root_fragment, root_buffer) =
+                crate::read::load_fragment(store.clone(), partition, root_address, options, None)
+                    .await
+                    .expect("load root list");
+
+            let file = super::super::open_file_write(dir.path().join("truncated.bin"), PAYLOAD)
+                .await
+                .expect("create target file");
+
+            let err = defragment_pipeline(
+                store.clone(),
+                partition,
+                root_address,
+                root_fragment,
+                root_buffer,
+                0..offset,
+                DefragmentSink::File {
+                    file,
+                    size: PAYLOAD,
+                },
+                options,
+                None,
+            )
+            .await
+            .expect_err("a write past the end of the sink fails the read");
+
+            assert!(
+                err.to_string().contains("out of bounds"),
+                "the sink's error must be the one reported, got: {err}"
+            );
+        }
+
+        /// Delegating store that counts the fragment loads reaching it.
+        ///
+        /// The walk descends by loading list nodes, so the count is what distinguishes a walk
+        /// that stopped from one that ran to the end of the tree sending leaves nobody took.
+        struct CountingGetStore {
+            inner: Arc<dyn ImmutableStore>,
+            gets: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl ImmutableStore for CountingGetStore {
+            async fn get(
+                self: Arc<Self>,
+                partition: Partition,
+                address: Address,
+            ) -> Result<crate::store_types::StoreGetData, StoreError> {
+                self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.inner.clone().get(partition, address).await
+            }
+
+            fn is_local(&self) -> bool {
+                self.inner.clone().is_local()
+            }
+
+            async fn get_metadata(
+                self: Arc<Self>,
+                partition: Partition,
+                address: Address,
+            ) -> Result<crate::store_types::StoreGetData, StoreError> {
+                self.inner.clone().get_metadata(partition, address).await
+            }
+
+            async fn query(
+                self: Arc<Self>,
+                partition: Partition,
+                addresses: &[Address],
+                results: &mut [crate::store_types::StoreMatchResult],
+            ) -> Result<(), StoreError> {
+                self.inner
+                    .clone()
+                    .query(partition, addresses, results)
+                    .await
+            }
+
+            async fn put(
+                self: Arc<Self>,
+                partition: Partition,
+                address: Address,
+                fragment: Fragment,
+                payload: Option<Bytes>,
+                force: bool,
+            ) -> Result<(), StoreError> {
+                self.inner
+                    .clone()
+                    .put(partition, address, fragment, payload, force)
+                    .await
+            }
+
+            async fn obliterate(
+                self: Arc<Self>,
+                partition: Partition,
+                address: Address,
+                stats: Arc<crate::store_types::StoreObliterateStats>,
+            ) -> Result<(), StoreError> {
+                self.inner
+                    .clone()
+                    .obliterate(partition, address, stats)
+                    .await
+            }
+
+            async fn evict(
+                self: Arc<Self>,
+                max_capacity: usize,
+                sync_data: bool,
+                sink: Option<crate::gc_event::GcEventSinkRef>,
+            ) -> Result<usize, StoreError> {
+                self.inner
+                    .clone()
+                    .evict(max_capacity, sync_data, sink)
+                    .await
+            }
+
+            async fn compact(
+                self: Arc<Self>,
+                max_size: usize,
+                at: Option<usize>,
+                sync_data: bool,
+                sink: Option<crate::gc_event::GcEventSinkRef>,
+            ) -> Result<Option<usize>, StoreError> {
+                self.inner
+                    .clone()
+                    .compact(max_size, at, sync_data, sink)
+                    .await
+            }
+
+            async fn compact_resume_at(self: Arc<Self>) -> Option<usize> {
+                self.inner.clone().compact_resume_at().await
+            }
+
+            async fn compact_stop(self: Arc<Self>) {
+                self.inner.clone().compact_stop().await;
+            }
+
+            fn max_query_batch(&self) -> Option<usize> {
+                None
+            }
+
+            async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+                self.inner.clone().flush(sync_data).await
+            }
+
+            async fn verify(self: Arc<Self>, heal: bool) -> Result<(), StoreError> {
+                self.inner.clone().verify(heal).await
+            }
+
+            async fn copy(
+                self: Arc<Self>,
+                source_partition: Partition,
+                source_address: Address,
+                destination_partition: Partition,
+                destination_context: Context,
+                durable: bool,
+            ) -> Result<(), StoreError> {
+                self.inner
+                    .clone()
+                    .copy(
+                        source_partition,
+                        source_address,
+                        destination_partition,
+                        destination_context,
+                        durable,
+                    )
+                    .await
+            }
+        }
+
+        /// A two-level tree of `SUBLISTS` sublists holding one leaf each, and its root, loaded.
+        ///
+        /// Wide rather than deep, because what is being counted is how far along a level the
+        /// walk gets before it stops, and a level is where the prefetch window lives.
+        async fn put_wide_tree(
+            store: &Arc<dyn ImmutableStore>,
+            partition: Partition,
+            context: Context,
+            sublists: usize,
+            payload: usize,
+        ) -> (Address, u64) {
+            let mut entries = Vec::with_capacity(sublists);
+            let mut offset = 0u64;
+            for index in 0..sublists {
+                let (leaf, _) =
+                    put_leaf(store, partition, context, vec![index as u8; payload]).await;
+                let sublist = put_list(
+                    store,
+                    partition,
+                    context,
+                    &refs_at(&[(leaf, offset)]),
+                    payload as u64,
+                )
+                .await;
+                entries.push((sublist, offset));
+                offset += payload as u64;
+            }
+            let root = put_list(store, partition, context, &refs_at(&entries), offset).await;
+            (root, offset)
+        }
+
+        /// A walk with nobody behind it loads nothing.
+        ///
+        /// The leaf channel is closed before the walk starts, which is the state it reaches the
+        /// moment its pipeline is abandoned. Loading even the first sublist would mean the walk
+        /// descends before it looks, and a tree deep enough would then be walked to the bottom.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_abandoned_walk_loads_no_list_nodes() {
+            const SUBLISTS: usize = 8;
+            const PAYLOAD: usize = 100;
+
+            let (_dir, inner) = make_store().await;
+            let partition = Partition::from([0x0C; 16]);
+            let context = Context::from([0x0C; 16]);
+            let (root_address, total) =
+                put_wide_tree(&inner, partition, context, SUBLISTS, PAYLOAD).await;
+
+            let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let store: Arc<dyn ImmutableStore> = Arc::new(CountingGetStore {
+                inner,
+                gets: gets.clone(),
+            });
+
+            let options = ReadOptions::default().no_verify().with_decompress();
+            let (root_fragment, root_buffer) =
+                crate::read::load_fragment(store.clone(), partition, root_address, options, None)
+                    .await
+                    .expect("load root list");
+            gets.store(0, std::sync::atomic::Ordering::SeqCst);
+
+            let (leaf_tx, leaf_rx) = channel::<LeafReference>(1);
+            drop(leaf_rx);
+
+            walk_fragment_tree(
+                store,
+                partition,
+                root_address,
+                root_fragment,
+                root_buffer,
+                0..total,
+                leaf_tx,
+                options,
+                None,
+            )
+            .await
+            .expect("an abandoned walk is not a failure");
+
+            assert_eq!(
+                gets.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "an abandoned walk must not load a single list node"
+            );
+        }
+
+        /// A walk abandoned part way through a level stops descending the rest of it.
+        ///
+        /// The consumer takes one leaf and goes, which is where a content comparison stops. What
+        /// is left is a level of sublists the walk has every offset for and no reason to load:
+        /// the bound is the prefetch window, since loads already in flight when the leaf channel
+        /// closes still land.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_walk_abandoned_part_way_stops_descending() {
+            const SUBLISTS: usize = 64;
+            const PAYLOAD: usize = 100;
+
+            let (_dir, inner) = make_store().await;
+            let partition = Partition::from([0x0D; 16]);
+            let context = Context::from([0x0D; 16]);
+            let (root_address, total) =
+                put_wide_tree(&inner, partition, context, SUBLISTS, PAYLOAD).await;
+
+            let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let store: Arc<dyn ImmutableStore> = Arc::new(CountingGetStore {
+                inner,
+                gets: gets.clone(),
+            });
+
+            let options = ReadOptions::default().no_verify().with_decompress();
+            let (root_fragment, root_buffer) =
+                crate::read::load_fragment(store.clone(), partition, root_address, options, None)
+                    .await
+                    .expect("load root list");
+            gets.store(0, std::sync::atomic::Ordering::SeqCst);
+
+            let (leaf_tx, mut leaf_rx) = channel::<LeafReference>(1);
+            let walk = lore_base::lore_spawn!(walk_fragment_tree(
+                store,
+                partition,
+                root_address,
+                root_fragment,
+                root_buffer,
+                0..total,
+                leaf_tx,
+                options,
+                None,
+            ));
+
+            leaf_rx.recv().await.expect("first leaf");
+            drop(leaf_rx);
+
+            tokio::time::timeout(std::time::Duration::from_secs(30), walk)
+                .await
+                .expect("the walk must return once its consumer is gone")
+                .expect("walk join")
+                .expect("an abandoned walk is not a failure");
+
+            let loaded = gets.load(std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                loaded < SUBLISTS,
+                "an abandoned walk loaded {loaded} fragments, as many as walking all {SUBLISTS} \
+                 sublists would take"
             );
         }
 
@@ -2458,7 +3146,7 @@ mod tests {
             drop(leaf_tx);
 
             // One slot, so only the first payload leaves the pipeline's accounting.
-            let (data_tx, mut data_rx) = channel::<Bytes>(1);
+            let (data_tx, mut data_rx) = channel::<Result<Bytes, StorageError>>(1);
             let pipeline = lore_base::lore_spawn!(fetch_ordered_and_stream_from(
                 budget,
                 store.clone(),
@@ -2492,7 +3180,11 @@ mod tests {
 
             // Draining releases them in order, and the walk completes.
             for index in 0..LEAVES {
-                let payload = data_rx.recv().await.expect("payload");
+                let payload = data_rx
+                    .recv()
+                    .await
+                    .expect("payload")
+                    .expect("payload must not be an error");
                 assert_eq!(payload.len(), PAYLOAD);
                 assert!(
                     payload.iter().all(|&byte| byte == index as u8),

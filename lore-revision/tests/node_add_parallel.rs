@@ -8,18 +8,15 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
 
-    use lore_base::error::NoRemote;
     use lore_base::lore_spawn;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Context;
     use lore_revision::node::*;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::state::State;
     use lore_storage::hash::hash_string;
     use lore_storage::local::immutable_store::LocalImmutableStore;
-    use lore_transport::ProtocolError;
     use tokio::task::JoinSet;
 
     include!("helper.rs");
@@ -45,7 +42,7 @@ mod tests {
     async fn node_add_parallel_siblings_are_race_free() {
         let (_immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
-        let repository_id = Context::from(uuid::Uuid::now_v7());
+        let _repository_id = Context::from(uuid::Uuid::now_v7());
 
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
@@ -63,14 +60,11 @@ mod tests {
                     lore_revision::repository::RepositoryWriteToken::acquire(path.as_path()).await;
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id.into(),
-                        lore_revision::instance::InstanceId::default(),
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -185,7 +179,7 @@ mod tests {
     async fn concurrent_tree_installs_push_one_block_placeholder() {
         let (_immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
-        let repository_id = Context::from(uuid::Uuid::now_v7());
+        let _repository_id = Context::from(uuid::Uuid::now_v7());
 
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
@@ -203,14 +197,11 @@ mod tests {
                     lore_revision::repository::RepositoryWriteToken::acquire(path.as_path()).await;
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store.clone(),
-                        mutable_store.clone(),
-                        repository_id.into(),
-                        lore_revision::instance::InstanceId::default(),
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(
+                            immutable_store.clone(),
+                            mutable_store.clone(),
+                        )
+                        .with_path(&path),
                     )
                     .with_write_token(write_token.share()),
                 );

@@ -15,6 +15,7 @@ use std::fmt;
 use lore_error_set::error_set;
 use lore_error_set::prelude::*;
 use lore_error_set::FfiError;
+use lore_error_set::Location;
 use lore_error_set::Traced;
 
 // ---------------------------------------------------------------------------
@@ -644,4 +645,67 @@ fn chain_err_from_accumulates_onto_multi_hop_trace() {
     assert_eq!(display.matches("  at ").count(), 3);
     assert!(display.contains("hop 1"));
     assert!(display.contains("hop 2"));
+}
+
+#[test]
+fn internal_helper_traces_caller() {
+    let before_error = ::std::panic::Location::caller();
+    let before_error = Location::new(
+        before_error.file(),
+        before_error.line(),
+        before_error.column(),
+    );
+    let a = SetA::internal("Test message");
+    let after_error = ::std::panic::Location::caller();
+    let after_error = Location::new(after_error.file(), after_error.line(), after_error.column());
+
+    assert_eq!(a.trace().locations().len(), 1);
+    let trace_location = a.trace().locations().first().unwrap();
+
+    assert_eq!(trace_location.file, before_error.file);
+
+    assert!(
+        trace_location.line > before_error.line,
+        "{} > {}",
+        trace_location.line,
+        before_error.line
+    );
+    assert!(
+        after_error.line > trace_location.line,
+        "{} > {}",
+        after_error.line,
+        trace_location.line
+    );
+}
+
+#[test]
+fn internal_with_context_helper_traces_caller() {
+    let before_error = ::std::panic::Location::caller();
+    let before_error = Location::new(
+        before_error.file(),
+        before_error.line(),
+        before_error.column(),
+    );
+    let io_err = std::io::Error::other("disk failure");
+    let a = SetA::internal_with_context(io_err, "test context");
+    let after_error = ::std::panic::Location::caller();
+    let after_error = Location::new(after_error.file(), after_error.line(), after_error.column());
+
+    assert_eq!(a.trace().locations().len(), 1);
+    let trace_location = a.trace().locations().first().unwrap();
+
+    assert_eq!(trace_location.file, before_error.file);
+
+    assert!(
+        trace_location.line > before_error.line,
+        "{} > {}",
+        trace_location.line,
+        before_error.line
+    );
+    assert!(
+        after_error.line > trace_location.line,
+        "{} > {}",
+        after_error.line,
+        trace_location.line
+    );
 }

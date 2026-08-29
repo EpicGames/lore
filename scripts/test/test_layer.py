@@ -259,6 +259,279 @@ def test_layer_branch_create(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_layer_branch_archive_leaves_layers_by_default(new_lore_repo):
+    """`lore branch archive` touches only the repository it ran in.
+
+    A layer is a separate repository owning its own branch lifecycle, so an
+    archive must not reach into it without being asked.
+    """
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    assert layer_repo.branch_list().has_remote_branch("feature"), (
+        "Expected branch create to cascade into the layer repository"
+    )
+
+    repo.branch_switch("main")
+    repo.branch_archive("feature")
+
+    assert sorted(repo.branch_list().remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    )
+    assert layer_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the layer branch to be left alone, got: {layer_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_include_layers(new_lore_repo):
+    """`--include-layers` archives the branch in the layer repository too, so
+    the layer is left with exactly the branches it had before the create.
+    """
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    branches_before = sorted(layer_repo.branch_list().remote_branches)
+
+    repo.branch_create("feature")
+    repo.push()
+    assert layer_repo.branch_list().has_remote_branch("feature"), (
+        "Expected branch create to cascade into the layer repository"
+    )
+
+    repo.branch_switch("main")
+    repo.branch_archive("feature", include_layers=True)
+
+    assert sorted(repo.branch_list().remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    )
+    assert sorted(layer_repo.branch_list().remote_branches) == branches_before, (
+        f"Expected layer branches {branches_before}, got: {layer_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_multiple_layers(new_lore_repo):
+    """`--include-layers` archives the branch in every configured layer."""
+    repo, second_repo, third_repo = _setup_repo_with_two_layers(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    for layer in (second_repo, third_repo):
+        assert layer.branch_list().has_remote_branch("feature"), (
+            f"Expected branch create to cascade into {layer.name}"
+        )
+
+    repo.branch_switch("main")
+    repo.branch_archive("feature", include_layers=True)
+
+    for layer in (second_repo, third_repo):
+        assert sorted(layer.branch_list().remote_branches) == ["main"], (
+            f"Expected only 'main' remaining in {layer.name}, got: {layer.branch_list()}"
+        )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_single_layer(new_lore_repo):
+    """`--layer <path>` archives the branch in that layer and no other."""
+    repo, second_repo, third_repo = _setup_repo_with_two_layers(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    repo.branch_archive("feature", layer="sec")
+
+    assert not second_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the scoped layer to be archived, got: {second_repo.branch_list()}"
+    )
+    assert third_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the other layer to be left alone, got: {third_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_unknown_layer_errors(new_lore_repo):
+    """`--layer` naming a path that is not a layer is an error, not a silent no-op."""
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    output = repo.branch_archive("feature", layer="not-a-layer", check=False)
+
+    assert "not a layer" in output.lower(), (
+        f"Expected an unknown layer path to be reported, got: {output}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_layer_flags_conflict(new_lore_repo):
+    """`--include-layers` and `--layer` are mutually exclusive."""
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    output = repo.branch_archive(
+        "feature", include_layers=True, layer="lay", check=False
+    )
+
+    assert "cannot be used with" in output.lower(), (
+        f"Expected clap to reject the flag combination, got: {output}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_local_keeps_layer_remote(new_lore_repo):
+    """`--local --include-layers` archives the layer's local cache only,
+    leaving the layer's remote branch in place.
+    """
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+
+    repo.branch_switch("main")
+    repo.branch_archive("feature", local=True, include_layers=True)
+
+    assert not repo.branch_list().has_local_branch("feature"), (
+        f"Expected the local branch to be archived, got: {repo.branch_list()}"
+    )
+    assert layer_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the layer remote branch to remain, got: {layer_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_skips_layer_without_branch(new_lore_repo):
+    """A layer that never had the branch is skipped quietly.
+
+    Creating the branch before the layer is configured is the one flow that
+    leaves a layer with no metadata for it, so the layer answers NOT_FOUND
+    rather than the idempotent already-archived success.
+    """
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+
+    repo.write_commit_push(None, {MAIN_FILE: b"main content"})
+    layer_repo.make_dirs("lay")
+    layer_repo.write_commit_push(None, {LAYER_FILE: b"layer content v1"})
+
+    # No layer configured yet, so the branch is never cascaded anywhere.
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    repo.layer_add("lay", layer_repo, "lay/")
+    assert not layer_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the layer to never have seen the branch, got: {layer_repo.branch_list()}"
+    )
+
+    output = repo.branch_archive("feature", include_layers=True)
+
+    assert "not found" not in output.lower(), (
+        f"Expected the missing layer branch to be skipped quietly, got: {output}"
+    )
+    assert sorted(repo.branch_list().remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_tolerates_already_archived_layer(new_lore_repo):
+    """Archiving a branch a layer already archived is not an error."""
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    layer_repo.branch_switch("main")
+    layer_repo.branch_archive("feature")
+
+    repo.branch_archive("feature", include_layers=True)
+
+    assert sorted(repo.branch_list().remote_branches) == ["main"], (
+        f"Expected only 'main' remaining in the parent, got: {repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_reports_once(new_lore_repo):
+    """Archiving reports a single branch, not one line per layer."""
+    repo, second_repo, third_repo = _setup_repo_with_two_layers(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    output = repo.branch_archive("feature", include_layers=True)
+
+    assert output.count("Archived branch") == 1, (
+        f"Expected one archive line for the outer repository, got: {output}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_continues_past_refusing_layer(new_lore_repo):
+    """One layer refusing the archive does not stop the remaining layers."""
+    repo, second_repo, third_repo = _setup_repo_with_two_layers(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    second_repo.branch_protect("feature")
+
+    repo.branch_archive("feature", include_layers=True, check=False)
+
+    assert second_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the protected layer branch to survive, got: {second_repo.branch_list()}"
+    )
+    assert not third_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the remaining layer to still be archived, got: {third_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_current_leaves_layers(new_lore_repo):
+    """Refusing to archive the current branch leaves the layers alone."""
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+
+    repo.branch_archive("feature", include_layers=True, check=False)
+
+    assert layer_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the layer branch to be untouched, got: {layer_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_branch_archive_converges_after_partial_archive(new_lore_repo):
+    """A repeat archive still reaches the layers after a partial one.
+
+    `--local` leaves every remote behind, so the second run finds the outer
+    local branch already gone. That must not abort the cascade, or the layer
+    remotes stay orphaned with no way to clean them up.
+    """
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    repo.branch_create("feature")
+    repo.push()
+    repo.branch_switch("main")
+
+    repo.branch_archive("feature", local=True, include_layers=True)
+    assert layer_repo.branch_list().has_remote_branch("feature")
+
+    repo.branch_archive("feature", include_layers=True, check=False)
+
+    assert not layer_repo.branch_list().has_remote_branch("feature"), (
+        f"Expected the repeat archive to reach the layer, got: {layer_repo.branch_list()}"
+    )
+
+
+@pytest.mark.smoke
 def test_layer_branch_switch_basic(new_lore_repo):
     """
     Switching to a branch that exists in the layer repo syncs layer files
@@ -1514,23 +1787,23 @@ def test_layer_sync_force_clears_stale_staged_pin(new_lore_repo):
 ZERO_HASH = "0" * 64
 
 
+def _layer_config_path(repo: Lore) -> str:
+    """Return the path of the repository's `layer.toml`."""
+    return os.path.join(repo.dot_path(), "layer.toml")
+
+
 def _layer_config_staged(repo: Lore, target_path: str) -> str:
     """Return the `staged` pin of the layer at `target_path` from `layer.toml`.
 
     `lore layer list` only reports the `current` pin. Returns "" when the
     config has no entry for `target_path`.
     """
-    for dot_dir in (".lore", ".urc"):
-        config_path = os.path.join(repo.path, dot_dir, "layer.toml")
-        if not os.path.isfile(config_path):
-            continue
-        with open(config_path, "rb") as config_file:
-            config = tomllib.load(config_file)
-        for layer in config.get("layers", []):
-            if layer.get("target_path") == target_path:
-                return layer.get("staged", "")
-        return ""
-    raise AssertionError(f"No layer config found under {repo.path}")
+    with open(_layer_config_path(repo), "rb") as config_file:
+        config = tomllib.load(config_file)
+    for layer in config.get("layers", []):
+        if layer.get("target_path") == target_path:
+            return layer.get("staged", "")
+    return ""
 
 
 @pytest.mark.smoke
@@ -1590,4 +1863,385 @@ def test_layer_stage_scan_unchanged_layer(new_lore_repo):
         content = out.read()
     assert content == b"layer content v2", (
         f"Expected the layer to be restored to L2 on main, got: {content}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_remove_refused_with_staged_layer_content(new_lore_repo):
+    """`layer remove` is refused without `--force` when the layer holds staged
+    changes, and the staged work survives the refusal.
+
+    Staged changes have already been reconciled with disk, so the local
+    modification gate does not see them.
+    """
+    from error_types import LocalModificationsError
+
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+    _stage_layer_change(repo)
+
+    with pytest.raises(LocalModificationsError):
+        repo.layer_remove("lay", layer_repo)
+
+    layers = parse_layer_list_json(repo.layer_list(json=True))
+    assert [layer.get("targetPath") for layer in layers] == ["lay"], (
+        f"The refused remove dropped the layer from the config, got {layers}"
+    )
+
+    status_entries = parse_status_json(repo.status(json=True))
+    paths = [entry.get("path") for entry in status_entries if entry.get("flagStaged")]
+    assert paths == ["lay/staged_new.txt"], (
+        f"The staged layer content should survive the refused remove, got {paths}"
+    )
+    assert os.path.isfile(os.path.join(repo.path, LAYER_STAGED_FILE)), (
+        "The staged file should still be on disk after the refused remove"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_remove_force_cleans_staged_add(new_lore_repo):
+    """`layer remove --force` counts and deletes a staged add.
+
+    A staged add is absent from the layer's `current` revision, so it has to be
+    taken from the staged state to be cleaned up.
+    """
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+    _stage_layer_change(repo)
+
+    remove_output = repo.layer_remove("lay", layer_repo, force=True, json=True)
+    remove_event = parse_layer_remove_json(remove_output)
+    assert remove_event is not None, (
+        f"Expected a layerRemove event, got: {remove_output}"
+    )
+    assert remove_event.get("fileCount") == 2, (
+        f"Expected the staged add to be counted alongside the tracked file, got {remove_event}"
+    )
+    assert remove_event.get("forced") == 1, (
+        f"Expected the remove to report that force was required, got {remove_event}"
+    )
+    assert remove_event.get("modifiedCount") == 0, (
+        f"A cleanly staged add is not a local modification, got {remove_event}"
+    )
+
+    assert not os.path.exists(os.path.join(repo.path, LAYER_STAGED_FILE)), (
+        "The staged add was left on disk as untracked debris"
+    )
+    assert not os.path.exists(os.path.join(repo.path, "lay")), (
+        "The layer mount directory should be gone once its files are removed"
+    )
+
+    layers = parse_layer_list_json(repo.layer_list(json=True))
+    assert layers == [], f"Expected no layers configured after remove, got {layers}"
+
+
+@pytest.mark.smoke
+def test_layer_remove_staged_delete_is_not_a_modification(new_lore_repo):
+    """A staged delete gates the remove by count, but the file it removed from
+    disk is not reported as a locally modified file.
+
+    Staging the delete is what unlinked the file, so its absence is the expected
+    state and must not be mistaken for the user having deleted it behind Lore's
+    back.
+    """
+    from error_types import LocalModificationsError
+
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+    os.remove(os.path.join(repo.path, LAYER_FILE))
+    repo.stage(scan=True)
+
+    with pytest.raises(LocalModificationsError):
+        repo.layer_remove("lay", layer_repo)
+
+    remove_event = parse_layer_remove_json(
+        repo.layer_remove("lay", layer_repo, force=True, json=True)
+    )
+    assert remove_event.get("modifiedCount") == 0, (
+        f"A staged delete is not a local modification, got {remove_event}"
+    )
+    assert remove_event.get("fileCount") == 0, (
+        f"A staged-deleted file is already off disk, got {remove_event}"
+    )
+    assert not os.path.exists(os.path.join(repo.path, "lay")), (
+        "The layer mount directory should be gone once its files are removed"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_remove_staged_modify_edited_again_is_gated(new_lore_repo):
+    """A file staged and then edited again on disk is still gated, by the staged
+    count rather than by the modified list.
+
+    A staged node carries no content address the edit can be measured against -
+    a staged modify keeps the pre-stage hash - so the modification check is
+    skipped and `modifiedCount` stays 0. The staged gate is what refuses here,
+    which is why it cannot be folded into the local-modification check.
+    """
+    from error_types import LocalModificationsError
+
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    repo.write_files({LAYER_FILE: b"layer content staged"})
+    repo.stage(LAYER_FILE)
+    repo.write_files({LAYER_FILE: b"layer content edited after staging"})
+
+    with pytest.raises(LocalModificationsError):
+        repo.layer_remove("lay", layer_repo)
+
+    remove_event = parse_layer_remove_json(
+        repo.layer_remove("lay", layer_repo, force=True, json=True)
+    )
+    assert remove_event.get("forced") == 1, (
+        f"Expected the remove to report that force was required, got {remove_event}"
+    )
+    assert remove_event.get("modifiedCount") == 0, (
+        f"A staged node has no comparable content address, got {remove_event}"
+    )
+    assert not os.path.exists(os.path.join(repo.path, "lay")), (
+        "The layer mount directory should be gone once its files are removed"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_remove_refused_reports_staged_and_modified(new_lore_repo):
+    """A layer that is both staged and modified names both reasons in one
+    refusal, so a single `--force` covers everything that would be lost.
+    """
+    from error_types import LocalModificationsError
+
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+    _stage_layer_change(repo)
+    repo.write_files({LAYER_FILE: b"layer content modified on disk"})
+
+    with pytest.raises(LocalModificationsError) as excinfo:
+        repo.layer_remove("lay", layer_repo)
+
+    output = str(excinfo.value)
+    assert "1 staged file(s)" in output, (
+        f"The refusal should name the staged count, got:\n{output}"
+    )
+    assert "locally modified files" in output, (
+        f"The refusal should also name the modified files, got:\n{output}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_remove_purge_refused_with_staged_layer_content(new_lore_repo):
+    """`--purge` deletes the whole mount including untracked content, so it is
+    gated on staged work exactly like a plain remove rather than bypassing it.
+    """
+    from error_types import LocalModificationsError
+
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+    _stage_layer_change(repo)
+
+    with pytest.raises(LocalModificationsError):
+        repo.layer_remove("lay", layer_repo, purge=True)
+
+    assert os.path.isfile(os.path.join(repo.path, LAYER_STAGED_FILE)), (
+        "The refused purge should leave the staged file on disk"
+    )
+
+    repo.layer_remove("lay", layer_repo, purge=True, force=True)
+    assert not os.path.exists(os.path.join(repo.path, "lay")), (
+        "A forced purge should remove the whole layer mount"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_config_corrupt_config_surfaces_error(new_lore_repo):
+    """A `layer.toml` that cannot be parsed reports an error and is preserved.
+
+    Reading a corrupt config as an empty layer set would hand back a repository
+    that appears to have no layers, and the next save would write that empty
+    set back over the only record of the layer set.
+    """
+    repo, _ = _setup_repo_with_layer(new_lore_repo)
+    config_path = _layer_config_path(repo)
+    with open(config_path, "rb") as config_file:
+        original = config_file.read()
+
+    with open(config_path, "wb") as config_file:
+        config_file.write(b"layers = = =")
+
+    output = repo.layer_list(json=True, check=False)
+    complete = parse_complete_json(output)
+    assert complete is not None and complete.get("status") != 0, (
+        f"Expected a non-zero status for a corrupt layer config, got: {output}"
+    )
+
+    with open(config_path, "rb") as config_file:
+        assert config_file.read() == b"layers = = =", (
+            "A failed load overwrote the corrupt config instead of preserving it"
+        )
+
+    with open(config_path, "wb") as config_file:
+        config_file.write(original)
+
+    layers = parse_layer_list_json(repo.layer_list(json=True))
+    assert len(layers) == 1 and layers[0].get("targetPath") == "lay", (
+        f"Expected the layer to be listed again once the config is restored, got {layers}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_config_unreadable_config_surfaces_error(new_lore_repo):
+    """A `layer.toml` that cannot be opened reports an error.
+
+    Only an absent config means "no layers configured". A config that is
+    present but unreadable must not read as an empty layer set, since
+    `layer.toml` is the sole record of the layer set and the next save would
+    write the empty set back.
+    """
+    repo, _ = _setup_repo_with_layer(new_lore_repo)
+    config_path = _layer_config_path(repo)
+    with open(config_path, "rb") as config_file:
+        original = config_file.read()
+
+    os.remove(config_path)
+    os.mkdir(config_path)
+
+    output = repo.layer_list(json=True, check=False)
+    complete = parse_complete_json(output)
+    assert complete is not None and complete.get("status") != 0, (
+        f"Expected a non-zero status for an unreadable layer config, got: {output}"
+    )
+
+    os.rmdir(config_path)
+    with open(config_path, "wb") as config_file:
+        config_file.write(original)
+
+    layers = parse_layer_list_json(repo.layer_list(json=True))
+    assert len(layers) == 1 and layers[0].get("targetPath") == "lay", (
+        f"Expected the layer to be listed again once the config is readable, got {layers}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_config_add_refuses_on_corrupt_config(new_lore_repo):
+    """`layer add` on a corrupt `layer.toml` reports an error and keeps the file.
+
+    Treating the corrupt config as empty would make this add write a config
+    holding only the new layer, permanently dropping the configured one.
+    """
+    repo, _ = _setup_repo_with_layer(new_lore_repo)
+    second_repo: Lore = new_lore_repo(repo.name + "_second")
+    second_repo.make_dirs("sec")
+    second_repo.write_commit_push(None, {os.path.join("sec", "second.txt"): b"second"})
+
+    config_path = _layer_config_path(repo)
+    with open(config_path, "rb") as config_file:
+        original = config_file.read()
+
+    corrupt = b"\xff\xfe\x00\x80"
+    with open(config_path, "wb") as config_file:
+        config_file.write(corrupt)
+
+    output = repo.layer_add("sec", second_repo, "sec/", json=True, check=False)
+    complete = parse_complete_json(output)
+    assert complete is not None and complete.get("status") != 0, (
+        f"Expected a non-zero status for add on a corrupt layer config, got: {output}"
+    )
+
+    with open(config_path, "rb") as config_file:
+        assert config_file.read() == corrupt, (
+            "A refused add rewrote the layer config, discarding the configured layer"
+        )
+
+    with open(config_path, "wb") as config_file:
+        config_file.write(original)
+
+    layers = parse_layer_list_json(repo.layer_list(json=True))
+    assert [layer.get("targetPath") for layer in layers] == ["lay"], (
+        f"Expected the original layer to survive the refused add, got {layers}"
+    )
+    assert os.path.isfile(os.path.join(repo.path, LAYER_FILE)), (
+        "Expected the original layer's content to be intact after the refused add"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_config_save_leaves_no_temporary_file(new_lore_repo):
+    """A saved `layer.toml` is complete and leaves no temporary file behind."""
+    repo, _ = _setup_repo_with_layer(new_lore_repo)
+    second_repo: Lore = new_lore_repo(repo.name + "_second")
+    second_repo.make_dirs("sec")
+    second_repo.write_commit_push(None, {os.path.join("sec", "second.txt"): b"second"})
+
+    repo.layer_add("sec", second_repo, "sec/")
+
+    config_path = _layer_config_path(repo)
+    with open(config_path, "rb") as config_file:
+        config = tomllib.load(config_file)
+    assert sorted(layer["target_path"] for layer in config["layers"]) == ["lay", "sec"], (
+        f"Expected both layers in the saved config, got {config}"
+    )
+
+    assert not os.path.exists(config_path + ".tmp"), (
+        "A successful save left its temporary file behind"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_config_save_replaces_stale_temporary_file(new_lore_repo):
+    """A leftover temporary file from an interrupted save does not disturb the
+    next one: the saved config holds the new layer set and the temporary file is
+    consumed by the rename that installs it.
+    """
+    repo, _ = _setup_repo_with_layer(new_lore_repo)
+    second_repo: Lore = new_lore_repo(repo.name + "_second")
+    second_repo.make_dirs("sec")
+    second_repo.write_commit_push(None, {os.path.join("sec", "second.txt"): b"second"})
+
+    config_path = _layer_config_path(repo)
+    temp_path = config_path + ".tmp"
+    with open(temp_path, "wb") as temp_file:
+        temp_file.write(b"layers = = =")
+
+    repo.layer_add("sec", second_repo, "sec/")
+
+    with open(config_path, "rb") as config_file:
+        config = tomllib.load(config_file)
+    assert sorted(layer["target_path"] for layer in config["layers"]) == ["lay", "sec"], (
+        f"Expected both layers in the saved config, got {config}"
+    )
+
+    assert not os.path.exists(temp_path), (
+        "The stale temporary file survived the save that should have consumed it"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_source_path_inside_link_is_rejected(new_lore_repo):
+    """A layer source path that belongs to a linked repository is refused.
+
+    Three repositories: `target` wants a layer from `middle`, but the path given
+    belongs to `inner`, which `middle` links in. The guard compares the
+    repository owning the resolved source node against the layer repository.
+    """
+    inner: Lore = new_lore_repo()
+    inner.write_commit_push(
+        "Initial inner", {"inner_data/inner.txt": "inner content\n"}
+    )
+
+    middle: Lore = new_lore_repo()
+    middle.write_commit_push("Initial middle", {"middle.txt": "middle content\n"})
+    middle.link_add("linked", inner.get_id(), "inner_data")
+    middle.commit("Middle links inner")
+    middle.push()
+
+    target: Lore = new_lore_repo()
+    target.write_commit_push("Initial target", {"target.txt": "target content\n"})
+
+    # The path has to reach inside the mount. Resolving "linked" alone returns
+    # middle's own link node, so the repository check passes and the later
+    # "must be a directory" guard fires instead. "linked/inner.txt" resolves
+    # through the link into inner, which is the case under test.
+    output = target.layer_add(
+        "linked/inner.txt", middle, "linked/inner.txt", check=False
+    )
+
+    assert "linked repository" in output, (
+        f"Layer source inside a link should be rejected, got: {output}"
+    )
+    assert middle.get_id() not in target.layer_list(), (
+        "No layer should be added when the source path belongs to a linked repository"
     )

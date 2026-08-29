@@ -2748,6 +2748,7 @@ fn fetch_branch_id_for_revision(globals: LoreGlobalArgs, revision: Hash) -> Opti
 fn fetch_branch_name(globals: LoreGlobalArgs, branch_id: Context) -> Option<String> {
     let info_args = LoreBranchInfoArgs {
         branch: LoreString::from(branch_id.to_string()),
+        link: LoreString::default(),
     };
 
     let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));

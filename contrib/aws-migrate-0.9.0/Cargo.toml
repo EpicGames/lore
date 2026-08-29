@@ -1,0 +1,52 @@
+[package]
+name = "lore-aws-migrate"
+version = "0.9.0"
+edition = "2024"
+publish = false
+description = "Migrates every fragment in an AWS immutable store onto the fragment state table"
+
+# Its own workspace: this tool is built and run by an operator against a store, on its own
+# schedule, and is not part of what the Lore workspace builds and tests.
+[workspace]
+
+[[bin]]
+name = "lore-aws-migrate"
+path = "src/main.rs"
+
+[dependencies]
+lore-aws = { path = "../../lore-aws" }
+# Depended on for the oodle feature below, which has to be turned on for the package that owns it.
+lore-storage = { path = "../../lore-storage" }
+
+anyhow = "1.0.103"
+clap = { version = "4.5.47", features = ["derive", "env"] }
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
+
+# Only the end-to-end test needs these: it writes a store the old way through the same clients the
+# tool reads it through, and interrupts the tool with the signal its handler listens for.
+[dev-dependencies]
+aws-sdk-dynamodb = { version = "1.112.0", default-features = false, features = ["rt-tokio"] }
+bytes = "1.11.1"
+libc = "0.2.186"
+rand = "0.9.4"
+# The reference list of a fragmented payload is read back as a slice of `FragmentReference`, so the
+# test builds it the same way the store reads it rather than restating the struct's layout.
+zerocopy = "0.8.48"
+
+# Same vendored quinn-proto the Lore workspace patches in. A patch table belongs to a workspace
+# root, so standing outside that workspace means restating it: lore-aws reaches lore-transport,
+# which is written against the vendored crate rather than the published one.
+[patch.crates-io]
+quinn-proto = { path = "../../vendor/quinn-proto" }
+
+[features]
+default = []
+# An Oodle payload can only be read where the Oodle libraries are: without this every Oodle
+# fragment is counted unreadable and left behind. Building with it requires OODLE_LIB_DIR.
+oodle = ["lore-storage/oodle"]
+# The end-to-end test in tests/. It drives a local MinIO and DynamoDB Local, so it is behind the
+# same gate the Lore workspace puts its own AWS suite behind rather than running on a bare
+# `cargo test`.
+integration_tests = []

@@ -263,6 +263,10 @@ pub struct LoreRepositoryStatusSummaryEventData {
     pub moves: u64,
     /// Number of files copied.
     pub copies: u64,
+    /// Number of files the answer required reading, including any that could not be read.
+    pub hash_checks: u64,
+    /// Number of files a recorded modified time answered for, sparing them a hash check.
+    pub mtime_matches: u64,
 }
 
 /// Thread-safe accumulator for dirty-node counts during the parallel status
@@ -275,6 +279,8 @@ pub struct StatusSummaryStats {
     modifies: AtomicU64,
     moves: AtomicU64,
     copies: AtomicU64,
+    hash_checks: AtomicU64,
+    mtime_matches: AtomicU64,
 }
 
 impl StatusSummaryStats {
@@ -294,6 +300,31 @@ impl StatusSummaryStats {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record what settled a file comparison, so a caller can tell a run that measured
+    /// content from one the recorded modified times carried.
+    fn classify_modification(&self, modification: &state::FileModification) {
+        match modification.answered_by() {
+            state::ComparisonAnswer::Mtime => {
+                self.mtime_matches.fetch_add(1, Ordering::Relaxed);
+            }
+            state::ComparisonAnswer::Hash => {
+                self.hash_checks.fetch_add(1, Ordering::Relaxed);
+            }
+            state::ComparisonAnswer::Size => {}
+        }
+    }
+
+    /// Fold a filesystem diff's comparison counts in, for the `--scan` walk that does its
+    /// comparing inside the diff rather than here.
+    fn append_diff(&self, stats: &state::FilesystemDiffStats) {
+        self.hash_checks
+            .fetch_add(stats.file_hash.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.mtime_matches.fetch_add(
+            stats.file_mtime_match.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+    }
+
     fn event_data(&self) -> LoreRepositoryStatusSummaryEventData {
         LoreRepositoryStatusSummaryEventData {
             adds: self.adds.load(Ordering::Relaxed),
@@ -301,6 +332,8 @@ impl StatusSummaryStats {
             modifies: self.modifies.load(Ordering::Relaxed),
             moves: self.moves.load(Ordering::Relaxed),
             copies: self.copies.load(Ordering::Relaxed),
+            hash_checks: self.hash_checks.load(Ordering::Relaxed),
+            mtime_matches: self.mtime_matches.load(Ordering::Relaxed),
         }
     }
 }
@@ -485,6 +518,7 @@ async fn file_size_from_node_change_path(
 async fn dirty_change_is_modified(
     repository: Arc<RepositoryContext>,
     change: &NodeChange,
+    summary: &StatusSummaryStats,
 ) -> Result<bool, StatusError> {
     if change.action != FileAction::Keep {
         return Ok(true);
@@ -511,18 +545,19 @@ async fn dirty_change_is_modified(
     }
 
     let (file_mtime, file_size) = crate::util::fs::file_mtime_and_size(&metadata);
-    let (is_modified, _file_hash) = state::is_file_modified(
+    let modification = state::file_modified_against_node(
         repository.clone(),
         &node,
         file_mtime,
         file_size,
         &change.path,
-        false,
+        !node.is_staged(),
     )
     .await
     .forward::<StatusError>("comparing dirty file against filesystem")?;
+    summary.classify_modification(&modification);
 
-    if !is_modified {
+    if !modification.is_modified() {
         node_state
             .state
             .node_clear_dirty(node_state.repository.clone(), node_state.node)
@@ -530,7 +565,7 @@ async fn dirty_change_is_modified(
             .forward::<StatusError>("clearing stale dirty flag")?;
     }
 
-    Ok(is_modified)
+    Ok(modification.is_modified())
 }
 
 /// Upper bound on concurrent subtree-counting tasks. Counting is dominated by
@@ -1235,7 +1270,8 @@ pub async fn status(
                         let mut cleared_dirty = false;
                         if check_dirty
                             && change.flags.is_dirty()
-                            && !dirty_change_is_modified(repository.clone(), change).await?
+                            && !dirty_change_is_modified(repository.clone(), change, &summary)
+                                .await?
                         {
                             if !change.flags.is_stage() {
                                 continue;
@@ -1398,7 +1434,7 @@ pub async fn status(
                         // walk can distinguish "node exists in staged but not in
                         // committed" — i.e. unstaged adds — from regular tracked
                         // files. Dirty flags are set/cleared inline during the walk.
-                        let (changes, _stats) = state::diff_filesystem_ex(
+                        let (changes, diff_stats) = state::diff_filesystem_ex(
                             repository.clone(),
                             state_staged.clone(),
                             repository.clone(),
@@ -1410,6 +1446,7 @@ pub async fn status(
                         )
                         .await
                         .forward::<StatusError>("computing diff against filesystem")?;
+                        summary.append_diff(&diff_stats);
 
                         lore_debug!(
                             "Scan found {} file system changes in {:.3}s",
@@ -1451,12 +1488,14 @@ pub async fn status(
     if show_scan || check_dirty {
         let data = summary.event_data();
         lore_debug!(
-            "Status summary: {} added, {} modified, {} deleted, {} moved, {} copied",
+            "Status summary: {} added, {} modified, {} deleted, {} moved, {} copied, {} hash checks, {} mtime matches",
             data.adds,
             data.modifies,
             data.deletes,
             data.moves,
-            data.copies
+            data.copies,
+            data.hash_checks,
+            data.mtime_matches
         );
         event::LoreEvent::RepositoryStatusSummary(data).send();
     }
@@ -1521,6 +1560,7 @@ mod remote_resolve_tests {
             state,
             Arc::default(),
             RepositoryFormat::Lore,
+            None,
         ))
     }
 

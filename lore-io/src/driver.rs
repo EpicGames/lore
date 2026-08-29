@@ -6,8 +6,9 @@
 //! `read_at`, `read_exact_at`, `read_vectored_at`, `write_at`, `write_all_at`,
 //! `write_vectored_at`, `open_read_head`, `read_file_bytes`, `write_file_bytes`,
 //! `write_file_segments`, `write_file_segments_atomic`, `sync`, `metadata`, `file_metadata`,
-//! `set_len`, `rename`, `copy`, `remove_file`, `create_dir_all`, `remove_dir` and
-//! `remove_dir_all`. A backend implements all twenty-two as inherent methods on its own type.
+//! `holds_name_exactly`, `set_len`, `rename`, `copy`, `remove_file`, `create_dir_all`, `remove_dir`
+//! and `remove_dir_all`. A backend implements all twenty-three as inherent methods on its own
+//! type.
 //!
 //! Every operation dispatches, including the metadata ones a completion backend will keep on the
 //! syscall pool anyway — a ring-submitted `statx` is punted to a kernel worker making the same
@@ -29,6 +30,7 @@
 //! backend to its `drivers()` list runs every case against it.
 use std::fs::File;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -357,14 +359,46 @@ impl IoDriver {
         }
     }
 
-    pub async fn metadata(&self, path: impl AsRef<Path>) -> std::io::Result<std::fs::Metadata> {
-        let path = path.as_ref().to_path_buf();
+    /// The metadata of `path`.
+    ///
+    /// Takes the path by value so a caller building one for the call hands it
+    /// over rather than having it copied, which a walk does once per component.
+    pub async fn metadata(&self, path: impl Into<PathBuf>) -> std::io::Result<std::fs::Metadata> {
+        let path = path.into();
         match &*self.inner {
             DriverInner::Psync(driver) => driver.metadata(path).await,
             #[cfg(target_os = "linux")]
             DriverInner::Uring(driver) => driver.metadata(path).await,
             #[cfg(target_family = "windows")]
             DriverInner::Iocp(driver) => driver.metadata(path).await,
+        }
+    }
+
+    /// Whether the filesystem holds `path` spelled exactly the way it is given.
+    ///
+    /// A case-insensitive filesystem keeps one spelling of a name and answers a
+    /// lookup in any other, so `Path::exists` cannot answer this: it says yes for
+    /// a neighbouring spelling. On Windows a single `FindFirstFileExW` can,
+    /// where the alternative is listing the parent and comparing every child -
+    /// and a caller resolving a path does that once per component.
+    ///
+    /// `Some(false)` is "not under this spelling", never "no such path", and
+    /// `None` is "this platform cannot say": macOS has no call for it and
+    /// answers `None` to everything, as does Windows for a path longer than the
+    /// lookup is built for. A caller that needs to know whether the name is
+    /// there in some other spelling has to read the directory, and so does one
+    /// that cannot act on `None`.
+    ///
+    /// Takes the path by value so a caller building one for the call hands it
+    /// over rather than having it copied.
+    pub async fn holds_name_exactly(&self, path: impl Into<PathBuf>) -> Option<bool> {
+        let path = path.into();
+        match &*self.inner {
+            DriverInner::Psync(driver) => driver.holds_name_exactly(path).await,
+            #[cfg(target_os = "linux")]
+            DriverInner::Uring(driver) => driver.holds_name_exactly(path).await,
+            #[cfg(target_family = "windows")]
+            DriverInner::Iocp(driver) => driver.holds_name_exactly(path).await,
         }
     }
 

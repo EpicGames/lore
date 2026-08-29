@@ -56,7 +56,11 @@ pub fn client_main() -> ExitCode {
         lore::set_thread_limit(max_threads);
     }
 
-    let globals = lore_globals_from_args(&cli);
+    let mut globals = lore_globals_from_args(&cli);
+    if let Err(err) = globals.validate() {
+        crate::eprintln!("Error: {err}");
+        return ExitCode::FAILURE;
+    }
 
     let result = handle_lore_commands(cli_command, globals);
 
