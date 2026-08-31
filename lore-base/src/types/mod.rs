@@ -127,18 +127,37 @@ impl<'de, const N: usize> de::Visitor<'de> for HexOrBytesVisitor<N> {
     }
 }
 
+/// Read an `N`-byte identifier written by [`serialize_hex`].
+///
+/// A self-describing format is asked what it actually holds, so hex text and raw
+/// bytes both read back — `DynamoDB` stores these as either, and reads have to
+/// take both. A format that cannot answer that question is read as the bytes
+/// [`serialize_hex`] wrote for it: asking bitcode to self-describe fails the read
+/// outright, which is why every value carrying one of these identifiers used to
+/// be unreadable under it.
+fn deserialize_raw<'de, D, const N: usize>(deserializer: D) -> Result<[u8; N], D::Error>
+where
+    D: Deserializer<'de>,
+{
+    if deserializer.is_human_readable() {
+        deserializer.deserialize_any(HexOrBytesVisitor::<N>)
+    } else {
+        deserializer.deserialize_bytes(HexOrBytesVisitor::<N>)
+    }
+}
+
 pub fn deserialize_context<'de, D>(deserializer: D) -> Result<[u8; 16], D::Error>
 where
     D: Deserializer<'de>,
 {
-    deserializer.deserialize_any(HexOrBytesVisitor::<16>)
+    deserialize_raw::<D, 16>(deserializer)
 }
 
 pub fn deserialize_hash<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
 where
     D: Deserializer<'de>,
 {
-    deserializer.deserialize_any(HexOrBytesVisitor::<32>)
+    deserialize_raw::<D, 32>(deserializer)
 }
 
 /// Opaque 128-bit context identifier.
@@ -633,53 +652,38 @@ pub trait ZeroHeapAlloc<SelfType = Self>
 where
     SelfType: zerocopy::FromBytes,
 {
-    fn new_from_heap_zeroed() -> Box<Self>
+    /// Heap this type's boxed values are taken from, or `None` for the global
+    /// allocator.
+    ///
+    /// The value comes back as a [`crate::allocator::HeapBox`], which releases
+    /// it through this same allocator. That is not an implementation detail an
+    /// override may work around: a dedicated rpmalloc heap counts every thread
+    /// as its owner, so a free that skips the heap corrupts it — see
+    /// [`crate::allocator::node_block_allocator`].
+    fn heap_allocator() -> Option<&'static (dyn std::alloc::GlobalAlloc + Sync)> {
+        None
+    }
+
+    fn new_from_heap_zeroed() -> crate::allocator::HeapBox<Self>
     where
-        Self: Sized,
+        Self: Sized + zerocopy::FromBytes,
     {
-        let layout = std::alloc::Layout::new::<Self>();
-        debug_assert!(layout.size() > 0);
-
-        #[allow(clippy::undocumented_unsafe_blocks)]
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout).cast::<Self>() };
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-
-        #[allow(clippy::undocumented_unsafe_blocks)]
-        unsafe {
-            Box::from_raw(ptr)
-        }
+        crate::allocator::HeapBox::new_zeroed_in(Self::heap_allocator())
     }
 }
 
 pub trait CloneHeapAlloc: zerocopy::IntoBytes + zerocopy::Immutable {
-    fn clone_on_heap(&self) -> Box<Self>
+    /// Heap this type's boxed clones are taken from, or `None` for the global
+    /// allocator. Same contract as [`ZeroHeapAlloc::heap_allocator`].
+    fn heap_allocator() -> Option<&'static (dyn std::alloc::GlobalAlloc + Sync)> {
+        None
+    }
+
+    fn clone_on_heap(&self) -> crate::allocator::HeapBox<Self>
     where
         Self: Sized,
     {
-        let layout = std::alloc::Layout::new::<Self>();
-        debug_assert!(layout.size() > 0);
-
-        #[allow(clippy::undocumented_unsafe_blocks)]
-        let ptr = unsafe { std::alloc::alloc(layout).cast::<Self>() };
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-
-        #[allow(clippy::undocumented_unsafe_blocks)]
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.as_bytes().as_ptr(),
-                ptr.cast::<u8>(),
-                layout.size(),
-            );
-        }
-
-        #[allow(clippy::undocumented_unsafe_blocks)]
-        unsafe {
-            Box::from_raw(ptr)
-        }
+        crate::allocator::HeapBox::copy_from_in(self, <Self as CloneHeapAlloc>::heap_allocator())
     }
 }
 
@@ -984,6 +988,15 @@ impl<'de> de::Visitor<'de> for AddressVisitor {
     where
         E: de::Error,
     {
+        // A short buffer would otherwise convert to the zero address, which is a
+        // meaningful value elsewhere, so a truncated one must not silently
+        // become it.
+        if v.len() != std::mem::size_of::<Address>() {
+            return Err(serde::de::Error::invalid_length(
+                v.len(),
+                &"48 bytes: a 32-byte hash followed by a 16-byte context",
+            ));
+        }
         Ok(v.into())
     }
 
@@ -1007,7 +1020,14 @@ impl<'de> Deserialize<'de> for Address {
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_any(AddressVisitor)
+        // A self-describing format is asked what it holds, so both the text and
+        // the byte form read back. Bitcode cannot answer, so it is read as the
+        // bytes `Serialize` wrote for it.
+        if deserializer.is_human_readable() {
+            deserializer.deserialize_any(AddressVisitor)
+        } else {
+            deserializer.deserialize_bytes(AddressVisitor)
+        }
     }
 }
 
@@ -1118,6 +1138,109 @@ mod tests {
         let json = serde_json::to_string(&addr).unwrap();
         let parsed: Address = serde_json::from_str(&json).unwrap();
         assert_eq!(addr, parsed);
+    }
+
+    /// JSON is where these identifiers are read by people and by other tools, so
+    /// the hex text is a compatibility guarantee, not an implementation detail.
+    /// A round-trip alone would not catch the encoding flipping to bytes, since
+    /// both directions would flip together.
+    #[test]
+    fn identifiers_serialize_as_hex_text_in_json() {
+        assert_eq!(
+            serde_json::to_string(&Hash::from([0xab; 32])).unwrap(),
+            format!("\"{}\"", "ab".repeat(32))
+        );
+        assert_eq!(
+            serde_json::to_string(&Context::from([0xcd; 16])).unwrap(),
+            format!("\"{}\"", "cd".repeat(16))
+        );
+        assert_eq!(
+            serde_json::to_string(&Partition::from([0xef; 16])).unwrap(),
+            format!("\"{}\"", "ef".repeat(16))
+        );
+        let address = Address {
+            hash: Hash::from([0x11; 32]),
+            context: Context::from([0x22; 16]),
+        };
+        assert_eq!(
+            serde_json::to_string(&address).unwrap(),
+            format!("\"{}-{}\"", "11".repeat(32), "22".repeat(16))
+        );
+    }
+
+    /// A non-self-describing format cannot be asked what a value is, so reading
+    /// one of these back used to fail outright: the deserializers called
+    /// `deserialize_any`, which bitcode rejects. Every command and record
+    /// carrying an identifier depends on this.
+    #[test]
+    fn identifiers_roundtrip_through_bitcode() {
+        let hash = Hash::from([0xab; 32]);
+        assert_eq!(
+            bitcode::deserialize::<Hash>(&bitcode::serialize(&hash).unwrap()).unwrap(),
+            hash
+        );
+
+        let context = Context::from([0xcd; 16]);
+        assert_eq!(
+            bitcode::deserialize::<Context>(&bitcode::serialize(&context).unwrap()).unwrap(),
+            context
+        );
+
+        let partition = Partition::from([0xef; 16]);
+        assert_eq!(
+            bitcode::deserialize::<Partition>(&bitcode::serialize(&partition).unwrap()).unwrap(),
+            partition
+        );
+
+        let address = Address {
+            hash: Hash::from([0x11; 32]),
+            context: Context::from([0x22; 16]),
+        };
+        assert_eq!(
+            bitcode::deserialize::<Address>(&bitcode::serialize(&address).unwrap()).unwrap(),
+            address
+        );
+    }
+
+    /// An identifier nested inside a struct is the shape that actually crosses
+    /// the service wire, and it exercises the field attributes rather than the
+    /// bare type.
+    #[test]
+    fn a_struct_of_identifiers_roundtrips_through_bitcode() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Record {
+            address: Address,
+            partition: Partition,
+            hashes: Vec<Hash>,
+        }
+
+        let record = Record {
+            address: Address {
+                hash: Hash::from([0x37; 32]),
+                context: Context::from([0x73; 16]),
+            },
+            partition: Partition::from([0x01; 16]),
+            hashes: vec![Hash::from([0u8; 32]), Hash::from([0xff; 32])],
+        };
+        let encoded = bitcode::serialize(&record).unwrap();
+        assert_eq!(bitcode::deserialize::<Record>(&encoded).unwrap(), record);
+    }
+
+    /// A short buffer converts to the zero address, which is a meaningful value
+    /// elsewhere, so a truncated one must be refused rather than silently become
+    /// it.
+    #[test]
+    fn a_truncated_address_is_refused_rather_than_zeroed() {
+        let address = Address {
+            hash: Hash::from([0x11; 32]),
+            context: Context::from([0x22; 16]),
+        };
+        let encoded = bitcode::serialize(&address.as_bytes()[..40].to_vec()).unwrap();
+        let parsed = bitcode::deserialize::<Address>(&encoded);
+        assert!(
+            parsed.is_err(),
+            "a 40-byte address must not deserialize, got {parsed:?}"
+        );
     }
 
     #[test]
@@ -1584,6 +1707,26 @@ mod tests {
         let read_slice = buf.as_type_slice::<u32>();
         assert_eq!(read_slice[0], 42);
         assert_eq!(read_slice[1], 99);
+    }
+
+    /// A buffer with no capacity never allocated, so its pointer is dangling and aligned for
+    /// bytes rather than for the type. A zero-length slice still requires an aligned pointer,
+    /// so the count has to be answered without forming one.
+    #[test]
+    fn typed_bytes_mut_type_slices_are_empty_without_capacity() {
+        use bytes::BytesMut;
+        let mut buf = BytesMut::with_count_capacity::<FragmentReference>(0);
+        assert!(buf.as_type_slice_mut::<FragmentReference>().is_empty());
+        assert!(buf.as_type_slice::<FragmentReference>().is_empty());
+    }
+
+    /// A capacity too small to hold one element is the same case as none at all.
+    #[test]
+    fn typed_bytes_mut_type_slices_are_empty_below_one_element() {
+        use bytes::BytesMut;
+        let mut buf = BytesMut::with_capacity(std::mem::size_of::<FragmentReference>() - 1);
+        assert!(buf.as_type_slice_mut::<FragmentReference>().is_empty());
+        assert!(buf.as_type_slice::<FragmentReference>().is_empty());
     }
 
     mod validate_response {

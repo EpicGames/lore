@@ -46,7 +46,7 @@ mod tests {
             max_file_size: 100,
             presign_config: None,
         };
-        let settings = LoreHttpServerSettings::default();
+        let settings = LoreHttpServerSettings::test_default();
         let app = create_router(test_shared_state, test_health, &settings);
         let test_server = TestServer::new(app).unwrap();
 

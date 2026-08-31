@@ -772,7 +772,7 @@ mod test {
                 .await
                 .expect("serialize metadata");
 
-            let state = State::new();
+            let state = Arc::new(State::new());
             state.set_parent_self(parent);
             state.set_revision_number(n);
             state.set_metadata_hash(metadata_hash);
@@ -1494,7 +1494,7 @@ mod test {
             let mut buffer = bytes::BytesMut::new();
             buffer.extend_from_slice(bogus_header.as_bytes());
             buffer.extend_from_slice([bogus_item].as_bytes());
-            let (address, _) = lore_revision::immutable::write(
+            let address = lore_revision::immutable::write(
                 repository_context.clone(),
                 lore_storage::Context::default(),
                 buffer.freeze(),

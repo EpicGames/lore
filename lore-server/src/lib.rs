@@ -41,44 +41,34 @@ mod tests {
     use bytes::Bytes;
     use lore_base::error::SlowDown;
     use lore_base::types::Address;
+    use lore_base::types::Context;
     use lore_base::types::Hash;
     use lore_base::types::Partition;
     use lore_storage::Fragment;
     use lore_storage::ImmutableStore;
     use lore_storage::StoreError;
-    use lore_storage::StoreMatch;
+    use lore_storage::StoreGetData;
     use lore_storage::StoreObliterateStats;
-    use lore_storage::StoreQueryResult;
 
     /// An `ImmutableStore` that returns `SlowDown` on every operation.
     struct SlowDownImmutableStore;
 
     #[async_trait]
     impl ImmutableStore for SlowDownImmutableStore {
-        async fn exist(
-            self: Arc<Self>,
-            _partition: Partition,
-            _address: Address,
-            _match_requested: StoreMatch,
-        ) -> Result<StoreMatch, StoreError> {
-            Err(StoreError::from(SlowDown))
-        }
-
-        async fn exist_batch(
-            self: Arc<Self>,
-            _partition: Partition,
-            _addresses: &[Address],
-            _match_requested: StoreMatch,
-        ) -> Result<Vec<StoreMatch>, StoreError> {
-            Err(StoreError::from(SlowDown))
-        }
-
         async fn query(
             self: Arc<Self>,
             _partition: Partition,
+            _addresses: &[Address],
+            _results: &mut [lore_storage::StoreMatchResult],
+        ) -> Result<(), StoreError> {
+            Err(StoreError::from(SlowDown))
+        }
+
+        async fn get_metadata(
+            self: Arc<Self>,
+            _partition: Partition,
             _address: Address,
-            _match_requested: StoreMatch,
-        ) -> Result<StoreQueryResult, StoreError> {
+        ) -> Result<StoreGetData, StoreError> {
             Err(StoreError::from(SlowDown))
         }
 
@@ -86,8 +76,7 @@ mod tests {
             self: Arc<Self>,
             _partition: Partition,
             _address: Address,
-            _match_required: StoreMatch,
-        ) -> Result<(Fragment, Bytes), StoreError> {
+        ) -> Result<StoreGetData, StoreError> {
             Err(StoreError::from(SlowDown))
         }
 
@@ -134,8 +123,6 @@ mod tests {
             None
         }
 
-        async fn compact_stop(self: Arc<Self>) {}
-
         fn max_query_batch(&self) -> Option<usize> {
             None
         }
@@ -145,6 +132,17 @@ mod tests {
         }
 
         async fn verify(self: Arc<Self>, _heal: bool) -> Result<(), StoreError> {
+            Err(StoreError::from(SlowDown))
+        }
+
+        async fn copy(
+            self: Arc<Self>,
+            _source_partition: Partition,
+            _source_address: Address,
+            _destination_partition: Partition,
+            _destination_context: Context,
+            _durable: bool,
+        ) -> Result<(), StoreError> {
             Err(StoreError::from(SlowDown))
         }
     }
@@ -163,7 +161,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(10),
-            lore_storage::read_raw(store, Partition::default(), address, StoreMatch::MatchFull),
+            lore_storage::read_raw(store, Partition::default(), address),
         )
         .await
         .expect("read_raw did not return within 10s — server retry policy may not be active");

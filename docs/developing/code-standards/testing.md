@@ -79,6 +79,7 @@ async fn test_with_isolated_state() {
 
 - `lore-revision/tests/helper.rs` — `test_store_create()`, `setup_test_execution()`.
 - `lore-revision/tests/` — Cross-module integration tests.
+- `lore-integration-tests/` — Tests against real infrastructure, without mocking
 
 ---
 
@@ -143,6 +144,23 @@ uv run pytest scripts/test/ --disable-local-server --lore-remote-url=lore://host
 | `--lore-remote-url` | `lore://127.0.0.1:41338` | Server address |
 | `--disable-local-server` | `false` | Use external server |
 | `--disable-auto-server` | `false` | Don't auto start the server |
+
+### Per-test timeout
+
+Every test is bounded at ten minutes (`timeout` in `pyproject.toml`), and the
+stack of every thread is dumped a minute before that (`faulthandler_timeout`).
+Nothing else bounds a test: the helper runs the client with `subprocess.run` and
+no timeout, so a client that never returns would otherwise be a run that never
+returns.
+
+A test that reaches the limit is reported as a failure and the run continues. On
+Linux the test fails in place; on Windows there is no `SIGALRM`, so the worker is
+killed and `xdist` reports
+`worker 'gwN' crashed while running <test>` and replaces it. Either way the log
+names the test and carries the stack it was stuck in.
+
+Override with `--timeout=0` to disable, or `--timeout=<seconds>` for a run that
+is legitimately slower.
 
 ### pytest markers
 

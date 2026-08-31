@@ -1,0 +1,19 @@
+error[E0277]: `.internal()` is not available on `Result<(), lore_error_set::Traced<lore_error_set::Internal>>`
+  --> tests/compile_fail/internal_forbidden_on_traced.rs:15:12
+   |
+15 |     result.internal("re-wrapping an already-traced error")
+   |            ^^^^^^^^ this error already carries its own variants and trace
+   |
+   = help: the trait `lore_error_set::ext::guard::Forbidden` is not implemented for `Result<(), lore_error_set::Traced<lore_error_set::Internal>>`
+   = note: `.internal()` is for foreign errors (io::Error, ParseIntError, ...)
+   = note: for an error set, use `.forward("context")` to preserve its variants
+   = note: to collapse deliberately, use `Target::internal_with_context(err, "context")`
+   = note: for a `Traced<_>`, use `.chain_err("context")` or `.chain_err_from(..)`
+note: required by a bound in `lore_error_set::prelude::InternalForbiddenOnErrorSets::internal`
+  --> src/ext.rs
+   |
+   |     fn internal(self, context: &str) -> Result<T, Traced<Internal>>
+   |        -------- required by a bound in this associated function
+   |     where
+   |         Self: guard::Forbidden;
+   |               ^^^^^^^^^^^^^^^^ required by this bound in `InternalForbiddenOnErrorSets::internal`

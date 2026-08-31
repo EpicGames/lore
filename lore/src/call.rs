@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -221,13 +222,15 @@ async fn prepare_repository_call(
     mut globals: LoreGlobalArgs,
     callback: LoreEventCallback,
 ) -> Result<(PathBuf, Arc<ExecutionContext>), i32> {
-    let repository_path =
-        if let Ok(path) = util::path::make_absolute(globals.repository_path.as_str()) {
-            globals.repository_path = path.display().to_string().into();
-            path
-        } else {
-            PathBuf::from(globals.repository_path.as_str())
-        };
+    let repository_path = if let Ok(path) = util::path::make_absolute_from(
+        globals.repository_path.as_str(),
+        globals.working_directory().map(Path::new),
+    ) {
+        globals.repository_path = path.display().to_string().into();
+        path
+    } else {
+        PathBuf::from(globals.repository_path.as_str())
+    };
 
     let execution = setup_execution(globals, callback);
 
@@ -388,7 +391,7 @@ mod tests {
     use super::*;
 
     // A concrete `#[error_set]` error for the wrapper closures. Its `NotFound`
-    // variant wraps `lore_base::error::NotFound`, which carries error code 13, so
+    // variant wraps `lore_base::error::NotFound`, which carries error code 79, so
     // the failure path has a known non-internal code to assert against.
     #[error_set]
     enum SampleError {
@@ -451,7 +454,7 @@ mod tests {
             .collect();
         assert_eq!(completes.len(), 1, "exactly one Complete event");
 
-        // The status holds the error code (13 for `NotFound`) and the detail is
+        // The status holds the error code (79 for `NotFound`) and the detail is
         // populated with that code and the error's message.
         let data = &completes[0];
         let expected_code = SampleError::from(NotFound).ffi_code();

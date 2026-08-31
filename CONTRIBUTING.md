@@ -9,7 +9,7 @@ Before you begin, read our [Code of Conduct](CODE_OF_CONDUCT.md).
 We welcome code contributions — bug fixes, features, performance improvements. The [roadmap](docs/roadmap.md) shows the big-rock themes we're working toward — a good place to find where help is wanted. There are also plenty of ways to help beyond writing code:
 
 - **Report a bug** — open a GitHub Issue with steps to reproduce
-- **Request a feature** — post in [#feature-requests on Discord](https://discord.gg/QYbNFVFv) or open a GitHub Issue
+- **Request a feature** — post in [#feature-requests on Discord](https://discord.gg/E4SFJKRPbg) or open a GitHub Issue
 - **Improve documentation** — fix typos, clarify explanations, add examples
 - **Triage issues** — help reproduce bugs, add labels, confirm scope
 - **Review pull requests** — read the code, test it, leave thoughtful feedback
@@ -172,7 +172,7 @@ lychee --config docs/developing/doc-standards/tools/lychee/lychee.toml docs/
 
 ## Community
 
-Get help on [Discord](https://discord.gg/QYbNFVFv):
+Get help on [Discord](https://discord.gg/E4SFJKRPbg):
 
 | Channel | Purpose |
 | --- | --- |
@@ -184,7 +184,7 @@ Get help on [Discord](https://discord.gg/QYbNFVFv):
 | `#show-and-tell` | Share what you've built with Lore |
 | `#off-topic` | Everything else |
 
-For longer-form design discussions, open a GitHub Issue or bring the conversation to `#general` on [Discord](https://discord.gg/QYbNFVFv).
+For longer-form design discussions, open a GitHub Issue or bring the conversation to `#general` on [Discord](https://discord.gg/E4SFJKRPbg).
 
 Issues tagged [`good-first-issue`](https://github.com/EpicGames/lore/labels/good-first-issue) are a good starting point if you're new to the codebase. If you're unsure where to begin, ask in `#support-requests`.
 

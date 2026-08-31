@@ -40,13 +40,11 @@ use lore_error_set::prelude::*;
 use lore_transport::Connection;
 use lore_transport::ProtocolError;
 use lore_transport::RepositoryData;
+use lore_transport::SessionPool;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use toml;
 use zerocopy::IntoBytes;
 
 use crate::branch;
@@ -80,6 +78,8 @@ use crate::revision::sync;
 use crate::revision::sync::SyncOptions;
 use crate::shared_store::get_shared_store_path_for_repo;
 use crate::state;
+use crate::state::CanReadRepository;
+use crate::state::allow_all_repositories;
 use crate::store::ImmutableStore;
 use crate::store::KeyType;
 use crate::store::MutableStore;
@@ -242,8 +242,8 @@ impl StoreConfig {
 ///
 /// Incremental GC is the default on write operations (`!read_only`). It is
 /// suppressed by `--no-gc` and on dry-run commands (`suppress_incremental`, which
-/// the caller folds together), since a dry run persists nothing and its background
-/// tasks would otherwise race the dry run's own teardown. Read-only opens never
+/// the caller folds together), since a dry run adds no content to collect and its
+/// background tasks would otherwise race its own teardown. Read-only opens never
 /// spawn it. When enabled but the repository has no `[store]` config, the built-in
 /// [`StoreConfig::client_default`] caps apply.
 fn incremental_gc_options(
@@ -303,7 +303,6 @@ mod store_config_tests {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct FileConfig {
     direct_write: Option<bool>,
-    direct_io: Option<bool>,
     flush_write: Option<bool>,
 }
 
@@ -311,7 +310,6 @@ impl Default for FileConfig {
     fn default() -> Self {
         FileConfig {
             direct_write: Some(false),
-            direct_io: Some(false),
             flush_write: Some(false),
         }
     }
@@ -325,17 +323,43 @@ pub struct SharedStoreToUseConfig {
     pub shared_store_path: Option<String>,
 }
 
+/// cbindgen:prefix-with-name
+/// cbindgen:rename-all=ScreamingSnakeCase
+#[repr(C)]
+/// Whether a repository being created or cloned should be backed by a shared store.
+///
+/// `Inherit` is zero so a zero-initialized C struct keeps following the machine's
+/// `use_shared_store_automatically` setting, as callers have always relied on. `Disabled` exists
+/// because that inherited setting is otherwise unconditional: without it, a caller on a machine
+/// that opts in automatically has no way to ask for a repository backed by its own store.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LoreSharedStoreMode {
+    /// Follow the machine's `use_shared_store_automatically` global setting.
+    #[default]
+    Inherit = 0,
+    /// Always back the repository with a shared store.
+    Enabled = 1,
+    /// Never back the repository with a shared store, whatever the global config says.
+    Disabled = 2,
+}
+
+lore_base::carries_no_text!(LoreSharedStoreMode);
+
 impl SharedStoreToUseConfig {
     pub fn from_cli_args(
         global_config: &GlobalConfig,
-        use_shared_store: u8,
+        use_shared_store: LoreSharedStoreMode,
         path: &LoreString,
     ) -> Result<Option<SharedStoreToUseConfig>, PathError> {
-        if global_config
-            .use_shared_store_automatically
-            .unwrap_or(false)
-            || use_shared_store != 0
-        {
+        let enabled = match use_shared_store {
+            LoreSharedStoreMode::Disabled => false,
+            LoreSharedStoreMode::Enabled => true,
+            LoreSharedStoreMode::Inherit => global_config
+                .use_shared_store_automatically
+                .unwrap_or(false),
+        };
+        if enabled {
             Ok(Some(SharedStoreToUseConfig {
                 use_shared_store: Some(true),
                 shared_store_path: if let Some(path_string) = Into::<Option<&str>>::into(path) {
@@ -357,8 +381,6 @@ pub struct RepositoryRuntimeSettings {
     pub disable_cache: AtomicBool,
     /// Write directly to target file instead of write to temporary file + move
     pub direct_file_write: AtomicBool,
-    /// Use direct file I/O instead of memory mapping files
-    pub direct_file_io: AtomicBool,
 }
 
 impl Default for RepositoryRuntimeSettings {
@@ -367,7 +389,6 @@ impl Default for RepositoryRuntimeSettings {
             disable_upload: AtomicBool::new(true),
             disable_cache: AtomicBool::new(true),
             direct_file_write: AtomicBool::new(false),
-            direct_file_io: AtomicBool::new(false),
         }
     }
 }
@@ -378,7 +399,6 @@ impl Clone for RepositoryRuntimeSettings {
             disable_upload: AtomicBool::new(self.disable_upload.load(Ordering::Relaxed)),
             disable_cache: AtomicBool::new(self.disable_cache.load(Ordering::Relaxed)),
             direct_file_write: AtomicBool::new(self.direct_file_write.load(Ordering::Relaxed)),
-            direct_file_io: AtomicBool::new(self.direct_file_io.load(Ordering::Relaxed)),
         }
     }
 
@@ -393,10 +413,6 @@ impl Clone for RepositoryRuntimeSettings {
         );
         self.direct_file_write.store(
             source.direct_file_write.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
-        self.direct_file_io.store(
-            source.direct_file_io.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
     }
@@ -419,6 +435,11 @@ impl Clone for RepositoryRuntimeSettings {
 ///   mutex is not the concurrency boundary; the token exists purely as
 ///   type-level proof of write authorization for the handle API. Gated by
 ///   [`ServerContext`].
+/// - [`InMemory`](Self::InMemory): carries nothing, for the same reason as
+///   `Server` — a path-less context has no per-path mutex to take, and the
+///   only writes it makes are content-addressed store writes and the branch
+///   tip, which the tip compare-and-swap serializes. Gated by
+///   [`InMemoryContext`].
 ///
 /// Tokens are stored as `Option<…>` on `RepositoryContext`; leaf write
 /// sites fetch via `repository.try_write_token().ok_or(WriteRequired)?`.
@@ -426,6 +447,7 @@ impl Clone for RepositoryRuntimeSettings {
 pub enum RepositoryWriteToken {
     Client(Arc<tokio::sync::OwnedMutexGuard<()>>),
     Server,
+    InMemory,
 }
 
 impl RepositoryWriteToken {
@@ -449,6 +471,17 @@ impl RepositoryWriteToken {
         Self::Server
     }
 
+    /// Mint a token for a path-less in-memory context. No mutex is taken —
+    /// there is no working-tree path to key one on.
+    ///
+    /// Gated by [`InMemoryContext`] on the same principle as
+    /// [`server`](Self::server): a crate opts in by implementing the marker
+    /// for one of its own types, so skipping the per-path mutex is a
+    /// compile-time decision rather than a call-site one.
+    pub fn in_memory<C: InMemoryContext>(_: &C) -> Self {
+        Self::InMemory
+    }
+
     /// Produce a sibling token. For [`Client`](Self::Client), the sibling
     /// refcounts the same underlying mutex guard so multi-context commands
     /// keep the mutex held until every sibling drops. For
@@ -465,9 +498,17 @@ impl RepositoryWriteToken {
         match self {
             Self::Client(guard) => Self::Client(guard.clone()),
             Self::Server => Self::Server,
+            Self::InMemory => Self::InMemory,
         }
     }
 }
+
+/// Marker trait that gates [`RepositoryWriteToken::in_memory`].
+///
+/// The counterpart to [`ServerContext`] for path-less in-memory contexts. The
+/// trait body is empty — it exists purely to make "I am an in-memory context" a
+/// compile-time prerequisite for skipping the per-path write mutex.
+pub trait InMemoryContext {}
 
 /// Marker trait that gates [`RepositoryWriteToken::server`].
 ///
@@ -526,12 +567,25 @@ pub struct RepositoryContext {
     pub instance_id: crate::instance::InstanceId,
     remote: Arc<tokio::sync::RwLock<RemoteState>>,
     pub filter: Arc<Filter>,
+    /// Defaults to allowing every repository; server handlers replace it with
+    /// the requester's authorization.
+    link_read: CanReadRepository,
     pub format: RepositoryFormat,
     settings: RepositoryRuntimeSettings,
     is_link: bool,
     is_layer: bool,
     write_token: Option<RepositoryWriteToken>,
     repo_lock: Option<Arc<RepositoryLock>>,
+    /// The storage session pool this repository's reads and writes pick from,
+    /// resolved on first use.
+    ///
+    /// Weak on purpose. The strong reference lives in the connection's session
+    /// cache, and `StorageSession::invalidate` clears that cache when the server
+    /// reports a stale session id — after a reconnect that rotated its session
+    /// map, say. An invalidated pool then stops upgrading here, so the next caller
+    /// resolves a fresh one rather than handing out sessions the server has
+    /// forgotten.
+    session_pool: parking_lot::RwLock<Weak<SessionPool>>,
 }
 
 impl std::fmt::Debug for RepositoryContext {
@@ -556,27 +610,30 @@ fn remote_arc(state: RemoteState) -> Arc<tokio::sync::RwLock<RemoteState>> {
     Arc::new(tokio::sync::RwLock::new(state))
 }
 
+pub struct RepositoryContextCreationArgs {
+    pub path: Option<PathBuf>,
+    pub immutable_store: Arc<dyn ImmutableStore>,
+    pub mutable_store: Arc<dyn MutableStore>,
+    pub id: RepositoryId,
+    pub instance_id: crate::instance::InstanceId,
+    pub remote: Result<Arc<Connection>, ProtocolError>,
+    pub filter: Arc<Filter>,
+    pub format: RepositoryFormat,
+    pub filesystem_provider: Option<Arc<dyn FilesystemProvider>>,
+}
+
 impl RepositoryContext {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        path: Option<PathBuf>,
-        immutable_store: Arc<dyn ImmutableStore>,
-        mutable_store: Arc<dyn MutableStore>,
-        id: RepositoryId,
-        instance_id: crate::instance::InstanceId,
-        remote: Result<Arc<Connection>, ProtocolError>,
-        filter: Arc<Filter>,
-        format: RepositoryFormat,
-    ) -> Self {
+    pub fn new(create_args: RepositoryContextCreationArgs) -> Self {
         Self::new_with_state(
-            path,
-            immutable_store,
-            mutable_store,
-            id,
-            instance_id,
-            RemoteState::from_result(remote),
-            filter,
-            format,
+            create_args.path,
+            create_args.immutable_store,
+            create_args.mutable_store,
+            create_args.id,
+            create_args.instance_id,
+            RemoteState::from_result(create_args.remote),
+            create_args.filter,
+            create_args.format,
+            create_args.filesystem_provider,
         )
     }
 
@@ -590,9 +647,12 @@ impl RepositoryContext {
         remote: RemoteState,
         filter: Arc<Filter>,
         format: RepositoryFormat,
+        filesystem_provider: Option<Arc<dyn FilesystemProvider>>,
     ) -> Self {
-        let file_system = Self::default_filesystem(path.as_deref().unwrap_or(Path::new("")));
+        let file_system = filesystem_provider
+            .unwrap_or_else(|| Self::default_filesystem(path.as_deref().unwrap_or(Path::new(""))));
         RepositoryContext {
+            link_read: allow_all_repositories(),
             path,
             immutable_store,
             mutable_store,
@@ -606,8 +666,19 @@ impl RepositoryContext {
             is_layer: false,
             write_token: None,
             repo_lock: None,
+            session_pool: Default::default(),
             file_system,
         }
+    }
+
+    /// Propagates into every context derived from this one.
+    pub fn with_link_read(mut self, link_read: CanReadRepository) -> Self {
+        self.link_read = link_read;
+        self
+    }
+
+    pub fn can_read_link(&self, id: RepositoryId) -> bool {
+        (self.link_read)(id)
     }
 
     /// Borrow the working-tree path required by filesystem-backed operations.
@@ -697,9 +768,6 @@ impl RepositoryContext {
                 as Arc<dyn std::any::Any + Send + Sync>,
             || {
                 lore_spawn_guarded!(async move {
-                    // Let the store compaction run one step
-                    immutable_store.clone().compact_stop().await;
-
                     let _ = immutable_store.flush(sync_data).await;
                     if let Some(mutable_store) = mutable_store {
                         let _ = mutable_store.flush(sync_data).await;
@@ -802,6 +870,7 @@ impl RepositoryContext {
         id: RepositoryId,
     ) -> Self {
         RepositoryContext {
+            link_read: allow_all_repositories(),
             file_system: Self::default_filesystem(Path::new("")),
             path: None,
             immutable_store,
@@ -816,11 +885,13 @@ impl RepositoryContext {
             is_layer: false,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
+            session_pool: Default::default(),
         }
     }
 
     pub fn to_server_context(&self, id: RepositoryId) -> Self {
         RepositoryContext {
+            link_read: self.link_read.clone(),
             path: self.path.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
@@ -834,6 +905,7 @@ impl RepositoryContext {
             is_layer: false,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
+            session_pool: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -843,6 +915,7 @@ impl RepositoryContext {
         mutable_store: Arc<dyn MutableStore>,
     ) -> Self {
         RepositoryContext {
+            link_read: allow_all_repositories(),
             file_system: Self::default_filesystem(Path::new("")),
             path: None,
             immutable_store,
@@ -857,11 +930,13 @@ impl RepositoryContext {
             is_layer: false,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
+            session_pool: Default::default(),
         }
     }
 
     pub fn to_null_context(&self) -> Self {
         RepositoryContext {
+            link_read: self.link_read.clone(),
             path: self.path.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
@@ -875,6 +950,7 @@ impl RepositoryContext {
             is_layer: false,
             write_token: None,
             repo_lock: None,
+            session_pool: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -894,6 +970,7 @@ impl RepositoryContext {
         remote: Result<Arc<Connection>, ProtocolError>,
     ) -> Self {
         RepositoryContext {
+            link_read: self.link_read.clone(),
             path: self.path.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
@@ -907,6 +984,7 @@ impl RepositoryContext {
             is_layer: self.is_layer,
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
+            session_pool: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -920,6 +998,7 @@ impl RepositoryContext {
         };
         let settings = self.settings.clone();
         RepositoryContext {
+            link_read: self.link_read.clone(),
             path: self.path.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
@@ -933,6 +1012,7 @@ impl RepositoryContext {
             is_layer: false,
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
+            session_pool: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -946,6 +1026,7 @@ impl RepositoryContext {
         };
         let settings = self.settings.clone();
         RepositoryContext {
+            link_read: self.link_read.clone(),
             path: self.path.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
@@ -959,12 +1040,14 @@ impl RepositoryContext {
             is_layer: true,
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
+            session_pool: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
 
     pub fn to_filter_context(&self, filter: Arc<Filter>) -> Self {
         RepositoryContext {
+            link_read: self.link_read.clone(),
             path: self.path.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
@@ -978,6 +1061,7 @@ impl RepositoryContext {
             is_layer: self.is_layer,
             write_token: None,
             repo_lock: self.repo_lock.clone(),
+            session_pool: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -1000,16 +1084,6 @@ impl RepositoryContext {
         self.settings
             .disable_upload
             .store(disable, Ordering::Relaxed);
-    }
-
-    pub fn direct_file_io(&self) -> bool {
-        self.settings.direct_file_io.load(Ordering::Relaxed)
-    }
-
-    pub fn set_direct_file_io(&self, direct: bool) {
-        self.settings
-            .direct_file_io
-            .store(direct, Ordering::Relaxed);
     }
 
     pub fn direct_file_write(&self) -> bool {
@@ -1063,6 +1137,59 @@ impl RepositoryContext {
             };
         }
         result
+    }
+
+    /// The storage session pool for this repository, resolved once and reused for
+    /// as long as it lives.
+    ///
+    /// `correlation_id` is only read when the pool has to be resolved. It belongs
+    /// to the command being executed and a context belongs to one command, so a
+    /// cached pool is always the one this context's correlation id asked for.
+    pub(crate) async fn session_pool(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Arc<SessionPool>, ProtocolError> {
+        if let Some(pool) = self.cached_session_pool() {
+            return Ok(pool);
+        }
+        let remote = self.remote().await?;
+        let pool = remote.session_pool(self.id, correlation_id).await?;
+        *self.session_pool.write() = Arc::downgrade(&pool);
+        Ok(pool)
+    }
+
+    /// The session pool if one is already resolved and still live, without
+    /// touching the remote. `None` means "resolve it", not "there is none".
+    ///
+    /// Private so the pool is only ever reached through [`Self::session_pool`]. A
+    /// caller handed the pool directly would pick from it eagerly, and an eager
+    /// session cannot be invalidated and retried — see [`crate::immutable`]'s
+    /// session resolution.
+    fn cached_session_pool(&self) -> Option<Arc<SessionPool>> {
+        self.session_pool.read().upgrade()
+    }
+
+    /// Hold `pool` as resolved, standing in for a resolution against a live remote.
+    /// The caller keeps the strong reference, as the connection's session cache
+    /// does.
+    #[cfg(test)]
+    pub(crate) fn set_session_pool(&self, pool: &Arc<SessionPool>) {
+        *self.session_pool.write() = Arc::downgrade(pool);
+    }
+
+    /// Whether this context is known to hold no remote, answered without waiting
+    /// on the state lock or driving a pending connect.
+    ///
+    /// [`RemoteState::Offline`] is terminal, so a `true` answer stands for the life
+    /// of the context and a caller can skip building a storage session outright.
+    /// Everything else answers `false`, a state lock held elsewhere included: that
+    /// costs only the session the caller would have built anyway. A failed connect
+    /// is not offline — a session built on one reports the failure, which is the
+    /// answer that belongs to it.
+    pub(crate) fn is_offline(&self) -> bool {
+        self.remote
+            .try_read()
+            .is_ok_and(|state| matches!(&*state, RemoteState::Offline))
     }
 
     /// Snapshot of the remote state. Awaits the state lock (cheap — only contended
@@ -1265,39 +1392,24 @@ pub fn parse_url(url: &str, offline: bool) -> Result<(String, String), Repositor
     Ok((remote_url, name.to_string()))
 }
 
+/// Reads the repository config, defaulting only when it is absent.
+///
+/// Read synchronously — see [`util::config::load_blocking`], which carries the reasoning. A
+/// config that is present but unreadable is an error rather than a default: this file holds the
+/// remote URL, so defaulting past a read failure presents a repository that merely could not be
+/// opened as one with no remote, and the next save writes that back.
 fn load_config(config_path: impl AsRef<Path>) -> Result<RepositoryConfig, RepositoryError> {
-    // Synchronous read: tiny config file, avoids thread hop and queuing behind
-    // any store flush tasks still in flight from the previous command.
-    let config = match std::fs::read_to_string(config_path) {
-        Ok(config) => config,
-        Err(_) => return Ok(RepositoryConfig::default()),
-    };
-    Ok(toml::from_str(config.as_str()).internal("Failed to load config file")?)
+    util::config::load_blocking(config_path)
+        .forward::<RepositoryError>("Failed to load config file")
 }
 
 async fn save_config(
     config_path: impl AsRef<Path>,
     config: &RepositoryConfig,
 ) -> Result<(), RepositoryError> {
-    let mut config_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(config_path)
+    util::config::save(config, config_path)
         .await
-        .internal("Failed to save config file")?;
-
-    let config_string = toml::to_string_pretty(&config).internal("Failed to save config file")?;
-
-    config_file
-        .write_all(config_string.as_bytes())
-        .await
-        .internal("Failed to save config file")?;
-    config_file
-        .flush()
-        .await
-        .internal("Failed to save config file")?;
-    Ok(())
+        .forward::<RepositoryError>("Failed to save config file")
 }
 
 pub fn load_repository_config(path: impl AsRef<Path>) -> Result<RepositoryConfig, RepositoryError> {
@@ -1368,13 +1480,10 @@ pub(crate) async fn get_or_create_repository_lock(
         return Ok(holder);
     }
 
-    // Acquire the OS flock on the blocking pool so a slow flock doesn't stall
-    // the runtime.
-    let path_for_lock = dot_path.clone();
-    let lock = lore_base::runtime::runtime()
-        .spawn_blocking(move || FSLock::acquire_directory_lock(path_for_lock))
+    // The OS flock is taken with non-blocking attempts and async retries,
+    // so a contended lock never stalls a runtime thread.
+    let lock = Box::pin(FSLock::acquire_directory_lock(dot_path.clone()))
         .await
-        .internal("Failed to get exclusive access to repository")?
         .internal("Failed to get exclusive access to repository")?;
 
     let holder = Arc::new(RepositoryLock { _lock: lock });
@@ -1460,6 +1569,27 @@ pub fn cache_in_memory_stores(
     IN_MEMORY_MUTABLE_CACHE
         .get_or_init(DashMap::new)
         .insert(path, mutable);
+}
+
+/// Stop garbage collection for good on every store still live in the caches, so a pass in
+/// flight gives up at its next packfile rather than holding shutdown open until it has
+/// rewritten the rest of the group, and none follows it. For shutdown, where no further
+/// call will be made; a caller that will use the store again wants
+/// [`lore_storage::ImmutableStore::stop_gc`] without `terminate`.
+pub async fn stop_store_gc() {
+    // Collected before awaiting: a `DashMap` guard held across an await blocks every other
+    // reader of the cache.
+    let mut stores: Vec<Arc<dyn ImmutableStore>> = Vec::new();
+    if let Some(cache) = IMMUTABLE_STORE_CACHE.get() {
+        stores.extend(cache.iter().filter_map(|entry| entry.value().upgrade()));
+    }
+    if let Some(cache) = IN_MEMORY_IMMUTABLE_CACHE.get() {
+        stores.extend(cache.iter().map(|entry| entry.value().clone()));
+    }
+
+    // Driven together so every store is asked to stop on the first poll, rather than each
+    // waiting out the one before it.
+    futures::future::join_all(stores.into_iter().map(|store| store.stop_gc(true))).await;
 }
 
 /// Release all cached store references for the given repository path.
@@ -1600,7 +1730,6 @@ pub async fn create_client_immutable_store(
         create_options,
         false, /* Don't deserialize all buckets on load */
         ImmutableStoreSettings {
-            allow_partial_fragment: true, /* Client store can have partial fragments */
             protect_local_fragment: true, /* Protect local fragments from eviction */
             verify_write,
             ..Default::default()
@@ -1695,7 +1824,6 @@ pub async fn create_client_memory_stores()
         ImmutableStoreCreateOptions::none(),
         false, /* Client does not deserialize all buckets on startup */
         ImmutableStoreSettings {
-            allow_partial_fragment: true, /* Client store can have partial fragments */
             protect_local_fragment: true, /* Protect local fragments from eviction */
             ..Default::default()
         },
@@ -1737,9 +1865,9 @@ fn connect(
     let handle: JoinHandle<Result<Arc<Connection>, ProtocolError>> = lore_spawn!(async move {
         let connection =
             protocol::connect(remote_url.as_str(), identity.as_str(), repository).await?;
-        // Pre-warm session so it's ready when the command runs
+        // Pre-warm the session pool so it's ready when the command runs
         if !repository.is_zero() {
-            let _ = connection.session(repository, &correlation_id).await;
+            let _ = connection.session_pool(repository, &correlation_id).await;
         }
         Ok(connection)
     });
@@ -1823,6 +1951,7 @@ pub async fn load_and_connect_with_token(
             None => "None",
             Some(RepositoryWriteToken::Client(_)) => "Some(Client)",
             Some(RepositoryWriteToken::Server) => "Some(Server)",
+            Some(RepositoryWriteToken::InMemory) => "Some(InMemory)",
         },
     );
 
@@ -2059,6 +2188,7 @@ pub async fn load_and_connect_with_token(
         remote_state,
         filter,
         format,
+        None,
     );
     let repository = match repo_lock {
         Some(lock) => repository.with_repository_lock(lock),
@@ -2075,7 +2205,6 @@ pub async fn load_and_connect_with_token(
 
     let config_file = config.file.unwrap_or_default();
     repository.set_direct_file_write(config_file.direct_write.unwrap_or_default());
-    repository.set_direct_file_io(config_file.direct_io.unwrap_or_default());
     repository.set_disable_cache(!global.cache());
 
     if global.local() {
@@ -2156,13 +2285,19 @@ pub async fn load_and_connect_with_token(
         }
 
         if migrated_current {
-            if let Err(err) = tokio::fs::remove_file(&current_anchor_path).await {
+            if let Err(err) = lore_io::IoDriver::global()
+                .remove_file(&current_anchor_path)
+                .await
+            {
                 lore_warn!("Failed to remove old current anchor file: {err}");
             }
             lore_debug!("Migrated file-based current anchor to mutable store");
         }
         if migrated_staged {
-            if let Err(err) = tokio::fs::remove_file(&staged_anchor_path).await {
+            if let Err(err) = lore_io::IoDriver::global()
+                .remove_file(&staged_anchor_path)
+                .await
+            {
                 lore_warn!("Failed to remove old staged anchor file: {err}");
             }
             lore_debug!("Migrated file-based staged anchor to mutable store");
@@ -2175,6 +2310,16 @@ pub async fn load_and_connect_with_token(
 pub const MAX_NAME_LEN: usize = 1000;
 pub const MAX_DESCRIPTION_LEN: usize = 65536;
 
+/// A name is a `/`-separated path of segments, each holding only ASCII
+/// alphanumerics, `-`, `_` and `.`.
+///
+/// Empty and dot-leading segments are rejected because names round-trip through
+/// URLs (see [`parse_url`]), and URL parsing rewrites them: `host/.` and
+/// `host/..` lose the name entirely, `host/org/../other` silently resolves to
+/// `other`, and a trailing `/` is trimmed. The server stores such names fine, so
+/// without this they produce repositories no client can address, or names that
+/// resolve to a different repository than the one written. Dot-leading segments
+/// also carry filesystem meaning for tooling that maps a name onto a directory.
 pub fn is_valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_NAME_LEN
@@ -2183,6 +2328,9 @@ pub fn is_valid_name(name: &str) -> bool {
                 !c.is_ascii_alphanumeric() && (c != '/') && (c != '-') && (c != '_') && (c != '.')
             })
             .is_none()
+        && name
+            .split('/')
+            .all(|segment| !segment.is_empty() && !segment.starts_with('.'))
 }
 
 pub async fn create_local(
@@ -2205,15 +2353,20 @@ pub async fn create_local(
     let idpath = dotpath.join(ID);
 
     let dotpath_display = dotpath.display().to_string();
-    tokio::fs::create_dir_all(dotpath.as_path())
+    lore_io::IoDriver::global()
+        .create_dir_all(dotpath.as_path())
         .await
         .internal_with(|| {
             format!("Failed to create repository, unable to create directory {dotpath_display}")
         })?;
 
     let idpath_display = idpath.display().to_string();
-    #[allow(clippy::disallowed_methods)] // Authorized repository ID writer.
-    tokio::fs::write(idpath.as_path(), repository.data())
+    lore_io::IoDriver::global()
+        .write_file_bytes(
+            idpath.as_path(),
+            bytes::Bytes::copy_from_slice(repository.data()),
+            false,
+        )
         .await
         .internal_with(|| {
             format!(
@@ -2263,16 +2416,17 @@ pub async fn create_local(
     // caller-supplied token authorizes those writes and keeps the per-path
     // write mutex held for the duration of setup.
     let repository = Arc::new(
-        RepositoryContext::new(
-            Some(path.to_path_buf()),
+        RepositoryContext::new(RepositoryContextCreationArgs {
+            path: Some(path.to_path_buf()),
             immutable_store,
             mutable_store,
-            repository,
+            id: repository,
             instance_id,
-            Err(ProtocolError::from(NoRemote)),
-            Arc::default(),
-            RepositoryFormat::Lore,
-        )
+            remote: Err(ProtocolError::from(NoRemote)),
+            filter: Arc::default(),
+            format: RepositoryFormat::Lore,
+            filesystem_provider: None,
+        })
         .with_write_token(token.share()),
     );
 
@@ -2409,9 +2563,15 @@ async fn branch_switch_create(
     .await
     .forward::<RepositoryError>("Failed to create branch")?;
 
+    // `branch::create` has just seeded the pointer with the branch point; move it
+    // on to the tip the remote reports.
+    let created_at = branch::load_latest(repository.clone(), branch)
+        .await
+        .unwrap_or_default();
     branch::store_latest(
         repository.clone(),
         branch,
+        created_at,
         latest,
         BranchLatestStatus::Divergent,
     )
@@ -2764,9 +2924,15 @@ pub async fn branch_switch(
     }
 
     if !global.dry_run() {
+        // A switch republishes the branch's own local tip; the sync above may have
+        // moved the pointer, so compare against what it holds now.
+        let stored_latest = branch::load_latest(repository.clone(), branch.id)
+            .await
+            .unwrap_or_default();
         branch::store_latest(
             repository.clone(),
             branch.id,
+            stored_latest,
             branch_latest_local,
             if branch_location == LoreBranchLocation::Local {
                 BranchLatestStatus::Divergent
@@ -2797,6 +2963,21 @@ pub async fn branch_switch(
 
         if branch_location == LoreBranchLocation::Remote {
             branch::store_last_sync(repository.clone(), branch.id, branch_latest_local).await;
+        }
+
+        // Restore the name-to-id mapping for the branch to ensure it shows up in the local branch list.
+        let mapped = branch::load_name_to_id_local(repository.clone(), branch_name)
+            .await
+            .unwrap_or_default();
+        if mapped != Context::default() && mapped != branch.id && !global.force() {
+            return Err(RepositoryError::internal(
+                "Given branch's name is already used by another branch",
+            ));
+        }
+        if mapped == Context::default() || global.force() {
+            branch::store_name_to_id(repository.clone(), branch.id, &branch_name)
+                .await
+                .forward::<RepositoryError>("restoring name-to-id mapping")?;
         }
 
         if !options.bare {
@@ -2840,7 +3021,7 @@ async fn layer_branch_switch(
     branch_signature: Hash,
     reset: bool,
 ) -> Result<(), RepositoryError> {
-    let layers = layer::list(repository.clone())
+    let layers = layer::list_with_context(repository.clone())
         .await
         .forward::<RepositoryError>("Failed to switch branch in layer")?;
 
@@ -2853,7 +3034,7 @@ async fn layer_branch_switch(
 
     let mut layer_updates: Vec<(RepositoryId, String, Hash)> = Vec::new();
 
-    for layer in layers {
+    for (layer, layer_repository) in layers {
         // Check for uncommitted staged changes in layer
         if !layer.staged.is_zero() && layer.staged != layer.current {
             if !global.force() {
@@ -2873,24 +3054,26 @@ async fn layer_branch_switch(
             .forward::<RepositoryError>("Failed to switch branch in layer")?;
         }
 
-        let layer_repository = Arc::new(repository.to_layer_context(layer.repository).await);
-
         // Check if branch already exists in layer repo
         let branch_exists = branch::exist_local(layer_repository.clone(), branch_id).await;
 
-        if !branch_exists {
-            // Create branch in layer repo - mirrors layer_branch_create pattern
+        let layer_current = if branch_exists {
+            None
+        } else {
             let current_revision =
                 state::State::deserialize(layer_repository.clone(), layer.current)
                     .await
                     .forward::<RepositoryError>("Failed to deserialize repository state")?;
             let current_branch = current_revision.branch(layer_repository.clone()).await;
+            Some((current_revision, current_branch))
+        };
 
-            if current_branch == branch_id {
-                // Already on this branch (by ID), skip
-                continue;
-            }
-
+        // Skip only the branch creation, not the layer: a layer already on this
+        // branch can still be behind the branch latest and needs resolving.
+        if let Some((current_revision, current_branch)) = layer_current
+            && current_branch != branch_id
+        {
+            // Create branch in layer repo - mirrors layer_branch_create pattern
             let parent_metadata = branch::metadata(layer_repository.clone(), current_branch)
                 .await
                 .forward::<RepositoryError>("Failed to load branch metadata")?;
@@ -3361,6 +3544,96 @@ pub async fn resolve_by_name(
 }
 
 #[cfg(test)]
+pub mod test_helpers {
+    use std::sync::Arc;
+
+    use crate::fs::filesystem_provider::FilesystemProvider;
+    use crate::instance::InstanceId;
+
+    pub fn default_repository_creation_args(
+        immutable_store: std::sync::Arc<dyn lore_storage::ImmutableStore>,
+        mutable_store: std::sync::Arc<dyn lore_storage::MutableStore>,
+    ) -> crate::repository::RepositoryContextCreationArgs {
+        crate::repository::RepositoryContextCreationArgs {
+            path: None,
+            immutable_store,
+            mutable_store,
+            id: lore_base::types::Context::from(uuid::Uuid::now_v7()).into(),
+            instance_id: InstanceId::generate(),
+            remote: Err(lore_transport::ProtocolError::from(
+                lore_base::error::NoRemote,
+            )),
+            filter: std::sync::Arc::default(),
+            format: crate::repository::RepositoryFormat::Lore,
+            filesystem_provider: None,
+        }
+    }
+
+    pub trait RepositoryContextCreationArgsExt {
+        fn with_path(self, path: impl AsRef<std::path::Path>) -> Self;
+        fn with_id(self, id: crate::lore::RepositoryId) -> Self;
+        fn with_instance_id(self, id: crate::instance::InstanceId) -> Self;
+        fn with_remote(
+            self,
+            remote: Result<
+                std::sync::Arc<lore_transport::Connection>,
+                lore_transport::ProtocolError,
+            >,
+        ) -> Self;
+        fn with_filter(self, filter: std::sync::Arc<crate::filter::Filter>) -> Self;
+        fn with_format(self, format: crate::repository::RepositoryFormat) -> Self;
+        fn with_filesystem_provider(self, filesystem_provider: Arc<dyn FilesystemProvider>)
+        -> Self;
+    }
+
+    impl RepositoryContextCreationArgsExt for crate::repository::RepositoryContextCreationArgs {
+        fn with_path(mut self, path: impl AsRef<std::path::Path>) -> Self {
+            self.path = Some(path.as_ref().to_owned());
+            self
+        }
+
+        fn with_id(mut self, id: crate::lore::RepositoryId) -> Self {
+            self.id = id;
+            self
+        }
+
+        fn with_instance_id(mut self, id: crate::instance::InstanceId) -> Self {
+            self.instance_id = id;
+            self
+        }
+
+        fn with_remote(
+            mut self,
+            remote: Result<
+                std::sync::Arc<lore_transport::Connection>,
+                lore_transport::ProtocolError,
+            >,
+        ) -> Self {
+            self.remote = remote;
+            self
+        }
+
+        fn with_filter(mut self, filter: std::sync::Arc<crate::filter::Filter>) -> Self {
+            self.filter = filter;
+            self
+        }
+
+        fn with_format(mut self, format: crate::repository::RepositoryFormat) -> Self {
+            self.format = format;
+            self
+        }
+
+        fn with_filesystem_provider(
+            mut self,
+            filesystem_provider: Arc<dyn FilesystemProvider>,
+        ) -> Self {
+            self.filesystem_provider = Some(filesystem_provider);
+            self
+        }
+    }
+}
+
+#[cfg(test)]
 // These tests spawn tokio tasks directly without a LORE_CONTEXT, which is fine for
 // state-machine unit tests that don't touch the execution context.
 #[allow(clippy::disallowed_methods)]
@@ -3423,7 +3696,106 @@ mod remote_state_tests {
             state,
             Arc::default(),
             crate::repository::RepositoryFormat::Lore,
+            None,
         ))
+    }
+
+    /// Nothing is cached until something resolves it, so the first reader or
+    /// writer drives the connect and a command that does neither remotely never
+    /// does.
+    #[tokio::test]
+    async fn a_fresh_context_has_no_session_pool_to_reuse() {
+        for state in [RemoteState::Offline, RemoteState::Failed(no_remote())] {
+            let context = context_with_state(state).await;
+            assert!(
+                context.cached_session_pool().is_none(),
+                "a context that has resolved nothing reported a pool"
+            );
+        }
+    }
+
+    /// Asking an offline context for a pool must not invent one, and must not
+    /// leave anything cached for the next caller to find.
+    #[tokio::test]
+    async fn an_offline_context_resolves_no_session_pool() {
+        let context = context_with_state(RemoteState::Offline).await;
+        assert!(context.session_pool("correlation").await.is_err());
+        assert!(context.cached_session_pool().is_none());
+    }
+
+    /// A pool for a context to hold, the strong reference left to the caller as the
+    /// connection's session cache holds it. The session in it is never resolved:
+    /// these tests ask which pool answered, not what it yields.
+    fn held_pool() -> Arc<lore_transport::SessionPool> {
+        let session = Arc::new(lore_transport::StorageSession::pending(|| async {
+            Err(ProtocolError::internal("a pooled session no test resolves"))
+        }));
+        Arc::new(lore_transport::SessionPool::new(vec![session]))
+    }
+
+    /// A pool once resolved is handed back without consulting the remote. This
+    /// context's connect has failed, so an answer at all is proof the pool was
+    /// reused rather than looked up again per call.
+    #[tokio::test]
+    async fn a_resolved_pool_is_reused_without_touching_the_remote() {
+        let context = context_with_state(RemoteState::Failed(disconnected())).await;
+        let pool = held_pool();
+        context.set_session_pool(&pool);
+
+        let reused = context
+            .session_pool("correlation")
+            .await
+            .expect("a context holding a pool answers from it");
+        assert!(Arc::ptr_eq(&reused, &pool));
+    }
+
+    /// The pool is held weakly, so dropping the pin — which is what
+    /// `StorageSession::invalidate` does to the connection's cache — sends the next
+    /// caller back to the remote rather than handing out sessions the server has
+    /// forgotten.
+    #[tokio::test]
+    async fn a_pool_whose_pin_is_dropped_is_not_reused() {
+        let context = context_with_state(RemoteState::Failed(disconnected())).await;
+        let pool = held_pool();
+        context.set_session_pool(&pool);
+        assert!(context.session_pool("correlation").await.is_ok());
+
+        drop(pool);
+        assert!(
+            context.session_pool("correlation").await.is_err(),
+            "an expired pool must send the caller back to the remote"
+        );
+    }
+
+    /// Only the terminal no-remote state answers yes. A failure and a connect
+    /// still in flight both have an answer a session carries, so a caller has to
+    /// build one.
+    #[tokio::test]
+    async fn only_a_context_without_a_remote_is_offline() {
+        assert!(
+            context_with_state(RemoteState::Offline).await.is_offline(),
+            "a context with no remote configured is offline"
+        );
+        for state in [
+            RemoteState::Failed(disconnected()),
+            RemoteState::Pending(ready_remote(Err(no_remote()))),
+        ] {
+            assert!(
+                !context_with_state(state).await.is_offline(),
+                "a context that has not settled on `Offline` reported itself offline"
+            );
+        }
+    }
+
+    /// The answer is taken without waiting, so a state lock held elsewhere reads
+    /// as not offline rather than blocking a caller that only wanted to skip work.
+    #[tokio::test]
+    async fn a_held_state_lock_does_not_answer_offline() {
+        let context = context_with_state(RemoteState::Offline).await;
+        let guard = context.remote.write().await;
+        assert!(!context.is_offline());
+        drop(guard);
+        assert!(context.is_offline());
     }
 
     #[tokio::test]
@@ -3590,27 +3962,17 @@ mod write_token_tests {
     //! with `WriteRequired`.
     use std::sync::Arc;
 
-    use lore_transport::ProtocolError;
-
     use super::RepositoryContext;
     use super::RepositoryWriteToken;
-    use crate::errors::NoRemote;
-    use crate::lore::RepositoryId;
+    use crate::repository::test_helpers::default_repository_creation_args;
 
     async fn in_memory_context() -> Arc<RepositoryContext> {
         let (immutable, mutable) = super::create_client_memory_stores()
             .await
             .expect("in-memory stores should be creatable");
-        Arc::new(RepositoryContext::new(
-            None,
-            immutable,
-            mutable,
-            RepositoryId::default(),
-            crate::instance::InstanceId::default(),
-            Err(ProtocolError::from(NoRemote)),
-            Arc::default(),
-            crate::repository::RepositoryFormat::Lore,
-        ))
+        Arc::new(RepositoryContext::new(default_repository_creation_args(
+            immutable, mutable,
+        )))
     }
 
     /// A `NoStore` context with a `Client` write token attached must grant
@@ -3655,29 +4017,16 @@ mod path_optional_tests {
     //! optional; when constructed with `None`, the context is fully usable
     //! for store-backed operations but `require_path` rejects callers that
     //! need a working-tree path.
-    use std::sync::Arc;
-
-    use lore_transport::ProtocolError;
-
     use super::RepositoryContext;
-    use crate::errors::NoRemote;
-    use crate::lore::RepositoryId;
+    use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
+    use crate::repository::test_helpers::default_repository_creation_args;
 
     #[tokio::test]
     async fn require_path_returns_invalid_arguments_when_path_is_none() {
         let (immutable, mutable) = super::create_client_memory_stores()
             .await
             .expect("in-memory stores should be creatable");
-        let ctx = RepositoryContext::new(
-            None,
-            immutable,
-            mutable,
-            RepositoryId::default(),
-            crate::instance::InstanceId::default(),
-            Err(ProtocolError::from(NoRemote)),
-            Arc::default(),
-            crate::repository::RepositoryFormat::Lore,
-        );
+        let ctx = RepositoryContext::new(default_repository_creation_args(immutable, mutable));
         ctx.require_path()
             .expect_err("path-less context should reject require_path");
     }
@@ -3689,18 +4038,97 @@ mod path_optional_tests {
             .expect("in-memory stores should be creatable");
         let path = std::path::PathBuf::from("/tmp/lore-test-require-path");
         let ctx = RepositoryContext::new(
-            Some(path.clone()),
-            immutable,
-            mutable,
-            RepositoryId::default(),
-            crate::instance::InstanceId::default(),
-            Err(ProtocolError::from(NoRemote)),
-            Arc::default(),
-            crate::repository::RepositoryFormat::Lore,
+            default_repository_creation_args(immutable, mutable).with_path(&path),
         );
         let got = ctx
             .require_path()
             .expect("path-bearing context should return path");
         assert_eq!(got, path.as_path());
+    }
+}
+
+#[cfg(test)]
+mod name_validation_tests {
+    //! Coverage for [`is_valid_name`], in particular the segment rules that keep
+    //! a name stable through the URL parsing in [`parse_url`].
+    use super::MAX_NAME_LEN;
+    use super::is_valid_name;
+    use super::parse_url;
+
+    #[test]
+    fn accepts_names_with_dots_inside_segments() {
+        for name in ["my-repo", "org/my-repo", "my.repo", "org/v1.2/repo_a"] {
+            assert!(is_valid_name(name), "{name} should be valid");
+        }
+    }
+
+    #[test]
+    fn rejects_dot_segments() {
+        for name in [".", "..", "./repo", "org/../other", "org/repo/..", "../.."] {
+            assert!(!is_valid_name(name), "{name} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_dot_leading_segments() {
+        // Not just the traversal-like `.` and `..`: any leading dot is rejected.
+        for name in [
+            "...",
+            ".hidden",
+            ".lore",
+            "org/...",
+            "org/.git",
+            "org/.git/repo",
+        ] {
+            assert!(!is_valid_name(name), "{name} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_empty_segments() {
+        for name in ["", "/", "//", "/repo", "repo/", "repo//", "org//repo"] {
+            assert!(!is_valid_name(name), "{name} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_disallowed_characters_and_oversized_names() {
+        for name in ["repo name", "org\\repo", "repo!", "org/repö"] {
+            assert!(!is_valid_name(name), "{name} should be rejected");
+        }
+        assert!(is_valid_name(&"a".repeat(MAX_NAME_LEN)));
+        assert!(!is_valid_name(&"a".repeat(MAX_NAME_LEN + 1)));
+    }
+
+    #[test]
+    fn every_valid_name_survives_url_parsing() {
+        // The point of the segment rules: a valid name is returned unchanged by
+        // `parse_url`, so the repository a client asks for is the one it created.
+        for name in ["repo", "org/repo", "org/v1.2/repo_a", "org/a.b.c/d-e"] {
+            let (_remote_url, parsed) = parse_url(&format!("lores://host/{name}"), false)
+                .unwrap_or_else(|err| panic!("{name} should parse: {err}"));
+            assert_eq!(parsed, name);
+        }
+    }
+
+    #[test]
+    fn rejected_names_are_the_ones_url_parsing_rewrites() {
+        // Each of these either loses the name or resolves to a different one.
+        // Tested because the parse_url logic dictates what kind of names we can allow.
+        // If parse_url changes, the is_valid_name logic needs to be re-evaluated.
+        for (url_name, parsed_as) in [
+            (".", ""),
+            ("..", ""),
+            ("org/../other", "other"),
+            ("./repo", "repo"),
+            ("repo/", "repo"),
+            ("/repo/test//", "repo/test"),
+        ] {
+            assert!(!is_valid_name(url_name), "{url_name} should be rejected");
+            let parsed = parse_url(&format!("lores://host/{url_name}"), false)
+                .map(|(_remote_url, name)| name)
+                .unwrap_or_default();
+            assert_eq!(parsed, parsed_as, "for {url_name}");
+        }
     }
 }

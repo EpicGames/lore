@@ -60,11 +60,13 @@ use crate::branch::push::LoreBranchPushRevisionPushEndEventData;
 use crate::branch::push::LoreBranchPushRevisionPushUpdateEventData;
 use crate::branch::push::LoreBranchPushRevisionUpdateBeginEventData;
 use crate::branch::push::LoreBranchPushRevisionUpdateEndEventData;
+use crate::branch::push::LoreBranchPushStatsEventData;
 use crate::branch::reset::LoreBranchResetEventData;
 use crate::commit::LoreRevisionCommitBeginEventData;
 use crate::commit::LoreRevisionCommitEndEventData;
 use crate::commit::LoreRevisionCommitProgressEventData;
 use crate::commit::LoreRevisionCommitRevisionEventData;
+use crate::commit::LoreRevisionCommitStatsEventData;
 use crate::dependency::LoreDependencyResolveBeginEventData;
 use crate::dependency::LoreDependencyResolveEndEventData;
 use crate::dependency::LoreDependencyResolveItemEventData;
@@ -80,6 +82,7 @@ use crate::dependency::LoreFileDependencyRemoveBeginEventData;
 use crate::dependency::LoreFileDependencyRemoveEndEventData;
 use crate::dependency::LoreFileDependencyRemoveEntryEventData;
 use crate::event::revision_tree::LoreRevisionTreeAddCompleteEventData;
+use crate::event::revision_tree::LoreRevisionTreeBatchCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeChildEventData;
 use crate::event::revision_tree::LoreRevisionTreeCloseCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeCommitCompleteEventData;
@@ -87,6 +90,7 @@ use crate::event::revision_tree::LoreRevisionTreeDeleteCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeInfoEventData;
 use crate::event::revision_tree::LoreRevisionTreeListChildrenBeginEventData;
 use crate::event::revision_tree::LoreRevisionTreeLoadedEventData;
+use crate::event::revision_tree::LoreRevisionTreeMetadataClearCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeMetadataGetCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeMetadataSetCompleteEventData;
 use crate::event::revision_tree::LoreRevisionTreeModifyCompleteEventData;
@@ -116,6 +120,7 @@ use crate::immutable::LoreFragmentWriteEventData;
 use crate::instance::LoreBranchMultipleInstanceEventData;
 use crate::instance::LoreRepositoryInstanceEventData;
 use crate::interface::LoreArray;
+use crate::interface::LoreBinary;
 use crate::interface::LoreError;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreEventCallbackConfig;
@@ -125,8 +130,8 @@ use crate::layer::LoreLayerAddEventData;
 use crate::layer::LoreLayerEntryEventData;
 use crate::layer::LoreLayerRemoveEventData;
 use crate::layer::LoreLayerStagedEntryEventData;
+use crate::link::LoreLinkBranchCreateEventData;
 use crate::link::LoreLinkChangeEventData;
-use crate::link::LoreLinkEntryEventData;
 use crate::link::list::LoreLinkStagedEntryEventData;
 use crate::lock::file::acquire::LoreLockFileAcquireBeginEventData;
 use crate::lock::file::acquire::LoreLockFileAcquireEventData;
@@ -136,6 +141,9 @@ use crate::lock::file::release::LoreLockFileReleaseBeginEventData;
 use crate::lock::file::release::LoreLockFileReleaseEventData;
 use crate::lock::file::status::LoreLockFileStatusBeginEventData;
 use crate::lock::file::status::LoreLockFileStatusEventData;
+use crate::lore::BranchId;
+use crate::lore::Hash;
+use crate::lore::RepositoryId;
 use crate::lore::execution_context;
 use crate::metadata::Metadata;
 use crate::metadata::MetadataError;
@@ -268,6 +276,69 @@ pub struct LoreProgressEventData {
     pub _unused: u32,
 }
 
+/// cbindgen:prefix-with-name
+/// cbindgen:rename-all=ScreamingSnakeCase
+#[repr(C)]
+/// Staged change to a link itself, as opposed to content inside it.
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LoreLinkStagedState {
+    /// The link carries no staged change.
+    None = 0,
+    /// The link was added and is not committed yet.
+    Added = 1,
+    /// The link was removed and the removal is not committed yet.
+    Removed = 2,
+    /// The link's pin was changed and is not committed yet.
+    Modified = 3,
+}
+
+/// Data for an event describing a single link in a repository. Carries the
+/// branch identifier rather than its name; a consumer that wants the name
+/// resolves it, so listing links costs no branch metadata reads.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreLinkEntryEventData {
+    /// Identifier of the repository the link points to.
+    pub link: RepositoryId,
+    /// Identifier of the link node in the parent repository.
+    pub link_node: u32,
+    /// Path of the link within the parent repository.
+    pub link_path: LoreString,
+    /// Identifier of the source node in the linked repository.
+    pub source_node: u32,
+    /// Path of the source within the linked repository.
+    pub source_path: LoreString,
+    /// Identifier of the branch the link is pinned to.
+    pub branch: BranchId,
+    /// Set when the link follows its parent's branch instead of being pinned to
+    /// an explicit one, in which case `branch` is the branch it resolved to.
+    #[serde(with = "crate::util::serde::u8_as_bool")]
+    pub tracking: u8,
+    /// Hash of the revision the link is pinned to.
+    pub revision: Hash,
+    /// Link flags.
+    pub flags: u32,
+}
+
+/// Data for an event describing a single link in detail: everything `LinkEntry`
+/// reports, plus the state only `link info` gathers.
+#[repr(C)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreLinkInfoEventData {
+    /// The link as `LinkEntry` reports it.
+    pub entry: LoreLinkEntryEventData,
+    /// Hash of the remote latest revision of the pinned branch, zero when the
+    /// remote was not consulted.
+    pub remote_revision: Hash,
+    /// Staged change to the link itself.
+    pub staged_state: LoreLinkStagedState,
+    /// Number of staged files inside the linked repository.
+    pub staged_file_count: u64,
+}
+
 /// Borrowed byte slice handed to callbacks.
 ///
 /// The pointer is valid only for the duration of the callback that receives
@@ -337,8 +408,18 @@ impl<'de> serde::Deserialize<'de> for LoreBytes {
 /// Narrower than the general library error code — events emitted per
 /// put/get/copy/etc. item embed this code so a caller can branch on the
 /// common cases cheaply without parsing the companion `LORE_EVENT_ERROR`
-/// detail. Variants overlap with the general library error code where they
-/// share a meaning.
+/// detail.
+///
+/// The values are the error codes themselves, taken from the registry in
+/// `lore_base::error`, so a code read from a per-item event means the same
+/// thing as the code on `Complete.status`. This enum names the subset a
+/// per-item event can carry; it is not a second numbering.
+///
+/// The variant order is the serialized wire format, not the numbering. Serde
+/// encodes a variant by its declaration index in a non-self-describing format,
+/// and `LoreEvent` crosses the service boundary in one, so reordering these
+/// would silently redecode old payloads as different errors. Add new variants
+/// at the end and change discriminants in place.
 ///
 /// cbindgen:prefix-with-name
 /// cbindgen:rename-all=ScreamingSnakeCase
@@ -349,14 +430,26 @@ pub enum LoreErrorCode {
     #[default]
     None = 0,
     /// The arguments supplied to the operation were invalid.
-    InvalidArguments = 1,
+    InvalidArguments = 3,
     /// A content-addressable object could not be found in any store.
-    AddressNotFound = 2,
+    AddressNotFound = 80,
     /// An internal error occurred.
-    Internal = 3,
+    Internal = -1,
     /// The backing store is overloaded; the caller should retry later.
-    SlowDown = 4,
+    SlowDown = 31,
 }
+
+// cbindgen cannot evaluate a const in a discriminant position — it drops the
+// enum and emits an incomplete type — so the codes above are written out.
+// These tie them back to the registry at compile time: a code that moves in
+// `lore-base` fails the build here rather than silently leaving this enum
+// describing the old numbering.
+const _: () = assert!(LoreErrorCode::Internal as i32 == lore_error_set::Internal::FFI_CODE);
+const _: () =
+    assert!(LoreErrorCode::InvalidArguments as i32 == lore_base::error::InvalidArguments::FFI_CODE);
+const _: () = assert!(LoreErrorCode::SlowDown as i32 == lore_base::error::SlowDown::FFI_CODE);
+const _: () =
+    assert!(LoreErrorCode::AddressNotFound as i32 == lore_base::error::AddressNotFound::FFI_CODE);
 
 /// Data for an error event.
 #[repr(C)]
@@ -414,9 +507,9 @@ impl LoreMetadataEventData {
             MetadataType::Hash => LoreMetadata::Hash(Metadata::to_hash(value)?),
             MetadataType::Numeric => LoreMetadata::Numeric(Metadata::to_u64(value)?),
             MetadataType::String => {
-                LoreMetadata::String(LoreString::from(Metadata::to_string(value).ok()))
+                LoreMetadata::String(LoreString::from(Metadata::to_string(value)?))
             }
-            MetadataType::Binary => return Err(MetadataError::internal("metadata type mismatch")),
+            MetadataType::Binary => LoreMetadata::Binary(LoreBinary::from_bytes(value)),
         };
 
         Ok(LoreMetadataEventData { key, value })
@@ -909,10 +1002,14 @@ pub enum LoreEvent {
     LayerRemove(LoreLayerRemoveEventData),
     /// One staged entry in a layer listing.
     LayerStagedEntry(LoreLayerStagedEntryEventData),
+    /// A link's branch in the linked repository was created or reused.
+    LinkBranchCreate(LoreLinkBranchCreateEventData),
     /// A link was changed.
     LinkChange(LoreLinkChangeEventData),
     /// One entry in a link listing.
     LinkEntry(LoreLinkEntryEventData),
+    /// Detailed information about a single link.
+    LinkInfo(LoreLinkInfoEventData),
     /// The start of a file lock acquire report.
     LockFileAcquireBegin(LoreLockFileAcquireBeginEventData),
     /// A file concerning the lock acquire report.
@@ -1130,6 +1227,14 @@ pub enum LoreEvent {
     CompactionProgress(LoreCompactionProgressEventData),
     /// A store compaction pass ended.
     CompactionEnd(LoreCompactionEndEventData),
+    /// A batch write call on a revision tree completed as a whole.
+    RevisionTreeBatchComplete(LoreRevisionTreeBatchCompleteEventData),
+    /// A metadata-clear entry completed.
+    RevisionTreeMetadataClearComplete(LoreRevisionTreeMetadataClearCompleteEventData),
+    /// What a commit has cost so far, or in total once it has drained its writes.
+    RevisionCommitStats(LoreRevisionCommitStatsEventData),
+    /// What a push has cost so far, or in total once it has finished.
+    BranchPushStats(LoreBranchPushStatsEventData),
 }
 
 impl LoreEvent {
@@ -1238,7 +1343,7 @@ mod error_detail_tests {
 
     // A concrete `#[error_set]` error used to exercise the constructor. Its
     // `NotFound` variant wraps `lore_base::error::NotFound`, which carries FFI
-    // code 13, so the detail's `error_code` has a known, non-internal value to
+    // code 79, so the detail's `error_code` has a known, non-internal value to
     // assert against.
     #[error_set]
     enum SampleError {
@@ -1446,5 +1551,62 @@ mod complete_event_tests {
             error: LoreErrorDetail::default(),
         };
         assert_eq!(by_position.status, status);
+    }
+}
+
+#[cfg(test)]
+mod metadata_event_tests {
+    use super::LoreMetadataEventData;
+    use crate::interface::LoreMetadata;
+    use crate::metadata::MetadataType;
+
+    /// Bytes stored under the string tag that are not text cannot be delivered
+    /// as a string, so the decode fails rather than reporting an empty value:
+    /// an empty string is a value a key can legitimately hold, and a caller
+    /// cannot tell the two apart. Argument text is checked at the entry point,
+    /// but a value read back out of a stored buffer never passed through it.
+    #[test]
+    fn a_string_value_that_is_not_text_fails_to_decode() {
+        assert!(
+            LoreMetadataEventData::new("key", b"\xff\xfe", MetadataType::String).is_err(),
+            "bytes that are not text must not decode to an empty string"
+        );
+        let decoded = LoreMetadataEventData::new("key", b"text", MetadataType::String)
+            .expect("valid text must decode");
+        assert_eq!(
+            decoded.value,
+            LoreMetadata::String(crate::interface::LoreString::from("text"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod wire_format_tests {
+    use super::LoreErrorCode;
+
+    /// Serde encodes an enum variant by its declaration index, not by its
+    /// explicit discriminant, and `LoreEvent` crosses the service boundary in
+    /// bitcode — a non-self-describing format. These bytes are the wire
+    /// contract: reorder the variants and a peer on an older build has its
+    /// payloads decode as different errors, silently. The discriminants are
+    /// free to change; the order is not. New variants go at the end.
+    #[test]
+    fn variant_order_is_pinned_to_the_wire_format() {
+        for (variant, encoded) in [
+            (LoreErrorCode::None, [0u8]),
+            (LoreErrorCode::InvalidArguments, [1]),
+            (LoreErrorCode::AddressNotFound, [2]),
+            (LoreErrorCode::Internal, [3]),
+            (LoreErrorCode::SlowDown, [4]),
+        ] {
+            assert_eq!(
+                bitcode::serialize(&variant).expect("serialize"),
+                encoded,
+                "{variant:?} moved in declaration order; a payload from an \
+                 older peer would decode as a different error"
+            );
+            let decoded: LoreErrorCode = bitcode::deserialize(&encoded).expect("deserialize");
+            assert_eq!(decoded, variant, "decoding {encoded:?} must be stable");
+        }
     }
 }

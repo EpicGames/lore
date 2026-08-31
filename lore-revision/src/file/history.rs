@@ -249,8 +249,7 @@ async fn history_state(
             .await
             .forward::<FileHistoryError>("Failed to deserialize metadata")?;
 
-        event::metadata::send(&metadata)
-            .forward::<FileHistoryError>("Failed to deserialize metadata")?;
+        event::metadata::send(&metadata);
     }
 
     // File metadata
@@ -259,8 +258,7 @@ async fn history_state(
             .await
             .forward::<FileHistoryError>("Failed to deserialize metadata")?;
 
-        event::metadata::send(&metadata)
-            .forward::<FileHistoryError>("Failed to deserialize metadata")?;
+        event::metadata::send(&metadata);
     }
 
     Ok(())
@@ -354,10 +352,10 @@ async fn find_start_revision(
         if current_branch.is_zero() {
             let metadata = repository::metadata_hash(repository.clone())
                 .await
-                .internal("Failed to load repository metadata")?;
+                .forward::<FileHistoryError>("Failed to load repository metadata")?;
             let metadata = repository::metadata(repository.clone(), metadata)
                 .await
-                .internal("Failed to load repository metadata")?;
+                .forward::<FileHistoryError>("Failed to load repository metadata")?;
             metadata.default_branch
         } else {
             current_branch

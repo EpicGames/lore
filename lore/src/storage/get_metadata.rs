@@ -31,6 +31,7 @@ use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
+use lore_macro::ValidateText;
 use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
@@ -51,7 +52,7 @@ use crate::storage::store::StoreInternal;
 
 /// One `get_metadata` item — the `(partition, address)` to look up.
 #[repr(C)]
-#[derive(Copy, Clone, Default, Debug, PartialEq, Deserialize, Serialize)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Deserialize, Serialize, ValidateText)]
 pub struct LoreStorageGetMetadataItem {
     /// Caller-chosen id echoed back in `GET_METADATA_ITEM_COMPLETE`
     pub id: u64,
@@ -187,6 +188,12 @@ enum LocalOutcome {
 /// on invalid args, on zero-hash short-circuit, or on a non-not-found local error. Returns
 /// `NeedRemote` only when the item missed locally with `AddressNotFound` and may still be
 /// satisfied by the remote.
+///
+/// Any match the store made is a hit, not just a full one. This operation answers what a payload
+/// *is*, and a weaker level names the same bytes under the same hash — reached under a context or
+/// partition the caller did not name, which changes whose association it is and not what the
+/// content decodes to. Requiring `MatchFull` here spent a round trip re-fetching a description the
+/// store had already produced.
 async fn resolve_local(
     store: &Arc<StoreInternal>,
     item: &LoreStorageGetMetadataItem,
@@ -204,10 +211,10 @@ async fn resolve_local(
     match store
         .immutable
         .clone()
-        .query(item.partition, item.address, StoreMatch::MatchFull)
+        .get_metadata(item.partition, item.address)
         .await
     {
-        Ok(result) if result.match_made == StoreMatch::MatchFull => {
+        Ok(result) if result.match_made != StoreMatch::MatchNone => {
             let code = emit_complete(item, result.fragment, LoreErrorCode::None);
             LocalOutcome::Done { code }
         }

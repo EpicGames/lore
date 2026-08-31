@@ -12,7 +12,6 @@ mod test_util;
 mod tests {
     use std::sync::Arc;
     use std::sync::LazyLock;
-    use std::time::Duration;
 
     use lore::interface::LoreString;
     use lore::repository::LoreRepositoryCreateArgs;
@@ -23,13 +22,11 @@ mod tests {
     use lore_revision::interface::LoreEventCallback;
     use lore_revision::interface::LoreEventCallbackConfig;
     use lore_revision::interface::LoreGlobalArgs;
+    use lore_revision::repository::LoreSharedStoreMode;
     use parking_lot::Mutex;
     use rand::Rng;
     use rand::distr::Alphanumeric;
     use serial_test::serial;
-    use tokio::task::JoinHandle;
-    use tokio::time::error::Elapsed;
-    use tokio::time::timeout;
 
     use super::test_util::TempDir;
     use super::*;
@@ -50,13 +47,15 @@ mod tests {
     static REPOSITORY_STATUS_COMPLETE: LazyLock<Arc<Mutex<bool>>> =
         LazyLock::new(|| Arc::new(Mutex::new(false)));
 
-    static TIMEOUT_DURATION: Duration = Duration::from_secs(5);
-
-    async fn repository_create(
-        callback: LoreEventCallback,
-        callback_task: JoinHandle<Result<(), Elapsed>>,
-        repository_path: std::path::PathBuf,
-    ) -> Result<(), Elapsed> {
+    /// Runs `repository::create` to completion, returning once its callback has
+    /// received every event.
+    ///
+    /// The call ends in [`EventDispatcher::complete`], which awaits the
+    /// forwarder's completion token while it holds the last strong sender, so
+    /// `Complete` and `End` have both been delivered by the time this returns.
+    /// A caller therefore asserts on what the callback recorded rather than
+    /// polling for it against a deadline.
+    async fn repository_create(callback: LoreEventCallback, repository_path: std::path::PathBuf) {
         let globals = LoreGlobalArgs {
             repository_path: repository_path.into(),
             offline: 1,
@@ -72,26 +71,23 @@ mod tests {
             repository_url: name.into(),
             id: LoreString::default(),
             description: LoreString::default(),
-            use_shared_store: 0,
+            use_shared_store: LoreSharedStoreMode::Disabled,
             shared_store_path: LoreString::default(),
         };
 
         // Run repo create command
-        let worker = runtime().spawn(async move {
-            let _ = lore::repository::create(globals, args, callback).await;
-        });
-
-        let callback_result = callback_task.await.unwrap();
-        worker.await.unwrap();
-
-        callback_result
+        runtime()
+            .spawn(async move {
+                let _ = lore::repository::create(globals, args, callback).await;
+            })
+            .await
+            .unwrap();
     }
 
-    async fn repository_status(
-        callback: LoreEventCallback,
-        callback_task: JoinHandle<Result<(), Elapsed>>,
-        repository_path: std::path::PathBuf,
-    ) -> Result<(), Elapsed> {
+    /// Runs `repository::status` to completion, returning once its callback has
+    /// received every event. Completes through the same dispatcher path as
+    /// [`repository_create`], including for a path that holds no repository.
+    async fn repository_status(callback: LoreEventCallback, repository_path: std::path::PathBuf) {
         let globals = LoreGlobalArgs {
             repository_path: repository_path.into(),
             offline: 1,
@@ -110,14 +106,12 @@ mod tests {
         };
 
         // Run repo status command
-        let worker = runtime().spawn(async move {
-            let _ = lore::repository::status(globals, args, callback).await;
-        });
-
-        let callback_result = callback_task.await.unwrap();
-        worker.await.unwrap();
-
-        callback_result
+        runtime()
+            .spawn(async move {
+                let _ = lore::repository::status(globals, args, callback).await;
+            })
+            .await
+            .unwrap();
     }
 
     fn repository_create_callback(event: &LoreEvent) {
@@ -178,34 +172,24 @@ mod tests {
         let tempdir = TempDir::new("lore-events-test-");
         let repository_path = tempdir.path().to_path_buf();
 
-        // Run task to check until create is complete
-        let callback_task = tokio::spawn(timeout(TIMEOUT_DURATION, async {
-            while !(*REPOSITORY_CREATE_COMPLETE.lock()) {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        }));
+        repository_create(callback, repository_path.clone()).await;
 
-        repository_create(callback, callback_task, repository_path.clone())
-            .await
-            .expect("[Repository create CompleteEvent not received in time.");
-
-        // Run the task to check until the failing create reports its failure
-        // through the enriched `Complete` event.
-        let fail_callback_task = tokio::spawn(timeout(TIMEOUT_DURATION, async {
-            while !(*REPOSITORY_CREATE_FAIL_COMPLETE.lock()
-                && *REPOSITORY_CREATE_FAIL_COMPLETE_IS_FAILURE.lock())
-            {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        }));
+        assert!(
+            *REPOSITORY_CREATE_COMPLETE.lock(),
+            "create must deliver a Complete event"
+        );
 
         // Run again to fail on purpose
-        repository_create(fail_callback, fail_callback_task, repository_path.clone())
-            .await
-            .expect(
-                "[repo_initialize_fail] Repository initialize CompleteEvent not received in time.",
-            );
+        repository_create(fail_callback, repository_path.clone()).await;
 
+        assert!(
+            *REPOSITORY_CREATE_FAIL_COMPLETE.lock(),
+            "failing create must deliver a Complete event"
+        );
+        assert!(
+            *REPOSITORY_CREATE_FAIL_COMPLETE_IS_FAILURE.lock(),
+            "failing create's Complete must carry a non-zero status matching its detail"
+        );
         assert!(
             !*REPOSITORY_CREATE_FAIL_ERROR_EVENT_SEEN.lock(),
             "failing create must not emit an Error event; the failure is carried by Complete"
@@ -215,16 +199,11 @@ mod tests {
     #[serial]
     #[tokio::test(flavor = "multi_thread")]
     async fn repository_create_no_callback() {
-        // Callback task that does nothing
-        let callback_task = tokio::spawn(timeout(TIMEOUT_DURATION, async {}));
-
         // Generate a tempdir to create in
         let tempdir = TempDir::new("lore-events-test-");
         let repository_path = tempdir.path().to_path_buf();
 
-        repository_create(None, callback_task, repository_path)
-            .await
-            .expect("Failed to create repository without callback");
+        repository_create(None, repository_path).await;
     }
 
     fn repository_status_callback(event: &LoreEvent) {
@@ -256,18 +235,12 @@ mod tests {
         let tempdir = TempDir::new("lore-events-test-");
         let repository_path = tempdir.path().to_path_buf();
 
-        // Run task to check until create is complete
-        let callback_task = tokio::spawn(timeout(TIMEOUT_DURATION, async {
-            while !(*REPOSITORY_STATUS_COMPLETE.lock()) {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        }));
+        repository_status(callback, repository_path.clone()).await;
 
-        repository_status(callback, callback_task, repository_path.clone())
-            .await
-            .expect(
-                "Repository status CompleteEvent for invalid repository path not received in time.",
-            );
+        assert!(
+            *REPOSITORY_STATUS_COMPLETE.lock(),
+            "status on a path holding no repository must deliver a Complete event"
+        );
     }
 
     #[unsafe(no_mangle)]
@@ -299,19 +272,15 @@ mod tests {
 
         let callback = convert_event_callback(callback_config);
 
-        // Run task to check until create is complete
-        let callback_task = tokio::spawn(timeout(TIMEOUT_DURATION, async {
-            while !(*REPOSITORY_CREATE_C_COMPLETE.lock()) {
-                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-            }
-        }));
-
         // Generate a tempdir to create in
         let tempdir = TempDir::new("lore-events-test-");
         let repository_path = tempdir.path().to_path_buf();
 
-        repository_create(callback, callback_task, repository_path)
-            .await
-            .expect("Repository create CompleteEvent not received in time.");
+        repository_create(callback, repository_path).await;
+
+        assert!(
+            *REPOSITORY_CREATE_C_COMPLETE.lock(),
+            "create must deliver a Complete event to a C callback"
+        );
     }
 }

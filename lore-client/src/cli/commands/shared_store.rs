@@ -27,10 +27,13 @@ pub struct SharedStoreArgs {
 
 #[derive(Subcommand)]
 pub enum SharedStoreCommands {
+    /// Create a shared store backed by a remote
     Create(SharedStoreCreateArgs),
 
+    /// Show the shared store this repository uses
     Info(SharedStoreInfoArgs),
 
+    /// Set whether new clones use a shared store without being asked to
     SetUseAutomatically(SharedStoreSetUseAutomaticallyArgs),
 }
 

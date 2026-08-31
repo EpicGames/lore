@@ -145,6 +145,9 @@ class NotALinkError(LoreException): ...
 class LinkNotFoundError(LoreException): ...
 
 
+class LinkPinDivergedError(LoreException): ...
+
+
 class NotALayerError(LoreException): ...
 
 
@@ -154,6 +157,18 @@ class BadSharedStoreRemoteUrl(LoreException): ...
 class MissingIdentityError(LoreException):
     """Raised when a commit-producing operation runs without a configured
     identity (no --identity arg, no config.toml identity, no cached auth)."""
+
+
+class NotAuthenticatedError(LoreException):
+    """Raised when an operation needs authentication the caller does not have,
+    e.g. a server-hitting command run against an auth-configured server with no
+    stored token (logged out)."""
+
+
+class NotSupportedError(LoreException):
+    """Raised when an operation is not supported in the current environment,
+    e.g. an auth command run against a server with no auth endpoint
+    configured."""
 
 
 ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
@@ -211,10 +226,13 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Nothing staged for commit", NothingStagedError),
     ("Path is not a link", NotALinkError),
     ("Link not found", LinkNotFoundError),
+    ("Link pin conflict at", LinkPinDivergedError),
     ("Path is not a layer", NotALayerError),
     ("Failed to connect to remote URL", BadSharedStoreRemoteUrl),
     ("Local modifications prevent synchronization", LocalModificationsError),
     ("No commit identity configured", MissingIdentityError),
+    ("Operation not supported", NotSupportedError),
+    ("Not authenticated", NotAuthenticatedError),
 ]
 
 

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 pub mod cert_metrics;
+pub mod core_hop;
 
 use lore_revision::interface::LoreGlobalArgs;
 

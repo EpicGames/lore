@@ -151,6 +151,20 @@ impl NotificationSubscription {
             cancellation_token,
         }
     }
+
+    /// Whether the subscription is still listening for notifications.
+    ///
+    /// A subscription goes inactive when its client gives up on its own, for
+    /// example when the network drops and reconnecting keeps failing.
+    pub fn is_active(&self) -> bool {
+        !self.cancellation_token.is_cancelled() && !self.task.is_finished()
+    }
+
+    /// Cancel the subscription and wait for its task to finish.
+    async fn shutdown(self) {
+        self.cancellation_token.cancel();
+        let _ = self.task.await;
+    }
 }
 
 static NOTIFICATION_SUBSCRIBERS: OnceLock<DashMap<RepositoryId, NotificationSubscription>> =
@@ -162,8 +176,20 @@ fn notification_subscribers() -> &'static DashMap<RepositoryId, NotificationSubs
 
 /// Subscribe to notifications for the given repository
 pub async fn subscribe(repository: Arc<RepositoryContext>) -> Result<(), NotificationError> {
-    if notification_subscribers().contains_key(&repository.id) {
+    if let Some(subscriber) = notification_subscribers().get(&repository.id)
+        && subscriber.is_active()
+    {
         return Ok(());
+    }
+
+    // A client that bailed out leaves its entry behind. Drop it so the caller
+    // can resubscribe without having to unsubscribe first.
+    if let Some((_, stale)) = notification_subscribers().remove(&repository.id) {
+        lore_debug!(
+            "Discarding inactive notification subscription for {}",
+            repository.id
+        );
+        stale.shutdown().await;
     }
 
     let Ok(remote) = repository.remote().await else {
@@ -183,7 +209,11 @@ pub async fn subscribe(repository: Arc<RepositoryContext>) -> Result<(), Notific
         repository.id
     );
     let subscriber = client.subscribe_repository(repository.id).await?;
-    let _previous = notification_subscribers().insert(repository.id, subscriber);
+    // A concurrent subscribe may have won the race; stop its task rather than
+    // detaching it by dropping the join handle.
+    if let Some(previous) = notification_subscribers().insert(repository.id, subscriber) {
+        previous.shutdown().await;
+    }
     lore_debug!(
         "Subscribed to repository notifications for {}",
         repository.id
@@ -202,8 +232,7 @@ pub async fn unsubscribe(repository: Arc<RepositoryContext>) -> Result<(), Notif
 
     lore_debug!("Unsubscribing notification client from {}", repository.id);
 
-    subscriber.cancellation_token.cancel();
-    let _ = subscriber.task.await;
+    subscriber.shutdown().await;
 
     lore_debug!("Unsubscribed notification client from {}", repository.id);
 

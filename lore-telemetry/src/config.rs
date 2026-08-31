@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 
-use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
@@ -129,32 +128,35 @@ impl TraceConfig {
 
     pub fn validate(&self) -> Result<(), TraceConfigError> {
         if !(0.0..=1.0).contains(&self.sample_rate) {
-            return Err(OutOfRange {
+            return Err(TraceConfigError::OutOfRange {
                 field: "sample_rate",
                 value: self.sample_rate,
-            }
-            .into());
+            });
         }
         if !(0.0..=1.0).contains(&self.sample_rate_low_tier) {
-            return Err(OutOfRange {
+            return Err(TraceConfigError::OutOfRange {
                 field: "sample_rate_low_tier",
                 value: self.sample_rate_low_tier,
-            }
-            .into());
+            });
         }
         Ok(())
     }
 }
 
-#[derive(Debug, Error, FfiError)]
-#[error("trace config field {field} value {value} is outside [0.0, 1.0]")]
-#[ffi_code(1)]
-pub struct OutOfRange {
-    pub field: &'static str,
-    pub value: f64,
-}
-
-#[error_set]
+/// Validation failures for a [`TraceConfig`].
+///
+/// A plain `thiserror` enum rather than an `#[error_set]`. This error never
+/// crosses the FFI boundary — `lore-server` validates the config at startup and
+/// turns it into a `config::ConfigError` — so it needs no FFI code, and an
+/// error set would demand one for every variant type.
+#[derive(Debug, Error)]
 pub enum TraceConfigError {
-    OutOfRange,
+    /// A sample rate fell outside the unit interval.
+    #[error("trace config field {field} value {value} is outside [0.0, 1.0]")]
+    OutOfRange {
+        /// The offending field, named as it appears in the config.
+        field: &'static str,
+        /// The value that was rejected.
+        value: f64,
+    },
 }

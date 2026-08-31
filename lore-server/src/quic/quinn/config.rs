@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use lore_transport::quic::client::STREAM_COUNT;
 use lore_transport::tls;
 use rustls::server::NoClientAuth;
 use rustls::server::danger::ClientCertVerifier;
@@ -20,6 +21,8 @@ pub struct QuinnConfig {
     // server from others?
     pub(crate) server_metrics_name: String,
     pub(crate) address: SocketAddr,
+    /// A UDP socket the caller bound itself, served on instead of binding `address` here.
+    pub(crate) socket: Option<std::net::UdpSocket>,
     pub(crate) alpns: Vec<String>,
     pub(crate) cert_file: PathBuf,
     pub(crate) pkey_file: PathBuf,
@@ -39,6 +42,7 @@ impl fmt::Debug for QuinnConfig {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("QuinnConfig")
             .field("address", &self.address)
+            .field("socket", &self.socket.is_some())
             .field("alpns", &self.alpns)
             .field("cert_file", &self.cert_file)
             .field("pkey_file", &self.pkey_file)
@@ -64,6 +68,7 @@ pub struct QuinnConfigBuilder {
     // server from others?
     pub(crate) server_metrics_name: String,
     pub(crate) address: Option<SocketAddr>,
+    pub(crate) socket: Option<std::net::UdpSocket>,
     pub(crate) cert_file: PathBuf,
     pub(crate) pkey_file: PathBuf,
     pub(crate) cert_chain: Option<PathBuf>,
@@ -80,7 +85,6 @@ pub struct QuinnConfigBuilder {
 
 const DEFAULT_IDLE_TIMEOUT_MILLIS: u64 = 30_000;
 const DEFAULT_KEEP_ALIVE_MILLS: u64 = 500;
-const DEFAULT_BIDI_STREAMS: u64 = 8;
 const DEFAULT_LISTENERS_COUNT: u8 = 10;
 const DEFAULT_METRICS_FREQUENCY: Duration = Duration::from_millis(60_000);
 const DEFAULT_TRANSPORT_BITS_PER_SECOND: usize = 1_073_741_824; // 1gbit/s
@@ -93,6 +97,23 @@ impl QuinnConfigBuilder {
 
     pub fn server_metrics_name(mut self, name: &str) -> Self {
         self.server_metrics_name = name.into();
+        self
+    }
+
+    /// Serve on a UDP socket the caller has already bound, rather than binding [`Self::address`]
+    /// here. The socket's own address is then authoritative, so `address` need not be set.
+    ///
+    /// A `lore://` peer serves QUIC on UDP and gRPC on TCP at one port number, and it cannot get
+    /// that pair by choosing a number and binding twice: whichever bind goes second can find the
+    /// number taken, and the failure arrives after the first server is already running. Binding
+    /// both sockets first — retrying until one number is free on both — and handing them over is
+    /// what makes the pair atomic as far as the servers are concerned.
+    ///
+    /// Note that a socket bound by the caller carries whatever options the caller set, not the
+    /// `SO_REUSEADDR`/`SO_REUSEPORT` this applies to sockets it binds itself. A caller that wants a
+    /// port exclusively should set neither, so that a clash fails instead of silently sharing.
+    pub fn socket(mut self, socket: std::net::UdpSocket) -> Self {
+        self.socket = Some(socket);
         self
     }
 
@@ -174,9 +195,17 @@ impl QuinnConfigBuilder {
             return Err(anyhow!("No alpns provided"));
         };
 
+        // A caller-bound socket is the truth about where this serves; asking it beats trusting an
+        // `address` set alongside it, which could disagree.
+        let address = match &self.socket {
+            Some(socket) => socket.local_addr()?,
+            None => self.address.ok_or(anyhow!("Address was not set"))?,
+        };
+
         Ok(QuinnConfig {
             server_metrics_name: self.server_metrics_name,
-            address: self.address.ok_or(anyhow!("Address was not set"))?,
+            address,
+            socket: self.socket,
             alpns,
             cert_file: self.cert_file,
             pkey_file: self.pkey_file,
@@ -191,7 +220,7 @@ impl QuinnConfigBuilder {
             keep_alive: self
                 .keep_alive
                 .unwrap_or(Duration::from_millis(DEFAULT_KEEP_ALIVE_MILLS)),
-            max_bidi_streams: self.max_bidi_streams.unwrap_or(DEFAULT_BIDI_STREAMS),
+            max_bidi_streams: self.max_bidi_streams.unwrap_or(STREAM_COUNT as u64),
             num_listeners: self.num_listeners.unwrap_or(DEFAULT_LISTENERS_COUNT),
             metrics_frequency: self.metrics_frequency.unwrap_or(DEFAULT_METRICS_FREQUENCY),
             transport_bits_per_second: self

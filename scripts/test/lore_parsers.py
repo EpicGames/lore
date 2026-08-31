@@ -205,6 +205,25 @@ def parse_status_summary_json(status_output: str) -> dict | None:
     return entries[-1] if entries else None
 
 
+def parse_commit_stats_json(output: str) -> dict | None:
+    """Parse `lore commit --json` output and return the revisionCommitStats event
+    data, or None if none was emitted.
+
+    A commit emits this event once, when it has drained every background write,
+    and only at statistics level one and above.
+    """
+    entries = parse_jsonl(output, "revisionCommitStats")
+    return entries[-1] if entries else None
+
+
+def parse_push_stats_json(output: str) -> dict | None:
+    """Parse `lore push --json` output and return the branchPushStats event data,
+    or None if none was emitted. Emitted once, as `parse_commit_stats_json`
+    describes."""
+    entries = parse_jsonl(output, "branchPushStats")
+    return entries[-1] if entries else None
+
+
 def parse_layer_list_json(output: str) -> list[dict]:
     """Parse `lore layer list --json` output into a list of layer entry dicts."""
     return parse_jsonl(output, "layerEntry")

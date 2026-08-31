@@ -156,7 +156,8 @@ pub async fn create_with_metadata(
         let existing = path.join(dot_dir);
         if existing.exists() {
             if call.force() {
-                tokio::fs::remove_dir_all(existing.as_path())
+                lore_io::IoDriver::global()
+                    .remove_dir_all(existing.as_path())
                     .await
                     .internal_with(|| {
                         format!("removing previous repository in path {}", path.display())

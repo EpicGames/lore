@@ -105,6 +105,9 @@ message Path {
   string path = 1;
   bytes address = 2;
   PathType type = 3;
+  // True when a link node tracks its parent's branch; false for pinned
+  // links and non-link nodes.
+  bool tracking = 4;
 }
 
 message PathDiff {
@@ -112,6 +115,17 @@ message PathDiff {
   Path from = 1;
   Path to = 2;
   bool automerged = 3;
+  // Repository the changed content resolves under; empty when it is the
+  // request's own repository. A link pin update is reported as one LINK-typed
+  // entry for the mount path plus the linked repository's per-file changes
+  // remapped under it, and every one of those entries carries the linked
+  // repository here. A consumer fetching content for such an entry MUST
+  // target this repository, not the request's repository id.
+  bytes link_partition = 4;
+  // True when a link change tracks its parent's branch; false for pinned
+  // links and non-link changes. Only meaningful on a LINK-typed entry; read
+  // it from the entry for the mount path itself.
+  bool tracking = 5;
 }
 
 ////////////////////////////////////////////

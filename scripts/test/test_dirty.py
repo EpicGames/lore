@@ -228,6 +228,119 @@ def test_dirty_move(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_dirty_move_of_uncommitted_source_stays_add(new_lore_repo):
+    """A `file dirty move` whose source is not in the revision state reports
+    the destination as action=add with no fromPath, in both a plain status and
+    a `status --scan`.
+
+    The source was never recorded in a commit — it exists only as a dirty add —
+    so there is nothing to move from: the destination inherits the add instead
+    of becoming a move, and --scan retains that add.
+    """
+    repo: Lore = new_lore_repo()
+
+    with repo.open_file("base.txt", "w+") as f:
+        f.write("base\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    # old.txt is only ever a dirty add, never recorded in a commit
+    with repo.open_file("old.txt", "w+") as f:
+        f.write("movable content\n")
+    repo.dirty("old.txt", offline=True)
+
+    pre_move = find_status_entry(get_status_files(repo), "old.txt")
+    assert pre_move is not None, "old.txt should appear in status as a dirty add"
+    assert pre_move["action"] == "add", (
+        f"old.txt should be action=add before the move, got {pre_move['action']!r}"
+    )
+
+    # Rename on disk, then notify Lore of the move
+    os.rename(
+        os.path.join(repo.path, "old.txt"),
+        os.path.join(repo.path, "new.txt"),
+    )
+    repo.dirty_move("old.txt", "new.txt", offline=True)
+
+    # Status without --scan: still an add, with no move provenance
+    entries = get_status_files(repo)
+    entry = find_status_entry(entries, "new.txt")
+    assert entry is not None, "new.txt should appear in status before scan"
+    assert entry["action"] == "add", (
+        "moving a source that is not in the revision state keeps it an add; "
+        f"got action={entry['action']!r} for new.txt"
+    )
+    assert entry.get("fromPath", "") == "", (
+        "new.txt should carry no move provenance, "
+        f"got fromPath={entry.get('fromPath')!r}"
+    )
+    assert entry["flagDirty"] is True, "new.txt should be flagDirty before scan"
+    assert find_status_entry(entries, "old.txt") is None, (
+        "the vacated source path must not appear before scan"
+    )
+
+    # Status with --scan: the add is retained
+    scanned = get_status_files(repo, scan=True)
+    scanned_entry = find_status_entry(scanned, "new.txt")
+    assert scanned_entry is not None, "new.txt should appear in status after scan"
+    assert scanned_entry["action"] == "add", (
+        f"--scan must retain the add; got action={scanned_entry['action']!r} for new.txt"
+    )
+    assert scanned_entry.get("fromPath", "") == "", (
+        "--scan must not invent move provenance, "
+        f"got fromPath={scanned_entry.get('fromPath')!r}"
+    )
+    assert scanned_entry["flagDirty"] is True, "new.txt should stay flagDirty after scan"
+    assert find_status_entry(scanned, "old.txt") is None, (
+        "the vacated source path must not reappear after scan"
+    )
+
+
+@pytest.mark.smoke
+def test_dirty_move_scan_without_prior_status(new_lore_repo):
+    """A file committed at its old path, renamed on disk and marked with
+    `file dirty move`, is reported by `status --scan` as action=move with
+    fromPath=source rather than as a delete of the source plus an add of the
+    destination.
+
+    The scan is the first status run on the working tree, so the filesystem
+    reconciliation has to pick the move up from the dirty marking alone
+    instead of from state a preceding plain status already reported.
+    """
+    repo: Lore = new_lore_repo()
+
+    with repo.open_file("old.txt", "w+") as f:
+        f.write("movable content\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    # Rename on disk, then notify Lore of the move
+    os.rename(
+        os.path.join(repo.path, "old.txt"),
+        os.path.join(repo.path, "new.txt"),
+    )
+    repo.dirty_move("old.txt", "new.txt", offline=True)
+
+    # No plain status in between: --scan is the first status of the tree
+    scanned = get_status_files(repo, scan=True)
+    entry = find_status_entry(scanned, "new.txt")
+    assert entry is not None, "new.txt should appear in status after scan"
+    assert entry["action"] == "move", (
+        "--scan must report the dirty move as a move, not an add; "
+        f"got action={entry['action']!r} for new.txt"
+    )
+    assert to_posix(entry.get("fromPath", "")) == "old.txt", (
+        "--scan must preserve the move provenance; "
+        f"got fromPath={entry.get('fromPath')!r} for new.txt"
+    )
+    assert entry["flagDirty"] is True, "new.txt should be flagDirty after scan"
+    assert find_status_entry(scanned, "old.txt") is None, (
+        "--scan must not report the move source as a separate delete entry; "
+        "a move must not degrade into delete + add"
+    )
+
+
+@pytest.mark.smoke
 def test_dirty_copy(new_lore_repo):
     """Mark a file as dirty-copied and verify status."""
     repo: Lore = new_lore_repo()
@@ -2806,3 +2919,111 @@ def test_dirty_add_repeated_is_idempotent(new_lore_repo):
     repo.dirty(added, offline=True)
     check("second dirty, plain status")
     check("second dirty, --check-dirty", check_dirty=True)
+
+
+@pytest.mark.smoke
+def test_scan_answers_from_recorded_mtime_after_commit(new_lore_repo):
+    """A commit reads and hashes every file it commits, and records the modified time it
+    read each at. The next scan must answer from those times: a repository that has just
+    been committed has nothing left to measure.
+
+    Without the recording the scan re-hashes the whole tree to reach the answer the commit
+    already had, which the summary reports as a hash check per file.
+    """
+    repo: Lore = new_lore_repo()
+
+    file_count = 8
+    for index in range(file_count):
+        with repo.open_file(f"recorded{index}.bin", "w+b") as f:
+            f.write(os.urandom(4096))
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    summary = parse_status_summary_json(repo.status(scan=True, json=True, offline=True))
+    assert summary is not None, "scan must emit a repositoryStatusSummary event"
+    assert summary["hashChecks"] == 0, (
+        f"a scan straight after a commit must measure no file, got {summary}"
+    )
+    assert summary["mtimeMatches"] == file_count, (
+        f"every committed file should be answered by its recorded time, got {summary}"
+    )
+    assert summary["modifies"] == 0, summary
+
+
+@pytest.mark.smoke
+def test_scan_hashes_a_same_size_edit(new_lore_repo):
+    """An edit that keeps the file's size cannot be settled by the size comparison, so the
+    scan has to measure the content against the node to tell it from an untouched file.
+
+    Asserting the hash check happened is what separates this from a size-changing edit,
+    which any comparison would catch.
+    """
+    repo: Lore = new_lore_repo()
+
+    file_count = 8
+    for index in range(file_count):
+        with repo.open_file(f"sized{index}.bin", "w+b") as f:
+            f.write(os.urandom(4096))
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    with repo.open_file("sized3.bin", "w+b") as f:
+        f.write(os.urandom(4096))
+
+    output = repo.status(scan=True, json=True, offline=True)
+    entry = find_status_entry(parse_status_json(output), "sized3.bin")
+    assert entry is not None, "a same-size edit must be reported by the scan"
+    assert entry["flagDirty"] is True, entry
+
+    summary = parse_status_summary_json(output)
+    assert summary is not None, "scan must emit a repositoryStatusSummary event"
+    assert summary["modifies"] == 1, summary
+    assert summary["hashChecks"] == 1, (
+        f"the edited file must be measured, not decided by size, got {summary}"
+    )
+    assert summary["mtimeMatches"] == file_count - 1, (
+        f"the untouched files should still be answered by recorded time, got {summary}"
+    )
+
+
+@pytest.mark.smoke
+def test_scan_records_mtime_after_hash_check(new_lore_repo):
+    """A file restored to its committed content has a new modified time, so the recorded
+    one no longer vouches for it and the scan measures it. Establishing the match is what
+    lets the scan record the new time, so the next scan answers without measuring again.
+
+    Without that recording the file is measured on every scan for as long as it is neither
+    written nor committed.
+    """
+    repo: Lore = new_lore_repo()
+
+    original = os.urandom(4096)
+    with repo.open_file("reverted.bin", "w+b") as f:
+        f.write(original)
+    with repo.open_file("untouched.bin", "w+b") as f:
+        f.write(os.urandom(4096))
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    # Same size, different content, then the committed bytes back again. The content
+    # matches the node once more but the modified time has moved on twice.
+    with repo.open_file("reverted.bin", "w+b") as f:
+        f.write(os.urandom(4096))
+    with repo.open_file("reverted.bin", "w+b") as f:
+        f.write(original)
+
+    output = repo.status(scan=True, json=True, offline=True)
+    assert find_status_entry(parse_status_json(output), "reverted.bin") is None, (
+        "a file restored to its committed content is not a change"
+    )
+    summary = parse_status_summary_json(output)
+    assert summary is not None, "scan must emit a repositoryStatusSummary event"
+    assert summary["hashChecks"] == 1, (
+        f"the restored file must be measured to establish the match, got {summary}"
+    )
+
+    summary = parse_status_summary_json(repo.status(scan=True, json=True, offline=True))
+    assert summary["hashChecks"] == 0, (
+        f"the established match must be recorded, sparing the next scan, got {summary}"
+    )
+    assert summary["mtimeMatches"] == 2, summary

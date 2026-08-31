@@ -14,6 +14,14 @@ enum NodeType {
   LINK = 2;
 }
 
+// File mode for a file-system entry.
+enum FileMode {
+  // No special file mode.
+  NONE = 0;
+  // File is executable.
+  EXECUTABLE = 1;
+}
+
 // Per-path action describing what happened between two states (or relative
 // to the common ancestor in 3-way merges).
 enum Action {
@@ -76,6 +84,10 @@ message DiffChange {
   // fetch for this change MUST target the corresponding partition,
   // not the request's repository id.
   uint32 link_repository_index = 8;
+  // True when a link change tracks its parent's branch; false for pinned
+  // links and non-link changes. Only meaningful on a LINK-typed entry; read
+  // it from the entry for the mount path itself.
+  bool tracking = 9;
 }
 
 // Pair of per-path changes describing a 3-way merge conflict at a single
@@ -113,6 +125,13 @@ message TreeNode {
   NodeType node_type = 2;
   // Content address for FILE / LINK entries; unused for DIRECTORY.
   lore.model.v1.Address address = 3;
+  // Original size in bytes. For DIRECTORY entries, this is the cumulative size of its descendant files.
+  uint64 size = 4;
+  // File mode for this entry. For possible flags and values, see enum FileMode.
+  uint64 mode = 5;
+  // True when a link entry tracks its parent's branch; false for pinned links
+  // and non-link entries.
+  bool tracking = 6;
 }
 
 // Self-describing revision record. Carries the resolved RevisionIdentifier
@@ -127,7 +146,7 @@ message Revision {
   lore.model.v1.RevisionIdentifier identifier = 2;
   // Free-form commit message.
   string commit_message = 3;
-  // Commit timestamp (Unix epoch seconds). Always commit time, never
+  // Commit timestamp (Unix epoch milliseconds). Always commit time, never
   // authorship time.
   uint64 timestamp = 4;
   // Identity that originally created the revision.

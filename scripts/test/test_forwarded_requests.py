@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 @pytest.mark.smoke
 @pytest.mark.xdist_group("forwarded_requests")
-class TestForwardedBranchCreate:
+class TestForwardedBranch:
     """
     Smoke tests for the forwarded-request delegation path.
 
@@ -26,7 +26,7 @@ class TestForwardedBranchCreate:
     so branch state is fully isolated between them. Server 2 is configured with
     [server.grpc_public_services.forwarded_requests] pointing at Server 1's
     internal gRPC port and revision_branch_create = true. When a client calls
-    BranchCreate on Server 2, Server 2 forwards the request to Server 1 instead
+    e.g. BranchCreate on Server 2, Server 2 forwards the request to Server 1 instead
     of executing it locally.
 
     Because the mutable stores are separate, the store Server 2 writes to is
@@ -65,14 +65,16 @@ class TestForwardedBranchCreate:
             server_root, server_env, lore_server_executable_path
         )
         yield server_proc, log_path, log_fd
-        _kill_server_by_pid(server_proc.pid, log_path, label="forwarded requests server 1")
+        _kill_server_by_pid(
+            server_proc.pid, log_path, label="forwarded requests server 1"
+        )
         log_fd.close()
 
     @pytest.fixture(scope="class")
     def server_2_config(self, request, tmp_path_factory, server_1_config):
         """
         Config for Server 2: the delegation *source*. Its local.toml is extended
-        with the forwarded_requests block that tells it to forward BranchCreate
+        with the forwarded_requests block that tells it to forward operations
         to Server 1's internal gRPC port. No certs are needed because Server 1's
         internal listener runs without TLS in this test.
         """
@@ -94,14 +96,15 @@ class TestForwardedBranchCreate:
         # Point Server 2's forwarded_requests client at Server 1's internal gRPC port
         # and enable the branch_create delegation flag
         with open(
-                os.path.join(server_root, "lore-server", "config", "local.toml"),
-                "a",
-                encoding="utf-8",
+            os.path.join(server_root, "lore-server", "config", "local.toml"),
+            "a",
+            encoding="utf-8",
         ) as f:
             f.write("[server.grpc_public_services.forwarded_requests.client]\n")
             f.write(f'url = "http://{server_hostname}:{server_1_internal_port}"\n')
             f.write("[server.grpc_public_services.forwarded_requests.enabled_rpcs]\n")
             f.write("revision_branch_create = true\n")
+            f.write("revision_branch_list = true\n")
 
         return server_root, server_env
 
@@ -117,18 +120,20 @@ class TestForwardedBranchCreate:
             server_root, server_env, lore_server_executable_path
         )
         yield server_proc, log_path, log_fd
-        _kill_server_by_pid(server_proc.pid, log_path, label="forwarded requests server 2")
+        _kill_server_by_pid(
+            server_proc.pid, log_path, label="forwarded requests server 2"
+        )
         log_fd.close()
 
     @pytest.fixture()
     def repos(
-            self,
-            request,
-            server_1_config,
-            server_2_config,
-            server_1,
-            server_2,
-            new_lore_repo,
+        self,
+        request,
+        server_1_config,
+        server_2_config,
+        server_1,
+        server_2,
+        new_lore_repo,
     ):
         """
         Create two lore clients pointing at different servers but sharing the
@@ -185,7 +190,9 @@ class TestForwardedBranchCreate:
         # branch_create is local-only; the BranchCreate RPC is only sent to
         # the server when the branch is explicitly pushed. branch_push triggers
         # that RPC on Server 2, which delegates it to Server 1.
-        logger.info("Creating branch '%s' via server 2 (delegates to server 1)", branch_name)
+        logger.info(
+            "Creating branch '%s' via server 2 (delegates to server 1)", branch_name
+        )
         server_2_repo.branch_create(branch_name)
         server_2_repo.branch_push(branch_name)
 
@@ -194,8 +201,192 @@ class TestForwardedBranchCreate:
             f"Branch '{branch_name}' should exist on server 1 after delegated create"
         )
 
-        # Server 2's mutable store was never written to — branch absent there
-        assert not server_2_repo.branch_list().has_remote_branch(branch_name), (
-            f"Branch '{branch_name}' should not exist on server 2's store "
+    @pytest.mark.smoke
+    def test_branch_list_delegates_read_to_server_1(self, repos):
+        """Verify delegation by listing via Server 2 and checking the result comes from Server 1."""
+        server_1_repo, server_2_repo = repos
+        branch_names = [
+            f"feature-{uuid.uuid4().hex[:8]}",
+            f"feature-{uuid.uuid4().hex[:8]}",
+        ]
+
+        # Push both branches directly to Server 1 — Server 2 never receives
+        # BranchCreate RPCs for them, so they are absent from Server 2's store.
+        for branch_name in branch_names:
+            logger.info("Pushing branch '%s' directly to server 1", branch_name)
+            server_1_repo.branch_create(branch_name)
+            server_1_repo.branch_push(branch_name)
+
+        # Server 1's store has all branches
+        for branch_name in branch_names:
+            assert server_1_repo.branch_list().has_remote_branch(branch_name), (
+                f"Branch '{branch_name}' should exist on server 1 after direct push"
+            )
+
+        # Listing via Server 2 delegates to Server 1 — all branches appear even
+        # though none were written to Server 2's mutable store.
+        for branch_name in branch_names:
+            assert server_2_repo.branch_list().has_remote_branch(branch_name), (
+                f"Branch '{branch_name}' should appear in server 2's delegated list "
+                "(BranchList was forwarded to server 1)"
+            )
+
+
+@pytest.mark.smoke
+@pytest.mark.xdist_group("forwarded_requests")
+class TestForwardedRepositoryCreate:
+    """
+    Smoke tests for the forwarded-request delegation path for RepositoryCreate.
+
+    Two independent Lore servers are started, each with their own mutable store.
+    Server 2 is configured with repository_create = true, pointing at
+    Server 1's internal gRPC port. When a client calls RepositoryCreate on Server 2,
+    Server 2 forwards the request to Server 1 instead of executing it locally.
+
+    The proof of delegation is the state of the two mutable stores after the call.
+    Because each server owns a completely separate store, a repository can only appear
+    in a store if that server executed the write itself:
+
+      - Server 1's store contains the repository  → Server 1 ran the write
+      - Server 2's store does not                 → Server 2 did not run it locally
+
+    A successful response from Server 2 alone would not distinguish delegation from
+    local execution; the repository-list assertions are what makes this meaningful.
+    """
+
+    @pytest.fixture(scope="class")
+    def server_1_config(self, request, tmp_path_factory):
+        """
+        Config for Server 1: the delegation *target*. Its internal gRPC server
+        is enabled without mTLS so Server 2 can reach it over plain HTTP/2.
+        """
+        shared_port = allocate_free_port()
+        ports = {
+            "quic": shared_port,
+            "grpc": shared_port,
+            "http": allocate_free_port(),
+            "internal": allocate_free_port(),
+        }
+        server_root, server_env = generate_server_config(
+            request, tmp_path_factory, ports
+        )
+        server_env["LORE__SERVER__GRPC_INTERNAL__ENABLED"] = "true"
+        server_env["LORE__SERVER__GRPC_INTERNAL__VERIFY_CLIENT_CERTS"] = "false"
+        return server_root, server_env
+
+    @pytest.fixture(scope="class")
+    def server_1(self, server_1_config, lore_server_executable_path):
+        """Launches Server 1 and tears it down after the class finishes."""
+        server_root, server_env = server_1_config
+        server_proc, log_path, log_fd = launch_lore_server(
+            server_root, server_env, lore_server_executable_path
+        )
+        yield server_proc, log_path, log_fd
+        _kill_server_by_pid(
+            server_proc.pid, log_path, label="forwarded repository server 1"
+        )
+        log_fd.close()
+
+    @pytest.fixture(scope="class")
+    def server_2_config(self, request, tmp_path_factory, server_1_config):
+        """
+        Config for Server 2: the delegation *source*. Its local.toml is extended
+        with the forwarded_requests block that tells it to forward RepositoryCreate
+        to Server 1's internal gRPC port.
+        """
+        shared_port = allocate_free_port()
+        ports = {
+            "quic": shared_port,
+            "grpc": shared_port,
+            "http": allocate_free_port(),
+            "internal": allocate_free_port(),
+        }
+        server_root, server_env = generate_server_config(
+            request, tmp_path_factory, ports
+        )
+
+        _, server_1_env = server_1_config
+        server_1_internal_port = server_1_env["LORE__SERVER__GRPC_INTERNAL__PORT"]
+        server_hostname = request.config.getoption("--lore-server-hostname")
+
+        with open(
+            os.path.join(server_root, "lore-server", "config", "local.toml"),
+            "a",
+            encoding="utf-8",
+        ) as f:
+            f.write("[server.grpc_public_services.forwarded_requests.client]\n")
+            f.write(f'url = "http://{server_hostname}:{server_1_internal_port}"\n')
+            f.write("[server.grpc_public_services.forwarded_requests.enabled_rpcs]\n")
+            f.write("repository_create = true\n")
+
+        return server_root, server_env
+
+    @pytest.fixture(scope="class")
+    def server_2(self, server_2_config, server_1, lore_server_executable_path):
+        """
+        Launches Server 2 and tears it down after the class finishes.
+        Depends on server_1 so that Server 1's internal gRPC port is ready
+        before Server 2 starts and attempts its first outbound connection.
+        """
+        server_root, server_env = server_2_config
+        server_proc, log_path, log_fd = launch_lore_server(
+            server_root, server_env, lore_server_executable_path
+        )
+        yield server_proc, log_path, log_fd
+        _kill_server_by_pid(
+            server_proc.pid, log_path, label="forwarded repository server 2"
+        )
+        log_fd.close()
+
+    @pytest.mark.smoke
+    def test_repository_create_delegates_write_to_server_1(
+        self,
+        request,
+        server_1_config,
+        server_2_config,
+        server_1,
+        server_2,
+        new_lore_repo,
+    ):
+        """Verify delegation by checking which store holds the repository after the call."""
+        server_hostname = request.config.getoption("--lore-server-hostname")
+        _, server_1_env = server_1_config
+        _, server_2_env = server_2_config
+
+        remote_url_server_1 = (
+            f"lore://{server_hostname}:{server_1_env['LORE__SERVER__GRPC__PORT']}"
+        )
+        remote_url_server_2 = (
+            f"lore://{server_hostname}:{server_2_env['LORE__SERVER__GRPC__PORT']}"
+        )
+
+        repo_name = f"delegated-repo-{uuid.uuid4().hex[:8]}"
+        repo_id = uuid.uuid4().hex
+
+        logger.info(
+            "Creating repository '%s' via server 2 (delegates to server 1)", repo_name
+        )
+        repo_via_server_2 = new_lore_repo(
+            remote_url=remote_url_server_2,
+            remote_path=f"{remote_url_server_2}/{repo_name}",
+            repo_id=repo_id,
+        )
+
+        # Create a client pointing at Server 1 (no repo create) for querying its store
+        server_1_client = new_lore_repo(
+            remote_url=remote_url_server_1,
+            create_repo=False,
+        )
+
+        # The write went to Server 1's mutable store — repository exists there
+        server_1_list = server_1_client.repository_list()
+        assert repo_name in server_1_list, (
+            f"Repository '{repo_name}' should exist in Server 1's store after delegated create"
+        )
+
+        # Server 2's mutable store was never written to — repository absent there
+        server_2_list = repo_via_server_2.repository_list()
+        assert repo_name not in server_2_list, (
+            f"Repository '{repo_name}' should not exist in Server 2's store "
             "(request was delegated, not written locally)"
         )

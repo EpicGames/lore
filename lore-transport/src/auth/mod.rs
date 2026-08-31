@@ -31,9 +31,9 @@ pub mod authentication {
         auth_url
             .split_once("://")
             .map(|(scheme, _)| scheme)
-            .ok_or(ProtocolError::internal(format!(
-                "invalid auth URL (missing scheme): '{auth_url}'"
-            )))
+            .ok_or_else(|| {
+                ProtocolError::internal(format!("invalid auth URL (missing scheme): '{auth_url}'"))
+            })
     }
 
     /// Finds the `Authentication` implementation for the given auth URL by
@@ -49,22 +49,23 @@ pub mod authentication {
         });
 
         let scheme = parse_scheme(auth_url)?;
-        // Collect result and available schemes under a single lock acquisition
-        let (result, available) = {
+        // The lookup and the scheme list the error reports share one lock
+        // acquisition, but the list is only collected on a miss, so a hit never
+        // pays to clone every registered key.
+        let found = {
             let map = AUTHENTICATION_MAP.lock();
-            let result = map.as_ref().and_then(|m| m.get(scheme).cloned());
-            let available: Vec<String> = map
-                .as_ref()
-                .map(|m| m.keys().cloned().collect())
-                .unwrap_or_default();
-            (result, available)
+            let auth = map.as_ref().and_then(|m| m.get(scheme).cloned());
+            auth.ok_or_else(|| {
+                map.as_ref()
+                    .map(|m| m.keys().cloned().collect::<Vec<String>>())
+                    .unwrap_or_default()
+            })
         };
-        match result {
-            Some(auth) => Ok(auth),
-            None => Err(ProtocolError::internal(format!(
+        found.map_err(|available| {
+            ProtocolError::internal(format!(
                 "no authentication implementation registered for scheme '{scheme}' (available: {available:?})",
-            ))),
-        }
+            ))
+        })
     }
 
     /// Registers an `Authentication` implementation for the given scheme.

@@ -25,11 +25,17 @@ pub type LoreLogLevel = lore_base::log::LoreLogLevel;
 pub type LoreBranchLocation = lore_revision::interface::LoreBranchLocation;
 
 pub type Context = lore_storage::Context;
+pub type Partition = lore_storage::Partition;
 pub type Hash = lore_storage::Hash;
 pub type Fragment = lore_storage::Fragment;
 pub type FragmentFlags = lore_storage::FragmentFlags;
+pub use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 pub type LoreString = lore_revision::interface::LoreString;
 pub type LoreArray<T> = lore_revision::interface::LoreArray<T>;
+
+/// Named by `lore_repository_create_args_t::use_shared_store`; re-exported so callers need no
+/// dependency on `lore_revision`.
+pub use lore_revision::repository::LoreSharedStoreMode;
 
 use crate::call_delegation::run_asynchronously;
 use crate::call_delegation::run_synchronously;
@@ -53,6 +59,10 @@ pub type LoreRevisionInfoDeltaEventData =
     lore_revision::revision::info::LoreRevisionInfoDeltaEventData;
 pub type LoreRevisionCommitRevisionEventData =
     lore_revision::commit::LoreRevisionCommitRevisionEventData;
+pub type LoreRevisionCommitStatsEventData = lore_revision::commit::LoreRevisionCommitStatsEventData;
+pub type LoreCommitFileStatsData = lore_revision::commit::LoreCommitFileStatsData;
+pub type LoreBranchPushStatsEventData = lore_revision::branch::push::LoreBranchPushStatsEventData;
+pub type LoreFragmentStatsData = lore_storage::FragmentWriteCounts;
 pub type LoreRevisionSyncProgressEventData =
     lore_revision::revision::sync::LoreRevisionSyncProgressEventData;
 pub type LoreRevisionSyncFileEventData =
@@ -61,6 +71,8 @@ pub type LoreRevisionSyncRevisionEventData =
     lore_revision::revision::sync::LoreRevisionSyncRevisionEventData;
 pub type LoreRevisionBisectEventData = lore_revision::revision::bisect::LoreRevisionBisectEventData;
 pub type LoreLinkChangeEventData = lore_revision::link::LoreLinkChangeEventData;
+pub type LoreLinkEntryEventData = lore_revision::event::LoreLinkEntryEventData;
+pub type LoreLinkBranchCreateEventData = lore_revision::link::LoreLinkBranchCreateEventData;
 pub type LoreFragmentWriteEventData = lore_revision::immutable::LoreFragmentWriteEventData;
 pub type LoreCompleteEventData = lore_revision::event::LoreCompleteEventData;
 pub type LoreMaintenanceEventData = lore_revision::event::LoreMaintenanceEventData;
@@ -419,6 +431,12 @@ pub type LoreBranchCreateArgs = crate::branch::LoreBranchCreateArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_BRANCH_CREATE` | `lore_branch_create_event_data_t` | Emitted when the branch has been successfully created, includes branch name and id |
+///
+/// ## Link Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LINK_BRANCH_CREATE` | `lore_link_branch_create_event_data_t` | Emitted once per linked repository mount, reporting whether its branch was created or an existing one reused |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_branch_create(
     globals: &LoreGlobalArgs,
@@ -450,6 +468,12 @@ pub extern "C" fn lore_branch_create(
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_BRANCH_CREATE` | `lore_branch_create_event_data_t` | Emitted when the branch has been successfully created, includes branch name and id |
+///
+/// ## Link Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LINK_BRANCH_CREATE` | `lore_link_branch_create_event_data_t` | Emitted once per linked repository mount, reporting whether its branch was created or an existing one reused |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_branch_create_async(
     globals: &LoreGlobalArgs,
@@ -3524,6 +3548,7 @@ pub type LoreLinkAddArgs = crate::link::LoreLinkAddArgs;
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_REPOSITORY_CLONE_BEGIN` | `lore_repository_clone_begin_event_data_t` | Emitted when cloning a linked repository begins |
 /// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted when cloning a linked repository completes |
+/// | `LORE_EVENT_LINK_BRANCH_CREATE` | `lore_link_branch_create_event_data_t` | Emitted when branching is enabled, reporting whether the link's branch was created or an existing one reused |
 /// | `LORE_EVENT_LINK_CHANGE` | `lore_link_change_event_data_t` | Emitted when the link has been added and saved |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_link_add(
@@ -3557,6 +3582,7 @@ pub extern "C" fn lore_link_add(
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_REPOSITORY_CLONE_BEGIN` | `lore_repository_clone_begin_event_data_t` | Emitted when cloning a linked repository begins |
 /// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted when cloning a linked repository completes |
+/// | `LORE_EVENT_LINK_BRANCH_CREATE` | `lore_link_branch_create_event_data_t` | Emitted when branching is enabled, reporting whether the link's branch was created or an existing one reused |
 /// | `LORE_EVENT_LINK_CHANGE` | `lore_link_change_event_data_t` | Emitted when the link has been added and saved |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_link_add_async(
@@ -3629,6 +3655,70 @@ pub extern "C" fn lore_link_remove_async(
     callback: LoreEventCallbackConfig,
 ) {
     run_asynchronously(globals, args, callback, crate::link::remove);
+}
+
+pub type LoreLinkInfoArgs = crate::link::LoreLinkInfoArgs;
+
+/// Report detailed information about a single repository link.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+///
+/// ## Link Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LINK_INFO` | `lore_link_info_event_data_t` | Emitted once for the described link |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_link_info(
+    globals: &LoreGlobalArgs,
+    args: &LoreLinkInfoArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, crate::link::info)
+}
+
+/// Asynchronous version of `lore_link_info`.
+///
+/// # Events
+///
+/// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LOG` | `lore_log_event_data_t` | Diagnostic messages throughout execution |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | `LORE_EVENT_END` | `lore_end_event_data_t` | Always emitted after `COMPLETE` to signal callback termination |
+///
+/// ## Link Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_LINK_INFO` | `lore_link_info_event_data_t` | Emitted once for the described link |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_link_info_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreLinkInfoArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, crate::link::info);
 }
 
 pub type LoreLinkListArgs = crate::link::LoreLinkListArgs;
@@ -6228,7 +6318,7 @@ pub type LoreStoragePutArgs = crate::storage::put::LoreStoragePutArgs;
 ///
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
-/// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item — success or failure |
+/// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item — success or failure; `stored_local`/`stored_remote` report where the content landed |
 /// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
 /// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
 #[unsafe(no_mangle)]
@@ -6281,6 +6371,133 @@ pub extern "C" fn lore_storage_get_async(
     callback: LoreEventCallbackConfig,
 ) {
     run_asynchronously(globals, args, callback, crate::storage::get::get);
+}
+
+pub type LoreStorageGetResolvedItem = crate::storage::get_resolved::LoreStorageGetResolvedItem;
+pub type LoreStorageGetResolvedArgs = crate::storage::get_resolved::LoreStorageGetResolvedArgs;
+
+/// Resolve one or more mutable keys and read the content they name, in one round trip.
+///
+/// `lore_storage_mutable_load` followed by `lore_storage_get`, performed by the server. The keys
+/// are read under the `LORE_KEY_TYPE_RESOLVE` key type, which is what `lore_storage_put_resolved`
+/// publishes; no other key type is resolvable this way.
+///
+/// The `address` in every event is the *resolved* address, so a caller can learn the key-to-hash
+/// mapping from the event stream. A key with no mapping, or one naming absent content, reports
+/// `error_code = ADDRESS_NOT_FOUND`, and the terminal event then carries a zero address.
+///
+/// Set `streaming` to receive one `LORE_EVENT_STORAGE_GET_DATA` per leaf fragment instead of a
+/// single reassembled buffer, exactly as `lore_storage_get` does. Without it the whole content is
+/// materialised in memory before the first byte reaches the callback, so a key naming something
+/// large should set it.
+///
+/// # Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_STORAGE_GET_HEADER` | `lore_storage_get_header_event_data_t` | Size of the item's reassembled content, emitted before any DATA events |
+/// | `LORE_EVENT_STORAGE_GET_DATA` | `lore_storage_get_data_event_data_t` | Payload bytes — valid only during the callback invocation. One event per item, or one per leaf fragment when `streaming` is set |
+/// | `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE` | `lore_storage_get_item_complete_event_data_t` | Terminal per-item event |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_get_resolved(
+    globals: &LoreGlobalArgs,
+    args: &LoreStorageGetResolvedArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::get_resolved::get_resolved,
+    )
+}
+
+/// Resolve one or more mutable keys and read the content they name (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_get_resolved_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreStorageGetResolvedArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::get_resolved::get_resolved,
+    );
+}
+
+pub type LoreStoragePutResolvedItem = crate::storage::put_resolved::LoreStoragePutResolvedItem;
+pub type LoreStoragePutResolvedArgs = crate::storage::put_resolved::LoreStoragePutResolvedArgs;
+
+/// Store one or more buffers and publish a mutable key naming each, in one round trip.
+///
+/// `lore_storage_put` followed by `lore_storage_mutable_store`, fused into one request when the
+/// content fits a single fragment. The key is published under `LORE_KEY_TYPE_RESOLVE`, making it
+/// readable by `lore_storage_get_resolved`, and the mapping is written only once the content is
+/// stored — so a key published this way never resolves to content that is not there. Writing the
+/// same key type directly with `lore_storage_mutable_store` carries no such guarantee.
+///
+/// The local store always receives both the content and the mapping. `remote_write = 1` also
+/// publishes them remotely, matching `lore_storage_put`; there is no local-then-remote fallback.
+/// A zero `key` or a zero `partition` rejects with `INVALID_ARGUMENTS`.
+///
+/// A zero-length `data` **removes** the key's mapping rather than publishing one: no content is
+/// stored, the key is set to the zero hash, and `lore_storage_get_resolved` then reports
+/// `ADDRESS_NOT_FOUND` for it. The terminal event carries the zero content hash and the caller's
+/// context.
+///
+/// With `remote_write = 0` this evicts only the locally cached mapping. The local mutable store
+/// is a cache, not an authority, so a key published remotely resolves again on the next call.
+/// Deleting a published key requires `remote_write = 1`.
+///
+/// A remote content upload that fails still leaves a successful local write, so the key is not
+/// published remotely and `stored_remote` is `0` while `error_code` stays `NONE`. Check
+/// `stored_remote`, not `error_code`, to confirm the key is visible to other clients.
+///
+/// Publishing is last-writer-wins. Two callers publishing the same key concurrently both
+/// succeed, and the key ends up naming whichever content was published second — the first
+/// publisher is not told it was overwritten. Callers needing to detect a lost update should
+/// store the content with `lore_storage_put` and publish with
+/// `lore_storage_mutable_compare_and_swap`, which costs the second round trip this operation
+/// exists to avoid.
+///
+/// # Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item; `address` is the content the key now resolves to, and `stored_local`/`stored_remote` report where it landed |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_put_resolved(
+    globals: &LoreGlobalArgs,
+    args: &LoreStoragePutResolvedArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::put_resolved::put_resolved,
+    )
+}
+
+/// Store one or more buffers and publish a mutable key naming each (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_put_resolved_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreStoragePutResolvedArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::put_resolved::put_resolved,
+    );
 }
 
 pub type LoreStorageCloseArgs = crate::storage::close::LoreStorageCloseArgs;
@@ -6948,8 +7165,7 @@ pub extern "C" fn lore_notification_unsubscribe_async(
 /// was not.
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_log_configure(config: &LoreLogConfig) -> i32 {
-    log::configure(config);
-    0
+    log::configure(config)
 }
 
 /// Shut the library down, stopping its worker threads and releasing the
@@ -6964,17 +7180,49 @@ pub extern "C" fn lore_shutdown() -> i32 {
 
 /// Limits the total number of threads Lore sizes its pools for.
 ///
-/// Lore internally decides how many worker, blocking and compute threads to use
-/// based on this ceiling and the host's processor count. Pass `0` for "no
-/// limit" (the default — pools are sized from the processor count). The
-/// `LORE_MAX_THREADS` environment variable overrides this count when set above
-/// zero. The `LORE_WORKER_THREADS`, `LORE_BLOCKING_THREADS` and
-/// `LORE_COMPUTE_THREADS` environment variables still override the count of
-/// their respective pool with an absolute value when set.
+/// Pass `0` for "no limit", which is the default and sizes every pool from the
+/// host's processor count. The `LORE_MAX_THREADS` environment variable overrides
+/// this count when set above zero.
 ///
-/// Must be called before the first Lore operation, while the runtime and
-/// compute pool are still unconstructed. Returns `0` if the limit was applied,
-/// `1` if it had already been set (or the runtime was already running).
+/// # The pools
+///
+/// Four pools share the limit:
+///
+/// - **worker** — the async runtime executing Lore's own work. Asks for one
+///   thread per processor.
+/// - **blocking** — OS APIs with no async form (keyring, cloud SDK
+///   initialization, service IPC). Asks for 3 regardless of processor count,
+///   two for the async runtime and one for the network runtime, because file
+///   I/O does not run here.
+/// - **net** — the network runtime carrying QUIC, TLS and HTTP/2, kept separate
+///   so protocol timers are not delayed by other work. Asks for 2 on a client,
+///   one per processor on a server.
+/// - **io** — the syscall pool every file operation dispatches through. Asks for
+///   twice the processor count, capped at 16.
+///
+/// # How a limit is divided
+///
+/// Each pool states an ideal, as above. Where a pool takes a configuration or
+/// environment control (`LORE_NET_THREADS`, `LORE_IO_POOL_THREADS`, the server's
+/// thread settings), that control raises the pool's ideal — it never sets the
+/// pool's final size, so no knob can lift the process above a limit set here.
+/// Retired per-pool variables are ignored outright.
+///
+/// With no limit, every pool gets its ideal. With one, the pools are scaled to
+/// fit by the largest-remainder method: each is granted its proportional share
+/// of the limit, and the threads left over by rounding go to the pools with the
+/// largest remainders. A pool never drops below 2 threads, since a starved pool
+/// can deadlock work another pool waits on. That floor outranks the limit, so a
+/// limit below 8 yields 8.
+///
+/// # What is not counted
+///
+/// Threads the host application or a linked library creates. Lore accounts only
+/// for its own.
+///
+/// Must be called before the first Lore operation, while the runtime is still
+/// unconstructed. Returns `0` if the limit was applied, `1` if it had already
+/// been set (or the runtime was already running).
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_set_thread_limit(count: usize) -> i32 {
     if crate::set_thread_limit(count) { 0 } else { 1 }
@@ -7442,5 +7690,504 @@ pub extern "C" fn lore_revision_tree_node_path_async(
         args,
         callback,
         crate::revision_tree::node_path::node_path,
+    );
+}
+
+pub type LoreRevisionTreeAddArgs = crate::revision_tree::add::LoreRevisionTreeAddArgs;
+
+/// Add a batch of nodes to a loaded revision tree. An entry parents onto an
+/// existing node or onto an earlier entry, so one call builds a subtree. Every
+/// entry is checked before any node is created, so one bad entry rejects the
+/// call and creates nothing; the reason names the offending entry's batch index,
+/// which a caller leaving `entry_id` at zero has no other way to identify. A failure
+/// after those checks pass is internal and may leave part of the batch created.
+///
+/// A link entry's target revision is not resolved here, so a link naming a
+/// revision that cannot be read is accepted and fails only when something later
+/// reads through it. Entries under separate parents are created concurrently,
+/// but allocating a node slot is serialized per loaded tree.
+///
+/// | Terminal event                            | Payload                                          | Notes                                                    |
+/// |-------------------------------------------|--------------------------------------------------|----------------------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_ADD_COMPLETE`   | `lore_revision_tree_add_complete_event_data_t`   | One per entry, carrying its `entry_id`                    |
+/// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE` | `lore_revision_tree_batch_complete_event_data_t` | Exactly one, carrying the `batch_id` and the call's outcome |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_add(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeAddArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, crate::revision_tree::add::add)
+}
+
+/// Add a batch of nodes to a loaded revision tree (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_add_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeAddArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, crate::revision_tree::add::add);
+}
+
+pub type LoreRevisionTreeDeleteArgs = crate::revision_tree::delete::LoreRevisionTreeDeleteArgs;
+
+/// Remove a batch of subtrees from a loaded revision tree. Each entry names a
+/// subtree root and removes it whole, transitive children included. Every entry
+/// is checked before any node is touched, so one bad entry rejects the call and
+/// leaves every subtree in place; the reason names the offending entry's batch
+/// index, which a caller leaving `entry_id` at zero has no other way to
+/// identify. A failure after those checks pass is internal and may leave part of
+/// the batch removed.
+///
+/// A node the loaded revision holds is **staged** for deletion and stays in the
+/// tree: it keeps its name and its place among its siblings, still lists through
+/// `lore_revision_tree_list_children`, and reports
+/// `LORE_NODE_STAGED_ACTION_DELETE` in its `staged_action`. The commit that
+/// freezes the tree is what drops it. A node added through this handle is in no
+/// revision yet, so it is discarded outright instead, freeing its name and its
+/// node id. A link is removed as one node — its subtree belongs to the linked
+/// repository's tree.
+///
+/// A staged deletion is reversible: `lore_revision_tree_add` of the same name
+/// under the same parent with the same kind restores the node. A zero
+/// `address.context` on that add preserves the node's `file_id`; supplying one
+/// replaces it, as on `lore_revision_tree_modify`. Only the named node comes back
+/// — restoring a directory leaves its children staged for deletion, so each has to
+/// be added back in turn. A discarded node is not restorable, since its id is
+/// gone.
+///
+/// Staging fans out one depth level at a time; discarding an added node rewrites
+/// sibling pointers and so runs serially, deepest first. Memory while the call
+/// runs is proportional to the widest level of the subtrees being removed rather
+/// than to the entry count, since a level is collected before it is staged. The
+/// root cannot be deleted, and an entry whose ancestor another entry deletes is
+/// rejected rather than removed twice.
+///
+/// | Terminal event                              | Payload                                           | Notes                                                    |
+/// |---------------------------------------------|---------------------------------------------------|----------------------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_DELETE_COMPLETE`  | `lore_revision_tree_delete_complete_event_data_t` | One per entry, carrying its `entry_id` and `node_count`   |
+/// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE`   | `lore_revision_tree_batch_complete_event_data_t`  | Exactly one, carrying the `batch_id` and the call's outcome |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_delete(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeDeleteArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::delete::delete,
+    )
+}
+
+/// Remove a batch of subtrees from a loaded revision tree (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_delete_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeDeleteArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::delete::delete,
+    );
+}
+
+pub type LoreRevisionTreeModifyArgs = crate::revision_tree::modify::LoreRevisionTreeModifyArgs;
+
+/// Rewrite a batch of file nodes' `mode`, `size` and `address` in a loaded
+/// revision tree. Every entry is checked before any node is rewritten, so one bad
+/// entry rejects the call and leaves every target untouched; the reason names the
+/// offending entry's batch index, which a caller leaving `entry_id` at zero has no
+/// other way to identify. A failure after those checks pass is internal and may
+/// leave part of the batch rewritten.
+///
+/// Only a file is modifiable: a directory's size and address are derived at
+/// commit and a link's address is its target. A zero `address.context` preserves
+/// the node's existing file id rather than generating one, which is the opposite
+/// of `lore_revision_tree_add` — the node already has an identity, and replacing
+/// it would record the edit as a move. Entries touch no parent or sibling chain,
+/// so the whole batch applies concurrently.
+///
+/// | Terminal event                              | Payload                                           | Notes                                                    |
+/// |---------------------------------------------|---------------------------------------------------|----------------------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_MODIFY_COMPLETE`  | `lore_revision_tree_modify_complete_event_data_t` | One per entry, carrying its `entry_id`                    |
+/// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE`   | `lore_revision_tree_batch_complete_event_data_t`  | Exactly one, carrying the `batch_id` and the call's outcome |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_modify(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeModifyArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::modify::modify,
+    )
+}
+
+/// Rewrite a batch of file nodes in a loaded revision tree (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_modify_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeModifyArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::modify::modify,
+    );
+}
+
+pub type LoreRevisionTreeMoveArgs = crate::revision_tree::move_node::LoreRevisionTreeMoveArgs;
+
+/// Move a batch of nodes to new parents and/or new names in a loaded revision tree. An
+/// entry naming the node's current parent renames it where it is. Every entry is checked
+/// before any node is moved, so one bad entry rejects the call and leaves every node
+/// where it was; the reason names the offending entry's batch index, which a caller
+/// leaving `entry_id` at zero has no other way to identify. A failure after those checks
+/// pass is internal and may leave earlier entries applied.
+///
+/// A move keeps the node: its node id, its `file_id` and its children come along, and
+/// the change is recorded as a move rather than as a deletion and an addition, so the
+/// revision graph carries the node's history across it. The node reports
+/// `LORE_NODE_STAGED_ACTION_MOVE` until the commit that freezes the tree, and so does
+/// every node under a moved directory — their records do not change, but their paths do.
+/// Two exceptions: a node added through this handle stays staged as an addition wherever
+/// it lands, since it is in no revision a move could be recorded against; and a node
+/// under the moved directory that is staged for deletion keeps its deletion, since it is
+/// leaving the revision at the commit either way.
+///
+/// Both batch-level rules read the tree the whole batch produces rather than the one in
+/// front of them. A destination inside the moved node's own subtree is rejected, and so
+/// is one that lands there once the batch is applied — moving A under B and B under A is
+/// a loop neither entry shows on its own. A name a live child of the destination already
+/// holds is rejected, but a name the batch itself vacates is not: moving `x` out of a
+/// directory while moving another node to `x` in it succeeds, and two entries taking one
+/// name under one destination reject even though neither collides with the tree.
+///
+/// Entries apply one at a time, in batch order, because a move rewrites the parent and
+/// sibling pointers of two child chains where `lore_revision_tree_add` only prepends to
+/// one. For the same reason concurrent calls have more to lose here than on `add` or
+/// `modify`: two calls moving nodes that share a parent chain can interleave their
+/// unlinks, which the pre-commit validator then refuses. Moves that may touch one parent
+/// chain belong in one call.
+///
+/// | Terminal event                            | Payload                                          | Notes                                                       |
+/// |-------------------------------------------|--------------------------------------------------|-------------------------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_MOVE_COMPLETE`  | `lore_revision_tree_move_complete_event_data_t`  | One per entry, carrying its `entry_id` and the moved node    |
+/// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE` | `lore_revision_tree_batch_complete_event_data_t` | Exactly one, carrying the `batch_id` and the call's outcome  |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_move(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMoveArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::move_node::move_node,
+    )
+}
+
+/// Move a batch of nodes in a loaded revision tree (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_move_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMoveArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::move_node::move_node,
+    );
+}
+
+pub type LoreRevisionTreeMetadataSetArgs =
+    crate::revision_tree::metadata_set::LoreRevisionTreeMetadataSetArgs;
+
+/// Record a batch of `(key, value)` pairs on a loaded revision tree's in-progress
+/// metadata.
+///
+/// `value` is a `lore_metadata_t`, which carries its own kind — set the union's
+/// `tag` and the matching member. There is no separate format field and nothing
+/// is parsed, so a value cannot be stored under a kind it is not, and a binary
+/// value can hold any bytes rather than only text. This differs from
+/// `lore_revision_metadata_set`, which takes text plus a parallel format array.
+/// `lore_revision_tree_metadata_get` returns the same union.
+///
+/// Every entry is checked before any pair is recorded, so one bad entry rejects
+/// the call and records nothing; the reason names the offending entry's batch
+/// index, which a caller leaving `entry_id` at zero has no other way to
+/// identify.
+///
+/// A repeated key is **not** rejected, unlike the duplicate-target rules on the
+/// node verbs: entries apply in index order, so the last entry naming a key wins
+/// — the same result as sending those pairs as separate calls.
+///
+/// Nothing reaches storage here. The pairs live on the handle until
+/// `lore_revision_tree_commit` serializes them, so only this handle's
+/// `lore_revision_tree_metadata_get` sees them. The whole batch applies under one
+/// write lock, which is what makes it atomic and why there is no concurrency to
+/// gain: the work is buffer writes, not I/O.
+///
+/// A revision's whole metadata is capped at 1 MiB. The cap counts the metadata
+/// itself — keys, values and per-entry overhead — and not what a value refers
+/// to: a value holding a content address costs the address, not the content
+/// behind it.
+///
+/// A single entry larger than the whole cap is rejected here, since no amount of
+/// removing other keys could make it fit. The running total is not checked here,
+/// because what a revision ends up carrying is only known once every set has
+/// run: a batch of individually legal entries that together push past the limit
+/// is reported as recorded and fails later, at `lore_revision_tree_commit`.
+///
+/// | Terminal event                                    | Payload                                                 | Notes                                                       |
+/// |---------------------------------------------------|---------------------------------------------------------|-------------------------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_METADATA_SET_COMPLETE`  | `lore_revision_tree_metadata_set_complete_event_data_t` | One per entry, carrying its `entry_id`                      |
+/// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE`         | `lore_revision_tree_batch_complete_event_data_t`        | Exactly one, carrying the `batch_id` and the call's outcome  |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_metadata_set(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMetadataSetArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::metadata_set::metadata_set,
+    )
+}
+
+/// Record a batch of metadata pairs on a loaded revision tree (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_metadata_set_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMetadataSetArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::metadata_set::metadata_set,
+    );
+}
+
+pub type LoreRevisionTreeMetadataGetArgs =
+    crate::revision_tree::metadata_get::LoreRevisionTreeMetadataGetArgs;
+
+/// Read a batch of metadata values from a loaded revision tree.
+///
+/// By default this reads only the **revision being built** — what
+/// `lore_revision_tree_metadata_set` recorded on this handle, which is exactly
+/// what `lore_revision_tree_commit` will write. Nothing is inherited from the
+/// revision the handle was loaded on. Set `include_revision` to `1` to also fall
+/// back to that revision for a key the handle has no entry for; a pending entry
+/// still wins, so the flag only adds answers.
+///
+/// A key present in neither emits **no event at all** and does not fail the call,
+/// matching `lore_revision_metadata_get`: detect an absent key by tracking
+/// whether a value event arrived for its `entry_id`. This verb is therefore **not
+/// all-or-nothing**, unlike the other batch verbs — it mutates nothing, so one
+/// unanswerable key costs the others nothing. Bad arguments still reject the
+/// whole call.
+///
+/// A value comes back as the same `lore_metadata_t` that
+/// `lore_revision_tree_metadata_set` takes, so it round-trips without either
+/// side encoding it as text. Every kind is returned, raw binary included.
+///
+/// A value whose stored bytes do not match the kind they are tagged with, or
+/// whose tag this build does not recognize, reports `LORE_ERROR_CODE_INTERNAL`
+/// on that entry rather than staying silent, so it is never mistaken for an
+/// absent key.
+///
+/// The revision's metadata is read once for the whole batch, which is what
+/// batching buys here.
+///
+/// | Terminal event                                    | Payload                                                 | Notes                                                       |
+/// |---------------------------------------------------|---------------------------------------------------------|-------------------------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_METADATA_GET_COMPLETE`  | `lore_revision_tree_metadata_get_complete_event_data_t` | One per key that resolved, carrying its `entry_id`; none for an absent key |
+/// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE`         | `lore_revision_tree_batch_complete_event_data_t`        | Exactly one, carrying the `batch_id` and the call's outcome  |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_metadata_get(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMetadataGetArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::metadata_get::metadata_get,
+    )
+}
+
+/// Read a batch of metadata values from a loaded revision tree (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_metadata_get_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMetadataGetArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::metadata_get::metadata_get,
+    );
+}
+
+pub type LoreRevisionTreeMetadataClearArgs =
+    crate::revision_tree::metadata_clear::LoreRevisionTreeMetadataClearArgs;
+
+/// Remove a batch of keys from a loaded revision tree's in-progress metadata.
+/// Every entry is checked before any key is removed, so one bad entry rejects the
+/// call and removes nothing; the reason names the offending entry's batch index,
+/// which a caller leaving `entry_id` at zero has no other way to identify.
+///
+/// **Clearing a key that is not set is a no-op success**, not a failure. The
+/// terminal's `removed` field says which happened: `1` when the key was there and
+/// is now gone, `0` when there was nothing to remove. A repeated key is likewise
+/// not rejected — the second entry naming it reports `removed = 0`.
+///
+/// This clears the **pending** metadata that `lore_revision_tree_metadata_set`
+/// records and `lore_revision_tree_metadata_get` reads first; a key frozen in the
+/// loaded revision is not reachable from here, since clearing edits the revision
+/// being built and the one it was loaded from is immutable. The whole batch
+/// applies under one write lock, which is what makes it atomic.
+///
+/// | Terminal event                                      | Payload                                                   | Notes                                                       |
+/// |-----------------------------------------------------|-----------------------------------------------------------|-------------------------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_METADATA_CLEAR_COMPLETE`  | `lore_revision_tree_metadata_clear_complete_event_data_t` | One per entry, carrying its `entry_id` and `removed`        |
+/// | `LORE_EVENT_REVISION_TREE_BATCH_COMPLETE`           | `lore_revision_tree_batch_complete_event_data_t`          | Exactly one, carrying the `batch_id` and the call's outcome  |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_metadata_clear(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMetadataClearArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::metadata_clear::metadata_clear,
+    )
+}
+
+/// Remove a batch of metadata keys from a loaded revision tree (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_metadata_clear_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeMetadataClearArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::metadata_clear::metadata_clear,
+    );
+}
+
+pub type LoreRevisionTreeCommitArgs = crate::revision_tree::commit::LoreRevisionTreeCommitArgs;
+pub type LoreRevisionTreeCommitOptions =
+    crate::revision_tree::commit::LoreRevisionTreeCommitOptions;
+
+/// Freeze a loaded revision tree into a new revision and advance its branch tip.
+///
+/// **The branch is not an argument.** It is the revision's own, read from the
+/// `branch` metadata key: set it with `lore_revision_tree_metadata_set` to start a
+/// branch's history, and leave it unset to continue the loaded revision's branch. A
+/// key that is set must name either the loaded revision's branch or a branch whose
+/// branch point is exactly the loaded revision. A handle loaded from the zero
+/// revision has no parent to read a branch from and must set the key.
+///
+/// The revision records exactly the metadata set on the handle — nothing is
+/// inherited from the revision it was loaded on — plus the three facts about the
+/// commit the caller did not supply: the branch, the timestamp if unset, and
+/// `created-by` / `committed-by` if unset. The commit message is caller metadata like
+/// any other: set `"message"` before committing.
+///
+/// On success the handle stays usable and now *is* the new revision: node ids
+/// captured before the commit still resolve, and further edits commit on top. The
+/// pending metadata is emptied, so the next revision starts fresh.
+///
+/// **A commit is all-or-nothing against the handle.** Either it succeeds and the
+/// handle is consistent on the new revision, or it fails and the handle is
+/// consistent on the state it had before the call. A call rejected before any write
+/// — nothing staged, an unusable branch, a tree the validator refuses, or a branch
+/// tip that has already moved — writes nothing at all. A failure once the freeze has
+/// begun leaves a part-frozen tree, which is discarded and rebuilt from a snapshot
+/// taken before the freeze started, so the handle comes back on the revision it was
+/// on with the edits still staged. Either way recovery is to fix what the terminal
+/// reported and retry **on the same handle**: no close, no reload, no re-applying
+/// edits. The one failure that still poisons the handle is a restore that itself
+/// fails, which reports `INTERNAL` saying so. When the branch had advanced,
+/// `new_tip_hash` on the terminal carries that tip, which is also how a caller tells
+/// that failure apart: neither a tip collision nor an empty commit has a
+/// `lore_error_code_t` of its own, so both report `INTERNAL` with the reason in the
+/// completion detail — the same codes the file-system commit returns.
+///
+/// `options.remote_write = 1` uploads within the call. It is a request, not a
+/// guarantee: a store bound offline or local-only, or a call passing
+/// `globals.local`, silently commits local-only. So does a store opened without a
+/// remote configuration — there is nothing to upload to, and the commit still
+/// reports success. Per-call flags contradicting the store's bound flags reject the
+/// call.
+///
+/// **The commit holds the handle for the length of the call.** No other call on the
+/// same handle runs while the tree is frozen, so an edit issued concurrently lands
+/// wholly before the commit reads the tree or wholly after it finishes, two commits
+/// on one handle serialize, and `metadata_set` can no longer lose an edit to the
+/// commit. A commit on a large tree therefore blocks reads on that handle for its
+/// duration, and a callback that re-enters the API on the same handle deadlocks —
+/// which the callback contract already forbids. Commits from *different* handles or
+/// processes still race, and the branch tip compare-and-swap decides them.
+///
+/// `remote_write` is resolved onto the handle's shared repository context, so the
+/// value outlives the call: the handle carries whatever the last commit resolved.
+///
+/// | Terminal event                                | Payload                                             | Notes                                                             |
+/// |-----------------------------------------------|-----------------------------------------------------|-------------------------------------------------------------------|
+/// | `LORE_EVENT_REVISION_TREE_COMMIT_COMPLETE`    | `lore_revision_tree_commit_complete_event_data_t`   | Exactly one; carries the new revision, or the new tip on collision |
+/// | `LORE_EVENT_REVISION_COMMIT_REVISION`         | `lore_revision_commit_revision_event_data_t`        | On success, for continuity with file-system commit consumers       |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_commit(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeCommitArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::commit::commit,
+    )
+}
+
+/// Freeze a loaded revision tree into a new revision (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_revision_tree_commit_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRevisionTreeCommitArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::revision_tree::commit::commit,
     );
 }

@@ -318,15 +318,30 @@ impl<E: fmt::Display> fmt::Display for Traced<E> {
 /// the trace from the source and adding a new location entry with context.
 ///
 /// Use this when mapping between different discrete error types across error
-/// set boundaries (e.g., `NotFound` → `AddressNotFound`) without losing the
-/// trace of where the original error came from.
+/// set boundaries without losing the trace of where the original error came
+/// from. Two variants are available depending on what you hold:
+///
+/// - [`chain_err`](ChainError::chain_err) — when you have already destructured
+///   an error-set variant and hold the inner `Traced<E>` directly.
+/// - [`chain_err_from`](ChainError::chain_err_from) — when you hold the
+///   error-set enum itself (anything implementing [`HasTrace`]); no
+///   destructuring required.
 ///
 /// ```ignore
-/// Err(MatchedProtocolError::NotFound(traced)) => {
-///     return Err(AddressNotFound { address }
-///         .chain_err(traced, "fragment not found on remote")
-///         .into());
+/// // chain_err: destructure first, then chain.
+/// Err(ImmutableError::AddressNotFound(traced)) => {
+///     return Err(StateError::NotFound(
+///         NotFound.chain_err(traced, "state data address not found")
+///     ));
 /// }
+///
+/// // chain_err_from: pass the enum directly.
+/// .map_err(|err| {
+///     DiffError::RevisionNotFound(
+///         RevisionNotFound { revision: signature.clone() }
+///             .chain_err_from(err, "source revision not found")
+///     )
+/// })?
 /// ```
 pub trait ChainError: Sized {
     /// Chains `self` onto the trace from `source`, adding `context` and the
@@ -339,6 +354,13 @@ pub trait ChainError: Sized {
     #[track_caller]
     fn chain_err_with<E>(self, source: Traced<E>, context: impl FnOnce() -> String)
         -> Traced<Self>;
+
+    /// Chains `self` onto the trace of any error that implements [`HasTrace`],
+    /// such as an `#[error_set]` enum. Prefer this over [`chain_err`](ChainError::chain_err)
+    /// when you hold the source error directly rather than having already
+    /// extracted a `Traced<T>` from it.
+    #[track_caller]
+    fn chain_err_from<S: HasTrace>(self, source: S, context: &str) -> Traced<Self>;
 }
 
 #[cfg(feature = "track-locations")]
@@ -372,6 +394,19 @@ impl<T> ChainError for T {
         ));
         Traced::new(self, trace)
     }
+
+    #[track_caller]
+    fn chain_err_from<S: HasTrace>(self, source: S, context: &str) -> Traced<Self> {
+        let mut trace = source.trace().clone();
+        let caller = std::panic::Location::caller();
+        trace.push(Location::with_context(
+            caller.file(),
+            caller.line(),
+            caller.column(),
+            context.into(),
+        ));
+        Traced::new(self, trace)
+    }
 }
 
 #[cfg(not(feature = "track-locations"))]
@@ -387,6 +422,11 @@ impl<T> ChainError for T {
         _source: Traced<E>,
         _context: impl FnOnce() -> String,
     ) -> Traced<Self> {
+        Traced::new(self, Trace)
+    }
+
+    #[track_caller]
+    fn chain_err_from<S: HasTrace>(self, _source: S, _context: &str) -> Traced<Self> {
         Traced::new(self, Trace)
     }
 }

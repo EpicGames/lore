@@ -15,7 +15,6 @@ use axum::http::header::CONTENT_ENCODING;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::header::InvalidHeaderValue;
 use axum::response::IntoResponse;
-use bytes::Bytes;
 use hex::FromHexError;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
@@ -29,7 +28,6 @@ use reqwest::header::CONTENT_LENGTH;
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::mpsc::channel;
-use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
@@ -149,15 +147,16 @@ pub async fn handler(
                 parsed_repository.into(),
             ));
 
-            let options = immutable::read_options_from_repository(&repository).with_isolation();
+            let options = immutable::read_options_from_repository(&repository);
 
             let (tx, rx) = channel(CHUNKED_RESPONSE_BUFFER_SIZE);
 
-            let content_length = immutable::read_stream(repository, parsed_address, options, tx)
-                .await
-                .map_err(GetContentError::ReadStream)?;
+            let content_length =
+                immutable::read_stream(repository, parsed_address, None, options, tx)
+                    .await
+                    .map_err(GetContentError::ReadStream)?;
 
-            let stream = ReceiverStream::new(rx).map(Ok::<Bytes, GetContentError>);
+            let stream = ReceiverStream::new(rx);
 
             let headers = create_stream_response_headers(query, content_length)
                 .map_err(GetContentError::HeaderGeneration)?;
@@ -207,7 +206,7 @@ mod tests {
                     presign_config: None,
                 };
 
-                let settings = LoreHttpServerSettings::default();
+                let settings = LoreHttpServerSettings::test_default();
                 let app = create_router(test_shared_state, test_health, &settings);
                 let test_server = TestServer::new(app).unwrap();
 
@@ -232,7 +231,7 @@ mod tests {
                     max_file_size: 100,
                     presign_config: None,
                 };
-                let settings = LoreHttpServerSettings::default();
+                let settings = LoreHttpServerSettings::test_default();
                 let app = create_router(test_shared_state, test_health, &settings);
                 let test_server = TestServer::new(app).unwrap();
 
@@ -259,7 +258,7 @@ mod tests {
                     max_file_size: 100,
                     presign_config: None,
                 };
-                let settings = LoreHttpServerSettings::default();
+                let settings = LoreHttpServerSettings::test_default();
                 let app = create_router(test_shared_state, test_health, &settings);
                 let test_server = TestServer::new(app).unwrap();
 
@@ -303,7 +302,7 @@ mod tests {
                     max_file_size: 100,
                     presign_config: None,
                 };
-                let settings = LoreHttpServerSettings::default();
+                let settings = LoreHttpServerSettings::test_default();
                 let app = create_router(test_shared_state, test_health, &settings);
                 let test_server = TestServer::new(app).unwrap();
                 let valid_url = format!("/v1/repository/{repository}/content/{address}");
@@ -346,7 +345,7 @@ mod tests {
                     max_file_size: 100,
                     presign_config: None,
                 };
-                let settings = LoreHttpServerSettings::default();
+                let settings = LoreHttpServerSettings::test_default();
                 let app = create_router(test_shared_state, test_health, &settings);
                 let test_server = TestServer::new(app).unwrap();
                 let valid_url = format!("/v1/repository/{repository}/content/{address}");
@@ -406,7 +405,7 @@ mod tests {
                     max_file_size: 100,
                     presign_config: None,
                 };
-                let settings = LoreHttpServerSettings::default();
+                let settings = LoreHttpServerSettings::test_default();
                 let app = create_router(test_shared_state, test_health, &settings);
                 let test_server = TestServer::new(app).unwrap();
                 let valid_url = format!("/v1/repository/{repository}/content/{address}");

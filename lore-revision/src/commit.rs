@@ -13,8 +13,10 @@ use std::sync::atomic::Ordering;
 use bytes::BytesMut;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
+use lore_storage::FragmentWriteCounts;
 use serde::Deserialize;
 use serde::Serialize;
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::task::AbortOnDropHandle;
@@ -26,10 +28,10 @@ use crate::branch;
 use crate::branch::BranchLatestStatus;
 use crate::change;
 use crate::change::FileAction;
-use crate::error::LoreResultExt;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
+use crate::filter::FilterMode;
 use crate::immutable;
 use crate::infer;
 use crate::interface::LoreArray;
@@ -41,7 +43,6 @@ use crate::link;
 use crate::lore::Address;
 use crate::lore::BranchId;
 use crate::lore::Context;
-use crate::lore::Fragment;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
 use crate::lore::TypedBytes;
@@ -68,15 +69,19 @@ use crate::node::NodeIDExt;
 use crate::node::ROOT_NODE;
 use crate::progress::DEFAULT_WORK_CHANNEL_CAPACITY;
 use crate::progress::DiscoveryStats;
+use crate::progress::MAX_CONCURRENT_DIRECTORY_TASKS;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
+use crate::repository::verify::verify_state_for_commit;
 use crate::revision::sync;
 use crate::state;
+use crate::state::RecordedModifiedTimes;
 use crate::state::State;
 use crate::state::StateNodeChildrenIterator;
 use crate::state::StateNodeChildrenWithNameIterator;
 use crate::util;
 use crate::util::path::RelativePath;
+use crate::util::path::RelativePathBuf;
 use crate::util::serde::u8_as_bool;
 
 /// Event data reported at the start of a commit.
@@ -152,6 +157,61 @@ pub struct LoreRevisionCommitProgressEventData {
 pub struct LoreRevisionCommitEndEventData {
     /// Final progress counters.
     pub count: LoreRevisionCommitCountData,
+}
+
+/// How many files a commit wrote, split by the action each was staged with.
+///
+/// The actions are exclusive: a file is counted once, under the action its staged
+/// node flags name.
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreCommitFileStatsData {
+    /// Files staged as new additions.
+    pub added: u64,
+    /// Files whose content or mode changed.
+    pub modified: u64,
+    /// Files staged for deletion.
+    pub deleted: u64,
+    /// Files staged as moves.
+    pub moved: u64,
+    /// Files staged as copies.
+    pub copied: u64,
+    /// Directories staged for deletion.
+    pub directories_deleted: u64,
+    /// Files the commit read off disk and fragmented. A different set from
+    /// `files`: a staged file whose content turns out to match the revision it is
+    /// committed against is read and committed as nothing, a view-excluded path is
+    /// committed from its staged node without being read, and an in-memory commit
+    /// reads none at all.
+    pub files_read: u64,
+    /// Uncompressed content bytes of `files_read`. The same number the progress
+    /// event reports as `bytesTransferred`.
+    pub bytes_transferred: u64,
+    /// Files whose content the commit wrote: `added + modified + moved + copied`.
+    pub files: u64,
+    /// Uncompressed content size of exactly the `files` above, so the two are a
+    /// pair. A delete contributes none.
+    ///
+    /// Distinct from [`FragmentWriteCounts::data_content_bytes`], which counts
+    /// fragments rather than files and excludes every fragment that needed no
+    /// payload.
+    pub file_bytes: u64,
+}
+
+/// Event data reporting what a commit cost.
+///
+/// Emitted once, when the commit has drained every background write, at
+/// statistics level one and above. A commit that failed reports what it had done
+/// by then.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoreRevisionCommitStatsEventData {
+    /// Files committed, by action.
+    pub files: LoreCommitFileStatsData,
+    /// What the commit's fragment writes cost.
+    pub fragments: FragmentWriteCounts,
 }
 
 /// Event data describing a revision produced by a commit.
@@ -248,14 +308,107 @@ struct CommitCompleteStats {
     pub file_total: AtomicU64,
     pub directory_delete_count: AtomicU64,
     pub file_delete_count: AtomicU64,
+    /// Files the commit wrote, whatever action staged them. Reported as
+    /// `fileModifyCount` on the progress event.
     pub file_modify_count: AtomicU64,
+    /// Content bytes read off disk and fragmented.
     pub bytes_transferred: AtomicU64,
 }
 
+/// The counts the statistics event alone reports: which action staged each file
+/// the commit wrote, and how many files were read to write them. No progress event
+/// reads any of it, so none of it is kept at statistics level zero.
+///
+/// Deletes are not here; `file_delete_count` and `directory_delete_count` above
+/// carry those.
 #[derive(Default)]
-struct CommitStats {
-    pub discovery: DiscoveryStats,
-    pub complete: CommitCompleteStats,
+struct CommitReportStats {
+    pub add_count: AtomicU64,
+    pub modify_count: AtomicU64,
+    pub move_count: AtomicU64,
+    pub copy_count: AtomicU64,
+    /// Content size of the files the counters above counted, which is a
+    /// different set from `bytes_transferred`: that one covers every file the
+    /// commit read, including one that turned out to match what it is committed
+    /// against.
+    pub file_bytes: AtomicU64,
+    /// Files read off disk and fragmented. A delete is never read; a
+    /// view-excluded path is committed without being read.
+    pub file_read_count: AtomicU64,
+}
+
+pub(crate) struct CommitStats {
+    discovery: DiscoveryStats,
+    complete: CommitCompleteStats,
+    report: CommitReportStats,
+    /// Whether to keep [`CommitReportStats`], which nothing reads at statistics
+    /// level zero.
+    statistics: bool,
+}
+
+impl CommitStats {
+    /// Counters for one commit, keeping what the call's statistics level reports.
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            discovery: DiscoveryStats::default(),
+            complete: CommitCompleteStats::default(),
+            report: CommitReportStats::default(),
+            statistics: crate::runtime::try_execution_context()
+                .is_some_and(|context| context.globals().stats()),
+        })
+    }
+
+    /// One file was read off disk and fragmented. The byte total is what a
+    /// progress event reports as transferred, so it is kept whatever the level.
+    fn file_read(&self, content_size: u64) {
+        if self.statistics {
+            self.report.file_read_count.fetch_add(1, Ordering::Relaxed);
+        }
+        self.complete
+            .bytes_transferred
+            .fetch_add(content_size, Ordering::Relaxed);
+    }
+
+    /// The per-action file counts, as an event payload.
+    fn file_stats(&self) -> LoreCommitFileStatsData {
+        let added = self.report.add_count.load(Ordering::Relaxed);
+        let modified = self.report.modify_count.load(Ordering::Relaxed);
+        let moved = self.report.move_count.load(Ordering::Relaxed);
+        let copied = self.report.copy_count.load(Ordering::Relaxed);
+        LoreCommitFileStatsData {
+            files_read: self.report.file_read_count.load(Ordering::Relaxed),
+            bytes_transferred: self.complete.bytes_transferred.load(Ordering::Relaxed),
+            added,
+            modified,
+            deleted: self.complete.file_delete_count.load(Ordering::Relaxed),
+            moved,
+            copied,
+            directories_deleted: self.complete.directory_delete_count.load(Ordering::Relaxed),
+            files: added + modified + moved + copied,
+            file_bytes: self.report.file_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Record which action staged one file the commit wrote, and the uncompressed
+    /// size of the content it committed.
+    ///
+    /// A file with no staged action counts as modified: it is here because its
+    /// content or mode changed under it.
+    fn record_file_action(&self, flags: u16, content_size: u64) {
+        if !self.statistics {
+            return;
+        }
+        let counter = match change::FileAction::from_node_flags(flags) {
+            change::FileAction::Add => &self.report.add_count,
+            change::FileAction::Move => &self.report.move_count,
+            change::FileAction::Copy => &self.report.copy_count,
+            _ => &self.report.modify_count,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+        self.report
+            .file_bytes
+            .fetch_add(content_size, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -275,9 +428,6 @@ pub struct CommitOptions {
     pub layer_messages: HashMap<String, String>,
     /// If set, commit only changes in this layer path
     pub layer: Option<String>,
-    /// Emit a `FragmentWrite` event per stored fragment so callers can report
-    /// write/dedup stats. Off by default to avoid the per-fragment overhead.
-    pub stats: bool,
 }
 
 impl CommitOptions {
@@ -285,6 +435,82 @@ impl CommitOptions {
         Self {
             message,
             ..Default::default()
+        }
+    }
+}
+
+/// How one commit reports on itself, carried through the commit as a unit.
+///
+/// The counters cover the whole commit, including the sub-commits it performs
+/// inside linked and layered repositories, so what is reported is the commit a
+/// caller asked for rather than one repository's share of it. The fragment
+/// counters it reports alongside live on the execution context, and are shared for
+/// the same reason.
+#[derive(Clone)]
+struct CommitReporting {
+    /// Emit the statistics event at all. Off still counts files, the progress
+    /// events needing the same counters.
+    enabled: bool,
+    /// Emit a `FragmentWrite` event per stored fragment.
+    per_fragment: bool,
+    /// How often to emit progress events.
+    interval: std::time::Duration,
+    /// Counters for the whole commit.
+    stats: Arc<CommitStats>,
+}
+
+impl CommitReporting {
+    /// Read what to report from the call's global arguments.
+    fn from_globals() -> Self {
+        let context = execution_context();
+        let globals = context.globals();
+        Self {
+            enabled: globals.stats(),
+            per_fragment: globals.stats_full(),
+            interval: globals.event_interval(),
+            stats: CommitStats::new(),
+        }
+    }
+
+    /// Everything this commit has counted since `baseline`, or `None` outside an
+    /// execution context — which is also no context to send an event through.
+    fn snapshot(&self, baseline: &FragmentWriteCounts) -> Option<LoreRevisionCommitStatsEventData> {
+        let context = crate::runtime::try_execution_context()?;
+        Some(LoreRevisionCommitStatsEventData {
+            files: self.stats.file_stats(),
+            fragments: context.fragment_stats().snapshot().since(baseline),
+        })
+    }
+
+    /// A guard that emits the statistics event when dropped, so the commit that
+    /// fails reports as the one that succeeds does.
+    ///
+    /// Hold it until after the commit has drained its background writes; the
+    /// fragment counters settle only then. Reporting turned off yields `None`.
+    fn report(&self) -> Option<CommitStatsReport> {
+        self.enabled.then(|| CommitStatsReport {
+            reporting: self.clone(),
+            baseline: crate::runtime::try_execution_context()
+                .map(|context| context.fragment_stats().snapshot())
+                .unwrap_or_default(),
+        })
+    }
+}
+
+/// Emits what the commit cost when dropped.
+struct CommitStatsReport {
+    reporting: CommitReporting,
+    /// The call's fragment counters as the commit found them. They are per call
+    /// rather than per commit, so an operation that writes before it commits — a
+    /// merge serializing its staged state, say — would otherwise have those
+    /// writes reported as the commit's.
+    baseline: FragmentWriteCounts,
+}
+
+impl Drop for CommitStatsReport {
+    fn drop(&mut self) {
+        if let Some(snapshot) = self.reporting.snapshot(&self.baseline) {
+            event::LoreEvent::RevisionCommitStats(snapshot).send();
         }
     }
 }
@@ -327,6 +553,9 @@ pub async fn commit_impl(
     values: LoreArray<LoreString>,
     formats: LoreArray<LoreMetadataType>,
 ) -> Result<Hash, CommitError> {
+    let reporting = CommitReporting::from_globals();
+    let _stats_report = reporting.report();
+
     if let Some(ref link_path) = options.link {
         return commit_link_only(
             repository,
@@ -336,7 +565,7 @@ pub async fn commit_impl(
             keys,
             values,
             formats,
-            options.stats,
+            reporting.clone(),
         )
         .await;
     }
@@ -355,7 +584,7 @@ pub async fn commit_impl(
             keys,
             values,
             formats,
-            options.stats,
+            reporting.clone(),
         )
         .await;
     }
@@ -433,7 +662,6 @@ pub async fn commit_impl(
     )
     .await?;
 
-    let stats = options.stats;
     let link_messages = Arc::new(options.link_messages);
     let layer_messages = Arc::new(options.layer_messages);
 
@@ -445,7 +673,7 @@ pub async fn commit_impl(
         state_staged.clone(),
         repository.clone(),
         ROOT_NODE,
-        RelativePath::new(),
+        RelativePathBuf::new(),
         &mut dirty_paths,
     )
     .await
@@ -468,7 +696,7 @@ pub async fn commit_impl(
             state_current.revision(),
             state_staged.revision()
         );
-        signature = commit_staged_revision(
+        let (committed, modified_times) = commit_staged_revision(
             repository.clone(),
             token.share(),
             state_current.clone(),
@@ -477,21 +705,25 @@ pub async fn commit_impl(
             None,
             link_messages.clone(),
             current_branch,
-            stats,
+            reporting.clone(),
         )
         .await?;
+        signature = committed;
 
         finalize_commit(
             repository.clone(),
             &state_current,
             &state_staged,
+            branch_latest,
             signature,
             current_branch,
             token,
         )
         .await?;
 
-        let _ = event::metadata::send(&metadata);
+        modified_times.store(repository.clone()).await;
+
+        event::metadata::send(&metadata);
     }
 
     if !dry_run && !dirty_paths.is_empty() {
@@ -525,12 +757,11 @@ pub async fn commit_impl(
             continue;
         }
 
-        let layer_repository = Arc::new(repository.to_layer_context(layer.repository).await);
-
         let layer_state = layer
-            .deserialize_current_and_staged(layer_repository.clone())
+            .deserialize_current_and_staged(repository.clone())
             .await
             .forward::<CommitError>("Failed to deserialize layer states")?;
+        let layer_repository = layer_state.repository.clone();
 
         lore_debug!(
             "Committing layer revision, current revision {}, staged revision {}",
@@ -547,7 +778,7 @@ pub async fn commit_impl(
         } else {
             metadata.clone()
         };
-        let layer_signature = commit_staged_revision(
+        let layer_result = commit_staged_revision(
             layer_repository.clone(),
             token.share(),
             layer_state.state_current.clone(),
@@ -560,15 +791,55 @@ pub async fn commit_impl(
             },
             Arc::new(HashMap::new()),
             current_branch,
-            stats,
+            reporting.clone(),
         )
-        .await?;
+        .await;
+
+        let (layer_signature, layer_modified_times) = match layer_result {
+            Ok(committed) => committed,
+            Err(err) if err.is_nothing_staged() => {
+                // The parent revision is already committed at this point, so a
+                // layer with nothing to commit must not fail the whole commit.
+                lore_warn!(
+                    "Layer at {} had nothing to commit, clearing its staged state",
+                    layer.target_path
+                );
+                if !dry_run {
+                    layer::store_layer_staged(
+                        repository.clone(),
+                        token,
+                        layer.target_path.as_str(),
+                        layer.repository,
+                        Hash::default(),
+                    )
+                    .await
+                    .forward::<CommitError>("Failed to clear layer staged state")?;
+                }
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         let layer_branch = layer_state
             .state_current
             .branch(layer_repository.clone())
             .await;
 
         if !dry_run {
+            // Without this `layer::latest_revision` cannot reach the new
+            // layer revision.
+            let layer_previous = branch::load_latest(layer_repository.clone(), current_branch)
+                .await
+                .unwrap_or_default();
+            branch::store_latest(
+                layer_repository.clone(),
+                current_branch,
+                layer_previous,
+                layer_signature,
+                BranchLatestStatus::Divergent,
+            )
+            .await
+            .forward::<CommitError>("Failed to store layer branch latest")?;
+
             layer::store_layer_current(
                 repository.clone(),
                 token,
@@ -580,6 +851,8 @@ pub async fn commit_impl(
             .await
             .forward::<CommitError>("Failed to store layer configuration")?;
         }
+
+        layer_modified_times.store(layer_repository.clone()).await;
 
         event::LoreEvent::RevisionCommitRevision(LoreRevisionCommitRevisionEventData {
             repository: layer_repository.id,
@@ -613,7 +886,7 @@ async fn commit_layer_only(
     keys: LoreArray<LoreString>,
     values: LoreArray<LoreString>,
     formats: LoreArray<LoreMetadataType>,
-    stats: bool,
+    reporting: CommitReporting,
 ) -> Result<Hash, CommitError> {
     // Resolve the layer by target_path against the parent's configured layers.
     // Unlike the auto-bundle path (which falls back to "no layers" on error),
@@ -632,11 +905,11 @@ async fn commit_layer_only(
             .into()
         })?;
 
-    let layer_repository_ctx = Arc::new(repository.to_layer_context(layer.repository).await);
     let layer_state = layer
-        .deserialize_current_and_staged(layer_repository_ctx.clone())
+        .deserialize_current_and_staged(repository.clone())
         .await
         .forward::<CommitError>("Failed to deserialize layer states")?;
+    let layer_repository_ctx = layer_state.repository.clone();
 
     let context = execution_context();
     let globals = context.globals();
@@ -682,7 +955,7 @@ async fn commit_layer_only(
     )
     .await?;
 
-    let layer_signature = commit_staged_revision(
+    let (layer_signature, layer_modified_times) = commit_staged_revision(
         layer_state.repository.clone(),
         token.share(),
         layer_state.state_current.clone(),
@@ -696,7 +969,7 @@ async fn commit_layer_only(
         },
         Arc::new(HashMap::new()),
         parent_current_branch,
-        stats,
+        reporting.clone(),
     )
     .await?;
 
@@ -706,6 +979,20 @@ async fn commit_layer_only(
         .await;
 
     if !globals.dry_run() {
+        let layer_previous =
+            branch::load_latest(layer_state.repository.clone(), parent_current_branch)
+                .await
+                .unwrap_or_default();
+        branch::store_latest(
+            layer_state.repository.clone(),
+            parent_current_branch,
+            layer_previous,
+            layer_signature,
+            BranchLatestStatus::Divergent,
+        )
+        .await
+        .forward::<CommitError>("Failed to store layer branch latest")?;
+
         layer::store_layer_current(
             repository.clone(),
             &token,
@@ -717,6 +1004,10 @@ async fn commit_layer_only(
         .await
         .forward::<CommitError>("Failed to store layer configuration")?;
     }
+
+    layer_modified_times
+        .store(layer_state.repository.clone())
+        .await;
 
     event::LoreEvent::RevisionCommitRevision(LoreRevisionCommitRevisionEventData {
         repository: layer_repository_ctx.id,
@@ -744,7 +1035,7 @@ async fn commit_link_only(
     keys: LoreArray<LoreString>,
     values: LoreArray<LoreString>,
     formats: LoreArray<LoreMetadataType>,
-    stats: bool,
+    reporting: CommitReporting,
 ) -> Result<Hash, CommitError> {
     let (current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
         .await
@@ -788,8 +1079,13 @@ async fn commit_link_only(
     let resolved_current =
         link::resolve_link_at_path(&state_parent_current, repository.clone(), &link_path)
             .await
-            .debug_map_err(LinkPathNotFound {
-                path: link_path.clone(),
+            .map_err(|err| {
+                CommitError::LinkPathNotFound(
+                    LinkPathNotFound {
+                        path: link_path.clone(),
+                    }
+                    .chain_err_from(err, "resolving link at path"),
+                )
             })?;
 
     let link_staged_revision = resolved_staged.link_node.linked_node().revision;
@@ -850,7 +1146,7 @@ async fn commit_link_only(
         link_repository.clone(),
         &link_state_staged,
         link_branch,
-        message,
+        message.clone(),
         keys,
         values,
         formats,
@@ -873,7 +1169,7 @@ async fn commit_link_only(
         Some((source_path, String::new()))
     };
 
-    let link_signature = commit_staged_revision(
+    let (link_signature, link_modified_times) = commit_staged_revision(
         link_repository.clone(),
         token.share(),
         link_state_current.clone(),
@@ -882,7 +1178,7 @@ async fn commit_link_only(
         path_remap,
         Arc::new(HashMap::new()),
         link_branch,
-        stats,
+        reporting.clone(),
     )
     .await?;
 
@@ -890,17 +1186,47 @@ async fn commit_link_only(
         link_repository.clone(),
         &link_state_current,
         &link_state_staged,
+        link_branch_latest,
         link_signature,
         link_branch,
         &token,
     )
     .await?;
 
-    // Update parent link pin to point at the committed revision and stage the parent
-    let link_local_node = resolved_staged.link_reference.local_node;
-    link::update_link_pin_by_node(
-        &state_parent_staged,
+    link_modified_times.store(link_repository.clone()).await;
+
+    // Update the link pin in the OWNING repository's registry (the innermost
+    // containing repo for a nested link, the top-level repo otherwise), then
+    // fold any intermediate linked revisions up into the top-level staged
+    // state. `resolve_link_chain` gives one shared mutable state per level so
+    // the pin write and the propagation see the same objects.
+    let chain = link::resolve_link_chain(
         repository.clone(),
+        state_parent_staged.clone(),
+        state_parent_current.clone(),
+        RelativePath::from_str(&link_path).unwrap_or_default(),
+        current_branch,
+    )
+    .await
+    .forward::<CommitError>("Failed to resolve link chain")?;
+
+    let owner_repository = chain.innermost_repository.clone();
+    let owner_state = chain.innermost_state.clone();
+
+    // Locate the link node within the owning repo's staged state.
+    let link_local_node = owner_state
+        .find_relative_node_link(
+            owner_repository.clone(),
+            chain.innermost_base_node,
+            chain.remainder_path.as_str(),
+        )
+        .await
+        .forward::<CommitError>("Failed to resolve link node in owning repository")?
+        .node;
+
+    link::update_link_pin_by_node(
+        &owner_state,
+        owner_repository.clone(),
         resolved_staged.link_context.id,
         resolved_staged.link_reference.branch,
         link_signature,
@@ -909,10 +1235,93 @@ async fn commit_link_only(
     .await
     .forward::<CommitError>("Failed to update link pin")?;
 
-    state_parent_staged
-        .node_mark(repository.clone(), link_local_node, NodeFlags::Staged, true)
+    owner_state
+        .node_mark(
+            owner_repository.clone(),
+            link_local_node,
+            NodeFlags::Staged,
+            true,
+        )
         .await
         .forward::<CommitError>("Failed to mark link node as staged")?;
+
+    // For a nested link, each intermediate link between the committed target
+    // and the top-level repo must itself be COMMITTED (not just reserialized),
+    // so the top-level pin references a real revision on each intermediate
+    // branch. Walk the chain inner -> outer: commit each level's child state
+    // (which now carries the updated pin), then repin its parent.
+    for i in (0..chain.levels.len()).rev() {
+        let level = &chain.levels[i];
+        let (child_state, child_repository) = chain.child_at(i);
+
+        let child_current = State::deserialize(child_repository.clone(), level.old_signature)
+            .await
+            .forward::<CommitError>("Failed to deserialize intermediate link current state")?;
+        child_state.set_parent_self(level.old_signature);
+
+        let child_metadata = build_commit_metadata(
+            child_repository.clone(),
+            &child_state,
+            level.branch,
+            message.clone(),
+            LoreArray::default(),
+            LoreArray::default(),
+            LoreArray::default(),
+        )
+        .await?;
+
+        let (child_signature, child_modified_times) = commit_staged_revision(
+            child_repository.clone(),
+            token.share(),
+            child_current.clone(),
+            child_state.clone(),
+            child_metadata,
+            None,
+            Arc::new(HashMap::new()),
+            level.branch,
+            reporting.clone(),
+        )
+        .await?;
+
+        let child_branch_latest = branch::load_latest(child_repository.clone(), level.branch)
+            .await
+            .unwrap_or_default();
+
+        finalize_commit(
+            child_repository.clone(),
+            &child_current,
+            &child_state,
+            child_branch_latest,
+            child_signature,
+            level.branch,
+            &token,
+        )
+        .await?;
+
+        child_modified_times.store(child_repository.clone()).await;
+
+        link::update_link_pin_by_node(
+            &level.state,
+            level.repository.clone(),
+            level.child_repository_id,
+            level.branch,
+            child_signature,
+            level.link_node_id,
+        )
+        .await
+        .forward::<CommitError>("Failed to update intermediate link pin")?;
+
+        level
+            .state
+            .node_mark(
+                level.repository.clone(),
+                level.link_node_id,
+                NodeFlags::Staged,
+                true,
+            )
+            .await
+            .forward::<CommitError>("Failed to mark intermediate link node staged")?;
+    }
 
     if !execution_context().globals().dry_run() {
         let parent_signature = state_parent_staged
@@ -948,15 +1357,7 @@ async fn build_commit_metadata(
         .iter()
         .map(|v| String::from(v.as_str()))
         .collect();
-    let metadata_formats = formats
-        .as_slice()
-        .iter()
-        .map(|format| match format {
-            LoreMetadataType::Binary => MetadataType::Binary,
-            LoreMetadataType::Numeric => MetadataType::Numeric,
-            LoreMetadataType::String => MetadataType::String,
-        })
-        .collect();
+    let metadata_formats = formats.as_slice().to_vec();
 
     let metadata_hash = state_staged.metadata_hash();
     let original_metadata = if metadata_hash.is_zero() {
@@ -981,10 +1382,16 @@ async fn build_commit_metadata(
 
 /// Stores branch latest, deletes staged anchor, updates last sync if merge,
 /// and emits the revision commit event.
+///
+/// `branch_previous` is what the pointer write compares against, so it must be
+/// the tip observed for `branch`, not the revision the caller built on: a prior
+/// link commit can advance the branch without committing the parent, which
+/// leaves that pin stale.
 async fn finalize_commit(
     repository: Arc<RepositoryContext>,
     state_current: &Arc<State>,
     state_staged: &Arc<State>,
+    branch_previous: Hash,
     signature: Hash,
     branch: BranchId,
     token: &RepositoryWriteToken,
@@ -992,7 +1399,13 @@ async fn finalize_commit(
     let dry_run = execution_context().globals().dry_run();
 
     if !dry_run {
-        store_branch_latest_and_make_current(repository.clone(), signature, branch).await?;
+        store_branch_latest_and_make_current(
+            repository.clone(),
+            branch_previous,
+            signature,
+            branch,
+        )
+        .await?;
 
         // Check if any dirty-only nodes remain in the staged state.
         // If so, preserve them in a new staged anchor re-parented to the new revision.
@@ -1049,8 +1462,8 @@ async fn commit_staged_revision(
     path_remap: Option<(String, String)>,
     link_messages: Arc<HashMap<String, String>>,
     parent_branch: BranchId,
-    stats: bool,
-) -> Result<Hash, CommitError> {
+    reporting: CommitReporting,
+) -> Result<(Hash, Arc<RecordedModifiedTimes>), CommitError> {
     let context = execution_context();
     let globals = context.globals();
 
@@ -1080,10 +1493,12 @@ async fn commit_staged_revision(
     // still wait for spawned leaders to terminate before propagating the
     // error so no task outlives this function holding references to scope-
     // bound resources.
-    let tracker = immutable::commit_write_tracker(stats);
+    let tracker = immutable::commit_write_tracker(reporting.per_fragment);
 
     let work_tracker = tracker.clone();
-    let work_result: Result<Hash, CommitError> = async move {
+    let modified_times = Arc::new(RecordedModifiedTimes::default());
+    let collected = modified_times.clone();
+    let work_result: Result<(Hash, Arc<RecordedModifiedTimes>), CommitError> = async move {
         // For each file in repository, create fragments if they don't already
         // exist. Also rehash directories affected by change and generate new
         // root hash.
@@ -1097,6 +1512,9 @@ async fn commit_staged_revision(
             link_messages,
             parent_branch,
             work_tracker.clone(),
+            collected.clone(),
+            reporting.stats.clone(),
+            reporting.interval,
         )
         .await?;
 
@@ -1143,7 +1561,7 @@ async fn commit_staged_revision(
             .await
             .forward::<CommitError>("Failed to serialize revision state")?;
 
-        Ok(signature)
+        Ok((signature, collected))
     }
     .await;
 
@@ -1156,23 +1574,31 @@ async fn commit_staged_revision(
     // Original work errors take precedence; tracker drain errors surface only
     // when the work itself succeeded.
     match work_result {
-        Ok(signature) => {
+        Ok(committed) => {
             drain_result
                 .forward::<CommitError>("Background fragment upload task failed during commit")?;
-            Ok(signature)
+            Ok(committed)
         }
         Err(work_err) => Err(work_err),
     }
 }
 
+/// Publish `signature` as `branch`'s tip and anchor it as the current revision.
+///
+/// `previous` is the tip the caller observed when it decided to commit; the
+/// pointer write compares against it, so a branch that advanced in the meantime
+/// fails with `BranchAdvanced` instead of orphaning the other committer's
+/// revision.
 pub async fn store_branch_latest_and_make_current(
     repository: Arc<RepositoryContext>,
+    previous: Hash,
     signature: Hash,
     branch: BranchId,
 ) -> Result<(), CommitError> {
     branch::store_latest(
         repository.clone(),
         branch,
+        previous,
         signature,
         BranchLatestStatus::Divergent,
     )
@@ -1197,11 +1623,13 @@ pub(crate) async fn commit_files_and_rehash(
     link_messages: Arc<HashMap<String, String>>,
     parent_branch: BranchId,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+    modified_times: Arc<RecordedModifiedTimes>,
+    stats: Arc<CommitStats>,
+    progress_interval: std::time::Duration,
 ) -> Result<(), CommitError> {
     lore_info!("Fragmenting files and updating tree hashes");
 
     let mut relative_path = RelativePath::new();
-    let stats = Arc::new(CommitStats::default());
 
     let delta = Arc::new(parking_lot::RwLock::new(BytesMut::new()));
     let discard = Arc::new(parking_lot::RwLock::new(vec![]));
@@ -1240,7 +1668,7 @@ pub(crate) async fn commit_files_and_rehash(
     // Print progress at regular intervals
     let ticker_stats = stats.clone();
     let ticker = AbortOnDropHandle::new(lore_spawn!(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
+        let mut ticker = tokio::time::interval(progress_interval);
         loop {
             ticker.tick().await;
             event::LoreEvent::RevisionCommitProgress(LoreRevisionCommitProgressEventData {
@@ -1261,6 +1689,7 @@ pub(crate) async fn commit_files_and_rehash(
         let subnodes_to_discard = subnodes_to_discard.clone();
         let stats = stats.clone();
         let tracker = tracker.clone();
+        let dir_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DIRECTORY_TASKS));
         lore_spawn!(async move {
             let result = commit_directory(
                 repository,
@@ -1278,6 +1707,7 @@ pub(crate) async fn commit_files_and_rehash(
                 stats,
                 parent_branch,
                 tracker,
+                dir_semaphore,
             )
             .await;
             discover_stats
@@ -1301,8 +1731,18 @@ pub(crate) async fn commit_files_and_rehash(
         let delta = delta.clone();
         let stats = stats.clone();
         let tracker = tracker.clone();
+        let modified_times = modified_times.clone();
         lore_spawn!(async move {
-            commit_execute(file_rx, repository, state, delta, stats, tracker).await
+            commit_execute(
+                file_rx,
+                repository,
+                state,
+                delta,
+                stats,
+                tracker,
+                modified_times,
+            )
+            .await
         })
     };
 
@@ -1374,6 +1814,7 @@ async fn commit_directory(
     stats: Arc<CommitStats>,
     parent_branch: BranchId,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+    dir_semaphore: Arc<Semaphore>,
 ) -> Result<(), CommitError> {
     let node_index = Node::index(node_id);
     let block = state
@@ -1394,18 +1835,30 @@ async fn commit_directory(
         delta_add(delta.clone(), node_id, node.flags);
     }
 
-    let mut tasks = JoinSet::new();
-
     let mut updated = false;
     let mut children =
         StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), node_id)
             .await
             .forward::<CommitError>("Failed deserializing state block")?;
-    while let Some((child_node_id, child_node, node_name)) = children
-        .next()
-        .await
-        .forward::<CommitError>("Failed deserializing state block")?
-    {
+
+    let mut tasks = JoinSet::new();
+    let mut walk_failure = None;
+
+    loop {
+        let child = match children
+            .next()
+            .await
+            .forward::<CommitError>("Failed deserializing state block")
+        {
+            Ok(Some(child)) => child,
+            Ok(None) => break,
+            Err(err) => {
+                walk_failure = Some(err);
+                break;
+            }
+        };
+        let (child_node_id, child_node, node_name) = child;
+
         if !child_node.is_staged() {
             continue;
         }
@@ -1448,39 +1901,74 @@ async fn commit_directory(
                     .fetch_add(1, Ordering::Relaxed);
             }
         } else if child_node.is_directory() {
-            lore_spawn!(tasks, {
-                let repository = repository.clone();
-                let token = token.share();
-                let state = state.clone();
-                let delta = delta.clone();
-                let discard = discard.clone();
-                let subnodes_to_discard = subnodes_to_discard.clone();
-                let file_tx = file_tx.clone();
-                let metadata = metadata.clone();
-                let link_messages = link_messages.clone();
-                let stats = stats.clone();
-                let tracker = tracker.clone();
-                async move {
-                    commit_directory_recurse(
-                        repository,
-                        token,
-                        state,
+            // Inline fallback rather than a blocking acquire: a parent awaiting
+            // its children must never block on a permit a descendant needs, or
+            // the bounded fan-out would deadlock.
+            match dir_semaphore.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    lore_spawn!(tasks, {
+                        let repository = repository.clone();
+                        let token = token.share();
+                        let state = state.clone();
+                        let delta = delta.clone();
+                        let discard = discard.clone();
+                        let subnodes_to_discard = subnodes_to_discard.clone();
+                        let file_tx = file_tx.clone();
+                        let metadata = metadata.clone();
+                        let link_messages = link_messages.clone();
+                        let stats = stats.clone();
+                        let tracker = tracker.clone();
+                        let dir_semaphore = dir_semaphore.clone();
+                        async move {
+                            let _permit = permit;
+                            commit_directory_recurse(
+                                repository,
+                                token,
+                                state,
+                                absolute_path,
+                                relative_path,
+                                child_node_id,
+                                delta,
+                                discard,
+                                subnodes_to_discard,
+                                file_tx,
+                                metadata,
+                                link_messages,
+                                stats,
+                                parent_branch,
+                                tracker,
+                                dir_semaphore,
+                            )
+                            .await
+                        }
+                    });
+                }
+                Err(_) => {
+                    if let Err(err) = commit_directory_recurse(
+                        repository.clone(),
+                        token.share(),
+                        state.clone(),
                         absolute_path,
                         relative_path,
                         child_node_id,
-                        delta,
-                        discard,
-                        subnodes_to_discard,
-                        file_tx,
-                        metadata,
-                        link_messages,
-                        stats,
+                        delta.clone(),
+                        discard.clone(),
+                        subnodes_to_discard.clone(),
+                        file_tx.clone(),
+                        metadata.clone(),
+                        link_messages.clone(),
+                        stats.clone(),
                         parent_branch,
-                        tracker,
+                        tracker.clone(),
+                        dir_semaphore.clone(),
                     )
                     .await
+                    {
+                        walk_failure = Some(err);
+                        break;
+                    }
                 }
-            });
+            }
         } else if child_node.is_link() {
             lore_debug!(
                 "Before committing link node, parent node {} address {}",
@@ -1519,7 +2007,7 @@ async fn commit_directory(
                 }
             });
         } else if child_node.is_file() {
-            collect_file(
+            if let Err(err) = collect_file(
                 child_node_id,
                 absolute_path,
                 relative_path,
@@ -1527,7 +2015,11 @@ async fn commit_directory(
                 &stats,
                 child_node.size,
             )
-            .await?;
+            .await
+            {
+                walk_failure = Some(err);
+                break;
+            }
             updated = true;
         }
     }
@@ -1543,6 +2035,9 @@ async fn commit_directory(
         } else {
             task_failure = Err(task.unwrap_err());
         }
+    }
+    if let Some(err) = walk_failure {
+        return Err(err);
     }
     commit_failure?;
     task_failure.internal("Recursion task failed")?;
@@ -1578,6 +2073,7 @@ fn commit_directory_recurse(
     stats: Arc<CommitStats>,
     parent_branch: BranchId,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+    dir_semaphore: Arc<Semaphore>,
 ) -> Pin<Box<dyn Future<Output = Result<(), CommitError>> + Send>> {
     Box::pin(commit_directory(
         repository,
@@ -1595,6 +2091,7 @@ fn commit_directory_recurse(
         stats,
         parent_branch,
         tracker,
+        dir_semaphore,
     ))
 }
 
@@ -1801,6 +2298,21 @@ async fn collect_file(
     Ok(())
 }
 
+/// Folds a finished [`commit_file`] task into the first failure seen.
+fn collect_committed_file(
+    result: Result<Result<(), CommitError>, tokio::task::JoinError>,
+    failure: &mut Option<CommitError>,
+) {
+    if let Err(err) = result
+        .internal("Recursion task failed")
+        .map_err(CommitError::from)
+        .flatten()
+        && failure.is_none()
+    {
+        *failure = Some(err);
+    }
+}
+
 async fn commit_execute(
     mut file_rx: mpsc::Receiver<FileToCommit>,
     repository: Arc<RepositoryContext>,
@@ -1808,6 +2320,7 @@ async fn commit_execute(
     delta: Arc<parking_lot::RwLock<BytesMut>>,
     stats: Arc<CommitStats>,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+    modified_times: Arc<RecordedModifiedTimes>,
 ) -> Result<(), CommitError> {
     const MAX_CONCURRENT_TASKS: usize = 10000;
     let mut tasks = JoinSet::new();
@@ -1817,16 +2330,17 @@ async fn commit_execute(
         lore_spawn!(tasks, {
             let repository = repository.clone();
             let state = state.clone();
-            let block_index = NodeBlock::index(file_to_commit.node_id);
-            let node_index = Node::index(file_to_commit.node_id);
-            let block = state
-                .block(repository.clone(), block_index)
-                .await
-                .forward::<CommitError>("Failed deserializing state block")?;
             let delta = delta.clone();
             let stats = stats.clone();
             let tracker = tracker.clone();
+            let modified_times = modified_times.clone();
             async move {
+                let block_index = NodeBlock::index(file_to_commit.node_id);
+                let node_index = Node::index(file_to_commit.node_id);
+                let block = state
+                    .block(repository.clone(), block_index)
+                    .await
+                    .forward::<CommitError>("Failed deserializing state block")?;
                 commit_file(
                     repository,
                     state,
@@ -1839,26 +2353,19 @@ async fn commit_execute(
                     delta,
                     stats,
                     tracker,
+                    modified_times,
                 )
                 .await
             }
         });
 
         while let Some(result) = tasks.try_join_next() {
-            commit_failure = commit_failure.or(result
-                .internal("Recursion task failed")
-                .map_err(CommitError::from)
-                .flatten()
-                .err());
+            collect_committed_file(result, &mut commit_failure);
         }
         while tasks.len() > MAX_CONCURRENT_TASKS
             && let Some(result) = tasks.join_next().await
         {
-            commit_failure = commit_failure.or(result
-                .internal("Recursion task failed")
-                .map_err(CommitError::from)
-                .flatten()
-                .err());
+            collect_committed_file(result, &mut commit_failure);
         }
 
         if commit_failure.is_some() {
@@ -1867,11 +2374,7 @@ async fn commit_execute(
     }
 
     while let Some(result) = tasks.join_next().await {
-        commit_failure = commit_failure.or(result
-            .internal("Recursion task failed")
-            .map_err(CommitError::from)
-            .flatten()
-            .err());
+        collect_committed_file(result, &mut commit_failure);
     }
 
     if let Some(err) = commit_failure {
@@ -1881,6 +2384,20 @@ async fn commit_execute(
     }
 }
 
+/// Metadata of the file about to be fragmented, read before its content rather than after.
+///
+/// A file written to while it is being fragmented then yields a time older than the content
+/// that was committed, costing that one file a hash on the next scan. A time read afterwards
+/// would describe content that was never committed, and the next scan would trust it.
+async fn metadata_before_fragmenting(path: &Path) -> Result<std::fs::Metadata, CommitError> {
+    Ok(lore_io::IoDriver::global()
+        .metadata(path)
+        .await
+        .internal_with(|| format!("Failed to get metadata for file {}", path.display()))?)
+}
+
+/// Commits one file node, recording the modified time it read the file at. A view-excluded
+/// path records nothing: its content is taken from the staged node rather than disk.
 #[allow(clippy::too_many_arguments)]
 async fn commit_file(
     repository: Arc<RepositoryContext>,
@@ -1894,6 +2411,7 @@ async fn commit_file(
     delta: Arc<parking_lot::RwLock<BytesMut>>,
     stats: Arc<CommitStats>,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+    modified_times: Arc<RecordedModifiedTimes>,
 ) -> Result<(), CommitError> {
     let mut node = { *block.read().node(node_index) };
 
@@ -1930,47 +2448,59 @@ async fn commit_file(
         node.flags
     );
 
-    if node.address.context.is_zero() {
-        // TODO(mjansson): Optionally find previous identical file content and deduplicate by using same context
-        node.address.context = uuid::Uuid::now_v7().into();
-        lore_trace!(
-            "Generate file ID for file: {} {}",
-            relative_path.as_str(),
-            node.address.context
-        );
-    }
+    // A sparse checkout has no working-tree file for a view-excluded path, so
+    // the staged content hash is the only source. Re-fragmenting would read a
+    // file that is absent or stale.
+    //
+    // This test must stay identical to the one realize gates disk writes on
+    // (`fs/realize.rs`), because that is what decided whether the file was
+    // written.
+    let (address, content_size, mode, modified_time) =
+        if repository
+            .filter
+            .excludes(&relative_path, false, FilterMode::View)
+        {
+            (node.address, node.size, node.mode, None)
+        } else {
+            if node.address.context.is_zero() {
+                // TODO(mjansson): Optionally find previous identical file content and deduplicate by using same context
+                node.address.context = uuid::Uuid::now_v7().into();
+                lore_trace!(
+                    "Generate file ID for file: {} {}",
+                    relative_path.as_str(),
+                    node.address.context
+                );
+            }
 
-    let (address, fragment) = immutable::write_from_file_with_tracker(
-        repository.clone(),
-        absolute_path.as_path(),
-        node.address.context,
-        immutable::write_options_from_repository(repository.clone()),
-        Some(tracker),
-    )
-    .await
-    .forward_with::<CommitError, _>(|| {
-        format!(
-            "Failed writing file {} to immutable store",
-            relative_path.as_str()
-        )
-    })?;
+            let metadata = metadata_before_fragmenting(absolute_path.as_path()).await?;
 
-    stats
-        .complete
-        .bytes_transferred
-        .fetch_add(fragment.size_content, Ordering::Relaxed);
+            let (address, size_content) = immutable::write_from_file_with_tracker(
+                repository.clone(),
+                absolute_path.as_path(),
+                node.address.context,
+                immutable::write_options_from_repository(repository.clone()),
+                Some(tracker),
+            )
+            .await
+            .forward_with::<CommitError, _>(|| {
+                format!(
+                    "Failed writing file {} to immutable store",
+                    relative_path.as_str()
+                )
+            })?;
 
-    let Ok(metadata) = tokio::fs::metadata(absolute_path.as_path()).await else {
-        return Err(CommitError::internal(format!(
-            "Failed to get metadata for file {}",
-            absolute_path.display()
-        )));
-    };
+            stats.file_read(size_content);
 
-    let mode = util::fs::metadata_to_mode(&metadata, node.mode);
+            (
+                address,
+                size_content,
+                util::fs::metadata_to_mode(&metadata, node.mode),
+                Some(util::fs::file_mtime(&metadata)),
+            )
+        };
 
     let modified = util::fs::mode_changed(node.mode, mode)
-        || node.size != fragment.size_content
+        || node.size != content_size
         || node.address.hash != address.hash;
 
     if modified
@@ -1993,6 +2523,7 @@ async fn commit_file(
             .complete
             .file_modify_count
             .fetch_add(1, Ordering::Relaxed);
+        stats.record_file_action(node.flags, content_size);
 
         let flags = node.flags;
         delta_add(delta, node_id, flags);
@@ -2002,7 +2533,7 @@ async fn commit_file(
             let node = block_writer.node(node_index);
 
             node.address = address;
-            node.size = fragment.size_content;
+            node.size = content_size;
             node.mode = mode;
             node.child = 0;
 
@@ -2028,6 +2559,10 @@ async fn commit_file(
             state.block_modified(block.clone(), block_index);
             state.mark_dirty();
         }
+    }
+
+    if let Some(modified_time) = modified_time {
+        modified_times.record(&repository, &relative_path, modified_time);
     }
 
     stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
@@ -2117,6 +2652,7 @@ async fn commit_link_node(
         branch_id,
         signature,
         link_metadata,
+        link_messages,
         stats,
         parent_tracker,
     )
@@ -2185,6 +2721,7 @@ async fn commit_link(
     branch: BranchId,
     current_revision: Hash,
     metadata: Arc<Metadata>,
+    link_messages: Arc<HashMap<String, String>>,
     stats: Arc<CommitStats>,
     parent_tracker: Arc<lore_storage::write_tracker::WriteTracker>,
 ) -> Result<(Hash, NodeID), CommitError> {
@@ -2209,17 +2746,26 @@ async fn commit_link(
 
     prune_dirty_for_commit(state.clone(), repository.clone()).await?;
 
+    // Observed before any write, so the pointer write below compares against the
+    // tip this commit was built on rather than one a racing committer published.
+    let link_previous = branch::load_latest(repository.clone(), branch)
+        .await
+        .unwrap_or_default();
+
     // Graceful-drain pattern mirroring commit_staged_revision: run all
     // write-producing work under `work_tracker`, then ALWAYS drain so leaders
     // never outlive this function. Only on drain success AND branch-pointer
     // success do we emit the event. `Ok(None)` signals the "unchanged link"
     // case — no new revision, no event.
     let work_tracker = link_tracker.clone();
+    let link_modified_times = Arc::new(RecordedModifiedTimes::default());
     let work_result: Result<Option<Hash>, CommitError> = {
         let repository = repository.clone();
         let state = state.clone();
         let metadata = metadata.clone();
+        let link_messages = link_messages.clone();
         let stats = stats.clone();
+        let link_modified_times = link_modified_times.clone();
         async move {
             let delta = Arc::new(parking_lot::RwLock::new(BytesMut::new()));
             let discard = Arc::new(parking_lot::RwLock::new(vec![]));
@@ -2239,8 +2785,11 @@ async fn commit_link(
                 let discard = discard.clone();
                 let subnodes_to_discard = subnodes_to_discard.clone();
                 let metadata = metadata.clone();
+                let link_messages = link_messages.clone();
                 let stats = stats.clone();
                 let tracker = work_tracker.clone();
+                // Own budget per linked sub-repo, isolated from the parent's.
+                let dir_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DIRECTORY_TASKS));
                 lore_spawn!(async move {
                     commit_directory_recurse(
                         repository,
@@ -2254,12 +2803,15 @@ async fn commit_link(
                         subnodes_to_discard,
                         file_tx,
                         metadata,
-                        // Per-link messages only apply one level deep. Nested
-                        // links receive the main message.
-                        Arc::new(HashMap::new()),
+                        // Per-link messages are keyed by full mount path, so a
+                        // nested link (e.g. `vendor/b/vendor/c`) still receives
+                        // its `--link-message`; it falls back to the main
+                        // message when no entry matches.
+                        link_messages,
                         stats,
                         link_branch,
                         tracker,
+                        dir_semaphore,
                     )
                     .await
                 })
@@ -2271,8 +2823,18 @@ async fn commit_link(
                 let delta = delta.clone();
                 let stats = stats.clone();
                 let tracker = work_tracker.clone();
+                let modified_times = link_modified_times.clone();
                 lore_spawn!(async move {
-                    commit_execute(file_rx, repository, state, delta, stats, tracker).await
+                    commit_execute(
+                        file_rx,
+                        repository,
+                        state,
+                        delta,
+                        stats,
+                        tracker,
+                        modified_times,
+                    )
+                    .await
                 })
             };
 
@@ -2347,6 +2909,7 @@ async fn commit_link(
                 branch::store_latest(
                     repository.clone(),
                     branch,
+                    link_previous,
                     signature,
                     BranchLatestStatus::Divergent,
                 )
@@ -2396,9 +2959,11 @@ async fn commit_link(
     .send();
 
     let node_link = state
-        .find_node_link(repository, &node_path)
+        .find_node_link(repository.clone(), &node_path)
         .await
         .forward::<CommitError>("Failed to find link node")?;
+
+    link_modified_times.store(repository).await;
 
     Ok((signature, node_link.node))
 }
@@ -2445,18 +3010,31 @@ pub async fn rehash_directory(
     lore_trace!("Rehash directory node {} address {}", node_id, node.address);
     debug_assert!(node.is_directory());
 
-    let mut tasks = JoinSet::new();
     let mut child_data: Vec<NodeHashData> = vec![];
 
     let mut total_size = 0;
     let mut children = StateNodeChildrenIterator::new(state.clone(), repository.clone(), node_id)
         .await
         .forward::<CommitError>("Failed deserializing state block")?;
-    while let Some((child_node_id, child_node)) = children
-        .next()
-        .await
-        .forward::<CommitError>("Failed deserializing state block")?
-    {
+
+    let mut tasks = JoinSet::new();
+    let mut walk_failure = None;
+
+    loop {
+        let child = match children
+            .next()
+            .await
+            .forward::<CommitError>("Failed deserializing state block")
+        {
+            Ok(Some(child)) => child,
+            Ok(None) => break,
+            Err(err) => {
+                walk_failure = Some(err);
+                break;
+            }
+        };
+        let (child_node_id, child_node) = child;
+
         if child_node.is_staged_delete() {
             let node_path = state
                 .node_path(repository.clone(), child_node_id)
@@ -2465,9 +3043,10 @@ pub async fn rehash_directory(
             lore_warn!(
                 "Encountered deleted node {child_node_id} when rehashing directory node {node_id}: {node_path}"
             );
-            return Err(CommitError::internal(
+            walk_failure = Some(CommitError::internal(
                 "Deleted node remains after nodes were committed",
             ));
+            break;
         }
 
         if child_node.is_dirty() {
@@ -2481,9 +3060,10 @@ pub async fn rehash_directory(
                 child_node.flags,
                 child_node.address
             );
-            return Err(CommitError::internal(
+            walk_failure = Some(CommitError::internal(
                 "Dirty node remain after nodes were committed",
             ));
+            break;
         }
 
         if child_node.is_directory() {
@@ -2505,9 +3085,10 @@ pub async fn rehash_directory(
                     child_node.flags,
                     child_node.address
                 );
-                return Err(CommitError::internal(
+                walk_failure = Some(CommitError::internal(
                     "Staged node remain after nodes were committed",
                 ));
+                break;
             } else if child_node.is_link() {
                 // Links are handled explicitly before hashing directories
                 lore_debug!(
@@ -2518,9 +3099,10 @@ pub async fn rehash_directory(
                 && child_node.address.hash.is_zero()
                 && child_node.size > 0
             {
-                return Err(CommitError::internal(
+                walk_failure = Some(CommitError::internal(
                     "Node with zero hash remain after nodes were committed",
                 ));
+                break;
             }
 
             lore_trace!(
@@ -2540,13 +3122,21 @@ pub async fn rehash_directory(
 
     let mut task_failure = Ok(());
     while let Some(task) = tasks.join_next().await {
-        if let Ok(result) = task {
-            let result = result?;
-            total_size += result.size;
-            child_data.push(result);
-        } else {
-            task_failure = Err(task.unwrap_err());
+        match task {
+            Ok(Ok(result)) => {
+                total_size += result.size;
+                child_data.push(result);
+            }
+            Ok(Err(err)) => {
+                if walk_failure.is_none() {
+                    walk_failure = Some(err);
+                }
+            }
+            Err(join_error) => task_failure = Err(join_error),
         }
+    }
+    if let Some(err) = walk_failure {
+        return Err(err);
     }
     task_failure.internal("Recursion task failed")?;
 
@@ -2625,7 +3215,7 @@ async fn generate_delta_block(
     };
     let delta_count = delta.count::<NodeDelta>();
 
-    let (address, _fragment) = if !delta.is_empty() {
+    let address = if !delta.is_empty() {
         immutable::write_with_tracker(
             repository.clone(),
             Context::default(),
@@ -2638,7 +3228,7 @@ async fn generate_delta_block(
         .await
         .forward::<CommitError>("Failed writing delta block to immutable store")?
     } else {
-        (Address::default(), Fragment::default())
+        Address::default()
     };
 
     state
@@ -3056,6 +3646,13 @@ pub(crate) async fn prune_dirty_for_commit(
 /// subtrees are untouched — in particular a clean committed empty directory
 /// is no longer visited, so the empty-directory collapse below only applies
 /// to directories on dirty paths.
+///
+/// `clear_dirty_flags` preserves Staged and the action bits when Staged is set,
+/// so clearing both restores dirty-only nodes and strips a stale Dirty
+/// propagation bit that `rehash_directory` would otherwise leave on a staged
+/// parent. An intermediate directory created solely to host dirty-add children
+/// is discarded once emptied, so the parent's rehash does not pull in an
+/// orphaned dirty-only directory.
 fn prune_dirty_recurse(
     state: Arc<State>,
     repository: Arc<RepositoryContext>,
@@ -3120,10 +3717,6 @@ fn prune_dirty_recurse(
         }
 
         if is_dirty {
-            // `clear_dirty_flags` preserves Staged + action bits when Staged
-            // is set, so this both restores dirty-only nodes and strips a
-            // stale Dirty propagation bit from staged parents that
-            // `rehash_directory` would otherwise leave behind.
             let dirtied = {
                 let mut block_writer = block.write();
                 let node = block_writer.node(node_index);
@@ -3139,15 +3732,623 @@ fn prune_dirty_recurse(
             return Ok(false);
         }
 
-        // An intermediate directory created solely to host dirty-add
-        // children is now empty — discard it too so the parent's rehash
-        // does not pull in an orphaned dirty-only directory.
         if is_dir_now && !child_now.is_valid_node_id() && !is_root {
             return Ok(true);
         }
 
         Ok(false)
     })
+}
+
+/// Resolve which branch a revision built on `current_revision` publishes to.
+///
+/// The revision's own `branch` metadata key decides, so a caller starting a new
+/// branch's history sets it before committing. A key that is set must name either
+/// the parent revision's branch — continuing it — or a branch whose branch point
+/// is exactly `(the parent's branch, current_revision)`, which is what the first
+/// revision on a branch created from that revision looks like. Unset resolves to
+/// the parent's branch.
+///
+/// "Still at the branch point" needs no separate check: the tip
+/// compare-and-swap compares against `current_revision`, so a branch that has
+/// moved past its branch point fails there.
+///
+/// An initial revision has no parent to read a branch from and must carry the key.
+///
+/// `parent` is the state of `current_revision` — for a handle that is the state it
+/// already holds, whose `metadata_hash` is still the loaded revision's until a
+/// commit replaces it. A caller without it in hand deserializes it first, so the
+/// read is visible where it is paid for rather than hidden here.
+pub async fn resolve_commit_branch(
+    repository: Arc<RepositoryContext>,
+    parent: Arc<State>,
+    metadata: &Metadata,
+    current_revision: Hash,
+) -> Result<BranchId, CommitError> {
+    let requested = metadata
+        .get_branch()
+        .ok()
+        .filter(|branch| !branch.is_zero());
+
+    if current_revision.is_zero() {
+        return requested.ok_or_else(|| {
+            CommitError::from(InvalidArguments {
+                reason: "an initial revision must record the branch it starts".into(),
+            })
+        });
+    }
+
+    let parent_branch = parent.branch(repository.clone()).await;
+
+    let Some(requested) = requested else {
+        if parent_branch.is_zero() {
+            return Err(InvalidArguments {
+                reason: format!(
+                    "parent revision {current_revision} records no branch, so the commit must record one"
+                ),
+            }
+            .into());
+        }
+        return Ok(parent_branch);
+    };
+
+    if requested == parent_branch {
+        return Ok(requested);
+    }
+
+    let branch_metadata = branch::metadata(repository.clone(), requested)
+        .await
+        .forward::<CommitError>("Failed to load branch metadata")?;
+    let stack = branch::stack(&branch_metadata);
+    let Some(branch_point) = stack.first() else {
+        return Err(InvalidArguments {
+            reason: format!("branch {requested} has no branch point to start from"),
+        }
+        .into());
+    };
+    if branch_point.branch != parent_branch || branch_point.revision != current_revision {
+        return Err(InvalidArguments {
+            reason: format!(
+                "branch {requested} branches from {} on {}, not from {current_revision} on {parent_branch}",
+                branch_point.revision, branch_point.branch
+            ),
+        }
+        .into());
+    }
+    Ok(requested)
+}
+
+/// Stamp the facts about the commit act the caller did not supply — which branch
+/// it publishes to, when it happened, and who made it — leaving every key the
+/// caller did set alone. Authorship is required only when the active remote
+/// authenticates.
+async fn stamp_commit_metadata(
+    repository: Arc<RepositoryContext>,
+    metadata: &mut Metadata,
+    branch: BranchId,
+) -> Result<(), CommitError> {
+    metadata
+        .set_branch(branch)
+        .forward::<CommitError>("Failed setting revision metadata")?;
+
+    if metadata.get_timestamp().unwrap_or_default() == 0 {
+        metadata
+            .set_timestamp(util::time::timestamp())
+            .forward::<CommitError>("Failed setting revision metadata")?;
+    }
+
+    let identity = execution_context().user_id().await;
+    if identity.is_empty() {
+        let require_identity = match repository.remote().await {
+            Ok(connection) => !connection.auth_url.is_empty(),
+            Err(lore_transport::ProtocolError::NoRemote(_)) => false,
+            Err(_) => true,
+        };
+        if require_identity && string_key_is_unset(metadata, metadata::CREATED_BY) {
+            return Err(MissingIdentity.into());
+        }
+        return Ok(());
+    }
+
+    for key in [metadata::CREATED_BY, metadata::COMMITTED_BY] {
+        if string_key_is_unset(metadata, key) {
+            metadata
+                .set_string(key, &identity)
+                .forward::<CommitError>("Failed setting revision metadata")?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `key` holds no string value, so writing one fills a gap rather than
+/// overwriting a choice.
+///
+/// Absent counts as unset, and so does an empty string — matching how
+/// [`crate::revision::amend`] reads the same keys. A value of any other kind counts
+/// as **set**, because the caller picked that kind deliberately. Asking `get_string`
+/// alone conflated the two: it fails for every non-string kind, so a numeric or
+/// binary value read as absent and was overwritten.
+fn string_key_is_unset(metadata: &Metadata, key: &str) -> bool {
+    match metadata.get_typed(key) {
+        Ok((value, MetadataType::String)) => Metadata::to_string(value).is_ok_and(str::is_empty),
+        Ok(_) => false,
+        Err(_) => true,
+    }
+}
+
+/// Commit the tree a path-less handle holds as a new revision on `branch`.
+///
+/// The in-memory counterpart to [`commit_staged_revision`]. Every leaf already
+/// carries the address the caller put there, so there is no working tree to walk
+/// and nothing to fragment — but the tree still has to be frozen: staged
+/// deletions discarded, change flags cleared, directories rehashed, and the node
+/// delta recorded for the next revision to weave history against.
+///
+/// `current_revision` becomes the new revision's parent, and the branch tip must
+/// still be on it: the check runs before any work so a caller fails fast, and the
+/// pointer write compares against the same observed value so a tip that advances
+/// during the freeze fails too.
+///
+/// The freeze cannot be undone, so it is snapshotted instead: the staged state is
+/// serialized just before it begins, and an error from there on returns that
+/// signature as [`InMemoryCommitFailure::restore_from`] for the caller to rebuild
+/// the tree from with [`State::deserialize`]. A restored state is a replacement, not
+/// a repair — the part-frozen one is dropped whole. Blocks written before the failure
+/// are content-addressed and idempotent on a retry, and the snapshot itself is
+/// unreferenced once the commit succeeds.
+///
+/// The snapshot is taken after the rejections, which leave the tree untouched and need
+/// none, and before `set_parent_self`, which already belongs to the commit rather than
+/// to the state the caller built. The state is marked dirty on either side of it: a
+/// clean state serializes to its existing signature without writing, so a
+/// metadata-only commit on a handle at the zero revision would snapshot to a zero hash
+/// — indistinguishable from "the freeze never started" — and the freeze's own writes
+/// re-dirty the state only when it has something to do.
+///
+/// The write tracker is drained on every path, including failure, since dropping it
+/// with leaders still running aborts them. The tip is published last, and only once
+/// every payload is durable: an unreferenced revision is an orphan the
+/// content-addressed store tolerates and a retry reproduces, where a tip pointing at
+/// payloads that never landed is not.
+pub async fn commit_in_memory_revision(
+    repository: Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    state_staged: Arc<State>,
+    metadata: Metadata,
+    current_revision: Hash,
+    branch: BranchId,
+) -> Result<Hash, InMemoryCommitFailure> {
+    let observed_tip = branch::load_latest(repository.clone(), branch)
+        .await
+        .unwrap_or_default();
+    if !observed_tip.is_zero() && observed_tip != current_revision {
+        lore_debug!(
+            "Branch {branch} is at {observed_tip}, not at the loaded revision {current_revision}"
+        );
+        return Err(InMemoryCommitFailure::rejected(BranchAdvanced));
+    }
+
+    let has_staged = has_staged_children(repository.clone(), &state_staged)
+        .await
+        .map_err(InMemoryCommitFailure::rejected)?;
+    if !has_staged && metadata_is_empty(&metadata) {
+        return Err(InMemoryCommitFailure::rejected(NothingStaged));
+    }
+
+    verify_state_for_commit(repository.clone(), state_staged.clone())
+        .await
+        .forward::<CommitError>("Revision state is not valid to commit")
+        .map_err(InMemoryCommitFailure::rejected)?;
+
+    let mut metadata = metadata;
+    stamp_commit_metadata(repository.clone(), &mut metadata, branch)
+        .await
+        .map_err(InMemoryCommitFailure::rejected)?;
+
+    state_staged.mark_dirty();
+    let restore_from = state_staged
+        .serialize(repository.clone(), token)
+        .await
+        .forward::<CommitError>("Failed to snapshot the staged state")
+        .map_err(InMemoryCommitFailure::rejected)?;
+    debug_assert!(
+        !restore_from.is_zero(),
+        "the snapshot must be a real state, or a post-freeze failure has nothing to restore from"
+    );
+    state_staged.mark_dirty();
+
+    state_staged.set_parent_self(current_revision);
+    state_staged.set_parent_other(Hash::default());
+
+    let stats = CommitStats::new();
+    let tracker = immutable::commit_write_tracker(false);
+    let work_tracker = tracker.clone();
+    let work_repository = repository.clone();
+    let work_result: Result<Hash, CommitError> = async move {
+        freeze_in_memory_tree(
+            work_repository.clone(),
+            state_staged.clone(),
+            stats.clone(),
+            work_tracker.clone(),
+        )
+        .await?;
+
+        state_staged.set_metadata_hash(
+            metadata
+                .serialize_with_tracker(work_repository.clone(), Some(work_tracker.clone()))
+                .await
+                .forward::<CommitError>("Failed to write commit metadata")?,
+        );
+
+        weave_history(work_repository.clone(), state_staged.clone()).await?;
+
+        state_staged.reset_merge_conflict_flags();
+        state_staged.clear_link_merge_state();
+
+        state_staged
+            .serialize(work_repository, token)
+            .await
+            .forward::<CommitError>("Failed to serialize revision state")
+    }
+    .await;
+
+    let drain_result = tracker.await_all().await;
+
+    let signature =
+        work_result.map_err(|error| InMemoryCommitFailure::while_freezing(error, restore_from))?;
+    drain_result
+        .forward::<CommitError>("Background fragment upload task failed during commit")
+        .map_err(|error| InMemoryCommitFailure::while_freezing(error, restore_from))?;
+
+    branch::store_latest(
+        repository,
+        branch,
+        observed_tip,
+        signature,
+        BranchLatestStatus::Divergent,
+    )
+    .await
+    .forward::<CommitError>("Failed to store current branch latest")
+    .map_err(|error| InMemoryCommitFailure::while_freezing(error, restore_from))?;
+
+    Ok(signature)
+}
+
+/// Why an in-memory commit failed, and whether it had begun freezing the tree.
+///
+/// A failure before the freeze wrote nothing to the state, so it is still exactly
+/// what the caller built — a batch with nothing staged or a branch that already
+/// moved on costs the caller nothing. From the freeze onwards the tree is
+/// part-frozen and cannot be trusted, and [`Self::restore_from`] carries the
+/// pre-commit snapshot to rebuild it from.
+#[derive(Debug)]
+pub struct InMemoryCommitFailure {
+    /// What went wrong.
+    pub error: CommitError,
+    /// Signature of the pre-commit state, zero until the freeze has begun. The two
+    /// facts are one: a tree nothing has mutated needs no snapshot to go back to.
+    pub restore_from: Hash,
+}
+
+impl InMemoryCommitFailure {
+    /// Whether the freeze had begun, so `state_staged` can no longer be trusted.
+    pub fn tree_mutated(&self) -> bool {
+        !self.restore_from.is_zero()
+    }
+
+    fn rejected(error: impl Into<CommitError>) -> Self {
+        Self {
+            error: error.into(),
+            restore_from: Hash::default(),
+        }
+    }
+
+    fn while_freezing(error: impl Into<CommitError>, restore_from: Hash) -> Self {
+        Self {
+            error: error.into(),
+            restore_from,
+        }
+    }
+}
+
+impl std::fmt::Display for InMemoryCommitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+fn metadata_is_empty(metadata: &Metadata) -> bool {
+    let mut count = 0usize;
+    metadata.walk(|_, _, _| count += 1);
+    count == 0
+}
+
+/// Whether anything under the root is staged, stopping at the first one found.
+///
+/// `State::node_has_staged_children` answers the same question through
+/// `node_children`, which collects every child into a vector and follows links —
+/// and link following is unbounded, so a cyclic link would hang here before the
+/// commit had looked at anything. The iterator neither allocates nor descends into
+/// a link, and carries the node so there is no second read per child.
+async fn has_staged_children(
+    repository: Arc<RepositoryContext>,
+    state: &Arc<State>,
+) -> Result<bool, CommitError> {
+    let mut children = StateNodeChildrenIterator::new(state.clone(), repository, ROOT_NODE)
+        .await
+        .forward::<CommitError>("Failed deserializing state node block")?;
+    while let Some((_child_node_id, child_node)) = children
+        .next()
+        .await
+        .forward::<CommitError>("Failed deserializing state node block")?
+    {
+        if child_node.is_staged() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Freeze the staged tree into the shape a revision records: dirty tracking
+/// pruned, staged deletions discarded, staged files and links cleared of their
+/// change flags, every affected directory rehashed, and the node delta written.
+async fn freeze_in_memory_tree(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    stats: Arc<CommitStats>,
+    tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+) -> Result<(), CommitError> {
+    prune_dirty_for_commit(state.clone(), repository.clone()).await?;
+
+    let delta = Arc::new(parking_lot::RwLock::new(BytesMut::new()));
+    let discard = Arc::new(parking_lot::RwLock::new(vec![]));
+    let subnodes_to_discard = Arc::new(parking_lot::RwLock::new(vec![]));
+
+    event::LoreEvent::RevisionCommitBegin(LoreRevisionCommitBeginEventData::default()).send();
+
+    freeze_directory(
+        repository.clone(),
+        state.clone(),
+        ROOT_NODE,
+        delta.clone(),
+        discard.clone(),
+        subnodes_to_discard.clone(),
+        stats.clone(),
+    )
+    .await?;
+
+    stats.discovery.complete.store(true, Ordering::Relaxed);
+    event::LoreEvent::RevisionCommitProgress(LoreRevisionCommitProgressEventData {
+        count: LoreRevisionCommitCountData::new(stats.clone()),
+    })
+    .send();
+
+    commit_discard_subnodes(
+        repository.clone(),
+        state.clone(),
+        subnodes_to_discard,
+        stats.clone(),
+    )
+    .await?;
+
+    commit_discard(
+        repository.clone(),
+        state.clone(),
+        delta.clone(),
+        discard,
+        stats.clone(),
+    )
+    .await?;
+
+    event::LoreEvent::RevisionCommitEnd(LoreRevisionCommitEndEventData {
+        count: LoreRevisionCommitCountData::new(stats),
+    })
+    .send();
+
+    rehash_directory(repository.clone(), state.clone(), ROOT_NODE).await?;
+
+    state
+        .update_tree_root_hash(repository.clone())
+        .await
+        .forward::<CommitError>("Failed to update tree root hash")?;
+
+    generate_delta_block(repository, state, delta, tracker).await
+}
+
+/// Walk one directory's staged children, recursing into staged subdirectories.
+///
+/// Sequential on purpose: the walk only flips flags and appends to one shared
+/// delta buffer, so fanning out would contend on that buffer for no gain — the
+/// parallelism that matters is in [`rehash_directory`], which hashes.
+///
+/// A staged file or link already carries the address the caller supplied, so
+/// there is nothing to fragment — only the change flags to clear.
+async fn freeze_directory(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    node_id: NodeID,
+    delta: Arc<parking_lot::RwLock<BytesMut>>,
+    discard: Arc<parking_lot::RwLock<Vec<NodeID>>>,
+    subnodes_to_discard: Arc<parking_lot::RwLock<Vec<NodeID>>>,
+    stats: Arc<CommitStats>,
+) -> Result<(), CommitError> {
+    let parent = state
+        .node(repository.clone(), node_id)
+        .await
+        .forward::<CommitError>("Failed deserializing state block")?;
+    if parent.is_staged() {
+        delta_add(delta.clone(), node_id, parent.flags);
+    }
+
+    let mut subdirectories: Vec<NodeID> = Vec::new();
+    let mut updated = false;
+    let mut children =
+        StateNodeChildrenIterator::from_parent(state.clone(), repository.clone(), node_id, &parent)
+            .await
+            .forward::<CommitError>("Failed deserializing state block")?;
+    while let Some((child_node_id, child_node)) = children
+        .next()
+        .await
+        .forward::<CommitError>("Failed deserializing state block")?
+    {
+        if !child_node.is_staged() {
+            continue;
+        }
+        updated = true;
+
+        if child_node.is_staged_delete() {
+            if child_node.is_directory() {
+                collect_discard_subnodes(
+                    repository.clone(),
+                    state.clone(),
+                    delta.clone(),
+                    child_node_id,
+                    subnodes_to_discard.clone(),
+                    stats.clone(),
+                )
+                .await?;
+            }
+            discard.write().push(child_node_id);
+            if child_node.is_file() {
+                stats.complete.file_total.fetch_add(1, Ordering::Relaxed);
+            } else {
+                stats
+                    .complete
+                    .directory_total
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            continue;
+        }
+
+        if child_node.is_directory() {
+            subdirectories.push(child_node_id);
+            continue;
+        }
+
+        delta_add(delta.clone(), child_node_id, child_node.flags);
+        freeze_node(repository.clone(), state.clone(), child_node_id).await?;
+        stats.complete.file_count.fetch_add(1, Ordering::Relaxed);
+        stats.complete.file_total.fetch_add(1, Ordering::Relaxed);
+        stats
+            .complete
+            .file_modify_count
+            .fetch_add(1, Ordering::Relaxed);
+        stats.record_file_action(child_node.flags, child_node.size);
+        stats.discovery.total_files.fetch_add(1, Ordering::Relaxed);
+    }
+
+    for subdirectory in subdirectories {
+        freeze_directory_recurse(
+            repository.clone(),
+            state.clone(),
+            subdirectory,
+            delta.clone(),
+            discard.clone(),
+            subnodes_to_discard.clone(),
+            stats.clone(),
+        )
+        .await?;
+    }
+
+    if updated {
+        stats
+            .complete
+            .directory_count
+            .fetch_add(1, Ordering::Relaxed);
+        stats
+            .complete
+            .directory_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    Ok(())
+}
+
+fn freeze_directory_recurse(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    node_id: NodeID,
+    delta: Arc<parking_lot::RwLock<BytesMut>>,
+    discard: Arc<parking_lot::RwLock<Vec<NodeID>>>,
+    subnodes_to_discard: Arc<parking_lot::RwLock<Vec<NodeID>>>,
+    stats: Arc<CommitStats>,
+) -> Pin<Box<dyn Future<Output = Result<(), CommitError>> + Send>> {
+    Box::pin(freeze_directory(
+        repository,
+        state,
+        node_id,
+        delta,
+        discard,
+        subnodes_to_discard,
+        stats,
+    ))
+}
+
+/// Clear the staged and dirty flags a committed node no longer carries.
+async fn freeze_node(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    node_id: NodeID,
+) -> Result<(), CommitError> {
+    let block_index = NodeBlock::index(node_id);
+    let block = state
+        .block(repository, block_index)
+        .await
+        .forward::<CommitError>("Failed deserializing state block")?;
+    let dirtied = {
+        let mut writer = block.write();
+        writer.node(Node::index(node_id)).clear_all_change_flags();
+        writer.mark_dirty()
+    };
+    if dirtied {
+        state.block_modified(block, block_index);
+        state.mark_dirty();
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod statistics_level_tests {
+    use lore_base::runtime::LORE_CONTEXT;
+
+    use super::*;
+    use crate::interface::ExecutionContext;
+    use crate::interface::LoreGlobalArgs;
+    use crate::relay::EventDispatcher;
+
+    /// Run `body` under an execution context asking for `stats`.
+    async fn at_statistics_level<T>(stats: u32, body: impl Future<Output = T>) -> T {
+        let globals = LoreGlobalArgs {
+            stats,
+            ..Default::default()
+        };
+        let execution = Arc::new(ExecutionContext::new_client(
+            globals,
+            EventDispatcher::no_dispatch(),
+        ));
+        LORE_CONTEXT.scope(execution, body).await
+    }
+
+    /// Statistics level zero reports nothing, so it keeps nothing beyond what a
+    /// progress event reads: the content read off disk, which it reports as the
+    /// bytes transferred.
+    #[tokio::test]
+    async fn a_count_is_kept_only_where_something_reports_it() {
+        for (level, kept) in [(0, 0), (1, 1)] {
+            let files = at_statistics_level(level, async {
+                let stats = CommitStats::new();
+                stats.file_read(4096);
+                stats.record_file_action(0, 4096);
+                stats.file_stats()
+            })
+            .await;
+
+            assert_eq!(files.files, kept, "level {level}");
+            assert_eq!(files.files_read, kept, "level {level}");
+            assert_eq!(files.file_bytes, kept * 4096, "level {level}");
+            assert_eq!(files.bytes_transferred, 4096, "level {level}");
+        }
+    }
 }
 
 #[cfg(test)]

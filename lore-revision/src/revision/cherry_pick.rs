@@ -250,7 +250,6 @@ pub async fn cherry_pick(
             link: None,
             layer_messages: std::collections::HashMap::new(),
             layer: None,
-            stats: false,
         };
 
         Box::pin(commit::commit(repository.clone(), token, commit_options))

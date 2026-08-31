@@ -120,6 +120,7 @@ impl Topology for RotatingIdFixedTopology {
 mod tests {
     use std::time::Duration;
 
+    use lore_base::lore_spawn;
     use lore_revision::cluster::peer::Locality;
 
     use super::*;
@@ -152,7 +153,7 @@ mod tests {
         let topology = RotatingIdFixedTopology::from_settings(&config);
         {
             let topology = topology.clone();
-            let _task = tokio::spawn(async move {
+            let _task = lore_spawn!(async move {
                 topology
                     .refresh_loop()
                     .await

@@ -207,7 +207,7 @@ pub struct AuthSession {
 /// Returned from login flows (interactive, token exchange, refresh).
 /// This is the protocol-layer type -- transient, in-memory. The orchestration
 /// layer converts it to `SerializedToken` (the token store's on-disk format)
-/// when persisting to `tokens.toml`.
+/// when persisting to `tokenstore.toml`.
 #[derive(Clone, Debug)]
 pub struct AuthenticationToken {
     /// The bearer token string (typically a JWT, but opaque to the interface).

@@ -138,7 +138,7 @@ pub async fn release(
     } else {
         let resolved = branch::resolve(repository.clone(), options.branch.as_str())
             .await
-            .internal("Invalid branch")?;
+            .forward::<ReleaseError>("Invalid branch")?;
         resolved.id
     };
 
@@ -147,7 +147,7 @@ pub async fn release(
     } else if !options.owner.is_empty() {
         let owner_id = auth::userinfo::user_id(repository.clone(), &options.owner)
             .await
-            .internal("Failed to resolve user id from user name")?;
+            .forward::<ReleaseError>("Failed to resolve user id from user name")?;
 
         Some(owner_id)
     } else {

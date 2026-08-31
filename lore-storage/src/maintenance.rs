@@ -92,6 +92,11 @@ pub async fn compactor(
             let Some(real_store) = store.upgrade() else {
                 break;
             };
+            // A pass that was stopped rather than finished leaves its resume point behind,
+            // so re-reading after the wait picks that group back up instead of restarting.
+            if at.is_none() {
+                at = real_store.clone().compact_resume_at().await;
+            }
             // Background maintenance is silent — not tied to any command's event stream.
             match real_store.compact(max_size, at, sync_data, None).await {
                 Ok(Some(step_at)) => {
@@ -413,14 +418,79 @@ mod tests {
 
         let (_frag, payload) = store
             .clone()
-            .get(
-                partition,
-                address,
-                crate::store_types::StoreMatch::MatchHash,
-            )
+            .get(partition, address)
             .await
+            .and_then(crate::store_types::StoreGetData::into_payload)
             .expect("non-durable fragment must survive GC");
         assert_eq!(payload.len(), data.len());
+    }
+
+    /// Stopping a pass while it runs must never lose data. Compaction moves payloads
+    /// between packfiles and eviction drops them, so this races a stop against a pass with
+    /// caps low enough to force both and requires every protected fragment to read back.
+    /// Where the stop lands varies between runs; the requirement holds wherever it lands.
+    #[tokio::test]
+    async fn fragments_survive_a_stopped_gc_pass() {
+        let dir = generate_tempdir();
+        let store = LocalImmutableStore::new(
+            Some(dir.to_path_buf()),
+            ImmutableStoreSettings {
+                protect_local_fragment: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let partition = crate::Partition::from([0x0b; 16]);
+        let mut stored = vec![];
+        for i in 0u8..32 {
+            let data = vec![i; 4096];
+            let hash = crate::hash_slice(&data);
+            let address = crate::Address {
+                hash,
+                context: crate::Context::from([i; 16]),
+            };
+            let frag = crate::Fragment {
+                // Non-durable, so eviction is forbidden to reclaim it and the fragment must
+                // survive however far the pass got.
+                flags: 0,
+                size_payload: data.len() as u32,
+                size_content: data.len() as u64,
+            };
+            store
+                .clone()
+                .put(
+                    partition,
+                    address,
+                    frag,
+                    Some(bytes::Bytes::from(data.clone())),
+                    false,
+                )
+                .await
+                .unwrap();
+            stored.push((address, data.len()));
+        }
+        store.clone().flush(true).await.unwrap();
+
+        let store: Arc<dyn ImmutableStore> = store;
+        let pass = {
+            let store = store.clone();
+            lore_base::lore_spawn!(async move { gc(store, 1, 1, false, None).await })
+        };
+        tokio::task::yield_now().await;
+        store.clone().stop_gc(true).await;
+        pass.await.unwrap();
+
+        for (address, size) in stored {
+            let (_fragment, payload) = store
+                .clone()
+                .get(partition, address)
+                .await
+                .and_then(crate::store_types::StoreGetData::into_payload)
+                .expect("fragment must survive a stopped pass");
+            assert_eq!(payload.len(), size);
+        }
     }
 
     #[tokio::test]
@@ -739,6 +809,7 @@ mod tests {
             committed_level: std::sync::atomic::AtomicUsize::new(
                 crate::local::fan_out::FAN_OUT_LEVEL_MAX,
             ),
+            flush_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             packstore: PackStore::new(Some(tempdir.to_path_buf()), 1, None),
             flush: tokio::sync::Mutex::new(JoinSet::new()),
         });

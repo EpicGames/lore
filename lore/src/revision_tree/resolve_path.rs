@@ -82,9 +82,10 @@ fn emit_resolve_complete(
 /// carrying the resolved node plus the `(repository, revision)` it belongs to
 /// (which differ from the handle's when the path crosses a link) and
 /// `error_code = NONE`, before `Complete {status: 0}`. An empty path resolves to
-/// the root node. A path that does not resolve to a node — because it does not
-/// exist or is not valid UTF-8 — completes with `error_code = INVALID_ARGUMENTS`.
-/// The verb materializes no bytes to disk.
+/// the root node. A path that does not resolve to a node completes with
+/// `error_code = INVALID_ARGUMENTS`. A path that is not valid UTF-8 never
+/// reaches the verb — the entry point rejects the call before dispatching it, so
+/// no `RESOLVE_PATH_COMPLETE` fires. The verb materializes no bytes to disk.
 pub async fn resolve_path(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeResolvePathArgs,
@@ -99,16 +100,15 @@ async fn resolve_path_impl(
     callback: LoreEventCallback,
 ) -> i32 {
     let handle = args.handle;
-    let miss_id = args.id;
     revision_tree_call(
         globals,
         callback,
         handle,
         args,
         resolve_path,
-        move || {
+        |args: &LoreRevisionTreeResolvePathArgs| {
             emit_resolve_complete(
-                miss_id,
+                args.id,
                 INVALID_NODE,
                 RepositoryId::default(),
                 Hash::default(),
@@ -117,32 +117,22 @@ async fn resolve_path_impl(
         },
         async move |internal, args: LoreRevisionTreeResolvePathArgs| {
             let id = args.id;
-            let Ok(path) = std::str::from_utf8(args.path.as_bytes()) else {
-                emit_resolve_complete(
-                    id,
-                    INVALID_NODE,
-                    RepositoryId::default(),
-                    Hash::default(),
-                    LoreErrorCode::InvalidArguments,
-                );
-                return Err(ResolvePathError::from(InvalidArguments {
-                    reason: "path is not valid UTF-8".into(),
-                }));
-            };
+            let path = args.path.as_str();
+            let access = internal.access_shared().await;
+            let state = access.state();
 
             if path.is_empty() {
                 emit_resolve_complete(
                     id,
                     ROOT_NODE,
                     internal.repository,
-                    internal.state.revision(),
+                    state.revision(),
                     LoreErrorCode::None,
                 );
                 return Ok(());
             }
 
-            match internal
-                .state
+            match state
                 .find_node_link(internal.repository_context.clone(), path)
                 .await
             {
@@ -202,10 +192,13 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
+    use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::Address;
     use lore_base::types::Context;
     use lore_base::types::Hash;
     use lore_base::types::Partition;
+    use lore_revision::interface::LoreArray;
+    use lore_revision::interface::LoreNodeType;
     use lore_revision::node::Node;
     use lore_revision::node::NodeFlags;
     use lore_revision::repository::RepositoryContext;
@@ -214,6 +207,10 @@ mod tests {
     use lore_storage::hash::hash_string;
 
     use super::*;
+    use crate::call::setup_execution;
+    use crate::revision_tree::add::LoreRevisionTreeAddArgs;
+    use crate::revision_tree::add::LoreRevisionTreeAddEntry;
+    use crate::revision_tree::add::add;
     use crate::revision_tree::handle as rt_handle;
     use crate::revision_tree::handle::LoreRevisionTree;
     use crate::revision_tree::load::LoreRevisionTreeLoadArgs;
@@ -226,6 +223,7 @@ mod tests {
         Error(u32),
         Complete(i32),
         RevisionTreeLoaded(u64),
+        AddComplete(u64, NodeID, LoreErrorCode),
         ResolvePathComplete(u64, NodeID, RepositoryId, Hash, LoreErrorCode),
         Other(u32),
     }
@@ -236,6 +234,9 @@ mod tests {
                 LoreEvent::Error(data) => Self::Error(data.error_type),
                 LoreEvent::Complete(data) => Self::Complete(data.status),
                 LoreEvent::RevisionTreeLoaded(data) => Self::RevisionTreeLoaded(data.handle_id),
+                LoreEvent::RevisionTreeAddComplete(data) => {
+                    Self::AddComplete(data.entry_id, data.node_id, data.error_code)
+                }
                 LoreEvent::RevisionTreeResolvePathComplete(data) => Self::ResolvePathComplete(
                     data.id,
                     data.node_id,
@@ -274,7 +275,7 @@ mod tests {
         let entry = rt_handle::REGISTRY
             .get(&handle.handle_id)
             .expect("handle registered");
-        (entry.state.clone(), entry.repository_context.clone())
+        (entry.state_for_tests(), entry.repository_context.clone())
     }
 
     /// Add a link node under root targeting `(repository, revision, target_node)`.
@@ -286,25 +287,35 @@ mod tests {
         revision: Hash,
         target_node: NodeID,
     ) -> NodeID {
-        let (state, repository_context) = handle_state(handle);
-        let node = Node {
-            flags: NodeFlags::Link.bits(),
-            name_hash: hash_string(name),
-            child: target_node,
-            address: Address {
-                hash: revision,
-                context: Context::from(repository),
-            },
-            ..Default::default()
-        };
-        state
-            .node_add(repository_context, ROOT_NODE, node, name)
+        LORE_CONTEXT
+            .scope(
+                setup_execution(LoreGlobalArgs::default(), None),
+                async move {
+                    let (state, repository_context) = handle_state(handle);
+                    let node = Node {
+                        flags: NodeFlags::Link.bits(),
+                        name_hash: hash_string(name),
+                        child: target_node,
+                        address: Address {
+                            hash: revision,
+                            context: Context::from(repository),
+                        },
+                        ..Default::default()
+                    };
+                    state
+                        .node_add(repository_context, ROOT_NODE, node, name)
+                        .await
+                        .expect("node_add must succeed")
+                },
+            )
             .await
-            .expect("node_add must succeed")
     }
 
     /// Add `child_name` under root, then serialize the state to a committed
     /// revision a link can point at. Returns the revision hash.
+    ///
+    /// Serializing reads through the store, so it runs in an execution context of
+    /// its own: every other call in these tests gets one from the dispatcher.
     async fn seal_target(handle: LoreRevisionTree, child_name: &str) -> Hash {
         let (state, repository_context) = handle_state(handle);
         let child = Node {
@@ -317,10 +328,17 @@ mod tests {
             .await
             .expect("node_add child must succeed");
         let token = RepositoryWriteToken::acquire(Path::new("link-target")).await;
-        state
-            .serialize(repository_context, &token)
+        LORE_CONTEXT
+            .scope(
+                setup_execution(LoreGlobalArgs::default(), None),
+                async move {
+                    state
+                        .serialize(repository_context, &token)
+                        .await
+                        .expect("serialize must succeed")
+                },
+            )
             .await
-            .expect("serialize must succeed")
     }
 
     async fn load_handle(label: &str, repository: Partition) -> (LoreRevisionTree, u64) {
@@ -404,6 +422,137 @@ mod tests {
         release(handle, store_handle_id);
     }
 
+    /// Build `a/b/c.txt` in one batch add. Returns the node ids of `a`, `a/b`
+    /// and `a/b/c.txt`.
+    async fn build_nested_tree(handle: LoreRevisionTree) -> (NodeID, NodeID, NodeID) {
+        let directory = |entry_id: u64, parent_entry_index: u32, name: &str, nested: bool| {
+            LoreRevisionTreeAddEntry {
+                entry_id,
+                parent_node_id: if nested { INVALID_NODE } else { ROOT_NODE },
+                parent_entry_index,
+                name: LoreString::from_str(name),
+                kind: LoreNodeType::Directory as u32,
+                mode: 0o755,
+                size: 0,
+                address: Address::default(),
+            }
+        };
+        let entries = vec![
+            directory(1, 0, "a", false),
+            directory(2, 0, "b", true),
+            LoreRevisionTreeAddEntry {
+                kind: LoreNodeType::File as u32,
+                mode: 0o644,
+                size: 12,
+                ..directory(3, 1, "c.txt", true)
+            },
+        ];
+
+        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let status = add(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeAddArgs {
+                batch_id: 100,
+                handle,
+                entries: LoreArray::from_vec(entries),
+            },
+            make_callback(sink.clone()),
+        )
+        .await;
+        let events = sink.lock().unwrap().clone();
+        assert_eq!(status, 0, "building the fixture tree must succeed");
+
+        let added = |id: u64| {
+            events
+                .iter()
+                .find_map(|event| match event {
+                    CapturedEvent::AddComplete(event_id, node_id, code) if *event_id == id => {
+                        assert_eq!(*code, LoreErrorCode::None, "entry {id} must succeed");
+                        Some(*node_id)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("entry {id} must emit AddComplete, got {events:?}"))
+        };
+        (added(1), added(2), added(3))
+    }
+
+    /// Each level is asserted separately: resolving only the leaf would pass even
+    /// if the walk skipped or double-consumed an intermediate component.
+    #[tokio::test]
+    async fn resolve_existing_path_returns_node_id() {
+        let repository = Partition::from([0x99u8; 16]);
+        let (handle, store_handle_id) = load_handle("resolve-existing", repository).await;
+        let (a, b, c) = build_nested_tree(handle).await;
+
+        for (id, path, expected) in [(20u64, "a", a), (21, "a/b", b), (22, "a/b/c.txt", c)] {
+            let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+            let status = resolve_path(
+                LoreGlobalArgs::default(),
+                LoreRevisionTreeResolvePathArgs {
+                    id,
+                    handle,
+                    path: LoreString::from_str(path),
+                },
+                make_callback(sink.clone()),
+            )
+            .await;
+
+            assert_eq!(status, 0, "resolving {path} must succeed");
+            let events = sink.lock().unwrap().clone();
+            let (node_id, resolved_repository, _revision, error_code) =
+                resolve_outcome(&events, id)
+                    .unwrap_or_else(|| panic!("ResolvePathComplete must fire for {path}"));
+            assert_eq!(error_code, LoreErrorCode::None, "got {events:?}");
+            assert_eq!(
+                node_id, expected,
+                "{path} must resolve to the node the add reported, got {events:?}"
+            );
+            assert_eq!(
+                resolved_repository, repository,
+                "a link-free path resolves in the handle's repository, got {events:?}"
+            );
+        }
+
+        release(handle, store_handle_id);
+    }
+
+    #[tokio::test]
+    async fn resolve_path_below_a_leaf_returns_invalid_arguments() {
+        let (handle, store_handle_id) =
+            load_handle("resolve-below-leaf", Partition::from([0xAAu8; 16])).await;
+        build_nested_tree(handle).await;
+
+        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let status = resolve_path(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeResolvePathArgs {
+                id: 23,
+                handle,
+                path: LoreString::from_str("a/b/c.txt/deeper"),
+            },
+            make_callback(sink.clone()),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "descending through a file must fail"
+        );
+        let events = sink.lock().unwrap().clone();
+        let (node_id, _repository, _revision, error_code) =
+            resolve_outcome(&events, 23).expect("ResolvePathComplete must fire");
+        assert_eq!(
+            error_code,
+            LoreErrorCode::InvalidArguments,
+            "got {events:?}"
+        );
+        assert_eq!(node_id, INVALID_NODE);
+
+        release(handle, store_handle_id);
+    }
+
     #[tokio::test]
     async fn resolve_missing_path_returns_invalid_arguments() {
         let (handle, store_handle_id) =
@@ -421,7 +570,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "resolving a missing path must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "resolving a missing path must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let (node_id, _repository, _revision, error_code) =
             resolve_outcome(&events, 8).expect("ResolvePathComplete must fire for the caller id");
@@ -435,42 +588,8 @@ mod tests {
             "a failed resolve must report the invalid-node sentinel, got {events:?}"
         );
         assert!(
-            events.contains(&CapturedEvent::Complete(1)),
-            "missing path must complete with status=1, got {events:?}"
-        );
-
-        release(handle, store_handle_id);
-    }
-
-    #[tokio::test]
-    async fn resolve_non_utf8_path_returns_invalid_arguments() {
-        let (handle, store_handle_id) =
-            load_handle("resolve-non-utf8", Partition::from([0x33u8; 16])).await;
-        let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
-
-        let status = resolve_path(
-            LoreGlobalArgs::default(),
-            LoreRevisionTreeResolvePathArgs {
-                id: 9,
-                handle,
-                path: LoreString::from_bytes(&[0xFF, 0xFE, 0xFD]),
-            },
-            make_callback(sink.clone()),
-        )
-        .await;
-
-        assert_eq!(status, 1, "a non-UTF-8 path must fail");
-        let events = sink.lock().unwrap().clone();
-        let (node_id, _repository, _revision, error_code) =
-            resolve_outcome(&events, 9).expect("ResolvePathComplete must fire for the caller id");
-        assert_eq!(
-            error_code,
-            LoreErrorCode::InvalidArguments,
-            "a non-UTF-8 path must report InvalidArguments, got {events:?}"
-        );
-        assert_eq!(
-            node_id, INVALID_NODE,
-            "a failed resolve must report the invalid-node sentinel, got {events:?}"
+            events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)),
+            "missing path must complete with status=InvalidArguments, got {events:?}"
         );
 
         release(handle, store_handle_id);
@@ -491,7 +610,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "resolving against an unknown handle must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "resolving against an unknown handle must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let (node_id, _repository, _revision, error_code) = resolve_outcome(&events, 10)
             .expect("a handle miss must still emit ResolvePathComplete carrying the caller id");
@@ -505,8 +628,8 @@ mod tests {
             "a handle miss must report the invalid-node sentinel, got {events:?}"
         );
         assert!(
-            events.contains(&CapturedEvent::Complete(1)),
-            "a handle miss must complete with status=1, got {events:?}"
+            events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)),
+            "a handle miss must complete with status=InvalidArguments, got {events:?}"
         );
     }
 

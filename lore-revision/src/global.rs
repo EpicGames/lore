@@ -9,12 +9,9 @@ use lore_base::fs::lock::FSLock;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::fs::OpenOptions;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncWriteExt;
-use tokio::task::spawn_blocking;
 
 use crate::util;
+use crate::util::config;
 use crate::util::url::normalize_remote_url;
 
 #[error_set]
@@ -153,14 +150,14 @@ impl GlobalConfig {
 
     pub async fn load() -> Result<Self, GlobalConfigError> {
         let path = global_config_toml_path()?;
-        load_config(&path)
+        config::load(&path)
             .await
             .forward::<GlobalConfigError>("Loading global config")
     }
 
     pub async fn load_locked() -> Result<(Self, FSLock), GlobalConfigError> {
         let path = global_config_toml_path()?;
-        let (mut config, lock) = load_config_with_lock::<Self>(&path)
+        let (mut config, lock) = config::load_with_lock::<Self>(&path)
             .await
             .forward::<GlobalConfigError>("Loading global config")?;
         // Normalize stored keys to strip legacy protocol prefixes (e.g. "urc://host" -> "host").
@@ -177,61 +174,8 @@ impl GlobalConfig {
 
     pub async fn save(&self, lock: FSLock) -> Result<(), GlobalConfigError> {
         let path = global_config_toml_path()?;
-        let result = save_config(self, &path).await;
+        let result = config::save(self, &path).await;
         drop(lock);
         result.forward::<GlobalConfigError>("saving global config")
     }
-}
-
-#[error_set]
-pub enum LoadConfigError {}
-
-pub async fn load_config_with_lock<ConfigType: Default + Serialize + for<'a> Deserialize<'a>>(
-    path: impl AsRef<Path> + Copy,
-) -> Result<(ConfigType, FSLock), LoadConfigError> {
-    let path_buf = path.as_ref().to_owned();
-    let lock = spawn_blocking(|| {
-        FSLock::acquire_file_lock(path_buf)
-            .map_err(|err| LoadConfigError::internal(format!("Failed acquiring lock {err}")))
-    })
-    .await
-    .internal("Failed to acquire file lock")??;
-    let config = load_config(path).await?;
-    Ok((config, lock))
-}
-
-pub async fn load_config<ConfigType: Default + Serialize + for<'a> Deserialize<'a>>(
-    path: impl AsRef<Path>,
-) -> Result<ConfigType, LoadConfigError> {
-    if let Ok(mut config_file) = OpenOptions::new().create(false).read(true).open(path).await {
-        let mut config = String::default();
-        config_file.read_to_string(&mut config).await.ok();
-        toml::from_str(config.as_str())
-            .map_err(|_err| LoadConfigError::internal("failed to parse config"))
-    } else {
-        Ok(ConfigType::default())
-    }
-}
-
-#[error_set]
-pub enum SaveConfigError {}
-
-pub async fn save_config<ConfigType: Serialize>(
-    config: &ConfigType,
-    path: impl AsRef<Path>,
-) -> Result<(), SaveConfigError> {
-    let mut config_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(path)
-        .await
-        .internal("opening config file for save")?;
-    let config_string = toml::to_string_pretty(&config).internal("formatting config as TOML")?;
-    config_file
-        .write_all(config_string.as_bytes())
-        .await
-        .internal("writing config file")?;
-    config_file.flush().await.internal("flushing config file")?;
-    Ok(())
 }

@@ -45,10 +45,13 @@ async fn connect_client(
     ProtocolError,
 > {
     let endpoint = grpc_endpoint(auth_url);
-    let channel = tonic::transport::Endpoint::new(endpoint)
-        .map_err(|e| ProtocolError::internal(format!("invalid auth endpoint: {e}")))?
-        .connect()
+    let endpoint = tonic::transport::Endpoint::new(endpoint)
+        .map_err(|e| ProtocolError::internal(format!("invalid auth endpoint: {e}")))?;
+    // Connect from a net-runtime task so the channel's driver tasks are
+    // bound to the net runtime.
+    let channel = lore_base::lore_spawn_net!(async move { endpoint.connect().await })
         .await
+        .map_err(|e| ProtocolError::internal(format!("auth endpoint connect task: {e}")))?
         .map_err(|e| ProtocolError::internal(format!("failed to connect to auth endpoint: {e}")))?;
     Ok(UrcAuthApiClient::with_interceptor(
         channel,

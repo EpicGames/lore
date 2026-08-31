@@ -3,7 +3,7 @@ lep: 2026-04-27-lore-enhancement-proposals
 title: Lore Enhancement Proposals
 authors:
   - raghav.narula
-status: Draft
+status: Approved
 created: 2026-04-27
 updated: 2026-04-28
 discussion: https://crowd.urc.internal.epicgames.net/Epic/URC/change-request/1684

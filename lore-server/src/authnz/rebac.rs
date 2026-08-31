@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use lore_base::lore_spawn_net;
 use lore_proto::RebacApiClient as RebacApiGrpcClient;
 use lore_proto::rebac::CreateResourceRequest;
 use lore_proto::rebac::CreateResourceResponse;
@@ -54,9 +55,11 @@ impl RebacClientHelper {
                 )
                 .warn_map_err(|_| Status::internal("Failed to configure TLS for rebac"))?;
         }
-        let channel = endpoint
-            .connect()
+        // Connect from net so the hyper/h2 driver tasks this spawns bind there
+        // rather than to the core runtime the caller runs on.
+        let channel = lore_spawn_net!(async move { endpoint.connect().await })
             .await
+            .warn_map_err(|_| Status::internal("rebac connection task failed"))?
             .warn_map_err(|_| Status::internal("Failed to connect to rebac service"))?;
         let client = RebacApiGrpcClient::with_interceptor(channel, CorrelationInterceptor);
         Ok(RebacClientHelper { client })

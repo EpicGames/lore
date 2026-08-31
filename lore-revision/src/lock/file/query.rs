@@ -91,7 +91,7 @@ pub async fn query(
     } else {
         let resolved = branch::resolve(repository.clone(), options.branch.as_str())
             .await
-            .internal("Invalid branch")?;
+            .forward_any::<QueryError>("Invalid branch")?;
         Some(resolved.id)
     };
 
@@ -100,7 +100,7 @@ pub async fn query(
     } else {
         let owner_id = auth::userinfo::user_id(repository.clone(), &options.owner)
             .await
-            .internal("Failed to resolve user id from user name")?;
+            .forward::<QueryError>("Failed to resolve user id from user name")?;
 
         Some(owner_id)
     };

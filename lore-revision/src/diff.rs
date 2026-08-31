@@ -77,13 +77,14 @@ pub async fn diff_revision_paths(
                     walker_repo,
                     state_target,
                     path,
+                    None,
                     &mut sink,
                     FilterMode::View,
                 )
                 .await
             });
             while let Some(item) = state_rx.recv().await {
-                let item = item.internal("calculating revision diff")?;
+                let item = item.forward_any::<DiffError>("calculating revision diff")?;
                 task_tx
                     .send(Ok(item))
                     .await
@@ -92,7 +93,7 @@ pub async fn diff_revision_paths(
             // Surface any error from the walker task itself.
             match walker.await {
                 Ok(Ok(())) => {}
-                Ok(Err(err)) => Err(err).internal("calculating revision diff")?,
+                Ok(Err(err)) => Err(err).forward_any::<DiffError>("calculating revision diff")?,
                 Err(join_err) => {
                     return Err(DiffError::internal_with_context(
                         join_err,
@@ -155,7 +156,10 @@ pub async fn diff_filesystem_paths(
                 exists_in_state = true;
             } else {
                 let absolute_path = path.to_absolute_path(repository.require_path()?);
-                exists_in_filesystem = std::fs::exists(absolute_path).unwrap_or_default();
+                exists_in_filesystem = lore_io::IoDriver::global()
+                    .metadata(absolute_path)
+                    .await
+                    .is_ok();
             }
 
             if !exists_in_state && !exists_in_filesystem {
@@ -190,7 +194,7 @@ pub async fn diff_filesystem_paths(
                         std::sync::Arc::new(Vec::new()),
                     )
                     .await
-                    .internal("calculating filesystem diff")?;
+                    .forward_any::<DiffError>("calculating filesystem diff")?;
 
                     lore_debug!("Found {} file system changes", changes.len());
 

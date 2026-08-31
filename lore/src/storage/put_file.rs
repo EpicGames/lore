@@ -26,6 +26,7 @@ use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
+use lore_macro::ValidateText;
 use lore_revision::event::EventError;
 use lore_revision::event::LoreErrorCode;
 use lore_revision::event::LoreEvent;
@@ -42,6 +43,7 @@ use tokio::task::JoinSet;
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
+use crate::storage::PutItemOutcome;
 use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
 use crate::storage::store::StoreInternal;
@@ -49,7 +51,7 @@ use crate::storage::store::StoreInternal;
 /// One `put_file` item — read the file at `path` and store it at
 /// `(partition, context)`.
 #[repr(C)]
-#[derive(Clone, PartialEq, Default, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Default, Deserialize, Serialize, ValidateText)]
 pub struct LoreStoragePutFileItem {
     /// Caller-chosen id echoed back in `PUT_ITEM_COMPLETE`
     pub id: u64,
@@ -163,46 +165,54 @@ async fn put_file_item(
     item: LoreStoragePutFileItem,
     session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
-    let (address, error_code) = resolve_put_file_item(store, &item, session).await;
+    let outcome = resolve_put_file_item(store, &item, session).await;
     LoreEvent::StoragePutItemComplete(LoreStoragePutItemCompleteEventData {
         id: item.id,
-        address,
-        error_code,
+        address: outcome.address,
+        error_code: outcome.error_code,
+        stored_local: u8::from(outcome.stored_local),
+        stored_remote: u8::from(outcome.stored_remote),
     })
     .send();
-    error_code
+    outcome.error_code
 }
 
 async fn resolve_put_file_item(
     store: Arc<StoreInternal>,
     item: &LoreStoragePutFileItem,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
-) -> (Address, LoreErrorCode) {
+) -> PutItemOutcome {
     if item.partition == Partition::default() {
-        return (Address::default(), LoreErrorCode::InvalidArguments);
+        return PutItemOutcome::failed(LoreErrorCode::InvalidArguments);
     }
 
     let path_str = item.path.as_str();
     if path_str.is_empty() {
-        return (Address::default(), LoreErrorCode::InvalidArguments);
+        return PutItemOutcome::failed(LoreErrorCode::InvalidArguments);
     }
     let path = PathBuf::from(path_str);
 
     match tokio::fs::metadata(&path).await {
         Ok(meta) => {
             if !meta.is_file() {
-                return (Address::default(), LoreErrorCode::InvalidArguments);
+                return PutItemOutcome::failed(LoreErrorCode::InvalidArguments);
             }
             if meta.len() == 0 {
-                let address = Address {
-                    hash: Hash::default(),
-                    context: item.context,
+                // Zero-hash short-circuit: succeeds without storing anything, so both placement
+                // flags stay clear even though `error_code` is `None`.
+                return PutItemOutcome {
+                    address: Address {
+                        hash: Hash::default(),
+                        context: item.context,
+                    },
+                    error_code: LoreErrorCode::None,
+                    stored_local: false,
+                    stored_remote: false,
                 };
-                return (address, LoreErrorCode::None);
             }
         }
         Err(_) => {
-            return (Address::default(), LoreErrorCode::InvalidArguments);
+            return PutItemOutcome::failed(LoreErrorCode::InvalidArguments);
         }
     }
 
@@ -214,21 +224,16 @@ async fn resolve_put_file_item(
         write_options = write_options.with_local_cache_priority();
     }
 
-    match write_from_file(
-        store.immutable.clone(),
-        item.partition,
-        Path::new(path_str),
-        item.context,
-        write_options,
-        remote_session,
-        None,
+    PutItemOutcome::from_write(
+        write_from_file(
+            store.immutable.clone(),
+            item.partition,
+            Path::new(path_str),
+            item.context,
+            write_options,
+            remote_session,
+            lore_revision::immutable::counted_write_context(),
+        )
+        .await,
     )
-    .await
-    {
-        Ok((address, _fragment)) => (address, LoreErrorCode::None),
-        Err(err) => (
-            Address::default(),
-            crate::storage::storage_error_to_code(&err),
-        ),
-    }
 }

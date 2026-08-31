@@ -7,7 +7,10 @@ publish = false
 [lib]
 name = "lore_macro"
 proc-macro = true
+# The crate holds no unit tests. Set this back to build a harness for them.
+test = false
 
 [dependencies]
+proc-macro2 = { workspace = true }
 syn = { workspace = true, features = ["full"] }
 quote = { workspace = true }

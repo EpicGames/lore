@@ -17,7 +17,6 @@ use crate::println;
 use crate::styling::cli_styles;
 use crate::util::get_repository_path;
 
-// TODO(UCS-12558): Cleanup logging args
 #[derive(Parser)]
 #[command(name = "lore", styles = cli_styles())]
 #[clap(about, long_about = None)]
@@ -31,15 +30,15 @@ pub struct LoreCli {
     pub repository: Option<String>,
 
     /// Set the logging level
-    #[clap(global = true, long = "log-level", value_name = "level")]
+    #[clap(global = true, long = "log-level", value_name = "level", conflicts_with_all = ["debug", "silent"])]
     pub level: Option<String>,
 
     /// Enable debug output
-    #[clap(global = true, long, short, action)]
+    #[clap(global = true, long, short, action, conflicts_with_all = ["level", "silent"])]
     pub debug: bool,
 
     /// Suppress all output
-    #[clap(global = true, hide = true, long, short, action)]
+    #[clap(global = true, hide = true, long, short, action, conflicts_with_all = ["level", "debug"])]
     pub silent: bool,
 
     /// Time execution of command
@@ -77,6 +76,16 @@ pub struct LoreCli {
     /// Use given identity
     #[clap(global = true, long, action)]
     pub identity: Option<String>,
+
+    /// Use given authentication token instead of one from the secure store. Acts
+    /// as the identity the token was issued to
+    #[clap(global = true, long, value_name = "token", conflicts_with = "identity")]
+    pub identity_token: Option<String>,
+
+    /// Use given authorization token instead of exchanging one with the
+    /// authentication service
+    #[clap(global = true, long, value_name = "token", conflicts_with = "identity")]
+    pub access_token: Option<String>,
 
     /// Avoid using compression
     #[clap(global = true, hide = true, long, action)]
@@ -128,6 +137,23 @@ pub struct LoreCli {
     /// Disable interactive prompts (e.g., per-link commit messages)
     #[clap(global = true, long, action)]
     pub non_interactive: bool,
+
+    /// Report what the operation cost: `--stats` for totals, `--stats=2` to add
+    /// per-fragment detail
+    #[clap(
+        global = true,
+        long,
+        value_name = "level",
+        num_args = 0..=1,
+        require_equals = true,
+        default_value_t = 0,
+        default_missing_value = "1"
+    )]
+    pub stats: u32,
+
+    /// How often to emit progress events, in milliseconds
+    #[clap(global = true, long, value_name = "milliseconds")]
+    pub event_interval: Option<u64>,
 }
 
 pub type EventCallbackFn = Box<dyn Fn(&LoreEvent) + Send + Sync>;
@@ -360,9 +386,14 @@ pub fn lore_globals_from_args(cli: &LoreCli) -> LoreGlobalArgs {
         cache: cli.cache.into(),
 
         identity: cli.identity.clone().into(),
+        identity_token: cli.identity_token.clone().into(),
+        access_token: cli.access_token.clone().into(),
 
         search_limit: cli.search_limit.unwrap_or_default() as u32,
         search_nearest: cli.search_nearest.into(),
+
+        stats: cli.stats,
+        event_interval_ms: cli.event_interval.unwrap_or_default(),
 
         ..Default::default()
     };

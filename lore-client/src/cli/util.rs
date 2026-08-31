@@ -1,22 +1,38 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use lore::branch;
+use lore::branch::LoreBranchInfoArgs;
+use lore::interface::Context;
 use lore::interface::LoreArray;
+use lore::interface::LoreEvent;
+use lore::interface::LoreEventCallback;
 use lore::interface::LoreGlobalArgs;
 use lore::interface::LoreMaintenanceEventData;
 use lore::interface::LorePathIgnoreEventData;
 use lore::interface::LoreRevisionSyncProgressEventData;
 use lore::interface::LoreString;
+use lore::runtime;
+use parking_lot::Mutex;
 
 use crate::eprintln;
 use crate::println;
 use crate::styling::CommonStyles;
 
+/// Discover the repository root by walking up from the process working
+/// directory, when `--repository` named none.
+///
+/// Runs in the CLI process while building `LoreGlobalArgs`, before any call
+/// crosses to the service, so the process working directory is the user's own —
+/// which is exactly what "the repository I am standing in" has to mean.
+#[allow(clippy::disallowed_methods)]
 pub fn get_repository_path(path: Option<String>) -> LoreString {
     if let Some(path) = path {
         path.into()
@@ -99,6 +115,11 @@ pub fn relativize_for_display(repo_root: &Path, cwd: &Path, repo_relative: &str)
 
 /// Build a closure that rebases repo-root-relative paths onto the current
 /// working directory for display, capturing the repo root and cwd once.
+///
+/// Presentation only, and runs in the CLI process, so the process working
+/// directory is the user's terminal directory — the frame paths must be printed
+/// relative to. A failure to read it degrades to repo-root-relative output.
+#[allow(clippy::disallowed_methods)]
 pub fn cwd_relativizer(globals: &LoreGlobalArgs) -> impl Fn(&str) -> String + 'static {
     let repo_root = std::path::absolute(globals.repository_path())
         .unwrap_or_else(|_| PathBuf::from(globals.repository_path()));
@@ -146,6 +167,62 @@ pub fn convert_paths_and_targets(
     LoreArray::from_vec(converted)
 }
 
+/// Resolves branch identifiers to names, remembering each answer.
+///
+/// Events carry the branch identifier rather than its name, so naming a branch
+/// costs a round trip. Links commonly follow one branch, and a listing would
+/// otherwise pay that trip once per link, so repeats are served from the map.
+/// An unresolvable identifier answers as itself.
+///
+/// `link_path` names the mount whose repository owns the branch, empty for a
+/// branch of this repository. A link pinned to its own branch keeps that name
+/// only in the linked repository, so the lookup has to be scoped there.
+pub struct BranchNameResolver {
+    globals: LoreGlobalArgs,
+    names: HashMap<(Context, String), String>,
+}
+
+impl BranchNameResolver {
+    pub fn new(globals: LoreGlobalArgs) -> Self {
+        Self {
+            globals,
+            names: HashMap::new(),
+        }
+    }
+
+    pub fn name(&mut self, id: Context, link_path: &str) -> String {
+        let key = (id, link_path.to_string());
+        if let Some(name) = self.names.get(&key) {
+            return name.clone();
+        }
+        let resolved = self.lookup(id, link_path);
+        self.names.insert(key, resolved.clone());
+        resolved
+    }
+
+    fn lookup(&self, id: Context, link_path: &str) -> String {
+        let args = LoreBranchInfoArgs {
+            branch: LoreString::from(id.to_string().as_str()),
+            link: LoreString::from(link_path),
+        };
+        let name = Arc::new(Mutex::new(None));
+        let name_cb = name.clone();
+        // Sub-operation callback without the default handlers: a name that will
+        // not resolve falls back to the identifier, and reporting that as an
+        // error would put a line on stderr for every link in a listing.
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+            if let LoreEvent::BranchInfo(data) = event {
+                *name_cb.lock() = Some(data.name.to_string());
+            }
+        }));
+        runtime().block_on(branch::info(self.globals.clone(), args, callback));
+        name.lock()
+            .take()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| id.to_string())
+    }
+}
+
 pub fn handle_maintenance_event(event: &LoreMaintenanceEventData) {
     eprintln!(
         "{}Server is in maintenance mode: {}{}",
@@ -159,20 +236,24 @@ pub fn handle_path_ignore_event(event: &LorePathIgnoreEventData) {
     println!("Ignoring invalid path: {}", event.path);
 }
 
+/// A byte count in the largest unit that leaves it above one.
+///
+/// A raw byte count renders as an integer, a fraction of a byte saying nothing.
+/// Only the scaled units carry decimals, the remainder there distinguishing
+/// 1.02 MiB from 1.98 MiB.
 pub fn format_bytes_to_string(bytes: u64) -> String {
-    let mut unit = "bytes";
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    const GIB: u64 = 1024 * MIB;
 
-    let converted = if bytes > 1024 * 1024 * 1024 {
-        unit = "GiB";
-        (bytes / (1024 * 1024)) as f64 / 1024.0
-    } else if bytes > 1024 * 1024 {
-        unit = "MiB";
-        (bytes / 1024) as f64 / 1024.0
-    } else if bytes > 1024 {
-        unit = "KiB";
-        bytes as f64 / 1024.0
+    let (converted, unit) = if bytes > GIB {
+        ((bytes / MIB) as f64 / 1024.0, "GiB")
+    } else if bytes > MIB {
+        ((bytes / KIB) as f64 / 1024.0, "MiB")
+    } else if bytes > KIB {
+        (bytes as f64 / 1024.0, "KiB")
     } else {
-        bytes as f64
+        return format!("{bytes} bytes");
     };
 
     format!("{converted:.2} {unit}")
@@ -306,5 +387,32 @@ pub fn read_line_with_editing(buf: &mut String) -> std::io::Result<usize> {
     #[cfg(not(unix))]
     {
         std::io::stdin().read_line(buf)
+    }
+}
+
+#[cfg(test)]
+mod format_bytes_tests {
+    use super::format_bytes_to_string;
+
+    /// A count of bytes is exact, so a decimal on it is noise at best and
+    /// misleading at worst — "600.00 bytes" reads as a measurement that was
+    /// rounded when it was not.
+    #[test]
+    fn a_raw_byte_count_carries_no_decimals() {
+        assert_eq!(format_bytes_to_string(0), "0 bytes");
+        assert_eq!(format_bytes_to_string(1), "1 bytes");
+        assert_eq!(format_bytes_to_string(600), "600 bytes");
+        assert_eq!(format_bytes_to_string(1024), "1024 bytes");
+    }
+
+    #[test]
+    fn a_scaled_unit_carries_decimals_because_the_remainder_means_something() {
+        assert_eq!(format_bytes_to_string(1025), "1.00 KiB");
+        assert_eq!(format_bytes_to_string(1536), "1.50 KiB");
+        assert_eq!(format_bytes_to_string(3 * 1024 * 1024 / 2), "1.50 MiB");
+        assert_eq!(
+            format_bytes_to_string(3 * 1024 * 1024 * 1024 / 2),
+            "1.50 GiB"
+        );
     }
 }

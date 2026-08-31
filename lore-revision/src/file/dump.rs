@@ -11,7 +11,6 @@ use crate::event;
 use crate::lore::Address;
 use crate::repository::RepositoryContext;
 use crate::state;
-use crate::store::StoreMatch;
 use crate::util::path::RelativePath;
 
 /// Data for the event reporting the stored representation of file content.
@@ -123,7 +122,7 @@ pub async fn dump_address(
 ) -> Result<(), DumpError> {
     let result = repository
         .immutable_store()
-        .query(repository.id, address, StoreMatch::MatchFull)
+        .get_metadata(repository.id, address)
         .await
         .forward::<DumpError>("querying fragment from immutable store")?;
 

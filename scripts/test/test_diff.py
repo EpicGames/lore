@@ -7,6 +7,7 @@ import pytest
 
 from error_types import ImproperArgumentsError
 from lore import Lore
+from lore_parsers import parse_jsonl
 from lore_parsers import parse_status_json
 
 logger = logging.getLogger(__name__)
@@ -1536,6 +1537,45 @@ def test_branch_diff_auto_resolve_no_write_required(new_lore_repo):
     assert f"M {shared}" in output, (
         "Auto-resolved file should appear as modified\n"
         "Output:\n" + output
+    )
+
+
+@pytest.mark.smoke
+def test_branch_diff_change_carries_the_move_source_path(new_lore_repo):
+    """A file moved on a branch must come out of `branch diff` as one move
+    event naming the path it was moved from. Without the source path a
+    receiver reads the move as an unrelated add at the new path and cannot
+    reproduce it."""
+    repo: Lore = new_lore_repo()
+
+    original_path = "original-file.txt"
+    moved_path = "renamed-file.txt"
+
+    # Base commit on main, so the move below is the only difference the
+    # branch carries.
+    repo.write_commit_push(
+        "Base commit",
+        {original_path: "line 1\nline 2\n"},
+        offline=True,
+    )
+
+    repo.branch_create("move-branch", offline=True)
+    repo.move(original_path, moved_path)
+    repo.file_stage_move(original_path, moved_path, offline=True)
+    repo.commit("Move the file on the branch", offline=True)
+
+    output = repo.branch_diff("main", source="move-branch", json=True, offline=True)
+    changes = [entry["change"] for entry in parse_jsonl(output, "branchDiffChange")]
+    moved = [change for change in changes if change["path"] == moved_path]
+
+    assert len(moved) == 1, (
+        f"Expected exactly one change at {moved_path}, got {changes}"
+    )
+    assert moved[0]["action"] == "move", (
+        f"The change at {moved_path} should be a move, got {moved[0]}"
+    )
+    assert moved[0]["fromPath"] == original_path, (
+        f"The move should report fromPath={original_path!r}, got {moved[0]}"
     )
 
 

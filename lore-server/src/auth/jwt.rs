@@ -97,7 +97,26 @@ pub struct JwtVerifier {
     pub jwt_audience: Option<Vec<String>>,
 }
 
+/// Whether a verification failure could be the signing key's fault rather than the token's.
+///
+/// A key rotated under an unchanged key id presents exactly this way, and it is the only
+/// failure worth re-fetching keys for: a token that has expired, or that names another
+/// audience or issuer, fails identically against every key that could ever be served. That
+/// distinction is what keeps an invalid token from being a way to ask for network work.
+fn key_may_be_stale(error: &JwtVerifierError) -> bool {
+    matches!(error, JwtVerifierError::ValidationFailed(inner) if matches!(
+        inner.kind(),
+        jsonwebtoken::errors::ErrorKind::InvalidSignature
+            | jsonwebtoken::errors::ErrorKind::InvalidAlgorithm
+    ))
+}
+
 impl JwtVerifier {
+    /// Verify a token, re-fetching the signing key once if the cached one looks stale.
+    ///
+    /// The retry is what makes a key rotated under an unchanged key id recoverable. Without
+    /// it the cache holds a key for the id, every lookup is satisfied by it, and every token
+    /// signed with the new material fails until the process restarts.
     pub async fn verify_token(&self, token: &str) -> Result<AuthorizationToken, JwtVerifierError> {
         let header = decode_header(token).map_err(JwtVerifierError::ValidationFailed)?;
         let kid = header.kid.ok_or(JwtVerifierError::HeaderKIDMissing)?;
@@ -108,7 +127,48 @@ impl JwtVerifier {
             .await
             .map_err(JwtVerifierError::KeyNotFound)?;
 
+        let stale_failure = match self.verify_token_internal(token, &key, &alg) {
+            Err(failure) if key_may_be_stale(&failure) => failure,
+            result => return result,
+        };
+
+        // `None` covers both unchanged material and a declined fetch, so the original failure
+        // stands rather than being re-derived from the same key.
+        let Some((key, alg)) = self
+            .jwk_service
+            .refresh_key(&kid)
+            .await
+            .map_err(JwtVerifierError::KeyNotFound)?
+        else {
+            return Err(stale_failure);
+        };
+
         self.verify_token_internal(token, &key, &alg)
+    }
+
+    /// Verify a token using only the JWK cache, without any `.await`. `Ok(Some(_))` on
+    /// success; `Err` when the token itself is at fault; `Ok(None)` when the cache cannot
+    /// answer and the caller must fall back to the async [`verify_token`].
+    ///
+    /// A signature that does not match the cached key is `Ok(None)`, not `Err`: the cached
+    /// key may be a rotated-out one, and only the async path can replace it. Reporting it as
+    /// a failure here is what left a rotated key broken until restart even though the
+    /// refresh existed.
+    pub fn try_verify_token_cached(
+        &self,
+        token: &str,
+    ) -> Result<Option<AuthorizationToken>, JwtVerifierError> {
+        let header = decode_header(token).map_err(JwtVerifierError::ValidationFailed)?;
+        let kid = header.kid.ok_or(JwtVerifierError::HeaderKIDMissing)?;
+
+        let Some((key, alg)) = self.jwk_service.get_cached_key(&kid) else {
+            return Ok(None);
+        };
+
+        match self.verify_token_internal(token, &key, &alg) {
+            Err(failure) if key_may_be_stale(&failure) => Ok(None),
+            result => result.map(Some),
+        }
     }
 
     fn verify_token_internal(
@@ -322,6 +382,16 @@ mod tests {
             &self,
             kid: &str,
         ) -> Result<(DecodingKey, jsonwebtoken::Algorithm), JWKServiceError>;
+
+                fn get_cached_key(
+            &self,
+            kid: &str,
+        ) -> Option<(DecodingKey, jsonwebtoken::Algorithm)>;
+
+                async fn refresh_key(
+            &self,
+            kid: &str,
+        ) -> Result<Option<(DecodingKey, jsonwebtoken::Algorithm)>, JWKServiceError>;
             }
         }
 
@@ -329,7 +399,14 @@ mod tests {
         where
             T: Serialize,
         {
-            let jwt_key = EncodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref());
+            encode_jwt_signed_with(AGREED_UPON_SIGNING_SECRET, jwt_claims)
+        }
+
+        fn encode_jwt_signed_with<T>(secret: &str, jwt_claims: &T) -> String
+        where
+            T: Serialize,
+        {
+            let jwt_key = EncodingKey::from_secret(secret.as_ref());
             let jwt_header = {
                 let mut header = Header::new(AGREED_UPON_ALGORITHM);
                 header.kid = Some("the kid".into());
@@ -337,6 +414,374 @@ mod tests {
             };
 
             encode(&jwt_header, &jwt_claims, &jwt_key).unwrap()
+        }
+
+        /// A key service whose material changes under an unchanged key id, which is the
+        /// rotation a cache keyed on the id alone cannot see. Refreshes are counted so a
+        /// test can assert that a failure no key could explain never asks for one.
+        struct RotatingJWKService {
+            served: std::sync::Mutex<String>,
+            rotates_to: Option<String>,
+            refreshes: std::sync::atomic::AtomicUsize,
+        }
+
+        impl RotatingJWKService {
+            fn new(served: &str, rotates_to: Option<&str>) -> Self {
+                RotatingJWKService {
+                    served: std::sync::Mutex::new(served.to_string()),
+                    rotates_to: rotates_to.map(str::to_string),
+                    refreshes: std::sync::atomic::AtomicUsize::new(0),
+                }
+            }
+
+            fn refreshes(&self) -> usize {
+                self.refreshes.load(std::sync::atomic::Ordering::Relaxed)
+            }
+
+            fn current(&self) -> (DecodingKey, Algorithm) {
+                let served = self.served.lock().expect("served key");
+                (
+                    DecodingKey::from_secret(served.as_bytes()),
+                    AGREED_UPON_ALGORITHM,
+                )
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl JWKService for RotatingJWKService {
+            async fn get_key(
+                &self,
+                _kid: &str,
+            ) -> Result<(DecodingKey, Algorithm), JWKServiceError> {
+                Ok(self.current())
+            }
+
+            fn get_cached_key(&self, _kid: &str) -> Option<(DecodingKey, Algorithm)> {
+                Some(self.current())
+            }
+
+            async fn refresh_key(
+                &self,
+                _kid: &str,
+            ) -> Result<Option<(DecodingKey, Algorithm)>, JWKServiceError> {
+                self.refreshes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(rotated) = self.rotates_to.as_ref() else {
+                    return Ok(None);
+                };
+                let mut served = self.served.lock().expect("served key");
+                if *served == *rotated {
+                    return Ok(None);
+                }
+                served.clone_from(rotated);
+                Ok(Some((
+                    DecodingKey::from_secret(served.as_bytes()),
+                    AGREED_UPON_ALGORITHM,
+                )))
+            }
+        }
+
+        fn verifier_for(service: Arc<RotatingJWKService>) -> JwtVerifier {
+            JwtVerifier {
+                jwk_service: service,
+                jwt_issuer: None,
+                jwt_audience: Some(vec!["Lore".to_string()]),
+            }
+        }
+
+        /// Well past `Validation`'s default 60-second leeway, so the expiry is what fails.
+        fn expired_authz_token() -> AuthorizationToken {
+            let mut claims = mock_authz_token(vec!["Lore".to_string()]);
+            claims.expires = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                - 3600;
+            claims
+        }
+
+        /// The finding: the identity provider replaces the material behind a key id without
+        /// changing the id. Every lookup is satisfied by the cached key, so every token
+        /// signed with the new one fails until the process restarts.
+        #[tokio::test]
+        async fn a_key_rotated_under_the_same_kid_is_picked_up() {
+            let service = Arc::new(RotatingJWKService::new(
+                "rotated-out-secret",
+                Some(AGREED_UPON_SIGNING_SECRET),
+            ));
+            let verifier = verifier_for(service.clone());
+            let (expected, encoded) = make_authz_token_with_audience(vec!["Lore".to_string()]);
+
+            let verified = verifier
+                .verify_token(&encoded)
+                .await
+                .expect("a rotated key is refetched");
+
+            assert_eq!(verified, expected);
+            assert_eq!(service.refreshes(), 1);
+        }
+
+        /// The interceptor's synchronous path has to defer rather than deny, or the retry
+        /// above is never reached for gRPC traffic.
+        #[test]
+        fn the_cached_path_defers_a_signature_failure_to_the_async_path() {
+            let service = Arc::new(RotatingJWKService::new("rotated-out-secret", None));
+            let verifier = verifier_for(service.clone());
+            let (_, encoded) = make_authz_token_with_audience(vec!["Lore".to_string()]);
+
+            let verdict = verifier
+                .try_verify_token_cached(&encoded)
+                .expect("a signature failure is not the token's fault");
+
+            assert!(verdict.is_none(), "must fall through to the async path");
+        }
+
+        /// A key that has not in fact rotated must cost exactly one refresh, not one per
+        /// verification attempt and not a retry loop.
+        #[tokio::test]
+        async fn a_key_that_did_not_rotate_is_refreshed_once_and_then_fails() {
+            let service = Arc::new(RotatingJWKService::new("wrong-secret", None));
+            let verifier = verifier_for(service.clone());
+            let (_, encoded) = make_authz_token_with_audience(vec!["Lore".to_string()]);
+
+            let error = verifier
+                .verify_token(&encoded)
+                .await
+                .expect_err("no key can verify this token");
+
+            assert!(matches!(error, JwtVerifierError::ValidationFailed(_)));
+            assert_eq!(service.refreshes(), 1);
+        }
+
+        /// An expired token is the token's fault. Refreshing keys cannot change the verdict,
+        /// and anyone can present one — so it must not reach the refresh at all, on either
+        /// path. This is the bound on using invalid tokens to drive outbound requests.
+        #[tokio::test]
+        async fn a_token_that_no_key_could_rescue_never_asks_for_a_refresh() {
+            let service = Arc::new(RotatingJWKService::new(
+                AGREED_UPON_SIGNING_SECRET,
+                Some(AGREED_UPON_SIGNING_SECRET),
+            ));
+            let verifier = verifier_for(service.clone());
+            let encoded = encode_jwt(&expired_authz_token());
+
+            verifier
+                .verify_token(&encoded)
+                .await
+                .expect_err("an expired token stays rejected");
+            verifier
+                .try_verify_token_cached(&encoded)
+                .expect_err("and is rejected outright, not deferred");
+
+            assert_eq!(service.refreshes(), 0);
+        }
+
+        /// The same for a token whose audience is wrong, which is the other failure an
+        /// unauthenticated caller can produce at will against a perfectly good key.
+        #[tokio::test]
+        async fn a_wrong_audience_never_asks_for_a_refresh() {
+            let service = Arc::new(RotatingJWKService::new(
+                AGREED_UPON_SIGNING_SECRET,
+                Some(AGREED_UPON_SIGNING_SECRET),
+            ));
+            let verifier = verifier_for(service.clone());
+            let (_, encoded) = make_authz_token_with_audience(vec!["not-lore".to_string()]);
+
+            verifier
+                .verify_token(&encoded)
+                .await
+                .expect_err("wrong audience stays rejected");
+
+            assert_eq!(service.refreshes(), 0);
+        }
+
+        /// Modulus and exponent of the RSA example key from RFC 7515 Appendix A.2. Public
+        /// values — which is the whole point of the test below.
+        const RSA_N: &str = "0vx7agoebGcQSuuPiLJXZptN9nndrQmbXEps2aiAFbWhM78LhWx4\
+                             cbbfAAtVT86zwu1RK7aPFFxuhDR1L6tSoc_BJECPebWKRXjBZCiF\
+                             V4n3oknjhMstn64tZ_2W-5JsGY4Hc5n9yBXArwl93lqt7_RN5w6C\
+                             f0h4QyQ5v-65YGjQR0_FDW2QvzqY368QQMicAtaSqzs8KJZgnYb9\
+                             c7d0zgdAZHzu6qMQvRL5hajrn1n91CbOpbISD08qNLyrdkt-bFTW\
+                             hAI4vMQFh6WeZu0fM4lFd2NcRwr3XPksINHaQ-G_xBniIqbw0Ls1\
+                             jF44-csFCur-kEgU8awapJzKnqDKgw";
+        const RSA_E: &str = "AQAB";
+
+        /// A key service serving one RSA public key under `the kid`, as a real provider would.
+        fn rsa_verifier() -> JwtVerifier {
+            let mut service = MockTestJWKService::new();
+            service.expect_get_key().returning(|_| {
+                Ok((
+                    DecodingKey::from_rsa_components(RSA_N, RSA_E).expect("rsa decoding key"),
+                    Algorithm::RS256,
+                ))
+            });
+            // A rejected signature looks like a possible rotation, so the retry is reached.
+            // Serving no replacement keeps these tests about the first verdict.
+            service.expect_refresh_key().returning(|_| Ok(None));
+
+            JwtVerifier {
+                jwk_service: Arc::new(service),
+                jwt_issuer: None,
+                jwt_audience: Some(vec!["Lore".to_string()]),
+            }
+        }
+
+        /// Assemble a token with an arbitrary header, since `encode` will not produce the
+        /// mismatches these tests are about.
+        fn token_with_header(
+            header_json: &str,
+            claims: &impl Serialize,
+            signature: &str,
+        ) -> String {
+            use base64::Engine;
+            use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+            let header = URL_SAFE_NO_PAD.encode(header_json);
+            let claims = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).expect("claims"));
+            format!("{header}.{claims}.{signature}")
+        }
+
+        /// The algorithm-confusion forgery, and the reason the algorithm comes from the JWK
+        /// rather than the token.
+        ///
+        /// An RSA public key is published to the world in the JWKS. If the header could choose
+        /// the algorithm, an attacker would sign with HS256 using that public modulus as the
+        /// shared secret, and the server — holding the same public value — would agree. Nobody
+        /// needs the private key for this. The signature here is genuinely valid for the
+        /// algorithm the token claims; it is refused because the token does not get a say.
+        #[tokio::test]
+        async fn a_public_rsa_key_is_never_accepted_as_an_hmac_secret() {
+            let verifier = rsa_verifier();
+            let claims = mock_authz_token(vec!["Lore".to_string()]);
+
+            let forged = {
+                let jwt_key = EncodingKey::from_secret(RSA_N.as_bytes());
+                let mut header = Header::new(Algorithm::HS256);
+                header.kid = Some("the kid".into());
+                encode(&header, &claims, &jwt_key).expect("attacker signs with the public modulus")
+            };
+
+            let error = verifier
+                .verify_token(&forged)
+                .await
+                .expect_err("an RSA key must never verify an HMAC signature");
+
+            // Specifically the algorithm, not some incidental claim failure — otherwise this
+            // would still pass with the pin removed.
+            let JwtVerifierError::ValidationFailed(inner) = &error else {
+                panic!("expected a validation failure, got {error:?}");
+            };
+            assert!(
+                matches!(
+                    inner.kind(),
+                    jsonwebtoken::errors::ErrorKind::InvalidAlgorithm
+                ),
+                "the header's algorithm is refused, not merely the signature: {inner:?}"
+            );
+        }
+
+        /// The same refusal on the synchronous interceptor path, which must not be a way
+        /// around the async one.
+        #[test]
+        fn the_cached_path_also_refuses_an_hmac_signature_against_an_rsa_key() {
+            let mut service = MockTestJWKService::new();
+            // `times(1)` matters: `Ok(None)` is also what a cache miss produces, so without
+            // proving the key was served this would pass against a mock that returned nothing.
+            service.expect_get_cached_key().times(1).returning(|_| {
+                Some((
+                    DecodingKey::from_rsa_components(RSA_N, RSA_E).expect("rsa decoding key"),
+                    Algorithm::RS256,
+                ))
+            });
+            let verifier = JwtVerifier {
+                jwk_service: Arc::new(service),
+                jwt_issuer: None,
+                jwt_audience: Some(vec!["Lore".to_string()]),
+            };
+
+            let forged = {
+                let jwt_key = EncodingKey::from_secret(RSA_N.as_bytes());
+                let mut header = Header::new(Algorithm::HS256);
+                header.kid = Some("the kid".into());
+                encode(&header, &jwt_claims_for_forgery(), &jwt_key).expect("forge")
+            };
+
+            // Deferred rather than denied outright, because a rejected signature is how a
+            // rotated key presents — but never accepted.
+            let verdict = verifier
+                .try_verify_token_cached(&forged)
+                .expect("not the token's own fault");
+            assert!(verdict.is_none(), "must never verify, on any path");
+        }
+
+        fn jwt_claims_for_forgery() -> AuthorizationToken {
+            mock_authz_token(vec!["Lore".to_string()])
+        }
+
+        /// A token naming a different RSA algorithm than the key does is refused too. The
+        /// signature is nonsense, but the algorithm check fires before it is ever examined,
+        /// which is what makes it a pin rather than a preference.
+        #[tokio::test]
+        async fn a_token_naming_another_algorithm_for_the_same_key_is_refused() {
+            let verifier = rsa_verifier();
+            let claims = mock_authz_token(vec!["Lore".to_string()]);
+            let token = token_with_header(
+                r#"{"alg":"RS512","typ":"JWT","kid":"the kid"}"#,
+                &claims,
+                "bm90LWEtc2lnbmF0dXJl",
+            );
+
+            let error = verifier
+                .verify_token(&token)
+                .await
+                .expect_err("the key is pinned to RS256");
+            let JwtVerifierError::ValidationFailed(inner) = &error else {
+                panic!("expected a validation failure, got {error:?}");
+            };
+            assert!(
+                matches!(
+                    inner.kind(),
+                    jsonwebtoken::errors::ErrorKind::InvalidAlgorithm
+                ),
+                "the algorithm is refused before the signature is looked at: {inner:?}"
+            );
+        }
+
+        /// `alg: none` is the other half of the classic pair. It has no `Algorithm` at all, so
+        /// it cannot match the pinned one and the token is thrown out at the header.
+        #[tokio::test]
+        async fn a_token_claiming_no_algorithm_is_refused() {
+            let verifier = rsa_verifier();
+            let claims = mock_authz_token(vec!["Lore".to_string()]);
+            let token =
+                token_with_header(r#"{"alg":"none","typ":"JWT","kid":"the kid"}"#, &claims, "");
+
+            verifier
+                .verify_token(&token)
+                .await
+                .expect_err("an unsigned token is never acceptable");
+        }
+
+        /// A token signed by a key that was never served must still be refused after the
+        /// refresh, or the retry would be a way around verification rather than a way to
+        /// pick up a rotation.
+        #[tokio::test]
+        async fn a_token_signed_by_an_unknown_key_is_still_refused_after_a_refresh() {
+            let service = Arc::new(RotatingJWKService::new(
+                "rotated-out-secret",
+                Some(AGREED_UPON_SIGNING_SECRET),
+            ));
+            let verifier = verifier_for(service.clone());
+            let encoded = encode_jwt_signed_with(
+                "an-attackers-secret",
+                &mock_authz_token(vec!["Lore".to_string()]),
+            );
+
+            verifier
+                .verify_token(&encoded)
+                .await
+                .expect_err("a forged token is refused even though the key rotated");
+            assert_eq!(service.refreshes(), 1);
         }
 
         fn mock_authz_token(audience: Vec<String>) -> AuthorizationToken {

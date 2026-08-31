@@ -4,7 +4,6 @@
 mod tests {
     use std::sync::Arc;
 
-    use lore_base::error::NoRemote;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::Address;
     use lore_base::types::Context;
@@ -13,8 +12,6 @@ mod tests {
     use lore_revision::metadata::Metadata;
     use lore_revision::metadata::MetadataError;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
-    use lore_transport::ProtocolError;
     use rand::random;
 
     include!("helper.rs");
@@ -23,17 +20,9 @@ mod tests {
         let (immutable, mutable, _execution) = test_store_create()
             .await
             .expect("Failed to create stores for metadata test");
-        let repository_id = Context::from(uuid::Uuid::now_v7());
         let tempdir = generate_tempdir();
         Arc::new(RepositoryContext::new(
-            Some(tempdir.to_path_buf()),
-            immutable,
-            mutable,
-            repository_id.into(),
-            lore_revision::instance::InstanceId::default(),
-            Err(ProtocolError::from(NoRemote)),
-            Arc::default(),
-            RepositoryFormat::Lore,
+            default_repository_creation_args(immutable, mutable).with_path(tempdir.path()),
         ))
     }
 
@@ -247,18 +236,29 @@ mod tests {
     // Size-bound enforcement tests for metadata
     // ------------------------------------------------------------------
 
+    /// Metadata whose total is past the cap, built from values that each fit
+    /// under it. A single value larger than the cap is refused where it is set,
+    /// so the total is the only way to reach the check in `serialize`.
+    fn over_the_cap_in_legal_entries() -> Metadata {
+        let mut metadata = Metadata::new();
+        let payload = vec![0u8; METADATA_MAX_SIZE / 2];
+        for index in 0..3 {
+            metadata
+                .set_binary(&format!("part-{index}"), &payload)
+                .expect("each value fits on its own");
+        }
+        metadata
+    }
+
     #[tokio::test]
     async fn serialize_rejects_oversize() {
         let execution = setup_test_execution();
         LORE_CONTEXT
             .scope(execution, async move {
                 let repo = make_repo_context().await;
-                let mut metadata = Metadata::new();
-                // Pack a single binary value that pushes the blob past the 1 MiB cap.
-                let big = vec![0u8; METADATA_MAX_SIZE + 1];
-                metadata
-                    .set_binary("big", &big)
-                    .expect("setter should accept");
+                // Each value fits on its own, so only the total is over the cap
+                // — which is the one the setter cannot know and serialize must.
+                let metadata = over_the_cap_in_legal_entries();
                 let err = metadata
                     .serialize(repo.clone())
                     .await
@@ -277,11 +277,7 @@ mod tests {
         LORE_CONTEXT
             .scope(execution, async move {
                 let repo = make_repo_context().await;
-                let mut metadata = Metadata::new();
-                let big = vec![0u8; METADATA_MAX_SIZE + 1];
-                metadata
-                    .set_binary("big", &big)
-                    .expect("setter should accept");
+                let metadata = over_the_cap_in_legal_entries();
                 let err = metadata
                     .serialize_local(repo.clone())
                     .await

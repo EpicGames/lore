@@ -10,6 +10,7 @@ use serde::Serialize;
 use super::ID;
 use super::RepositoryAccess;
 use super::RepositoryContext;
+use super::RepositoryContextCreationArgs;
 use super::RepositoryError;
 use super::RepositoryFormat;
 use super::create_client_memory_stores;
@@ -42,7 +43,8 @@ pub struct LoreRepositoryDataEventData {
     pub default_branch_name: LoreString,
     /// Name of the user who created the repository.
     pub creator: LoreString,
-    /// Creation time of the repository, in seconds since the Unix epoch.
+    /// Creation time of the repository, in milliseconds since the Unix
+    /// epoch.
     pub created: u64,
 }
 
@@ -102,16 +104,17 @@ pub async fn info(repository_url: Option<&str>, identity: &str) -> Result<(), Re
             format!("Failed to connect to remote repository {remote_url}")
         })?;
 
-    let repository = Arc::new(RepositoryContext::new(
-        None,
+    let repository = Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
+        path: None,
         immutable_store,
         mutable_store,
-        data.id,
-        crate::instance::InstanceId::default(),
-        Ok(remote),
-        Arc::default(),
-        super::RepositoryFormat::Lore,
-    ));
+        id: data.id,
+        instance_id: crate::instance::InstanceId::default(),
+        remote: Ok(remote),
+        filter: Arc::default(),
+        format: super::RepositoryFormat::Lore,
+        filesystem_provider: None,
+    }));
 
     let metadata = repository::metadata(repository, data.metadata)
         .await

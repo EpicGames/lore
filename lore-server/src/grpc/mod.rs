@@ -4,6 +4,7 @@ use futures::FutureExt;
 pub mod admin_service;
 pub mod environment;
 pub mod environment_service;
+pub mod forwarded_repository;
 pub mod forwarded_requests;
 pub mod forwarded_revision;
 pub mod handlers;
@@ -31,6 +32,7 @@ pub mod tower;
 pub use admin_service::LoreAdminService;
 pub use grpc_internal_server::GrpcInternalServerBuilder;
 use lore_base::types::Context;
+use lore_revision::link::LinkError;
 use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::MetadataError;
 use lore_revision::repository::RepositoryWriteToken;
@@ -347,6 +349,14 @@ pub fn extract_correlation_id<B>(request: &tonic::Request<B>) -> Option<String> 
     }
 }
 
+pub fn extract_authorization_header<B>(request: &tonic::Request<B>) -> Option<String> {
+    request
+        .metadata()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(|s| s.to_string())
+}
+
 pub fn rpc_code_to_str(code: &Code) -> &'static str {
     match code {
         Code::Ok => "Ok",
@@ -434,6 +444,10 @@ pub fn hook_error_to_status(error: HookError) -> Status {
     }
 }
 
+pub fn no_repository_access_status() -> Status {
+    Status::permission_denied("Unauthorized")
+}
+
 pub fn timeout_grpc<T>(
     duration: Duration,
     fut: impl Future<Output = Result<T, Status>>,
@@ -449,6 +463,17 @@ pub trait FilterSlowDownExt<T, E> {
 
 impl<T> FilterSlowDownExt<T, StateError> for Result<T, StateError> {
     fn filter_slow_down(self) -> Result<Result<T, StateError>, Status> {
+        if let Err(err) = &self
+            && err.is_slow_down()
+        {
+            return Err(Status::resource_exhausted(err.to_string()));
+        }
+        Ok(self)
+    }
+}
+
+impl<T> FilterSlowDownExt<T, LinkError> for Result<T, LinkError> {
+    fn filter_slow_down(self) -> Result<Result<T, LinkError>, Status> {
         if let Err(err) = &self
             && err.is_slow_down()
         {

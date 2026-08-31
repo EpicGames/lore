@@ -8,3 +8,4 @@
 pub mod filesystem_provider;
 pub mod os;
 pub mod realize;
+pub mod swfs;

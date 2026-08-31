@@ -9,6 +9,7 @@ mod logging;
 mod pager;
 mod print_macros;
 mod progress_bar;
+mod stats_display;
 mod styling;
 mod terminal_size;
 mod util;

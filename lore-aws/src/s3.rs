@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashMap;
 use std::ops::Range;
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput;
 use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::operation::put_object::PutObjectOutput;
 use aws_sdk_s3::primitives::ByteStream;
+use bytes::Bytes;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
 use lore_telemetry::observe::Observe;
@@ -105,7 +107,7 @@ impl S3Impl {
             Err(SdkError::ServiceError(err)) if err.err().is_not_found() => Ok(false),
             Err(e) => {
                 warn!("Failed to check if bucket exists: {e}");
-                Err(AwsError::AwsSdkError(e))
+                Err(AwsError::sdk_error(e))
             }
         }
     }
@@ -134,7 +136,7 @@ impl S3Impl {
             )
             .await
             .output
-            .map_err(AwsError::AwsSdkError)
+            .map_err(AwsError::sdk_error)
     }
 
     #[tracing::instrument(name = "S3Impl::head_object", skip_all)]
@@ -157,7 +159,7 @@ impl S3Impl {
             )
             .await
             .output
-            .map_err(AwsError::AwsSdkError)
+            .map_err(AwsError::sdk_error)
     }
 
     #[tracing::instrument(name = "S3Impl::get_object", skip_all)]
@@ -187,24 +189,31 @@ impl S3Impl {
             )
             .await
             .output
-            .map_err(AwsError::AwsSdkError)
+            .map_err(AwsError::sdk_error)
     }
 
+    /// Store an object, optionally attaching object metadata carried as `x-amz-meta-*` headers.
+    ///
+    /// Object metadata is part of the object version rather than a separate record, so a reader
+    /// always observes the metadata that was written with the bytes it is reading. Writing the
+    /// two together is what makes them impossible to tear apart.
     #[tracing::instrument(name = "S3Impl::put_object", skip_all)]
-    pub async fn put_object<T>(
+    /// The body is [`Bytes`] rather than something convertible to a `Vec<u8>`: callers already hold
+    /// the payload in a refcounted buffer, and `ByteStream` takes one directly, so the bytes reach
+    /// the SDK without being copied on the way.
+    pub async fn put_object(
         &self,
         bucket: &str,
         key: &str,
-        body: T,
-    ) -> Result<PutObjectOutput, AwsError<SdkError<PutObjectError>>>
-    where
-        T: Into<Vec<u8>> + 'static,
-    {
+        body: Bytes,
+        metadata: Option<HashMap<String, String>>,
+    ) -> Result<PutObjectOutput, AwsError<SdkError<PutObjectError>>> {
         self.client
             .put_object()
             .bucket(bucket)
             .key(key)
-            .body(ByteStream::from(Into::<Vec<u8>>::into(body)))
+            .set_metadata(metadata)
+            .body(ByteStream::from(body))
             .send()
             .observe(
                 self.instruments.operation_latency_histogram.clone(),
@@ -215,7 +224,7 @@ impl S3Impl {
             )
             .await
             .output
-            .map_err(AwsError::AwsSdkError)
+            .map_err(AwsError::sdk_error)
     }
 
     pub async fn list_versions(
@@ -237,7 +246,7 @@ impl S3Impl {
             )
             .await
             .output
-            .map_err(AwsError::AwsSdkError)
+            .map_err(AwsError::sdk_error)
     }
 
     #[tracing::instrument(name = "S3Impl::delete_object", skip_all)]
@@ -262,7 +271,7 @@ impl S3Impl {
             )
             .await
             .output
-            .map_err(AwsError::AwsSdkError)
+            .map_err(AwsError::sdk_error)
     }
 
     pub fn sdk_client(&self) -> &s3::Client {

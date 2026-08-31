@@ -217,7 +217,7 @@ mod tests {
                     response.into_inner()
                 );
 
-                let state = state::State::new();
+                let state = Arc::new(state::State::new());
                 state.set_parent_self(Hash::default());
                 let base_hash = state
                     .serialize(repository.clone(), &write_token)

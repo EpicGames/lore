@@ -34,6 +34,8 @@ use crate::repository::RepositoryContext;
 use crate::store::ImmutableStore;
 use crate::store::StoreError;
 use crate::store::StoreMatch;
+use crate::store::StoreMatchResult;
+use crate::store::query_one;
 
 #[error_set]
 pub enum ImmutableError {
@@ -65,11 +67,13 @@ pub struct LoreFragmentWriteEventData {
     pub deduplicated: u8,
 }
 
-/// Build a `WriteTracker`. When `stats` is set the tracker emits a
-/// `FragmentWrite` event per fragment; otherwise it carries no observer so the
-/// common commit path avoids the per-fragment overhead.
-pub fn commit_write_tracker(stats: bool) -> Arc<lore_storage::write_tracker::WriteTracker> {
-    if !stats {
+/// Build a `WriteTracker`. When `per_fragment` is set the tracker emits a
+/// `FragmentWrite` event per fragment; otherwise it carries no observer.
+///
+/// Aggregate counters live on the execution context rather than the tracker, so
+/// this flag governs only the per-fragment events.
+pub fn commit_write_tracker(per_fragment: bool) -> Arc<lore_storage::write_tracker::WriteTracker> {
+    if !per_fragment {
         return Arc::new(lore_storage::write_tracker::WriteTracker::new());
     }
     Arc::new(lore_storage::write_tracker::WriteTracker::with_observer(
@@ -81,6 +85,34 @@ pub fn commit_write_tracker(stats: bool) -> Arc<lore_storage::write_tracker::Wri
             .send();
         }),
     ))
+}
+
+/// The counters this call's writes report into, or `None` where nothing counts
+/// them: statistics level zero, or outside a call.
+///
+/// Read at each write rather than threaded through the callers, so that a write
+/// carrying no tracker still lands in the operation's totals. At level zero the
+/// whole `lore-storage` write pipeline holds no counters and takes no atomic add
+/// per fragment.
+fn ambient_fragment_stats() -> Option<Arc<lore_storage::FragmentWriteStats>> {
+    let context = crate::runtime::try_execution_context()?;
+    if !context.globals().stats() {
+        return None;
+    }
+    Some(context.fragment_stats().clone())
+}
+
+/// The write context for a call that dispatches background writes into `tracker`.
+pub fn write_context(
+    tracker: Option<Arc<lore_storage::write_tracker::WriteTracker>>,
+) -> lore_storage::WriteContext {
+    lore_storage::WriteContext::tracked(tracker, ambient_fragment_stats())
+}
+
+/// The write context for a call that has no tracker, so its writes run inline
+/// but still land in this call's totals.
+pub fn counted_write_context() -> lore_storage::WriteContext {
+    lore_storage::WriteContext::counted(ambient_fragment_stats())
 }
 
 /// Construct [`WriteOptions`] from a repository context.
@@ -100,7 +132,6 @@ pub fn read_options_from_repository(repository: &RepositoryContext) -> ReadOptio
     ReadOptions {
         cache: !repository.disable_cache(),
         direct_write: repository.direct_file_write(),
-        direct_file_io: repository.direct_file_io(),
         sync_data,
         ..Default::default()
     }
@@ -110,23 +141,46 @@ pub fn read_options_from_repository(repository: &RepositoryContext) -> ReadOptio
 // Session resolution helper
 // ---------------------------------------------------------------------------
 
-/// Build a lazily-resolved storage session for a repository context. The
-/// underlying server-side session is established only when the session is
-/// actually used — local-only command paths never drive the connect.
-fn resolve_session(repository: &Arc<RepositoryContext>) -> Arc<StorageSession> {
+/// A storage session for a repository context, or `None` where the context holds
+/// no remote and nothing can come of one.
+///
+/// The session is lazy: the server-side session is established only when it is
+/// actually used, so a command that reads and writes nothing remotely never drives
+/// the connect. It stays lazy rather than resolving here because the read path
+/// recovers a rotated server session map by invalidating the session and retrying
+/// that same one, and only a lazy session resolves again — see
+/// [`StorageSession::is_lazy`].
+///
+/// The correlation id is read here rather than inside the resolver because the
+/// resolver runs wherever the read or write ends up, which is not necessarily
+/// under this command's execution context.
+fn resolve_session(repository: &Arc<RepositoryContext>) -> Option<Arc<StorageSession>> {
+    if repository.is_offline() {
+        return None;
+    }
     let repository = repository.clone();
     let correlation_id = crate::lore::execution_context()
         .globals()
         .correlation_id
         .to_string();
-    Arc::new(StorageSession::pending(move || {
+    Some(Arc::new(StorageSession::pending(move || {
         let repository = repository.clone();
         let correlation_id = correlation_id.clone();
-        async move {
-            let remote = repository.remote().await?;
-            remote.session(repository.id, &correlation_id).await
-        }
-    }))
+        async move { pooled_session(&repository, &correlation_id).await }
+    })))
+}
+
+/// A pick from the pool the repository context holds, resolving it on first use.
+///
+/// Going through [`RepositoryContext::session_pool`] rather than the connection is
+/// the point: the connection's own lookup owns a key and re-pins the pool, and
+/// every call in a command carries the same key, so all of them land on the one
+/// shard it hashes to.
+async fn pooled_session(
+    repository: &Arc<RepositoryContext>,
+    correlation_id: &str,
+) -> Result<Arc<StorageSession>, ProtocolError> {
+    Ok(repository.session_pool(correlation_id).await?.pick())
 }
 
 // ---------------------------------------------------------------------------
@@ -138,9 +192,8 @@ pub async fn load_raw_store_retry(
     store: Arc<dyn ImmutableStore>,
     repository: Partition,
     address: Address,
-    match_required: StoreMatch,
 ) -> Result<(Fragment, Bytes), ImmutableError> {
-    lore_storage::read::read_raw(store, repository, address, match_required)
+    lore_storage::read::read_raw(store, repository, address)
         .await
         .forward("loading raw fragment from store")
 }
@@ -165,7 +218,7 @@ pub async fn store_raw_remote_retry(
     fragment: Fragment,
     payload: Option<Bytes>,
 ) -> Result<(), ImmutableError> {
-    let mut retry = lore_storage::retry(50, 10_000, 60);
+    let mut retry = lore_storage::store_retry();
     loop {
         match remote_storage.put(address, fragment, payload.clone()).await {
             Ok(_) => return Ok(()),
@@ -202,7 +255,7 @@ pub async fn load_raw(
     address: Address,
     options: ReadOptions,
 ) -> Result<(Fragment, Bytes), ImmutableError> {
-    let session = Some(resolve_session(&repository));
+    let session = resolve_session(&repository);
 
     lore_storage::load_fragment(
         repository.immutable_store(),
@@ -219,17 +272,23 @@ pub async fn load_raw(
 // Read path -- delegates to lore-storage with session
 // ---------------------------------------------------------------------------
 
+/// Stream the given data range to `sender`, returning the number of bytes that will arrive.
+///
+/// `None` streams the whole content, so the count is `size_content` as it always was. A range
+/// is clamped to the content and only the fragments it touches are fetched.
 pub async fn read_stream(
     repository: Arc<RepositoryContext>,
     address: Address,
+    range: Option<Range<usize>>,
     options: ReadOptions,
-    sender: Sender<Bytes>,
+    sender: Sender<Result<Bytes, lore_storage::StorageError>>,
 ) -> Result<u64, ImmutableError> {
     let store = repository.immutable_store();
     let partition = repository.id;
-    let session = Some(resolve_session(&repository));
-    lore_storage::read_stream(store, partition, address, options, sender, session)
+    let session = resolve_session(&repository);
+    lore_storage::read_stream(store, partition, address, range, options, sender, session)
         .await
+        .map(|(_fragment, streamed)| streamed.end - streamed.start)
         .forward("reading immutable data")
 }
 
@@ -244,9 +303,10 @@ pub async fn read(
 ) -> Result<Bytes, ImmutableError> {
     let store = repository.immutable_store();
     let partition = repository.id;
-    let session = Some(resolve_session(&repository));
+    let session = resolve_session(&repository);
     lore_storage::read(store, partition, address, range, options, session)
         .await
+        .map(|(_fragment, bytes)| bytes)
         .forward("reading immutable data")
 }
 
@@ -259,25 +319,30 @@ pub async fn read_into(
 ) -> Result<(), ImmutableError> {
     let store = repository.immutable_store();
     let partition = repository.id;
-    let session = Some(resolve_session(&repository));
+    let session = resolve_session(&repository);
     lore_storage::read_into(store, partition, address, range, slice, options, session)
         .await
         .forward("reading immutable data")
 }
 
+/// Write the given data range to `path`. The file holds exactly that range starting at its
+/// first byte; `None` writes the whole content.
 pub async fn read_into_file(
     repository: Arc<RepositoryContext>,
     address: Address,
     path: &Path,
+    range: Option<Range<usize>>,
     options: ReadOptions,
 ) -> Result<(Fragment, Option<std::fs::Metadata>), ImmutableError> {
     let store = repository.immutable_store();
     let partition = repository.id;
     let temp_ext = crate::repository::TEMP_FILE_EXTENSION;
-    let session = Some(resolve_session(&repository));
-    lore_storage::read_into_file(store, partition, address, path, temp_ext, options, session)
-        .await
-        .forward("reading immutable data")
+    let session = resolve_session(&repository);
+    lore_storage::read_into_file(
+        store, partition, address, path, temp_ext, range, options, session,
+    )
+    .await
+    .forward("reading immutable data")
 }
 
 // ---------------------------------------------------------------------------
@@ -293,7 +358,7 @@ pub async fn store_raw(
     buffer: Bytes,
     cache_local: bool,
     remote_write: bool,
-) -> Result<(Address, Fragment), ImmutableError> {
+) -> Result<Address, ImmutableError> {
     store_raw_with_tracker(
         repository,
         address,
@@ -319,9 +384,9 @@ pub async fn store_raw_with_tracker(
     cache_local: bool,
     remote_write: bool,
     tracker: Option<Arc<lore_storage::write_tracker::WriteTracker>>,
-) -> Result<(Address, Fragment), ImmutableError> {
+) -> Result<Address, ImmutableError> {
     let session = if remote_write {
-        Some(resolve_session(&repository))
+        resolve_session(&repository)
     } else {
         None
     };
@@ -334,13 +399,13 @@ pub async fn store_raw_with_tracker(
         buffer,
         cache_local,
         session,
-        tracker,
+        write_context(tracker),
         None,
     )
     .await
     .forward::<ImmutableError>("storing fragment")?;
 
-    Ok((result.address, result.fragment))
+    Ok(result.address)
 }
 
 // ---------------------------------------------------------------------------
@@ -352,7 +417,7 @@ pub async fn write(
     context: Context,
     buffer: Bytes,
     flags: WriteOptions,
-) -> Result<(Address, Fragment), ImmutableError> {
+) -> Result<Address, ImmutableError> {
     write_with_tracker(repository, context, buffer, flags, None).await
 }
 
@@ -363,9 +428,9 @@ pub async fn write_with_tracker(
     buffer: Bytes,
     flags: WriteOptions,
     tracker: Option<Arc<lore_storage::write_tracker::WriteTracker>>,
-) -> Result<(Address, Fragment), ImmutableError> {
+) -> Result<Address, ImmutableError> {
     let session = if flags.remote_write {
-        Some(resolve_session(&repository))
+        resolve_session(&repository)
     } else {
         None
     };
@@ -376,18 +441,22 @@ pub async fn write_with_tracker(
         buffer,
         flags,
         session,
-        tracker,
+        write_context(tracker),
+        None,
     )
     .await
+    .map(|written| written.address)
     .forward("writing immutable content")
 }
 
+/// Write a file to the immutable store, returning its address and the size of the content that
+/// address stands for.
 pub async fn write_from_file(
     repository: Arc<RepositoryContext>,
     path: &Path,
     context: Context,
     flags: WriteOptions,
-) -> Result<(Address, Fragment), ImmutableError> {
+) -> Result<(Address, u64), ImmutableError> {
     write_from_file_with_tracker(repository, path, context, flags, None).await
 }
 
@@ -398,9 +467,9 @@ pub async fn write_from_file_with_tracker(
     context: Context,
     flags: WriteOptions,
     tracker: Option<Arc<lore_storage::write_tracker::WriteTracker>>,
-) -> Result<(Address, Fragment), ImmutableError> {
+) -> Result<(Address, u64), ImmutableError> {
     let session = if flags.remote_write {
-        Some(resolve_session(&repository))
+        resolve_session(&repository)
     } else {
         None
     };
@@ -411,9 +480,10 @@ pub async fn write_from_file_with_tracker(
         context,
         flags,
         session,
-        tracker,
+        write_context(tracker),
     )
     .await
+    .map(|written| (written.address, written.size_content))
     .forward("writing immutable content from file")
 }
 
@@ -433,6 +503,26 @@ pub async fn hash_file(
     )
     .await
     .forward("hashing file")
+}
+
+/// Whether `path` still holds the content `previous` addresses, fetching fragment metadata
+/// but never content payloads.
+pub async fn file_matches(
+    repository: Arc<RepositoryContext>,
+    path: impl AsRef<Path>,
+    previous: Address,
+    previous_size: Option<usize>,
+) -> Result<lore_storage::FileMatch, ImmutableError> {
+    lore_storage::file_matches(
+        repository.immutable_store(),
+        repository.id,
+        path,
+        previous,
+        previous_size,
+        None,
+    )
+    .await
+    .forward("comparing file against stored content")
 }
 
 // ---------------------------------------------------------------------------
@@ -479,7 +569,8 @@ pub async fn cache(
         total_query_count += query_count;
         lore_trace!("Query and cache {query_count} immutable fragments from remote");
 
-        let mut query_tasks: JoinSet<Result<(Bytes, Vec<StoreMatch>), StoreError>> = JoinSet::new();
+        let mut query_tasks: JoinSet<Result<(Bytes, Vec<StoreMatchResult>), StoreError>> =
+            JoinSet::new();
         while !query_address.is_empty() {
             // Cap number of tasks to a reasonable batch size
             const BATCH_COUNT: usize = 100;
@@ -495,13 +586,11 @@ pub async fn cache(
 
             let repository = repository.clone();
             lore_spawn!(query_tasks, async move {
-                let matches = repository
+                let addresses = slice.as_type_slice::<Address>();
+                let mut matches = vec![StoreMatchResult::default(); addresses.len()];
+                repository
                     .immutable_store()
-                    .exist_batch(
-                        repository.id,
-                        slice.as_type_slice::<Address>(),
-                        StoreMatch::MatchHash,
-                    )
+                    .query(repository.id, addresses, &mut matches)
                     .await?;
                 Ok((slice, matches))
             });
@@ -550,8 +639,8 @@ pub async fn cache(
                 && address.count::<Address>() == matches.len()
             {
                 let address = address.as_type_slice::<Address>();
-                for (index, match_made) in matches.iter().enumerate() {
-                    if *match_made != StoreMatch::MatchNone {
+                for (index, resolved) in matches.iter().enumerate() {
+                    if resolved.match_made != StoreMatch::MatchNone {
                         continue;
                     }
 
@@ -627,14 +716,9 @@ pub async fn cache(
 
 pub async fn is_stored_local(repository: Arc<RepositoryContext>, address: Address) -> bool {
     lore_trace!("Check if {} is cached in local store", address);
-    if let Ok(query) = repository
-        .immutable_store()
-        .query(repository.id, address, StoreMatch::MatchHash)
-        .await
-    {
-        lore_trace!("Query result {:?}", query);
-        query.match_made != StoreMatch::MatchNone
-            && (query.fragment.flags & FragmentFlags::PayloadStoredLocal) != 0
+    if let Ok(resolved) = query_one(&repository.immutable_store(), repository.id, address).await {
+        lore_trace!("Resolve result {:?}", resolved);
+        resolved.stored_local
     } else {
         false
     }
@@ -706,7 +790,7 @@ where
         repository: Arc<RepositoryContext>,
         address: Address,
         cache: bool,
-    ) -> Result<Box<SelfType>, ImmutableError> {
+    ) -> Result<lore_base::allocator::HeapBox<SelfType>, ImmutableError> {
         let mut elem = SelfType::new_from_heap_zeroed();
         let slice = unsafe {
             std::slice::from_raw_parts_mut(
@@ -742,7 +826,7 @@ pub trait WriteToImmutable: zerocopy::IntoBytes + zerocopy::Immutable + std::mar
         repository: Arc<RepositoryContext>,
         context: Context,
         flags: WriteOptions,
-    ) -> Result<(Address, Fragment), ImmutableError> {
+    ) -> Result<Address, ImmutableError> {
         let self_slice = self.as_bytes();
         // Unsafe extension of the lifetime of the self-as-buffer memory. Since
         // we await the task and no shared references of the buffer will be kept
@@ -754,3 +838,146 @@ pub trait WriteToImmutable: zerocopy::IntoBytes + zerocopy::Immutable + std::mar
 
 impl<T> WriteToImmutable for T where T: zerocopy::IntoBytes + zerocopy::Immutable + std::marker::Send
 {}
+
+#[cfg(test)]
+mod session_tests {
+    use std::future::Future;
+
+    use lore_base::runtime::LORE_CONTEXT;
+
+    use super::*;
+    use crate::interface::ExecutionContext;
+    use crate::interface::LoreGlobalArgs;
+    use crate::relay::EventDispatcher;
+    use crate::repository::RemoteState;
+
+    /// A context carrying the given remote state, on in-memory stores so
+    /// everything but the remote is valid.
+    async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
+        let (immutable, mutable) = crate::repository::create_client_memory_stores()
+            .await
+            .expect("in-memory stores should be creatable");
+        Arc::new(RepositoryContext::new_with_state(
+            None,
+            immutable,
+            mutable,
+            crate::lore::RepositoryId::default(),
+            crate::instance::InstanceId::default(),
+            state,
+            Arc::default(),
+            crate::repository::RepositoryFormat::Lore,
+            None,
+        ))
+    }
+
+    /// Run `body` under an execution context, which is where the correlation id a
+    /// session is attributed to comes from.
+    async fn under_execution_context<T>(body: impl Future<Output = T>) -> T {
+        let execution = Arc::new(ExecutionContext::new_client(
+            LoreGlobalArgs::default(),
+            EventDispatcher::no_dispatch(),
+        ));
+        LORE_CONTEXT.scope(execution, body).await
+    }
+
+    /// An address nothing has stored, so a read of it reaches the point where a
+    /// session would have been used.
+    fn absent_address() -> Address {
+        Address {
+            hash: Hash::from([0xa5u8; 32]),
+            context: Context::from([0xa5u8; 16]),
+        }
+    }
+
+    /// A pool for the context to hold, with the strong reference left to the caller
+    /// and the one session in it to compare a pick against. That session is never
+    /// resolved: the test asks which pool answered, not what it yields.
+    fn held_pool() -> (Arc<lore_transport::SessionPool>, Arc<StorageSession>) {
+        let session = Arc::new(StorageSession::pending(|| async {
+            Err(ProtocolError::internal(
+                "a pooled session this test never resolves",
+            ))
+        }));
+        (
+            Arc::new(lore_transport::SessionPool::new(vec![session.clone()])),
+            session,
+        )
+    }
+
+    /// What a read or write ends up using comes from the pool the context holds.
+    /// This context's connect has failed, so reaching the pool at all is proof the
+    /// session was not looked up through the connection per call.
+    #[tokio::test]
+    async fn a_pooled_session_comes_from_the_pool_the_context_holds() {
+        let context =
+            context_with_state(RemoteState::Failed(ProtocolError::from(Disconnected))).await;
+        let (pool, pooled) = held_pool();
+        context.set_session_pool(&pool);
+
+        let session = pooled_session(&context, "correlation")
+            .await
+            .expect("the pool the context holds answers, remote or no remote");
+        assert!(Arc::ptr_eq(&session, &pooled));
+    }
+
+    /// A context with no remote has nothing a session could resolve to, so the
+    /// read and write paths take their local-only route rather than carrying one
+    /// per fragment and failing it.
+    #[tokio::test]
+    async fn an_offline_context_resolves_no_session() {
+        let context = context_with_state(RemoteState::Offline).await;
+        let session = under_execution_context(async { resolve_session(&context) }).await;
+        assert!(session.is_none());
+    }
+
+    /// A failed connect is an answer a session carries, so one is still built: the
+    /// failure belongs in the error the read or write reports.
+    #[tokio::test]
+    async fn a_failed_connect_still_resolves_a_session() {
+        let context =
+            context_with_state(RemoteState::Failed(ProtocolError::from(Disconnected))).await;
+        let session = under_execution_context(async { resolve_session(&context) })
+            .await
+            .expect("a context that is not offline resolves a session");
+        assert!(
+            session.is_lazy(),
+            "the read path invalidates the session and retries that same one, \
+             which only a lazy session resolves again"
+        );
+    }
+
+    /// A write on a context with no remote stores locally and reports success,
+    /// which is what a write carrying a session reported: the upload's outcome only
+    /// sets the durable flag, it never fails the write.
+    #[tokio::test]
+    async fn a_write_on_an_offline_context_stores_locally() {
+        let context = context_with_state(RemoteState::Offline).await;
+        let payload = Bytes::from_static(b"content with no remote to go to");
+        let address = under_execution_context(write(
+            context.clone(),
+            Context::from([0x5au8; 16]),
+            payload.clone(),
+            WriteOptions::default().with_remote_write(),
+        ))
+        .await
+        .expect("a write with no remote still stores locally");
+
+        let stored = under_execution_context(read(context, address, None, ReadOptions::default()))
+            .await
+            .expect("what was stored reads back");
+        assert_eq!(stored, payload);
+    }
+
+    /// Skipping the session on an offline context reports what carrying one
+    /// reported: a resolver finding no remote maps to the address not being found,
+    /// which is what no session at all reports.
+    #[tokio::test]
+    async fn a_miss_on_an_offline_context_reports_the_address_not_found() {
+        let context = context_with_state(RemoteState::Offline).await;
+        let err =
+            under_execution_context(load_raw(context, absent_address(), ReadOptions::default()))
+                .await
+                .expect_err("nothing was ever stored under that address");
+        assert!(err.is_address_not_found(), "reported {err:?}");
+    }
+}

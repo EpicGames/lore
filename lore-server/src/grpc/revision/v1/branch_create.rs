@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::BranchPoint;
@@ -13,6 +11,7 @@ use lore_revision::lore::BranchId;
 use lore_revision::notification::NotificationSender;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::util;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use tonic::Request;
@@ -130,10 +129,7 @@ pub async fn branch_create_implementation(
 
     let branch = BranchId::from(req.id);
 
-    let created = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or_default();
+    let created = util::time::timestamp();
 
     let execution = setup_execution(
         module_path!(),
@@ -352,6 +348,61 @@ mod test {
         }
 
         #[tokio::test]
+        async fn create_stamps_created_in_milliseconds() {
+            let repository = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            let mut notification_sender = MockNotificationSender::new();
+            notification_sender
+                .expect_branch_created()
+                .return_once(|_, _| ());
+            let notification_sender = Arc::new(notification_sender);
+            let instrument_provider = TestInstrumentProvider {};
+
+            Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+                let branch_id = BranchId::from(uuid::Uuid::now_v7());
+                let mut request = Request::new(BranchCreateRequest {
+                    id: branch_id.into(),
+                    name: "main".into(),
+                    creator: Some("alice".into()),
+                    category: "default".into(),
+                    stack: vec![],
+                });
+                request.metadata_mut().insert_bin(
+                    REPOSITORY_ID_KEY,
+                    tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+                );
+
+                let hook_dispatcher = HookDispatcher::empty();
+                let before = util::time::timestamp();
+                let response = handler(
+                    request,
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    notification_sender.clone(),
+                    &None, /* no forwarded requests */
+                    &hook_dispatcher,
+                    &instrument_provider,
+                )
+                .await
+                .expect("Request failed");
+                let after = util::time::timestamp();
+
+                let created = response
+                    .into_inner()
+                    .branch
+                    .expect("response should include Branch")
+                    .created;
+                assert!(
+                    (before..=after).contains(&created),
+                    "created {created} outside [{before}, {after}], expected epoch milliseconds"
+                );
+            }))
+            .await;
+        }
+
+        #[tokio::test]
         async fn empty_name_returns_invalid_argument() {
             let repository = random::<RepositoryId>();
             let (immutable_store, mutable_store, execution) =
@@ -551,6 +602,14 @@ mod test {
             {
                 unreachable!("branch_get should not be called in branch_create tests")
             }
+
+            async fn branch_list(
+                &mut self,
+                _request: Request<lore_proto::lore::revision::v1::BranchListRequest>,
+            ) -> ForwardedRequestResult<crate::grpc::revision::v1::branch_list::BranchListStream>
+            {
+                unreachable!("branch_list should not be called in branch_create tests")
+            }
         }
 
         struct StubForwardedRequests {
@@ -593,6 +652,15 @@ mod test {
                 Box::new(SingleShotClient {
                     response: Arc::clone(&self.response),
                 })
+            }
+
+            fn forwarded_repository_service(
+                &self,
+            ) -> Box<dyn crate::grpc::forwarded_requests::repository_service::ForwardedRepositoryServiceClient>
+{
+                unreachable!(
+                    "forwarded_repository_service should not be called in branch_create tests"
+                )
             }
         }
 

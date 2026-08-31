@@ -47,7 +47,7 @@ pub(crate) fn spawn_flush_stores(
         Arc::new(ExecutionContext::default()) as Arc<dyn std::any::Any + Send + Sync>,
         || {
             lore_spawn_guarded!(async move {
-                immutable_store.clone().compact_stop().await;
+                immutable_store.clone().stop_gc(false).await;
                 let _ = immutable_store.flush(sync_data).await;
                 let _ = mutable_store.flush(sync_data).await;
             });
@@ -86,6 +86,12 @@ impl EventError for CloseError {
 ///
 /// Subsequent calls against the same handle return `InvalidArguments`. A second `close` on an
 /// already-closed handle also returns `InvalidArguments`.
+///
+/// Revision tree handles loaded against this store are neither closed nor reported: each
+/// holds its own reference to the store and stays usable, reads and commits included.
+/// Releasing them is the caller's job, with `lore_revision_tree_close`. Background eviction
+/// and compaction stop here and do not restart, so a tree that keeps writing afterwards
+/// runs without cache-size enforcement.
 pub async fn close(
     globals: LoreGlobalArgs,
     args: LoreStorageCloseArgs,
@@ -121,12 +127,51 @@ async fn close_local(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::time::Duration;
     use std::time::Instant;
 
+    use lore_base::types::Hash;
+    use lore_base::types::Partition;
+    use lore_revision::event::LoreEvent;
+
     use super::*;
+    use crate::revision_tree::handle as tree_handle;
+    use crate::revision_tree::handle::LoreRevisionTree;
+    use crate::revision_tree::load::LoreRevisionTreeLoadArgs;
+    use crate::revision_tree::load::load;
     use crate::storage::store::OpGuard;
     use crate::storage::store::in_memory_for_tests;
+
+    /// Load a revision tree against an already-registered storage handle.
+    async fn load_revision_tree(
+        store_handle: LoreStore,
+        repository: Partition,
+    ) -> LoreRevisionTree {
+        let loaded: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let sink = loaded.clone();
+        let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+            if let LoreEvent::RevisionTreeLoaded(data) = event {
+                *sink.lock().unwrap() = Some(data.handle_id);
+            }
+        }));
+        let status = load(
+            LoreGlobalArgs::default(),
+            LoreRevisionTreeLoadArgs {
+                store: store_handle,
+                repository,
+                revision_hash: Hash::default(),
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(status, 0, "loading the revision tree fixture must succeed");
+        let handle_id = loaded
+            .lock()
+            .unwrap()
+            .expect("load must emit RevisionTreeLoaded");
+        LoreRevisionTree { handle_id }
+    }
 
     /// Close must block until the in-flight counter drains. An `OpGuard` held by the test keeps
     /// the counter > 0; close's `mark_invalid_and_await` must not complete until the guard
@@ -170,6 +215,38 @@ mod tests {
         assert_eq!(
             status, 0,
             "close should report success after the counter drains"
+        );
+    }
+
+    /// The store outlives its storage handle for exactly as long as a revision tree still
+    /// references it. That reference is what makes reads work after a parent close, so it
+    /// has to be the last one dropped, not merely present.
+    #[tokio::test]
+    async fn the_store_tears_down_only_once_the_last_revision_handle_closes() {
+        let store = in_memory_for_tests("close-refcount").await;
+        let alive = Arc::downgrade(&store);
+        let store_handle = handle::register(store);
+        let tree = load_revision_tree(store_handle, Partition::from([0x1Au8; 16])).await;
+
+        let status = close(
+            LoreGlobalArgs::default(),
+            LoreStorageCloseArgs {
+                handle: store_handle,
+            },
+            None,
+        )
+        .await;
+        assert_eq!(status, 0, "closing the storage handle must succeed");
+        assert!(
+            alive.upgrade().is_some(),
+            "the revision tree's reference must hold the store up",
+        );
+
+        let internal = tree_handle::unregister(tree).expect("the tree must still be registered");
+        drop(internal);
+        assert!(
+            alive.upgrade().is_none(),
+            "and dropping it must be what finally tears the store down",
         );
     }
 }

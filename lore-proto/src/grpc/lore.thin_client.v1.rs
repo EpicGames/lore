@@ -37,6 +37,11 @@ pub struct DiffChange {
     /// not the request's repository id.
     #[prost(uint32, tag = "8")]
     pub link_repository_index: u32,
+    /// True when a link change tracks its parent's branch; false for pinned
+    /// links and non-link changes. Only meaningful on a LINK-typed entry; read
+    /// it from the entry for the mount path itself.
+    #[prost(bool, tag = "9")]
+    pub tracking: bool,
 }
 impl ::prost::Name for DiffChange {
     const NAME: &'static str = "DiffChange";
@@ -111,6 +116,16 @@ pub struct TreeNode {
     /// Content address for FILE / LINK entries; unused for DIRECTORY.
     #[prost(message, optional, tag = "3")]
     pub address: ::core::option::Option<crate::lore::model::v1::Address>,
+    /// Original size in bytes. For DIRECTORY entries, this is the cumulative size of its descendant files.
+    #[prost(uint64, tag = "4")]
+    pub size: u64,
+    /// File mode for this entry. For possible flags and values, see enum FileMode.
+    #[prost(uint64, tag = "5")]
+    pub mode: u64,
+    /// True when a link entry tracks its parent's branch; false for pinned links
+    /// and non-link entries.
+    #[prost(bool, tag = "6")]
+    pub tracking: bool,
 }
 impl ::prost::Name for TreeNode {
     const NAME: &'static str = "TreeNode";
@@ -138,7 +153,7 @@ pub struct Revision {
     /// Free-form commit message.
     #[prost(string, tag = "3")]
     pub commit_message: ::prost::alloc::string::String,
-    /// Commit timestamp (Unix epoch seconds). Always commit time, never
+    /// Commit timestamp (Unix epoch milliseconds). Always commit time, never
     /// authorship time.
     #[prost(uint64, tag = "4")]
     pub timestamp: u64,
@@ -382,6 +397,35 @@ impl NodeType {
             "DIRECTORY" => Some(Self::Directory),
             "FILE" => Some(Self::File),
             "LINK" => Some(Self::Link),
+            _ => None,
+        }
+    }
+}
+/// File mode for a file-system entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FileMode {
+    /// No special file mode.
+    None = 0,
+    /// File is executable.
+    Executable = 1,
+}
+impl FileMode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::None => "NONE",
+            Self::Executable => "EXECUTABLE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "NONE" => Some(Self::None),
+            "EXECUTABLE" => Some(Self::Executable),
             _ => None,
         }
     }

@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+
+name: Labeler
+
+# pull_request_target is required so the job's token can label PRs from
+# forks. It is safe here: the labeler only reads the PR's changed-file list
+# via the API and there is no checkout, so fork code is never executed.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions: {}
+
+concurrency:
+  group: labeler-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # Read .github/labeler.yml and the PR's changed files
+      pull-requests: write # Apply area/documentation labels to the PR
+    steps:
+      - uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7.0.0

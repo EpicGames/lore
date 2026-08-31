@@ -21,18 +21,24 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let crate_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
 
-    // list all .rs files in `lore` so that we run this script to update the c header
-    for entry in glob("src/**/*.rs").expect("glob syntax error") {
-        match entry {
-            Ok(path) => println!("cargo:rerun-if-changed={}", path.display()),
-            Err(err) => println!("Glob error: {err}"),
+    // Watch every source cbindgen reads, so the checked-in header cannot go stale: this crate's
+    // own, and the crates `cbindgen.toml` names under `parse.include`, which define C-API types
+    // of their own. Cargo does not re-run a build script when only a dependency crate changes.
+    for pattern in [
+        "src/**/*.rs",
+        "../lore-base/src/**/*.rs",
+        "../lore-notification/src/**/*.rs",
+        "../lore-revision/src/**/*.rs",
+        "../lore-storage/src/**/*.rs",
+        "../lore-transport/src/**/*.rs",
+    ] {
+        for entry in glob(pattern).expect("glob syntax error") {
+            match entry {
+                Ok(path) => println!("cargo:rerun-if-changed={}", path.display()),
+                Err(err) => println!("Glob error: {err}"),
+            }
         }
     }
-
-    // `LoreEvent` is a cbindgen-exported C-API type defined in lore-revision, not in `lore`.
-    // Cargo does not re-run this build script when only a dependency crate changes, so watch the
-    // event source explicitly to keep the generated header in sync with the event enum.
-    println!("cargo:rerun-if-changed=../lore-revision/src/event.rs");
 
     // list input configuration files so that we run this script to update the c header
     println!("cargo:rerun-if-changed=cbindgen.toml");
@@ -64,6 +70,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let contents = contents.replace("_t_Tag;", "_tag_t;");
     let contents = contents.replace("_t_Tag tag;", "_tag_t tag;");
     let contents = contents.replace("enum lore_event_tag_t {", "enum lore_event_id_t {");
+    // A metadata value's discriminant is the same set of kinds `lore_metadata_type_t`
+    // already names, so drop the synthesised copy of them and keep the tag's own
+    // width.
+    let metadata_tag = Regex::new(r"(?s)enum lore_metadata_tag_t \{.*?\n\};\n")
+        .expect("Failed to create regex to drop the synthesised metadata tag enum");
+    let contents = metadata_tag.replace(contents.as_str(), "").to_string();
     // Fill out empty structs with a dummy field
     let contents = contents.replace("{\n\n} lore_", "{\n  int _unused;\n} lore_");
 

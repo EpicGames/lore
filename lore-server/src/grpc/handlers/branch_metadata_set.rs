@@ -62,22 +62,16 @@ pub(crate) async fn validate_binary_blobs(
     proposed: &Metadata,
 ) -> Result<(), Status> {
     let mut addresses = vec![];
-    proposed
-        .walk(
-            |_key_slice: &[u8], value_slice: &[u8], value_type: MetadataType| {
-                if value_type == MetadataType::Address
-                    && value_slice.len() == std::mem::size_of::<Address>()
-                {
-                    let address: Address = value_slice.into();
-                    addresses.push(address);
-                }
-            },
-        )
-        .map_err(|err| {
-            warn_error_to_status(&err, |err| {
-                Status::internal(format!("failed to walk proposed metadata: {err}"))
-            })
-        })?;
+    proposed.walk(
+        |_key_slice: &[u8], value_slice: &[u8], value_type: MetadataType| {
+            if value_type == MetadataType::Address
+                && value_slice.len() == std::mem::size_of::<Address>()
+            {
+                let address: Address = value_slice.into();
+                addresses.push(address);
+            }
+        },
+    );
 
     for address in addresses {
         let options = lore_revision::immutable::read_options_from_repository(&repo).with_cache();

@@ -376,7 +376,7 @@ mod test {
         revision_number: u64,
     ) -> Hash {
         let write_token = get_write_token();
-        let state = state::State::new();
+        let state = Arc::new(state::State::new());
         state.set_parent_self(parent_self);
         if !parent_other.is_zero() {
             state.set_parent_other(parent_other);

@@ -59,6 +59,10 @@ impl EventError for CloseError {
 /// handle has paired its decrement, then drops the underlying
 /// `Arc<RevisionTreeInternal>` (which in turn releases the `Arc<StoreInternal>`
 /// borrowed from the parent storage handle).
+///
+/// The handle is unregistered before the drain, so `handle::lookup` refuses new
+/// ops immediately; ops that already took the handle hold their own `Arc` and the
+/// drain waits them out.
 pub async fn close(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeCloseArgs,
@@ -73,8 +77,6 @@ async fn close_impl(
     callback: LoreEventCallback,
 ) -> i32 {
     no_repository_call(globals, callback, args, close, async move |args| {
-        // Unregister first so concurrent `handle::lookup` returns None for new ops; ops that
-        // already grabbed the handle still hold their `Arc` and the drain below waits them out.
         let Some(internal) = handle::unregister(args.handle) else {
             LoreEvent::RevisionTreeCloseComplete(LoreRevisionTreeCloseCompleteEventData {
                 id: args.id,
@@ -231,12 +233,11 @@ mod tests {
         )
         .await;
         assert_eq!(
-            status_second, 1,
+            status_second,
+            InvalidArguments::FFI_CODE,
             "second close on the same handle must fail"
         );
         let events_second = sink_second.lock().unwrap().clone();
-        // A failed close signals its error through the close-complete event's
-        // error code and the terminal `Complete` status, not a separate `Error`.
         assert!(
             events_second.contains(&CapturedEvent::RevisionTreeCloseComplete(
                 43,
@@ -245,8 +246,8 @@ mod tests {
             "second close must emit RevisionTreeCloseComplete with InvalidArguments, got {events_second:?}"
         );
         assert!(
-            events_second.contains(&CapturedEvent::Complete(1)),
-            "second close must complete with status=1, got {events_second:?}"
+            events_second.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)),
+            "second close must complete with status=InvalidArguments, got {events_second:?}"
         );
 
         storage_handle::unregister(crate::storage::handle::LoreStore {
@@ -266,7 +267,11 @@ mod tests {
             make_callback(sink.clone()),
         )
         .await;
-        assert_eq!(status, 1, "close on INVALID must fail with status=1");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "close on INVALID must fail with status=InvalidArguments"
+        );
         let events = sink.lock().unwrap().clone();
         assert!(
             events.contains(&CapturedEvent::RevisionTreeCloseComplete(
@@ -276,8 +281,8 @@ mod tests {
             "close on INVALID must emit RevisionTreeCloseComplete with InvalidArguments, got {events:?}"
         );
         assert!(
-            events.contains(&CapturedEvent::Complete(1)),
-            "close on INVALID must complete with status=1, got {events:?}"
+            events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)),
+            "close on INVALID must complete with status=InvalidArguments, got {events:?}"
         );
     }
 
@@ -293,7 +298,11 @@ mod tests {
             make_callback(sink.clone()),
         )
         .await;
-        assert_eq!(status, 1, "close on INVALID must fail with status=1");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "close on INVALID must fail with status=InvalidArguments"
+        );
         let events = sink.lock().unwrap().clone();
         assert!(
             events.contains(&CapturedEvent::RevisionTreeCloseComplete(
@@ -397,8 +406,8 @@ mod tests {
         statuses.sort_unstable();
         assert_eq!(
             statuses,
-            [0, 1],
-            "exactly one close must succeed (0) and one must fail (1), got {statuses:?}"
+            [0, InvalidArguments::FFI_CODE],
+            "exactly one close must succeed (0) and one must fail, got {statuses:?}"
         );
         assert!(
             rt_handle::lookup(handle_value).is_none(),

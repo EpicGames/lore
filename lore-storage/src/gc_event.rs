@@ -34,11 +34,12 @@ pub fn current_gc_event_sink() -> Option<GcEventSinkRef> {
 /// Receives store garbage-collection lifecycle and progress callbacks.
 ///
 /// All methods take raw values; constructing and emitting events is the
-/// implementor's responsibility. A pass reports `*_begin` only once it has
-/// determined there is work to do (the store is above the limit), one
-/// `*_progress` per evicted bucket / compacted group, and `*_end` only on
-/// natural completion — an interrupted pass (store dropped mid-step) emits no
-/// `*_end`.
+/// implementor's responsibility. A `*_begin` is reported once the work is committed
+/// to, one `*_progress` per evicted bucket / compacted group, and exactly one
+/// `*_end` for every `*_begin`, carrying what that unit achieved — a unit stopped
+/// rather than finished reports its end all the same. Eviction reports one pair per
+/// sweep; compaction runs in steps and reports a pair per step, so the progress
+/// events between a begin and its end sum to what that end carries.
 pub trait GcEventSink: Send + Sync {
     /// An eviction pass started, targeting `target_fragments` total fragments.
     fn eviction_begin(&self, target_fragments: u64);

@@ -1,11 +1,15 @@
-/* malloc.c  -  Memory allocator  -  Public Domain  -  2016 Mattias Jansson
+/* malloc.c  -  Memory allocator  -  2016 Mattias Jansson
+ *
+ * SPDX-FileCopyrightText: 2016 Mattias Jansson
+ * SPDX-License-Identifier: Unlicense OR MIT
  *
  * This library provides a cross-platform lock free thread caching malloc implementation in C11.
  * The latest source code is always available at
  *
  * https://github.com/mjansson/rpmalloc
  *
- * This library is put in the public domain; you can redistribute it and/or modify it without any restrictions.
+ * This library is put in the public domain; you can redistribute it and/or modify it without any
+ * restrictions. Or, if you choose, you can use it under the MIT license.
  *
  */
 
@@ -15,10 +19,6 @@
 // This file provides overrides for the standard library malloc entry points for C and new/delete operators for C++
 // It also provides automatic initialization/finalization of process and threads
 //
-
-#ifdef _MSC_VER
-#pragma warning(disable : 4068)
-#endif
 
 #if defined(__TINYC__)
 #include <sys/types.h>
@@ -74,6 +74,8 @@ static void* rpaligned_alloc_reverse_nothrow(size_t size, size_t align, rp_nothr
 static void rpfree_size(void* p, size_t size) { (void)sizeof(size); rpfree(p); }
 static void rpfree_aligned(void* p, size_t align) { (void)sizeof(align); rpfree(p); }
 static void rpfree_size_aligned(void* p, size_t size, size_t align) { (void)sizeof(size); (void)sizeof(align); rpfree(p); }
+static void rpfree_nothrow(void* p, rp_nothrow_t t) { (void)sizeof(t); rpfree(p); }
+static void rpfree_aligned_nothrow(void* p, size_t align, rp_nothrow_t t) { (void)sizeof(align); (void)sizeof(t); rpfree(p); }
 
 #endif
 
@@ -117,6 +119,48 @@ rpreallocarray(void* ptr, size_t count, size_t size) {
 	return rprealloc(ptr, total);
 }
 
+extern inline size_t RPMALLOC_CDECL
+rpmalloc_good_size(size_t size) {
+	uint32_t size_class = get_size_class(size);
+	if (size_class < SIZE_CLASS_COUNT)
+		return global_size_class[size_class].block_size;
+	return get_page_aligned_size(size + SPAN_HEADER_SIZE) - SPAN_HEADER_SIZE;
+}
+
+extern inline int RPMALLOC_CDECL
+rpreallocarr(void* ptrp, size_t count, size_t size) {
+	if (!ptrp || !size) {
+		errno = EINVAL;
+		return EINVAL;
+	}
+	size_t total;
+#if defined(__GNUC__) || defined(__clang__)
+	if (__builtin_mul_overflow(count, size, &total)) {
+		errno = EOVERFLOW;
+		return EOVERFLOW;
+	}
+#else
+	total = count * size;
+	if ((total / size) != count) {
+		errno = EOVERFLOW;
+		return EOVERFLOW;
+	}
+#endif
+	void** op = (void**)ptrp;
+	if (total == 0) {
+		rpfree(*op);
+		*op = 0;
+		return 0;
+	}
+	void* newp = rprealloc(*op, total);
+	if (!newp) {
+		errno = ENOMEM;
+		return ENOMEM;
+	}
+	*op = newp;
+	return 0;
+}
+
 #if USE_IMPLEMENT
 
 extern inline void* RPMALLOC_CDECL malloc(size_t size) { return rpmalloc(size); }
@@ -133,14 +177,20 @@ extern inline size_t RPMALLOC_CDECL malloc_size(void* ptr) { return rpmalloc_usa
 extern inline void* RPMALLOC_CDECL valloc(size_t size) { return rpvalloc(size); }
 extern inline void* RPMALLOC_CDECL pvalloc(size_t size) { return rppvalloc(size); }
 extern inline void* RPMALLOC_CDECL reallocarray(void* ptr, size_t count, size_t size) { return rpreallocarray(ptr, count, size); }
+extern inline int RPMALLOC_CDECL reallocarr(void* ptr, size_t count, size_t size) { return rpreallocarr(ptr, count, size); }
+extern inline size_t RPMALLOC_CDECL malloc_good_size(size_t size) { return rpmalloc_good_size(size); }
+extern inline void RPMALLOC_CDECL vfree(void* ptr) { rpfree(ptr); }
+#ifndef _WIN32
+extern inline void* RPMALLOC_CDECL _aligned_malloc(size_t size, size_t alignment) { return rpaligned_alloc(alignment, size); }
+#endif
 
 #ifdef _WIN32
-extern inline RPMALLOC_RESTRICT void* RPMALLOC_CDECL _malloc_base(size_t size) { return rpmalloc(size); }
+extern inline void* RPMALLOC_CDECL _malloc_base(size_t size) { return rpmalloc(size); }
 extern inline void RPMALLOC_CDECL _free_base(void* ptr) { rpfree(ptr); }
-extern inline RPMALLOC_RESTRICT void* RPMALLOC_CDECL _calloc_base(size_t count, size_t size) { return rpcalloc(count, size); }
+extern inline void* RPMALLOC_CDECL _calloc_base(size_t count, size_t size) { return rpcalloc(count, size); }
 extern inline size_t RPMALLOC_CDECL _msize(void* ptr) { return rpmalloc_usable_size(ptr); }
 extern inline size_t RPMALLOC_CDECL _msize_base(void* ptr) { return rpmalloc_usable_size(ptr); }
-extern inline RPMALLOC_RESTRICT void* RPMALLOC_CDECL _realloc_base(void* ptr, size_t size) { return rprealloc(ptr, size); }
+extern inline void* RPMALLOC_CDECL _realloc_base(void* ptr, size_t size) { return rprealloc(ptr, size); }
 #endif
 
 #ifdef _WIN32
@@ -151,6 +201,10 @@ extern inline RPMALLOC_RESTRICT void* RPMALLOC_CDECL _realloc_base(void* ptr, si
 #define RPDEFVIS __attribute__((visibility("default")))
 extern void _ZdlPv(void* p); void RPDEFVIS _ZdlPv(void* p) { rpfree(p); }
 extern void _ZdaPv(void* p); void RPDEFVIS _ZdaPv(void* p) { rpfree(p); }
+extern void _ZdlPvRKSt9nothrow_t(void* p, rp_nothrow_t t); void RPDEFVIS _ZdlPvRKSt9nothrow_t(void* p, rp_nothrow_t t) { (void)sizeof(t); rpfree(p); }
+extern void _ZdaPvRKSt9nothrow_t(void* p, rp_nothrow_t t); void RPDEFVIS _ZdaPvRKSt9nothrow_t(void* p, rp_nothrow_t t) { (void)sizeof(t); rpfree(p); }
+extern void _ZdlPvSt11align_val_tRKSt9nothrow_t(void* p, size_t align, rp_nothrow_t t); void RPDEFVIS _ZdlPvSt11align_val_tRKSt9nothrow_t(void* p, size_t align, rp_nothrow_t t) { (void)sizeof(align); (void)sizeof(t); rpfree(p); }
+extern void _ZdaPvSt11align_val_tRKSt9nothrow_t(void* p, size_t align, rp_nothrow_t t); void RPDEFVIS _ZdaPvSt11align_val_tRKSt9nothrow_t(void* p, size_t align, rp_nothrow_t t) { (void)sizeof(align); (void)sizeof(t); rpfree(p); }
 #if ARCH_64BIT
 // 64-bit operators new and new[], normal and aligned
 extern void* _Znwm(uint64_t size); void* RPDEFVIS _Znwm(uint64_t size) { return rpmalloc(size); }
@@ -246,6 +300,11 @@ __attribute__ ((section("__DATA, __interpose"))) = {
 void _ZdlPv(void* p) RPALIAS(rpfree)
 void _ZdaPv(void* p) RPALIAS(rpfree)
 
+void _ZdlPvRKSt9nothrow_t(void* p, rp_nothrow_t t) RPALIAS(rpfree_nothrow)
+void _ZdaPvRKSt9nothrow_t(void* p, rp_nothrow_t t) RPALIAS(rpfree_nothrow)
+void _ZdlPvSt11align_val_tRKSt9nothrow_t(void* p, size_t a, rp_nothrow_t t) RPALIAS(rpfree_aligned_nothrow)
+void _ZdaPvSt11align_val_tRKSt9nothrow_t(void* p, size_t a, rp_nothrow_t t) RPALIAS(rpfree_aligned_nothrow)
+
 #if ARCH_64BIT
 // 64-bit operators new and new[], normal and aligned
 void* _Znwm(uint64_t size) RPALIAS(rpmalloc)
@@ -304,11 +363,17 @@ size_t malloc_usable_size(const void* ptr) RPALIAS(rpmalloc_usable_size)
 size_t malloc_usable_size(void* ptr) RPALIAS(rpmalloc_usable_size)
 #endif
 size_t malloc_size(void* ptr) RPALIAS(rpmalloc_usable_size)
+size_t malloc_good_size(size_t size) RPALIAS(rpmalloc_good_size)
+void vfree(void* ptr) RPALIAS(rpfree)
+void* _aligned_malloc(size_t size, size_t alignment) RPALIAS(rpaligned_alloc_reverse)
+__attribute__((weak, visibility("default")))
+int reallocarr(void* ptr, size_t count, size_t size);
+int reallocarr(void* ptr, size_t count, size_t size) { return rpreallocarr(ptr, count, size); }
 
 // end USE_ALIAS
 #endif
 
-#if defined(__GLIBC__) && defined(__linux__) && 0
+#if defined(__GLIBC__) && defined(__linux__)
 
 void* __libc_malloc(size_t size) RPALIAS(rpmalloc)
 void* __libc_calloc(size_t count, size_t size) RPALIAS(rpcalloc)

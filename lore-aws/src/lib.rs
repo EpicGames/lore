@@ -15,6 +15,7 @@ use tracing::warn;
 pub mod aws_error;
 pub mod clients;
 pub mod dynamodb;
+pub mod net_http_client;
 pub mod s3;
 pub mod store;
 pub mod telemetry;

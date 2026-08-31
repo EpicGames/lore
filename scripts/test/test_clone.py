@@ -1,10 +1,12 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
 import logging
+import os
+import shutil
 from pathlib import Path
 
 import pytest
-from lore_parsers import parse_jsonl
+from lore_parsers import parse_jsonl, parse_status_json, parse_status_summary_json
 
 from lore import Lore
 
@@ -134,3 +136,89 @@ def test_clone_by_branch_id(new_lore_repo):
 
     with clone.open_file("file.txt") as f:
         assert f.read() == "main content\nfeature\n"
+
+
+@pytest.mark.smoke
+def test_clone_direct_file_write(new_lore_repo):
+    """
+    Verify that clone with --direct-file-write produces correct files on disk.
+
+    --direct-file-write skips the default atomic write strategy (write to temp
+    file then rename) and writes directly to the destination path. The result
+    must be identical to a normal clone.
+    """
+    repo: Lore = new_lore_repo()
+
+    repo.write_commit_push("Initial commit", {
+        "text.txt": "hello world\n",
+        "subdir/nested.txt": "nested content\n",
+        "binary.bin": b"\x00\x01\x02\xff" * 256,
+    })
+
+    clone = repo.clone(direct_file_write=True)
+
+    # Verify text files
+    with clone.open_file("text.txt") as f:
+        assert f.read() == "hello world\n", "text file content mismatch"
+
+    with clone.open_file("subdir/nested.txt") as f:
+        assert f.read() == "nested content\n", "nested file content mismatch"
+
+    # Verify binary file
+    with clone.open_file("binary.bin", "rb") as f:
+        content = f.read()
+    assert content == b"\x00\x01\x02\xff" * 256, (
+        f"binary file content mismatch, got {len(content)} bytes"
+    )
+
+
+@pytest.mark.smoke
+def test_reclone_over_existing_files_records_their_modified_times(new_lore_repo):
+    """A clone into a directory that already holds identical files retains them rather than
+    writing them, and establishes that they match by measuring their content. Recording the
+    modified time it measured them at is what leaves the next scan nothing to measure.
+
+    The re-clone mints a fresh instance, so none of the times the first clone recorded can
+    be read back: whatever answers the scan afterwards must have been recorded by the
+    retain path itself.
+    """
+    repo: Lore = new_lore_repo()
+
+    file_count = 8
+    for index in range(file_count):
+        with repo.open_file(f"retained{index}.bin", "w+b") as f:
+            f.write(os.urandom(4096))
+    repo.stage(scan=True)
+    repo.commit("Base")
+    repo.push()
+
+    clone: Lore = repo.clone()
+
+    # Drop the repository metadata and keep the working files, so the re-clone finds every
+    # file present and identical.
+    shutil.rmtree(clone.dot_path(), ignore_errors=True)
+
+    output = repo.run(["repository", "clone", repo.remote_path, clone.path], json=True)
+    clone_end = parse_jsonl(output, "repositoryCloneEnd")
+    assert clone_end, "clone must emit a repositoryCloneEnd event"
+    count = clone_end[-1]["count"]
+    assert count["fileRetain"] == file_count, (
+        f"every existing file should have been retained, got {count}"
+    )
+    assert count["fileReplace"] == 0, (
+        f"no existing file should have been rewritten, got {count}"
+    )
+
+    # One scan only: a second would record whatever the first measured, and so would report
+    # nothing left to measure even if the retain path had recorded nothing.
+    scan = clone.status(scan=True, json=True, offline=True)
+    assert not parse_status_json(scan), (
+        "a re-clone over identical files leaves nothing changed"
+    )
+
+    summary = parse_status_summary_json(scan)
+    assert summary is not None, "scan must emit a repositoryStatusSummary event"
+    assert summary["hashChecks"] == 0, (
+        f"the retained files must be answered by their recorded times, got {summary}"
+    )
+    assert summary["mtimeMatches"] == file_count, summary

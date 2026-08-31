@@ -23,6 +23,7 @@ use tracing::info;
 use super::record::build_repository;
 use super::repository_get::repository_load_id;
 use crate::grpc::ServerResultExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
 use crate::grpc::get_user_id;
@@ -46,11 +47,7 @@ pub async fn handler(
     let user_info = get_authorization(request.extensions());
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-    let authorization = request
-        .metadata()
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .map(|s| s.to_string());
+    let authorization = extract_authorization_header(&request);
     let req = request.into_inner();
 
     // TODO(mjansson): Once the authz model has read/write/admin, replace

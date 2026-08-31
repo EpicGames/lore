@@ -1,0 +1,55 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+
+# Path -> label map consumed by .github/workflows/labeler.yml.
+#
+# Area labels are coarse (client / server / core / ci) to match how work is
+# filtered; the globs stay per-crate so the map is explicit about what lands
+# where. A new top-level crate must be added to one bucket below.
+
+'area:client':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'lore-client/**'
+
+'area:server':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'lore-server/**'
+          - 'lore-aws/**'
+          - 'lore-credential/**'
+          - 'lore-hashicorp/**'
+          - 'lore-notification/**'
+          - 'lore-telemetry/**'
+
+'area:core':
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'lore/**'
+          - 'lore-capi/**'
+          - 'lore-revision/**'
+          - 'lore-storage/**'
+          - 'lore-transport/**'
+          - 'lore-proto/**'
+          - 'lore-base/**'
+          - 'lore-io/**'
+          - 'lore-macro/**'
+          - 'lore-error-set/**'
+          - 'lore-error-set-macro/**'
+          - 'lore-chaos-client/**'
+          - 'lore-integration-tests/**'
+
+'area:ci':
+  - changed-files:
+      - any-glob-to-any-file:
+          - '.github/**'
+
+documentation:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'docs/**'
+
+LEP:
+  - changed-files:
+      - any-glob-to-any-file:
+          - 'docs/proposals/**'

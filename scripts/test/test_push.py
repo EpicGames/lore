@@ -72,7 +72,7 @@ def test_push(new_lore_repo):
     )
 
     # Clone the repository
-    clone = repo.clone(direct_file_io=True)
+    clone = repo.clone()
 
     # Switch to my-mega-feature branch
     clone.branch_switch("my-mega-feature")
@@ -150,7 +150,7 @@ def test_push_fast_forward_merge(new_lore_repo):
 
     # At this point the merge commit's parent_self = main rev 1 (the initial push).
     # Now advance main from another clone to simulate a concurrent push.
-    clone_b = repo.clone(direct_file_io=True)
+    clone_b = repo.clone()
     clone_b.make_dirs(os.path.join("assets", "textures", "hdr"))
     with clone_b.open_file(os.path.join("assets", "textures", "hdr", "sky.bin"), "w+b") as f:
         f.write(os.urandom(4096))
@@ -201,7 +201,7 @@ def test_push_fast_forward_merge(new_lore_repo):
     )
 
     # Verify via a fresh clone that the server state is correct
-    verify = repo.clone(direct_file_io=True)
+    verify = repo.clone()
     clone_files = _collect_repo_files(verify)
     assert clone_files == expected_files, (
         f"Cloned files differ from expected.\n"
@@ -264,7 +264,7 @@ def test_push_fast_forward_merge_conflict(new_lore_repo):
     # Now advance main from another clone by modifying the same file — this
     # creates a conflict between the merge (which changed shared.txt via the
     # feature branch) and the concurrent push (which also changes shared.txt)
-    clone_b = repo.clone(direct_file_io=True)
+    clone_b = repo.clone()
     with clone_b.open_file(os.path.join("src", "core", "utils", "shared.txt"), "w+") as f:
         f.write("concurrent change to shared file on main\n")
     clone_b.stage(scan=True, offline=True)
@@ -299,7 +299,7 @@ def test_push_fast_forward_merge_non_merge(new_lore_repo):
     repo.commit("Regular commit", offline=True)
 
     # Advance main from another clone with a non-conflicting change
-    clone_b = repo.clone(direct_file_io=True)
+    clone_b = repo.clone()
     repo_b_dir = os.path.join("docs", "guides", "setup")
     clone_b.make_dirs(repo_b_dir)
     with clone_b.open_file(os.path.join(repo_b_dir, "install.txt"), "w+") as f:
@@ -339,7 +339,7 @@ def test_push_fast_forward_merge_non_merge(new_lore_repo):
     )
 
     # Verify via fresh clone
-    verify = repo.clone(direct_file_io=True)
+    verify = repo.clone()
     clone_files = _collect_repo_files(verify)
     assert clone_files == expected_files, (
         f"Cloned files differ from expected.\n"

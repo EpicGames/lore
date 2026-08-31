@@ -27,6 +27,7 @@ use lore::interface::LoreRepositoryStatusArgs;
 use lore::interface::LoreRepositoryStoreImmutableQueryArgs;
 use lore::interface::LoreRepositoryVerifyFragmentArgs;
 use lore::interface::LoreRepositoryVerifyStateArgs;
+use lore::interface::LoreSharedStoreMode;
 use lore::interface::LoreString;
 use lore::repository;
 use lore::repository::LoreRepositoryDeleteArgs;
@@ -163,10 +164,6 @@ pub struct RepositoryCloneArgs {
     /// Write directly to the destination file instead of write to a temporary file and move into place
     #[clap(long, action)]
     direct_file_write: bool,
-
-    /// Use direct file I/O instead of memory mapping files
-    #[clap(long, action)]
-    direct_file_io: bool,
 
     /// Layer to add
     #[clap(long, value_name = "repository")]
@@ -614,6 +611,8 @@ pub fn handle_repository_status(globals: LoreGlobalArgs, args: &RepositoryStatus
 
     let result = runtime().block_on(repository::status(globals, args, callback)) as u8;
 
+    // CLI process, so this is the user's terminal directory.
+    #[allow(clippy::disallowed_methods)]
     let cwd = std::env::current_dir().unwrap_or_else(|_| repo_root.clone());
     let display_path = |path: &str, node_type| {
         path_typed(
@@ -885,7 +884,11 @@ pub fn handle_repository_create(globals: LoreGlobalArgs, args: &RepositoryCreate
         repository_url: url.into(),
         id: LoreString::from(&args.id),
         description: LoreString::from(&args.description),
-        use_shared_store: args.use_shared_store as u8,
+        use_shared_store: if args.use_shared_store {
+            LoreSharedStoreMode::Enabled
+        } else {
+            LoreSharedStoreMode::Inherit
+        },
         shared_store_path: args.shared_store_path.as_ref().into(),
     };
 
@@ -927,14 +930,24 @@ pub fn handle_repository_delete(globals: LoreGlobalArgs, args: &RepositoryDelete
 
     let args = LoreRepositoryDeleteArgs { repository_url };
 
+    let dry_run = globals.dry_run();
+
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::Complete(data) if data.status == 0 => {
-                println!(
-                    "{}Repository deleted successfully{}",
-                    CommonStyles::SUCCESS,
-                    anstyle::Reset
-                );
+                if dry_run {
+                    println!(
+                        "{}Repository would be deleted{}",
+                        CommonStyles::SUCCESS,
+                        anstyle::Reset
+                    );
+                } else {
+                    println!(
+                        "{}Repository deleted successfully{}",
+                        CommonStyles::SUCCESS,
+                        anstyle::Reset
+                    );
+                }
             }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
@@ -995,11 +1008,14 @@ pub fn handle_repository_clone(globals: LoreGlobalArgs, args: &RepositoryCloneAr
         bare: args.bare.into(),
         virtually: args.virtually.into(),
         direct_file_write: args.direct_file_write.into(),
-        direct_file_io: args.direct_file_io.into(),
         layer: args.layer.as_ref().into(),
         layer_metadata: args.layer_metadata.as_ref().into(),
         prefetch: args.prefetch.as_ref().into(),
-        use_shared_store: args.use_shared_store as u8,
+        use_shared_store: if args.use_shared_store {
+            LoreSharedStoreMode::Enabled
+        } else {
+            LoreSharedStoreMode::Inherit
+        },
         shared_store_path: args.shared_store_path.as_ref().into(),
         no_tracking: args.no_tracking.into(),
         root_files: LoreArray::from_vec(

@@ -16,6 +16,7 @@ use lore_revision::interface::LoreMetadataType;
 use lore_revision::lore::RepositoryId;
 use lore_revision::lore::execution_context;
 use lore_revision::repository;
+use lore_revision::repository::LoreSharedStoreMode;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryError;
 use lore_revision::repository::SharedStoreToUseConfig;
@@ -60,16 +61,15 @@ pub struct LoreRepositoryCloneArgs {
     pub virtually: u8,
     /// Use direct file write
     pub direct_file_write: u8,
-    /// Use direct file I/O instead of memory mapping files
-    pub direct_file_io: u8,
     /// (Optional) Layer module
     pub layer: LoreString,
     /// (Optional) Layer metadata key to link revisions with
     pub layer_metadata: LoreString,
     /// (Optional) File containing list of files to prefetch
     pub prefetch: LoreString,
-    /// Use the shared store instead of a local immutable store
-    pub use_shared_store: u8,
+    /// Whether to use the shared store instead of a local immutable store. Zero-initialized
+    /// (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
+    pub use_shared_store: LoreSharedStoreMode,
     /// [Optional] Path to use for the shared store, an empty string means to use the default
     pub shared_store_path: LoreString,
     /// Clone without local repository tracking (memory-only stores)
@@ -152,7 +152,6 @@ async fn clone_impl(
     let ignore_existing = false;
     let virtually = args.virtually != 0;
     let direct_file_write = args.direct_file_write != 0;
-    let direct_file_io = args.direct_file_io != 0;
     let no_tracking = args.no_tracking != 0;
 
     let view_path = if args.view.length > 0 {
@@ -193,7 +192,6 @@ async fn clone_impl(
         ignore_existing,
         virtually,
         direct_file_write,
-        direct_file_io,
         prefetch,
         shared_store_options,
         no_tracking,
@@ -388,8 +386,9 @@ pub struct LoreRepositoryCreateArgs {
     pub description: LoreString,
     /// Optional repository ID, set to empty string to generate a new ID
     pub id: LoreString,
-    /// Use the shared store instead of a local immutable store
-    pub use_shared_store: u8,
+    /// Whether to use the shared store instead of a local immutable store. Zero-initialized
+    /// (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
+    pub use_shared_store: LoreSharedStoreMode,
     /// [Optional] Path to use for the shared store, an empty string means to use the default
     pub shared_store_path: LoreString,
 }
@@ -880,12 +879,6 @@ async fn status_local(
     args: LoreRepositoryStatusArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    // Avoid store updates during status, which is effectively read only
-    // State fragments are still prioritized in local store, so prioritize
-    // less file system writes of store files over accuracy in eviction/compaction
-    let mut globals = globals;
-    globals.no_atime = 1;
-
     if args.scan != 0 || args.check_dirty != 0 || args.reset != 0 {
         // Scan and check_dirty persist refreshed dirty flags in the staged
         // state and reset drops the staged anchor; all require write capability
@@ -1235,7 +1228,7 @@ async fn metadata_set_impl(
         .iter()
         .zip(args.formats.as_slice().iter())
     {
-        let metadata_type = (*f).into();
+        let metadata_type = *f;
         encoded_values.push(
             Metadata::decode_to_value(v.as_str(), &metadata_type).map_err(|e| {
                 lore_base::error::InvalidArguments {

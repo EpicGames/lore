@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use anyhow::anyhow;
+use lore_base::lore_spawn_net;
 use lore_proto::AdminServiceServer;
 use lore_proto::LockServiceServer;
 use lore_proto::lore::environment::v1::environment_service_server as environment_v1_server;
@@ -25,6 +26,7 @@ use lore_storage::MutableStore;
 use lore_telemetry::grpc_tower_layer::GrpcMetricsLayer;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
 use serde::Deserialize;
+use tonic::transport::Certificate;
 use tonic::transport::Identity;
 use tonic::transport::ServerTlsConfig;
 use tonic::transport::server::Server;
@@ -63,6 +65,7 @@ use crate::legacy::rpc::environment_service_server::EnvironmentServiceServer;
 use crate::legacy::rpc::repository_service_server::RepositoryServiceServer;
 use crate::legacy::rpc::revision_service_server::RevisionServiceServer;
 use crate::legacy::rpc::storage_service_server::StorageServiceServer;
+use crate::util::core_hop::CoreHopLayer;
 
 // Why Tower, why?
 // Just try to make this type alias match the 'router' type in GrpcServerBuilder.
@@ -79,7 +82,7 @@ type GrpcRouter = tonic::transport::server::Router<
                         TraceLayer<SharedClassifier<GrpcErrorsAsFailures>, MakeCorrelationIdSpan>,
                         CorrelationIdLayer,
                     >,
-                    tower::layer::util::Identity,
+                    Stack<CoreHopLayer, tower::layer::util::Identity>,
                 >,
             >,
         >,
@@ -159,6 +162,29 @@ impl Default for RevisionListAcceleration {
             list_cache: true,
         }
     }
+}
+
+/// Builds a [`ServerTlsConfig`] for a gRPC server endpoint.
+///
+/// `cert_path` and `key_path` are the server's own certificate and private key.
+/// `cert_chain_path`, when supplied, is the CA certificate used to verify client
+/// certificates; client certificates are accepted but not required. Without it
+/// no client verification is configured.
+fn build_server_tls_config(
+    cert_path: PathBuf,
+    key_path: PathBuf,
+    cert_chain_path: Option<PathBuf>,
+) -> Result<ServerTlsConfig> {
+    info!("Loading TLS certs - cert: {cert_path:?} key: {key_path:?}");
+    let identity = Identity::from_pem(std::fs::read(&cert_path)?, std::fs::read(&key_path)?);
+    let mut tls = ServerTlsConfig::new()
+        .identity(identity)
+        .client_auth_optional(true);
+    if let Some(chain_path) = cert_chain_path {
+        info!("Loading CA cert for client verification: {chain_path:?}");
+        tls = tls.client_ca_root(Certificate::from_pem(std::fs::read(chain_path)?));
+    }
+    Ok(tls)
 }
 
 #[derive(Debug, Default)]
@@ -333,25 +359,18 @@ impl GrpcServerBuilder<WantsTlsConfig> {
         key_path: Option<PathBuf>,
         cert_chain_path: Option<PathBuf>,
     ) -> Result<GrpcServerBuilder<WantsAdminEndpoints>> {
-        let tls_config = if let Some(key_path) = key_path {
-            let cert_path =
-                cert_chain_path.unwrap_or(cert_path.ok_or(anyhow!("Missing TLS cert path"))?);
-            info!(
-                "Loading TLS certs - cert: {:?} key: {:?}",
-                cert_path, key_path
-            );
-            let cert = std::fs::read(cert_path)?;
-            info!("Loading TLS key: {:?}", key_path);
-            let key = std::fs::read(key_path)?;
-            let identity = Identity::from_pem(cert, key);
-
-            Some(
-                ServerTlsConfig::new()
-                    .identity(identity)
-                    .client_auth_optional(true),
-            )
-        } else {
-            None
+        let tls_config = match (cert_path, key_path) {
+            (Some(cert_path), Some(key_path)) => Some(build_server_tls_config(
+                cert_path,
+                key_path,
+                cert_chain_path,
+            )?),
+            (None, None) => None,
+            _ => {
+                return Err(anyhow!(
+                    "TLS is partially configured: cert_file and pkey_file must both be set or both be absent"
+                ));
+            }
         };
 
         Ok(GrpcServerBuilder(WantsAdminEndpoints {
@@ -555,6 +574,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             self.0.immutable_store.clone(),
             self.0.mutable_store.clone(),
             self.0.hook_dispatcher.clone(),
+            self.0.forwarded_requests.clone(),
             rpc_timeout,
         );
 
@@ -589,6 +609,9 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             config
         };
         let mut router = server
+            // Outermost, so everything inward runs on core: this stack is served
+            // from net.
+            .layer(CoreHopLayer)
             .layer(
                 CorrelationIdLayerBuilder::new()
                     .with_grpc_tracer(trace_layer_config)
@@ -704,8 +727,48 @@ pub struct WantsAddress {
 }
 
 impl GrpcServerBuilder<WantsAddress> {
-    pub async fn serve(self, addr: SocketAddr, signal: impl Future<Output = ()>) -> Result<()> {
-        self.0.router.serve_with_shutdown(addr, signal).await?;
+    /// Serves on the net runtime. Handler bodies are hopped back to core by the
+    /// [`CoreHopLayer`] at the outside of the stack, so only the transport and
+    /// h2 driver stay here.
+    pub async fn serve(
+        self,
+        addr: SocketAddr,
+        signal: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<()> {
+        lore_spawn_net!(async move { self.0.router.serve_with_shutdown(addr, signal).await })
+            .await??;
+        Ok(())
+    }
+
+    /// Serve on a socket the caller already bound, so the port is held from the moment it is
+    /// chosen.
+    ///
+    /// [`GrpcServerBuilder::serve`] binds the address itself, which leaves the caller no way to
+    /// reserve a port and hand it over: between learning a free port and this binding it, anything
+    /// on the machine can take it. A caller that cannot tolerate that window binds first and passes
+    /// the socket.
+    ///
+    /// The socket arrives as [`std::net::TcpListener`] rather than tokio's, because a tokio
+    /// listener belongs to the runtime that created it and this serves on the net runtime; the
+    /// conversion happens there.
+    pub async fn serve_with_listener(
+        self,
+        listener: std::net::TcpListener,
+        signal: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<()> {
+        lore_spawn_net!(async move {
+            listener.set_nonblocking(true)?;
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            self.0
+                .router
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    signal,
+                )
+                .await
+                .map_err(anyhow::Error::from)
+        })
+        .await??;
         Ok(())
     }
 }
@@ -719,35 +782,135 @@ pub async fn serve_maintenance(
     cert_path: Option<PathBuf>,
     key_path: Option<PathBuf>,
     cert_chain_path: Option<PathBuf>,
-    signal: impl Future<Output = ()>,
+    signal: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
     let environment_svc = LoreEnvironmentService::maintenance(environment.clone());
     let environment_v1_svc = LoreEnvironmentV1Service::maintenance(environment);
 
     let mut server = Server::builder();
-    if let Some(key_path) = key_path {
-        let cert_path =
-            cert_chain_path.unwrap_or(cert_path.ok_or(anyhow!("Missing TLS cert path"))?);
-        info!(
-            "Loading maintenance TLS certs - cert: {:?} key: {:?}",
-            cert_path, key_path
-        );
-        let cert = std::fs::read(cert_path)?;
-        let key = std::fs::read(key_path)?;
-        let identity = Identity::from_pem(cert, key);
-        let tls_config = ServerTlsConfig::new()
-            .identity(identity)
-            .client_auth_optional(true);
-        server = server.tls_config(tls_config)?;
+    match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            info!("Loading maintenance TLS certs - cert: {cert_path:?} key: {key_path:?}");
+            let tls_config = build_server_tls_config(cert_path, key_path, cert_chain_path)?;
+            server = server.tls_config(tls_config)?;
+        }
+        (None, None) => {}
+        _ => {
+            return Err(anyhow!(
+                "Maintenance TLS is partially configured: cert_file and pkey_file must both be set or both be absent"
+            ));
+        }
     }
 
-    server
+    // Served from net like the other listeners. No `CoreHopLayer`: both handlers
+    // only return UNAVAILABLE, so there is nothing to keep off net.
+    let router = server
         .add_service(EnvironmentServiceServer::new(environment_svc))
         .add_service(environment_v1_server::EnvironmentServiceServer::new(
             environment_v1_svc,
-        ))
-        .serve_with_shutdown(addr, signal)
-        .await?;
+        ));
+    lore_spawn_net!(async move { router.serve_with_shutdown(addr, signal).await }).await??;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Generate a CA and a matching server cert+key using rcgen, writing the cert
+    /// and key to a tempdir (the server takes file paths, not PEM bytes).
+    ///
+    /// Returns `(ca_pem, cert_path, key_path, _dir)`.  The caller must keep
+    /// `_dir` alive for as long as the paths are needed; dropping it removes the
+    /// files.
+    fn generate_test_certs() -> (
+        String,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        tempfile::TempDir,
+    ) {
+        use rcgen::BasicConstraints;
+        use rcgen::CertificateParams;
+        use rcgen::IsCa;
+        use rcgen::Issuer;
+        use rcgen::KeyPair;
+        use rcgen::KeyUsagePurpose;
+
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_pem = ca_cert.pem();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let server_key = KeyPair::generate().unwrap();
+        let server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
+
+        let dir = tempfile::Builder::new()
+            .prefix("lore-server-tls-test-")
+            .tempdir()
+            .unwrap();
+        let cert_path = dir.path().join("server.crt");
+        let key_path = dir.path().join("server.key");
+        std::fs::write(&cert_path, server_cert.pem()).unwrap();
+        std::fs::write(&key_path, server_key.serialize_pem()).unwrap();
+
+        (ca_pem, cert_path, key_path, dir)
+    }
+
+    #[test]
+    fn build_server_tls_config_valid_cert_and_key_succeeds() {
+        let (_ca_pem, cert_path, key_path, _dir) = generate_test_certs();
+        let config = build_server_tls_config(cert_path, key_path, None)
+            .expect("build_server_tls_config should not fail for a matched cert+key");
+
+        // Applying to a server builder is what actually validates the cert+key pair —
+        // rustls rejects a mismatch here with KeyMismatch.
+        Server::builder()
+            .tls_config(config)
+            .expect("server builder should accept a matched cert+key");
+    }
+
+    #[test]
+    fn build_server_tls_config_with_ca_cert_succeeds() {
+        let (ca_pem, cert_path, key_path, dir) = generate_test_certs();
+        let ca_path = dir.path().join("ca.crt");
+        std::fs::write(&ca_path, &ca_pem).unwrap();
+
+        let config = build_server_tls_config(cert_path, key_path, Some(ca_path))
+            .expect("build_server_tls_config should not fail for a matched cert+key with CA");
+
+        // Applying to a server builder validates both the cert+key pair and that
+        // the CA cert is valid PEM accepted by the TLS stack.
+        Server::builder()
+            .tls_config(config)
+            .expect("server builder should accept a matched cert+key with a valid CA cert");
+    }
+
+    #[test]
+    fn build_server_tls_config_mismatched_cert_and_key_is_rejected_by_server_builder() {
+        // Generate two independent chains; their certs and keys are not interchangeable.
+        let (_ca_a, cert_path_a, _key_a, _dir_a) = generate_test_certs();
+        let (_ca_b, _cert_b, key_path_b, _dir_b) = generate_test_certs();
+
+        // build_server_tls_config itself succeeds — it only reads bytes.
+        let config = build_server_tls_config(cert_path_a, key_path_b, None)
+            .expect("build_server_tls_config should not fail reading files");
+
+        // The mismatch is caught when the config is applied to a server builder;
+        // rustls validates that the cert and key form a consistent pair at this point.
+        let result = Server::builder().tls_config(config);
+        assert!(
+            result.is_err(),
+            "expected Err when applying a mismatched cert+key to a server builder"
+        );
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(
+            err.contains("KeyMismatch") || err.contains("key"),
+            "expected a key-mismatch error, got: {err}"
+        );
+    }
 }

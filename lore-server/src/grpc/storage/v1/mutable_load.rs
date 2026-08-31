@@ -69,8 +69,8 @@ pub async fn handler(
 
 #[cfg(test)]
 mod tests {
+    use lore_base::lore_spawn;
     use lore_base::runtime::LORE_CONTEXT;
-    use lore_base::runtime::runtime;
     use lore_base::types::Context;
     use lore_base::types::Hash;
     use lore_proto::lore::storage::v1 as storage_v1;
@@ -90,30 +90,25 @@ mod tests {
         let repository = random::<Context>();
         let key = random::<Hash>();
 
-        runtime()
-            .spawn(LORE_CONTEXT.scope(execution, async move {
-                let service = LoreStorageService::new(
-                    immutable_store.clone(),
-                    immutable_store,
-                    mutable_store,
-                );
+        lore_spawn!(LORE_CONTEXT.scope(execution, async move {
+            let service =
+                LoreStorageService::new(immutable_store.clone(), immutable_store, mutable_store);
 
-                let load_request = storage_v1::MutableLoadRequest {
-                    key: bytes::Bytes::copy_from_slice(key.as_bytes()),
-                    key_type: 0,
-                };
-                let request =
-                    make_request_with_metadata(load_request, repository, "test-not-found");
+            let load_request = storage_v1::MutableLoadRequest {
+                key: bytes::Bytes::copy_from_slice(key.as_bytes()),
+                key_type: 0,
+            };
+            let request = make_request_with_metadata(load_request, repository, "test-not-found");
 
-                let result = StorageServiceV1::mutable_load(&service, request).await;
-                assert!(result.is_err(), "Load of non-existent key should fail");
-                assert_eq!(
-                    result.unwrap_err().code(),
-                    tonic::Code::NotFound,
-                    "Should return NotFound"
-                );
-            }))
-            .await
-            .expect("Test task failed");
+            let result = StorageServiceV1::mutable_load(&service, request).await;
+            assert!(result.is_err(), "Load of non-existent key should fail");
+            assert_eq!(
+                result.unwrap_err().code(),
+                tonic::Code::NotFound,
+                "Should return NotFound"
+            );
+        }))
+        .await
+        .expect("Test task failed");
     }
 }

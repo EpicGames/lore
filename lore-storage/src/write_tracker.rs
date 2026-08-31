@@ -20,11 +20,14 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use crate::error::StorageError;
-use crate::types::Address;
 use crate::types::Fragment;
+use crate::write_stats::FragmentWriteStats;
 
 /// Result type every leader / follower task yields.
-pub type TrackedResult = Result<(Address, Fragment), StorageError>;
+///
+/// Success carries nothing: the tracker only ever asks whether the write landed, and the caller
+/// that dispatched it already has the address.
+pub type TrackedResult = Result<(), StorageError>;
 
 /// Callback invoked per stored fragment with its header and dedup status.
 pub type FragmentObserver = Arc<dyn Fn(&Fragment, bool) + Send + Sync>;
@@ -203,6 +206,64 @@ impl Default for WriteTracker {
     }
 }
 
+/// What an operation gives its fragment writes: the tracker background work is
+/// dispatched into, and the counters that work reports into.
+///
+/// The two halves are independent. A commit supplies both; a write that must
+/// finish before its caller continues supplies only the counters; the default
+/// supplies neither.
+///
+/// Cloning it clones the tracker handle, which must not outlive
+/// [`WriteTracker::await_all`] — that requires its handle to be the only one left.
+/// Work handed to a spawned task therefore takes [`WriteContext::stats`] alone.
+#[derive(Clone, Default)]
+pub struct WriteContext {
+    tracker: Option<Arc<WriteTracker>>,
+    stats: Option<Arc<FragmentWriteStats>>,
+}
+
+impl WriteContext {
+    /// Neither tracker nor counters: the plain inline write.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Counters only, for a write that cannot be dispatched into a tracker.
+    pub fn counted(stats: Option<Arc<FragmentWriteStats>>) -> Self {
+        Self {
+            tracker: None,
+            stats,
+        }
+    }
+
+    /// Dispatch into `tracker` and count into `stats`.
+    pub fn tracked(
+        tracker: Option<Arc<WriteTracker>>,
+        stats: Option<Arc<FragmentWriteStats>>,
+    ) -> Self {
+        Self { tracker, stats }
+    }
+
+    /// The tracker to dispatch background writes into, if any.
+    pub fn tracker(&self) -> Option<&Arc<WriteTracker>> {
+        self.tracker.as_ref()
+    }
+
+    /// The counters to report into, owned so a spawned task can take them
+    /// without also holding the tracker that awaits it.
+    pub fn stats(&self) -> Option<Arc<FragmentWriteStats>> {
+        self.stats.clone()
+    }
+
+    /// Report a fact to the counters, doing nothing when none were supplied. The
+    /// path with no counters costs one null check.
+    pub fn count(&self, record: impl FnOnce(&FragmentWriteStats)) {
+        if let Some(stats) = self.stats.as_deref() {
+            record(stats);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -210,24 +271,10 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
-    use zerocopy::FromZeros;
-
     use super::*;
-    use crate::types::Context;
-    use crate::types::Hash;
 
     fn ok_result() -> TrackedResult {
-        Ok((
-            Address {
-                context: Context::new_zeroed(),
-                hash: Hash::new_zeroed(),
-            },
-            Fragment {
-                flags: 0,
-                size_payload: 1,
-                size_content: 1,
-            },
-        ))
+        Ok(())
     }
 
     #[tokio::test]
@@ -282,11 +329,11 @@ mod tests {
         let tracker = Arc::new(WriteTracker::new());
         tracker.spawn_leader(async {
             tokio::time::sleep(Duration::from_millis(5)).await;
-            Err::<(Address, Fragment), _>(StorageError::internal("first"))
+            Err::<(), _>(StorageError::internal("first"))
         });
         tracker.spawn_leader(async {
             tokio::time::sleep(Duration::from_millis(30)).await;
-            Err::<(Address, Fragment), _>(StorageError::internal("second"))
+            Err::<(), _>(StorageError::internal("second"))
         });
         let err = tracker
             .await_all()

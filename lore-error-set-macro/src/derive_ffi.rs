@@ -18,8 +18,25 @@ pub fn derive_ffi_error(input: &DeriveInput) -> TokenStream {
     };
 
     quote! {
+        // Scopes the attribute to the FFI code registry. This is a bare
+        // identifier, so it resolves in the module the derive expands into
+        // rather than against this crate: a `#[ffi_code(N)]` written anywhere
+        // that does not declare `__ffi_code_registry_marker` fails to compile.
+        // Codes share one numeric space and one process-exit-status space, so
+        // they are allocated in exactly one place.
+        const _: fn() = __ffi_code_registry_marker;
+
+        impl #name {
+            /// This type's FFI error code, usable in const position.
+            ///
+            /// Lets another declaration that must spell the same code — a
+            /// `#[repr(C)]` enum discriminant, say — assert equality at compile
+            /// time instead of duplicating the literal unchecked.
+            pub const FFI_CODE: i32 = #code;
+        }
+
         impl lore_error_set::FfiError for #name {
-            fn ffi_code(&self) -> i32 { #code }
+            fn ffi_code(&self) -> i32 { Self::FFI_CODE }
         }
     }
 }

@@ -30,6 +30,8 @@ impl LoreStore {
     pub const INVALID: Self = Self { handle_id: 0 };
 }
 
+lore_base::carries_no_text!(LoreStore);
+
 static REGISTRY: LazyLock<DashMap<u64, Arc<StoreInternal>>> = LazyLock::new(DashMap::new);
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 

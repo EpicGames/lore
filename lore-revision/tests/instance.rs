@@ -5,7 +5,6 @@ mod tests {
     use std::sync::Arc;
 
     use futures::StreamExt;
-    use lore_base::error::NoRemote;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Context;
@@ -17,10 +16,8 @@ mod tests {
     use lore_revision::instance::instance_key;
     use lore_revision::instance::{self};
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::repository::SALT_LORE;
     use lore_storage::store_types::KeyType;
-    use lore_transport::ProtocolError;
 
     include!("helper.rs");
 
@@ -35,14 +32,9 @@ mod tests {
         let write_token = lore_revision::repository::RepositoryWriteToken::acquire(&path).await;
         Arc::new(
             RepositoryContext::new(
-                Some(path.clone()),
-                immutable_store,
-                mutable_store,
-                Context::default().into(),
-                instance_id,
-                Err(ProtocolError::from(NoRemote)),
-                Arc::default(),
-                RepositoryFormat::Lore,
+                default_repository_creation_args(immutable_store, mutable_store)
+                    .with_path(&path)
+                    .with_instance_id(instance_id),
             )
             .with_write_token(write_token.share()),
         )

@@ -35,6 +35,7 @@ use crate::node::ROOT_NODE;
 use crate::node::SiblingCycleGuard;
 use crate::state;
 use crate::state::State;
+use crate::state::StateNodeChildrenIterator;
 use crate::store::StoreMatch;
 use crate::util::path::RelativePath;
 
@@ -134,6 +135,166 @@ pub struct VerifyFragmentArgs {
     pub heal: bool,
 }
 
+/// Validate a staged in-memory state on its way to becoming a revision.
+///
+/// Reads only through the state's own blocks — no working tree, no instance
+/// anchors, no healing, nothing prompted. Rejects the tree shapes the push-side
+/// validator rejects and a programmatic caller can build where the working tree
+/// cannot: a child whose parent link does not lead back to its parent, a looped
+/// sibling chain, a name whose hash does not match the stored string, and a staged
+/// name a live sibling already holds.
+///
+/// Walks only what the commit will freeze — the same shape [`commit_directory`]
+/// and [`rehash_directory`] walk, descending into a directory only when it is
+/// staged. `node_mark` propagates the plain `Staged` bit to the root, so every
+/// directory holding a change is reached and a settled subtree is never read. The
+/// consequence is that two *settled* siblings sharing a name are not caught; they
+/// come from a revision that was validated when it was published.
+///
+/// Staged and dirty flags are otherwise not examined. They are still set when a
+/// commit calls this, and clearing them is the freeze's job — `rehash_directory`
+/// is what refuses a leftover.
+///
+/// [`commit_directory`]: crate::commit
+/// [`rehash_directory`]: crate::commit::rehash_directory
+pub async fn verify_state_for_commit(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+) -> Result<(), RepositoryError> {
+    verify_staged_directory(repository, state, ROOT_NODE).await
+}
+
+/// A live child of a directory the walk is validating.
+struct ChildName {
+    node_id: NodeID,
+    name_hash: u64,
+    staged: bool,
+    directory: bool,
+}
+
+/// Validate the staged children of one directory, then recurse into the staged
+/// directories among them.
+///
+/// Sequential, like the freeze walk it precedes: the work is now proportional to
+/// what changed rather than to the tree, so there is nothing to fan out.
+async fn verify_staged_directory(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    node_id: NodeID,
+) -> Result<(), RepositoryError> {
+    let parent = state
+        .node(repository.clone(), node_id)
+        .await
+        .forward::<RepositoryError>("Failed to deserialize repository state")?;
+
+    let mut names: Vec<ChildName> = Vec::new();
+    let mut any_staged = false;
+    let mut children =
+        StateNodeChildrenIterator::from_parent(state.clone(), repository.clone(), node_id, &parent)
+            .await
+            .forward::<RepositoryError>("Invalid node hierarchy in revision state")?;
+
+    while let Some((child_node_id, child_node)) = children
+        .next()
+        .await
+        .forward::<RepositoryError>("Invalid node hierarchy in revision state")?
+    {
+        if child_node.is_staged_delete() || child_node.is_discarded() {
+            continue;
+        }
+        let staged = child_node.is_staged();
+        if staged {
+            any_staged = true;
+            verify_node_name_hash(
+                repository.clone(),
+                state.clone(),
+                child_node_id,
+                child_node.name_hash,
+            )
+            .await?;
+        }
+        names.push(ChildName {
+            node_id: child_node_id,
+            name_hash: child_node.name_hash,
+            staged,
+            directory: child_node.is_directory(),
+        });
+    }
+
+    if any_staged {
+        verify_no_sibling_claims_a_staged_name(repository.clone(), state.clone(), &mut names)
+            .await?;
+    }
+
+    for child in names.iter().filter(|child| child.staged && child.directory) {
+        verify_staged_directory_recurse(repository.clone(), state.clone(), child.node_id).await?;
+    }
+
+    Ok(())
+}
+
+/// Reject a live sibling holding a name this commit publishes.
+///
+/// Sorting the chain's live children by name hash puts every namesake next to its
+/// twin, so one comparison per neighbouring pair settles the directory — against a
+/// scan of the staged names for every sibling, which is the product of the two.
+///
+/// A pair of *settled* namesakes is left alone: it came from a revision that was
+/// validated when it was published, and this commit does not republish it.
+async fn verify_no_sibling_claims_a_staged_name(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    names: &mut [ChildName],
+) -> Result<(), RepositoryError> {
+    names.sort_unstable_by_key(|child| child.name_hash);
+    for pair in names.windows(2) {
+        let [first, second] = pair else { continue };
+        if first.name_hash != second.name_hash || !(first.staged || second.staged) {
+            continue;
+        }
+        let node_path = state
+            .node_path(repository.clone(), second.node_id)
+            .await
+            .unwrap_or_default();
+        return Err(RepositoryError::internal(format!(
+            "Repository verification failed: Node {} shares a name with node {}: {node_path}",
+            second.node_id, first.node_id
+        )));
+    }
+    Ok(())
+}
+
+/// Reject a node whose stored name does not hash to the `name_hash` beside it.
+async fn verify_node_name_hash(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    node_id: NodeID,
+    name_hash: u64,
+) -> Result<(), RepositoryError> {
+    let block = state
+        .block_with_nametable(repository, NodeBlock::index(node_id))
+        .await
+        .forward::<RepositoryError>("Failed to deserialize repository state")?;
+    let node_name = block
+        .node_name_ref(Node::index(node_id))
+        .forward::<RepositoryError>("Failed to get node name")?;
+    let expected = hash::hash_string(&node_name);
+    if name_hash != expected {
+        return Err(RepositoryError::internal(format!(
+            "Repository verification failed: Node {node_id} has invalid name hash for name: {node_name} hash is {expected:x} found {name_hash:x}"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_staged_directory_recurse(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    node_id: NodeID,
+) -> Pin<Box<dyn Future<Output = Result<(), RepositoryError>> + Send>> {
+    Box::pin(verify_staged_directory(repository, state, node_id))
+}
+
 pub async fn verify(
     repository: Arc<RepositoryContext>,
     path: Option<RelativePath>,
@@ -143,8 +304,6 @@ pub async fn verify(
         .send();
 
     lore_debug!("Verifying local immutable store");
-
-    repository.immutable_store().compact_stop().await;
 
     repository
         .immutable_store()

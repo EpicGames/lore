@@ -34,6 +34,12 @@ num_listeners = 10
 transport_bits_per_second = 1_073_741_824  # 1 gbit/s
 transport_rtt = 100  # 100 ms
 handler_timeout_seconds = 50
+# Wait for a per-stream processing permit. Short on purpose: this wait sits on the stream's
+# read loop, so it delays requests queued behind it on that stream.
+permit_timeout_ms = 100
+# Requests in handling per connection, across all streams and including those waiting for a
+# permit. Defaults to stream_message_limit * max_bidi_streams.
+# connection_inflight_limit = 4000
 
 # internal replication endpoint — opt in per environment, mTLS required
 [server.quic_internal]
@@ -47,6 +53,12 @@ num_listeners = 10
 transport_bits_per_second = 10_737_418_240  # 10 gbit/s
 transport_rtt = 100  # 100 ms
 handler_timeout_seconds = 50
+# Wait for a per-stream processing permit. Short on purpose: this wait sits on the stream's
+# read loop, so it delays requests queued behind it on that stream.
+permit_timeout_ms = 100
+# Requests in handling per connection, across all streams and including those waiting for a
+# permit. Defaults to stream_message_limit * max_bidi_streams.
+# connection_inflight_limit = 400_000
 
 [server.grpc]
 enabled = true
@@ -100,13 +112,6 @@ flush_delay_seconds = 10
 
 [mutable_store.local]
 flush_delay_seconds = 10
-
-# =============================================================================
-# Tokio Runtime Configuration
-# =============================================================================
-
-[tokio]
-max_blocking_threads = 512
 
 # =============================================================================
 # Telemetry Configuration

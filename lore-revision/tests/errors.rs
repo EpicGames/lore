@@ -21,13 +21,13 @@ fn address_not_found_display() {
 #[test]
 fn address_not_found_ffi_code() {
     let err = AddressNotFound::from(Address::default());
-    assert_eq!(err.ffi_code(), 2);
+    assert_eq!(err.ffi_code(), 80);
 }
 
 #[test]
 fn payload_not_found_ffi_code() {
     let err = PayloadNotFound::from(Hash::default());
-    assert_eq!(err.ffi_code(), 4);
+    assert_eq!(err.ffi_code(), 81);
 }
 
 #[test]
@@ -43,7 +43,7 @@ fn payload_not_found_display() {
 fn slow_down_display_and_ffi_code() {
     let err = SlowDown;
     assert_eq!(err.to_string(), "Store overloaded, slow down");
-    assert_eq!(err.ffi_code(), 5);
+    assert_eq!(err.ffi_code(), 31);
 }
 
 #[test]
@@ -59,7 +59,7 @@ fn invalid_arguments_ffi_code() {
     let err = InvalidArguments {
         reason: "bad input".to_string(),
     };
-    assert_eq!(err.ffi_code(), 1);
+    assert_eq!(err.ffi_code(), 3);
 }
 
 #[test]
@@ -75,7 +75,7 @@ fn file_not_found_ffi_code() {
     let err = FileNotFound {
         resource: "src/main.rs".to_string(),
     };
-    assert_eq!(err.ffi_code(), 3);
+    assert_eq!(err.ffi_code(), 82);
 }
 
 #[test]

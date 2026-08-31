@@ -154,7 +154,8 @@ pub struct ProtocolErrorInfo {
     pub is_appropriate_for_logging: bool,
 }
 
-#[cfg(test)]
+/// Compiled for `integration_tests` too, so the suite can stand up a real QUIC storage server.
+#[cfg(any(test, feature = "integration_tests"))]
 pub mod tests {
     use std::env;
     use std::path::PathBuf;
@@ -174,6 +175,7 @@ pub mod tests {
     use crate::quic::replication_store_service::server::ReplicationStoreService;
     use crate::quic::storage_service::StorageService;
     use crate::quic::storage_service_v4::StorageServiceV4;
+    use crate::quic::stream_handler::AdmissionLimits;
     use crate::quic::stream_handler::StreamHandler;
 
     pub fn collapse_bytes_with_skip(chunks: &[Bytes], num_to_skip: usize) -> Bytes {
@@ -251,8 +253,12 @@ pub mod tests {
                         Box::new(StreamHandler::new(
                             Arc::new(storage_protocol),
                             context,
-                            100,
-                            None, /* handler timeout */
+                            AdmissionLimits {
+                                process_limit: 100,
+                                inflight_limit: 800,
+                                handler_timeout: None,
+                                permit_timeout: None,
+                            },
                         ))
                     }),
                 );
@@ -272,8 +278,12 @@ pub mod tests {
                         Box::new(StreamHandler::new(
                             Arc::new(v4_service),
                             context,
-                            100,
-                            None, /* handler timeout */
+                            AdmissionLimits {
+                                process_limit: 100,
+                                inflight_limit: 800,
+                                handler_timeout: None,
+                                permit_timeout: None,
+                            },
                         ))
                     }),
                 );
@@ -290,8 +300,12 @@ pub mod tests {
                         Box::new(StreamHandler::new(
                             Arc::new(service),
                             context,
-                            100,
-                            None, /* handler timeout */
+                            AdmissionLimits {
+                                process_limit: 100,
+                                inflight_limit: 800,
+                                handler_timeout: None,
+                                permit_timeout: None,
+                            },
                         ))
                     }),
                 );

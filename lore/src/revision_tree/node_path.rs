@@ -83,7 +83,9 @@ fn emit_node_path_error(id: u64, error_code: LoreErrorCode) {
 /// resolves to an empty path (e.g. an unallocated slot) is rejected with
 /// `error_code = INVALID_ARGUMENTS` rather than returning a bogus empty path. An
 /// invalid or unknown node id likewise completes with
-/// `error_code = INVALID_ARGUMENTS`. The verb materializes no bytes to disk.
+/// `error_code = INVALID_ARGUMENTS` — `State::node_path` does not distinguish an
+/// out-of-range id from a read failure, so both collapse to it, as in
+/// `list_children`. The verb materializes no bytes to disk.
 pub async fn node_path(
     globals: LoreGlobalArgs,
     args: LoreRevisionTreeNodePathArgs,
@@ -98,15 +100,14 @@ async fn node_path_impl(
     callback: LoreEventCallback,
 ) -> i32 {
     let handle = args.handle;
-    let miss_id = args.id;
     revision_tree_call(
         globals,
         callback,
         handle,
         args,
         node_path,
-        move || {
-            emit_node_path_error(miss_id, LoreErrorCode::InvalidArguments);
+        |args: &LoreRevisionTreeNodePathArgs| {
+            emit_node_path_error(args.id, LoreErrorCode::InvalidArguments);
         },
         async move |internal, args: LoreRevisionTreeNodePathArgs| {
             let id = args.id;
@@ -117,11 +118,10 @@ async fn node_path_impl(
                 return Err(invalid("node id is invalid"));
             }
 
-            // An unresolvable id is a bad argument; `State::node_path` does not
-            // distinguish an out-of-range id from a read failure, so both collapse to
-            // `InvalidArguments` (as in `list_children`).
-            let Ok(path) = internal
-                .state
+            let access = internal.access_shared().await;
+            let state = access.state();
+
+            let Ok(path) = state
                 .node_path(internal.repository_context.clone(), node_id)
                 .await
             else {
@@ -129,8 +129,6 @@ async fn node_path_impl(
                 return Err(invalid("node id is unknown"));
             };
 
-            // Every non-root node has a non-empty name, so an empty path means the
-            // id landed on an unallocated slot rather than a real node.
             if node_id != ROOT_NODE && path.is_empty() {
                 emit_node_path_error(id, LoreErrorCode::InvalidArguments);
                 return Err(invalid("node id does not resolve to a named node"));
@@ -139,7 +137,7 @@ async fn node_path_impl(
             LoreEvent::RevisionTreeNodePath(LoreRevisionTreeNodePathEventData {
                 id,
                 repository: internal.repository,
-                revision: internal.state.revision(),
+                revision: state.revision(),
                 path: LoreString::from(path.as_str()),
                 error_code: LoreErrorCode::None,
             })
@@ -236,7 +234,7 @@ mod tests {
         let entry = rt_handle::REGISTRY
             .get(&handle.handle_id)
             .expect("handle registered");
-        (entry.state.clone(), entry.repository_context.clone())
+        (entry.state_for_tests(), entry.repository_context.clone())
     }
 
     /// Add a node under `parent` and return its id. `is_file` chooses a file vs
@@ -413,7 +411,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "an invalid node id must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "an invalid node id must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let data = node_path_event(&events)
             .expect("a failure must still emit the node path terminal carrying the id");
@@ -423,7 +425,7 @@ mod tests {
             LoreErrorCode::InvalidArguments,
             "got {events:?}"
         );
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
 
         release(handle, store_handle_id);
     }
@@ -445,7 +447,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "a node id past any allocated block must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "a node id past any allocated block must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let data = node_path_event(&events)
             .expect("a failure must still emit the node path terminal carrying the id");
@@ -455,18 +461,18 @@ mod tests {
             LoreErrorCode::InvalidArguments,
             "an unknown node id must report InvalidArguments, got {events:?}"
         );
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
 
         release(handle, store_handle_id);
     }
 
+    /// Nothing is added to the handle, so id 1 is an in-range but unallocated
+    /// slot, which would otherwise reconstruct to an empty (root-looking) path.
     #[tokio::test]
     async fn node_path_unallocated_node_returns_invalid_arguments() {
         let (handle, store_handle_id) =
             load_handle("np-unallocated", Partition::from([0x55u8; 16])).await;
 
-        // No nodes added: id 1 is an in-range but unallocated slot, which would
-        // otherwise reconstruct to an empty (root-looking) path.
         let sink: Arc<Mutex<Vec<CapturedEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let status = node_path(
             LoreGlobalArgs::default(),
@@ -479,7 +485,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "an unallocated node id must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "an unallocated node id must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let data = node_path_event(&events)
             .expect("a failure must still emit the node path terminal carrying the id");
@@ -489,7 +499,7 @@ mod tests {
             LoreErrorCode::InvalidArguments,
             "a non-root node resolving to an empty path must report InvalidArguments, got {events:?}"
         );
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
 
         release(handle, store_handle_id);
     }
@@ -509,7 +519,11 @@ mod tests {
         )
         .await;
 
-        assert_eq!(status, 1, "an unknown handle must fail");
+        assert_eq!(
+            status,
+            InvalidArguments::FFI_CODE,
+            "an unknown handle must fail"
+        );
         let events = sink.lock().unwrap().clone();
         let data = node_path_event(&events)
             .expect("a handle miss must still emit the node path terminal carrying the id");
@@ -519,6 +533,6 @@ mod tests {
             LoreErrorCode::InvalidArguments,
             "got {events:?}"
         );
-        assert!(events.contains(&CapturedEvent::Complete(1)));
+        assert!(events.contains(&CapturedEvent::Complete(InvalidArguments::FFI_CODE)));
     }
 }

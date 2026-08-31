@@ -276,7 +276,9 @@ async fn info_path(
         let mut is_deleted = false;
         if local_filtered.local_size == 0 {
             let absolute_path = path.to_absolute_path(repository.require_path()?);
-            let file_metadata = tokio::fs::metadata(absolute_path.as_path()).await;
+            let file_metadata = lore_io::IoDriver::global()
+                .metadata(absolute_path.as_path())
+                .await;
             if let Ok(file_metadata) = file_metadata {
                 if file_metadata.is_file() {
                     local_filtered.local_size = util::fs::file_size(&file_metadata);
@@ -290,7 +292,9 @@ async fn info_path(
                             Some(node.size as usize),
                         )
                         .await
-                        .forward::<InfoError>(&format!("Failed to hash local file: {path}"))?;
+                        .forward_with::<InfoError, _>(|| {
+                            format!("Failed to hash local file: {path}")
+                        })?;
                     }
                 }
             } else {
@@ -350,11 +354,11 @@ async fn info_path(
                 .await
                 .forward::<InfoError>("Deserialize metadata failed")?;
 
-            event::metadata::send(&metadata).forward::<InfoError>("Deserialize metadata failed")?;
+            event::metadata::send(&metadata);
         }
     } else {
         let absolute_path = path.to_absolute_path(repository.require_path()?);
-        let file_metadata = tokio::fs::metadata(absolute_path).await;
+        let file_metadata = lore_io::IoDriver::global().metadata(absolute_path).await;
         if let Ok(file_metadata) = file_metadata
             && (file_metadata.is_file() || file_metadata.is_dir())
         {
@@ -406,7 +410,10 @@ async fn calculate_local_filtered_size_hash(
 
     let absolute_path = relative_path.to_absolute_path(repository.require_path()?);
     if node.is_file() {
-        if let Ok(metadata) = tokio::fs::metadata(absolute_path.as_path()).await {
+        if let Ok(metadata) = lore_io::IoDriver::global()
+            .metadata(absolute_path.as_path())
+            .await
+        {
             let size = util::fs::file_size(&metadata);
             let hash = if size > 0 {
                 immutable::hash_file(
@@ -416,7 +423,9 @@ async fn calculate_local_filtered_size_hash(
                     Some(node.size as usize),
                 )
                 .await
-                .forward::<InfoError>(&format!("Failed to hash local file: {relative_path}"))?
+                .forward_with::<InfoError, _>(|| {
+                    format!("Failed to hash local file: {relative_path}")
+                })?
             } else {
                 Hash::default()
             };
@@ -500,7 +509,10 @@ fn calculate_local_size_recurse(
         }
         let absolute_path = relative_path.to_absolute_path(repository.require_path()?);
 
-        if let Ok(metadata) = tokio::fs::metadata(absolute_path.as_path()).await {
+        if let Ok(metadata) = lore_io::IoDriver::global()
+            .metadata(absolute_path.as_path())
+            .await
+        {
             if repository
                 .filter
                 .emit_excludes(&relative_path, metadata.is_dir(), FilterMode::Full)
@@ -514,9 +526,13 @@ fn calculate_local_size_recurse(
                 let mut local_size = 0;
                 let mut local_size_tasks = JoinSet::new();
                 let mut list = util::fs::list_directory(absolute_path)
-                    .internal(&format!("Failed to list directory: {relative_path}"))?;
+                    .await
+                    .internal_with(|| format!("Failed to list directory: {relative_path}"))?;
 
-                while let Some(item) = list.recv().await {
+                while let Some(entry) = list.next().await {
+                    let Some(item) = util::fs::file_list_item(entry) else {
+                        continue;
+                    };
                     let repository = repository.clone();
                     let relative_path = relative_path.push_into_buf(item.name.as_str()).freeze();
                     lore_spawn!(local_size_tasks, async move {

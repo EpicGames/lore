@@ -5,6 +5,7 @@ mod tests {
     use std::path::PathBuf;
 
     use bytes::Bytes;
+    use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::lore::*;
     use lore_revision::repository::cache_in_memory_stores;
     use lore_revision::repository::create_client_memory_stores;
@@ -61,8 +62,9 @@ mod tests {
                 .expect("Failed to put into immutable store");
 
                 let (got_fragment, got_payload) =
-                    ImmutableStore::get(imm.clone(), repository, address, StoreMatch::MatchFull)
+                    ImmutableStore::get(imm.clone(), repository, address)
                         .await
+                        .and_then(lore_storage::StoreGetData::into_payload)
                         .expect("Failed to get from immutable store");
                 assert_eq!(
                     got_fragment.size_payload, fragment.size_payload,
@@ -162,8 +164,7 @@ mod tests {
                 );
 
                 // Immutable store should not contain the previously stored fragment
-                let get_result =
-                    ImmutableStore::get(new_imm, repository, address, StoreMatch::MatchFull).await;
+                let get_result = ImmutableStore::get(new_imm, repository, address).await;
                 assert!(
                     get_result.is_err(),
                     "New immutable store should not contain data from released store"

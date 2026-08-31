@@ -210,15 +210,15 @@ pub async fn unstage(
 
     let state_current = State::deserialize(repository.clone(), current_revision)
         .await
-        .forward::<UnstageError>(&format!(
-            "Failed to deserialize revision state {current_revision}"
-        ))?;
+        .forward_with::<UnstageError, _>(|| {
+            format!("Failed to deserialize revision state {current_revision}")
+        })?;
 
     let state_staged = State::deserialize(repository.clone(), staged_revision)
         .await
-        .forward::<UnstageError>(&format!(
-            "Failed to deserialize revision state {staged_revision}"
-        ))?;
+        .forward_with::<UnstageError, _>(|| {
+            format!("Failed to deserialize revision state {staged_revision}")
+        })?;
 
     event::LoreEvent::FileUnstageBegin(LoreFileUnstageBeginEventData {
         path_count: paths.len(),
@@ -424,22 +424,13 @@ async fn unstage_path(
         relative_path.as_str(),
     );
 
-    let repository_root = repository.require_path()?.to_path_buf();
-    let full_path = if !relative_path.is_empty() {
-        // Find file system case variation that corresponds to user given path
-        let fs_path = util::fs::filesystem_path(repository_root.as_path(), &relative_path)
-            .await
-            .unwrap_or(relative_path.as_str().to_string());
-        repository_root.join(fs_path.as_str())
+    let relative_path = if relative_path.is_empty() {
+        relative_path
     } else {
-        repository_root.clone()
+        let repository_root = repository.require_path()?;
+        let resolved = util::fs::filesystem_path(repository_root, &relative_path, None).await;
+        resolved.unwrap_or(relative_path)
     };
-
-    let relative_path = RelativePath::new_from_user_path(
-        repository.require_path()?,
-        full_path.to_string_lossy().as_ref(),
-    )
-    .forward::<UnstageError>(&format!("Invalid path {relative_path}"))?;
 
     let force = execution_context().globals().force();
     if !force
@@ -649,8 +640,11 @@ async fn unstage_node(
     {
         Ok(found_node_link) => {
             let mut current_repository = repository.clone();
+            let mut current_state_staged = state_staged.clone();
+            let mut current_state = state_current.clone();
+            let mut found_node_id = found_node_link.node;
 
-            let current_state_staged = if found_node_link.repository != repository.id {
+            if found_node_link.repository != repository.id {
                 lore_debug!(
                     "Transition into linked repository: from {} to {}, node={}",
                     repository.id,
@@ -658,53 +652,45 @@ async fn unstage_node(
                     found_node_link.node
                 );
 
-                current_repository =
-                    Arc::new(repository.to_link_context(found_node_link.repository).await);
+                // Resolve the chain so every crossed link is tracked and the
+                // mutated node lives in the shared innermost state.
+                let chain = crate::link::resolve_link_chain(
+                    repository.clone(),
+                    state_staged.clone(),
+                    state_current.clone(),
+                    node_path.clone(),
+                    crate::lore::BranchId::default(),
+                )
+                .await
+                .forward::<UnstageError>("Failed to resolve link chain")?;
 
-                State::deserialize(current_repository.clone(), found_node_link.revision)
-                    .await
-                    .forward::<UnstageError>(&format!(
-                        "Failed to deserialize revision state {}",
-                        found_node_link.revision
-                    ))?
-            } else {
-                state_staged.clone()
-            };
+                let innermost_state = chain.innermost_state.clone();
+                chain
+                    .record_tracker_contexts(&link_tracker, &innermost_state, node_path.as_str())
+                    .await;
 
-            let current_state = if found_node_link.repository != repository.id {
-                State::deserialize(current_repository.clone(), found_node_link.revision)
-                    .await
-                    .forward::<UnstageError>(&format!(
-                        "Failed to deserialize revision state {}",
-                        found_node_link.revision
-                    ))?
-            } else {
-                state_current.clone()
-            };
+                current_repository = chain.innermost_repository.clone();
+                current_state_staged = chain.innermost_state.clone();
+                current_state = State::deserialize(
+                    current_repository.clone(),
+                    chain.levels.last().map_or_else(
+                        || current_state_staged.revision(),
+                        |level| level.old_signature,
+                    ),
+                )
+                .await
+                .forward::<UnstageError>("Failed to deserialize revision state")?;
 
-            if found_node_link.repository != repository.id {
-                // Find the parent repository's link node
-                let parent_link_node_id = state_staged
-                    .find_link_parent_node(
-                        repository.clone(),
-                        node_path.as_str(),
-                        found_node_link.repository,
+                found_node_id = current_state_staged
+                    .find_relative_node_link(
+                        current_repository.clone(),
+                        chain.innermost_base_node,
+                        chain.remainder_path.as_str(),
                     )
                     .await
-                    .forward::<UnstageError>("Failed to find subnode")?;
-
-                let link_context = crate::link::LinkContext {
-                    link_repository_id: found_node_link.repository,
-                    link_node_id: parent_link_node_id,
-                    parent_repository_id: repository.id,
-                    link_path: node_path.clone().into_buf(),
-                    link_state: current_state_staged.clone(),
-                };
-
-                link_tracker.add_link(link_context);
+                    .forward::<UnstageError>("Failed to find node in linked repository")?
+                    .node;
             }
-
-            let found_node_id = found_node_link.node;
 
             // Get the actual path of the node in the current repository context
             let resolved_node_path = if found_node_link.repository != repository.id {
@@ -769,6 +755,9 @@ async fn unstage_node(
                         }
                     }
 
+                    // The `or_default` guard dies at the `;`, so the shard lock is
+                    // not held across the await below.
+                    #[allow(clippy::disallowed_methods)]
                     discard
                         .entry(current_repository.id)
                         .or_default()
@@ -887,7 +876,9 @@ async fn unstage_node(
                 if node.is_dirty() && node.is_file() {
                     let current_repository_root = current_repository.require_path()?;
                     let absolute_path = current_repository_root.join(resolved_node_path.as_str());
-                    if let Ok(file_metadata) = tokio::fs::metadata(&absolute_path).await {
+                    if let Ok(file_metadata) =
+                        lore_io::IoDriver::global().metadata(&absolute_path).await
+                    {
                         let node_path_rel = crate::util::path::RelativePath::new_from_user_path(
                             current_repository_root,
                             absolute_path.to_string_lossy().as_ref(),
@@ -895,7 +886,7 @@ async fn unstage_node(
                         .forward::<UnstageError>("Invalid path")?;
                         let (file_mtime, file_size) =
                             crate::util::fs::file_mtime_and_size(&file_metadata);
-                        let (file_modified, _) = crate::state::is_file_modified(
+                        let file_modified = crate::state::file_modification(
                             current_repository.clone(),
                             &current_node,
                             file_mtime,
@@ -904,7 +895,8 @@ async fn unstage_node(
                             true, /* Force hash check */
                         )
                         .await
-                        .forward::<UnstageError>("Failed to check if file was modified")?;
+                        .forward::<UnstageError>("Failed to check if file was modified")?
+                        .is_modified();
 
                         if !file_modified {
                             // File matches current revision — clear Dirty
@@ -1144,57 +1136,16 @@ async fn process_link_unstage_updates(
     state_staged: Arc<State>,
     link_tracker: Arc<LinkTracker>,
 ) -> Result<(), UnstageError> {
-    if !link_tracker.has_modifications() {
-        lore_debug!("No link modifications detected, skipping link unstage updates");
-        return Ok(());
-    }
-
-    let unstage_links = link_tracker.get_links_needing_rehash();
-
-    for link_context in unstage_links.iter() {
-        let current_link_ref = state_current
-            .link_find(
-                repository.clone(),
-                link_context.link_repository_id,
-                link_context.link_node_id,
-            )
-            .await
-            .forward::<UnstageError>("Failed to unstage link nodes")?;
-
-        let staged_link_ref = state_staged
-            .link_find(
-                repository.clone(),
-                link_context.link_repository_id,
-                link_context.link_node_id,
-            )
-            .await
-            .forward::<UnstageError>("Failed to unstage link nodes")?;
-
-        let new_signature = link::reserialize_tracked_link(
-            &state_staged,
-            repository.clone(),
-            token,
-            link_context,
-            current_link_ref.signature,
-            staged_link_ref.branch,
-        )
-        .await
-        .forward::<UnstageError>("Failed to unstage link nodes")?;
-
-        lore_debug!(
-            "Updating link node hash: node={}, old_hash={}, new_hash={}",
-            link_context.link_node_id,
-            staged_link_ref.signature,
-            new_signature
-        );
-    }
-
-    lore_debug!(
-        "All {} link unstage updates completed successfully",
-        unstage_links.len()
-    );
-
-    Ok(())
+    link::drain_link_tracker(
+        repository,
+        token,
+        state_current,
+        state_staged,
+        &link_tracker,
+        false,
+    )
+    .await
+    .forward::<UnstageError>("Failed to unstage link nodes")
 }
 
 /// Demote a staged-add subtree to dirty in place: clear the staged flags on every

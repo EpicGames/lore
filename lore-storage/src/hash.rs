@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use core::mem::MaybeUninit;
+
 use crate::FragmentFlags;
 use crate::compress::FRAGMENT_SIZE_THRESHOLD;
 use crate::compress::FragmentError;
@@ -103,10 +105,29 @@ pub fn hash_fragment(fragment: Fragment, data: &[u8]) -> Result<Hash, FragmentEr
 /// 64-bit string hash type, used for node name lookups.
 pub type StringHash = u64;
 
+/// Longest name [`hash_string`] folds without allocating, one cache line wide.
+const HASH_STRING_STACK_BYTES: usize = 64;
+
 /// Compute the 64-bit xxh3 hash of the lowercase form of a string.
+///
+/// Names up to [`HASH_STRING_STACK_BYTES`] fold in one branchless pass over a
+/// stack buffer; the high bits it accumulates say whether the name is ASCII and
+/// the fold usable. Testing per byte instead would stop the pass vectorizing.
 pub fn hash_string(string: &str) -> StringHash {
-    let lowercase_string = string.to_lowercase();
-    xxhash_rust::xxh3::xxh3_64(lowercase_string.as_bytes())
+    let bytes = string.as_bytes();
+    if bytes.len() <= HASH_STRING_STACK_BYTES {
+        let mut buffer = [const { MaybeUninit::<u8>::uninit() }; HASH_STRING_STACK_BYTES];
+        let mut high_bits = 0u8;
+        for (target, &source) in buffer.iter_mut().zip(bytes) {
+            high_bits |= source;
+            target.write(source.to_ascii_lowercase());
+        }
+        if high_bits & 0x80 == 0 {
+            // SAFETY: the loop above wrote every byte of `buffer[..bytes.len()]`.
+            return xxhash_rust::xxh3::xxh3_64(unsafe { buffer[..bytes.len()].assume_init_ref() });
+        }
+    }
+    xxhash_rust::xxh3::xxh3_64(string.to_lowercase().as_bytes())
 }
 
 /// Zero-alloc xxh3 of raw string-like bytes (same digest family as [`hash_string`] without the lowercasing, distinct from the blake3 [`hash_slice`]).
@@ -117,6 +138,114 @@ pub fn hash_string_bytes(bytes: &[u8]) -> StringHash {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Unicode fold both paths of [`hash_string`] must agree with. Node
+    /// names store the digest and lookups match on it, so it cannot move.
+    fn hash_string_reference(string: &str) -> StringHash {
+        xxhash_rust::xxh3::xxh3_64(string.to_lowercase().as_bytes())
+    }
+
+    #[test]
+    fn hash_string_matches_the_unicode_fold() {
+        let long_ascii = "a-name-that-does-not-fit-the-stack-buffer-".repeat(10);
+        let long_unicode = "\u{00e4}-name-that-does-not-fit-the-stack-buffer-".repeat(10);
+        for string in [
+            "",
+            "a",
+            "A",
+            "rock.mesh",
+            "Rock.mesh",
+            "ROCK.MESH",
+            "MiXeD.CaSe-123_x",
+            "0123456789 !@#$%^&*()",
+            // Above ASCII: length-changing and context-dependent folds.
+            "\u{00c4}pfel",
+            "Stra\u{00df}e",
+            "\u{0130}stanbul",
+            "\u{03a3}\u{03bf}\u{03c6}\u{03bf}\u{03c2}",
+            // A capital sigma ending a word, the fold that depends on position.
+            "\u{039f}\u{0394}\u{039f}\u{03a3}",
+            "\u{4f60}\u{597d}",
+            &long_ascii,
+            &long_unicode,
+        ] {
+            assert_eq!(
+                hash_string(string),
+                hash_string_reference(string),
+                "{string:?} does not match the Unicode fold"
+            );
+        }
+    }
+
+    /// Exhaustive over one- and two-character ASCII, plus a sample of the code
+    /// points above it.
+    #[test]
+    fn hash_string_matches_the_unicode_fold_across_ascii() {
+        for first in 0u8..128 {
+            let single = String::from_utf8(vec![first]).expect("ascii is utf-8");
+            assert_eq!(
+                hash_string(&single),
+                hash_string_reference(&single),
+                "{single:?} does not match the Unicode fold"
+            );
+            for second in 0u8..128 {
+                let pair = String::from_utf8(vec![first, second]).expect("ascii is utf-8");
+                assert_eq!(
+                    hash_string(&pair),
+                    hash_string_reference(&pair),
+                    "{pair:?} does not match the Unicode fold"
+                );
+            }
+        }
+
+        for code in (0u32..0x3000).step_by(7) {
+            let Some(character) = char::from_u32(code) else {
+                continue;
+            };
+            let alone = character.to_string();
+            let after_ascii = format!("A{character}");
+            for string in [&alone, &after_ascii] {
+                assert_eq!(
+                    hash_string(string),
+                    hash_string_reference(string),
+                    "{string:?} does not match the Unicode fold"
+                );
+            }
+        }
+    }
+
+    /// Pins the digests themselves. Agreement between the two paths says
+    /// nothing if xxh3 moves underneath both, which would silently void every
+    /// stored name lookup.
+    #[test]
+    fn hash_string_digests_are_the_ones_already_stored() {
+        for (string, digest) in [
+            ("", 0x2d06_8005_38d3_94c2u64),
+            ("a", 0xe6c6_32b6_1e96_4e1f),
+            ("Rock.mesh", 0x1e82_9b1c_9417_add2),
+            ("ROCK.MESH", 0x1e82_9b1c_9417_add2),
+            ("MiXeD.CaSe-123_x", 0xd03b_4303_99ba_f75a),
+            ("Stra\u{00df}e", 0x862b_1b43_f409_32bc),
+            ("\u{0130}stanbul", 0xf1c9_09f6_e5c8_2711),
+            ("\u{4f60}\u{597d}", 0xad90_5e65_cd72_90f0),
+        ] {
+            assert_eq!(hash_string(string), digest, "{string:?} moved");
+        }
+    }
+
+    /// The paths meet at the buffer boundary and on either side of it.
+    #[test]
+    fn hash_string_agrees_across_the_stack_buffer_boundary() {
+        for length in [
+            HASH_STRING_STACK_BYTES - 1,
+            HASH_STRING_STACK_BYTES,
+            HASH_STRING_STACK_BYTES + 1,
+        ] {
+            let string = "Aa".repeat(length).split_at(length).0.to_string();
+            assert_eq!(string.len(), length);
+            assert_eq!(hash_string(&string), hash_string_reference(&string));
+        }
+    }
 
     #[test]
     fn hash_fragment_uncompressed_ok() {

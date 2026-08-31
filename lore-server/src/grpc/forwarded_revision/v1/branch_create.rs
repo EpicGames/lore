@@ -79,6 +79,7 @@ mod test {
             repository_id: repository,
             user_id: "alice".into(),
             correlation_id: String::new(),
+            authorization: None,
         }
         .to_forwarded_request(BranchCreateRequest {
             id: branch_id.into(),

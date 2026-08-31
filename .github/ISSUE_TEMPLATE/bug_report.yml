@@ -1,0 +1,112 @@
+name: Bug report
+description: Report a defect in Lore
+labels: [bug, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please search [existing issues](https://github.com/EpicGames/lore/issues) first.
+        If the error came from a Lore server you don't operate, report it to that
+        server's operator; this tracker covers the Lore client and self-hosted server.
+  - type: input
+    id: version
+    attributes:
+      label: Lore version
+      description: Paste the output of `lore --version`.
+      placeholder: lore 0.8.6+3201
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: Installation method
+      description: >
+        If you built from source, include your Rust toolchain (`rustc --version`)
+        and any custom `RUSTFLAGS` in the reproduction steps -- a custom `RUSTFLAGS`
+        overrides the flags in `.cargo/config.toml` and is a known source of build failures.
+      options:
+        - Prebuilt release binary
+        - Built from source
+        - MSI installer (Windows)
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system / architecture
+      description: Where did you hit the bug?
+      options:
+        - Linux -- x86_64
+        - Linux -- aarch64
+        - macOS -- aarch64
+        - Windows -- x86_64
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: >
+        Exact commands and repository state needed to trigger the bug. Helpful
+        detail: does it reproduce on a clean repo and on the latest release? For
+        sync/push/clone problems, note your network environment (VPN, proxy,
+        firewall). On Linux aarch64, include your CPU model (`lscpu`) -- prebuilt
+        aarch64 binaries target AWS Graviton.
+      placeholder: |
+        1. lore clone <url>
+        2. lore stage .
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs actual behavior
+      description: What did you expect to happen, and what happened instead?
+    validations:
+      required: false
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: >
+        Which side do you believe is at fault? If you pick Server or
+        Both / unsure, please also fill in Server context below.
+      options:
+        - Client (CLI)
+        - Server
+        - Both / unsure
+    validations:
+      required: false
+  - type: textarea
+    id: server
+    attributes:
+      label: Server context
+      description: >
+        Server bugs only -- server version, how it's deployed (Docker, compose,
+        bare metal), the storage backend (local disk, S3, other), and your
+        `local.toml` server config. Redact certificate paths, credentials, and
+        anything else sensitive before posting.
+    validations:
+      required: false
+  - type: input
+    id: regression
+    attributes:
+      label: Regression?
+      description: Did this work in an earlier Lore version? If so, which one?
+      placeholder: worked in 0.7.x
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or output
+      description: >
+        Rerun the failing command with `--debug`; set `RUST_BACKTRACE=1` for
+        crashes. Log files live in the directory printed by `lore logfile info`.
+        Logs can contain repository paths and commit messages -- redact anything
+        sensitive before posting. This is rendered as code automatically.
+      render: shell
+    validations:
+      required: false

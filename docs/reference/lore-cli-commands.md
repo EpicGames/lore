@@ -4,11 +4,13 @@ The `lore` command-line client drives every local and remote Lore operation: cre
 
 This page documents the command surface only. For a guided first run, see the [Quickstart](../tutorials/quickstart.md); to install the client, see [Install the Lore CLI](../how-to/install-lore-cli.md).
 
-This page is generated from `lore --markdown-help` (CLI `0.8.2-nightly+31`). Everything below the marker is generated — change the CLI, not this section. To regenerate in place (preserving this header), run from the repository root:
+This page is generated from `lore --markdown-help` (CLI `0.9.1-nightly+803`). Everything below the marker is generated — change the CLI, not this section. To regenerate in place (preserving this header), run from the repository root:
 
 ```bash
-{ sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-commands.md; lore --markdown-help | tail -n +4; } > docs/reference/.cli.tmp && mv docs/reference/.cli.tmp docs/reference/lore-cli-commands.md
+printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-commands.md; lore --markdown-help | tail -n +4; } )" > docs/reference/.cli.tmp && mv docs/reference/.cli.tmp docs/reference/lore-cli-commands.md
 ```
+
+`clap-markdown` ends its output with a blank line, which the quoted expansion strips. A subcommand carrying no help text renders as a trailing separator, which the whitespace hook rejects — write the help text rather than trimming the line.
 
 <!-- BEGIN generated: lore --markdown-help -->
 
@@ -137,6 +139,7 @@ This page is generated from `lore --markdown-help` (CLI `0.8.2-nightly+31`). Eve
 * [`lore link remove`↴](#lore-link-remove)
 * [`lore link update`↴](#lore-link-update)
 * [`lore link list`↴](#lore-link-list)
+* [`lore link info`↴](#lore-link-info)
 * [`lore status`↴](#lore-status)
 * [`lore clone`↴](#lore-clone)
 * [`lore stage`↴](#lore-stage)
@@ -213,15 +216,22 @@ This page is generated from `lore --markdown-help` (CLI `0.8.2-nightly+31`). Eve
 * `--remote` — Use remote data
 * `--local` — Use local data
 * `--identity <IDENTITY>` — Use given identity
+* `--identity-token <token>` — Use given authentication token instead of one from the secure store. Acts as the identity the token was issued to
+* `--access-token <token>` — Use given authorization token instead of exchanging one with the authentication service
 * `--max-connections <MAX_CONNECTIONS>` — Set maximum number of parallel connections
 * `--file-count-limit <count>` — Set maximum number of parallel files opened
 * `--file-size-limit <size>` — Set maximum total size in bytes of parallel files opened
 * `--compress-limit <count>` — Set maximum number of parallel compress operations
 * `--search-limit <SEARCH_LIMIT>` — Set maximum number of revisions to search when matching or finding revisions
 * `--search-nearest` — Set to search for nearest match when matching revisions
-* `--gc` — Set to run automatic garbage collection on local store in background
+* `--no-gc` — Prevent automatic incremental garbage collection for this command; it otherwise runs in the background on writes. `lore repository gc` always runs a full pass regardless
 * `--sync-data` — Force sync data to storage media during flush
+* `--cache` — Cache fragment payloads fetched from remote in the local store
 * `--non-interactive` — Disable interactive prompts (e.g., per-link commit messages)
+* `--stats <level>` — Report what the operation cost: `--stats` for totals, `--stats=2` to add per-fragment detail
+
+  Default value: `0`
+* `--event-interval <milliseconds>` — How often to emit progress events, in milliseconds
 
 
 
@@ -341,7 +351,6 @@ Clone a remote repository into the given path
 * `--bare` — Clone without files, only fetch latest revision tree
 * `--virtual` — Clone virtually using split-write filesystem
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into place
-* `--direct-file-io` — Use direct file I/O instead of memory mapping files
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
 * `--prefetch <file>` — File containing list of files to prefetch
@@ -882,11 +891,18 @@ Diff two branches using the common ancestor base revision Will calculate the set
 
 Archive an existing branch
 
-**Usage:** `lore branch archive <branch>`
+**Usage:** `lore branch archive [OPTIONS] <branch>`
 
 ###### **Arguments:**
 
 * `<branch>` — Name of the branch to archive
+
+###### **Options:**
+
+* `--include-layers` — Also archive the branch in every configured layer
+* `--layer <path>` — Also archive the branch in the layer at the given mount path
+* `--include-links` — Also archive the branch in every configured link
+* `--link <path>` — Also archive the branch in the link at the given mount path
 
 
 
@@ -938,11 +954,13 @@ Branch latest related commands
 
 ###### **Subcommands:**
 
-* `list` —
+* `list` — List previous latest pointers of a branch
 
 
 
 ## `lore branch latest list`
+
+List previous latest pointers of a branch
 
 **Usage:** `lore branch latest list [OPTIONS] [LIMIT]`
 
@@ -1091,7 +1109,6 @@ Commit the staged state
 
 ###### **Options:**
 
-* `--stats` — Print stats
 * `--link <LINK>` — Commit only changes in this linked repository (mount path relative to repo root)
 * `--link-message <PATH>` — Per-link commit message. Takes two values: <path> <message>. Can be specified multiple times
 * `--layer <LAYER>` — Commit only changes in this layer (mount path relative to repo root)
@@ -1103,15 +1120,11 @@ Commit the staged state
 
 Amend the latest commit's message
 
-**Usage:** `lore revision amend [OPTIONS] <MESSAGE>`
+**Usage:** `lore revision amend <MESSAGE>`
 
 ###### **Arguments:**
 
 * `<MESSAGE>` — Commit message
-
-###### **Options:**
-
-* `--stats` — Print stats
 
 
 
@@ -2123,6 +2136,7 @@ Link commands
 * `remove` — Remove the link at the given point in the repository
 * `update` — Update the link to a new pin
 * `list` — List all links in the repository
+* `info` — Show detailed information about the link at the given path
 
 
 
@@ -2185,6 +2199,18 @@ List all links in the repository
 
 
 
+## `lore link info`
+
+Show detailed information about the link at the given path
+
+**Usage:** `lore link info <link_path>`
+
+###### **Arguments:**
+
+* `<link_path>` — Path in the repository of the link to describe
+
+
+
 ## `lore status`
 
 Show current repository status.
@@ -2235,7 +2261,6 @@ Clone a remote repository into the given path
 * `--bare` — Clone without files, only fetch latest revision tree
 * `--virtual` — Clone virtually using split-write filesystem
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into place
-* `--direct-file-io` — Use direct file I/O instead of memory mapping files
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
 * `--prefetch <file>` — File containing list of files to prefetch
@@ -2462,7 +2487,6 @@ Commit the staged revision
 
 ###### **Options:**
 
-* `--stats` — Print stats
 * `--link <LINK>` — Commit only changes in this linked repository (mount path relative to repo root)
 * `--link-message <PATH>` — Per-link commit message. Takes two values: <path> <message>. Can be specified multiple times
 * `--layer <LAYER>` — Commit only changes in this layer (mount path relative to repo root)
@@ -2682,13 +2706,15 @@ Manage the shared store
 
 ###### **Subcommands:**
 
-* `create` —
-* `info` —
-* `set-use-automatically` —
+* `create` — Create a shared store backed by a remote
+* `info` — Show the shared store this repository uses
+* `set-use-automatically` — Set whether new clones use a shared store without being asked to
 
 
 
 ## `lore shared-store create`
+
+Create a shared store backed by a remote
 
 **Usage:** `lore shared-store create [OPTIONS] <remote-url>`
 
@@ -2708,11 +2734,15 @@ Manage the shared store
 
 ## `lore shared-store info`
 
+Show the shared store this repository uses
+
 **Usage:** `lore shared-store info`
 
 
 
 ## `lore shared-store set-use-automatically`
+
+Set whether new clones use a shared store without being asked to
 
 **Usage:** `lore shared-store set-use-automatically <enabled>`
 

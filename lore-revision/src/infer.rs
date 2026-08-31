@@ -3,27 +3,16 @@
 use std::path::Path;
 
 use tokio::io;
-use tokio::io::AsyncBufReadExt;
-use tokio::io::AsyncReadExt;
-use tokio::io::AsyncSeekExt;
 
 use crate::util::encoding::decode_text_for_display;
 use crate::util::encoding::is_utf16_bom;
 
-async fn infer_into_buffer(path: &Path, max: u64) -> io::Result<Vec<u8>> {
-    let mut file = tokio::fs::File::open(path).await?;
-
-    let metadata = file.metadata().await?;
-
-    let to_read: usize = std::cmp::min(max, metadata.len()) as usize;
-    if to_read == 0 {
-        return Ok(vec![]);
-    }
-
-    let mut buffer = vec![0u8; to_read];
-    file.read_exact(&mut buffer).await?;
-
-    Ok(buffer)
+async fn infer_into_buffer(path: &Path, max: u64) -> io::Result<bytes::Bytes> {
+    // One backend dispatch: open + stat + first `max` bytes.
+    let (_file, _metadata, head) = lore_io::IoDriver::global()
+        .open_read_head(path, &lore_io::OpenOptions::new().read(true), max as usize)
+        .await?;
+    Ok(head)
 }
 
 pub fn infer_type_by_slice(buffer: &[u8]) -> Option<&str> {
@@ -134,6 +123,9 @@ pub fn infer_is_conflicted_by_str(text: &str) -> bool {
     false
 }
 
+/// Window size for the streaming line scan in [`infer_is_conflicted_by_path`].
+const SCAN_WINDOW: usize = 64 * 1024;
+
 /// Check if conflict markers are present in file.
 ///
 /// # Arguments
@@ -153,30 +145,73 @@ pub fn infer_is_conflicted_by_str(text: &str) -> bool {
 /// UTF-16 BOM-prefixed files — which `BufReader::lines` cannot decode — are
 /// read whole and routed through [`decode_text_for_display`].
 pub async fn infer_is_conflicted_by_path(path: &Path) -> Result<bool, std::io::Error> {
-    if tokio::fs::metadata(path).await.is_err() {
-        return Ok(false);
+    /// Mirrors the previous line reader: a line that is not valid UTF-8
+    /// ends the scan as not-conflicted.
+    enum LineScan {
+        Conflicted,
+        Clean,
+        NotText,
+    }
+    fn scan_line(line: &[u8]) -> LineScan {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        match std::str::from_utf8(line) {
+            Ok(text) if infer_is_conflicted_by_line(text) => LineScan::Conflicted,
+            Ok(_) => LineScan::Clean,
+            Err(_) => LineScan::NotText,
+        }
     }
 
-    let mut file = tokio::fs::File::open(path).await?;
+    let (file, metadata, head) = match lore_io::IoDriver::global()
+        .open_read_head(path, &lore_io::OpenOptions::new().read(true), SCAN_WINDOW)
+        .await
+    {
+        Ok(parts) => parts,
+        Err(_) => return Ok(false),
+    };
+    let file_size = metadata.len();
 
-    let mut bom = [0u8; 2];
-    let bom_len = file.read(&mut bom).await?;
-    if bom_len == 2 && is_utf16_bom(&bom) {
-        let mut bytes = bom.to_vec();
-        file.read_to_end(&mut bytes).await?;
+    if head.len() >= 2 && is_utf16_bom(&head[..2]) {
+        let bytes = if head.len() as u64 == file_size {
+            head
+        } else {
+            file.read_exact_at(file_size as usize, 0).await?
+        };
         return Ok(infer_is_conflicted_by_str(&decode_text_for_display(&bytes)));
     }
 
-    file.seek(std::io::SeekFrom::Start(0)).await?;
-    let reader = tokio::io::BufReader::new(file);
-
-    let mut lines = reader.lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        if infer_is_conflicted_by_line(line.as_str()) {
-            return Ok(true);
+    // Stream fixed windows, scanning complete lines and carrying the
+    // trailing partial line across window boundaries.
+    let mut carry: Vec<u8> = Vec::new();
+    let mut offset = 0u64;
+    let mut window = head;
+    loop {
+        let mut start = 0usize;
+        while let Some(newline) = window[start..].iter().position(|&byte| byte == b'\n') {
+            let end = start + newline;
+            let result = if carry.is_empty() {
+                scan_line(&window[start..end])
+            } else {
+                carry.extend_from_slice(&window[start..end]);
+                let result = scan_line(&carry);
+                carry.clear();
+                result
+            };
+            match result {
+                LineScan::Conflicted => return Ok(true),
+                LineScan::NotText => return Ok(false),
+                LineScan::Clean => {}
+            }
+            start = end + 1;
         }
+        carry.extend_from_slice(&window[start..]);
+        offset += window.len() as u64;
+        if offset >= file_size {
+            break;
+        }
+        let length = std::cmp::min(SCAN_WINDOW as u64, file_size - offset) as usize;
+        window = file.read_exact_at(length, offset).await?;
     }
-    Ok(false)
+    Ok(!carry.is_empty() && matches!(scan_line(&carry), LineScan::Conflicted))
 }
 
 /// Checks if a file contains diffable data.
@@ -187,13 +222,26 @@ pub async fn infer_is_conflicted_by_path(path: &Path) -> Result<bool, std::io::E
 pub async fn infer_is_diffable_by_path(path: &Path) -> io::Result<bool> {
     // Inspect the first 4 KiB of the file at most.
     let buffer = infer_into_buffer(path, 4 * 1024).await?;
-    Ok(infer_is_diffable_by_slice(buffer.as_slice()))
+    Ok(infer_is_diffable_by_slice(buffer.as_ref()))
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use super::SCAN_WINDOW;
+    use super::infer_is_conflicted_by_path;
     use super::infer_is_diffable_by_slice;
     use super::infer_is_utf8_by_slice;
+
+    /// A file holding `contents`, alive for as long as the returned directory is.
+    #[allow(clippy::disallowed_methods)] // A test fixture in its own temporary directory.
+    fn file_holding(contents: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("scanned");
+        std::fs::write(&path, contents).expect("write scanned file");
+        (dir, path)
+    }
 
     #[test]
     fn is_utf8() {
@@ -240,5 +288,89 @@ mod tests {
             !infer_is_diffable_by_slice(&bytes),
             "UTF-16 BE BOM must be non-diffable so merge falls into the binary-conflict path that preserves bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn marker_within_one_window_is_conflicted() {
+        let (_dir, path) = file_holding(b"clean line\n<<<<<<< ours\nmore\n");
+        assert!(infer_is_conflicted_by_path(&path).await.unwrap());
+    }
+
+    /// The marker's own bytes straddle the window boundary: three of them end the first window
+    /// and the rest open the second, so only the carry joining them sees a marker at all.
+    #[tokio::test]
+    async fn marker_split_across_a_window_boundary_is_conflicted() {
+        let mut contents = vec![b'a'; SCAN_WINDOW - 4];
+        contents.push(b'\n');
+        contents.extend_from_slice(b"<<<<<<< ours\n");
+
+        let (_dir, path) = file_holding(&contents);
+        assert!(infer_is_conflicted_by_path(&path).await.unwrap());
+    }
+
+    /// A marker line ending `\r\n` with the carriage return the last byte of one window and the
+    /// newline the first of the next. The line is only stripped after the carry joins them, so
+    /// this is what says the strip happens on the joined line rather than per window.
+    #[tokio::test]
+    async fn crlf_split_across_a_window_boundary_is_conflicted() {
+        let marker = b"<<<<<<< ours";
+        let mut contents = marker.to_vec();
+        contents.extend(std::iter::repeat_n(b' ', SCAN_WINDOW - 1 - marker.len()));
+        contents.extend_from_slice(b"\r\n");
+        assert_eq!(contents[SCAN_WINDOW - 1], b'\r');
+        assert_eq!(contents[SCAN_WINDOW], b'\n');
+
+        let (_dir, path) = file_holding(&contents);
+        assert!(infer_is_conflicted_by_path(&path).await.unwrap());
+    }
+
+    /// The last line of a file with no trailing newline never reaches the in-window scan, only
+    /// the carry left over once the windows run out.
+    #[tokio::test]
+    async fn marker_on_an_unterminated_final_line_is_conflicted() {
+        let (_dir, path) = file_holding(b"clean line\n>>>>>>> theirs");
+        assert!(infer_is_conflicted_by_path(&path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn unterminated_final_line_without_a_marker_is_clean() {
+        let (_dir, path) = file_holding(b"clean line\nalso clean");
+        assert!(!infer_is_conflicted_by_path(&path).await.unwrap());
+    }
+
+    /// A UTF-16 file is read whole rather than scanned in windows, so one larger than a window
+    /// exercises the second read the head does not cover.
+    #[tokio::test]
+    async fn utf16_larger_than_one_window_is_conflicted() {
+        let text = format!("{}\n<<<<<<< ours\n", "a".repeat(SCAN_WINDOW));
+        let mut contents = vec![0xFF, 0xFE];
+        contents.extend(text.encode_utf16().flat_map(u16::to_le_bytes));
+        assert!(contents.len() > SCAN_WINDOW);
+
+        let (_dir, path) = file_holding(&contents);
+        assert!(infer_is_conflicted_by_path(&path).await.unwrap());
+    }
+
+    /// An empty file has no window to scan and no carry to check, and must end rather than wait
+    /// for a read that never comes.
+    #[tokio::test]
+    async fn empty_file_is_clean() {
+        let (_dir, path) = file_holding(b"");
+        assert!(!infer_is_conflicted_by_path(&path).await.unwrap());
+    }
+
+    /// A line that is not text ends the scan, so a marker after one is never reached. This is
+    /// the line reader's behaviour that the windowed scan replaced, kept deliberately.
+    #[tokio::test]
+    async fn a_line_that_is_not_utf8_ends_the_scan() {
+        let (_dir, path) = file_holding(b"clean line\n\xC3\x28 broken\n<<<<<<< ours\n");
+        assert!(!infer_is_conflicted_by_path(&path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_missing_file_is_clean() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("absent");
+        assert!(!infer_is_conflicted_by_path(&path).await.unwrap());
     }
 }

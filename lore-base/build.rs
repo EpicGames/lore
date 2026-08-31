@@ -23,6 +23,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .static_crt(true)
         .force_frame_pointer(false)
         .opt_level(3)
+        .define("RPMALLOC_FIRST_CLASS_HEAPS", "1")
+        // rpmalloc is used as an explicit allocator, not a process-wide malloc override.
+        .define("ENABLE_OVERRIDE", "0")
         .includes(Some(native_dir.join("thirdparty")));
 
     if platform == "linux" && arch == "aarch64" {

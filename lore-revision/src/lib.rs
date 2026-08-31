@@ -9,7 +9,6 @@ pub mod commit;
 pub mod dependency;
 pub mod diff;
 pub mod environment;
-pub mod error;
 pub mod errors;
 pub mod event;
 pub mod file;
@@ -54,10 +53,17 @@ pub mod util;
 
 #[cfg(all(target_family = "windows", feature = "vfs"))]
 pub mod projfs;
-//#[cfg(all(target_family = "windows", feature = "vfs"))]
-//pub mod swfs;
 
 pub use lore_base::lore_drain_tasks;
 pub use lore_base::lore_limit_drain_tasks;
 pub use lore_base::lore_spawn_blocking;
 pub use lore_base::lore_spawn_blocking_nocontext;
+
+/// Ceiling on concurrently-spawned tasks in a filesystem or state tree walk:
+/// the diff, stage, realize and verify-filesystem walks.
+///
+/// These tasks wait on the `lore-io` syscall pool rather than holding a core, so
+/// the bound keeps that pool fed while capping live per-task state. Overflow
+/// recurses inline rather than blocking on a permit, so any value >= 1 is
+/// correct.
+pub const MAX_CONCURRENT_TREE_TASKS: usize = 1000;

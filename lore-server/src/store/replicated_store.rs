@@ -16,9 +16,9 @@ use lore_base::types::Partition;
 use lore_revision::runtime::execution_context;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
-use lore_storage::StoreMatch;
+use lore_storage::StoreGetData;
+use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
-use lore_storage::StoreQueryResult;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::observe::Observe;
 use lore_transport::ProtocolError;
@@ -33,14 +33,14 @@ use tracing::error;
 use tracing::instrument;
 use tracing::warn;
 
-use crate::protocol::replication_store::exists_batch;
-use crate::protocol::replication_store::exists_batch::ExistsBatch;
-use crate::protocol::replication_store::exists_batch::ExistsBatchResponse;
-use crate::protocol::replication_store::exists_batch::MAX_ADDRESSES;
+use crate::protocol::replication_store::copy::ImmutableCopy;
 use crate::protocol::replication_store::get::Get;
+use crate::protocol::replication_store::get_metadata::GetMetadata;
 use crate::protocol::replication_store::header::ReplicationHeader;
 use crate::protocol::replication_store::obliterate::Obliterate;
+use crate::protocol::replication_store::query;
 use crate::protocol::replication_store::query::Query;
+use crate::protocol::replication_store::query::QueryResponse;
 use crate::quic::client_monitor::ClientMetrics;
 use crate::quic::replication_store_service::client::ReplicationStoreClientError;
 use crate::quic::replication_store_service::client::ServiceRequestMeta;
@@ -186,13 +186,11 @@ where
             .output
     }
 
-    async fn do_exists_batch(
+    async fn do_query(
         self: Arc<Self>,
-        metric_label: &'static str,
-        repository: Context,
+        partition: Partition,
         addresses: Vec<Address>,
-        match_requested: StoreMatch,
-    ) -> Result<ExistsBatchResponse, StoreError> {
+    ) -> Result<QueryResponse, StoreError> {
         let meta = ServiceRequestMeta {
             client_epoch: self.client_container.epoch(),
             address: None,
@@ -201,19 +199,18 @@ where
         let store = self.clone();
         let service_result = async move {
             let context = execution_context();
-            let request = ExistsBatch {
+            let request = Query {
                 header: ReplicationHeader {
                     correlation_id: uuid::Uuid::try_parse(
                         context.globals().correlation_id.as_str(),
                     )
                     .unwrap_or_default(),
-                    repository,
+                    repository: partition.into(),
                 },
-                store_match: match_requested,
                 addresses,
             };
             let client = store.client_container.client().read().await;
-            client.exists_batch(request).await
+            client.query(request).await
         }
         .observe(
             self.instruments
@@ -221,7 +218,7 @@ where
                 .clone(),
             self.instruments
                 .provider
-                .get_labels_for_operation_context(metric_label),
+                .get_labels_for_operation_context("query"),
             observe_client_interaction(),
         )
         .await
@@ -240,72 +237,10 @@ where
         self.client_container.is_healthy()
     }
 
-    #[lore_macro::lore_instrument]
-    #[instrument(name = "ReplicatedStore::Exist", skip_all)]
-    async fn exist(
-        self: Arc<Self>,
-        partition: Partition,
-        address: Address,
-        match_requested: StoreMatch,
-    ) -> Result<StoreMatch, StoreError> {
-        let repository: Context = partition.into();
-        let quic_response = self
-            .do_exists_batch("exist", repository, vec![address], match_requested)
-            .await?;
-        if quic_response.matches.len() == 1 {
-            Ok(quic_response.matches[0])
-        } else {
-            warn!(
-                num_matches = quic_response.matches.len(),
-                "exist response was not 1 match"
-            );
-            Err(StoreError::internal(
-                "replication service exist response mismatch",
-            ))
-        }
-    }
-
-    #[lore_macro::lore_instrument]
-    #[instrument(name = "ReplicatedStore::ExistBatch", skip_all)]
-    async fn exist_batch(
-        self: Arc<Self>,
-        partition: Partition,
-        addresses: &[Address],
-        match_requested: StoreMatch,
-    ) -> Result<Vec<StoreMatch>, StoreError> {
-        let repository: Context = partition.into();
-        let quic_futures: Vec<_> = addresses
-            .chunks(exists_batch::MAX_ADDRESSES)
-            .map(|address_chunk| {
-                self.clone().do_exists_batch(
-                    "exist_batch",
-                    repository,
-                    address_chunk.to_vec(),
-                    match_requested,
-                )
-            })
-            .collect();
-        let store_matches = join_all(quic_futures).await.into_iter().try_fold(
-            Vec::with_capacity(addresses.len()),
-            |mut acc, response_result| {
-                let response = response_result?;
-                acc.extend(response.matches);
-                Ok::<_, StoreError>(acc)
-            },
-        )?;
-
-        if store_matches.len() != addresses.len() {
-            warn!(
-                num_response_matches = store_matches.len(),
-                num_requested = addresses.len(),
-                "exist_batch mismatch"
-            );
-            Err(StoreError::internal(
-                "replication service exist_batch response mismatch",
-            ))
-        } else {
-            Ok(store_matches)
-        }
+    /// The peer answers exact addresses only, so nothing it returns can have come from another
+    /// partition.
+    fn isolates_partitions(&self) -> bool {
+        true
     }
 
     #[lore_macro::lore_instrument]
@@ -313,10 +248,51 @@ where
     async fn query(
         self: Arc<Self>,
         partition: Partition,
+        addresses: &[Address],
+        results: &mut [StoreMatchResult],
+    ) -> Result<(), StoreError> {
+        debug_assert_eq!(addresses.len(), results.len());
+
+        let quic_futures = addresses
+            .chunks(query::MAX_ADDRESSES)
+            .map(|address_chunk| self.clone().do_query(partition, address_chunk.to_vec()));
+
+        let responses = join_all(quic_futures).await;
+
+        let mut offset = 0;
+        for (chunk, response) in addresses.chunks(query::MAX_ADDRESSES).zip(responses) {
+            let response = response?;
+            if response.results.len() != chunk.len() {
+                warn!(
+                    num_response_results = response.results.len(),
+                    num_requested = chunk.len(),
+                    "resolve mismatch"
+                );
+                return Err(StoreError::internal(
+                    "replication service resolve response mismatch",
+                ));
+            }
+
+            for (result_from_peer, result) in response
+                .results
+                .into_iter()
+                .zip(results[offset..].iter_mut())
+            {
+                *result = result_from_peer;
+            }
+            offset += chunk.len();
+        }
+
+        Ok(())
+    }
+
+    #[lore_macro::lore_instrument]
+    #[instrument(name = "ReplicatedStore::GetMetadata", skip_all)]
+    async fn get_metadata(
+        self: Arc<Self>,
+        partition: Partition,
         address: Address,
-        match_requested: StoreMatch,
-    ) -> Result<StoreQueryResult, StoreError> {
-        let repository: Context = partition.into();
+    ) -> Result<StoreGetData, StoreError> {
         let meta = ServiceRequestMeta {
             client_epoch: self.client_container.epoch(),
             address: Some(address),
@@ -325,19 +301,18 @@ where
         let store = self.clone();
         let service_result = async move {
             let context = execution_context();
-            let request = Query(ExistsBatch {
+            let request = GetMetadata {
                 header: ReplicationHeader {
                     correlation_id: uuid::Uuid::try_parse(
                         context.globals().correlation_id.as_str(),
                     )
                     .unwrap_or_default(),
-                    repository,
+                    repository: partition.into(),
                 },
-                store_match: match_requested,
-                addresses: vec![address],
-            });
+                address,
+            };
             let client = store.client_container.client().read().await;
-            client.query(request).await
+            client.get_metadata(request).await
         }
         .observe(
             self.instruments
@@ -345,17 +320,13 @@ where
                 .clone(),
             self.instruments
                 .provider
-                .get_labels_for_operation_context("query"),
+                .get_labels_for_operation_context("get_metadata"),
             observe_client_interaction(),
         )
         .await
         .output;
 
-        let query_response = handle_service_response(service_result, self, meta)?;
-        Ok(StoreQueryResult {
-            fragment: query_response.fragment,
-            match_made: query_response.match_made,
-        })
+        handle_service_response(service_result, self, meta)
     }
 
     #[lore_macro::lore_instrument]
@@ -364,9 +335,7 @@ where
         self: Arc<Self>,
         partition: Partition,
         address: Address,
-        match_required: StoreMatch,
-    ) -> Result<(Fragment, Bytes), StoreError> {
-        let repository: Context = partition.into();
+    ) -> Result<StoreGetData, StoreError> {
         let meta = ServiceRequestMeta {
             client_epoch: self.client_container.epoch(),
             address: Some(address),
@@ -381,10 +350,9 @@ where
                         context.globals().correlation_id.as_str(),
                     )
                     .unwrap_or_default(),
-                    repository,
+                    repository: partition.into(),
                 },
                 address,
-                match_required,
             };
             let client = store.client_container.client().read().await;
             client.get(request).await
@@ -401,8 +369,7 @@ where
         .await
         .output;
 
-        let response = handle_service_response(service_result, self, meta)?;
-        Ok((response.fragment, response.payload))
+        handle_service_response(service_result, self, meta)
     }
 
     #[lore_macro::lore_instrument]
@@ -454,7 +421,6 @@ where
         address: Address,
         stats: Arc<StoreObliterateStats>,
     ) -> Result<(), StoreError> {
-        let repository: Context = partition.into();
         let meta = ServiceRequestMeta {
             client_epoch: self.client_container.epoch(),
             address: Some(address),
@@ -469,7 +435,7 @@ where
                         context.globals().correlation_id.as_str(),
                     )
                     .unwrap_or_default(),
-                    repository,
+                    repository: partition.into(),
                 },
                 address,
             };
@@ -522,11 +488,9 @@ where
         None
     }
 
-    async fn compact_stop(self: Arc<Self>) {}
-
     fn max_query_batch(&self) -> Option<usize> {
         // todo(UCS-18195) - configure the max query size to be whatever the QUIC Server says is the max_query_batch
-        Some(MAX_ADDRESSES)
+        Some(query::MAX_ADDRESSES)
     }
 
     async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
@@ -535,6 +499,55 @@ where
 
     async fn verify(self: Arc<Self>, _heal: bool) -> Result<(), StoreError> {
         Ok(())
+    }
+
+    #[lore_macro::lore_instrument]
+    #[instrument(name = "ReplicatedStore::Copy", skip_all)]
+    async fn copy(
+        self: Arc<Self>,
+        source_partition: Partition,
+        source_address: Address,
+        destination_partition: Partition,
+        destination_context: Context,
+        durable: bool,
+    ) -> Result<(), StoreError> {
+        let meta = ServiceRequestMeta {
+            client_epoch: self.client_container.epoch(),
+            address: Some(source_address),
+        };
+
+        let store = self.clone();
+        let service_result = async move {
+            let context = execution_context();
+            let request = ImmutableCopy {
+                header: ReplicationHeader {
+                    correlation_id: uuid::Uuid::try_parse(
+                        context.globals().correlation_id.as_str(),
+                    )
+                    .unwrap_or_default(),
+                    repository: destination_partition.into(),
+                },
+                source_partition,
+                source_address,
+                destination_context,
+                durable,
+            };
+            let client = store.client_container.client().read().await;
+            client.copy(request).await
+        }
+        .observe(
+            self.instruments
+                .immutable_operation_latency_histogram
+                .clone(),
+            self.instruments
+                .provider
+                .get_labels_for_operation_context("copy"),
+            observe_client_interaction(),
+        )
+        .await
+        .output;
+
+        handle_service_response(service_result, self, meta)
     }
 }
 
@@ -603,14 +616,14 @@ impl ReplicatedStoreInstruments {
 #[cfg(test)]
 mod tests {
     use lore_revision::util::time::RetryPolicy;
+    use lore_storage::StoreMatch;
     use lore_transport::quic::client::ConnectionStats;
     use tokio::sync::mpsc;
     use tokio::sync::mpsc::Receiver;
 
     use super::*;
-    use crate::protocol::replication_store::exists_batch::ExistsBatch;
-    use crate::protocol::replication_store::exists_batch::ExistsBatchResponse;
-    use crate::protocol::replication_store::get::GetResponse;
+    use crate::protocol::replication_store::copy::ImmutableCopy;
+    use crate::protocol::replication_store::get_metadata::GetMetadata;
     use crate::protocol::replication_store::obliterate::ObliterateResponse;
     use crate::protocol::replication_store::put::Put;
     use crate::protocol::replication_store::query::Query;
@@ -628,11 +641,6 @@ mod tests {
 
             async fn put(&self, request: Put) -> Result<(), ReplicationStoreClientError>;
 
-            async fn exists_batch(
-                &self,
-                request: ExistsBatch,
-            ) -> Result<ExistsBatchResponse, ReplicationStoreClientError>;
-
             async fn obliterate(
                 &self,
                 request: Obliterate,
@@ -641,26 +649,36 @@ mod tests {
             async fn get(
                 &self,
                 request: Get,
-            ) -> Result<GetResponse, ReplicationStoreClientError>;
+            ) -> Result<StoreGetData, ReplicationStoreClientError>;
+
+            async fn get_metadata(
+                &self,
+                request: GetMetadata,
+            ) -> Result<StoreGetData, ReplicationStoreClientError>;
+
+            async fn local_put(&self, request: Put) -> Result<(), ReplicationStoreClientError>;
+
+            async fn local_get(&self, request: Get) -> Result<StoreGetData, ReplicationStoreClientError>;
+
+            async fn local_get_metadata(
+                &self,
+                request: GetMetadata,
+            ) -> Result<StoreGetData, ReplicationStoreClientError>;
 
             async fn query(
                 &self,
                 request: Query,
             ) -> Result<QueryResponse, ReplicationStoreClientError>;
 
-            async fn local_put(&self, request: Put) -> Result<(), ReplicationStoreClientError>;
-
-            async fn local_exists_batch(
-                &self,
-                request: ExistsBatch,
-            ) -> Result<ExistsBatchResponse, ReplicationStoreClientError>;
-
-            async fn local_get(&self, request: Get) -> Result<GetResponse, ReplicationStoreClientError>;
-
             async fn local_query(
                 &self,
                 request: Query,
             ) -> Result<QueryResponse, ReplicationStoreClientError>;
+
+            async fn copy(
+                &self,
+                request: ImmutableCopy,
+            ) -> Result<(), ReplicationStoreClientError>;
         }
     }
 
@@ -712,6 +730,57 @@ mod tests {
         )
         .await
         .expect("Creation should work")
+    }
+
+    /// The contract, against the replicated store. Writes go through a different path than the
+    /// battery drives, so what applies here are the absence cases — where an answer about content
+    /// nobody stored has to name no partition as its source.
+    #[tokio::test]
+    async fn satisfies_the_immutable_store_contract() {
+        let execution = crate::util::setup_execution(
+            "test",
+            uuid::Uuid::new_v4().as_hyphenated().to_string(),
+            String::default(),
+        );
+        lore_base::runtime::LORE_CONTEXT
+            .scope(execution, async move {
+                let (tx, rx) = mpsc::channel(1);
+                let factory = ChannelFactory { rx: rx.into() };
+
+                let mut client = make_mock_client();
+                client.expect_query().returning(|request| {
+                    Ok(QueryResponse {
+                        results: vec![StoreMatchResult::default(); request.addresses.len()],
+                    })
+                });
+                client
+                    .expect_get_metadata()
+                    .returning(|_| Ok(StoreGetData::default()));
+                client.expect_get().returning(|_| {
+                    Err(ReplicationStoreClientError::ServiceError(
+                        ReplicationServiceErrorCode::AddressNotFound,
+                    ))
+                });
+
+                tx.send(Ok(client)).await.unwrap();
+                let store = ReplicatedStore::new(
+                    Arc::new(factory),
+                    make_client_container_config(),
+                    Duration::from_secs(60),
+                    Duration::from_secs(10),
+                )
+                .await
+                .expect("Creation should work");
+
+                lore_storage::conformance::verify_immutable_store(
+                    store,
+                    lore_storage::conformance::Capabilities::new("ReplicatedStore")
+                        .no_put()
+                        .no_obliterate(),
+                )
+                .await;
+            })
+            .await;
     }
 
     mod regenerate_client {
@@ -1000,7 +1069,7 @@ mod tests {
         #[tokio::test]
         async fn successful_put_request_transformation_works() {
             let correlation_id = uuid::Uuid::new_v4();
-            let repository: Context = random();
+            let partition: Partition = random();
             let (fragment, address, payload) = fragment::generate_random();
 
             // The put method sets PayloadDoNotReplicate on the fragment before
@@ -1017,7 +1086,7 @@ mod tests {
                 .with(eq(Put {
                     header: ReplicationHeader {
                         correlation_id,
-                        repository,
+                        repository: partition.into(),
                     },
                     address,
                     fragment: expected_fragment,
@@ -1046,7 +1115,7 @@ mod tests {
 
                     store
                         .put(
-                            repository.into(),
+                            partition,
                             address,
                             fragment,
                             Some(payload),
@@ -1064,7 +1133,7 @@ mod tests {
                 crate::util::setup_execution("test", String::default(), String::default());
             LORE_CONTEXT
                 .scope(execution, async move {
-                    let repository: Context = random();
+                    let partition: Partition = random();
                     let (fragment, address, payload) = fragment::generate_random();
 
                     let (tx, rx) = mpsc::channel(1);
@@ -1089,7 +1158,7 @@ mod tests {
 
                     let error = store
                         .put(
-                            repository.into(),
+                            partition,
                             address,
                             fragment,
                             Some(payload),
@@ -1103,7 +1172,7 @@ mod tests {
         }
     }
 
-    mod exists_batch {
+    mod query {
         use std::collections::HashMap;
 
         use lore_base::runtime::LORE_CONTEXT;
@@ -1112,12 +1181,11 @@ mod tests {
         use rand::random;
 
         use super::*;
-        use crate::protocol::replication_store::exists_batch::MAX_ADDRESSES;
+        use crate::protocol::replication_store::query::MAX_ADDRESSES;
 
-        // Creates a large volume addresses to check, which all have a pre-assigned
-        // random store match. The mocks return the store match that was pre-assigned
-        // and the final output from store.exists_batch() call goes through the addresses in
-        // original order and ensures they match the original pre-assigned store match
+        // Creates a large number of addresses, each with a pre-assigned random StoreMatchResult.
+        // The mocks return the pre-assigned result per address, and the test verifies the full
+        // result (match level, partition, and storage flags) is forwarded in the original order.
         #[tokio::test]
         async fn successful_transformation_with_order_preserved() {
             let correlation_id = uuid::Uuid::new_v4();
@@ -1128,22 +1196,26 @@ mod tests {
             );
             LORE_CONTEXT
                 .scope(execution, async move {
-                    let repository: Context = random();
+                    let partition: Partition = random();
 
-                    // create random addresses and decide randomly what store match they will be
+                    // create random addresses and decide randomly what store match result they will be
                     // for the duration of the test
                     let mut addresses = Vec::new();
-                    let address_matches: Arc<Mutex<HashMap<Address, StoreMatch>>> =
+                    let address_results: Arc<Mutex<HashMap<Address, StoreMatchResult>>> =
                         Arc::new(HashMap::new().into());
                     for _ in 0..MAX_ADDRESSES * 4 {
                         let (_, address, _) = fragment::generate_random();
                         addresses.push(address);
 
                         let random_match: u8 = random::<u8>() % 4;
-                        let store_match: StoreMatch =
-                            random_match.try_into().expect("invalid store match");
-
-                        address_matches.lock().insert(address, store_match);
+                        let result = StoreMatchResult {
+                            match_made: random_match.try_into().expect("invalid store match"),
+                            partition,
+                            context: lore_base::types::Context::default(),
+                            stored_local: random(),
+                            stored_durable: random(),
+                        };
+                        address_results.lock().insert(address, result);
                     }
 
                     let (tx, rx) = mpsc::channel(1);
@@ -1151,24 +1223,20 @@ mod tests {
 
                     let mut client = make_mock_client();
                     for addresses in addresses.chunks(MAX_ADDRESSES) {
-                        let address_matches = address_matches.clone();
+                        let address_results = address_results.clone();
                         client
-                            .expect_exists_batch()
-                            .with(eq(ExistsBatch {
+                            .expect_query()
+                            .with(eq(Query {
                                 header: ReplicationHeader {
                                     correlation_id,
-                                    repository,
+                                    repository: partition.into(),
                                 },
-                                store_match: StoreMatch::MatchHash,
                                 addresses: addresses.to_vec(),
                             }))
                             .returning(move |request| {
-                                let map = address_matches.lock();
-                                let mut output = Vec::new();
-                                for address in request.addresses {
-                                    output.push(map[&address]);
-                                }
-                                Ok(ExistsBatchResponse { matches: output })
+                                let map = address_results.lock();
+                                let results = request.addresses.iter().map(|a| map[a]).collect();
+                                Ok(QueryResponse { results })
                             });
                     }
 
@@ -1182,18 +1250,17 @@ mod tests {
                     .await
                     .expect("Creation should work");
 
-                    let store_matches = store
-                        .exist_batch(repository.into(), &addresses, StoreMatch::MatchHash)
+                    let mut store_matches = vec![StoreMatchResult::default(); addresses.len()];
+                    store
+                        .query(partition, &addresses, &mut store_matches)
                         .await
-                        .expect("exists_batch should work");
+                        .expect("resolve should work");
 
                     // sanity check the addresses are what we expect
-                    let map = address_matches.lock();
-                    assert_eq!(store_matches.len(), addresses.len());
-                    for (index, store_match) in store_matches.iter().enumerate() {
+                    let map = address_results.lock();
+                    for (index, got) in store_matches.iter().enumerate() {
                         let address = addresses[index];
-                        let expected_match = map[&address];
-                        assert_eq!(*store_match, expected_match);
+                        assert_eq!(*got, map[&address]);
                     }
                 })
                 .await;
@@ -1209,7 +1276,7 @@ mod tests {
             );
             LORE_CONTEXT
                 .scope(execution, async move {
-                    let repository: Context = random();
+                    let partition: Partition = random();
 
                     let mut addresses = Vec::new();
                     for _ in 0..MAX_ADDRESSES * 2 {
@@ -1222,17 +1289,17 @@ mod tests {
 
                     let mut client = make_mock_client();
                     // 1 of the batched calls is ok, the other isn't
-                    client.expect_exists_batch().returning(|_| {
+                    client.expect_query().returning(|_| {
                         Err(ReplicationStoreClientError::ServiceError(
                             ReplicationServiceErrorCode::SlowDown,
                         ))
                     });
-                    client.expect_exists_batch().returning(|request| {
-                        Ok(ExistsBatchResponse {
-                            matches: request
+                    client.expect_query().returning(|request| {
+                        Ok(QueryResponse {
+                            results: request
                                 .addresses
-                                .into_iter()
-                                .map(|_| StoreMatch::MatchHash)
+                                .iter()
+                                .map(|_| StoreMatchResult::default())
                                 .collect(),
                         })
                     });
@@ -1247,26 +1314,18 @@ mod tests {
                     .await
                     .expect("Creation should work");
 
+                    let mut results = vec![StoreMatchResult::default(); addresses.len()];
                     let error = store
-                        .exist_batch(repository.into(), &addresses, StoreMatch::MatchHash)
+                        .query(partition, &addresses, &mut results)
                         .await
-                        .expect_err("exists_error should fail");
+                        .expect_err("resolve should fail");
                     assert!(matches!(error, StoreError::SlowDown(_)));
                 })
                 .await;
         }
-    }
-
-    mod exists {
-        use lore_base::runtime::LORE_CONTEXT;
-        use lore_revision::fragment;
-        use mockall::predicate::eq;
-        use rand::random;
-
-        use super::*;
 
         #[tokio::test]
-        async fn successful_exist_transform_works() {
+        async fn successful_query_one_works() {
             let correlation_id = uuid::Uuid::new_v4();
             let execution = crate::util::setup_execution(
                 "test",
@@ -1275,7 +1334,7 @@ mod tests {
             );
             LORE_CONTEXT
                 .scope(execution, async move {
-                    let repository: Context = random();
+                    let partition: Partition = random();
                     let (_, address, _) = fragment::generate_random();
 
                     let (tx, rx) = mpsc::channel(1);
@@ -1283,18 +1342,23 @@ mod tests {
 
                     let mut client = make_mock_client();
                     client
-                        .expect_exists_batch()
-                        .with(eq(ExistsBatch {
+                        .expect_query()
+                        .with(eq(Query {
                             header: ReplicationHeader {
                                 correlation_id,
-                                repository,
+                                repository: partition.into(),
                             },
-                            store_match: StoreMatch::MatchFull,
                             addresses: vec![address],
                         }))
-                        .returning(|_| {
-                            Ok(ExistsBatchResponse {
-                                matches: vec![StoreMatch::MatchPartition],
+                        .returning(move |_| {
+                            Ok(QueryResponse {
+                                results: vec![StoreMatchResult {
+                                    match_made: lore_storage::StoreMatch::MatchPartition,
+                                    partition,
+                                    context: lore_base::types::Context::default(),
+                                    stored_local: false,
+                                    stored_durable: false,
+                                }],
                             })
                         });
 
@@ -1308,55 +1372,18 @@ mod tests {
                     .await
                     .expect("Creation should work");
 
-                    let exist_output = store
-                        .exist(repository.into(), address, StoreMatch::MatchFull)
-                        .await
-                        .expect("exists_batch should work");
-
-                    assert_eq!(exist_output, StoreMatch::MatchPartition);
-                })
-                .await;
-        }
-
-        #[tokio::test]
-        async fn service_error_transformation_works() {
-            let correlation_id = uuid::Uuid::new_v4();
-            let execution = crate::util::setup_execution(
-                "test",
-                correlation_id.as_hyphenated().to_string(),
-                String::default(),
-            );
-            LORE_CONTEXT
-                .scope(execution, async move {
-                    let repository: Context = random();
-                    let (_, address, _) = fragment::generate_random();
-
-                    let (tx, rx) = mpsc::channel(1);
-                    let factory = ChannelFactory { rx: rx.into() };
-
-                    let mut client = make_mock_client();
-                    client.expect_exists_batch().returning(|_| {
-                        Err(ReplicationStoreClientError::ServiceError(
-                            ReplicationServiceErrorCode::SlowDown,
-                        ))
-                    });
-
-                    tx.send(Ok(client)).await.unwrap();
-                    let store = ReplicatedStore::new(
-                        Arc::new(factory),
-                        make_client_container_config(),
-                        Duration::from_secs(60),
-                        Duration::from_secs(10),
+                    let exist_output = lore_storage::immutable_store::query_one(
+                        &(store as Arc<dyn ImmutableStore>),
+                        partition,
+                        address,
                     )
                     .await
-                    .expect("Creation should work");
+                    .expect("resolve should work");
 
-                    let exist_error = store
-                        .exist(repository.into(), address, StoreMatch::MatchFull)
-                        .await
-                        .expect_err("exists_batch should fail");
-
-                    assert!(matches!(exist_error, StoreError::SlowDown(_)));
+                    assert_eq!(
+                        exist_output.match_made,
+                        lore_storage::StoreMatch::MatchPartition
+                    );
                 })
                 .await;
         }
@@ -1380,7 +1407,7 @@ mod tests {
             );
             LORE_CONTEXT
                 .scope(execution, async move {
-                    let repository: Context = random();
+                    let partition: Partition = random();
                     let (_, address, _) = fragment::generate_random();
                     // don't generate too large a random value to overflow when
                     // we add pre-existing stats to the obliterate() call below
@@ -1399,7 +1426,7 @@ mod tests {
                             .with(eq(Obliterate {
                                 header: ReplicationHeader {
                                     correlation_id,
-                                    repository,
+                                    repository: partition.into(),
                                 },
                                 address,
                             }))
@@ -1428,7 +1455,7 @@ mod tests {
                         num_payloads: base_num_payloads.into(),
                     });
                     store
-                        .obliterate(repository.into(), address, stats.clone())
+                        .obliterate(partition, address, stats.clone())
                         .await
                         .expect("obliterate should work");
                     assert_eq!(
@@ -1449,7 +1476,7 @@ mod tests {
                 crate::util::setup_execution("test", String::default(), String::default());
             LORE_CONTEXT
                 .scope(execution, async move {
-                    let repository: Context = random();
+                    let partition: Partition = random();
                     let (_, address, _) = fragment::generate_random();
 
                     let (tx, rx) = mpsc::channel(1);
@@ -1477,7 +1504,7 @@ mod tests {
                         num_payloads: 0.into(),
                     });
                     let error = store
-                        .obliterate(repository.into(), address, stats.clone())
+                        .obliterate(partition, address, stats.clone())
                         .await
                         .expect_err("obliterate should fail");
                     assert!(matches!(error, StoreError::SlowDown(_)));
@@ -1506,7 +1533,7 @@ mod tests {
             );
             LORE_CONTEXT
                 .scope(execution, async move {
-                    let repository: Context = random();
+                    let partition: Partition = random();
                     let (fragment, address, payload) = fragment::generate_random();
 
                     let (tx, rx) = mpsc::channel(1);
@@ -1520,15 +1547,16 @@ mod tests {
                             .with(eq(Get {
                                 header: ReplicationHeader {
                                     correlation_id,
-                                    repository,
+                                    repository: partition.into(),
                                 },
                                 address,
-                                match_required: StoreMatch::MatchFull,
                             }))
                             .returning(move |_| {
-                                Ok(GetResponse {
+                                Ok(StoreGetData {
                                     fragment,
-                                    payload: payload.clone(),
+                                    match_made: lore_storage::StoreMatch::MatchFull,
+                                    partition,
+                                    payload: Some(payload.clone()),
                                 })
                             });
                     }
@@ -1544,8 +1572,9 @@ mod tests {
                     .expect("Creation should work");
 
                     let get_output = store
-                        .get(repository.into(), address, StoreMatch::MatchFull)
+                        .get(partition, address)
                         .await
+                        .and_then(lore_storage::StoreGetData::into_payload)
                         .expect("get should work");
 
                     assert_eq!(get_output.0, fragment);
@@ -1560,7 +1589,7 @@ mod tests {
                 crate::util::setup_execution("test", String::default(), String::default());
             LORE_CONTEXT
                 .scope(execution, async move {
-                    let repository: Context = random();
+                    let partition: Partition = random();
                     let (_, address, _) = fragment::generate_random();
 
                     let (tx, rx) = mpsc::channel(1);
@@ -1584,7 +1613,7 @@ mod tests {
                     .expect("Creation should work");
 
                     let error = store
-                        .get(repository.into(), address, StoreMatch::MatchFull)
+                        .get(partition, address)
                         .await
                         .expect_err("get should fail");
                     assert!(matches!(error, StoreError::SlowDown(_)));
@@ -1593,8 +1622,9 @@ mod tests {
         }
     }
 
-    mod query {
+    mod copy {
         use lore_base::runtime::LORE_CONTEXT;
+        use lore_base::types::Context;
         use lore_revision::fragment;
         use mockall::predicate::eq;
         use rand::random;
@@ -1602,7 +1632,7 @@ mod tests {
         use super::*;
 
         #[tokio::test]
-        async fn successful_transform_works() {
+        async fn copy_sends_quic_copy_message_to_remote() {
             let correlation_id = uuid::Uuid::new_v4();
             let execution = crate::util::setup_execution(
                 "test",
@@ -1611,7 +1641,167 @@ mod tests {
             );
             LORE_CONTEXT
                 .scope(execution, async move {
-                    let repository: Context = random();
+                    let source_partition: Partition = random();
+                    let (_, source_address, _) = fragment::generate_random();
+                    let destination_partition: Partition = random();
+                    let destination_context: Context = random();
+
+                    let (tx, rx) = mpsc::channel(1);
+                    let factory = ChannelFactory { rx: rx.into() };
+
+                    let mut client = make_mock_client();
+                    client
+                        .expect_copy()
+                        .with(eq(ImmutableCopy {
+                            header: ReplicationHeader {
+                                correlation_id,
+                                repository: destination_partition.into(),
+                            },
+                            source_partition,
+                            source_address,
+                            destination_context,
+                            durable: false,
+                        }))
+                        .returning(|_| Ok(()));
+
+                    tx.send(Ok(client)).await.unwrap();
+                    let store = ReplicatedStore::new(
+                        Arc::new(factory),
+                        make_client_container_config(),
+                        Duration::from_secs(60),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .expect("Creation should work");
+
+                    store
+                        .copy(
+                            source_partition,
+                            source_address,
+                            destination_partition,
+                            destination_context,
+                            false,
+                        )
+                        .await
+                        .expect("copy should succeed");
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn copy_forwards_durable_flag() {
+            let correlation_id = uuid::Uuid::new_v4();
+            let execution = crate::util::setup_execution(
+                "test",
+                correlation_id.as_hyphenated().to_string(),
+                String::default(),
+            );
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let source_partition: Partition = random();
+                    let (_, source_address, _) = fragment::generate_random();
+                    let destination_partition: Partition = random();
+                    let destination_context: Context = random();
+
+                    let (tx, rx) = mpsc::channel(1);
+                    let factory = ChannelFactory { rx: rx.into() };
+
+                    let mut client = make_mock_client();
+                    client
+                        .expect_copy()
+                        .withf(|req| req.durable)
+                        .returning(|_| Ok(()));
+
+                    tx.send(Ok(client)).await.unwrap();
+                    let store = ReplicatedStore::new(
+                        Arc::new(factory),
+                        make_client_container_config(),
+                        Duration::from_secs(60),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .expect("Creation should work");
+
+                    store
+                        .copy(
+                            source_partition,
+                            source_address,
+                            destination_partition,
+                            destination_context,
+                            true,
+                        )
+                        .await
+                        .expect("copy should succeed");
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn copy_propagates_service_error() {
+            let execution =
+                crate::util::setup_execution("test", String::default(), String::default());
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let source_partition: Partition = random();
+                    let (_, source_address, _) = fragment::generate_random();
+                    let destination_partition: Partition = random();
+                    let destination_context: Context = random();
+
+                    let (tx, rx) = mpsc::channel(1);
+                    let factory = ChannelFactory { rx: rx.into() };
+
+                    let mut client = make_mock_client();
+                    client.expect_copy().returning(|_| {
+                        Err(ReplicationStoreClientError::ServiceError(
+                            ReplicationServiceErrorCode::AddressNotFound,
+                        ))
+                    });
+
+                    tx.send(Ok(client)).await.unwrap();
+                    let store = ReplicatedStore::new(
+                        Arc::new(factory),
+                        make_client_container_config(),
+                        Duration::from_secs(60),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .expect("Creation should work");
+
+                    let error = store
+                        .copy(
+                            source_partition,
+                            source_address,
+                            destination_partition,
+                            destination_context,
+                            false,
+                        )
+                        .await
+                        .expect_err("copy should fail on service error");
+                    assert!(matches!(error, StoreError::AddressNotFound(_)));
+                })
+                .await;
+        }
+    }
+
+    mod get_metadata {
+        use lore_base::runtime::LORE_CONTEXT;
+        use lore_revision::fragment;
+        use mockall::predicate::eq;
+        use rand::random;
+
+        use super::*;
+
+        #[tokio::test]
+        async fn full_match_transform_works() {
+            let correlation_id = uuid::Uuid::new_v4();
+            let execution = crate::util::setup_execution(
+                "test",
+                correlation_id.as_hyphenated().to_string(),
+                String::default(),
+            );
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let partition: Partition = random();
                     let (fragment, address, _) = fragment::generate_random();
 
                     let (tx, rx) = mpsc::channel(1);
@@ -1619,19 +1809,20 @@ mod tests {
 
                     let mut client = make_mock_client();
                     client
-                        .expect_query()
-                        .with(eq(Query(ExistsBatch {
+                        .expect_get_metadata()
+                        .with(eq(GetMetadata {
                             header: ReplicationHeader {
                                 correlation_id,
-                                repository,
+                                repository: partition.into(),
                             },
-                            store_match: StoreMatch::MatchFull,
-                            addresses: vec![address],
-                        })))
+                            address,
+                        }))
                         .returning(move |_| {
-                            Ok(QueryResponse {
+                            Ok(StoreGetData {
                                 fragment,
-                                match_made: StoreMatch::MatchPartition,
+                                match_made: lore_storage::StoreMatch::MatchFull,
+                                partition,
+                                payload: None,
                             })
                         });
 
@@ -1645,19 +1836,19 @@ mod tests {
                     .await
                     .expect("Creation should work");
 
-                    let exist_output = store
-                        .query(repository.into(), address, StoreMatch::MatchFull)
+                    let output = store
+                        .get_metadata(partition, address)
                         .await
-                        .expect("query should work");
+                        .expect("get_metadata should work");
 
-                    assert_eq!(exist_output.match_made, StoreMatch::MatchPartition);
-                    assert_eq!(exist_output.fragment, fragment);
+                    assert_eq!(output.match_made, StoreMatch::MatchFull);
+                    assert_eq!(output.fragment, fragment);
                 })
                 .await;
         }
 
         #[tokio::test]
-        async fn service_error_transformation_works() {
+        async fn partial_match_transform_works() {
             let correlation_id = uuid::Uuid::new_v4();
             let execution = crate::util::setup_execution(
                 "test",
@@ -1666,14 +1857,66 @@ mod tests {
             );
             LORE_CONTEXT
                 .scope(execution, async move {
-                    let repository: Context = random();
+                    let partition: Partition = random();
+                    let (fragment, address, _) = fragment::generate_random();
+
+                    let (tx, rx) = mpsc::channel(1);
+                    let factory = ChannelFactory { rx: rx.into() };
+
+                    let mut client = make_mock_client();
+                    client
+                        .expect_get_metadata()
+                        .with(eq(GetMetadata {
+                            header: ReplicationHeader {
+                                correlation_id,
+                                repository: partition.into(),
+                            },
+                            address,
+                        }))
+                        .returning(move |_| {
+                            Ok(StoreGetData {
+                                fragment,
+                                match_made: lore_storage::StoreMatch::MatchPartition,
+                                partition,
+                                payload: None,
+                            })
+                        });
+
+                    tx.send(Ok(client)).await.unwrap();
+                    let store = ReplicatedStore::new(
+                        Arc::new(factory),
+                        make_client_container_config(),
+                        Duration::from_secs(60),
+                        Duration::from_secs(10),
+                    )
+                    .await
+                    .expect("Creation should work");
+
+                    let output = store
+                        .get_metadata(partition, address)
+                        .await
+                        .expect("get_metadata should work");
+
+                    assert_eq!(output.match_made, StoreMatch::MatchPartition);
+                    assert_eq!(output.fragment, fragment);
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn service_error_transformation_works() {
+            let execution =
+                crate::util::setup_execution("test", String::default(), String::default());
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let partition: Partition = random();
                     let (_, address, _) = fragment::generate_random();
 
                     let (tx, rx) = mpsc::channel(1);
                     let factory = ChannelFactory { rx: rx.into() };
 
                     let mut client = make_mock_client();
-                    client.expect_query().returning(|_| {
+                    client.expect_get_metadata().returning(|_| {
                         Err(ReplicationStoreClientError::ServiceError(
                             ReplicationServiceErrorCode::SlowDown,
                         ))
@@ -1689,12 +1932,11 @@ mod tests {
                     .await
                     .expect("Creation should work");
 
-                    let exist_error = store
-                        .query(repository.into(), address, StoreMatch::MatchFull)
+                    let error = store
+                        .get_metadata(partition, address)
                         .await
-                        .expect_err("query should fail");
-
-                    assert!(matches!(exist_error, StoreError::SlowDown(_)));
+                        .expect_err("get_metadata should fail");
+                    assert!(matches!(error, StoreError::SlowDown(_)));
                 })
                 .await;
         }

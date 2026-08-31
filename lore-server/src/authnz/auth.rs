@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use lore_base::lore_spawn_net;
 use lore_proto::auth::CheckUserPermissionRequest;
 use lore_proto::auth::CheckUserPermissionResponse;
 use lore_proto::auth::LookupUserPermissionsRequest;
@@ -40,9 +41,11 @@ impl LoreAuthClientHelper {
                 )
                 .warn_map_err(|_| Status::internal("Failed to configure TLS for lore auth"))?;
         }
-        let channel = endpoint
-            .connect()
+        // Connect from net so the hyper/h2 driver tasks this spawns bind there
+        // rather than to the core runtime the caller runs on.
+        let channel = lore_spawn_net!(async move { endpoint.connect().await })
             .await
+            .warn_map_err(|_| Status::internal("lore auth connection task failed"))?
             .warn_map_err(|_| Status::internal("Failed to connect to lore auth service"))?;
         let client = UrcAuthApiClient::with_interceptor(channel, CorrelationInterceptor);
         Ok(LoreAuthClientHelper { client })

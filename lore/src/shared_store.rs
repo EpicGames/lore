@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: MIT
 use std::path::PathBuf;
 
-use lore_error_set::WrapInternal;
+use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
-use lore_revision::error::LoreErrorExt;
 use lore_revision::global::GlobalConfig;
 use lore_revision::shared_store::LoreSharedStoreInfoEventData;
 use lore_revision::shared_store::SharedStoreError;
@@ -81,16 +80,8 @@ async fn create_local(
             .unwrap_or(raw_remote_url)
             .to_owned();
 
-        match lore_revision::shared_store::create_shared_store(
-            path,
-            remote_url,
-            args.make_default != 0,
-        )
-        .await
-        {
-            Ok(result) => Ok(result),
-            Err(e) => e.emit(),
-        }
+        lore_revision::shared_store::create_shared_store(path, remote_url, args.make_default != 0)
+            .await
     })
     .await
 }
@@ -137,7 +128,7 @@ async fn info_local(
     let command = async move |_args| -> Result<(), SharedStoreError> {
         let config = GlobalConfig::load()
             .await
-            .internal("loading global config")?;
+            .forward::<SharedStoreError>("loading global config")?;
 
         let mut remote_urls = Vec::new();
         let mut shared_store_paths = Vec::new();
@@ -206,13 +197,16 @@ async fn set_use_automatically_local(
     let command = async move |_args| -> Result<(), SharedStoreError> {
         let (mut config, lock) = GlobalConfig::load_locked()
             .await
-            .internal("loading global config")?;
+            .forward::<SharedStoreError>("loading global config")?;
         if args.enabled != 0 {
             config.use_shared_store_automatically = Some(true);
         } else {
             config.use_shared_store_automatically = None;
         }
-        config.save(lock).await.internal("saving global config")?;
+        config
+            .save(lock)
+            .await
+            .forward::<SharedStoreError>("saving global config")?;
         Ok(())
     };
     no_repository_call(globals, callback, args, info, command).await

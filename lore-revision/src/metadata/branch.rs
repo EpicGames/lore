@@ -9,13 +9,21 @@ use lore_error_set::prelude::*;
 use crate::branch;
 use crate::errors::AddressNotFound;
 use crate::errors::Disconnected;
+use crate::errors::FileNotFound;
 use crate::errors::InvalidArguments;
 use crate::errors::InvalidPath;
 use crate::errors::LinkNotFound;
+use crate::errors::Maintenance;
+use crate::errors::NoRemote;
 use crate::errors::NodeNotFound;
+use crate::errors::NotAuthenticated;
+use crate::errors::NotAuthorized;
+use crate::errors::NotConnected;
 use crate::errors::NotFound;
+use crate::errors::NotSupported;
 use crate::errors::Oversized;
 use crate::errors::PayloadNotFound;
+use crate::errors::SlowDown;
 use crate::errors::WriteRequired;
 use crate::event;
 use crate::event::EventError;
@@ -28,7 +36,6 @@ use crate::lore::Hash;
 use crate::metadata::Metadata;
 use crate::metadata::MetadataType;
 use crate::repository::RepositoryContext;
-use crate::store;
 use crate::util::path::RelativePath;
 
 /// Keys that cannot be modified or removed via the branch metadata API.
@@ -69,6 +76,14 @@ pub enum BranchMetadataError {
     InvalidPath,
     AddressNotFound,
     PayloadNotFound,
+    SlowDown,
+    Maintenance,
+    NotConnected,
+    NoRemote,
+    NotAuthenticated,
+    NotAuthorized,
+    NotSupported,
+    FileNotFound,
 }
 
 impl EventError for BranchMetadataError {
@@ -121,9 +136,9 @@ async fn fetch_metadata_hash(
         return Ok(hash);
     }
 
-    Ok(branch::metadata_hash(repo, branch)
+    branch::metadata_hash(repo, branch)
         .await
-        .internal("loading branch metadata hash")?)
+        .forward_any::<BranchMetadataError>("loading branch metadata hash")
 }
 
 /// Collect all addresses referenced by a metadata blob: the blob itself plus any binary
@@ -134,7 +149,7 @@ fn collect_metadata_addresses(metadata: &Metadata, metadata_hash: Hash) -> Vec<A
         context: Context::default(),
     }];
 
-    let _ = metadata.walk(|_key: &[u8], value: &[u8], value_type: MetadataType| {
+    metadata.walk(|_key: &[u8], value: &[u8], value_type: MetadataType| {
         if value_type == MetadataType::Address && value.len() == std::mem::size_of::<Address>() {
             addresses.push(value.into());
         }
@@ -157,7 +172,7 @@ async fn ensure_remote_blobs(
     let status = storage
         .query(addresses)
         .await
-        .internal("querying server for metadata blob existence")?;
+        .forward::<BranchMetadataError>("querying server for metadata blob existence")?;
 
     let mut missing = vec![];
     for (index, value) in status.iter().enumerate() {
@@ -167,18 +182,16 @@ async fn ensure_remote_blobs(
     }
 
     for address in missing {
-        let (fragment, payload) = immutable::load_raw_store_retry(
-            repo.immutable_store(),
-            repo.id,
-            address,
-            store::StoreMatch::MatchFull,
-        )
-        .await
-        .internal("loading metadata blob from local store for upload")?;
+        let (fragment, payload) =
+            immutable::load_raw_store_retry(repo.immutable_store(), repo.id, address)
+                .await
+                .forward::<BranchMetadataError>(
+                    "loading metadata blob from local store for upload",
+                )?;
 
         immutable::store_raw_remote_retry(storage.clone(), address, fragment, Some(payload))
             .await
-            .internal("uploading metadata blob to server")?;
+            .forward::<BranchMetadataError>("uploading metadata blob to server")?;
     }
 
     Ok(())
@@ -198,7 +211,10 @@ async fn commit_metadata_hash(
     expected: Hash,
     new: Hash,
 ) -> Result<(), BranchMetadataError> {
-    let remote = repo.remote().await.internal("remote connection required")?;
+    let remote = repo
+        .remote()
+        .await
+        .forward::<BranchMetadataError>("remote connection required")?;
 
     let correlation_id = crate::lore::execution_context()
         .globals()
@@ -207,7 +223,7 @@ async fn commit_metadata_hash(
     let storage = remote
         .session(repo.id, &correlation_id)
         .await
-        .internal("connecting to storage service")?;
+        .forward::<BranchMetadataError>("connecting to storage service")?;
 
     let addresses = collect_metadata_addresses(metadata, new);
     ensure_remote_blobs(repo.clone(), storage, &addresses).await?;
@@ -215,11 +231,11 @@ async fn commit_metadata_hash(
     let revision_service = remote
         .revision(repo.id)
         .await
-        .internal("connecting to revision service")?;
+        .forward::<BranchMetadataError>("connecting to revision service")?;
     let result = revision_service
         .branch_metadata_set(branch, expected, new)
         .await
-        .internal("branch metadata CAS")?;
+        .forward::<BranchMetadataError>("branch metadata CAS")?;
 
     if !result.success {
         return Err(BranchMetadataError::internal(
@@ -248,12 +264,12 @@ pub async fn get(
 
     let metadata = Metadata::deserialize(repo, hash)
         .await
-        .internal("deserializing branch metadata")?;
+        .forward::<BranchMetadataError>("deserializing branch metadata")?;
 
     if let Some(key) = key {
-        event::metadata::send_keyed(&metadata, key).internal("sending metadata event")?;
+        event::metadata::send_keyed(&metadata, key);
     } else {
-        event::metadata::send(&metadata).internal("sending metadata event")?;
+        event::metadata::send(&metadata);
     }
 
     Ok(())
@@ -299,7 +315,7 @@ pub async fn set(
     } else {
         Metadata::deserialize(repo.clone(), old_hash)
             .await
-            .internal("deserializing branch metadata")?
+            .forward::<BranchMetadataError>("deserializing branch metadata")?
     };
 
     for i in 0..keys.len() {
@@ -315,46 +331,48 @@ pub async fn set(
                     given_path
                 } else {
                     let repo_path = repo.require_path()?;
-                    let relative_path = RelativePath::new_from_user_path(repo_path, &user_path)
-                        .internal("resolving binary metadata path")?;
+                    let relative_path =
+                        RelativePath::new_from_user_path(repo_path, &user_path)
+                            .forward::<BranchMetadataError>("resolving binary metadata path")?;
                     relative_path.to_absolute_path(repo_path)
                 };
 
-                tokio::fs::read(input_path)
+                lore_io::IoDriver::global()
+                    .read_file_bytes(input_path)
                     .await
                     .internal("reading binary metadata file")?
             };
 
-            let (address, _) = immutable::write(
+            let address = immutable::write(
                 repo.clone(),
                 Context::default(),
                 Bytes::from_owner(payload),
                 immutable::write_options_from_repository(repo.clone()),
             )
             .await
-            .internal("writing binary metadata to immutable store")?;
+            .forward::<BranchMetadataError>("writing binary metadata to immutable store")?;
 
             metadata
                 .set_address(
                     std::str::from_utf8(key).internal("invalid key encoding")?,
                     address,
                 )
-                .internal("setting binary metadata")?;
+                .forward::<BranchMetadataError>("setting binary metadata")?;
         } else {
             metadata
                 .set(key, value, format)
-                .internal("setting metadata")?;
+                .forward::<BranchMetadataError>("setting metadata")?;
         }
     }
 
     let new_hash = metadata
         .serialize(repo.clone())
         .await
-        .internal("serializing branch metadata")?;
+        .forward::<BranchMetadataError>("serializing branch metadata")?;
 
     commit_metadata_hash(repo, branch, &metadata, old_hash, new_hash).await?;
 
-    let _ = event::metadata::send(&metadata);
+    event::metadata::send(&metadata);
 
     Ok(())
 }
@@ -384,21 +402,19 @@ pub async fn clear(
 
     let mut metadata = Metadata::deserialize(repo.clone(), old_hash)
         .await
-        .internal("deserializing branch metadata")?;
+        .forward::<BranchMetadataError>("deserializing branch metadata")?;
 
     if keys.is_empty() {
         let mut to_remove = vec![];
-        metadata
-            .walk(
-                |key_slice: &[u8], _value_slice: &[u8], _value_type: MetadataType| {
-                    if let Ok(key) = std::str::from_utf8(key_slice)
-                        && !is_built_in_key(key)
-                    {
-                        to_remove.push(key.to_string());
-                    }
-                },
-            )
-            .internal("walking metadata for clear")?;
+        metadata.walk(
+            |key_slice: &[u8], _value_slice: &[u8], _value_type: MetadataType| {
+                if let Ok(key) = std::str::from_utf8(key_slice)
+                    && !is_built_in_key(key)
+                {
+                    to_remove.push(key.to_string());
+                }
+            },
+        );
         for key in &to_remove {
             metadata.remove_key(key);
         }
@@ -411,7 +427,7 @@ pub async fn clear(
     let new_hash = metadata
         .serialize(repo.clone())
         .await
-        .internal("serializing branch metadata")?;
+        .forward::<BranchMetadataError>("serializing branch metadata")?;
 
     commit_metadata_hash(repo, branch, &metadata, old_hash, new_hash).await?;
 

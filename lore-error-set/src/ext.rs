@@ -33,7 +33,7 @@ use crate::traced::Traced;
 /// error set via the generated `From<Traced<Internal>>` impl.
 ///
 /// ```
-/// use lore_error_set::{Internal, Traced, WrapInternal};
+/// use lore_error_set::prelude::*;
 ///
 /// fn parse_port(s: &str) -> Result<u16, Traced<Internal>> {
 ///     s.parse::<u16>().internal("parsing port number")
@@ -94,6 +94,109 @@ where
             ));
             Traced::new(Internal::new(Arc::new(e)), trace)
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// InternalForbiddenOnErrorSets — poison `.internal()` where it would lose data
+// ---------------------------------------------------------------------------
+
+#[doc(hidden)]
+pub mod guard {
+    /// Unsatisfiable bound carried by the poisoned `.internal()` overloads.
+    ///
+    /// Nothing implements this trait, and nothing outside this crate can: the
+    /// only receivers that would matter are `Result<..>`, so an external impl
+    /// is a foreign type and a foreign trait, which the orphan rule rejects.
+    /// That makes the methods bounded on it uncallable, including under UFCS.
+    #[diagnostic::on_unimplemented(
+        message = "`.internal()` is not available on `{Self}`",
+        label = "this error already carries its own variants and trace",
+        note = "`.internal()` is for foreign errors (io::Error, ParseIntError, ...)",
+        note = "for an error set, use `.forward(\"context\")` to preserve its variants",
+        note = "to collapse deliberately, use `Target::internal_with_context(err, \"context\")`",
+        note = "for a `Traced<_>`, use `.chain_err(\"context\")` or `.chain_err_from(..)`"
+    )]
+    pub trait Forbidden {
+        /// Never callable, since no type implements [`Forbidden`]. It exists so
+        /// the poisoned methods can have panic-free bodies.
+        fn absurd<T>(self) -> T;
+    }
+}
+
+/// Poison trait that makes `.internal()` a compile error on errors that
+/// already carry their own variants and trace.
+///
+/// [`WrapInternal`] is blanket-implemented for every
+/// `E: std::error::Error + Send + Sync + 'static`, and every `#[error_set]`
+/// enum satisfies that bound. Without this trait, `.internal()` on an error set
+/// compiles and silently collapses every handleable variant into `Internal`,
+/// discarding the accumulated trace — the caller loses the ability to match on
+/// `NotFound`, `Conflict`, and the rest, and the FFI boundary reports `-1`.
+///
+/// This trait declares methods with the same names as [`WrapInternal`]'s, so
+/// method resolution finds two candidates and refuses to pick one. Both traits
+/// must be in scope for that to happen, which is why they are exported together
+/// from [`crate::prelude`] — always import that rather than either trait alone.
+///
+/// The diagnostics differ by receiver, and both are intentional:
+///
+/// - `Result<T, E: ErrorSet>` — [`WrapInternal`] also applies, so this is an
+///   `E0034` ambiguity naming this trait among the candidates.
+/// - `Result<T, Traced<X>>` — [`WrapInternal`] does *not* apply (`Traced` has no
+///   `Error` impl), so this resolves here uniquely and reports the
+///   [`guard::Forbidden`] message. Without this impl the error would be a
+///   confusing "`std::error::Error` is not implemented for `Traced<_>`".
+///
+/// Use [`ForwardStrict::forward`] instead, or
+/// [`SupportsInternalError::internal_with_context`] to collapse on purpose.
+///
+/// [`SupportsInternalError::internal_with_context`]:
+///     crate::internal::SupportsInternalError::internal_with_context
+pub trait InternalForbiddenOnErrorSets<T> {
+    /// Never callable — see [the trait docs](InternalForbiddenOnErrorSets).
+    fn internal(self, context: &str) -> Result<T, Traced<Internal>>
+    where
+        Self: guard::Forbidden;
+
+    /// Never callable — see [the trait docs](InternalForbiddenOnErrorSets).
+    fn internal_with<F>(self, f: F) -> Result<T, Traced<Internal>>
+    where
+        Self: guard::Forbidden,
+        F: FnOnce() -> String;
+}
+
+impl<T, E: ErrorSet> InternalForbiddenOnErrorSets<T> for Result<T, E> {
+    fn internal(self, _context: &str) -> Result<T, Traced<Internal>>
+    where
+        Self: guard::Forbidden,
+    {
+        guard::Forbidden::absurd(self)
+    }
+
+    fn internal_with<F>(self, _f: F) -> Result<T, Traced<Internal>>
+    where
+        Self: guard::Forbidden,
+        F: FnOnce() -> String,
+    {
+        guard::Forbidden::absurd(self)
+    }
+}
+
+impl<T, X> InternalForbiddenOnErrorSets<T> for Result<T, Traced<X>> {
+    fn internal(self, _context: &str) -> Result<T, Traced<Internal>>
+    where
+        Self: guard::Forbidden,
+    {
+        guard::Forbidden::absurd(self)
+    }
+
+    fn internal_with<F>(self, _f: F) -> Result<T, Traced<Internal>>
+    where
+        Self: guard::Forbidden,
+        F: FnOnce() -> String,
+    {
+        guard::Forbidden::absurd(self)
     }
 }
 
@@ -214,29 +317,34 @@ impl<T, E: ErrorSet> ResultExt<T, E> for Result<T, E> {
         Target: ErrorSet,
         F: FnOnce(E::Matched) -> Target,
     {
-        let caller = ::std::panic::Location::caller();
-        let loc = Location::with_context(
-            caller.file(),
-            caller.line(),
-            caller.column(),
-            Arc::from(context),
-        );
         match self {
             Ok(val) => Ok(val),
-            Err(err) => match err.into_matched(context, loc) {
-                Ok(matched) => Err(f(matched)),
-                Err(traced_internal) => {
-                    let (internal, trace) = traced_internal.into_parts();
-                    Err(Target::wrap_internal(
-                        crate::set::TracedBox::new(
-                            Box::new(internal)
-                                as Box<dyn std::error::Error + Send + Sync + 'static>,
-                            trace,
-                        ),
-                        context,
-                    ))
+            Err(err) => {
+                // Built here rather than above the match: `Arc::from(context)`
+                // copies the string onto the heap, and the success path has no
+                // trace to put it on.
+                let caller = ::std::panic::Location::caller();
+                let loc = Location::with_context(
+                    caller.file(),
+                    caller.line(),
+                    caller.column(),
+                    Arc::from(context),
+                );
+                match err.into_matched(context, loc) {
+                    Ok(matched) => Err(f(matched)),
+                    Err(traced_internal) => {
+                        let (internal, trace) = traced_internal.into_parts();
+                        Err(Target::wrap_internal(
+                            crate::set::TracedBox::new(
+                                Box::new(internal)
+                                    as Box<dyn std::error::Error + Send + Sync + 'static>,
+                                trace,
+                            ),
+                            context,
+                        ))
+                    }
                 }
-            },
+            }
         }
     }
 }
@@ -319,6 +427,132 @@ impl<T, E: ErrorSet> ForwardStrict<T, E> for Result<T, E> {
     fn forward_with<Target, F>(self, f: F) -> Result<T, Target>
     where
         Target: ErrorSet + crate::set::HasAll<E::Variants>,
+        F: FnOnce() -> String,
+    {
+        let caller = ::std::panic::Location::caller();
+        self.map_err(move |source| {
+            let context_str = f();
+            let traced = source.extract_inner();
+            match Target::try_from_inner(traced) {
+                Ok(mut target) => {
+                    target.push_trace(Location::with_context(
+                        caller.file(),
+                        caller.line(),
+                        caller.column(),
+                        Arc::from(context_str.as_str()),
+                    ));
+                    target
+                }
+                Err(mut unmatched) => {
+                    unmatched.trace.push(Location::with_context(
+                        caller.file(),
+                        caller.line(),
+                        caller.column(),
+                        Arc::from(context_str.as_str()),
+                    ));
+                    Target::wrap_internal(unmatched, &context_str)
+                }
+            }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ForwardAny — lenient forward for sources that over-declare
+// ---------------------------------------------------------------------------
+
+/// Extension trait providing the lenient
+/// [`forward_any`](ForwardAny::forward_any).
+///
+/// **Prefer [`ForwardStrict::forward`].** Reach for this only when the source
+/// set declares variants the call site cannot actually produce, so the strict
+/// `HasAll` bound cannot be satisfied without widening the target with
+/// unreachable variants.
+///
+/// The runtime behaviour is identical to [`ForwardStrict::forward`]: every
+/// variant the target declares is preserved, and only unmatched ones collapse
+/// to `Target::Internal`. The sole difference is the missing
+/// `Target: HasAll<E::Variants>` bound, so the guarantee moves from
+/// compile time to best effort — which is why the strict form stays the
+/// default.
+///
+/// # When this is the right tool
+///
+/// `HasAll` is keyed on the source's *declared* variants, not on what a given
+/// call site can reach. A function returning a broad set (say one covering
+/// every failure in a subsystem) forces every target to declare all of them,
+/// even where only a handful are reachable. Widening targets to satisfy that
+/// is how a codebase converges on one universal error set: the strict form's
+/// only remedy is "widen the target", and under mutual forwarding the sole
+/// fixpoint is the union of everything.
+///
+/// This is the escape valve. It keeps whatever the target genuinely declares
+/// without pushing the source's imprecision into it.
+///
+/// The real fix, where it is affordable, is to narrow the source so
+/// [`ForwardStrict::forward`] applies again.
+///
+/// ```ignore
+/// use lore_error_set::prelude::*;
+///
+/// fn f() -> Result<(), NarrowErrors> {
+///     // WideErrors declares 44 variants; this call reaches ~8 of them, and
+///     // NarrowErrors declares only what its callers can act on.
+///     load_state().forward_any("loading state")?;
+///     Ok(())
+/// }
+/// ```
+pub trait ForwardAny<T, E: ErrorSet> {
+    /// Forwards every variant `Target` declares, collapsing the rest to
+    /// `Target::Internal`. See [the trait docs](ForwardAny).
+    fn forward_any<Target>(self, context: &str) -> Result<T, Target>
+    where
+        Target: ErrorSet;
+
+    /// Like [`forward_any`](Self::forward_any), but with a lazily-evaluated
+    /// context string. The closure is only called on the error path.
+    fn forward_any_with<Target, F>(self, f: F) -> Result<T, Target>
+    where
+        Target: ErrorSet,
+        F: FnOnce() -> String;
+}
+
+impl<T, E: ErrorSet> ForwardAny<T, E> for Result<T, E> {
+    #[track_caller]
+    fn forward_any<Target>(self, context: &str) -> Result<T, Target>
+    where
+        Target: ErrorSet,
+    {
+        let caller = ::std::panic::Location::caller();
+        self.map_err(move |source| {
+            let traced = source.extract_inner();
+            match Target::try_from_inner(traced) {
+                Ok(mut target) => {
+                    target.push_trace(Location::with_context(
+                        caller.file(),
+                        caller.line(),
+                        caller.column(),
+                        Arc::from(context),
+                    ));
+                    target
+                }
+                Err(mut unmatched) => {
+                    unmatched.trace.push(Location::with_context(
+                        caller.file(),
+                        caller.line(),
+                        caller.column(),
+                        Arc::from(context),
+                    ));
+                    Target::wrap_internal(unmatched, context)
+                }
+            }
+        })
+    }
+
+    #[track_caller]
+    fn forward_any_with<Target, F>(self, f: F) -> Result<T, Target>
+    where
+        Target: ErrorSet,
         F: FnOnce() -> String,
     {
         let caller = ::std::panic::Location::caller();

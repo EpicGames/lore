@@ -7,8 +7,6 @@
 //! is needed because the handle itself serves as the future correlation key.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicU64;
 
 use lore_base::error::AddressNotFound;
 use lore_base::error::InvalidArguments;
@@ -23,17 +21,16 @@ use lore_revision::event::EventError;
 use lore_revision::event::LoreEvent;
 use lore_revision::event::revision_tree::LoreRevisionTreeLoadedEventData;
 use lore_revision::interface::LoreError;
-use lore_revision::metadata::Metadata;
 use lore_revision::state::State;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio::sync::Notify;
 
 use crate::call::no_repository_call;
 use crate::call_delegation::dispatch_call;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreGlobalArgs;
 use crate::revision_tree::handle;
+use crate::revision_tree::handle::LoreRevisionTree;
 use crate::revision_tree::handle::RevisionTreeInternal;
 use crate::revision_tree::handle::synth_repository_context;
 use crate::storage::handle as storage_handle;
@@ -93,6 +90,22 @@ fn map_state_error(err: StateErrors) -> LoadError {
     }
 }
 
+/// Unregister a handle whose parent storage handle went away while the load was in
+/// flight, reporting whether it did.
+///
+/// A connection teardown between the parent lookup and the registration sweeps a registry
+/// this handle is not in yet, leaving it holding a store nobody will reclaim. Checking
+/// *after* registering closes that window rather than moving it: the teardown removes the
+/// storage handle before it sweeps, so either the sweep sees this entry or this sees the
+/// storage handle gone.
+fn withdraw_if_parent_closed(store: LoreStore, revision_tree: LoreRevisionTree) -> bool {
+    if storage_handle::lookup(store).is_some() {
+        return false;
+    }
+    handle::unregister(revision_tree);
+    true
+}
+
 /// Open a memory-based revision tree handle on the given `(store, repository, revision_hash)`.
 ///
 /// On success the caller receives `LORE_EVENT_REVISION_TREE_LOADED` carrying
@@ -125,18 +138,19 @@ async fn load_impl(
             .await
             .map_err(map_state_error)?;
 
-        let internal = Arc::new(RevisionTreeInternal {
+        let internal = Arc::new(RevisionTreeInternal::new(
             store_internal,
-            parent_storage_handle_id: args.store.handle_id,
-            repository: args.repository,
+            args.store.handle_id,
+            args.repository,
             repository_context,
             state,
-            pending_metadata: parking_lot::RwLock::new(Metadata::default()),
-            in_flight: AtomicU64::new(0),
-            invalid: AtomicBool::new(false),
-            drained: Notify::new(),
-        });
+        ));
         let revision_tree_handle = handle::register(internal);
+        if withdraw_if_parent_closed(args.store, revision_tree_handle) {
+            return Err(LoadError::from(InvalidArguments {
+                reason: "storage handle was closed while the revision tree was loading".into(),
+            }));
+        }
         LoreEvent::RevisionTreeLoaded(LoreRevisionTreeLoadedEventData {
             handle_id: revision_tree_handle.handle_id,
         })
@@ -190,6 +204,32 @@ mod tests {
             CapturedEvent::RevisionTreeLoaded(id) => Some(*id),
             _ => None,
         })
+    }
+
+    /// With the parent gone the check unregisters the tree rather than merely reporting;
+    /// with the parent alive it leaves it registered. The interleaving itself is not
+    /// reachable — there is no controllable yield between the lookup and the registration.
+    #[tokio::test]
+    async fn a_load_withdraws_its_handle_when_the_parent_storage_handle_is_gone() {
+        let store_handle = storage_handle::register(in_memory_for_tests("withdraw").await);
+        let live = rt_handle::register(rt_handle::test_support::new_for_testing().await);
+        assert!(
+            !withdraw_if_parent_closed(store_handle, live),
+            "a live parent must leave the handle alone"
+        );
+        assert!(rt_handle::lookup(live).is_some());
+        rt_handle::unregister(live);
+
+        let orphan = rt_handle::register(rt_handle::test_support::new_for_testing().await);
+        storage_handle::unregister(store_handle);
+        assert!(
+            withdraw_if_parent_closed(store_handle, orphan),
+            "a closed parent must withdraw the handle"
+        );
+        assert!(
+            rt_handle::lookup(orphan).is_none(),
+            "the withdrawn handle must not stay in the registry",
+        );
     }
 
     #[tokio::test]
@@ -249,8 +289,6 @@ mod tests {
 
         let status = load(LoreGlobalArgs::default(), args, make_callback(sink.clone())).await;
 
-        // A terminal failure surfaces its code through the `Complete` event, not
-        // a separate `Error` event; an unknown revision hash maps to not-found.
         let expected_code = LoadError::from(NotFound).ffi_code();
         assert_eq!(status, expected_code);
         let events = sink.lock().unwrap().clone();

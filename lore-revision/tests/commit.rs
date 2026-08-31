@@ -7,7 +7,6 @@ mod tests {
     use std::io::Write;
     use std::sync::Arc;
 
-    use lore_base::error::NoRemote;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_revision::branch;
@@ -22,11 +21,10 @@ mod tests {
     use lore_revision::node::NodeFlags;
     use lore_revision::repository;
     use lore_revision::repository::RepositoryContext;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::stage;
     use lore_revision::stage::StageOptions;
     use lore_revision::state;
-    use lore_transport::ProtocolError;
+    use lore_revision::util::path::RelativePath;
 
     include!("helper.rs");
 
@@ -59,14 +57,10 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store,
-                        mutable_store,
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(immutable_store, mutable_store)
+                            .with_path(&path)
+                            .with_id(repository_id)
+                            .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -111,7 +105,6 @@ mod tests {
                     link: None,
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
-                    stats: false,
                 };
                 let signature = Box::pin(commit::commit(repository.clone(), &write_token, options))
                     .await
@@ -199,14 +192,10 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store,
-                        mutable_store,
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(immutable_store, mutable_store)
+                            .with_path(&path)
+                            .with_id(repository_id)
+                            .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -251,7 +240,6 @@ mod tests {
                     link: None,
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
-                    stats: false,
                 };
                 let _signature =
                     Box::pin(commit::commit(repository.clone(), &write_token, options))
@@ -292,6 +280,232 @@ mod tests {
             captured.contains(&commit_discriminant),
             "expected RevisionCommitRevision event (discriminant {commit_discriminant}) in captured {captured:?}"
         );
+    }
+
+    /// A commit reads and hashes every file it commits. Recording the modified
+    /// time it read them at is what lets the next stage answer "unmodified" from
+    /// metadata; without it `is_file_modified` finds no cached time, and hashes
+    /// the whole tree again to reach the answer the commit already had.
+    #[tokio::test]
+    async fn commit_records_the_modified_time_of_what_it_committed() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
+
+                let default_branch_id = BranchId::from(uuid::Uuid::now_v7());
+                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
+                let created_repo = repository::create_local(
+                    path.as_path(),
+                    &write_token,
+                    repository_id,
+                    default_branch_id,
+                    branch::DEFAULT_DEFAULT_NAME.to_string(),
+                    repository::RepositoryConfig::default(),
+                    false,
+                )
+                .await
+                .expect("Failed to initialize repository");
+
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        default_repository_creation_args(immutable_store, mutable_store)
+                            .with_path(&path)
+                            .with_id(repository_id)
+                            .with_instance_id(created_repo.instance_id),
+                    )
+                    .with_write_token(write_token.share()),
+                );
+                lore_revision::instance::store_current_anchor_branch(
+                    &repository,
+                    default_branch_id,
+                )
+                .await
+                .expect("Failed to store anchor branch");
+
+                let relative_path = RelativePath::new_from_initial_path("recorded.file")
+                    .expect("valid relative path");
+                let file_path = path.as_path().join("recorded.file");
+                {
+                    let mut file = std::fs::File::options()
+                        .create(true)
+                        .truncate(true)
+                        .write(true)
+                        .open(file_path.as_path())
+                        .expect("Failed to create test file");
+                    file.write_all(b"content the commit will hash")
+                        .expect("Failed to write test file");
+                }
+
+                // Nothing has looked at this file yet, so nothing can have cached
+                // a time for it.
+                assert_eq!(
+                    state::file_modified_time(repository.clone(), &relative_path).await,
+                    0,
+                    "expected no cached modified time before the commit"
+                );
+
+                let _signature = file::stage::stage(
+                    repository.clone(),
+                    &write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&path)]),
+                    StageOptions {
+                        case_change: stage::StageCaseChange::Error,
+                        node_flags: NodeFlags::NoFlags,
+                        file_id: None,
+                        no_children: false,
+                        scan: true,
+                    },
+                )
+                .await
+                .expect("Failed to stage file");
+
+                let options = CommitOptions {
+                    message: String::new(),
+                    link_messages: std::collections::HashMap::new(),
+                    link: None,
+                    layer_messages: std::collections::HashMap::new(),
+                    layer: None,
+                };
+                Box::pin(commit::commit(repository.clone(), &write_token, options))
+                    .await
+                    .expect("Failed to commit revision");
+
+                let metadata =
+                    std::fs::metadata(file_path.as_path()).expect("Failed to stat test file");
+                let (expected, _size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
+                assert_ne!(expected, 0, "test file has no usable modified time");
+                assert_eq!(
+                    state::file_modified_time(repository.clone(), &relative_path).await,
+                    expected,
+                    "commit did not record the modified time it read the file at"
+                );
+
+                let _ = std::fs::remove_dir_all(path.as_path());
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A dry run reads and fragments every staged file but never makes its revision the
+    /// current one. Recording the times it read them at would let a later scan answer
+    /// "unmodified" about a node the working copy is not on, so nothing is recorded.
+    #[tokio::test]
+    async fn a_dry_run_commit_records_no_modified_time() {
+        use lore_revision::interface::ExecutionContext;
+        use lore_revision::interface::LoreGlobalArgs;
+        use lore_revision::relay::EventDispatcher;
+
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
+
+                let default_branch_id = BranchId::from(uuid::Uuid::now_v7());
+                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
+                let created_repo = repository::create_local(
+                    path.as_path(),
+                    &write_token,
+                    repository_id,
+                    default_branch_id,
+                    branch::DEFAULT_DEFAULT_NAME.to_string(),
+                    repository::RepositoryConfig::default(),
+                    false,
+                )
+                .await
+                .expect("Failed to initialize repository");
+
+                let repository = Arc::new(
+                    RepositoryContext::new(
+                        default_repository_creation_args(immutable_store, mutable_store)
+                            .with_path(&path)
+                            .with_id(repository_id)
+                            .with_instance_id(created_repo.instance_id),
+                    )
+                    .with_write_token(write_token.share()),
+                );
+                lore_revision::instance::store_current_anchor_branch(
+                    &repository,
+                    default_branch_id,
+                )
+                .await
+                .expect("Failed to store anchor branch");
+
+                let relative_path =
+                    RelativePath::new_from_initial_path("dry.file").expect("valid relative path");
+                let file_path = path.as_path().join("dry.file");
+                {
+                    let mut file = std::fs::File::options()
+                        .create(true)
+                        .truncate(true)
+                        .write(true)
+                        .open(file_path.as_path())
+                        .expect("Failed to create test file");
+                    file.write_all(b"content the dry run will hash")
+                        .expect("Failed to write test file");
+                }
+
+                let _signature = file::stage::stage(
+                    repository.clone(),
+                    &write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&path)]),
+                    StageOptions {
+                        case_change: stage::StageCaseChange::Error,
+                        node_flags: NodeFlags::NoFlags,
+                        file_id: None,
+                        no_children: false,
+                        scan: true,
+                    },
+                )
+                .await
+                .expect("Failed to stage file");
+
+                let options = CommitOptions {
+                    message: String::new(),
+                    link_messages: std::collections::HashMap::new(),
+                    link: None,
+                    layer_messages: std::collections::HashMap::new(),
+                    layer: None,
+                };
+                let callback: lore_revision::interface::LoreEventCallback = None;
+                let dry_run = Arc::new(ExecutionContext::new_client_with_user_id(
+                    LoreGlobalArgs {
+                        dry_run: 1,
+                        ..Default::default()
+                    },
+                    EventDispatcher::new(callback),
+                    "test-user".to_string(),
+                ));
+                LORE_CONTEXT
+                    .scope(
+                        dry_run,
+                        Box::pin(commit::commit(repository.clone(), &write_token, options)),
+                    )
+                    .await
+                    .expect("Failed to commit revision");
+
+                assert_eq!(
+                    state::file_modified_time(repository.clone(), &relative_path).await,
+                    0,
+                    "a dry run recorded a modified time"
+                );
+
+                let _ = std::fs::remove_dir_all(path.as_path());
+            }))
+            .await
+            .expect("Test task failed");
     }
 
     #[tokio::test]
@@ -343,14 +557,10 @@ mod tests {
 
                 let repository = Arc::new(
                     RepositoryContext::new(
-                        Some(path.clone()),
-                        immutable_store,
-                        mutable_store,
-                        repository_id,
-                        created_repo.instance_id,
-                        Err(ProtocolError::from(NoRemote)),
-                        Arc::default(),
-                        RepositoryFormat::Lore,
+                        default_repository_creation_args(immutable_store, mutable_store)
+                            .with_path(&path)
+                            .with_id(repository_id)
+                            .with_instance_id(created_repo.instance_id),
                     )
                     .with_write_token(write_token.share()),
                 );
@@ -369,7 +579,6 @@ mod tests {
                     link: None,
                     layer_messages: std::collections::HashMap::new(),
                     layer: None,
-                    stats: false,
                 };
                 let result =
                     Box::pin(commit::commit(repository.clone(), &write_token, options)).await;

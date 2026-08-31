@@ -47,7 +47,7 @@ pub async fn add_file_dependencies(
 ) -> Result<AddResult, DependencyError> {
     let (current_revision, _current_branch) = crate::instance::load_current_anchor(&repository)
         .await
-        .internal("deserializing current anchor")?;
+        .forward::<DependencyError>("deserializing current anchor")?;
     let staged_revision = crate::instance::load_staged_revision(&repository)
         .await
         .ok()
@@ -56,7 +56,7 @@ pub async fn add_file_dependencies(
 
     let state = state::State::deserialize(repository.clone(), staged_revision)
         .await
-        .internal("deserializing state")?;
+        .forward::<DependencyError>("deserializing state")?;
 
     // Resolve all paths to NodeIDs upfront
     type ResolvedDep<'a> = (NodeID, Vec<&'a str>);
@@ -203,11 +203,11 @@ pub(super) async fn flush_state(
         let signature = state
             .serialize(repository.clone(), token)
             .await
-            .internal("serializing state")?;
+            .forward::<DependencyError>("serializing state")?;
 
         crate::instance::store_staged_anchor(repository, signature)
             .await
-            .internal("flushing stores and serializing staged anchor")?;
+            .forward::<DependencyError>("flushing stores and serializing staged anchor")?;
     }
 
     Ok(())

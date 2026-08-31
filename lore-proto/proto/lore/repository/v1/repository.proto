@@ -30,6 +30,13 @@ service RepositoryService {
   rpc RepositoryMetadataSet(RepositoryMetadataSetRequest) returns (RepositoryMetadataSetResponse);
 }
 
+// A service to receive requests forwarded on from another Lore Server,
+// to perform an RPC on behalf of a client
+service ForwardedRepositoryService {
+
+  rpc RepositoryCreate  (RepositoryCreateRequest)  returns (RepositoryCreateResponse);
+}
+
 // Request to create a new repository. The caller pre-generates `id` and
 // `default_branch_id` so retries are idempotent — a duplicate `id` yields
 // ALREADY_EXISTS unless the call is byte-for-byte the same as the prior
@@ -39,7 +46,8 @@ message RepositoryCreateRequest {
   bytes id = 1;
   // Human-readable repository name. Must satisfy the validation rules in
   // `lore-revision::repository::is_valid_name` and must not collide with
-  // any existing repository.
+  // any existing repository: `/`-separated segments of ASCII alphanumerics,
+  // `-`, `_` and `.`, where no segment is empty or starts with `.`.
   string name = 2;
   // Free-form description, stored verbatim in the repository metadata.
   string description = 3;

@@ -372,3 +372,40 @@ impl From<&crate::lock::Resource> for LockResource {
         }
     }
 }
+
+impl crate::lore::model::v1::ItemStatus {
+    /// The success value, for responses whose outcome is carried by the status itself.
+    pub fn ok() -> Self {
+        Self {
+            code: i32::from(tonic::Code::Ok) as u32,
+            message: String::new(),
+        }
+    }
+
+    pub fn is_ok(&self) -> bool {
+        self.code == i32::from(tonic::Code::Ok) as u32
+    }
+}
+
+/// Streaming storage handlers build a per-item failure as a `tonic::Status` — that
+/// keeps the existing `MessageHandleError` mapping and server-error logging intact —
+/// then convert here to put it on the wire in-band. `details` and metadata are
+/// dropped deliberately: the address that used to be smuggled through `details` is
+/// now a field on the response message itself.
+impl From<&tonic::Status> for crate::lore::model::v1::ItemStatus {
+    fn from(status: &tonic::Status) -> Self {
+        Self {
+            code: i32::from(status.code()) as u32,
+            message: status.message().to_string(),
+        }
+    }
+}
+
+/// Rebuild a `Status` from an in-band item error so both sides can keep using the
+/// established `Status` conversions — `ProtocolError::from` on the client, status-code
+/// logging and metrics on the server. An unrecognised code decodes to `Code::Unknown`.
+impl From<&crate::lore::model::v1::ItemStatus> for tonic::Status {
+    fn from(item: &crate::lore::model::v1::ItemStatus) -> Self {
+        tonic::Status::new(tonic::Code::from(item.code as i32), item.message.clone())
+    }
+}

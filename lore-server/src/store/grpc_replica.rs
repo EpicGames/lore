@@ -11,6 +11,7 @@ use dashmap::DashMap;
 use lore_base::error::SlowDown;
 use lore_base::lore_spawn;
 use lore_base::types::Address;
+use lore_base::types::Context;
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 use lore_base::types::Fragment;
 use lore_base::types::Partition;
@@ -22,9 +23,9 @@ use lore_revision::util;
 use lore_revision::util::time::RetryPolicy;
 use lore_storage::ImmutableStore;
 use lore_storage::StoreError;
-use lore_storage::StoreMatch;
+use lore_storage::StoreGetData;
+use lore_storage::StoreMatchResult;
 use lore_storage::StoreObliterateStats;
-use lore_storage::StoreQueryResult;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
 use lore_telemetry::drop_record::DropRecord;
@@ -517,6 +518,16 @@ impl InstrumentProvider for ReplicationClientInstrumentProvider {
     }
 }
 
+/// Write-only replication over gRPC: it accepts `put` and `obliterate` and refuses every read.
+///
+/// Not in use, and outstanding work. `query`, `get_metadata` and `get` answer with
+/// `Store does not support operation`, so nothing that resolves an address can be backed by this
+/// store, and it is the one production [`ImmutableStore`] the conformance battery does not run
+/// against — a store that refuses to resolve fails the battery's first check for behaving as
+/// designed, so hooking it up needs the battery to gain a way to express "this store does not
+/// answer reads" and assert the refusal is uniform across all three. Until then this
+/// implementation is unverified against the contract the other stores are held to. Both belong in
+/// the change that brings this store back into use.
 pub struct GrpcReplica {
     client: ReplicationClient,
 }
@@ -529,30 +540,24 @@ impl GrpcReplica {
 
 #[async_trait]
 impl ImmutableStore for GrpcReplica {
-    async fn exist(
-        self: Arc<Self>,
-        _repository: Partition,
-        _address: Address,
-        _match_requested: StoreMatch,
-    ) -> Result<StoreMatch, StoreError> {
-        Err(StoreError::internal("Store does not support operation"))
-    }
-
-    async fn exist_batch(
-        self: Arc<Self>,
-        _repository: Partition,
-        _addresses: &[Address],
-        _match_requested: StoreMatch,
-    ) -> Result<Vec<StoreMatch>, StoreError> {
-        Err(StoreError::internal("Store does not support operation"))
+    fn isolates_partitions(&self) -> bool {
+        true
     }
 
     async fn query(
         self: Arc<Self>,
+        _partition: Partition,
+        _addresses: &[Address],
+        _results: &mut [StoreMatchResult],
+    ) -> Result<(), StoreError> {
+        Err(StoreError::internal("Store does not support operation"))
+    }
+
+    async fn get_metadata(
+        self: Arc<Self>,
         _repository: Partition,
         _address: Address,
-        _match_requested: StoreMatch,
-    ) -> Result<StoreQueryResult, StoreError> {
+    ) -> Result<StoreGetData, StoreError> {
         Err(StoreError::internal("Store does not support operation"))
     }
 
@@ -560,8 +565,7 @@ impl ImmutableStore for GrpcReplica {
         self: Arc<Self>,
         _repository: Partition,
         _address: Address,
-        _match_required: StoreMatch,
-    ) -> Result<(Fragment, Bytes), StoreError> {
+    ) -> Result<StoreGetData, StoreError> {
         Err(StoreError::internal("Store does not support operation"))
     }
 
@@ -626,8 +630,6 @@ impl ImmutableStore for GrpcReplica {
         None
     }
 
-    async fn compact_stop(self: Arc<Self>) {}
-
     fn max_query_batch(&self) -> Option<usize> {
         None
     }
@@ -638,6 +640,17 @@ impl ImmutableStore for GrpcReplica {
 
     async fn verify(self: Arc<Self>, _heal: bool) -> Result<(), StoreError> {
         Ok(())
+    }
+
+    async fn copy(
+        self: Arc<Self>,
+        _source_partition: Partition,
+        _source_address: Address,
+        _destination_partition: Partition,
+        _destination_context: Context,
+        _durable: bool,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::internal("copy not supported on grpc replica"))
     }
 }
 
@@ -799,7 +812,7 @@ mod stream_error_tests {
             let mut stream = request.into_inner();
             let (tx, rx) = mpsc::channel(100);
 
-            tokio::spawn(async move {
+            lore_spawn!(async move {
                 let mut count = 0;
                 while let Some(req) = stream.next().await {
                     let Ok(req) = req else { break };
@@ -832,7 +845,7 @@ mod stream_error_tests {
 
         let addr: SocketAddr = ([127, 0, 0, 1], port).into();
 
-        tokio::spawn(async move {
+        lore_spawn!(async move {
             tonic::transport::Server::builder()
                 .add_service(ReplicationServiceServer::new(service))
                 .serve(addr)
@@ -877,7 +890,7 @@ mod stream_error_tests {
         let mut join_set = tokio::task::JoinSet::new();
         for _ in 0..20 {
             let client = client.clone();
-            join_set.spawn(async move {
+            lore_spawn!(join_set, async move {
                 let repository = rand::random::<Partition>();
                 let (fragment, address, payload) = generate_random();
                 client

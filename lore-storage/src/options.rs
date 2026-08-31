@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::sync::atomic;
 
 use crate::compress::FRAGMENT_SIZE_THRESHOLD;
-use crate::concurrency::LOCAL_ISOLATION;
 use crate::fragment_flags::FragmentFlags;
 
 /// Options controlling how a fragment is written to storage.
@@ -17,8 +15,6 @@ pub struct WriteOptions {
     pub remote_write: bool,
     /// Fixed size chunking if nonzero
     pub fixed_size_chunk: usize,
-    /// Clone the memory buffer before hashing for consistent reads
-    pub clone_buffer: bool,
 }
 
 impl WriteOptions {
@@ -54,6 +50,17 @@ impl WriteOptions {
         self
     }
 
+    /// The size to cut fixed-size chunks at, or `None` for content-defined chunking.
+    ///
+    /// The clamp lives here, not only in the builder, because `fixed_size_chunk` is `pub` and a
+    /// struct literal bypasses it. Every cutting path asks this, so none can omit the bound.
+    ///
+    /// An oversized leaf is not just different chunking: `store_fragment` refuses it, and the
+    /// compare walk reads any entry above the threshold as a nested list.
+    pub fn cut_size(&self) -> Option<usize> {
+        (self.fixed_size_chunk > 0).then(|| self.fixed_size_chunk.clamp(1, FRAGMENT_SIZE_THRESHOLD))
+    }
+
     pub fn with_fixed_size_chunk(mut self, size: usize) -> Self {
         self.fixed_size_chunk = std::cmp::min(FRAGMENT_SIZE_THRESHOLD, size);
         self
@@ -74,8 +81,6 @@ impl From<WriteOptions> for u32 {
 /// Options controlling how a fragment is read from storage.
 #[derive(Copy, Clone, Debug)]
 pub struct ReadOptions {
-    /// Enforce repository isolation
-    pub isolate: bool,
     /// Decompress data
     pub decompress: bool,
     /// Verify data
@@ -90,8 +95,6 @@ pub struct ReadOptions {
     pub cache: bool,
     /// Write to file directly
     pub direct_write: bool,
-    /// Use file read/write instead of memory mapping
-    pub direct_file_io: bool,
     /// Force sync data to storage media after write
     pub sync_data: bool,
     /// Priority read hint for stream scheduling (metadata/tree blocks)
@@ -107,14 +110,12 @@ pub struct ReadOptions {
 impl Default for ReadOptions {
     fn default() -> Self {
         ReadOptions {
-            isolate: LOCAL_ISOLATION.load(atomic::Ordering::Relaxed),
             decompress: true,
             verify: true,
             local: true,
             remote: true,
             cache: false,
             direct_write: false,
-            direct_file_io: false,
             sync_data: false,
             priority: false,
             max_content_size: None,
@@ -178,23 +179,8 @@ impl ReadOptions {
         self
     }
 
-    pub fn with_isolation(mut self) -> Self {
-        self.isolate = true;
-        self
-    }
-
-    pub fn no_isolation(mut self) -> Self {
-        self.isolate = false;
-        self
-    }
-
     pub fn with_direct_write(mut self) -> Self {
         self.direct_write = true;
-        self
-    }
-
-    pub fn with_direct_file_io(mut self) -> Self {
-        self.direct_file_io = true;
         self
     }
 

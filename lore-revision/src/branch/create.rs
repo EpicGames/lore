@@ -7,7 +7,6 @@ use lore_error_set::prelude::*;
 
 use super::execution_context;
 use crate::branch;
-use crate::error::LoreResultExt;
 use crate::errors::*;
 use crate::event::EventError;
 use crate::interface::LoreError;
@@ -149,11 +148,9 @@ pub async fn create(
             if force {
                 match branch::resolve(repository.clone(), branch.as_str()).await {
                     Ok(resolved) => {
-                        let _ = branch::delete(repository.clone(), resolved.id)
-                            .await
-                            .debug_map_err(CreateError::internal(
-                                "Failed to delete existing local branch",
-                            ));
+                        if let Err(err) = branch::delete(repository.clone(), resolved.id).await {
+                            lore_debug!("Failed to delete existing local branch: {err}");
+                        }
                         if let Ok(remote) = repository.remote().await {
                             let _ =
                                 branch::delete_remote(remote.clone(), repository.id, resolved.id)
@@ -176,10 +173,13 @@ pub async fn create(
                         .await
                         .forward::<CreateError>("retrying branch creation after delete")?;
                     }
-                    Err(_err) => {
-                        return Err(CreateError::from(BranchAlreadyExists {
-                            branch: branch.clone(),
-                        }));
+                    Err(err) => {
+                        return Err(CreateError::BranchAlreadyExists(
+                            BranchAlreadyExists {
+                                branch: branch.clone(),
+                            }
+                            .chain_err_from(err, "failed to resolve branch for force-recreate"),
+                        ));
                     }
                 }
             } else {
@@ -230,14 +230,16 @@ async fn layer_branch_create(
     branch_id: BranchId,
     category: String,
 ) -> Result<(), CreateError> {
-    let layers = layer::list(repository.clone())
+    let layers = layer::list_with_context(repository.clone())
         .await
         .forward::<CreateError>("listing layers")?;
 
-    lore_debug!("Creating branch {branch} for layers {layers:?}");
+    lore_debug!(
+        "Creating branch {branch} for layers {:?}",
+        layers.iter().map(|(layer, _)| layer).collect::<Vec<_>>()
+    );
 
-    for layer in layers {
-        let layer_repository = Arc::new(repository.to_layer_context(layer.repository).await);
+    for (layer, layer_repository) in layers {
         let user_id = execution_context().user_id().await;
 
         let current_revision = State::deserialize(layer_repository.clone(), layer.current)

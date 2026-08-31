@@ -272,6 +272,7 @@ impl LoreInterface {
                     .clone()
                     .map(LoreString::from)
                     .unwrap_or_default(),
+                link: LoreString::default(),
             },
             Some(Box::new(move |event| error_and_log!(span, event))),
         ));

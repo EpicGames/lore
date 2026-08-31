@@ -82,7 +82,7 @@ pub struct RevisionMetadata {
 impl RevisionMetadata {
     pub fn from_metadata(metadata: Metadata) -> Self {
         let mut revision_metadata = RevisionMetadata::default();
-        let _ = metadata.walk(|key, value, _value_type| {
+        metadata.walk(|key, value, _value_type| {
             let key = std::str::from_utf8(key).unwrap_or("<binary>");
             match key {
                 metadata::MESSAGE => {
@@ -268,6 +268,7 @@ pub async fn diff3(
         include_same,
         None,
         None,
+        None,
         tx,
     )
     .await
@@ -301,6 +302,9 @@ pub async fn diff3_with_source_cap(
     include_same: bool,
     source_cap: Option<usize>,
     history_walk_concurrency: Option<usize>,
+    // Decides which subtrees the view excludes and may be adopted whole.
+    // `None` disables adoption.
+    graft_view: Option<Arc<crate::filter::Filter>>,
     tx: mpsc::Sender<Result<DiffItem, StateError>>,
 ) -> Result<Diff3Summary, StateError> {
     let (state_base, state_source, state_target) = join!(
@@ -341,6 +345,15 @@ pub async fn diff3_with_source_cap(
     let source_walker_state_base = state_base.clone();
     let source_walker_state_source = state_source.clone();
     let source_walker_path = path.clone();
+    // Give the source walk the target tree, so it can adopt whole subtrees
+    // the target never touched instead of descending.
+    let source_walker_graft = graft_view.map(|view| {
+        Arc::new(state::GraftOracle::new(
+            repository.clone(),
+            state_target.clone(),
+            view,
+        ))
+    });
     let source_walker = lore_spawn!(async move {
         let mut sink = state::ChangeSink::Channel(&source_tx);
         state::diff(
@@ -349,6 +362,7 @@ pub async fn diff3_with_source_cap(
             source_walker_repo,
             source_walker_state_source,
             source_walker_path,
+            source_walker_graft,
             &mut sink,
             FilterMode::View,
         )
@@ -431,6 +445,8 @@ pub async fn diff3_with_source_cap(
             walker_repo,
             state_target,
             walker_path,
+            // Adoption is a source-side decision.
+            None,
             &mut sink,
             FilterMode::View,
         )
@@ -857,9 +873,14 @@ async fn find_last_modified_revision(
                     return Ok((state_parent.revision(), state_parent.revision_number()));
                 }
             }
+
+            let parent_revision = state_current.parent_self();
+            if parent_revision.is_zero() {
+                break;
+            }
+
             state_parent = state_current.clone();
-            state_current =
-                State::deserialize(repository.clone(), state_current.parent_self()).await?;
+            state_current = State::deserialize(repository.clone(), parent_revision).await?;
         }
 
         lore_debug!(

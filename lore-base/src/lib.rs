@@ -5,6 +5,8 @@ pub mod directories;
 pub mod error;
 pub mod fs;
 pub mod log;
+pub mod retry;
 pub mod runtime;
+pub mod text;
 pub mod types;
 pub mod version;

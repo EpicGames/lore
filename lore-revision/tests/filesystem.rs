@@ -18,10 +18,12 @@ mod tests {
     use lore_revision::branch;
     use lore_revision::fs::filesystem_provider::FilesystemPath;
     use lore_revision::fs::filesystem_provider::InstanceOperation;
-    use lore_revision::fs::filesystem_provider::StaticDispatchInstanceOperation;
+    use lore_revision::fs::filesystem_provider::InstanceOperationImpl;
     use lore_revision::lore::RepositoryId;
     use lore_revision::repository;
+    use lore_revision::repository::RepositoryContext;
     use lore_revision::util::path::RelativePath;
+    use lore_revision::util::path::RepositoryPath;
 
     include!("helper.rs");
 
@@ -46,7 +48,9 @@ mod tests {
     /// Returns `true` from the closure to indicate changes were made (passed to finalize).
     async fn run_fs_test<F, Fut>(test_fn: F)
     where
-        F: FnOnce(Arc<StaticDispatchInstanceOperation>, PathBuf) -> Fut + Send + 'static,
+        F: FnOnce(Arc<RepositoryContext>, Arc<InstanceOperationImpl>, PathBuf) -> Fut
+            + Send
+            + 'static,
         Fut: Future<Output = bool> + Send,
     {
         let (_immutable_store, _mutable_store, execution) =
@@ -80,7 +84,8 @@ mod tests {
                     .await
                     .expect("begin_operation should succeed");
 
-                let changes_made = test_fn(operation.clone(), path.clone()).await;
+                let changes_made =
+                    test_fn(repository.clone(), operation.clone(), path.clone()).await;
 
                 operation
                     .finalize(changes_made)
@@ -151,10 +156,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_operation_create_dir_all() {
-        run_fs_test(|operation, path| async move {
+        run_fs_test(|repository, operation, path| async move {
             let rel_path = RelativePath::new_from_initial_path("test_subdir/nested").unwrap();
             operation
-                .create_dir_all(FilesystemPath::Repository(&rel_path))
+                .create_dir_all(FilesystemPath::Repository(
+                    &RepositoryPath::from_relative(&repository, rel_path).unwrap(),
+                ))
                 .await
                 .expect("create_dir_all should succeed");
 
@@ -170,8 +177,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_operation_file_info_directory() {
-        run_fs_test(|operation, _path| async move {
+        run_fs_test(|repository, operation, _path| async move {
             let rel_path = RelativePath::new_from_initial_path("test_dir").unwrap();
+            let rel_path = RepositoryPath::from_relative(&repository, rel_path).unwrap();
             operation
                 .create_dir_all(FilesystemPath::Repository(&rel_path))
                 .await
@@ -191,7 +199,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_operation_file_info_file() {
-        run_fs_test(|operation, path| async move {
+        run_fs_test(|repository, operation, path| async move {
             let test_file = path.join("test_file.txt");
             let content = b"test content";
             {
@@ -201,7 +209,9 @@ mod tests {
 
             let rel_path = RelativePath::new_from_initial_path("test_file.txt").unwrap();
             let info = operation
-                .file_info(FilesystemPath::Repository(&rel_path))
+                .file_info(FilesystemPath::Repository(
+                    &RepositoryPath::from_relative(&repository, rel_path).unwrap(),
+                ))
                 .await
                 .expect("file_info should succeed");
             assert!(info.exists, "File should exist");
@@ -215,10 +225,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_operation_file_info_nonexistent() {
-        run_fs_test(|operation, _path| async move {
+        run_fs_test(|repository, operation, _path| async move {
             let rel_path = RelativePath::new_from_initial_path("nonexistent").unwrap();
             let info = operation
-                .file_info(FilesystemPath::Repository(&rel_path))
+                .file_info(FilesystemPath::Repository(
+                    &RepositoryPath::from_relative(&repository, rel_path).unwrap(),
+                ))
                 .await
                 .expect("file_info should succeed even for nonexistent path");
             assert!(!info.exists, "Nonexistent path should have exists=false");
@@ -231,8 +243,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_operation_create_file() {
-        run_fs_test(|operation, path| async move {
+        run_fs_test(|repository, operation, path| async move {
             let rel_path = RelativePath::new_from_initial_path("new_file.txt").unwrap();
+            let rel_path = RepositoryPath::from_relative(&repository, rel_path).unwrap();
             operation
                 .create_file(FilesystemPath::Repository(&rel_path))
                 .await
@@ -260,7 +273,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_operation_remove_file() {
-        run_fs_test(|operation, path| async move {
+        run_fs_test(|repository, operation, path| async move {
             let test_file = path.join("to_remove.txt");
             {
                 let mut file = std::fs::File::create(&test_file).expect("Create file failed");
@@ -270,7 +283,9 @@ mod tests {
 
             let rel_path = RelativePath::new_from_initial_path("to_remove.txt").unwrap();
             operation
-                .remove(FilesystemPath::Repository(&rel_path))
+                .remove(FilesystemPath::Repository(
+                    &RepositoryPath::from_relative(&repository, rel_path).unwrap(),
+                ))
                 .await
                 .expect("remove should succeed");
 
@@ -282,8 +297,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_operation_remove_empty_directory() {
-        run_fs_test(|operation, path| async move {
+        run_fs_test(|repository, operation, path| async move {
             let rel_path = RelativePath::new_from_initial_path("empty_dir").unwrap();
+            let rel_path = RepositoryPath::from_relative(&repository, rel_path).unwrap();
             operation
                 .create_dir_all(FilesystemPath::Repository(&rel_path))
                 .await
@@ -308,7 +324,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_operation_remove_recursive() {
-        run_fs_test(|operation, path| async move {
+        run_fs_test(|repository, operation, path| async move {
             let dir_path = path.join("dir_with_contents");
             std::fs::create_dir_all(&dir_path).expect("Create directory failed");
             {
@@ -329,7 +345,9 @@ mod tests {
 
             let rel_path = RelativePath::new_from_initial_path("dir_with_contents").unwrap();
             operation
-                .remove_recursive(FilesystemPath::Repository(&rel_path))
+                .remove_recursive(FilesystemPath::Repository(
+                    &RepositoryPath::from_relative(&repository, rel_path).unwrap(),
+                ))
                 .await
                 .expect("remove_recursive should succeed");
 
@@ -344,7 +362,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_operation_copy_to_scratch_file() {
-        run_fs_test(|operation, path| async move {
+        run_fs_test(|repository, operation, path| async move {
             let source_file = path.join("source.txt");
             let content = b"source content for copy test";
             {
@@ -358,7 +376,12 @@ mod tests {
 
             let source_rel_path = RelativePath::new_from_initial_path("source.txt").unwrap();
             operation
-                .copy_to_scratch_file(FilesystemPath::Repository(&source_rel_path), &scratch_file)
+                .copy_to_scratch_file(
+                    FilesystemPath::Repository(
+                        &RepositoryPath::from_relative(&repository, source_rel_path).unwrap(),
+                    ),
+                    &scratch_file,
+                )
                 .await
                 .expect("copy_to_scratch_file should succeed");
 
@@ -381,7 +404,7 @@ mod tests {
     async fn instance_operation_make_executable() {
         use std::os::unix::fs::PermissionsExt;
 
-        run_fs_test(|operation, path| async move {
+        run_fs_test(|repository, operation, path| async move {
             let test_file = path.join("script.sh");
             {
                 let mut file = std::fs::File::create(&test_file).expect("Create file failed");
@@ -399,7 +422,12 @@ mod tests {
 
             let rel_path = RelativePath::new_from_initial_path("script.sh").unwrap();
             operation
-                .make_executable(FilesystemPath::Repository(&rel_path))
+                .make_executable(
+                    FilesystemPath::Repository(
+                        &RepositoryPath::from_relative(&repository, rel_path).unwrap(),
+                    ),
+                    true,
+                )
                 .await
                 .expect("make_executable should succeed");
 
@@ -417,7 +445,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_operation_scratch_path() {
-        run_fs_test(|operation, _path| async move {
+        run_fs_test(|_repository, operation, _path| async move {
             let scratch_dir = std::env::temp_dir().join("lore_test_scratch_dir");
             std::fs::create_dir_all(&scratch_dir).expect("Create scratch dir failed");
 

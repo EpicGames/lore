@@ -73,9 +73,12 @@ pub async fn merge3_text_by_pathbuf(
     result: PathBuf,
     mode: MergeTextMode<'_>,
 ) -> std::io::Result<bool> {
-    let base_buffer = lore_spawn!(async move { tokio::fs::read(base).await });
-    let mine_buffer = lore_spawn!(async move { tokio::fs::read(mine).await });
-    let theirs_buffer = lore_spawn!(async move { tokio::fs::read(theirs).await });
+    let base_buffer =
+        lore_spawn!(async move { lore_io::IoDriver::global().read_file_bytes(base).await });
+    let mine_buffer =
+        lore_spawn!(async move { lore_io::IoDriver::global().read_file_bytes(mine).await });
+    let theirs_buffer =
+        lore_spawn!(async move { lore_io::IoDriver::global().read_file_bytes(theirs).await });
 
     let base_buffer = base_buffer.await;
     let mine_buffer = mine_buffer.await;
@@ -96,8 +99,9 @@ pub async fn merge3_text_by_pathbuf(
         let merge_output = match merge_result {
             Err(str) | Ok(str) => str,
         };
-        #[allow(clippy::disallowed_methods)] // Authorized merge output writer.
-        tokio::fs::write(result, merge_output).await?;
+        lore_io::IoDriver::global()
+            .write_file_bytes(result, bytes::Bytes::from(merge_output), false)
+            .await?;
     }
 
     Ok(merge_conflicts)
@@ -116,9 +120,12 @@ pub async fn merge3_text_by_path(
     let mine = mine.to_absolute_path(repository_path);
     let theirs = theirs.to_absolute_path(repository_path);
 
-    let base_buffer = lore_spawn!(async move { tokio::fs::read(base).await });
-    let mine_buffer = lore_spawn!(async move { tokio::fs::read(mine).await });
-    let theirs_buffer = lore_spawn!(async move { tokio::fs::read(theirs).await });
+    let base_buffer =
+        lore_spawn!(async move { lore_io::IoDriver::global().read_file_bytes(base).await });
+    let mine_buffer =
+        lore_spawn!(async move { lore_io::IoDriver::global().read_file_bytes(mine).await });
+    let theirs_buffer =
+        lore_spawn!(async move { lore_io::IoDriver::global().read_file_bytes(theirs).await });
 
     let base_buffer = base_buffer.await;
     let mine_buffer = mine_buffer.await;
@@ -140,8 +147,9 @@ pub async fn merge3_text_by_path(
         let merge_output = match merge_result {
             Err(str) | Ok(str) => str,
         };
-        #[allow(clippy::disallowed_methods)] // Authorized merge output writer.
-        tokio::fs::write(result, merge_output).await?;
+        lore_io::IoDriver::global()
+            .write_file_bytes(result, bytes::Bytes::from(merge_output), false)
+            .await?;
     }
 
     Ok(merge_conflicts)

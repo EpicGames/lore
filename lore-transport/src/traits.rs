@@ -8,6 +8,7 @@ use bytes::Bytes;
 use lore_base::types::*;
 
 use crate::connection::Connection;
+use crate::connection::SuppliedCredentials;
 use crate::error::ProtocolError;
 use crate::types::*;
 
@@ -15,17 +16,20 @@ use crate::types::*;
 #[async_trait]
 pub trait Protocol: Send + Sync {
     /// Connect to remote storage service
+    #[allow(clippy::too_many_arguments)]
     async fn storage(
         &self,
         connection: Weak<Connection>,
         remote_url: &str,
         auth_url: &str,
         identity: &str,
-        repository: RepositoryId,
+        partition: Partition,
         index: usize,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Storage>, ProtocolError>;
 
     /// Connect to remote revision service
+    #[allow(clippy::too_many_arguments)]
     async fn revision(
         &self,
         connection: Weak<Connection>,
@@ -33,6 +37,7 @@ pub trait Protocol: Send + Sync {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Revision>, ProtocolError>;
 
     /// Connect to remote repository service
@@ -42,9 +47,11 @@ pub trait Protocol: Send + Sync {
         remote_url: &str,
         auth_url: &str,
         identity: &str,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Repository>, ProtocolError>;
 
     /// Connect to remote admin service
+    #[allow(clippy::too_many_arguments)]
     async fn admin(
         &self,
         connection: Weak<Connection>,
@@ -52,9 +59,11 @@ pub trait Protocol: Send + Sync {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Admin>, ProtocolError>;
 
     /// Connect to remote lock service
+    #[allow(clippy::too_many_arguments)]
     async fn lock(
         &self,
         connection: Weak<Connection>,
@@ -62,6 +71,7 @@ pub trait Protocol: Send + Sync {
         auth_url: &str,
         identity: &str,
         repository: RepositoryId,
+        credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Lock>, ProtocolError>;
 
     /// Connect to remote environment service
@@ -75,13 +85,13 @@ pub trait Protocol: Send + Sync {
 /// Storage protocol
 #[async_trait]
 pub trait Storage: Send + Sync {
-    /// Start a session for the given repository and correlation ID.
+    /// Start a session for the given partition and correlation ID.
     /// Returns a raw session ID. The caller is responsible for calling
     /// `session_stop` when done. Prefer `StorageConnector::session()` for
     /// automatic lifecycle management.
     async fn session_start(
         &self,
-        repository: RepositoryId,
+        partition: Partition,
         correlation_id: &str,
     ) -> Result<u32, ProtocolError>;
 
@@ -140,8 +150,8 @@ pub trait Storage: Send + Sync {
         heal: bool,
     ) -> Result<VerifyResult, ProtocolError>;
 
-    /// Copy a fragment from `(source_repository, source_address)` to
-    /// `(session.repository, source_address.hash, target_context)`.
+    /// Copy a fragment from `(source_partition, source_address)` to
+    /// `(session.partition, source_address.hash, target_context)`.
     ///
     /// The hash is preserved by the transport (content-addressed); the target context lets the
     /// caller pivot the destination's dedup tag without ever transferring the payload — including
@@ -149,7 +159,7 @@ pub trait Storage: Send + Sync {
     async fn copy(
         &self,
         session_id: u32,
-        source_repository: RepositoryId,
+        source_partition: Partition,
         source_address: Address,
         target_context: Context,
     ) -> Result<(), ProtocolError>;
@@ -163,6 +173,47 @@ pub trait Storage: Send + Sync {
     ) -> Result<Hash, ProtocolError> {
         let _ = (session_id, key, key_type);
         Err(ProtocolError::internal("unsupported: mutable_load"))
+    }
+
+    /// `mutable_load(key)` followed by `get(Address { hash: resolved, context })`, performed
+    /// server-side in one round trip.
+    ///
+    /// The key is always read as [`KeyType::Resolve`], so no key type is sent. `context` is
+    /// required because the mutable store yields only a hash. `flags` is a `get_resolved_flags`
+    /// bitmask; 0 for default behaviour.
+    ///
+    /// Returns `(resolved_hash, fragment, payload)`; the hash permits caching the key->hash
+    /// mapping and verifying the payload.
+    async fn get_resolved(
+        &self,
+        session_id: u32,
+        key: &Hash,
+        context: &Context,
+        flags: u32,
+    ) -> Result<(Hash, Fragment, Bytes), ProtocolError> {
+        let _ = (session_id, key, context, flags);
+        Err(ProtocolError::internal("unsupported: get_resolved"))
+    }
+
+    /// `put(address, fragment, payload)` followed by a `KeyType::Resolve` mapping of `key` to
+    /// `address.hash`, performed server-side in one round trip. The write side of
+    /// [`Storage::get_resolved`].
+    ///
+    /// The mapping lands only once the fragment is durably stored, so a key never resolves to
+    /// content the server does not hold. Only a root fragment is published this way; a fragment
+    /// list's leaves are written with ordinary [`Storage::put`] calls beforehand.
+    ///
+    /// A zero `address.hash` removes the mapping instead; `fragment` and `payload` are ignored.
+    async fn put_resolved(
+        &self,
+        session_id: u32,
+        key: &Hash,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+    ) -> Result<(), ProtocolError> {
+        let _ = (session_id, key, address, fragment, payload);
+        Err(ProtocolError::internal("unsupported: put_resolved"))
     }
 
     /// Store a mutable key-value pair.

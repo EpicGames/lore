@@ -110,6 +110,7 @@ Tokio
 Zstd
 
 # Technical terms missing from Vale's bundled Hunspell dictionary:
+[Aa]ntichain
 [Aa]sync
 [Aa]utogenerat(e|es|ion)
 benchmarked
@@ -125,5 +126,7 @@ packfiles
 paginator
 performant
 precompiled
+syscall
+syscalls
 [Tt]iering
 worktree

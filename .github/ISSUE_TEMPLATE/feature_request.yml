@@ -1,0 +1,35 @@
+name: Feature request
+description: Propose a concrete improvement to Lore
+labels: [enhancement, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Large or cross-cutting ideas (new subsystems, protocol or format changes,
+        anything spanning multiple crates) should start as a
+        [Lore Enhancement Proposal](https://github.com/EpicGames/lore/blob/main/docs/proposals/README.md)
+        instead of an issue. For open-ended discussion, use `#feature-requests` on
+        [Discord](https://discord.gg/E4SFJKRPbg).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What are you trying to do that Lore currently makes hard or impossible?
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How would you like this to work?
+    validations:
+      required: false
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: >
+        Workarounds you use today, what you tried with existing features,
+        or other approaches you ruled out.
+    validations:
+      required: false

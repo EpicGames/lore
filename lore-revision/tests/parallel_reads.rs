@@ -595,7 +595,6 @@ mod tests {
                 link: None,
                 layer_messages: std::collections::HashMap::new(),
                 layer: None,
-                stats: false,
             },
         ))
         .await
@@ -650,7 +649,6 @@ mod tests {
                 link: None,
                 layer_messages: std::collections::HashMap::new(),
                 layer: None,
-                stats: false,
             },
         ))
         .await

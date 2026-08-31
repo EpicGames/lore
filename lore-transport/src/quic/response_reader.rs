@@ -10,7 +10,7 @@ use bytes::Bytes;
 use bytes::BytesMut;
 use dashmap::DashMap;
 use lore_base::lore_debug;
-use lore_base::lore_spawn;
+use lore_base::lore_spawn_net;
 use lore_base::lore_trace;
 use quinn::ConnectionError;
 use quinn::ReadError;
@@ -46,7 +46,7 @@ impl ResponseReader {
         let pending = Arc::new(PendingCommandMap::new());
         let pending_clone = pending.clone();
         ResponseReader {
-            task: lore_spawn!({
+            task: lore_spawn_net!({
                 async move {
                     let pending = pending_clone;
                     let result = read_response(
