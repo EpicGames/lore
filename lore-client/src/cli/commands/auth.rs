@@ -154,19 +154,6 @@ fn resolve_login_remote_url(
 }
 
 pub fn handle_login_command(globals: LoreGlobalArgs, args: &AuthLoginArgs) -> u8 {
-    if args.token_type.is_some() ^ args.token.is_some() {
-        crate::eprintln!("Both --token-type and --token are required for non-interactive login");
-        return 1;
-    }
-
-    let remote_url = match resolve_login_remote_url(&globals, args) {
-        Ok(remote_url) => remote_url,
-        Err(message) => {
-            crate::eprintln!("{message}");
-            return 1;
-        }
-    };
-
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::AuthUrl(data) => {
@@ -193,6 +180,13 @@ pub fn handle_login_command(globals: LoreGlobalArgs, args: &AuthLoginArgs) -> u8
     ));
 
     if let (Some(token_type), Some(token)) = (args.token_type.as_deref(), args.token.as_deref()) {
+        let remote_url = match resolve_login_remote_url(&globals, args) {
+            Ok(remote_url) => remote_url,
+            Err(message) => {
+                crate::eprintln!("{message}");
+                return 1;
+            }
+        };
         let args = LoreAuthLoginWithTokenArgs {
             remote_url,
             token: token.into(),
@@ -200,7 +194,17 @@ pub fn handle_login_command(globals: LoreGlobalArgs, args: &AuthLoginArgs) -> u8
             auth_url: args.auth_url.as_deref().into(),
         };
         runtime().block_on(auth::login_with_token(globals, args, callback)) as u8
+    } else if args.token_type.is_some() || args.token.is_some() {
+        crate::eprintln!("Both --token-type and --token are required for non-interactive login");
+        1
     } else {
+        let remote_url = match resolve_login_remote_url(&globals, args) {
+            Ok(remote_url) => remote_url,
+            Err(message) => {
+                crate::eprintln!("{message}");
+                return 1;
+            }
+        };
         let args = LoreAuthLoginInteractiveArgs {
             remote_url,
             no_browser: if args.no_browser { 1 } else { 0 },
@@ -619,5 +623,15 @@ mod tests {
             resolve_login_remote_url(&globals, &args).unwrap().as_str(),
             "lore.example.com"
         );
+    }
+
+    #[test]
+    fn login_with_only_one_token_arg_fails() {
+        let globals = globals_without_repo();
+        let args = login_args(None, Some("api-key"), None, None);
+        assert_eq!(handle_login_command(globals.clone(), &args), 1);
+
+        let args = login_args(None, None, Some("secret"), None);
+        assert_eq!(handle_login_command(globals, &args), 1);
     }
 }
