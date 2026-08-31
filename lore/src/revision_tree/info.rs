@@ -100,7 +100,6 @@ async fn info_impl(
         },
         async move |internal, args: LoreRevisionTreeInfoArgs| {
             let id = args.id;
-
             let access = internal.access_shared().await;
             let state = access.state();
 

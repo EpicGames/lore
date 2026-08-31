@@ -1380,6 +1380,8 @@ pub extern "C" fn lore_branch_merge_restart_async(
 }
 
 pub type LoreBranchMergeStartArgs = crate::branch::LoreBranchMergeStartArgs;
+pub type LorePathMergeRule = crate::branch::LorePathMergeRule;
+pub type LorePathMergeStrategy = crate::branch::LorePathMergeStrategy;
 
 /// Start a merge from another branch into the current branch.
 ///

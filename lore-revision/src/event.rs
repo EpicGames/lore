@@ -437,6 +437,8 @@ pub enum LoreErrorCode {
     Internal = -1,
     /// The backing store is overloaded; the caller should retry later.
     SlowDown = 31,
+    /// The target branch tip advanced past the caller's parent revision.
+    BranchAdvanced = 41,
 }
 
 // cbindgen cannot evaluate a const in a discriminant position — it drops the
@@ -448,6 +450,8 @@ const _: () = assert!(LoreErrorCode::Internal as i32 == lore_error_set::Internal
 const _: () =
     assert!(LoreErrorCode::InvalidArguments as i32 == lore_base::error::InvalidArguments::FFI_CODE);
 const _: () = assert!(LoreErrorCode::SlowDown as i32 == lore_base::error::SlowDown::FFI_CODE);
+const _: () =
+    assert!(LoreErrorCode::BranchAdvanced as i32 == lore_base::error::BranchAdvanced::FFI_CODE);
 const _: () =
     assert!(LoreErrorCode::AddressNotFound as i32 == lore_base::error::AddressNotFound::FFI_CODE);
 

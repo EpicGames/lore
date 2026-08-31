@@ -386,6 +386,8 @@ pub struct LoreRepositoryCreateArgs {
     pub description: LoreString,
     /// Optional repository ID, set to empty string to generate a new ID
     pub id: LoreString,
+    /// Optional default branch name, set to empty string to use the Lore default
+    pub default_branch_name: LoreString,
     /// Whether to use the shared store instead of a local immutable store. Zero-initialized
     /// (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
     pub use_shared_store: LoreSharedStoreMode,
@@ -463,6 +465,11 @@ async fn create_impl(args: &LoreRepositoryCreateArgs) -> Result<(), CreateError>
         } else {
             None
         },
+        default_branch_name: if !args.default_branch_name.is_empty() {
+            Some(args.default_branch_name.to_string())
+        } else {
+            None
+        },
         shared_store_options: SharedStoreToUseConfig::from_cli_args(
             &global_config,
             args.use_shared_store,
@@ -523,6 +530,11 @@ async fn create_with_metadata_impl(
         id: if !id.is_zero() { Some(id) } else { None },
         description: if !args.description.is_empty() {
             Some(args.description.to_string())
+        } else {
+            None
+        },
+        default_branch_name: if !args.default_branch_name.is_empty() {
+            Some(args.default_branch_name.to_string())
         } else {
             None
         },

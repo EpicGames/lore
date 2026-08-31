@@ -139,6 +139,13 @@ async fn node_info_impl(
                 return Err(invalid("node id is unknown"));
             };
 
+            // A discarded slot keeps its name for history weaving; the node
+            // itself is gone (e.g. deleted through this handle).
+            if node.is_discarded() {
+                emit_node_info_error(id, LoreErrorCode::InvalidArguments);
+                return Err(invalid("node id resolves to a deleted node"));
+            }
+
             let name = if node_id == ROOT_NODE {
                 String::new()
             } else {

@@ -616,6 +616,17 @@ pub async fn read_stream(
     )
     .await?;
 
+    if let Some(max) = options.max_content_size
+        && fragment.size_content > max
+    {
+        return Err(StorageError::from(crate::errors::Oversized {
+            context: format!(
+                "fragment size_content {} exceeds caller-supplied max {max}",
+                fragment.size_content
+            ),
+        }));
+    }
+
     let range = resolve_content_range(range, fragment.size_content);
     let streamed = range.start as u64..range.end as u64;
     if range.is_empty() {

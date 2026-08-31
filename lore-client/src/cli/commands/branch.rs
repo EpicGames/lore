@@ -37,6 +37,8 @@ use lore::interface::LoreBranchUnprotectArgs;
 use lore::interface::LoreEvent;
 use lore::interface::LoreGlobalArgs;
 use lore::interface::LoreMetadataType;
+use lore::interface::LorePathMergeRule;
+use lore::interface::LorePathMergeStrategy;
 use lore::interface::LoreString;
 use lore::interface::Partition;
 use lore::runtime;
@@ -142,6 +144,21 @@ impl From<&BranchSourceSpecifier> for LoreString {
     }
 }
 
+#[derive(Clone, Default, Args)]
+pub struct BranchMergePathStrategyArgs {
+    /// Path merge rules as strategy:path entries, e.g. keep-target:.git,exclude:generated
+    #[clap(long, value_name = "strategy:path", value_delimiter = ',')]
+    merge_strategy: Vec<String>,
+
+    /// Keep the current target branch version for matching paths
+    #[clap(long, value_name = "path", value_delimiter = ',')]
+    keep_target: Vec<String>,
+
+    /// Exclude matching source changes from the merge
+    #[clap(long, value_name = "path", value_delimiter = ',')]
+    exclude: Vec<String>,
+}
+
 #[derive(Args)]
 #[command(subcommand_negates_reqs = true)]
 pub struct BranchMergeArgs {
@@ -156,6 +173,9 @@ pub struct BranchMergeArgs {
     /// Change the message for committing when no conflicts arise from the merge
     #[clap(long, action)]
     message: Option<String>,
+
+    #[clap(flatten)]
+    path_strategy: BranchMergePathStrategyArgs,
 }
 
 #[derive(Args)]
@@ -183,6 +203,9 @@ pub struct BranchMergeStartArgs {
     /// Merge only the main repository, skipping all linked repositories
     #[clap(long, action, conflicts_with = "link")]
     ignore_links: bool,
+
+    #[clap(flatten)]
+    path_strategy: BranchMergePathStrategyArgs,
 }
 
 #[derive(Args)]
@@ -1073,13 +1096,74 @@ fn handle_branch_merge_into(globals: LoreGlobalArgs, args: &BranchMergeIntoArgs)
     return runtime().block_on(branch::merge_into(globals, merge_into_args, callback)) as u8;
 }
 
+fn parse_path_merge_strategy(value: &str) -> Result<LorePathMergeStrategy, String> {
+    match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "merge" => Ok(LorePathMergeStrategy::Merge),
+        "keep-target" | "keeptarget" | "target" => Ok(LorePathMergeStrategy::KeepTarget),
+        "exclude" => Ok(LorePathMergeStrategy::Exclude),
+        _ => Err(format!(
+            "invalid path merge strategy '{value}'; expected merge, keep-target, or exclude"
+        )),
+    }
+}
+
+fn push_path_merge_rule(
+    rules: &mut Vec<LorePathMergeRule>,
+    strategy: LorePathMergeStrategy,
+    path: &str,
+) -> Result<(), String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("path merge strategy paths cannot be empty".to_string());
+    }
+    rules.push(LorePathMergeRule {
+        path: LoreString::from(path),
+        strategy,
+    });
+    Ok(())
+}
+
+fn parse_path_merge_rules(
+    args: &BranchMergePathStrategyArgs,
+) -> Result<Vec<LorePathMergeRule>, String> {
+    let mut rules = Vec::new();
+
+    for value in &args.merge_strategy {
+        let (strategy, path) = value.split_once(':').ok_or_else(|| {
+            format!(
+                "invalid path merge rule '{value}'; expected strategy:path, e.g. keep-target:.git"
+            )
+        })?;
+        push_path_merge_rule(&mut rules, parse_path_merge_strategy(strategy)?, path)?;
+    }
+
+    for path in &args.keep_target {
+        push_path_merge_rule(&mut rules, LorePathMergeStrategy::KeepTarget, path)?;
+    }
+
+    for path in &args.exclude {
+        push_path_merge_rule(&mut rules, LorePathMergeStrategy::Exclude, path)?;
+    }
+
+    Ok(rules)
+}
+
 fn handle_branch_merge_start(globals: LoreGlobalArgs, args: &BranchMergeStartArgs) -> u8 {
+    let path_merge_rules = match parse_path_merge_rules(&args.path_strategy) {
+        Ok(rules) => rules,
+        Err(err) => {
+            println!("error: {err}");
+            return 1;
+        }
+    };
+
     let merge_start_args = LoreBranchMergeStartArgs {
         branch: LoreString::from(&args.branch),
         message: LoreString::from(&args.message),
         no_commit: args.no_commit as u8,
         link: LoreString::from(&args.link),
         ignore_links: args.ignore_links as u8,
+        path_merge_rules: LoreArray::from_vec(path_merge_rules),
     };
 
     let debug = progress_debug();
@@ -1321,6 +1405,7 @@ pub fn handle_branch_merge(globals: LoreGlobalArgs, args: &BranchMergeArgs) -> u
             dry_run: false,
             link: None,
             ignore_links: false,
+            path_strategy: args.path_strategy.clone(),
         };
 
         return handle_branch_merge_start(globals, &sub_args);

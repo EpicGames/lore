@@ -209,6 +209,7 @@ pub async fn cherry_pick(
         diff,
         state_current.clone(),
         MergeType::CherryPick,
+        &[],
         false,
         current_branch,
     )

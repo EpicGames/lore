@@ -44,6 +44,8 @@ static REGISTER_BUILTIN_PROTOCOLS: Once = Once::new();
 
 pub fn find(scheme: &str) -> Result<Arc<dyn Protocol>, ProtocolError> {
     REGISTER_BUILTIN_PROTOCOLS.call_once(|| {
+        let _ = add("spacesync", Arc::new(LoreProtocol::default()));
+        let _ = add("spacesyncs", Arc::new(LoreProtocol::default()));
         let _ = add("lore", Arc::new(LoreProtocol::default()));
         let _ = add("lores", Arc::new(LoreProtocol::default()));
         // Legacy protocol schemes for backwards compatibility

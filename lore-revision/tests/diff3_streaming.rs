@@ -488,6 +488,7 @@ mod tests {
                         message: "merge main into feature (sparse view)".to_string(),
                         no_commit: false,
                         scope: lore_revision::branch::merge::MergeScope::MainOnly,
+                        path_merge_rules: Vec::new(),
                     },
                 )
                 .await
@@ -591,6 +592,7 @@ mod tests {
                 message: message.to_string(),
                 no_commit: false,
                 scope: lore_revision::branch::merge::MergeScope::MainOnly,
+                path_merge_rules: Vec::new(),
             },
         )
         .await
@@ -861,7 +863,7 @@ mod tests {
     /// walk runs.
     ///
     /// Build a fixture where source produces more changes than the
-    /// configured cap allows. The streaming `diff3_with_source_cap`
+    /// configured cap allows. The streaming `diff3_with_options`
     /// must error out with `BranchError::Oversized` before any target
     /// work happens. The v1 handler uses `is_oversized()` to map the
     /// failure to `Status::resource_exhausted`.
@@ -902,25 +904,26 @@ mod tests {
                 fixture.write_file("target_only.txt", b"target\n");
                 let target_revision = fixture.stage_and_commit("target add 1").await;
 
-                // Drive the streaming branch::diff3_with_source_cap
+                // Drive the streaming branch::diff3_with_options
                 // with a cap below source's 3-change count. The cap
                 // fires inside revision::diff3 and the error wraps as
                 // BranchError::Diff at the branch layer.
                 let (tx, mut rx) = tokio::sync::mpsc::channel::<
                     Result<lore_revision::revision::DiffItem, lore_revision::branch::BranchError>,
                 >(8);
-                let producer = Box::pin(branch::diff3_with_source_cap(
+                let producer = Box::pin(branch::diff3_with_options(
                     fixture.repository.clone(),
                     source_branch,
                     source_revision,
                     target_branch,
                     target_revision,
-                    None,
-                    false, // include_same
-                    false, // auto_resolve
-                    Some(1),
-                    None, // history_walk_concurrency: default
-                    None, // graft_view: no grafting
+                    branch::Diff3Options {
+                        include_same: false,
+                        auto_resolve: false,
+                        source_cap: Some(1),
+                        history_walk_concurrency: None,
+                        ..Default::default()
+                    },
                     tx,
                 ));
                 // Drain any items the producer emits before erroring.
@@ -1222,6 +1225,7 @@ mod tests {
                         message: "merge target into source".to_string(),
                         no_commit: false,
                         scope: lore_revision::branch::merge::MergeScope::MainOnly,
+                        path_merge_rules: Vec::new(),
                     },
                 )
                 .await

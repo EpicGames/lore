@@ -13,10 +13,12 @@ use bytes::BytesMut;
 use lore_base::error::Disconnected;
 use lore_base::error::NotAuthorized;
 use lore_base::error::NotFound;
+use lore_base::error::NotSupported;
 use lore_base::error::Oversized;
 use lore_base::error::SlowDown;
 use lore_base::lore_debug;
 use lore_base::lore_trace;
+use lore_base::lore_warn;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Fragment;
@@ -49,6 +51,7 @@ use super::super::storage_service::MAX_CHUNK_SIZE;
 use super::super::storage_service::auth::StorageClientAuth;
 use crate::connection::Connection;
 use crate::connection::SuppliedCredentials;
+use crate::direct_download::DirectDownloadBatcher;
 use crate::error::ProtocolError;
 use crate::quic::client::CongestionAlgorithm;
 use crate::traits::Storage;
@@ -72,6 +75,7 @@ pub struct StorageClient {
     quic: Arc<QuicConnection>,
     connection_establish: Semaphore,
     command_limit: Semaphore,
+    direct_downloads: DirectDownloadBatcher,
     sent: AtomicUsize,
 }
 
@@ -117,6 +121,7 @@ impl StorageClient {
             counter: AtomicUsize::new(0),
             sent: AtomicUsize::new(0),
             command_limit: Semaphore::new(INFLIGHT_COMMAND_LIMIT),
+            direct_downloads: DirectDownloadBatcher::new(),
         }
     }
 
@@ -249,6 +254,9 @@ impl ServiceClient for StorageClient {
                         storage_service::command_name(&failed_request)
                     ),
                 }),
+                QuicClientError::NotSupported => ProtocolError::from(NotSupported {
+                    operation: storage_service::command_name(&failed_request).to_string(),
+                }),
                 _ => {
                     let name = storage_service::command_name(&failed_request);
                     ProtocolError::internal(format!(
@@ -349,6 +357,32 @@ impl Storage for StorageClient {
         session_id: u32,
         address: &Address,
     ) -> Result<(Fragment, Bytes), ProtocolError> {
+        match self
+            .direct_downloads
+            .presign(*address, |addresses, expires_in| async move {
+                self.presign_downloads(session_id, &addresses, expires_in)
+                    .await
+            })
+            .await
+        {
+            Ok(download) => match self.direct_downloads.download(download).await {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    lore_warn!(
+                        "Direct QUIC download failed for {}, falling back to server get: {err}",
+                        address
+                    );
+                }
+            },
+            Err(ProtocolError::NotSupported(_)) => {}
+            Err(err) => {
+                lore_debug!(
+                    "Direct QUIC presign failed for {}, falling back to server get: {err}",
+                    address
+                );
+            }
+        }
+
         let mut payload = send_normal_with_reconnect(self, Command::Get, session_id, || {
             [Bytes::default(), Bytes::from_owner(*address)]
         })
@@ -453,6 +487,32 @@ impl Storage for StorageClient {
         session_id: u32,
         address: &Address,
     ) -> Result<(Fragment, Bytes), ProtocolError> {
+        match self
+            .direct_downloads
+            .presign(*address, |addresses, expires_in| async move {
+                self.presign_downloads(session_id, &addresses, expires_in)
+                    .await
+            })
+            .await
+        {
+            Ok(download) => match self.direct_downloads.download(download).await {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    lore_warn!(
+                        "Direct QUIC priority download failed for {}, falling back to server get: {err}",
+                        address
+                    );
+                }
+            },
+            Err(ProtocolError::NotSupported(_)) => {}
+            Err(err) => {
+                lore_debug!(
+                    "Direct QUIC priority presign failed for {}, falling back to server get: {err}",
+                    address
+                );
+            }
+        }
+
         let mut payload = send_high_priority_with_reconnect(self, Command::Get, session_id, || {
             [Bytes::default(), Bytes::from_owner(*address)]
         })

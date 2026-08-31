@@ -146,6 +146,75 @@ impl ::prost::Name for PutResolvedResponse {
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UploadContentRequest {
+    #[prost(oneof = "upload_content_request::Part", tags = "1, 2")]
+    pub part: ::core::option::Option<upload_content_request::Part>,
+}
+/// Nested message and enum types in `UploadContentRequest`.
+pub mod upload_content_request {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Part {
+        /// Required exactly once as the first stream message.
+        #[prost(message, tag = "1")]
+        Header(super::UploadContentHeader),
+        /// Raw file bytes. Chunks may be any non-empty transport-friendly size;
+        /// callers must not pre-fragment them according to Lore internals.
+        #[prost(bytes, tag = "2")]
+        Chunk(::prost::bytes::Bytes),
+    }
+}
+impl ::prost::Name for UploadContentRequest {
+    const NAME: &'static str = "UploadContentRequest";
+    const PACKAGE: &'static str = "lore.storage.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.storage.v1.UploadContentRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.storage.v1.UploadContentRequest".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UploadContentHeader {
+    /// UUIDv7 file identity. Use the existing address context when modifying a
+    /// file. Empty asks Lore to mint a UUIDv7 for a new file.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub file_id: ::prost::bytes::Bytes,
+    /// Optional integrity assertion checked against the actual bytes read.
+    #[prost(uint64, optional, tag = "2")]
+    pub expected_size: ::core::option::Option<u64>,
+    /// Required caller-generated UUIDv7 for retry/correlation diagnostics.
+    #[prost(bytes = "bytes", tag = "3")]
+    pub request_id: ::prost::bytes::Bytes,
+}
+impl ::prost::Name for UploadContentHeader {
+    const NAME: &'static str = "UploadContentHeader";
+    const PACKAGE: &'static str = "lore.storage.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.storage.v1.UploadContentHeader".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.storage.v1.UploadContentHeader".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct UploadContentResponse {
+    #[prost(message, optional, tag = "1")]
+    pub address: ::core::option::Option<crate::lore::model::v1::Address>,
+    /// Actual logical byte count observed by Lore.
+    #[prost(uint64, tag = "2")]
+    pub size: u64,
+}
+impl ::prost::Name for UploadContentResponse {
+    const NAME: &'static str = "UploadContentResponse";
+    const PACKAGE: &'static str = "lore.storage.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.storage.v1.UploadContentResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.storage.v1.UploadContentResponse".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PutRequest {
     #[prost(message, optional, tag = "1")]
     pub address: ::core::option::Option<crate::lore::model::v1::Address>,
@@ -212,6 +281,59 @@ impl ::prost::Name for QueryResponse {
     }
     fn type_url() -> ::prost::alloc::string::String {
         "/lore.storage.v1.QueryResponse".into()
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PresignDownloadRequest {
+    #[prost(message, repeated, tag = "1")]
+    pub addresses: ::prost::alloc::vec::Vec<crate::lore::model::v1::Address>,
+    #[prost(uint64, tag = "2")]
+    pub expires_in_seconds: u64,
+}
+impl ::prost::Name for PresignDownloadRequest {
+    const NAME: &'static str = "PresignDownloadRequest";
+    const PACKAGE: &'static str = "lore.storage.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.storage.v1.PresignDownloadRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.storage.v1.PresignDownloadRequest".into()
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PresignedDownload {
+    #[prost(message, optional, tag = "1")]
+    pub address: ::core::option::Option<crate::lore::model::v1::Address>,
+    #[prost(message, optional, tag = "2")]
+    pub fragment: ::core::option::Option<crate::lore::model::v1::Fragment>,
+    #[prost(string, tag = "3")]
+    pub url: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "4")]
+    pub expires_at_epoch_seconds: u64,
+}
+impl ::prost::Name for PresignedDownload {
+    const NAME: &'static str = "PresignedDownload";
+    const PACKAGE: &'static str = "lore.storage.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.storage.v1.PresignedDownload".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.storage.v1.PresignedDownload".into()
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PresignDownloadResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub downloads: ::prost::alloc::vec::Vec<PresignedDownload>,
+}
+impl ::prost::Name for PresignDownloadResponse {
+    const NAME: &'static str = "PresignDownloadResponse";
+    const PACKAGE: &'static str = "lore.storage.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.storage.v1.PresignDownloadResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.storage.v1.PresignDownloadResponse".into()
     }
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -647,6 +769,38 @@ pub mod storage_service_client {
                 );
             self.inner.streaming(req, path, codec).await
         }
+        /// UploadContent accepts one header followed by raw byte chunks. Lore owns
+        /// chunking, hashing, compression, fragment-list construction, and durable
+        /// storage. Cancellation can leave unreachable content-addressed fragments;
+        /// it never publishes a revision or branch.
+        pub async fn upload_content(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<
+                Message = super::UploadContentRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<super::UploadContentResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.storage.v1.StorageService/UploadContent",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("lore.storage.v1.StorageService", "UploadContent"),
+                );
+            self.inner.client_streaming(req, path, codec).await
+        }
         pub async fn put(
             &mut self,
             request: impl tonic::IntoStreamingRequest<Message = super::PutRequest>,
@@ -690,6 +844,32 @@ pub mod storage_service_client {
             let mut req = request.into_request();
             req.extensions_mut()
                 .insert(GrpcMethod::new("lore.storage.v1.StorageService", "Query"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn presign_download(
+            &mut self,
+            request: impl tonic::IntoRequest<super::PresignDownloadRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PresignDownloadResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.storage.v1.StorageService/PresignDownload",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("lore.storage.v1.StorageService", "PresignDownload"),
+                );
             self.inner.unary(req, path, codec).await
         }
         pub async fn verify(
@@ -892,6 +1072,17 @@ pub mod storage_service_server {
             tonic::Response<Self::PutResolvedStream>,
             tonic::Status,
         >;
+        /// UploadContent accepts one header followed by raw byte chunks. Lore owns
+        /// chunking, hashing, compression, fragment-list construction, and durable
+        /// storage. Cancellation can leave unreachable content-addressed fragments;
+        /// it never publishes a revision or branch.
+        async fn upload_content(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::UploadContentRequest>>,
+        ) -> std::result::Result<
+            tonic::Response<super::UploadContentResponse>,
+            tonic::Status,
+        >;
         /// Server streaming response type for the Put method.
         type PutStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<super::PutResponse, tonic::Status>,
@@ -906,6 +1097,13 @@ pub mod storage_service_server {
             &self,
             request: tonic::Request<super::QueryRequest>,
         ) -> std::result::Result<tonic::Response<super::QueryResponse>, tonic::Status>;
+        async fn presign_download(
+            &self,
+            request: tonic::Request<super::PresignDownloadRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::PresignDownloadResponse>,
+            tonic::Status,
+        >;
         async fn verify(
             &self,
             request: tonic::Request<super::VerifyRequest>,
@@ -1225,6 +1423,53 @@ pub mod storage_service_server {
                     };
                     Box::pin(fut)
                 }
+                "/lore.storage.v1.StorageService/UploadContent" => {
+                    #[allow(non_camel_case_types)]
+                    struct UploadContentSvc<T: StorageService>(pub Arc<T>);
+                    impl<
+                        T: StorageService,
+                    > tonic::server::ClientStreamingService<super::UploadContentRequest>
+                    for UploadContentSvc<T> {
+                        type Response = super::UploadContentResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                tonic::Streaming<super::UploadContentRequest>,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as StorageService>::upload_content(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UploadContentSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.client_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/lore.storage.v1.StorageService/Put" => {
                     #[allow(non_camel_case_types)]
                     struct PutSvc<T: StorageService>(pub Arc<T>);
@@ -1299,6 +1544,52 @@ pub mod storage_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = QuerySvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.storage.v1.StorageService/PresignDownload" => {
+                    #[allow(non_camel_case_types)]
+                    struct PresignDownloadSvc<T: StorageService>(pub Arc<T>);
+                    impl<
+                        T: StorageService,
+                    > tonic::server::UnaryService<super::PresignDownloadRequest>
+                    for PresignDownloadSvc<T> {
+                        type Response = super::PresignDownloadResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::PresignDownloadRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as StorageService>::presign_download(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = PresignDownloadSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

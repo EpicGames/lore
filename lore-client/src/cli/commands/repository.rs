@@ -816,8 +816,8 @@ pub fn handle_repository_info(globals: LoreGlobalArgs, args: &RepositoryInfoArgs
                     anstyle::Reset,
                     data.creator
                 );
-                if let Some(created) = DateTime::from_timestamp_millis(data.created as i64)
-                    .map(|time| time.to_rfc2822())
+                if let Some(created) =
+                    DateTime::from_timestamp(data.created as i64, 0).map(|time| time.to_rfc2822())
                 {
                     println!(
                         "{}Created:{} {created}",
@@ -884,6 +884,7 @@ pub fn handle_repository_create(globals: LoreGlobalArgs, args: &RepositoryCreate
         repository_url: url.into(),
         id: LoreString::from(&args.id),
         description: LoreString::from(&args.description),
+        default_branch_name: LoreString::default(),
         use_shared_store: if args.use_shared_store {
             LoreSharedStoreMode::Enabled
         } else {

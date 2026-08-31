@@ -28,6 +28,7 @@ use reqwest::header::CONTENT_LENGTH;
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::mpsc::channel;
+use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
@@ -156,7 +157,8 @@ pub async fn handler(
                     .await
                     .map_err(GetContentError::ReadStream)?;
 
-            let stream = ReceiverStream::new(rx);
+            let stream =
+                ReceiverStream::new(rx).map(|item| item.map_err(GetContentError::ReadStream));
 
             let headers = create_stream_response_headers(query, content_length)
                 .map_err(GetContentError::HeaderGeneration)?;

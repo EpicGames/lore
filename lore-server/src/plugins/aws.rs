@@ -119,6 +119,11 @@ pub struct AwsImmutableStorePluginConfig {
     /// non-AWS hostnames like `MinIO` in Docker).
     #[serde(default)]
     pub s3_force_path_style: bool,
+
+    /// Allow clients to download immutable fragment payloads directly from S3
+    /// using short-lived presigned URLs. Disable to force server-proxied reads.
+    #[serde(default = "default_direct_downloads_enabled")]
+    pub direct_downloads_enabled: bool,
 }
 
 /// Configuration for the AWS mutable store plugin.
@@ -193,6 +198,10 @@ fn default_slow_threshold() -> u64 {
 
 fn default_timeout() -> u64 {
     5000
+}
+
+fn default_direct_downloads_enabled() -> bool {
+    true
 }
 
 // =============================================================================
@@ -338,7 +347,8 @@ impl ImmutableStorePluginFactory for AwsImmutableStorePluginFactory {
             s3_settings,
             dynamodb_settings,
             plugin_config.force_write,
-        );
+        )
+        .with_direct_downloads_enabled(plugin_config.direct_downloads_enabled);
 
         let store = AwsImmutableStore::new(s3_client, dynamodb_client, &store_settings);
 
@@ -671,6 +681,7 @@ mod tests {
             dynamodb_slow_operation_threshold_millis = 500
             timeout_millis = 3000
             force_write = true
+            direct_downloads_enabled = false
         "#;
 
         let config: toml::Value = toml::from_str(config_str).unwrap();
@@ -696,6 +707,7 @@ mod tests {
         assert_eq!(plugin_config.dynamodb_slow_operation_threshold_millis, 500);
         assert_eq!(plugin_config.timeout_millis, 3000);
         assert!(plugin_config.force_write);
+        assert!(!plugin_config.direct_downloads_enabled);
     }
 
     /// A configuration written before this change points at the table holding fragment metadata,
@@ -764,6 +776,7 @@ mod tests {
         );
         assert_eq!(plugin_config.timeout_millis, 5000);
         assert!(!plugin_config.force_write);
+        assert!(plugin_config.direct_downloads_enabled);
     }
 
     #[tokio::test]

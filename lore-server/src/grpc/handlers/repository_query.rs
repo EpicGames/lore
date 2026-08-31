@@ -142,6 +142,7 @@ pub async fn repository_query_id(
     Ok(RepositoryData {
         id,
         name: metadata.name,
+        default_branch_name: metadata.default_branch_name,
         metadata: metadata_hash,
     })
 }
@@ -200,6 +201,7 @@ pub async fn repository_query_name(
     Ok(RepositoryData {
         id,
         name: metadata.name,
+        default_branch_name: metadata.default_branch_name,
         metadata: metadata_hash,
     })
 }

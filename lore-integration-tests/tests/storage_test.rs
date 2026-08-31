@@ -120,6 +120,7 @@ mod open_tests {
                 repository_url: "lore://localhost/test-storage-open".into(),
                 description: LoreString::default(),
                 id: LoreString::default(),
+                default_branch_name: LoreString::default(),
                 use_shared_store: LoreSharedStoreMode::Disabled,
                 shared_store_path: LoreString::default(),
             },

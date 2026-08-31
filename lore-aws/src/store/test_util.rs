@@ -625,6 +625,7 @@ pub(crate) async fn store_with(
         s3: S3StoreSettings::new(BUCKET.to_string()),
         dynamodb: dynamodb_settings,
         force_write,
+        direct_downloads_enabled: true,
     };
 
     let execution = super::setup_execution("test".to_string());
@@ -667,6 +668,7 @@ pub(crate) async fn store_with_separate_metadata_table(fake: &Fake) -> Arc<AwsIm
         s3: S3StoreSettings::new(BUCKET.to_string()),
         dynamodb: dynamodb_settings,
         force_write: false,
+        direct_downloads_enabled: true,
     };
 
     let execution = super::setup_execution("test".to_string());

@@ -76,6 +76,7 @@ use crate::http::LoreHttpServer;
 use crate::http::security_headers::ContentTypePolicy;
 use crate::http::server::LoreHttpServerSettings;
 use crate::http::server::PresignSettings;
+use crate::http::server::build_presign_config;
 use crate::plugins;
 use crate::plugins::PluginRegistry;
 use crate::plugins::traits::NotificationPluginContext;
@@ -468,6 +469,19 @@ async fn launch_grpc_server(
 
     let mut environment = settings.environment.clone().unwrap_or_default();
     let feature = settings.feature.clone().unwrap_or_default();
+    let presign_config = match settings.server.http.as_ref().filter(|http| http.enabled) {
+        Some(http) => build_presign_config(&PresignSettings {
+            hmac_key: http.presigned_url_hmac_key.clone(),
+            min_ttl_seconds: http.presigned_url_min_ttl_seconds,
+            default_ttl_seconds: http.presigned_url_default_ttl_seconds,
+            max_ttl_seconds: http.presigned_url_max_ttl_seconds,
+            content_type_policy: ContentTypePolicy {
+                extra: http.presigned_url_extra_content_types.clone(),
+                denied: http.presigned_url_denied_content_types.clone(),
+            },
+        })?,
+        None => None,
+    };
 
     // Enforce store limits
     if let Some(limit) = immutable_store.max_query_batch() {
@@ -502,6 +516,7 @@ async fn launch_grpc_server(
             service_settings,
             user_agent_filter,
             forwarded_requests,
+            presign_config,
         )
         .with_jwt_verifier(jwt_verifier)?
         .serve(addr, async move {

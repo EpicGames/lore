@@ -119,3 +119,30 @@ def test_merge_into(new_lore_repo):
     repo.revision_sync()
     output = repo.revision_history()
     verify_signatures(output, 5)
+
+
+def test_merge_into_after_unpushed_target_merge(new_lore_repo):
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push(
+        "Initial main commit",
+        {"original.txt": "hello from main\n"},
+    )
+
+    clone = repo.clone(name="merge-into-clone")
+    clone.branch_create("feature-branch")
+    clone.write_files({"feature.txt": "hello from feature\n"})
+    clone.stage(scan=True)
+    clone.commit("Feature commit")
+
+    clone.branch_merge_into("main", "First merge into main")
+
+    with pytest.raises(MergeRequired):
+        clone.branch_merge_into("main", "Repeat merge into main")
+
+    clone.branch_merge_start("main", message="Merge main into feature")
+
+    clone.branch_merge_into("main", "Merge feature merge commit into main")
+    clone.branch_switch("main")
+    clone.sync()
+
+    assert clone.file_exists("feature.txt")

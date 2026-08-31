@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -11,10 +12,16 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
 use axum::http::StatusCode;
+use axum::http::header::ACCEPT_RANGES;
 use axum::http::header::CONTENT_DISPOSITION;
 use axum::http::header::CONTENT_ENCODING;
+use axum::http::header::CONTENT_LENGTH;
+use axum::http::header::CONTENT_RANGE;
 use axum::http::header::CONTENT_TYPE;
+use axum::http::header::ETAG;
+use axum::http::header::IF_RANGE;
 use axum::http::header::InvalidHeaderValue;
+use axum::http::header::RANGE;
 use axum::response::IntoResponse;
 use hex::FromHexError;
 use lore_base::runtime::LORE_CONTEXT;
@@ -24,11 +31,13 @@ use lore_revision::immutable::ImmutableError;
 use lore_revision::immutable::read_options_from_repository;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
+use lore_storage::StoreError;
+use lore_storage::StoreMatch;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
-use reqwest::header::CONTENT_LENGTH;
 use serde::Deserialize;
 use thiserror::Error;
 use tokio::sync::mpsc::channel;
+use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::http::log_http_error;
@@ -56,6 +65,14 @@ pub enum RedeemError {
     ReadStream(ImmutableError),
     #[error("Failed to generate response headers: {0}")]
     HeaderGeneration(InvalidHeaderValue),
+    #[error("Requested byte range is not satisfiable for a {0}-byte representation")]
+    RangeNotSatisfiable(u64),
+    #[error("Failed to query content metadata: {0}")]
+    Query(StoreError),
+    #[error("Address not found")]
+    NotFound,
+    #[error("Signed content length {signed} does not match stored content length {stored}")]
+    ContentLengthMismatch { signed: u64, stored: u64 },
 }
 
 impl IntoResponse for RedeemError {
@@ -71,11 +88,18 @@ impl IntoResponse for RedeemError {
             RedeemError::ReadStream(e) if e.is_address_not_found() || e.is_payload_not_found() => {
                 (StatusCode::NOT_FOUND, "address not found".to_string())
             }
+            RedeemError::NotFound => (StatusCode::NOT_FOUND, "address not found".to_string()),
+            RedeemError::RangeNotSatisfiable(_) => {
+                (StatusCode::RANGE_NOT_SATISFIABLE, self.to_string())
+            }
             RedeemError::NotConfigured => (
                 StatusCode::NOT_FOUND,
                 "presigned URL feature is not enabled".to_string(),
             ),
-            RedeemError::ReadStream(_) | RedeemError::HeaderGeneration(_) => (
+            RedeemError::ReadStream(_)
+            | RedeemError::HeaderGeneration(_)
+            | RedeemError::Query(_)
+            | RedeemError::ContentLengthMismatch { .. } => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong. See server log for more info.".to_string(),
             ),
@@ -85,6 +109,12 @@ impl IntoResponse for RedeemError {
 
         let mut headers = HeaderMap::new();
         headers.insert("content-type", "text/plain".parse().unwrap());
+        if let RedeemError::RangeNotSatisfiable(content_length) = &self {
+            headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            if let Ok(value) = HeaderValue::from_str(&format!("bytes */{content_length}")) {
+                headers.insert(CONTENT_RANGE, value);
+            }
+        }
         (status, headers, msg).into_response()
     }
 }
@@ -153,13 +183,62 @@ pub async fn handler(
             ));
 
             let options = read_options_from_repository(&repository);
+            let signed_content_length = payload.content_length;
+            let content_length = match signed_content_length {
+                Some(content_length) => content_length,
+                None if parsed_address.hash.is_zero() => 0,
+                None => {
+                    let query = repository
+                        .immutable_store()
+                        .get_metadata(parsed_repository, parsed_address)
+                        .await
+                        .map_err(RedeemError::Query)?;
+                    if query.match_made != StoreMatch::MatchFull {
+                        return Err(RedeemError::NotFound);
+                    }
+                    query.fragment.size_content
+                }
+            };
+            let etag = format!("\"{parsed_address}\"");
+            let range_header = match headers.get(IF_RANGE) {
+                Some(if_range) if if_range.as_bytes() != etag.as_bytes() => None,
+                _ => headers.get(RANGE),
+            };
+            let requested_range = parse_range(range_header, content_length)?;
+            let response_range = requested_range.clone().unwrap_or(0..content_length);
 
-            let (tx, rx) = channel(CHUNKED_RESPONSE_BUFFER_SIZE);
-
-            let content_length =
-                immutable::read_stream(repository, parsed_address, None, options, tx)
-                    .await
-                    .map_err(RedeemError::ReadStream)?;
+            let body = if parsed_address.hash.is_zero() {
+                if content_length != 0 {
+                    return Err(RedeemError::ContentLengthMismatch {
+                        signed: content_length,
+                        stored: 0,
+                    });
+                }
+                Body::empty()
+            } else {
+                let (tx, rx) = channel(CHUNKED_RESPONSE_BUFFER_SIZE);
+                let (stored_length, normalized_range) = immutable::read_stream_range(
+                    repository,
+                    parsed_address,
+                    requested_range.clone(),
+                    options,
+                    tx,
+                )
+                .await
+                .map_err(RedeemError::ReadStream)?;
+                if stored_length != content_length {
+                    return Err(RedeemError::ContentLengthMismatch {
+                        signed: content_length,
+                        stored: stored_length,
+                    });
+                }
+                if normalized_range != response_range {
+                    return Err(RedeemError::RangeNotSatisfiable(content_length));
+                }
+                let stream =
+                    ReceiverStream::new(rx).map(|item| item.map_err(RedeemError::ReadStream));
+                Body::from_stream(stream)
+            };
 
             let mut response_headers = HeaderMap::new();
             response_headers.insert(CONTENT_TYPE, content_type);
@@ -178,9 +257,26 @@ pub async fn handler(
 
             response_headers.insert(
                 CONTENT_LENGTH,
-                HeaderValue::from_str(&format!("{content_length}"))
+                HeaderValue::from_str(&(response_range.end - response_range.start).to_string())
                     .map_err(RedeemError::HeaderGeneration)?,
             );
+            response_headers.insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+            response_headers.insert(
+                ETAG,
+                HeaderValue::from_str(&etag).map_err(RedeemError::HeaderGeneration)?,
+            );
+            if requested_range.is_some() {
+                response_headers.insert(
+                    CONTENT_RANGE,
+                    HeaderValue::from_str(&format!(
+                        "bytes {}-{}/{}",
+                        response_range.start,
+                        response_range.end - 1,
+                        content_length
+                    ))
+                    .map_err(RedeemError::HeaderGeneration)?,
+                );
+            }
 
             let remaining_ttl = payload.expires_at.saturating_sub(now);
             response_headers.insert(
@@ -191,10 +287,64 @@ pub async fn handler(
 
             apply_security_headers(&mut response_headers);
 
-            let stream = ReceiverStream::new(rx);
-            Ok((StatusCode::OK, response_headers, Body::from_stream(stream)))
+            let status = if requested_range.is_some() {
+                StatusCode::PARTIAL_CONTENT
+            } else {
+                StatusCode::OK
+            };
+            Ok((status, response_headers, body))
         })
         .await
+}
+
+fn parse_range(
+    header: Option<&HeaderValue>,
+    content_length: u64,
+) -> Result<Option<Range<u64>>, RedeemError> {
+    let Some(header) = header else {
+        return Ok(None);
+    };
+    let value = header
+        .to_str()
+        .map_err(|_| RedeemError::RangeNotSatisfiable(content_length))?;
+    let value = value
+        .strip_prefix("bytes=")
+        .ok_or(RedeemError::RangeNotSatisfiable(content_length))?;
+    if value.contains(',') || content_length == 0 {
+        return Err(RedeemError::RangeNotSatisfiable(content_length));
+    }
+    let (start, end) = value
+        .split_once('-')
+        .ok_or(RedeemError::RangeNotSatisfiable(content_length))?;
+
+    let range = if start.is_empty() {
+        let suffix = end
+            .parse::<u64>()
+            .ok()
+            .filter(|suffix| *suffix != 0)
+            .ok_or(RedeemError::RangeNotSatisfiable(content_length))?;
+        content_length.saturating_sub(suffix)..content_length
+    } else {
+        let start = start
+            .parse::<u64>()
+            .map_err(|_| RedeemError::RangeNotSatisfiable(content_length))?;
+        if start >= content_length {
+            return Err(RedeemError::RangeNotSatisfiable(content_length));
+        }
+        let end_exclusive = if end.is_empty() {
+            content_length
+        } else {
+            end.parse::<u64>()
+                .map_err(|_| RedeemError::RangeNotSatisfiable(content_length))?
+                .saturating_add(1)
+                .min(content_length)
+        };
+        if end_exclusive <= start {
+            return Err(RedeemError::RangeNotSatisfiable(content_length));
+        }
+        start..end_exclusive
+    };
+    Ok(Some(range))
 }
 
 #[cfg(test)]
@@ -203,10 +353,17 @@ mod tests {
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
 
+    use axum::http::HeaderValue;
     use axum::http::StatusCode;
+    use axum::http::header::ACCEPT_RANGES;
+    use axum::http::header::CONTENT_LENGTH;
+    use axum::http::header::CONTENT_RANGE;
     use axum::http::header::CONTENT_TYPE;
+    use axum::http::header::IF_RANGE;
+    use axum::http::header::RANGE;
     use axum_test::TestServer;
     use lore_base::runtime::LORE_CONTEXT;
+    use lore_base::types::Address;
     use lore_revision::fragment;
     use lore_revision::lore::RepositoryId;
     use rand::random;
@@ -249,6 +406,7 @@ mod tests {
             content_type: content_type.map(String::from),
             content_encoding: None,
             content_disposition: None,
+            content_length: None,
         };
         sign(&payload, &config.hmac_key)
     }
@@ -358,6 +516,7 @@ mod tests {
                     content_type: None,
                     content_encoding: None,
                     content_disposition: None,
+                    content_length: None,
                 };
                 let token = sign(&payload, &config.hmac_key);
 
@@ -428,6 +587,153 @@ mod tests {
                     max_age > 3590 && max_age <= 3600,
                     "max-age {max_age} not in expected range"
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn returns_206_for_a_logical_byte_range() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repository = random::<RepositoryId>();
+                let (fragment_data, address, payload) = fragment::generate_random();
+                assert!(payload.len() > 8, "test payload must cover requested range");
+                immutable_store
+                    .clone()
+                    .put(
+                        repository,
+                        address,
+                        fragment_data,
+                        Some(payload.clone()),
+                        false,
+                    )
+                    .await
+                    .expect("Failed to put data in immutable store");
+
+                let config = presign_config();
+                let repo_hex = repository.to_string();
+                let address_str = address.to_string();
+                let token = valid_token(&repo_hex, &address_str, &config);
+                let test_health = ServerHealth::new_without_availability(immutable_store.clone());
+                let state = ServerState {
+                    immutable_store,
+                    mutable_store,
+                    jwt_verifier: None,
+                    max_file_size: 100,
+                    presign_config: Some(config),
+                };
+                let app = create_router(state, test_health, &LoreHttpServerSettings::default());
+                let server = TestServer::new(app).unwrap();
+
+                let response = server
+                    .get(&format!("/v1/presigned/{repo_hex}/{address_str}"))
+                    .add_query_param("token", token)
+                    .add_header(RANGE, HeaderValue::from_static("bytes=3-7"))
+                    .add_header(
+                        IF_RANGE,
+                        HeaderValue::from_str(&format!("\"{address_str}\"")).unwrap(),
+                    )
+                    .await;
+
+                assert_eq!(response.status_code(), StatusCode::PARTIAL_CONTENT);
+                assert_eq!(response.headers()[CONTENT_RANGE], "bytes 3-7/32");
+                assert_eq!(response.headers()[CONTENT_LENGTH], "5");
+                assert_eq!(response.headers()[ACCEPT_RANGES], "bytes");
+                assert_eq!(response.as_bytes(), &payload[3..8]);
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn returns_416_for_an_out_of_bounds_range() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repository = random::<RepositoryId>();
+                let (fragment_data, address, payload) = fragment::generate_random();
+                immutable_store
+                    .clone()
+                    .put(repository, address, fragment_data, Some(payload), false)
+                    .await
+                    .expect("Failed to put data in immutable store");
+                let config = presign_config();
+                let repo_hex = repository.to_string();
+                let address_str = address.to_string();
+                let token = valid_token(&repo_hex, &address_str, &config);
+                let test_health = ServerHealth::new_without_availability(immutable_store.clone());
+                let state = ServerState {
+                    immutable_store,
+                    mutable_store,
+                    jwt_verifier: None,
+                    max_file_size: 100,
+                    presign_config: Some(config),
+                };
+                let app = create_router(state, test_health, &LoreHttpServerSettings::default());
+                let server = TestServer::new(app).unwrap();
+
+                let response = server
+                    .get(&format!("/v1/presigned/{repo_hex}/{address_str}"))
+                    .add_query_param("token", token)
+                    .add_header(RANGE, HeaderValue::from_static("bytes=100-200"))
+                    .await;
+
+                assert_eq!(response.status_code(), StatusCode::RANGE_NOT_SATISFIABLE);
+                assert_eq!(response.headers()[CONTENT_RANGE], "bytes */32");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn returns_an_empty_body_for_a_signed_zero_address() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let repository = random::<RepositoryId>();
+                let address = Address::default().to_string();
+                let config = presign_config();
+                let repo_hex = repository.to_string();
+                let expires_at = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    + 3600;
+                let token = sign(
+                    &PresignTokenPayload {
+                        version: CURRENT_TOKEN_VERSION,
+                        key_id: config.key_id.clone(),
+                        repository: repo_hex.clone(),
+                        address: address.clone(),
+                        expires_at,
+                        content_type: Some("application/octet-stream".to_string()),
+                        content_encoding: None,
+                        content_disposition: Some("attachment; filename=\"empty.txt\"".to_string()),
+                        content_length: Some(0),
+                    },
+                    &config.hmac_key,
+                );
+                let test_health = ServerHealth::new_without_availability(immutable_store.clone());
+                let state = ServerState {
+                    immutable_store,
+                    mutable_store,
+                    jwt_verifier: None,
+                    max_file_size: 100,
+                    presign_config: Some(config),
+                };
+                let app = create_router(state, test_health, &LoreHttpServerSettings::default());
+                let server = TestServer::new(app).unwrap();
+
+                let response = server
+                    .get(&format!("/v1/presigned/{repo_hex}/{address}"))
+                    .add_query_param("token", token)
+                    .await;
+
+                assert_eq!(response.status_code(), StatusCode::OK);
+                assert_eq!(response.headers()[CONTENT_LENGTH], "0");
+                assert!(response.as_bytes().is_empty());
             })
             .await;
     }

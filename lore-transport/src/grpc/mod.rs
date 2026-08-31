@@ -488,8 +488,8 @@ impl GRPCConnection {
             credentials.from_supplied_credentials(),
         );
 
-        if let Some(auth) = self.auth.get(&key) {
-            return auth.clone();
+        if let Some(auth_entry) = self.auth.get(&key) {
+            return auth_entry.clone();
         }
 
         let auth = GRPCAuth::new(
@@ -523,8 +523,8 @@ impl GRPCConnection {
             credentials.from_supplied_credentials(),
         );
 
-        if let Some(auth) = self.auth.get(&key) {
-            return auth.clone();
+        if let Some(auth_entry) = self.auth.get(&key) {
+            return auth_entry.clone();
         }
 
         let auth = GRPCAuth::new_for_custom_resource(

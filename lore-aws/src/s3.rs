@@ -21,6 +21,7 @@ use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsError;
 use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput;
 use aws_sdk_s3::operation::put_object::PutObjectError;
 use aws_sdk_s3::operation::put_object::PutObjectOutput;
+use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use bytes::Bytes;
 use lore_telemetry::InstrumentProvider;
@@ -190,6 +191,26 @@ impl S3Impl {
             .await
             .output
             .map_err(AwsError::sdk_error)
+    }
+
+    #[tracing::instrument(name = "S3Impl::presign_get_object", skip_all)]
+    pub async fn presign_get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        expires_in: Duration,
+    ) -> Result<String, String> {
+        let presigning_config = PresigningConfig::expires_in(expires_in)
+            .map_err(|err| format!("failed to build S3 presigning config: {err}"))?;
+
+        self.client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .presigned(presigning_config)
+            .await
+            .map(|request| request.uri().to_string())
+            .map_err(|err| format!("failed to presign S3 get object: {err:?}"))
     }
 
     /// Store an object, optionally attaching object metadata carried as `x-amz-meta-*` headers.

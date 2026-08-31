@@ -100,6 +100,18 @@ pub(crate) fn build_storage_protocol_request_span(
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
         ),
+        Ok(Command::PresignDownload) => info_span!(
+            parent: None,
+            "StoragePresignDownloadTask",
+            { SAMPLING_TIER_LOW } = true,
+            { TRANSPORT } = %Transport::Quic,
+            { PROTOCOL } = %protocol,
+            { QUIC_OPCODE } = opcode_label,
+            { CONNECTION_ID } = connection_id,
+            { REPOSITORY_ID } = repository_id,
+            { CORRELATION_ID } = correlation_id,
+            { USER_ID } = user_id,
+        ),
         Ok(Command::Put) => info_span!(
             parent: None,
             "StoragePutTask",
@@ -252,6 +264,7 @@ pub enum ParsedStorageRequest {
     /// Stores a fragment and publishes a mutable key naming it, saving the caller the round trip
     /// a separate `MutableStore` would cost. v4-only: it needs both stores.
     PutResolved(requests::PutResolved),
+    PresignDownload(requests::PresignDownload),
     Put(requests::Put),
     Query(requests::Query),
     Correlate(requests::Correlate),
@@ -271,6 +284,7 @@ fn quic_error(message_error: &MessageHandleError) -> QuicServiceError {
         }
         MessageHandleError::SlowDown => QuicServiceError::SlowDown,
         MessageHandleError::Oversized => QuicServiceError::Oversized,
+        MessageHandleError::NotImplemented => QuicServiceError::NotSupported,
         _ => QuicServiceError::Failed,
     }
 }
@@ -306,6 +320,9 @@ pub fn parse_message_for_opcode(
         Command::Get => Ok(ParsedStorageRequest::Get(requests::Get::parse(bytes)?)),
         Command::GetMetadata => Ok(ParsedStorageRequest::GetMetadata(
             crate::protocol::storage::get::GetMetadata::parse(bytes)?,
+        )),
+        Command::PresignDownload => Ok(ParsedStorageRequest::PresignDownload(
+            requests::PresignDownload::parse(bytes)?,
         )),
         Command::Put => Ok(ParsedStorageRequest::Put(requests::Put::parse(bytes)?)),
         Command::Query => Ok(ParsedStorageRequest::Query(requests::Query::parse(bytes)?)),

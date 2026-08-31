@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use bytes::BufMut;
 use bytes::Bytes;
@@ -16,8 +17,10 @@ use lore_base::error::SlowDown;
 use lore_base::lore_debug;
 use lore_base::lore_error;
 use lore_base::lore_spawn_net;
+use lore_base::lore_warn;
 use lore_base::types::Address;
 use lore_base::types::Context;
+use lore_base::types::DirectDownload;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
 use lore_base::types::HealResult;
@@ -37,6 +40,7 @@ use tonic::metadata::MetadataValue;
 use super::CORRELATION_ID_HEADER;
 use super::PARTITION_ID_KEY;
 use super::REPOSITORY_ID_KEY;
+use crate::direct_download::DirectDownloadBatcher;
 use crate::error::ProtocolError;
 
 /// Translate a response's in-band `status` into a [`ProtocolError`], or `None` when the item
@@ -426,6 +430,7 @@ pub struct StorageService {
     put_resolved_streams:
         StreamCache<storage_v1::PutResolvedRequest, Arc<storage_v1::PutResolvedResponse>>,
     get_put_limiter: Semaphore,
+    direct_downloads: DirectDownloadBatcher,
 }
 
 fn inject_metadata<T>(request: &mut tonic::Request<T>, ctx: &GrpcSessionContext) {
@@ -462,6 +467,7 @@ impl StorageService {
             get_resolved_streams: StreamCache::new(),
             put_resolved_streams: StreamCache::new(),
             get_put_limiter: Semaphore::new(INFLIGHT_COMMAND_LIMIT),
+            direct_downloads: DirectDownloadBatcher::new(),
         }
     }
 
@@ -484,6 +490,31 @@ impl StorageService {
         address: &Address,
     ) -> Result<(Fragment, Bytes), ProtocolError> {
         lore_debug!("gRPC get fragment: {}", address);
+
+        match self
+            .direct_downloads
+            .presign(*address, |addresses, expires_in| async move {
+                self.presign_downloads(ctx, &addresses, expires_in).await
+            })
+            .await
+        {
+            Ok(download) => match self.direct_downloads.download(download).await {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    lore_warn!(
+                        "Direct gRPC download failed for {}, falling back to server get: {err}",
+                        address
+                    );
+                }
+            },
+            Err(ProtocolError::NotSupported(_)) => {}
+            Err(err) => {
+                lore_debug!(
+                    "Direct gRPC presign failed for {}, falling back to server get: {err}",
+                    address
+                );
+            }
+        }
 
         let _permit = self
             .get_put_limiter
@@ -520,6 +551,64 @@ impl StorageService {
         }
 
         Ok((fragment, payload))
+    }
+
+    pub async fn presign_downloads(
+        &self,
+        ctx: &GrpcSessionContext,
+        addresses: &[Address],
+        expires_in: Duration,
+    ) -> Result<Vec<DirectDownload>, ProtocolError> {
+        if addresses.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        lore_debug!("gRPC presign_download {} fragments", addresses.len());
+
+        let request = storage_v1::PresignDownloadRequest {
+            addresses: addresses.iter().map(model_v1::Address::from).collect(),
+            expires_in_seconds: expires_in.as_secs(),
+        };
+        let mut client = StorageServiceClient::new(self.connection.channel());
+        let mut req = tonic::Request::new(request);
+        inject_metadata(&mut req, ctx);
+
+        let response = client
+            .presign_download(req)
+            .await
+            .map(|res| res.into_inner())
+            .map_err(ProtocolError::from)?;
+
+        response
+            .downloads
+            .into_iter()
+            .map(|download| {
+                let address = download
+                    .address
+                    .as_ref()
+                    .ok_or_else(|| ProtocolError::internal("presign_download: missing address"))?;
+                let fragment = download
+                    .fragment
+                    .as_ref()
+                    .ok_or_else(|| ProtocolError::internal("presign_download: missing fragment"))?;
+                let fragment = Fragment {
+                    flags: fragment.flags,
+                    size_payload: fragment.size_payload,
+                    size_content: fragment.size_content,
+                };
+                if let Err(reason) = lore_base::types::validate_fragment_response(&fragment) {
+                    return Err(ProtocolError::internal(format!(
+                        "presign_download: invalid fragment {fragment:?}: {reason}"
+                    )));
+                }
+                Ok(DirectDownload {
+                    address: Address::from(address),
+                    fragment,
+                    url: download.url,
+                    expires_at_epoch_seconds: download.expires_at_epoch_seconds,
+                })
+            })
+            .collect()
     }
 
     /// Fetch only the fragment metadata for an address. Same wire request as `get` (just an
@@ -1418,6 +1507,20 @@ mod tests {
                 }
             };
             Ok(Response::new(Box::pin(stream) as Self::PutStream))
+        }
+
+        async fn upload_content(
+            &self,
+            _request: Request<Streaming<storage_v1::UploadContentRequest>>,
+        ) -> Result<Response<storage_v1::UploadContentResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
+        }
+
+        async fn presign_download(
+            &self,
+            _request: Request<storage_v1::PresignDownloadRequest>,
+        ) -> Result<Response<storage_v1::PresignDownloadResponse>, Status> {
+            Err(Status::unimplemented("not used by this test"))
         }
 
         type CopyStream = ResponseStream<storage_v1::CopyResponse>;

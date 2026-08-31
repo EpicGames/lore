@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
+use lore_macro::ValidateText;
 use lore_revision::branch;
 use lore_revision::branch::BranchError;
 use lore_revision::branch::latest::ListOptions;
@@ -11,6 +12,8 @@ use lore_revision::branch::merge::MergeError;
 use lore_revision::branch::merge::MergeIntoOptions;
 use lore_revision::branch::merge::MergeScope;
 use lore_revision::branch::merge::MergeStartOptions;
+use lore_revision::branch::merge::PathMergeRule;
+use lore_revision::branch::merge::PathMergeStrategy;
 use lore_revision::branch::push::PushOptions;
 use lore_revision::branch::reset::ResetError;
 use lore_revision::interface::LoreArray;
@@ -28,6 +31,7 @@ use lore_revision::repository;
 use lore_revision::repository::BranchSwitchOptions;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryWriteToken;
+use lore_revision::util::path::RelativePath;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -299,6 +303,42 @@ async fn list_local(
     .await
 }
 
+/// cbindgen:prefix-with-name
+/// cbindgen:rename-all=ScreamingSnakeCase
+#[repr(C)]
+/// Strategy used for a path during branch merge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ValidateText)]
+#[serde(rename_all = "camelCase")]
+pub enum LorePathMergeStrategy {
+    /// Merge the path normally.
+    #[default]
+    Merge = 0,
+    /// Keep the current target branch version for matching source changes.
+    KeepTarget = 1,
+    /// Exclude matching source changes from the merge.
+    Exclude = 2,
+}
+
+impl From<LorePathMergeStrategy> for PathMergeStrategy {
+    fn from(value: LorePathMergeStrategy) -> Self {
+        match value {
+            LorePathMergeStrategy::Merge => Self::Merge,
+            LorePathMergeStrategy::KeepTarget => Self::KeepTarget,
+            LorePathMergeStrategy::Exclude => Self::Exclude,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ValidateText)]
+/// A repository-relative path merge strategy rule.
+pub struct LorePathMergeRule {
+    /// Repository-relative path. Directories match descendants.
+    pub path: LoreString,
+    /// Strategy to apply when this rule is the most-specific match.
+    pub strategy: LorePathMergeStrategy,
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
 #[handler(merge_start_local)]
@@ -314,6 +354,9 @@ pub struct LoreBranchMergeStartArgs {
     pub link: LoreString,
     /// Merge only the main repository, skipping all linked repositories
     pub ignore_links: u8,
+    /// Ordered per-path merge strategy rules.
+    #[serde(default)]
+    pub path_merge_rules: LoreArray<LorePathMergeRule>,
 }
 
 /// Begins merging a source branch into the current branch, auto-committing if there are no conflicts.
@@ -355,6 +398,24 @@ pub async fn merge_start(
     dispatch_call(globals, args, callback, merge_start_local).await
 }
 
+fn convert_path_merge_rules(
+    repository: &RepositoryContext,
+    rules: &LoreArray<LorePathMergeRule>,
+) -> Result<Vec<PathMergeRule>, MergeError> {
+    let repository_path = repository
+        .require_path()
+        .map_err(|err| MergeError::internal_with_context(err, "resolving repository path"))?;
+    let mut converted = Vec::with_capacity(rules.len());
+    for rule in rules.as_slice() {
+        converted.push(PathMergeRule {
+            path: RelativePath::new_from_user_path(repository_path, rule.path.as_str())
+                .forward::<MergeError>("invalid path merge rule")?,
+            strategy: rule.strategy.into(),
+        });
+    }
+    Ok(converted)
+}
+
 async fn merge_start_local(
     globals: LoreGlobalArgs,
     args: LoreBranchMergeStartArgs,
@@ -375,13 +436,16 @@ async fn merge_start_local(
                 MergeScope::Link(link_str)
             };
 
-            let options = MergeStartOptions {
-                message: args.message.to_string(),
-                no_commit: args.no_commit != 0,
-                scope,
-            };
-
             async move {
+                let path_merge_rules =
+                    convert_path_merge_rules(&repository, &args.path_merge_rules)?;
+                let options = MergeStartOptions {
+                    message: args.message.to_string(),
+                    no_commit: args.no_commit != 0,
+                    scope,
+                    path_merge_rules,
+                };
+
                 let branch = branch::resolve(repository.clone(), args.branch.as_str())
                     .await
                     .forward::<MergeError>("resolving branch")?;

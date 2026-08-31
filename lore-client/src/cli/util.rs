@@ -40,7 +40,7 @@ pub fn get_repository_path(path: Option<String>) -> LoreString {
         let current_dir = std::env::current_dir().unwrap_or_default();
         let mut current_path = current_dir.as_path();
         loop {
-            if current_path.join(".urc").is_dir() || current_path.join(".lore").is_dir() {
+            if current_path.join(".urc").is_dir() || current_path.join(".spacesync").is_dir() {
                 break current_path.into();
             }
             if let Some(parent_path) = current_path.parent() {

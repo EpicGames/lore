@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 //! Smoke test verifying `lore.thin_client.v1` carries the model types and
-//! the 4 RPCs' request / response messages.
+//! the RPC request / response messages.
 
 use lore_proto::lore::thin_client::v1::Action;
 use lore_proto::lore::thin_client::v1::ContentDiffChunkResponse;
@@ -16,8 +16,11 @@ use lore_proto::lore::thin_client::v1::MetadataType;
 use lore_proto::lore::thin_client::v1::NodeType;
 use lore_proto::lore::thin_client::v1::Revision;
 use lore_proto::lore::thin_client::v1::RevisionDiffHeader;
+use lore_proto::lore::thin_client::v1::RevisionDiffMode;
 use lore_proto::lore::thin_client::v1::RevisionDiffRequest;
 use lore_proto::lore::thin_client::v1::RevisionDiffResponse;
+use lore_proto::lore::thin_client::v1::RevisionFileDownloadRequest;
+use lore_proto::lore::thin_client::v1::RevisionFileDownloadResponse;
 use lore_proto::lore::thin_client::v1::RevisionInfoRequest;
 use lore_proto::lore::thin_client::v1::RevisionInfoResponse;
 use lore_proto::lore::thin_client::v1::RevisionTreeHeader;
@@ -29,6 +32,7 @@ use lore_proto::lore::thin_client::v1::revision::Parent as RevisionParent;
 use lore_proto::lore::thin_client::v1::revision_diff_request::QueryFrom as RevisionDiffQueryFrom;
 use lore_proto::lore::thin_client::v1::revision_diff_request::QueryTo as RevisionDiffQueryTo;
 use lore_proto::lore::thin_client::v1::revision_diff_response::Payload as RevisionDiffPayload;
+use lore_proto::lore::thin_client::v1::revision_file_download_request::Query as RevisionFileDownloadQuery;
 use lore_proto::lore::thin_client::v1::revision_info_request::Query as RevisionInfoQuery;
 use lore_proto::lore::thin_client::v1::revision_tree_request::Query as RevisionTreeQuery;
 use lore_proto::lore::thin_client::v1::revision_tree_response::Payload as RevisionTreePayload;
@@ -49,6 +53,7 @@ fn v1_thin_client_model_types_default() {
     assert_eq!(NodeType::Directory as i32, 0);
     assert_eq!(Action::Keep as i32, 0);
     assert_eq!(MetadataType::Address as i32, 0);
+    assert_eq!(RevisionDiffMode::Auto as i32, 0);
 }
 
 #[test]
@@ -61,6 +66,8 @@ fn v1_thin_client_service_types_default() {
     let _ = RevisionTreeRequest::default();
     let _ = RevisionTreeResponse::default();
     let _ = RevisionTreeHeader::default();
+    let _ = RevisionFileDownloadRequest::default();
+    let _ = RevisionFileDownloadResponse::default();
 }
 
 /// Field-shape regression net: destructuring each message + naming each
@@ -107,6 +114,7 @@ fn v1_thin_client_field_shapes() {
     let DiffConflict {
         change_from: _,
         change_to: _,
+        conflict_id: _,
     } = DiffConflict::default();
     let DiffPartition {
         index: _,
@@ -116,6 +124,7 @@ fn v1_thin_client_field_shapes() {
         path: _,
         node_type: _,
         address: _,
+        last_changed_revision_signature: _,
         size: _,
         mode: _,
         tracking: _,
@@ -155,6 +164,7 @@ fn v1_thin_client_field_shapes() {
         query_from: _,
         query_to: _,
         autoresolve: _,
+        mode: _,
     } = RevisionDiffRequest::default();
     let _ = RevisionDiffQueryFrom::IdentifierFrom(Default::default());
     let _ = RevisionDiffQueryFrom::SignatureFrom(Default::default());
@@ -167,6 +177,7 @@ fn v1_thin_client_field_shapes() {
         signature_to: _,
         identifier_base: _,
         signature_base: _,
+        mode: _,
     } = RevisionDiffHeader::default();
     let RevisionDiffResponse { payload: _ } = RevisionDiffResponse::default();
     let _ = RevisionDiffPayload::Header(Default::default());
@@ -189,4 +200,25 @@ fn v1_thin_client_field_shapes() {
     let RevisionTreeResponse { payload: _ } = RevisionTreeResponse::default();
     let _ = RevisionTreePayload::Header(Default::default());
     let _ = RevisionTreePayload::Node(Default::default());
+
+    // RevisionFileDownload
+    let RevisionFileDownloadRequest {
+        query: _,
+        path: _,
+        ttl_seconds: _,
+        content_type: _,
+        inline: _,
+    } = RevisionFileDownloadRequest::default();
+    let _ = RevisionFileDownloadQuery::Identifier(Default::default());
+    let _ = RevisionFileDownloadQuery::Signature(Default::default());
+    let RevisionFileDownloadResponse {
+        revision: _,
+        repository_resolved: _,
+        address: _,
+        size: _,
+        url_suffix: _,
+        expires_at_epoch_seconds: _,
+        file_name: _,
+        mode: _,
+    } = RevisionFileDownloadResponse::default();
 }

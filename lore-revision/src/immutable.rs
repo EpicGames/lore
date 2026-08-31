@@ -281,15 +281,55 @@ pub async fn read_stream(
     address: Address,
     range: Option<Range<usize>>,
     options: ReadOptions,
-    sender: Sender<Result<Bytes, lore_storage::StorageError>>,
+    sender: Sender<Result<Bytes, ImmutableError>>,
 ) -> Result<u64, ImmutableError> {
+    let range = range.map(|range| range.start as u64..range.end as u64);
+    let (_, streamed) = read_stream_range(repository, address, range, options, sender).await?;
+    Ok(streamed.end - streamed.start)
+}
+
+pub async fn read_stream_range(
+    repository: Arc<RepositoryContext>,
+    address: Address,
+    range: Option<Range<u64>>,
+    options: ReadOptions,
+    sender: Sender<Result<Bytes, ImmutableError>>,
+) -> Result<(u64, Range<u64>), ImmutableError> {
     let store = repository.immutable_store();
     let partition = repository.id;
     let session = resolve_session(&repository);
-    lore_storage::read_stream(store, partition, address, range, options, sender, session)
-        .await
-        .map(|(_fragment, streamed)| streamed.end - streamed.start)
-        .forward("reading immutable data")
+    let range = range
+        .map(|range| {
+            let start = usize::try_from(range.start)
+                .map_err(|_| ImmutableError::internal("stream range start is too large"))?;
+            let end = usize::try_from(range.end)
+                .map_err(|_| ImmutableError::internal("stream range end is too large"))?;
+            Ok::<_, ImmutableError>(start..end)
+        })
+        .transpose()?;
+    let (storage_sender, mut storage_receiver) = tokio::sync::mpsc::channel(sender.max_capacity());
+    let (fragment, streamed) = lore_storage::read_stream(
+        store,
+        partition,
+        address,
+        range,
+        options,
+        storage_sender,
+        session,
+    )
+    .await
+    .forward::<ImmutableError>("reading immutable data")?;
+    lore_spawn!(async move {
+        while let Some(item) = storage_receiver.recv().await {
+            let item = item.map_err(|error| {
+                ImmutableError::internal_with_context(error, "reading immutable stream")
+            });
+            if sender.send(item).await.is_err() {
+                break;
+            }
+        }
+    });
+    Ok((fragment.size_content, streamed))
 }
 
 /// Read the given data range from a fragment which can be a large data set

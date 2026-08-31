@@ -44,6 +44,8 @@ use crate::metadata::Metadata;
 use crate::node::NodeFileMetadata;
 use crate::node::NodeFileMetadataBlock;
 use crate::node::NodeIDExt;
+use crate::path_merge::PathMergePolicy;
+use crate::path_merge::PathMergeRule;
 use crate::repository::RepositoryContext;
 use crate::state;
 use crate::state::State;
@@ -216,6 +218,18 @@ fn filter_from_source_changes(source_changes: &[NodeChange]) -> Option<Filter> {
     Some(filter)
 }
 
+async fn state_has_path(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    path: &RelativePath,
+) -> Result<bool, StateError> {
+    match state.find_node_link(repository, path.as_str()).await {
+        Ok(link) => Ok(link.is_valid_or_root()),
+        Err(err) if err.is_node_not_found() => Ok(false),
+        Err(err) => Err(err),
+    }
+}
+
 /// Threshold above which `diff3_collect` skips building a source-derived
 /// path filter for target's walk. Tuned to bound filter-construction
 /// cost; above this the unfiltered walk is cheaper.
@@ -243,8 +257,8 @@ const SOURCE_FILTER_THRESHOLD: usize = 10_000;
 ///    (`Move + from_path`, directory-delete overlap, history-walk
 ///    resolution) before emitting. History-walk runs in parallel via
 ///    a semaphore-bounded `JoinSet` (see the
-///    `history_walk_concurrency` parameter of
-///    `diff3_with_source_cap`, defaulting to
+///    `history_walk_concurrency` option of
+///    `diff3_with_options`, defaulting to
 ///    `DEFAULT_HISTORY_WALK_CONCURRENCY`).
 ///
 /// Returns a `Diff3Summary` carrying the base / source / target
@@ -259,16 +273,16 @@ pub async fn diff3(
     include_same: bool,
     tx: mpsc::Sender<Result<DiffItem, StateError>>,
 ) -> Result<Diff3Summary, StateError> {
-    diff3_with_source_cap(
+    diff3_with_options(
         repository,
         base,
         source,
         target,
-        path,
-        include_same,
-        None,
-        None,
-        None,
+        Diff3Options {
+            path,
+            include_same,
+            ..Default::default()
+        },
         tx,
     )
     .await
@@ -282,31 +296,47 @@ pub async fn diff3(
 /// deserialised revision blob).
 pub const DEFAULT_HISTORY_WALK_CONCURRENCY: usize = 24;
 
+/// Optional behavior for streaming revision 3-way diffs.
+#[derive(Clone, Debug)]
+pub struct Diff3Options<'a> {
+    pub path: Option<RelativePath>,
+    pub include_same: bool,
+    /// Abort with `StateError::Oversized` when source's diff produces more
+    /// than this many items. `None` keeps the diff unbounded.
+    pub source_cap: Option<usize>,
+    /// Permit count for the parallel history-walk semaphore. `None` falls back
+    /// to `DEFAULT_HISTORY_WALK_CONCURRENCY`.
+    pub history_walk_concurrency: Option<usize>,
+    /// Ordered per-path merge rules used to suppress matching merge inputs.
+    pub path_merge_rules: &'a [PathMergeRule],
+    /// View used to identify untouched out-of-view subtrees that can be grafted.
+    /// `None` disables graft adoption.
+    pub graft_view: Option<Arc<crate::filter::Filter>>,
+}
+
+impl Default for Diff3Options<'_> {
+    fn default() -> Self {
+        Self {
+            path: None,
+            include_same: false,
+            source_cap: None,
+            history_walk_concurrency: None,
+            path_merge_rules: &[],
+            graft_view: None,
+        }
+    }
+}
+
 /// `diff3` with optional tunables.
-///
-/// * `source_cap` — abort with `StateError::Oversized` when source's
-///   `diff_collect` produces more than `n` items. The error message
-///   includes the cap and the produced count. Bounds peak memory for
-///   callers that need a ceiling. Library callers (filesystem diff,
-///   merge, capi, CLI) pass `None` via `diff3` to stay unbounded.
-/// * `history_walk_concurrency` — permit count for the semaphore
-///   gating parallel `is_last_change_merged` history walks. Passing
-///   `None` falls back to `DEFAULT_HISTORY_WALK_CONCURRENCY`.
-#[allow(clippy::too_many_arguments)]
-pub async fn diff3_with_source_cap(
+pub async fn diff3_with_options(
     repository: Arc<RepositoryContext>,
     base: Hash,
     source: Hash,
     target: Hash,
-    path: Option<RelativePath>,
-    include_same: bool,
-    source_cap: Option<usize>,
-    history_walk_concurrency: Option<usize>,
-    // Decides which subtrees the view excludes and may be adopted whole.
-    // `None` disables adoption.
-    graft_view: Option<Arc<crate::filter::Filter>>,
+    options: Diff3Options<'_>,
     tx: mpsc::Sender<Result<DiffItem, StateError>>,
 ) -> Result<Diff3Summary, StateError> {
+    let path_merge_policy = PathMergePolicy::new(options.path_merge_rules);
     let (state_base, state_source, state_target) = join!(
         State::deserialize(repository.clone(), base),
         State::deserialize(repository.clone(), source),
@@ -344,10 +374,10 @@ pub async fn diff3_with_source_cap(
     let source_walker_repo = repository.clone();
     let source_walker_state_base = state_base.clone();
     let source_walker_state_source = state_source.clone();
-    let source_walker_path = path.clone();
+    let source_walker_path = options.path.clone();
     // Give the source walk the target tree, so it can adopt whole subtrees
     // the target never touched instead of descending.
-    let source_walker_graft = graft_view.map(|view| {
+    let source_walker_graft = options.graft_view.clone().map(|view| {
         Arc::new(state::GraftOracle::new(
             repository.clone(),
             state_target.clone(),
@@ -386,8 +416,11 @@ pub async fn diff3_with_source_cap(
         if is_file_id_only_churn {
             continue;
         }
+        if !path_merge_policy.should_merge_change(&change) {
+            continue;
+        }
         source_changes.push(change);
-        if let Some(cap) = source_cap
+        if let Some(cap) = options.source_cap
             && source_changes.len() > cap
         {
             oversized = true;
@@ -404,7 +437,7 @@ pub async fn diff3_with_source_cap(
         return Err(StateError::from(Oversized {
             context: format!(
                 "source-side diff change count exceeds configured limit of {}",
-                source_cap.unwrap_or(0)
+                options.source_cap.unwrap_or(0)
             ),
         }));
     }
@@ -423,7 +456,20 @@ pub async fn diff3_with_source_cap(
     lore_info!("Sorting {} source changes", source_changes.len());
     change::sort_by_path(&mut source_changes);
 
-    let target_filter = if source_changes.len() < SOURCE_FILTER_THRESHOLD
+    let target_paths = if !path_merge_policy.is_empty() {
+        let mut paths = Vec::with_capacity(source_changes.len());
+        for change in &source_changes {
+            paths.push(change.path.clone());
+            if let Some(from_path) = change.from_path.as_ref() {
+                paths.push(from_path.clone());
+            }
+        }
+        Some(RelativePath::dedup_to_supersets(paths))
+    } else {
+        None
+    };
+    let target_filter = if path_merge_policy.is_empty()
+        && source_changes.len() < SOURCE_FILTER_THRESHOLD
         && let Some(filter) = filter_from_source_changes(&source_changes)
     {
         Arc::new(filter)
@@ -436,21 +482,48 @@ pub async fn diff3_with_source_cap(
     let (target_tx, mut target_rx) = mpsc::channel::<Result<NodeChange, StateError>>(256);
     let walker_repo = target_repository.clone();
     let walker_state_base = state_base.clone();
-    let walker_path = path.clone();
+    let walker_state_target = state_target.clone();
+    let walker_path = options.path.clone();
+    let walker_paths = target_paths.clone();
     let walker = lore_spawn!(async move {
         let mut sink = state::ChangeSink::Channel(&target_tx);
-        state::diff(
-            walker_repo.clone(),
-            walker_state_base,
-            walker_repo,
-            state_target,
-            walker_path,
-            // Adoption is a source-side decision.
-            None,
-            &mut sink,
-            FilterMode::View,
-        )
-        .await
+        if let Some(paths) = walker_paths {
+            for path in paths {
+                let exists_in_base =
+                    state_has_path(walker_repo.clone(), walker_state_base.clone(), &path).await?;
+                let exists_in_target =
+                    state_has_path(walker_repo.clone(), walker_state_target.clone(), &path).await?;
+                if !exists_in_base && !exists_in_target {
+                    continue;
+                }
+                Box::pin(state::diff(
+                    walker_repo.clone(),
+                    walker_state_base.clone(),
+                    walker_repo.clone(),
+                    walker_state_target.clone(),
+                    Some(path),
+                    // Adoption is a source-side decision.
+                    None,
+                    &mut sink,
+                    FilterMode::View,
+                ))
+                .await?;
+            }
+            Ok(())
+        } else {
+            state::diff(
+                walker_repo.clone(),
+                walker_state_base,
+                walker_repo,
+                walker_state_target,
+                walker_path,
+                // Adoption is a source-side decision.
+                None,
+                &mut sink,
+                FilterMode::View,
+            )
+            .await
+        }
     });
 
     // Join loop: target streams in; source lives in the sorted Vec.
@@ -471,6 +544,9 @@ pub async fn diff3_with_source_cap(
         if is_file_id_only_churn {
             continue;
         }
+        if !path_merge_policy.should_merge_change(&target_change) {
+            continue;
+        }
         match source_changes.binary_search_by(|c| c.path.as_str().cmp(target_change.path.as_str()))
         {
             Ok(idx) => {
@@ -481,7 +557,7 @@ pub async fn diff3_with_source_cap(
                     sc.flags = change::Flags::Conflict;
                     target_change.flags = change::Flags::Conflict;
                     joined_conflicts.push((sc, target_change));
-                } else if include_same
+                } else if options.include_same
                     && (joined_changes.is_empty()
                         || joined_changes[joined_changes.len() - 1].path != source_change.path)
                 {
@@ -493,7 +569,6 @@ pub async fn diff3_with_source_cap(
             }
         }
     }
-
     match walker.await {
         Ok(Ok(())) => {}
         Ok(Err(err)) => return Err(err),
@@ -537,7 +612,9 @@ pub async fn diff3_with_source_cap(
     // code is designed to tolerate today (e.g. a task aborted mid-write
     // to a downstream channel could surface a partial value), so let
     // them run to completion.
-    let permits = history_walk_concurrency.unwrap_or(DEFAULT_HISTORY_WALK_CONCURRENCY);
+    let permits = options
+        .history_walk_concurrency
+        .unwrap_or(DEFAULT_HISTORY_WALK_CONCURRENCY);
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(permits));
     let mut history_walks: JoinSet<Result<HistoryWalkOutcome, StateError>> = JoinSet::new();
     let mut outcomes: Vec<HistoryWalkOutcome> = Vec::with_capacity(joined_conflicts.len());
@@ -672,13 +749,6 @@ pub async fn diff3_with_source_cap(
     Ok(summary)
 }
 
-/// Resolves `Move + other-change-at-from-path` interactions per the
-/// pre-streaming rules:
-///   - `Move(X→Y) + Delete(X)` → conflict (divergent move).
-///   - Pure rename `Move(X→Y, content unchanged) + Modify(X)` →
-///     absorb the modify into the rename (the rename carries the
-///     modified content).
-///   - `Move(X→Y, content changed) + Modify(X)` → conflict (both
 ///     branches modified content differently).
 fn apply_move_from_path_pass(
     changes: &mut Vec<NodeChange>,

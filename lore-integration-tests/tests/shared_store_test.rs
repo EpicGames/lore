@@ -99,6 +99,7 @@ mod shared_store_tests {
                 repository_url: REMOTE_URL.into(),
                 description: LoreString::default(),
                 id: LoreString::default(),
+                default_branch_name: LoreString::default(),
                 use_shared_store: mode,
                 shared_store_path,
             },

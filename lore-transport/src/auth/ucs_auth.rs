@@ -16,14 +16,15 @@ use crate::grpc::CorrelationInterceptor;
 use crate::traits::Authentication;
 use crate::types::*;
 
-/// Strips the custom scheme from an auth URL and returns an HTTPS URL
+/// Strips the custom scheme from an auth URL and returns a tonic endpoint
 /// suitable for gRPC connection.
 ///
 /// `ucs-auth://auth.example.com` -> `https://auth.example.com`
 /// `https://auth.example.com` -> `https://auth.example.com` (unchanged)
+/// `http://127.0.0.1:8787` -> `http://127.0.0.1:8787` (local dev)
 fn grpc_endpoint(auth_url: &str) -> String {
     match auth_url.split_once("://") {
-        Some(("https", _)) => auth_url.to_string(),
+        Some(("https" | "http", _)) => auth_url.to_string(),
         Some((_, rest)) => format!("https://{rest}"),
         None => format!("https://{auth_url}"),
     }
@@ -308,6 +309,14 @@ mod tests {
         assert_eq!(
             grpc_endpoint("https://auth.example.com"),
             "https://auth.example.com"
+        );
+    }
+
+    #[test]
+    fn grpc_endpoint_http() {
+        assert_eq!(
+            grpc_endpoint("http://127.0.0.1:8787"),
+            "http://127.0.0.1:8787"
         );
     }
 

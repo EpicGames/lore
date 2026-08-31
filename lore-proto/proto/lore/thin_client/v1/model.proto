@@ -99,6 +99,10 @@ message DiffConflict {
   DiffChange change_from = 1;
   // The change the other side made relative to the common ancestor.
   DiffChange change_to = 2;
+  // Stable identifier for this conflict when the resolved base and the
+  // request's from/to revisions remain pinned. Pass this value to
+  // lore.revision.v1.BranchMerge when selecting a resolution.
+  bytes conflict_id = 3;
 }
 
 // Per-stream partition table entry. Announces a linked partition and
@@ -125,6 +129,10 @@ message TreeNode {
   NodeType node_type = 2;
   // Content address for FILE / LINK entries; unused for DIRECTORY.
   lore.model.v1.Address address = 3;
+  // Signature of the revision in the requested repository that most recently
+  // changed this entry. Empty for directories. Descendants of a linked
+  // repository inherit the revision that last changed the link pin.
+  bytes last_changed_revision_signature = 7;
   // Original size in bytes. For DIRECTORY entries, this is the cumulative size of its descendant files.
   uint64 size = 4;
   // File mode for this entry. For possible flags and values, see enum FileMode.

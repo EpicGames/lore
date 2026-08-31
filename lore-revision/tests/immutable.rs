@@ -1149,8 +1149,7 @@ mod tests {
                     .expect("Failed writing to store");
 
                 // Read via stream and collect all buffers
-                let (tx, mut rx) =
-                    tokio::sync::mpsc::channel::<Result<Bytes, lore_storage::StorageError>>(64);
+                let (tx, mut rx) = tokio::sync::mpsc::channel(64);
                 let options = immutable::read_options_from_repository(&repository);
                 let content_length =
                     immutable::read_stream(repository.clone(), address, None, options, tx)
@@ -1167,6 +1166,32 @@ mod tests {
 
                 assert_eq!(reassembled.len(), payload.len());
                 assert_eq!(reassembled.as_slice(), payload.as_ref());
+
+                // A cross-fragment range streams only the selected logical
+                // bytes, including partial first/last leaves.
+                let requested = 12_345u64..1_876_543u64;
+                let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+                let options = immutable::read_options_from_repository(&repository);
+                let (full_length, normalized) = immutable::read_stream_range(
+                    repository.clone(),
+                    address,
+                    Some(requested.clone()),
+                    options,
+                    tx,
+                )
+                .await
+                .expect("read_stream_range failed");
+                assert_eq!(full_length, payload_size as u64);
+                assert_eq!(normalized, requested);
+
+                let mut ranged = Vec::new();
+                while let Some(chunk) = rx.recv().await {
+                    ranged.extend_from_slice(chunk.expect("range stream item failed").as_ref());
+                }
+                assert_eq!(
+                    ranged.as_slice(),
+                    &payload[requested.start as usize..requested.end as usize]
+                );
             })
             .await;
     }

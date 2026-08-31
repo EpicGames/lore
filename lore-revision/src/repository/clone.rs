@@ -332,6 +332,24 @@ pub struct CloneWorkItem {
     pub repository_path: RepositoryPath,
 }
 
+async fn cache_repository_metadata(
+    repository: Arc<RepositoryContext>,
+    metadata: &repository::RepositoryMetadata,
+    expected_hash: Hash,
+) -> Result<(), CloneError> {
+    let cached_hash = repository::metadata_store(repository.clone(), metadata.clone())
+        .await
+        .forward::<CloneError>("Failed to cache repository metadata")?;
+    if cached_hash != expected_hash {
+        return Err(CloneError::internal(format!(
+            "Cloned repository metadata hash mismatch: expected {expected_hash}, got {cached_hash}"
+        )));
+    }
+    repository::metadata_store_hash(repository, expected_hash)
+        .await
+        .forward::<CloneError>("Failed to cache repository metadata hash")
+}
+
 /// Shared context for dependency-driven discovery across all block workers.
 struct DependencyDiscoverContext {
     /// Tags to filter dependency edges by. Empty means follow all edges.
@@ -895,6 +913,7 @@ pub async fn clone(
         file: Some(FileConfig::default()),
     };
 
+    let repository_metadata_hash = repository_data.metadata;
     let repository_metadata = {
         // Dummy repository context just to be able to load the repository
         // metadata from the remote
@@ -918,7 +937,7 @@ pub async fn clone(
 
         repository.set_disable_upload(true);
 
-        repository::metadata(repository, repository_data.metadata)
+        repository::metadata(repository, repository_metadata_hash)
             .await
             .forward::<CloneError>("Repository not found")?
     };
@@ -1024,6 +1043,18 @@ pub async fn clone(
     let repository = Arc::new(new_context);
 
     repository.set_disable_upload(true);
+
+    // Clone initially deserializes repository metadata through a temporary
+    // remote-backed context. Persist the same content-addressed fragment and
+    // mutable pointer in the real local context so later branch pushes can
+    // collect every repository fragment without requiring another remote
+    // metadata read.
+    cache_repository_metadata(
+        repository.clone(),
+        &repository_metadata,
+        repository_metadata_hash,
+    )
+    .await?;
 
     // Prune stale instances in the background when using a shared store.
     // AbortOnDropHandle ensures the task is cancelled if clone fails early.
@@ -2176,6 +2207,72 @@ mod tests {
 
     fn relative_path(path: &str) -> RelativePath {
         RelativePath::new_from_initial_path(path).expect("Relative path")
+    }
+
+    async fn metadata_test_context(path: &Path) -> Arc<RepositoryContext> {
+        let (immutable, mutable) = repository::create_client_memory_stores()
+            .await
+            .expect("create in-memory stores");
+        let token = RepositoryWriteToken::acquire(path).await;
+        Arc::new(
+            RepositoryContext::new(RepositoryContextCreationArgs {
+                path: Some(path.to_path_buf()),
+                immutable_store: immutable,
+                mutable_store: mutable,
+                id: RepositoryId::default(),
+                instance_id: crate::instance::InstanceId::default(),
+                remote: Err(lore_transport::ProtocolError::from(crate::errors::NoRemote)),
+                filter: Arc::default(),
+                format: RepositoryFormat::Lore,
+                filesystem_provider: None,
+            })
+            .with_write_token(token),
+        )
+    }
+
+    #[tokio::test]
+    async fn clone_metadata_cache_is_available_without_a_remote() {
+        let execution = Arc::new(crate::interface::ExecutionContext::new_client_with_user_id(
+            crate::interface::LoreGlobalArgs::default(),
+            crate::relay::EventDispatcher::no_dispatch(),
+            "test-user".to_owned(),
+        ));
+        lore_base::runtime::LORE_CONTEXT
+            .scope(execution, async {
+                let source_dir = tempfile::tempdir().expect("source temp dir");
+                let source = metadata_test_context(source_dir.path()).await;
+                let metadata = repository::RepositoryMetadata {
+                    name: "clone-metadata-test".to_owned(),
+                    description: "cached for later pushes".to_owned(),
+                    default_branch: Default::default(),
+                    default_branch_name: "main".to_owned(),
+                    creator: "test-user".to_owned(),
+                    created: 42,
+                };
+                let expected_hash = repository::metadata_store(source, metadata.clone())
+                    .await
+                    .expect("serialize source metadata");
+
+                let clone_dir = tempfile::tempdir().expect("clone temp dir");
+                let cloned = metadata_test_context(clone_dir.path()).await;
+                cache_repository_metadata(cloned.clone(), &metadata, expected_hash)
+                    .await
+                    .expect("cache cloned metadata");
+
+                assert_eq!(
+                    repository::metadata_hash(cloned.clone())
+                        .await
+                        .expect("read cached metadata hash"),
+                    expected_hash
+                );
+                assert_eq!(
+                    repository::metadata(cloned, expected_hash)
+                        .await
+                        .expect("deserialize cached metadata"),
+                    metadata
+                );
+            })
+            .await;
     }
 
     #[tokio::test]

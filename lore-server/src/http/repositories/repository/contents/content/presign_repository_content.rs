@@ -18,7 +18,6 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_revision::lore::RepositoryId;
 use lore_storage::StoreMatch;
-use lore_storage::immutable_store::query_one;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use serde::Deserialize;
 use serde::Serialize;
@@ -176,8 +175,11 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            // Verify the address exists before issuing a URL for it.
-            let match_result = query_one(&immutable_store, repository, parsed_address)
+            // Verify the exact repository/context association and retain the
+            // logical length so redemption can serve byte ranges without a
+            // separate metadata round trip.
+            let match_result = immutable_store
+                .get_metadata(repository, parsed_address)
                 .await
                 .map_err(|e| {
                     warn!(%e, "Presign resolve check failed");
@@ -212,6 +214,7 @@ pub async fn handler(
                 content_type: body.content_type,
                 content_encoding: body.content_encoding,
                 content_disposition: body.content_disposition,
+                content_length: Some(match_result.fragment.size_content),
             };
 
             let token_str = sign(&payload, &presign_config.hmac_key);

@@ -65,6 +65,21 @@ fn cache() -> &'static AuthzCache {
     AUTHZ_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Invalidates cached authorization tokens for one imported identity.
+///
+/// Direct token login replaces the durable token-store entries, but live
+/// transports may otherwise keep returning a still-unexpired token from this
+/// process cache. The next exchange reloads the replacement token from the
+/// store.
+pub async fn invalidate_identity(auth_url: &str, identity: &str) {
+    cache()
+        .lock()
+        .await
+        .retain(|(cached_auth_url, cached_identity, _, _, _), _| {
+            cached_auth_url != auth_url || cached_identity != identity
+        });
+}
+
 pub fn is_expired(expires: u64) -> bool {
     let expires = expires as u128;
     let current_time = SystemTime::now()

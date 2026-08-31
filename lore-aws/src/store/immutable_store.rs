@@ -9,6 +9,8 @@ use std::string::ToString;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use async_trait::async_trait;
 use aws_sdk_dynamodb::operation::put_item::PutItemError;
@@ -21,9 +23,11 @@ use aws_smithy_types::error::metadata::ProvideErrorMetadata;
 use bytes::Bytes;
 use bytes::BytesMut;
 use lore_base::error::AddressNotFound;
+use lore_base::error::NotSupported;
 use lore_base::error::SlowDown;
 use lore_base::types::Address;
 use lore_base::types::Context;
+use lore_base::types::DirectDownload;
 use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
 use lore_base::types::Fragment;
 use lore_base::types::FragmentFlags;
@@ -283,6 +287,10 @@ impl DynamoDbImmutableStoreSettings {
 
 /// The maximum number of individual exists tasks we'll allow to be submitted across all concurrent
 /// requests.
+fn default_direct_downloads_enabled() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(bound(deserialize = "'de: 'static"))]
 pub struct AwsImmutableStoreSettings {
@@ -290,6 +298,8 @@ pub struct AwsImmutableStoreSettings {
     pub dynamodb: DynamoDbImmutableStoreSettings,
     #[serde(default)]
     pub force_write: bool,
+    #[serde(default = "default_direct_downloads_enabled")]
+    pub direct_downloads_enabled: bool,
 }
 
 impl AwsImmutableStoreSettings {
@@ -302,7 +312,13 @@ impl AwsImmutableStoreSettings {
             s3,
             dynamodb,
             force_write,
+            direct_downloads_enabled: default_direct_downloads_enabled(),
         }
+    }
+
+    pub fn with_direct_downloads_enabled(mut self, enabled: bool) -> Self {
+        self.direct_downloads_enabled = enabled;
+        self
     }
 }
 
@@ -542,6 +558,7 @@ pub struct AwsImmutableStore {
     /// deployment that has never written one, and reads accordingly refuse to guess.
     fragment_metadata_table_name: Option<Arc<str>>,
     force_write: bool,
+    direct_downloads_enabled: bool,
     /// How long to wait between removing an association and counting what remains, so a put that
     /// had already passed its state probe has time to land its own association and be counted.
     obliteration_drain: Duration,
@@ -588,6 +605,7 @@ impl AwsImmutableStore {
                 .as_ref()
                 .map(|name| Arc::from(name.clone())),
             force_write: settings.force_write,
+            direct_downloads_enabled: settings.direct_downloads_enabled,
             obliteration_drain: Duration::from_millis(
                 settings
                     .dynamodb
@@ -1751,6 +1769,22 @@ impl AwsImmutableStore {
         info!("Done obliterating sub-fragments");
         Ok(())
     }
+
+    async fn presign_payload(
+        &self,
+        hash: Hash,
+        expires_in: Duration,
+    ) -> Result<String, StoreError> {
+        let mut dst = [0u8; 64];
+        let key = lore_revision::util::to_hex_str(hash.data(), &mut dst);
+        self.s3
+            .presign_get_object(self.bucket.as_str(), key, expires_in)
+            .await
+            .map_err(|err| {
+                warn!("Failed to presign payload for hash {hash}: {err}");
+                StoreError::internal(err)
+            })
+    }
 }
 
 #[async_trait]
@@ -1937,6 +1971,72 @@ impl ImmutableStoreTrait for AwsImmutableStore {
             partition,
             payload: Some(payload),
         })
+    }
+
+    #[lore_macro::lore_instrument]
+    #[tracing::instrument(name = "AwsImmutableStore::presign_downloads", skip(self, addresses))]
+    async fn presign_downloads(
+        self: Arc<Self>,
+        partition: Partition,
+        addresses: &[Address],
+        match_required: StoreMatch,
+        expires_in: Duration,
+    ) -> Result<Vec<DirectDownload>, StoreError> {
+        if !self.direct_downloads_enabled {
+            return Err(StoreError::from(NotSupported {
+                operation: "immutable direct download".to_string(),
+            }));
+        }
+        if match_required != StoreMatch::MatchFull {
+            return Err(StoreError::internal(format!(
+                "direct downloads require MatchFull, got {match_required:?}"
+            )));
+        }
+
+        let expires_at_epoch_seconds = SystemTime::now()
+            .checked_add(expires_in)
+            .and_then(|expires_at| expires_at.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+
+        let mut join_set = JoinSet::new();
+        for (position, address) in addresses.iter().copied().enumerate() {
+            let store = self.clone();
+            join_set.spawn(async move {
+                let result = store.clone().get_metadata(partition, address).await?;
+                if result.match_made != StoreMatch::MatchFull {
+                    return Ok::<_, StoreError>(None);
+                }
+
+                let mut fragment = result.fragment;
+                fragment.flags &= !FragmentFlags::PayloadStored.bits();
+                fragment.flags |= FragmentFlags::PayloadStoredDurable.bits();
+                let url = store.presign_payload(address.hash, expires_in).await?;
+                Ok(Some((
+                    position,
+                    DirectDownload {
+                        address,
+                        fragment,
+                        url,
+                        expires_at_epoch_seconds,
+                    },
+                )))
+            });
+        }
+
+        let mut downloads = Vec::new();
+        while let Some(result) = join_set.join_next().await {
+            if let Some(download) = result
+                .map_err(|err| StoreError::internal_with_context(err, "joining presign task"))??
+            {
+                downloads.push(download);
+            }
+        }
+        downloads.sort_by_key(|(position, _)| *position);
+        Ok(downloads
+            .into_iter()
+            .map(|(_, download)| download)
+            .collect())
     }
 
     #[lore_macro::lore_instrument]

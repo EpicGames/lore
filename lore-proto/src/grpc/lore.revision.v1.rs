@@ -245,6 +245,129 @@ impl ::prost::Name for BranchPushResponse {
         "/lore.revision.v1.BranchPushResponse".into()
     }
 }
+/// Request for an atomic, server-authored branch merge. Both tips are required
+/// optimistic-concurrency guards; stale tips fail with FAILED_PRECONDITION.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BranchMergeRequest {
+    /// Required caller-generated UUIDv7. A successfully published request is
+    /// idempotent; reusing its id with different content is rejected.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub request_id: ::prost::bytes::Bytes,
+    /// Branch that will move when the merge succeeds.
+    #[prost(bytes = "bytes", tag = "2")]
+    pub branch_id_target: ::prost::bytes::Bytes,
+    /// Exact target tip observed by the caller.
+    #[prost(bytes = "bytes", tag = "3")]
+    pub revision_signature_target: ::prost::bytes::Bytes,
+    /// Branch whose changes will be merged into the target.
+    #[prost(bytes = "bytes", tag = "4")]
+    pub branch_id_source: ::prost::bytes::Bytes,
+    /// Exact source tip observed by the caller.
+    #[prost(bytes = "bytes", tag = "5")]
+    pub revision_signature_source: ::prost::bytes::Bytes,
+    /// Commit message for the server-authored merge revision.
+    #[prost(string, tag = "6")]
+    pub commit_message: ::prost::alloc::string::String,
+    /// Per-conflict decisions keyed by RevisionDiff conflict_id. Missing
+    /// decisions are returned in-band and cause no branch mutation.
+    #[prost(message, repeated, tag = "7")]
+    pub resolutions: ::prost::alloc::vec::Vec<BranchMergeResolution>,
+}
+impl ::prost::Name for BranchMergeRequest {
+    const NAME: &'static str = "BranchMergeRequest";
+    const PACKAGE: &'static str = "lore.revision.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.revision.v1.BranchMergeRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.revision.v1.BranchMergeRequest".into()
+    }
+}
+/// Resolution for one conflict. The oneof is an extension point for a future
+/// custom/uploaded-content resolution without changing existing clients.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BranchMergeResolution {
+    /// Stable conflict id emitted by RevisionDiff for the same pinned tips.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub conflict_id: ::prost::bytes::Bytes,
+    /// Requested resolution strategy.
+    #[prost(oneof = "branch_merge_resolution::Resolution", tags = "2")]
+    pub resolution: ::core::option::Option<branch_merge_resolution::Resolution>,
+}
+/// Nested message and enum types in `BranchMergeResolution`.
+pub mod branch_merge_resolution {
+    /// Requested resolution strategy.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Resolution {
+        /// Keep the complete target or source side.
+        #[prost(enumeration = "super::BranchMergeSide", tag = "2")]
+        Side(i32),
+    }
+}
+impl ::prost::Name for BranchMergeResolution {
+    const NAME: &'static str = "BranchMergeResolution";
+    const PACKAGE: &'static str = "lore.revision.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.revision.v1.BranchMergeResolution".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.revision.v1.BranchMergeResolution".into()
+    }
+}
+/// Minimal conflict identity returned by BranchMerge. Clients can obtain full
+/// content addresses and presentation diffs from RevisionDiff.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BranchMergeConflict {
+    /// Stable id accepted by BranchMergeResolution.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub conflict_id: ::prost::bytes::Bytes,
+    /// Path changed on the source side.
+    #[prost(string, tag = "2")]
+    pub path_source: ::prost::alloc::string::String,
+    /// Path changed on the target side.
+    #[prost(string, tag = "3")]
+    pub path_target: ::prost::alloc::string::String,
+}
+impl ::prost::Name for BranchMergeConflict {
+    const NAME: &'static str = "BranchMergeConflict";
+    const PACKAGE: &'static str = "lore.revision.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.revision.v1.BranchMergeConflict".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.revision.v1.BranchMergeConflict".into()
+    }
+}
+/// Result of an authoritative merge attempt. CONFLICTED and
+/// ALREADY_UP_TO_DATE are successful, non-mutating outcomes.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BranchMergeResponse {
+    /// Machine-readable outcome.
+    #[prost(enumeration = "BranchMergeOutcome", tag = "1")]
+    pub outcome: i32,
+    /// Published target tip for MERGED, otherwise the pinned target tip.
+    #[prost(bytes = "bytes", tag = "2")]
+    pub revision_signature: ::prost::bytes::Bytes,
+    /// Revision number corresponding to revision_signature.
+    #[prost(uint64, tag = "3")]
+    pub revision_number: u64,
+    /// Common ancestor selected by the server.
+    #[prost(bytes = "bytes", tag = "4")]
+    pub revision_signature_base: ::prost::bytes::Bytes,
+    /// Conflicts lacking a supplied decision. Empty for terminal outcomes.
+    #[prost(message, repeated, tag = "5")]
+    pub unresolved_conflicts: ::prost::alloc::vec::Vec<BranchMergeConflict>,
+}
+impl ::prost::Name for BranchMergeResponse {
+    const NAME: &'static str = "BranchMergeResponse";
+    const PACKAGE: &'static str = "lore.revision.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.revision.v1.BranchMergeResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.revision.v1.BranchMergeResponse".into()
+    }
+}
 /// Request for a cheap hash-only read of a branch's metadata pointer.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BranchMetadataGetRequest {
@@ -391,6 +514,249 @@ impl ::prost::Name for RevisionListResponse {
     }
     fn type_url() -> ::prost::alloc::string::String {
         "/lore.revision.v1.RevisionListResponse".into()
+    }
+}
+/// Request to atomically apply a path changeset to a pinned branch tip.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct RevisionCreateRequest {
+    /// Required caller-generated UUIDv7. Reusing it with identical request bytes
+    /// returns the original result; reuse with different bytes is rejected.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub request_id: ::prost::bytes::Bytes,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub branch_id: ::prost::bytes::Bytes,
+    /// Exact branch tip observed by the caller. Zero is valid only for an
+    /// initial/root revision. Stale bases fail with FAILED_PRECONDITION.
+    #[prost(bytes = "bytes", tag = "3")]
+    pub revision_signature_base: ::prost::bytes::Bytes,
+    #[prost(string, tag = "4")]
+    pub commit_message: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "5")]
+    pub metadata: ::prost::alloc::vec::Vec<RevisionCreateMetadataEntry>,
+    #[prost(message, repeated, tag = "6")]
+    pub operations: ::prost::alloc::vec::Vec<RevisionCreateOperation>,
+}
+impl ::prost::Name for RevisionCreateRequest {
+    const NAME: &'static str = "RevisionCreateRequest";
+    const PACKAGE: &'static str = "lore.revision.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.revision.v1.RevisionCreateRequest".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.revision.v1.RevisionCreateRequest".into()
+    }
+}
+/// Caller-supplied metadata entry for a new revision.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RevisionCreateMetadataEntry {
+    #[prost(string, tag = "1")]
+    pub key: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub value: ::prost::bytes::Bytes,
+    /// lore metadata type encoding (Address=1, Boolean=2, Context=3, Hash=4,
+    /// Numeric=5, String=6, Binary=255).
+    #[prost(uint32, tag = "3")]
+    pub format: u32,
+}
+impl ::prost::Name for RevisionCreateMetadataEntry {
+    const NAME: &'static str = "RevisionCreateMetadataEntry";
+    const PACKAGE: &'static str = "lore.revision.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.revision.v1.RevisionCreateMetadataEntry".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.revision.v1.RevisionCreateMetadataEntry".into()
+    }
+}
+/// One path-level edit in a RevisionCreate changeset.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RevisionCreateOperation {
+    #[prost(oneof = "revision_create_operation::Op", tags = "1, 2, 3, 4")]
+    pub op: ::core::option::Option<revision_create_operation::Op>,
+}
+/// Nested message and enum types in `RevisionCreateOperation`.
+pub mod revision_create_operation {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Op {
+        #[prost(message, tag = "1")]
+        PutFile(super::RevisionCreatePutFile),
+        #[prost(message, tag = "2")]
+        CreateDirectory(super::RevisionCreateDirectory),
+        #[prost(message, tag = "3")]
+        DeletePath(super::RevisionCreateDeletePath),
+        #[prost(message, tag = "4")]
+        MovePath(super::RevisionCreateMovePath),
+    }
+}
+impl ::prost::Name for RevisionCreateOperation {
+    const NAME: &'static str = "RevisionCreateOperation";
+    const PACKAGE: &'static str = "lore.revision.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.revision.v1.RevisionCreateOperation".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.revision.v1.RevisionCreateOperation".into()
+    }
+}
+/// Add or replace a file with content previously uploaded to Lore.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RevisionCreatePutFile {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub mode: u32,
+    /// UploadContent result. The server verifies the exact repository/context
+    /// association and derives logical size from immutable fragment metadata.
+    #[prost(message, optional, tag = "3")]
+    pub address: ::core::option::Option<crate::lore::model::v1::Address>,
+}
+impl ::prost::Name for RevisionCreatePutFile {
+    const NAME: &'static str = "RevisionCreatePutFile";
+    const PACKAGE: &'static str = "lore.revision.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.revision.v1.RevisionCreatePutFile".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.revision.v1.RevisionCreatePutFile".into()
+    }
+}
+/// Create an empty directory at a path.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RevisionCreateDirectory {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+    #[prost(uint32, tag = "2")]
+    pub mode: u32,
+}
+impl ::prost::Name for RevisionCreateDirectory {
+    const NAME: &'static str = "RevisionCreateDirectory";
+    const PACKAGE: &'static str = "lore.revision.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.revision.v1.RevisionCreateDirectory".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.revision.v1.RevisionCreateDirectory".into()
+    }
+}
+/// Delete a file or directory tree at a path.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RevisionCreateDeletePath {
+    #[prost(string, tag = "1")]
+    pub path: ::prost::alloc::string::String,
+}
+impl ::prost::Name for RevisionCreateDeletePath {
+    const NAME: &'static str = "RevisionCreateDeletePath";
+    const PACKAGE: &'static str = "lore.revision.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.revision.v1.RevisionCreateDeletePath".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.revision.v1.RevisionCreateDeletePath".into()
+    }
+}
+/// Move or rename a path while preserving its file identity.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RevisionCreateMovePath {
+    #[prost(string, tag = "1")]
+    pub source: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub destination: ::prost::alloc::string::String,
+}
+impl ::prost::Name for RevisionCreateMovePath {
+    const NAME: &'static str = "RevisionCreateMovePath";
+    const PACKAGE: &'static str = "lore.revision.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.revision.v1.RevisionCreateMovePath".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.revision.v1.RevisionCreateMovePath".into()
+    }
+}
+/// Published revision identity returned by RevisionCreate.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RevisionCreateResponse {
+    #[prost(bytes = "bytes", tag = "1")]
+    pub revision_signature: ::prost::bytes::Bytes,
+    #[prost(uint64, tag = "2")]
+    pub revision_number: u64,
+}
+impl ::prost::Name for RevisionCreateResponse {
+    const NAME: &'static str = "RevisionCreateResponse";
+    const PACKAGE: &'static str = "lore.revision.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.revision.v1.RevisionCreateResponse".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.revision.v1.RevisionCreateResponse".into()
+    }
+}
+/// Which complete side of a merge conflict should be retained. Values are
+/// intentionally prefixed because protobuf enum values share package scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum BranchMergeSide {
+    Unspecified = 0,
+    /// Keep the target branch's version of the conflicted path.
+    Target = 1,
+    /// Apply the source branch's version of the conflicted path.
+    Source = 2,
+}
+impl BranchMergeSide {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "BRANCH_MERGE_SIDE_UNSPECIFIED",
+            Self::Target => "BRANCH_MERGE_SIDE_TARGET",
+            Self::Source => "BRANCH_MERGE_SIDE_SOURCE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "BRANCH_MERGE_SIDE_UNSPECIFIED" => Some(Self::Unspecified),
+            "BRANCH_MERGE_SIDE_TARGET" => Some(Self::Target),
+            "BRANCH_MERGE_SIDE_SOURCE" => Some(Self::Source),
+            _ => None,
+        }
+    }
+}
+/// Terminal result of a BranchMerge attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum BranchMergeOutcome {
+    Unspecified = 0,
+    /// A two-parent revision was published to the target branch.
+    Merged = 1,
+    /// The source introduced no changes relative to the resolved base.
+    AlreadyUpToDate = 2,
+    /// One or more conflicts still need an explicit resolution.
+    Conflicted = 3,
+}
+impl BranchMergeOutcome {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "BRANCH_MERGE_OUTCOME_UNSPECIFIED",
+            Self::Merged => "BRANCH_MERGE_OUTCOME_MERGED",
+            Self::AlreadyUpToDate => "BRANCH_MERGE_OUTCOME_ALREADY_UP_TO_DATE",
+            Self::Conflicted => "BRANCH_MERGE_OUTCOME_CONFLICTED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "BRANCH_MERGE_OUTCOME_UNSPECIFIED" => Some(Self::Unspecified),
+            "BRANCH_MERGE_OUTCOME_MERGED" => Some(Self::Merged),
+            "BRANCH_MERGE_OUTCOME_ALREADY_UP_TO_DATE" => Some(Self::AlreadyUpToDate),
+            "BRANCH_MERGE_OUTCOME_CONFLICTED" => Some(Self::Conflicted),
+            _ => None,
+        }
     }
 }
 /// Generated client implementations.
@@ -625,6 +991,35 @@ pub mod revision_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Authoritatively merge a pinned source branch tip into a pinned target
+        /// branch tip, optionally resolving each conflict to the target or source
+        /// side. The target moves only after the entire merge succeeds.
+        pub async fn branch_merge(
+            &mut self,
+            request: impl tonic::IntoRequest<super::BranchMergeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::BranchMergeResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.revision.v1.RevisionService/BranchMerge",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("lore.revision.v1.RevisionService", "BranchMerge"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
         /// Cheap hash-only read of a branch's current metadata pointer.
         pub async fn branch_metadata_get(
             &mut self,
@@ -713,6 +1108,35 @@ pub mod revision_service_client {
                 );
             self.inner.unary(req, path, codec).await
         }
+        /// Atomically apply an address-backed path changeset to an observed branch
+        /// tip. Immutable construction happens first; the same protected BranchPush
+        /// CAS path used by BranchPush is the visibility point.
+        pub async fn revision_create(
+            &mut self,
+            request: impl tonic::IntoRequest<super::RevisionCreateRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RevisionCreateResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/lore.revision.v1.RevisionService/RevisionCreate",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("lore.revision.v1.RevisionService", "RevisionCreate"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated server implementations.
@@ -773,6 +1197,16 @@ pub mod revision_service_server {
             tonic::Response<super::BranchPushResponse>,
             tonic::Status,
         >;
+        /// Authoritatively merge a pinned source branch tip into a pinned target
+        /// branch tip, optionally resolving each conflict to the target or source
+        /// side. The target moves only after the entire merge succeeds.
+        async fn branch_merge(
+            &self,
+            request: tonic::Request<super::BranchMergeRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::BranchMergeResponse>,
+            tonic::Status,
+        >;
         /// Cheap hash-only read of a branch's current metadata pointer.
         async fn branch_metadata_get(
             &self,
@@ -796,6 +1230,16 @@ pub mod revision_service_server {
             request: tonic::Request<super::RevisionListRequest>,
         ) -> std::result::Result<
             tonic::Response<super::RevisionListResponse>,
+            tonic::Status,
+        >;
+        /// Atomically apply an address-backed path changeset to an observed branch
+        /// tip. Immutable construction happens first; the same protected BranchPush
+        /// CAS path used by BranchPush is the visibility point.
+        async fn revision_create(
+            &self,
+            request: tonic::Request<super::RevisionCreateRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::RevisionCreateResponse>,
             tonic::Status,
         >;
     }
@@ -1105,6 +1549,51 @@ pub mod revision_service_server {
                     };
                     Box::pin(fut)
                 }
+                "/lore.revision.v1.RevisionService/BranchMerge" => {
+                    #[allow(non_camel_case_types)]
+                    struct BranchMergeSvc<T: RevisionService>(pub Arc<T>);
+                    impl<
+                        T: RevisionService,
+                    > tonic::server::UnaryService<super::BranchMergeRequest>
+                    for BranchMergeSvc<T> {
+                        type Response = super::BranchMergeResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::BranchMergeRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RevisionService>::branch_merge(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = BranchMergeSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
                 "/lore.revision.v1.RevisionService/BranchMetadataGet" => {
                     #[allow(non_camel_case_types)]
                     struct BranchMetadataGetSvc<T: RevisionService>(pub Arc<T>);
@@ -1227,6 +1716,52 @@ pub mod revision_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = RevisionListSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/lore.revision.v1.RevisionService/RevisionCreate" => {
+                    #[allow(non_camel_case_types)]
+                    struct RevisionCreateSvc<T: RevisionService>(pub Arc<T>);
+                    impl<
+                        T: RevisionService,
+                    > tonic::server::UnaryService<super::RevisionCreateRequest>
+                    for RevisionCreateSvc<T> {
+                        type Response = super::RevisionCreateResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::RevisionCreateRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as RevisionService>::revision_create(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = RevisionCreateSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

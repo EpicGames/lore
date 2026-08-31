@@ -36,6 +36,7 @@ mod tests {
             repository_url: url.into(),
             id: LoreString::default(),
             description: LoreString::default(),
+            default_branch_name: LoreString::default(),
             use_shared_store: LoreSharedStoreMode::Disabled,
             shared_store_path: LoreString::default(),
         };

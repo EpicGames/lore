@@ -125,6 +125,11 @@ async fn resolve_listing_target(
         let Ok(node) = state.node(repository.clone(), node_id).await else {
             return Ok(None);
         };
+        // A discarded slot reads back as a directory shape (no file or link
+        // bits); the node itself is gone (e.g. deleted through this handle).
+        if node.is_discarded() {
+            return Ok(None);
+        }
         if node.is_directory() {
             return Ok(Some((state, repository, node_id)));
         }

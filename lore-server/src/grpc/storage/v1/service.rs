@@ -17,11 +17,13 @@ use super::get_resolved::GetResolvedResponseStream;
 use super::mutable_compare_and_swap;
 use super::mutable_load;
 use super::mutable_store;
+use super::presign_download;
 use super::put;
 use super::put::PutResponseStream;
 use super::put_resolved;
 use super::put_resolved::PutResolvedResponseStream;
 use super::query;
+use super::upload_content;
 use super::verify;
 use crate::grpc::storage_service::LoreStorageService;
 
@@ -84,11 +86,30 @@ impl StorageServiceV1 for LoreStorageService {
         put::handler(request, self.immutable_store().clone(), self).await
     }
 
+    async fn upload_content(
+        &self,
+        request: Request<Streaming<storage_v1::UploadContentRequest>>,
+    ) -> Result<Response<storage_v1::UploadContentResponse>, Status> {
+        upload_content::handler(
+            request,
+            self.immutable_store().clone(),
+            self.upload_content_max_bytes(),
+        )
+        .await
+    }
+
     async fn query(
         &self,
         request: Request<storage_v1::QueryRequest>,
     ) -> Result<Response<storage_v1::QueryResponse>, Status> {
         query::handler(request, self.immutable_store().clone()).await
+    }
+
+    async fn presign_download(
+        &self,
+        request: Request<storage_v1::PresignDownloadRequest>,
+    ) -> Result<Response<storage_v1::PresignDownloadResponse>, Status> {
+        presign_download::handler(request, self.immutable_store().clone()).await
     }
 
     type CopyStream = CopyResponseStream;

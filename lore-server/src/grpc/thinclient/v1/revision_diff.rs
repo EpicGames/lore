@@ -72,11 +72,11 @@ pub const DEFAULT_REVISION_DIFF_SOURCE_CAP: usize = 100_000;
 #[derive(Clone, Copy, Debug)]
 pub struct RevisionDiffConfig {
     /// Source-side change-count cap. The handler passes this to
-    /// `branch::diff3_with_source_cap` so the producer aborts with
+    /// `branch::diff3_with_options` so the producer aborts with
     /// `BranchError::Oversized` before target's walk runs.
     pub source_cap: usize,
     /// Permit count for the parallel history-walk semaphore inside
-    /// `revision::diff3_with_source_cap`. `None` falls back to
+    /// `revision::diff3_with_options`. `None` falls back to
     /// `lore_revision::revision::DEFAULT_HISTORY_WALK_CONCURRENCY`.
     pub history_walk_concurrency: Option<usize>,
 }
@@ -97,13 +97,15 @@ impl Default for RevisionDiffConfig {
 /// then `DiffChange` items, then — in 3-way mode only — `DiffConflict`
 /// items.
 ///
-/// Mode selection is server-side from revision metadata:
-/// * **2-way** when both revisions live on the same branch, or when
-///   one is the branch point of the other's branch.
-/// * **3-way** otherwise. The common ancestor is found via the
-///   branches' stacks (then `find_branch_point` as a fallback). When
-///   no common ancestor exists, the call fails with
-///   `FAILED_PRECONDITION`.
+/// Callers can force pairwise (2-way) or merge (3-way) semantics. AUTO
+/// preserves the historical metadata-driven selection:
+/// * **2-way** when both revisions live on the same branch, or when one is
+///   the branch point of the other's branch.
+/// * **3-way** otherwise.
+///
+/// Three-way mode finds the common ancestor via the branches' stacks (then
+/// `find_branch_point` as a fallback). When no common ancestor exists, the
+/// call fails with `FAILED_PRECONDITION`.
 ///
 /// Identical revisions short-circuit to an OK header-only stream with
 /// `_base` unset.
@@ -131,6 +133,12 @@ pub async fn handler(
         ));
     };
     let autoresolve = req.autoresolve;
+    let mode = thin_client_v1::RevisionDiffMode::try_from(req.mode).map_err(|_| {
+        Status::invalid_argument(format!(
+            "RevisionDiffRequest.mode has unknown value {}",
+            req.mode
+        ))
+    })?;
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
     let repository = Arc::new(
@@ -156,6 +164,7 @@ pub async fn handler(
                         to_sig,
                         to_id,
                         autoresolve,
+                        mode,
                         config,
                         tx,
                     )
@@ -178,11 +187,18 @@ async fn stream_diff(
     to_sig: Hash,
     to_id: model_v1::RevisionIdentifier,
     autoresolve: bool,
+    mode: thin_client_v1::RevisionDiffMode,
     config: RevisionDiffConfig,
     tx: mpsc::Sender<Result<RevisionDiffResponse, Status>>,
 ) {
     // Identical short-circuit: emit a header-only OK stream.
     if from_sig == to_sig {
+        let effective_mode = match mode {
+            thin_client_v1::RevisionDiffMode::Merge => thin_client_v1::RevisionDiffMode::Merge,
+            thin_client_v1::RevisionDiffMode::Auto | thin_client_v1::RevisionDiffMode::Pairwise => {
+                thin_client_v1::RevisionDiffMode::Pairwise
+            }
+        };
         let header = thin_client_v1::RevisionDiffHeader {
             identifier_from: Some(from_id),
             signature_from: from_sig.into(),
@@ -190,6 +206,7 @@ async fn stream_diff(
             signature_to: to_sig.into(),
             identifier_base: None,
             signature_base: None,
+            mode: effective_mode as i32,
         };
         let _ = send_header(&tx, header).await;
         return;
@@ -198,41 +215,14 @@ async fn stream_diff(
     let from_branch = BranchId::from(&from_id.branch_id);
     let to_branch = BranchId::from(&to_id.branch_id);
 
-    // 2-way mode kicks in when the two revisions share a branch OR when
-    // one is the branch point of the other's branch — in both cases
-    // there is no divergence to merge.
-    let two_way = if from_branch == to_branch {
-        debug!(
-            {REPOSITORY_ID} = %repository.id,
-            {BRANCH_ID} = %from_branch,
-            "RevisionDiff: same branch → 2-way",
-        );
-        true
-    } else if from_branch.is_zero() || to_branch.is_zero() {
-        debug!(
-            {REPOSITORY_ID} = %repository.id,
-            from_branch = %from_branch,
-            to_branch = %to_branch,
-            "RevisionDiff: a branch is zeroed → 2-way",
-        );
-        true
-    } else {
-        match is_branch_point_of_other(&repository, from_sig, to_branch, to_sig, from_branch).await
-        {
-            Ok(true) => {
-                debug!(
-                    {REPOSITORY_ID} = %repository.id,
-                    "RevisionDiff: branch-point-of-other → 2-way",
-                );
-                true
-            }
-            Ok(false) => false,
+    let two_way =
+        match select_two_way(&repository, mode, from_sig, from_branch, to_sig, to_branch).await {
+            Ok(two_way) => two_way,
             Err(status) => {
                 let _ = tx.send(Err(status)).await;
                 return;
             }
-        }
-    };
+        };
 
     if two_way {
         if let Err(status) = run_two_way(&repository, from_sig, from_id, to_sig, to_id, &tx).await {
@@ -253,6 +243,62 @@ async fn stream_diff(
     .await
     {
         let _ = tx.send(Err(status)).await;
+    }
+}
+
+async fn select_two_way(
+    repository: &Arc<RepositoryContext>,
+    mode: thin_client_v1::RevisionDiffMode,
+    from_sig: Hash,
+    from_branch: BranchId,
+    to_sig: Hash,
+    to_branch: BranchId,
+) -> Result<bool, Status> {
+    match mode {
+        thin_client_v1::RevisionDiffMode::Pairwise => {
+            debug!(
+                {REPOSITORY_ID} = %repository.id,
+                "RevisionDiff: explicit pairwise mode → 2-way",
+            );
+            return Ok(true);
+        }
+        thin_client_v1::RevisionDiffMode::Merge => {
+            debug!(
+                {REPOSITORY_ID} = %repository.id,
+                "RevisionDiff: explicit merge mode → 3-way",
+            );
+            return Ok(false);
+        }
+        thin_client_v1::RevisionDiffMode::Auto => {}
+    }
+
+    // AUTO chooses 2-way when the revisions share a branch OR when one is the
+    // branch point of the other's branch — in both cases the historical
+    // behavior treats the snapshots as not diverged.
+    if from_branch == to_branch {
+        debug!(
+            {REPOSITORY_ID} = %repository.id,
+            {BRANCH_ID} = %from_branch,
+            "RevisionDiff: AUTO same branch → 2-way",
+        );
+        Ok(true)
+    } else if from_branch.is_zero() || to_branch.is_zero() {
+        debug!(
+            {REPOSITORY_ID} = %repository.id,
+            from_branch = %from_branch,
+            to_branch = %to_branch,
+            "RevisionDiff: AUTO zero branch → 2-way",
+        );
+        Ok(true)
+    } else if is_branch_point_of_other(repository, from_sig, to_branch, to_sig, from_branch).await?
+    {
+        debug!(
+            {REPOSITORY_ID} = %repository.id,
+            "RevisionDiff: AUTO branch-point-of-other → 2-way",
+        );
+        Ok(true)
+    } else {
+        Ok(false)
     }
 }
 
@@ -336,6 +382,7 @@ async fn run_two_way(
         signature_to: to_sig.into(),
         identifier_base: None,
         signature_base: None,
+        mode: thin_client_v1::RevisionDiffMode::Pairwise as i32,
     };
     send_header(tx, header).await?;
 
@@ -481,6 +528,7 @@ async fn run_three_way(
         signature_to: to_sig.into(),
         identifier_base: Some(base_id),
         signature_base: Some(base.into()),
+        mode: thin_client_v1::RevisionDiffMode::Merge as i32,
     };
     send_header(tx, header).await?;
 
@@ -491,19 +539,20 @@ async fn run_three_way(
     let (producer_tx, mut producer_rx) = mpsc::channel::<Result<DiffItem, BranchError>>(256);
     let repo_clone = repository.clone();
     let producer = lore_spawn!(async move {
-        Box::pin(branch::diff3_with_source_cap(
+        Box::pin(branch::diff3_with_options(
             repo_clone,
             from_branch,
             from_sig,
             to_branch,
             to_sig,
-            None,
-            false,
-            autoresolve,
-            Some(config.source_cap),
-            config.history_walk_concurrency,
-            // The display diff reports every changed path individually.
-            None,
+            branch::Diff3Options {
+                auto_resolve: autoresolve,
+                source_cap: Some(config.source_cap),
+                history_walk_concurrency: config.history_walk_concurrency,
+                // The display diff reports every changed path individually.
+                graft_view: None,
+                ..Default::default()
+            },
             producer_tx,
         ))
         .await
@@ -556,7 +605,12 @@ async fn run_three_way(
                         unreachable!("resolve_or_announce returns Sent only via Ok")
                     }
                 };
-                Payload::Conflict(diff_conflict_from_pair(&pair, index_from, index_to).await)
+                let conflict_id = lore_revision::merge_resolution::conflict_id(
+                    base, from_sig, to_sig, &pair.0, &pair.1,
+                );
+                Payload::Conflict(
+                    diff_conflict_from_pair(&pair, conflict_id, index_from, index_to).await,
+                )
             }
         };
         match send_payload(tx, payload).await {
@@ -768,10 +822,27 @@ mod test {
         to: QueryTo,
         autoresolve: bool,
     ) -> Request<RevisionDiffRequest> {
+        make_request_with_mode(
+            repository,
+            from,
+            to,
+            autoresolve,
+            thin_client_v1::RevisionDiffMode::Auto,
+        )
+    }
+
+    fn make_request_with_mode(
+        repository: RepositoryId,
+        from: QueryFrom,
+        to: QueryTo,
+        autoresolve: bool,
+        mode: thin_client_v1::RevisionDiffMode,
+    ) -> Request<RevisionDiffRequest> {
         let mut request = Request::new(RevisionDiffRequest {
             query_from: Some(from),
             query_to: Some(to),
             autoresolve,
+            mode: mode as i32,
         });
         request.metadata_mut().insert_bin(
             REPOSITORY_ID_KEY,
@@ -887,6 +958,7 @@ mod test {
                 query_from: None,
                 query_to: Some(QueryTo::SignatureTo(Hash::default().into())),
                 autoresolve: false,
+                mode: thin_client_v1::RevisionDiffMode::Auto as i32,
             });
             request.metadata_mut().insert_bin(
                 REPOSITORY_ID_KEY,
@@ -901,6 +973,36 @@ mod test {
             .await
             {
                 Ok(_) => panic!("missing query_from must fail"),
+                Err(err) => err,
+            };
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn unknown_mode_returns_invalid_argument() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let mut request = make_request(
+                repository,
+                QueryFrom::SignatureFrom(Hash::default().into()),
+                QueryTo::SignatureTo(Hash::default().into()),
+                false,
+            );
+            request.get_mut().mode = i32::MAX;
+
+            let err = match handler(
+                request,
+                immutable_store,
+                mutable_store,
+                RevisionDiffConfig::default(),
+            )
+            .await
+            {
+                Ok(_) => panic!("unknown mode must fail"),
                 Err(err) => err,
             };
             assert_eq!(err.code(), tonic::Code::InvalidArgument);
@@ -958,6 +1060,10 @@ mod test {
             assert_eq!(Hash::from(header.signature_to.as_ref()), rev);
             assert!(header.identifier_base.is_none());
             assert!(header.signature_base.is_none());
+            assert_eq!(
+                header.mode,
+                thin_client_v1::RevisionDiffMode::Pairwise as i32
+            );
         }))
         .await;
     }
@@ -1018,6 +1124,10 @@ mod test {
             // 2-way: no base.
             assert!(header.identifier_base.is_none());
             assert!(header.signature_base.is_none());
+            assert_eq!(
+                header.mode,
+                thin_client_v1::RevisionDiffMode::Pairwise as i32
+            );
 
             let changes: Vec<&thin_client_v1::DiffChange> = items[1..]
                 .iter()
@@ -1210,12 +1320,199 @@ mod test {
             assert_eq!(BranchId::from(&base_id.branch_id), main);
             let base_sig = header.signature_base.as_ref().expect("signature_base set");
             assert_eq!(Hash::from(base_sig.as_ref()), main_rev);
+            assert_eq!(header.mode, thin_client_v1::RevisionDiffMode::Merge as i32);
             // At least one conflict reported.
             assert!(
                 items[1..]
                     .iter()
                     .any(|item| matches!(item.payload, Some(Payload::Conflict(_)))),
                 "expected at least one conflict",
+            );
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn explicit_pairwise_compares_diverged_branches_directly() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let main = create_branch(&repository_context, "main", vec![]).await;
+            let base = push_revision(
+                &repository_context,
+                main,
+                Hash::default(),
+                1,
+                &[("changed.txt", b"base".as_slice())],
+            )
+            .await;
+            let branch_a = create_branch(
+                &repository_context,
+                "branch_a",
+                vec![BranchPoint {
+                    branch: main,
+                    revision: base,
+                }],
+            )
+            .await;
+            let revision_a = push_revision(
+                &repository_context,
+                branch_a,
+                base,
+                1,
+                &[("changed.txt", b"left".as_slice())],
+            )
+            .await;
+            let branch_b = create_branch(
+                &repository_context,
+                "branch_b",
+                vec![BranchPoint {
+                    branch: main,
+                    revision: base,
+                }],
+            )
+            .await;
+            let revision_b = push_revision(
+                &repository_context,
+                branch_b,
+                base,
+                1,
+                &[("changed.txt", b"right".as_slice())],
+            )
+            .await;
+
+            let response = handler(
+                make_request_with_mode(
+                    repository,
+                    QueryFrom::SignatureFrom(revision_a.into()),
+                    QueryTo::SignatureTo(revision_b.into()),
+                    false,
+                    thin_client_v1::RevisionDiffMode::Pairwise,
+                ),
+                immutable_store,
+                mutable_store,
+                RevisionDiffConfig::default(),
+            )
+            .await
+            .expect("handler ok");
+            let items: Vec<_> = collect(response)
+                .await
+                .into_iter()
+                .map(|item| item.expect("stream item"))
+                .collect();
+
+            let header = match &items[0].payload {
+                Some(Payload::Header(header)) => header,
+                other => panic!("expected header, got {other:?}"),
+            };
+            assert!(header.identifier_base.is_none());
+            assert!(header.signature_base.is_none());
+            assert_eq!(
+                header.mode,
+                thin_client_v1::RevisionDiffMode::Pairwise as i32
+            );
+            assert!(
+                items[1..]
+                    .iter()
+                    .all(|item| !matches!(item.payload, Some(Payload::Conflict(_))))
+            );
+            assert!(items[1..].iter().any(|item| {
+                matches!(
+                    &item.payload,
+                    Some(Payload::Change(change))
+                        if change.path == "changed.txt"
+                            && change.content_from != change.content_to
+                )
+            }));
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn explicit_merge_resolves_same_branch_divergence() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let main = create_branch(&repository_context, "main", vec![]).await;
+            let base = push_revision(
+                &repository_context,
+                main,
+                Hash::default(),
+                1,
+                &[("changed.txt", b"base".as_slice())],
+            )
+            .await;
+            let detached = push_revision(
+                &repository_context,
+                main,
+                base,
+                2,
+                &[("changed.txt", b"detached".as_slice())],
+            )
+            .await;
+            let current = push_revision(
+                &repository_context,
+                main,
+                base,
+                2,
+                &[("changed.txt", b"current".as_slice())],
+            )
+            .await;
+
+            let response = handler(
+                make_request_with_mode(
+                    repository,
+                    QueryFrom::SignatureFrom(detached.into()),
+                    QueryTo::SignatureTo(current.into()),
+                    false,
+                    thin_client_v1::RevisionDiffMode::Merge,
+                ),
+                immutable_store,
+                mutable_store,
+                RevisionDiffConfig::default(),
+            )
+            .await
+            .expect("handler ok");
+            let items: Vec<_> = collect(response)
+                .await
+                .into_iter()
+                .map(|item| item.expect("stream item"))
+                .collect();
+
+            let header = match &items[0].payload {
+                Some(Payload::Header(header)) => header,
+                other => panic!("expected header, got {other:?}"),
+            };
+            assert_eq!(
+                Hash::from(
+                    header
+                        .signature_base
+                        .as_ref()
+                        .expect("signature_base")
+                        .as_ref()
+                ),
+                base
+            );
+            assert_eq!(header.mode, thin_client_v1::RevisionDiffMode::Merge as i32);
+            assert!(
+                items[1..]
+                    .iter()
+                    .any(|item| matches!(item.payload, Some(Payload::Conflict(_)))),
+                "same-branch siblings should be evaluated as a merge conflict",
             );
         }))
         .await;
@@ -1409,6 +1706,7 @@ mod test {
                 query_from: Some(QueryFrom::SignatureFrom(Hash::default().into())),
                 query_to: None,
                 autoresolve: false,
+                mode: thin_client_v1::RevisionDiffMode::Auto as i32,
             });
             request.metadata_mut().insert_bin(
                 REPOSITORY_ID_KEY,

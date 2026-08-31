@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 pub mod auth;
 pub mod connection;
+pub(crate) mod direct_download;
 pub mod error;
 pub mod grpc;
 pub mod quic;

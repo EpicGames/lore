@@ -109,6 +109,7 @@ impl LoreInterface {
                 no_commit: 0,
                 link: Default::default(),
                 ignore_links: 0,
+                path_merge_rules: LoreArray::default(),
             },
             Some(Box::new(move |event| match event {
                 LoreEvent::BranchMergeStartEnd(event) => {

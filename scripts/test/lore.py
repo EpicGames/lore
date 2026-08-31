@@ -616,8 +616,38 @@ class Lore:
         link: str | None = None,
         dry_run: bool = False,
         ignore_links: bool = False,
+        merge_strategy: str | list[str] | None = None,
+        keep_target: str | list[str] | Path | list[Path] | None = None,
+        exclude: str | list[str] | Path | list[Path] | None = None,
         **kwargs: Unpack[GlobalOptions],
     ):
+        def optional_string_list(value):
+            if value is None:
+                return []
+            if isinstance(value, list):
+                return [str(item) for item in value]
+            return [str(value)]
+
+        def optional_path_list(value):
+            return [self._fix_path(path) for path in optional_string_list(value)]
+
+        def optional_strategy_list(value):
+            strategies = []
+            for item in optional_string_list(value):
+                entries = item.split(",")
+                converted = []
+                for entry in entries:
+                    if ":" not in entry:
+                        converted.append(entry)
+                        continue
+                    strategy, path = entry.split(":", 1)
+                    converted.append(f"{strategy}:{self._fix_path(path)}")
+                strategies.append(",".join(converted))
+            return strategies
+
+        merge_strategy = optional_strategy_list(merge_strategy)
+        keep_target = optional_path_list(keep_target)
+        exclude = optional_path_list(exclude)
         return self.run(
             ["branch", "merge", "start"]
             + ([name] if name else [])
@@ -626,7 +656,10 @@ class Lore:
             + (["--no-commit"] if no_commit else [])
             + (["--link", link] if link else [])
             + (["--dry-run"] if dry_run else [])
-            + (["--ignore-links"] if ignore_links else []),
+            + (["--ignore-links"] if ignore_links else [])
+            + [item for rule in merge_strategy for item in ["--merge-strategy", rule]]
+            + [item for path in keep_target for item in ["--keep-target", path]]
+            + [item for path in exclude for item in ["--exclude", path]],
             **kwargs,
         )
 

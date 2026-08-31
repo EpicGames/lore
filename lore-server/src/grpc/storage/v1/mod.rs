@@ -7,10 +7,12 @@ pub mod get_resolved;
 pub mod mutable_compare_and_swap;
 pub mod mutable_load;
 pub mod mutable_store;
+pub mod presign_download;
 pub mod put;
 pub mod put_resolved;
 pub mod query;
 pub mod service;
+pub mod upload_content;
 pub mod verify;
 
 #[cfg(test)]

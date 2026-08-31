@@ -70,6 +70,7 @@ impl RepositoryService {
         Ok(RepositoryData {
             id: repository.id.into(),
             name: repository.name,
+            default_branch_name: repository.default_branch_name,
             metadata: repository.metadata.into(),
         })
     }
@@ -132,6 +133,7 @@ impl RepositoryService {
             Ok(RepositoryData {
                 id: repository.id.into(),
                 name: repository.name,
+                default_branch_name: repository.default_branch_name,
                 metadata: repository.metadata.into(),
             })
         } else {
@@ -158,6 +160,7 @@ impl RepositoryService {
                                     entries.push(RepositoryData {
                                         id: repository.id.into(),
                                         name: repository.name,
+                                        default_branch_name: repository.default_branch_name,
                                         metadata: repository.metadata.into(),
                                     });
                                 }
