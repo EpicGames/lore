@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+// SPDX-FileCopyrightText: 2026 glitch-ux
 // SPDX-License-Identifier: MIT
 use std::io::ErrorKind;
 use std::io::Read;
@@ -49,7 +50,7 @@ pub fn blocking_read_v1_message<Message: for<'a> Deserialize<'a>, Reader: Read +
     reader
         .read_exact(&mut header_bytes)
         .internal("reading message header")?;
-    let header = V1Header::from_bytes(&header_bytes).unwrap();
+    let header = V1Header::from_bytes(&header_bytes)?;
 
     let mut message_bytes = vec![0; header.payload_size as usize];
     reader
