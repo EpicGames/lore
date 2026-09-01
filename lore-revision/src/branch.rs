@@ -393,7 +393,7 @@ pub const LATEST_STATUS: &str = "branch-head-status";
 pub const LATEST_HISTORY: &str = "branch-head-history";
 pub const LAST_SYNC: &str = "branch-last-sync";
 pub const METADATA: &str = "branch-metadata";
-pub const REVISION_NUMBER_STEP: &str = "branch-revision-number-step";
+pub const REVISION_NUMBER_STEP: &str = "branch-revision-number-step-v2";
 pub const REVISION_LIST_STEP: &str = "branch-revision-list-step";
 pub const DEFAULT_HISTORY_STEP_SIZE: u64 = 100;
 
@@ -408,6 +408,17 @@ pub const CACHED_REVISION_LIST_MAGIC: u32 = u32::from_le_bytes(*b"RLSC");
 /// are discarded on load and rebuilt via backfill — there is no
 /// in-place migration.
 pub const CACHED_REVISION_LIST_VERSION: u32 = 1;
+
+/// "functions" passed to `mutable_key_type` that may exist in the Mutable Store that are no longer
+/// referenced by the codebase, and can be removed without data loss.
+///
+/// These are not guaranteed to exist and depend on the versions of `lore-server` that have been
+/// used against the Mutable Store
+pub const ORPHANED_MUTABLE_STORE_KEY_TYPE_FUNCTIONS: [&str; 1] = [
+    // a revision step acceleration key, that had a bug which meant step boundaries were prematurely
+    // sealed and legitimate revisions could not be found in boundaries where they should have been
+    "branch-revision-number-step",
+];
 
 /// Fixed-size header at the start of every cached revision-list blob.
 /// The remainder of the blob is a packed array of `CachedRevisionItem`.

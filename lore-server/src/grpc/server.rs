@@ -216,9 +216,22 @@ pub struct RevisionListAcceleration {
 
 impl RevisionListAcceleration {
     pub fn from_feature(feature: &FeatureSettings) -> Self {
+        let step_keys = feature.revision_step_keys.unwrap_or(true);
+
+        let wants_list_cache = feature.revision_list_cache.unwrap_or(true);
+        let list_cache = if !step_keys && wants_list_cache {
+            warn!(
+                ?feature,
+                "List Cache acceleration feature does not function without Step Keys feature"
+            );
+            false
+        } else {
+            wants_list_cache
+        };
+
         Self {
-            step_keys: feature.revision_step_keys.unwrap_or(true),
-            list_cache: feature.revision_list_cache.unwrap_or(true),
+            step_keys,
+            list_cache,
         }
     }
 }

@@ -45,7 +45,6 @@ use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
-use crate::grpc::get_write_token;
 use crate::grpc::revision::v1::service::RevisionListInstruments;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
@@ -513,7 +512,7 @@ async fn walk_revisions(
     // Segment-aligns the walk: walk-served pages stop at the floor so they line up
     // with cache-served pages and consecutive backward-cursor calls don't overlap.
     let mut segment_floor: Option<u64> = None;
-    let mut prev_step_info: Option<(u64, Hash, Hash)> = None;
+    let mut prev_step_state: Option<Arc<state::State>> = None;
 
     while items.len() < MAX_REVISION_LIST_RESPONSE_ITEMS && !current.is_zero() {
         let state = state::State::deserialize(repository.clone(), current)
@@ -558,6 +557,41 @@ async fn walk_revisions(
 
         let current_number = state.revision_number();
 
+        // Backfill missing history-step keys when full-iteration crosses a
+        // step boundary. Subsequent paginated calls can then take the
+        // HistoryStep fast path. Skipped when step keys are disabled. Must
+        // run before the segment-floor check below: the crossing this
+        // detects and the walk's exit point are the same revision, so
+        // checking floor first would break out before this ever ran.
+        if acceleration.step_keys
+            && matches!(strategy, RevisionListStrategy::FullIteration)
+            && let Some(previous_state) = &prev_step_state
+            && let Some((lowest_b, highest_b)) = cache::revision::sealed_boundaries(
+                state.revision_number(),
+                previous_state.revision_number(),
+                history_step_size,
+            )
+            && let Ok(metadata) =
+                Metadata::deserialize(repository.clone(), previous_state.metadata_hash()).await
+            && let Ok(branch_id) = metadata.get_branch()
+        {
+            for boundary in (lowest_b..=highest_b).step_by(history_step_size as usize) {
+                let _ = cache::revision::seal_boundary_revision_number(
+                    repository.clone(),
+                    branch_id,
+                    history_step_size,
+                    boundary,
+                    &state,
+                    previous_state,
+                )
+                .await;
+                debug!(boundary, "Backfilled history step key");
+            }
+        }
+        if matches!(strategy, RevisionListStrategy::FullIteration) {
+            prev_step_state = Some(state.clone());
+        }
+
         if first {
             let b = current_number.div_ceil(history_step_size) * history_step_size;
             segment_floor = Some(b.saturating_sub(history_step_size).saturating_add(1));
@@ -566,35 +600,6 @@ async fn walk_revisions(
         {
             next_older = Some(current);
             break;
-        }
-
-        // Backfill missing history-step keys when full-iteration crosses a
-        // step boundary. Subsequent paginated calls can then take the
-        // HistoryStep fast path. Skipped when step keys are disabled.
-        if acceleration.step_keys
-            && matches!(strategy, RevisionListStrategy::FullIteration)
-            && let Some((prev_number, prev_hash, prev_metadata_hash)) = prev_step_info
-            && prev_number / history_step_size != current_number / history_step_size
-            && let Ok(metadata) =
-                Metadata::deserialize(repository.clone(), prev_metadata_hash).await
-            && let Ok(branch_id) = metadata.get_branch()
-        {
-            let (key, key_type) = branch::revision_step_key(
-                repository::SALT_LORE,
-                repository.id,
-                branch_id,
-                prev_number,
-                history_step_size,
-            );
-            let write_token = get_write_token();
-            let _ = repository
-                .write_mutable_store(&write_token)
-                .store(repository.id, key, prev_hash, key_type)
-                .await;
-            debug!(number = prev_number, key = %key, "Backfilled history step key");
-        }
-        if matches!(strategy, RevisionListStrategy::FullIteration) {
-            prev_step_info = Some((current_number, current, state.metadata_hash()));
         }
 
         items.push(model_v1::RevisionItem {
@@ -663,6 +668,7 @@ async fn forward_cursor(
 
 #[cfg(test)]
 mod test {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use lore_base::runtime::LORE_CONTEXT;
@@ -798,6 +804,133 @@ mod test {
         }
         signatures.reverse();
         (branch_id, signatures)
+    }
+
+    /// Serialize a revision without pushing it, for use as the `parent_other`
+    /// of a merge. Its revision number is what drags the branch's number up.
+    async fn serialize_detached_revision(
+        repository: &Arc<RepositoryContext>,
+        branch_id: BranchId,
+        revision_number: u64,
+    ) -> Hash {
+        let write_token = get_write_token();
+        let mut metadata = Metadata::new();
+        metadata.set_branch(branch_id).expect("set branch");
+        let metadata_hash = metadata
+            .serialize(repository.clone())
+            .await
+            .expect("serialize metadata");
+
+        let state = Arc::new(State::new());
+        state.set_revision_number(revision_number);
+        state.set_metadata_hash(metadata_hash);
+        state
+            .serialize(repository.clone(), &write_token)
+            .await
+            .expect("serialize detached state")
+    }
+
+    /// Push one revision chained onto `parent_self`. `revision_number` is a
+    /// hint only — `push` recomputes it from both parents.
+    async fn push_chained_revision(
+        repository: &Arc<RepositoryContext>,
+        branch_id: BranchId,
+        parent_self: Hash,
+        parent_other: Hash,
+        revision_number: u64,
+    ) -> (Hash, u64) {
+        let write_token = get_write_token();
+        let mut metadata = Metadata::new();
+        metadata.set_branch(branch_id).expect("set branch");
+        let metadata_hash = metadata
+            .serialize(repository.clone())
+            .await
+            .expect("serialize metadata");
+
+        let state = Arc::new(State::new());
+        state.set_parent_self(parent_self);
+        if !parent_other.is_zero() {
+            state.set_parent_other(parent_other);
+        }
+        state.set_revision_number(revision_number);
+        state.set_metadata_hash(metadata_hash);
+        let serialized = state
+            .serialize(repository.clone(), &write_token)
+            .await
+            .expect("serialize state");
+
+        let result = branch_push::push(
+            repository.clone(),
+            branch_id,
+            serialized,
+            true,
+            true,
+            false,
+            DEFAULT_HISTORY_STEP_SIZE,
+            crate::grpc::server::RevisionListAcceleration::default(),
+        )
+        .await
+        .expect("push revision");
+        (result.revision, result.revision_number)
+    }
+
+    /// Build a branch whose revision numbers are not contiguous: a linear run
+    /// of `linear_before` revisions, then a merge whose `parent_other` is
+    /// numbered `jump_other_number` (so the branch number jumps to
+    /// `jump_other_number + 1`), then `linear_after` more revisions.
+    /// Returns `(branch_id, revision number -> signature)`.
+    async fn create_branch_with_jump_history(
+        repository: &Arc<RepositoryContext>,
+        linear_before: u64,
+        jump_other_number: u64,
+        linear_after: u64,
+    ) -> (BranchId, BTreeMap<u64, Hash>) {
+        let write_token = get_write_token();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        branch::create(
+            repository.clone(),
+            &write_token,
+            branch_id,
+            "test-branch",
+            branch::default_category(),
+            "creator",
+            1,
+            vec![],
+            false,
+            false,
+        )
+        .await
+        .expect("create branch");
+
+        let mut revisions = BTreeMap::new();
+        let mut parent = Hash::default();
+        for number in 1..=linear_before {
+            let (revision, revision_number) =
+                push_chained_revision(repository, branch_id, parent, Hash::default(), number).await;
+            revisions.insert(revision_number, revision);
+            parent = revision;
+        }
+
+        let other = serialize_detached_revision(repository, branch_id, jump_other_number).await;
+        let (revision, jumped_number) =
+            push_chained_revision(repository, branch_id, parent, other, 0).await;
+        revisions.insert(jumped_number, revision);
+        parent = revision;
+
+        for offset in 1..=linear_after {
+            let (revision, revision_number) = push_chained_revision(
+                repository,
+                branch_id,
+                parent,
+                Hash::default(),
+                jumped_number + offset,
+            )
+            .await;
+            revisions.insert(revision_number, revision);
+            parent = revision;
+        }
+
+        (branch_id, revisions)
     }
 
     #[tokio::test]
@@ -1752,6 +1885,182 @@ mod test {
             assert_eq!(inner.items.len(), 50);
             assert_eq!(inner.items[0].number, 150);
             assert_eq!(inner.items[49].number, 101);
+        }))
+        .await;
+    }
+
+    /// Every revision that exists resolves by number, including on a branch
+    /// whose numbering has a gap left by a merge.
+    #[tokio::test]
+    async fn finds_revision_below_a_jump_that_skipped_a_boundary() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            // 1..=99, then a merge jumping to 105, then 106..=150.
+            let (branch_id, revisions) =
+                create_branch_with_jump_history(&repository_context, 99, 104, 45).await;
+            assert!(revisions.contains_key(&105));
+            assert_eq!(revisions.keys().next_back(), Some(&150));
+            // 100..=104 were skipped by the jump.
+            assert!(!revisions.contains_key(&100));
+
+            for number in [99, 105, 120, 150] {
+                let response = handler(
+                    make_request_identifier(repository, branch_id, number),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    DEFAULT_HISTORY_STEP_SIZE,
+                    crate::grpc::server::RevisionListAcceleration::default(),
+                    &make_instruments(),
+                )
+                .await
+                .unwrap_or_else(|err| panic!("revision {number} should resolve: {err}"))
+                .into_inner();
+                assert_eq!(response.items[0].number, number);
+                assert_eq!(
+                    Hash::from(response.items[0].signature.as_ref()),
+                    revisions[&number],
+                );
+            }
+        }))
+        .await;
+    }
+
+    /// With several boundaries skipped in one jump, each sealed boundary
+    /// answers with the highest revision at or below it, so lookups inside
+    /// the pre-jump segment still resolve. A request served from the list
+    /// cache returns that whole segment, so the requested revision is located
+    /// within the items rather than assumed to head them.
+    #[tokio::test]
+    async fn finds_revisions_below_a_multi_boundary_jump() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            // 1..=150, then a merge jumping to 400 (skipping boundaries 200
+            // and 300), then 401..=405.
+            let (branch_id, revisions) =
+                create_branch_with_jump_history(&repository_context, 150, 399, 5).await;
+            assert!(revisions.contains_key(&400));
+
+            for number in [101, 120, 150, 400, 405] {
+                let response = handler(
+                    make_request_identifier(repository, branch_id, number),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    DEFAULT_HISTORY_STEP_SIZE,
+                    crate::grpc::server::RevisionListAcceleration::default(),
+                    &make_instruments(),
+                )
+                .await
+                .unwrap_or_else(|err| panic!("revision {number} should resolve: {err}"))
+                .into_inner();
+                let item = response
+                    .items
+                    .iter()
+                    .find(|item| item.number == number)
+                    .unwrap_or_else(|| panic!("revision {number} missing from response"));
+                assert_eq!(Hash::from(item.signature.as_ref()), revisions[&number]);
+            }
+        }))
+        .await;
+    }
+
+    /// A revision number a merge skipped does not exist. A sealed boundary
+    /// whose anchor is numbered below the request proves that absence.
+    #[tokio::test]
+    async fn revision_number_skipped_by_a_jump_is_not_found() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (branch_id, revisions) =
+                create_branch_with_jump_history(&repository_context, 150, 399, 5).await;
+            assert!(!revisions.contains_key(&250));
+
+            let err = handler(
+                make_request_identifier(repository, branch_id, 250),
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration::default(),
+                &make_instruments(),
+            )
+            .await
+            .expect_err("skipped revision number should not resolve");
+            assert_eq!(err.code(), tonic::Code::NotFound);
+        }))
+        .await;
+    }
+
+    /// The segment holding the branch head stays open until the head moves
+    /// past it, so a lookup inside it resolves by iteration.
+    #[tokio::test]
+    async fn jump_does_not_seal_the_segment_it_landed_in() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            // Head lands at 105 and stops, leaving segment 200 open.
+            let (branch_id, _) =
+                create_branch_with_jump_history(&repository_context, 99, 104, 0).await;
+
+            let (key, key_type) = branch::revision_step_key(
+                lore_revision::repository::SALT_LORE,
+                repository,
+                branch_id,
+                200,
+                DEFAULT_HISTORY_STEP_SIZE,
+            );
+            assert!(
+                mutable_store
+                    .clone()
+                    .load(repository, key, key_type)
+                    .await
+                    .is_err(),
+                "segment 200 holds the head and must not be sealed",
+            );
+
+            // Boundary 100 was crossed by the jump and is sealed with 99.
+            let (crossed_key, crossed_key_type) = branch::revision_step_key(
+                lore_revision::repository::SALT_LORE,
+                repository,
+                branch_id,
+                100,
+                DEFAULT_HISTORY_STEP_SIZE,
+            );
+            assert!(
+                mutable_store
+                    .load(repository, crossed_key, crossed_key_type)
+                    .await
+                    .is_ok(),
+                "boundary 100 was crossed and must be sealed",
+            );
         }))
         .await;
     }

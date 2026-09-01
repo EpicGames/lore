@@ -40,7 +40,7 @@ use tracing::instrument;
 use tracing::span;
 use tracing::warn;
 
-use crate::cache;
+use crate::cache::revision::store_history_step;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
@@ -434,9 +434,9 @@ pub async fn push(
             store_history_step(
                 repository.clone(),
                 branch,
-                state_parent.revision_number(),
                 history_step_size,
                 acceleration,
+                state_parent,
                 state.clone(),
             )
             .await;
@@ -566,17 +566,17 @@ async fn try_fast_forward_merge(
         state_current.set_parent_other(incoming_revision);
 
         // Compute revision number from both parents
-        let state_current_number = {
-            let parent_state = State::deserialize(repository.clone(), current_head)
-                .await
-                .filter_slow_down()?
-                .warn_map_err(|err| {
-                    Status::internal(format!("Failed to load current head state: {err}"))
-                })?;
-            parent_state.revision_number()
-        };
-        let revision_number =
-            next_revision_number(state_current_number, incoming_state.revision_number());
+        let parent_state = State::deserialize(repository.clone(), current_head)
+            .await
+            .filter_slow_down()?
+            .warn_map_err(|err| {
+                Status::internal(format!("Failed to load current head state: {err}"))
+            })?;
+
+        let revision_number = next_revision_number(
+            parent_state.revision_number(),
+            incoming_state.revision_number(),
+        );
         state_current.set_revision_number(revision_number);
 
         // Copy metadata from the incoming revision and set merged-by to "server"
@@ -646,9 +646,9 @@ async fn try_fast_forward_merge(
             store_history_step(
                 repository.clone(),
                 branch,
-                state_current_number,
                 history_step_size,
                 acceleration,
+                parent_state,
                 state_current.clone(),
             )
             .await;
@@ -674,99 +674,6 @@ async fn try_fast_forward_merge(
 /// The revision number is one greater than the maximum of the two parents.
 fn next_revision_number(parent_self_number: u64, parent_other_number: u64) -> u64 {
     std::cmp::max(parent_self_number, parent_other_number) + 1
-}
-
-/// Store the history-step skip pointer (if a boundary was crossed) and any
-/// revision-list cache entries for segments newly closed by this push.
-///
-/// A segment `B` (= `N * history_step_size`) is *closed* by this push iff
-/// `parent_revision_number <= B < revision_number`. A single push can close
-/// multiple segments (e.g. a merge that jumps past several boundaries). For
-/// each closed segment we walk `parent_self` from `state` and persist the
-/// items whose number falls in `(B - step, B]`.
-///
-/// Errors are ignored — this is purely an acceleration construct and will be
-/// recreated on the next lookup if any step fails.
-async fn store_history_step(
-    repository: Arc<RepositoryContext>,
-    branch: BranchId,
-    parent_revision_number: u64,
-    history_step_size: u64,
-    acceleration: crate::grpc::server::RevisionListAcceleration,
-    state: Arc<State>,
-) {
-    let revision_number = state.revision_number();
-    let revision = state.revision();
-
-    if acceleration.step_keys
-        && parent_revision_number / history_step_size != revision_number / history_step_size
-    {
-        let (key, key_type) = branch::revision_step_key(
-            repository::SALT_LORE,
-            repository.id,
-            branch,
-            revision_number,
-            history_step_size,
-        );
-        let write_token = get_write_token();
-        let _ = repository
-            .clone()
-            .write_mutable_store(&write_token)
-            .store(repository.id, key, revision, key_type)
-            .await;
-    }
-
-    if !acceleration.list_cache {
-        return;
-    }
-
-    // Determine which segment boundaries are *newly closed* by this push.
-    // A boundary B (multiple of history_step_size) is newly closed iff
-    // P <= B < N (where P = parent_revision_number, N = revision_number).
-    let lowest_b = parent_revision_number.div_ceil(history_step_size) * history_step_size;
-    let highest_b = if revision_number > 0 {
-        ((revision_number - 1) / history_step_size) * history_step_size
-    } else {
-        return;
-    };
-    if lowest_b == 0 || lowest_b > highest_b {
-        return;
-    }
-
-    // Walk parent chain from the new revision until we cross below the lowest
-    // closed segment, capturing items for each closed boundary.
-    let stop_below = lowest_b.saturating_sub(history_step_size);
-    let span_segments = (highest_b.saturating_sub(lowest_b) / history_step_size) + 1;
-    let max_items = (span_segments as usize)
-        .saturating_mul(history_step_size as usize)
-        // Allow a small overshoot so partial segments above the closed range
-        // (the still-open one containing N) and the one terminator item can
-        // still be walked.
-        .saturating_add(history_step_size as usize)
-        .saturating_add(1);
-
-    let walk =
-        cache::revision::walk_segment_revisions(&repository, revision, stop_below, max_items).await;
-
-    if !walk.reached_terminator {
-        // Walk was bounded by max_items; the last segment may be partial.
-        // Skip cache writes — next reader will rebuild them via backfill.
-        return;
-    }
-
-    let segments = cache::revision::partition_into_segments(&walk.items, history_step_size);
-    for (segment_b, list) in segments {
-        if segment_b >= lowest_b && segment_b <= highest_b {
-            cache::revision::store_cached_list(
-                &repository,
-                branch,
-                segment_b,
-                history_step_size,
-                &list,
-            )
-            .await;
-        }
-    }
 }
 
 /// Verify that all new fragments between `parent_state` and `state` exist in the
@@ -919,133 +826,426 @@ mod tests {
     use crate::grpc::server::RevisionListAcceleration;
     use crate::store::test_store_create;
 
-    #[test]
-    fn use_x_forwarded_when_available() {
-        let mut req = Request::new(());
-
-        let xff_metadata_value: MetadataValue<_> = "10.0.0.1, 10.0.0.2".parse().unwrap();
-        req.metadata_mut()
-            .insert("x-forwarded-for", xff_metadata_value);
-
-        // set remote address to make sure it's NOT used in presence of the XFF header
-        let peer_addr = SocketAddr::from(([192, 168, 1, 42], 4242));
-        req.extensions_mut().insert(TcpConnectInfo {
-            local_addr: None,
-            remote_addr: Some(peer_addr),
-        });
-
-        assert_eq!(
-            extract_client_ip(&req),
-            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))
-        );
-    }
-
-    #[test]
-    fn dont_use_xff_when_it_contains_invalid_value() {
-        let mut req = Request::new(());
-
-        let xff_metadata_value: MetadataValue<_> = "10.0.0.lol, 10.0.0.wat".parse().unwrap();
-        req.metadata_mut()
-            .insert("x-forwarded-for", xff_metadata_value);
-
-        let peer_addr = SocketAddr::from(([192, 168, 1, 42], 4242));
-        req.extensions_mut().insert(TcpConnectInfo {
-            local_addr: None,
-            remote_addr: Some(peer_addr),
-        });
-
-        assert_eq!(
-            extract_client_ip(&req),
-            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)))
-        );
-    }
-
-    #[test]
-    fn still_uses_last_ip_when_xff_contains_invalid_value_in_chain() {
-        let mut req = Request::new(());
-
-        let xff_metadata_value: MetadataValue<_> =
-            "10.0.0.lol, 10.0.0.wat, 10.0.0.42".parse().unwrap();
-        req.metadata_mut()
-            .insert("x-forwarded-for", xff_metadata_value);
-
-        let peer_addr = SocketAddr::from(([192, 168, 1, 42], 4242));
-        req.extensions_mut().insert(TcpConnectInfo {
-            local_addr: None,
-            remote_addr: Some(peer_addr),
-        });
-
-        assert_eq!(
-            extract_client_ip(&req),
-            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42)))
-        );
-    }
-
-    #[test]
-    fn fallback_to_remote_addr() {
-        let mut req = Request::new(());
-
-        let peer_addr = SocketAddr::from(([192, 168, 1, 42], 31415));
-        req.extensions_mut().insert(TcpConnectInfo {
-            local_addr: None,
-            remote_addr: Some(peer_addr),
-        });
-
-        assert_eq!(
-            extract_client_ip(&req),
-            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)))
-        );
-    }
-
-    #[tokio::test]
-    async fn push_unknown_revision_returns_not_found() {
-        let repository_id = random::<RepositoryId>();
+    async fn create_test_branch(repository: &Arc<RepositoryContext>) -> BranchId {
         let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let write_token = get_write_token();
+        branch::create(
+            repository.clone(),
+            &write_token,
+            branch_id,
+            "test-branch",
+            branch::default_category(),
+            "creator",
+            1,
+            vec![],
+            false,
+            false,
+        )
+        .await
+        .expect("create branch");
+        branch_id
+    }
 
-        let (immutable_store, mutable_store, execution) =
-            test_store_create().await.expect("Failed to create stores");
-
-        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
-            let repository_context = Arc::new(RepositoryContext::new_server_context(
-                immutable_store,
-                mutable_store,
-                repository_id,
-            ));
-
-            let write_token = get_write_token();
-            branch::create(
-                repository_context.clone(),
-                &write_token,
-                branch_id,
-                "test-branch",
-                branch::personal_category(),
-                "test-creator",
-                1,
-                vec![],
-                false,
-                false,
-            )
+    async fn serialize_revision(
+        repository: &Arc<RepositoryContext>,
+        branch: BranchId,
+        parent_self: Hash,
+        parent_other: Hash,
+        revision_number: u64,
+    ) -> Arc<State> {
+        let write_token = get_write_token();
+        let mut metadata = lore_revision::metadata::Metadata::new();
+        metadata.set_branch(branch).expect("set branch");
+        let metadata_hash = metadata
+            .serialize(repository.clone())
             .await
-            .expect("Failed to create branch");
+            .expect("serialize metadata");
 
-            // A hash with no corresponding state data in the immutable store
-            let nonexistent_revision = random::<Hash>();
+        let state = Arc::new(State::new());
+        state.set_parent_self(parent_self);
+        if !parent_other.is_zero() {
+            state.set_parent_other(parent_other);
+        }
+        state.set_revision_number(revision_number);
+        state.set_metadata_hash(metadata_hash);
+        state
+            .serialize(repository.clone(), &write_token)
+            .await
+            .expect("serialize state");
+        state
+    }
 
-            let result = push(
-                repository_context,
-                branch_id,
-                nonexistent_revision,
+    /// Push revisions `numbers`, chained from `parent`. Returns the pushed
+    /// signatures oldest-first.
+    async fn push_linear_revisions(
+        repository: &Arc<RepositoryContext>,
+        branch: BranchId,
+        parent: Hash,
+        numbers: std::ops::RangeInclusive<u64>,
+    ) -> Vec<Hash> {
+        let mut parent = parent;
+        let mut signatures = Vec::new();
+        for number in numbers {
+            let state =
+                serialize_revision(repository, branch, parent, Hash::default(), number).await;
+            parent = push(
+                repository.clone(),
+                branch,
+                state.revision(),
                 true,
                 true,
                 false,
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
             )
-            .await;
+            .await
+            .expect("push revision")
+            .revision;
+            signatures.push(parent);
+        }
+        signatures
+    }
 
-            assert!(result.is_err());
-            assert_eq!(result.err().unwrap().code(), Code::NotFound);
-        }))
+    /// Push a merge revision whose `parent_other` carries a much higher
+    /// revision number, so the branch's revision number jumps to
+    /// `other_revision_number + 1` and skips the numbers in between.
+    async fn push_jump_revision(
+        repository: &Arc<RepositoryContext>,
+        branch: BranchId,
+        parent: Hash,
+        other_revision_number: u64,
+    ) -> (Hash, u64) {
+        let other = serialize_revision(
+            repository,
+            branch,
+            Hash::default(),
+            Hash::default(),
+            other_revision_number,
+        )
         .await;
+        let state = serialize_revision(
+            repository,
+            branch,
+            parent,
+            other.revision(),
+            0, /* rewritten */
+        )
+        .await;
+
+        let result = push(
+            repository.clone(),
+            branch,
+            state.revision(),
+            true,
+            true,
+            false,
+            DEFAULT_HISTORY_STEP_SIZE,
+            RevisionListAcceleration::default(),
+        )
+        .await
+        .expect("push jump revision");
+        (result.revision, result.revision_number)
+    }
+
+    /// Read the revision sealed at `boundary`, or `None` when unsealed.
+    async fn load_step_key(
+        repository: &Arc<RepositoryContext>,
+        branch: BranchId,
+        boundary: u64,
+    ) -> Option<Hash> {
+        let (key, key_type) = branch::revision_step_key(
+            repository::SALT_LORE,
+            repository.id,
+            branch,
+            boundary,
+            DEFAULT_HISTORY_STEP_SIZE,
+        );
+        repository
+            .clone()
+            .read_mutable_store()
+            .load(repository.id, key, key_type)
+            .await
+            .ok()
+            .filter(|revision| !revision.is_zero())
+    }
+
+    mod extract_client_ip {
+        use super::*;
+
+        #[test]
+        fn use_x_forwarded_when_available() {
+            let mut req = Request::new(());
+
+            let xff_metadata_value: MetadataValue<_> = "10.0.0.1, 10.0.0.2".parse().unwrap();
+            req.metadata_mut()
+                .insert("x-forwarded-for", xff_metadata_value);
+
+            // set remote address to make sure it's NOT used in presence of the XFF header
+            let peer_addr = SocketAddr::from(([192, 168, 1, 42], 4242));
+            req.extensions_mut().insert(TcpConnectInfo {
+                local_addr: None,
+                remote_addr: Some(peer_addr),
+            });
+
+            assert_eq!(
+                extract_client_ip(&req),
+                Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))
+            );
+        }
+
+        #[test]
+        fn dont_use_xff_when_it_contains_invalid_value() {
+            let mut req = Request::new(());
+
+            let xff_metadata_value: MetadataValue<_> = "10.0.0.lol, 10.0.0.wat".parse().unwrap();
+            req.metadata_mut()
+                .insert("x-forwarded-for", xff_metadata_value);
+
+            let peer_addr = SocketAddr::from(([192, 168, 1, 42], 4242));
+            req.extensions_mut().insert(TcpConnectInfo {
+                local_addr: None,
+                remote_addr: Some(peer_addr),
+            });
+
+            assert_eq!(
+                extract_client_ip(&req),
+                Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)))
+            );
+        }
+
+        #[test]
+        fn still_uses_last_ip_when_xff_contains_invalid_value_in_chain() {
+            let mut req = Request::new(());
+
+            let xff_metadata_value: MetadataValue<_> =
+                "10.0.0.lol, 10.0.0.wat, 10.0.0.42".parse().unwrap();
+            req.metadata_mut()
+                .insert("x-forwarded-for", xff_metadata_value);
+
+            let peer_addr = SocketAddr::from(([192, 168, 1, 42], 4242));
+            req.extensions_mut().insert(TcpConnectInfo {
+                local_addr: None,
+                remote_addr: Some(peer_addr),
+            });
+
+            assert_eq!(
+                extract_client_ip(&req),
+                Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42)))
+            );
+        }
+
+        #[test]
+        fn fallback_to_remote_addr() {
+            let mut req = Request::new(());
+
+            let peer_addr = SocketAddr::from(([192, 168, 1, 42], 31415));
+            req.extensions_mut().insert(TcpConnectInfo {
+                local_addr: None,
+                remote_addr: Some(peer_addr),
+            });
+
+            assert_eq!(
+                extract_client_ip(&req),
+                Some(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 42)))
+            );
+        }
+    }
+
+    mod push {
+        use super::*;
+
+        #[tokio::test]
+        async fn push_unknown_revision_returns_not_found() {
+            let repository_id = random::<RepositoryId>();
+            let branch_id = BranchId::from(uuid::Uuid::now_v7());
+
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+                let repository_context = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store,
+                    mutable_store,
+                    repository_id,
+                ));
+
+                let write_token = get_write_token();
+                branch::create(
+                    repository_context.clone(),
+                    &write_token,
+                    branch_id,
+                    "test-branch",
+                    branch::personal_category(),
+                    "test-creator",
+                    1,
+                    vec![],
+                    false,
+                    false,
+                )
+                .await
+                .expect("Failed to create branch");
+
+                // A hash with no corresponding state data in the immutable store
+                let nonexistent_revision = random::<Hash>();
+
+                let result = push(
+                    repository_context,
+                    branch_id,
+                    nonexistent_revision,
+                    true,
+                    true,
+                    false,
+                    DEFAULT_HISTORY_STEP_SIZE,
+                    RevisionListAcceleration::default(),
+                )
+                .await;
+
+                assert!(result.is_err());
+                assert_eq!(result.err().unwrap().code(), Code::NotFound);
+            }))
+            .await;
+        }
+
+        #[tokio::test]
+        async fn linear_history_seals_a_boundary_only_once_the_head_moves_past_it() {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store,
+                    mutable_store,
+                    random::<RepositoryId>(),
+                ));
+                let branch = create_test_branch(&repository).await;
+
+                let chain =
+                    push_linear_revisions(&repository, branch, Hash::default(), 1..=100).await;
+
+                // Revision 100 is the head, so segment 100 is still the open one.
+                assert_eq!(load_step_key(&repository, branch, 100).await, None);
+
+                push_linear_revisions(&repository, branch, chain[99], 101..=101).await;
+
+                // Now the head has moved past 100, sealing it with revision 100.
+                assert_eq!(
+                    load_step_key(&repository, branch, 100).await,
+                    Some(chain[99])
+                );
+                // Nothing above the head may be sealed.
+                assert_eq!(load_step_key(&repository, branch, 200).await, None);
+            }))
+            .await;
+        }
+
+        #[tokio::test]
+        async fn linear_history_seals_each_boundary_with_its_own_highest_revision() {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store,
+                    mutable_store,
+                    random::<RepositoryId>(),
+                ));
+                let branch = create_test_branch(&repository).await;
+
+                let chain =
+                    push_linear_revisions(&repository, branch, Hash::default(), 1..=250).await;
+
+                assert_eq!(
+                    load_step_key(&repository, branch, 100).await,
+                    Some(chain[99])
+                );
+                assert_eq!(
+                    load_step_key(&repository, branch, 200).await,
+                    Some(chain[199])
+                );
+                // Segment 300 holds the head at 250 and stays open.
+                assert_eq!(load_step_key(&repository, branch, 300).await, None);
+            }))
+            .await;
+        }
+
+        /// A jump seals the boundaries between the two revisions and no
+        /// others. The segment the new revision lands in stays open, since the
+        /// revisions above it do not exist yet.
+        #[tokio::test]
+        async fn jump_seals_the_crossed_boundary_and_not_the_one_it_landed_in() {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store,
+                    mutable_store,
+                    random::<RepositoryId>(),
+                ));
+                let branch = create_test_branch(&repository).await;
+
+                let chain =
+                    push_linear_revisions(&repository, branch, Hash::default(), 1..=99).await;
+                let (_, revision_number) =
+                    push_jump_revision(&repository, branch, chain[98], 104).await;
+                assert_eq!(revision_number, 105);
+
+                // Boundary 100 is the only one crossed, answered by revision 99.
+                assert_eq!(
+                    load_step_key(&repository, branch, 100).await,
+                    Some(chain[98])
+                );
+                // Segment 200 contains the new head at 105 and is still open.
+                assert_eq!(load_step_key(&repository, branch, 200).await, None);
+                assert_eq!(load_step_key(&repository, branch, 300).await, None);
+            }))
+            .await;
+        }
+
+        #[tokio::test]
+        async fn jump_seals_every_boundary_it_skipped_over() {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store,
+                    mutable_store,
+                    random::<RepositoryId>(),
+                ));
+                let branch = create_test_branch(&repository).await;
+
+                let chain =
+                    push_linear_revisions(&repository, branch, Hash::default(), 1..=150).await;
+                assert_eq!(
+                    load_step_key(&repository, branch, 100).await,
+                    Some(chain[99])
+                );
+
+                let (_, revision_number) =
+                    push_jump_revision(&repository, branch, chain[149], 399).await;
+                assert_eq!(revision_number, 400);
+
+                // 150 -> 400 skips 200 and 300; both are answered by revision 150,
+                // the highest revision numbered at or below them.
+                assert_eq!(
+                    load_step_key(&repository, branch, 200).await,
+                    Some(chain[149])
+                );
+                assert_eq!(
+                    load_step_key(&repository, branch, 300).await,
+                    Some(chain[149])
+                );
+                // The boundary already sealed before the jump is left alone.
+                assert_eq!(
+                    load_step_key(&repository, branch, 100).await,
+                    Some(chain[99])
+                );
+                // Segment 400 holds the new head, and 500 was never reached.
+                assert_eq!(load_step_key(&repository, branch, 400).await, None);
+                assert_eq!(load_step_key(&repository, branch, 500).await, None);
+            }))
+            .await;
+        }
     }
 }
