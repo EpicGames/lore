@@ -18,6 +18,7 @@ use crate::lore::Address;
 use crate::lore::Hash;
 use crate::node::INVALID_NODE;
 use crate::repository::RepositoryContext;
+use crate::state;
 use crate::state::State;
 use crate::util::collect_stream::collect_stream_with_summary;
 use crate::util::path::RelativePath;
@@ -156,6 +157,7 @@ pub async fn diff(
     })
     .await
     .forward::<DiffError>("diffing states")?;
+    state::detect_and_coalesce_moves(&mut diff);
     change::sort_by_path(&mut diff);
 
     let pin_changes = link::diff_link_pins(repository.clone(), &state_source, &state_target)

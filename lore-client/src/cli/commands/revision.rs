@@ -1565,13 +1565,24 @@ pub fn handle_revision_diff(globals: LoreGlobalArgs, args: &RevisionDiffArgs) ->
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
             LoreEvent::RevisionDiffFile(data) => {
-                println!(
-                    "{}{}{} {}",
-                    FileActionStyle::from_action(data.action),
-                    data.action_as_string_short(),
-                    anstyle::Reset,
-                    display_path(data.path.as_str())
-                );
+                if data.from_path.is_empty() {
+                    println!(
+                        "{}{}{} {}",
+                        FileActionStyle::from_action(data.action),
+                        data.action_as_string_short(),
+                        anstyle::Reset,
+                        display_path(data.path.as_str())
+                    );
+                } else {
+                    println!(
+                        "{}{}{} {} -> {}",
+                        FileActionStyle::from_action(data.action),
+                        data.action_as_string_short(),
+                        anstyle::Reset,
+                        display_path(data.from_path.as_str()),
+                        display_path(data.path.as_str())
+                    );
+                }
             }
             LoreEvent::Complete(_) => {}
             LoreEvent::Maintenance(data) => {

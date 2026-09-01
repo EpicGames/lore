@@ -1587,6 +1587,48 @@ def test_branch_diff_change_carries_the_move_source_path(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_revision_diff_reports_a_move_as_one_change(new_lore_repo):
+    """A file moved between two revisions must come out of `revision diff` as
+    one move naming the path it was moved from. Reported as an unrelated
+    delete plus add, the two ends cannot be tied back together."""
+    repo: Lore = new_lore_repo()
+
+    original_path = "original-file.txt"
+    moved_path = "renamed-file.txt"
+
+    repo.write_commit_push(
+        "Base commit",
+        {original_path: "line 1\nline 2\n"},
+        offline=True,
+    )
+    base_revision = repo.revision_info(offline=True).signature
+
+    repo.move(original_path, moved_path)
+    repo.file_stage_move(original_path, moved_path, offline=True)
+    repo.commit("Move the file", offline=True)
+
+    output = repo.revision_diff(base_revision, json=True, offline=True)
+    files = parse_jsonl(output, "revisionDiffFile")
+    moved = [entry for entry in files if entry["path"] == moved_path]
+
+    assert len(moved) == 1, f"Expected exactly one change at {moved_path}, got {files}"
+    assert moved[0]["action"] == "move", (
+        f"The change at {moved_path} should be a move, got {moved[0]}"
+    )
+    assert moved[0]["fromPath"] == original_path, (
+        f"The move should report fromPath={original_path!r}, got {moved[0]}"
+    )
+    assert not [entry for entry in files if entry["path"] == original_path], (
+        f"The move source must not also be reported as a delete, got {files}"
+    )
+
+    output = repo.revision_diff(base_revision, offline=True)
+    assert f"V {original_path} -> {moved_path}" in output.splitlines(), (
+        f"Revision diff did not print the move source path, got:\n{output}"
+    )
+
+
+@pytest.mark.smoke
 def test_file_diff_binary_emits_marker(new_lore_repo):
     """`lore diff` on binary content must emit a `Binary files differ` marker,
     not garbled bytes rendered through the lossy text decoder."""
