@@ -27,13 +27,18 @@ ARG ARM64_TARGET_CPU=""
 #
 # Not `--release`: that profile is Cargo.toml's local-development build, with
 # debug-assertions and so overflow-checks left on. release-lto is the real one.
-# It asks for full DWARF, which --strip-debug drops again, keeping the symbol
-# table so backtraces still name their frames.
+#
+# release-lto also asks for `debug = 2`, which a fat-LTO link cannot afford: it
+# holds the whole dependency graph's DWARF at once and gets OOM-killed on a
+# 16 GB runner. `strip --strip-debug` below would have discarded all of it in
+# the next breath, so -C debuginfo=0 costs nothing observable — tracing's
+# file/line fields come from compile-time macros, not from DWARF.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
     set -eu; \
     RUSTFLAGS="--cfg tokio_unstable --cfg uuid_unstable -C force-unwind-tables=yes -C force-frame-pointers=yes"; \
+    RUSTFLAGS="${RUSTFLAGS} -C debuginfo=0"; \
     if [ "${TARGETARCH}" = "arm64" ] && [ -n "${ARM64_TARGET_CPU}" ]; then \
       RUSTFLAGS="${RUSTFLAGS} -C target-cpu=${ARM64_TARGET_CPU}"; \
     fi; \
