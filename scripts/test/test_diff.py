@@ -1578,6 +1578,13 @@ def test_branch_diff_change_carries_the_move_source_path(new_lore_repo):
         f"The move should report fromPath={original_path!r}, got {moved[0]}"
     )
 
+    # The human-readable listing must name both ends of the move, otherwise it
+    # reads as an add at the new path.
+    output = repo.branch_diff("main", source="move-branch", offline=True)
+    assert f"V {original_path} -> {moved_path}" in output.splitlines(), (
+        f"Branch diff did not print the move source path, got:\n{output}"
+    )
+
 
 @pytest.mark.smoke
 def test_file_diff_binary_emits_marker(new_lore_repo):

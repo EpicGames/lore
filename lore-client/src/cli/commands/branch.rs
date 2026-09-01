@@ -1479,18 +1479,32 @@ pub fn handle_branch_diff(globals: LoreGlobalArgs, args: &BranchDiffArgs) -> u8 
                 );
             }
             LoreEvent::BranchDiffChange(data) => {
-                println!(
-                    "{}{}{} {}{}",
-                    FileActionStyle::from_action(data.change.action),
-                    data.change.action.as_string_short(),
-                    anstyle::Reset,
-                    data.change.path.as_str(),
-                    if data.change.automerged != 0 {
-                        " (automerged)"
-                    } else {
-                        ""
-                    }
-                );
+                let automerged = if data.change.automerged != 0 {
+                    " (automerged)"
+                } else {
+                    ""
+                };
+
+                if data.change.from_path.is_empty() {
+                    println!(
+                        "{}{}{} {}{}",
+                        FileActionStyle::from_action(data.change.action),
+                        data.change.action.as_string_short(),
+                        anstyle::Reset,
+                        data.change.path.as_str(),
+                        automerged
+                    );
+                } else {
+                    println!(
+                        "{}{}{} {} -> {}{}",
+                        FileActionStyle::from_action(data.change.action),
+                        data.change.action.as_string_short(),
+                        anstyle::Reset,
+                        data.change.from_path.as_str(),
+                        data.change.path.as_str(),
+                        automerged
+                    );
+                }
             }
             LoreEvent::BranchDiffChangeEnd(_data) => {}
             LoreEvent::BranchDiffConflictBegin(data) if data.conflicts_count > 0 => {
