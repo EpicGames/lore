@@ -8,13 +8,23 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /build
 COPY . .
 
-# .cargo/config.toml tunes aarch64 for Graviton3+ with -C
-# target-cpu=neoverse-512tvb, which SIGILLs on older arm64 parts. Dropping it
-# needs RUSTFLAGS, not CARGO_TARGET_<triple>_RUSTFLAGS: that one only joins the
-# config arrays, RUSTFLAGS replaces [build] and [target.*] outright. Hence the
-# repetition; the --cfg values are load-bearing, the clippy lints are not.
-ENV RUSTFLAGS="--cfg tokio_unstable --cfg uuid_unstable -C force-unwind-tables=yes -C force-frame-pointers=yes"
+# Which arm64 microarchitecture to tune for. Empty is baseline armv8-a, which
+# runs anywhere — Apple Silicon, Ampere, any non-Graviton host — and is what
+# the default image ships. The publish workflow passes neoverse-512tvb for the
+# separate -graviton tag, matching how Lore is built and deployed on
+# Graviton3+. Ignored on amd64, which is baseline either way.
+ARG TARGETARCH
+ARG ARM64_TARGET_CPU=""
 
+# The flags are assembled here rather than left to .cargo/config.toml, whose
+# [target.aarch64-unknown-linux-gnu] table pins Graviton3+ unconditionally.
+# Overriding that needs RUSTFLAGS specifically, not
+# CARGO_TARGET_<triple>_RUSTFLAGS: the latter is only another source for the
+# same config key and cargo *joins* config arrays, so the config's
+# -C target-cpu would survive and a baseline build would still SIGILL off
+# Graviton. RUSTFLAGS replaces [build] and [target.*] outright, hence the
+# repetition. The --cfg values are load-bearing, the clippy lints are not.
+#
 # Not `--release`: that profile is Cargo.toml's local-development build, with
 # debug-assertions and so overflow-checks left on. release-lto is the real one.
 # It asks for full DWARF, which --strip-debug drops again, keeping the symbol
@@ -22,8 +32,15 @@ ENV RUSTFLAGS="--cfg tokio_unstable --cfg uuid_unstable -C force-unwind-tables=y
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    cargo build --profile release-lto --bin loreserver && \
-    cp /build/target/release-lto/loreserver /build/loreserver-bin && \
+    set -eu; \
+    RUSTFLAGS="--cfg tokio_unstable --cfg uuid_unstable -C force-unwind-tables=yes -C force-frame-pointers=yes"; \
+    if [ "${TARGETARCH}" = "arm64" ] && [ -n "${ARM64_TARGET_CPU}" ]; then \
+      RUSTFLAGS="${RUSTFLAGS} -C target-cpu=${ARM64_TARGET_CPU}"; \
+    fi; \
+    export RUSTFLAGS; \
+    echo "building with RUSTFLAGS=${RUSTFLAGS}"; \
+    cargo build --profile release-lto --bin loreserver; \
+    cp /build/target/release-lto/loreserver /build/loreserver-bin; \
     strip --strip-debug /build/loreserver-bin
 
 FROM debian:trixie-slim
