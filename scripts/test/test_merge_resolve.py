@@ -584,3 +584,72 @@ def test_merge_resolve_mine_no_paths(new_lore_repo):
         )
 
     repo.commit("Resolved all with mine (no paths)", offline=True)
+# ---------------------------------------------------------------------------
+# Test: a final line without a newline survives resolve unchanged
+# ---------------------------------------------------------------------------
+
+# `IncompleteHunkStyle::Git` inserts a newline after an incomplete final line so
+# the following conflict marker starts at column 0. These pin that the newline
+# belongs to the marker rendering only: resolving restores the side byte for
+# byte, exactly as it was committed.
+
+BASE_NO_EOL = b"line 1\nline 2"
+MINE_NO_EOL = b"line 1\nline 2 mine"
+THEIRS_NO_EOL = b"line 1\nline 2 theirs"
+
+
+@pytest.mark.smoke
+def test_merge_conflict_markers_own_line_without_trailing_newline(new_lore_repo):
+    """Every marker starts a line even when the conflicting hunk has no EOL."""
+    repo: Lore = new_lore_repo()
+    setup_merge_conflict(
+        repo, {"a.txt": (BASE_NO_EOL, MINE_NO_EOL, THEIRS_NO_EOL)}
+    )
+
+    with repo.open_file("a.txt", "rb") as f:
+        conflicted = f.read().decode()
+
+    for marker in ["<<<<<<< ours", "||||||| original", "=======", ">>>>>>> theirs"]:
+        assert any(line == marker for line in conflicted.split("\n")), (
+            f"{marker!r} must occupy a whole line, got {conflicted!r}"
+        )
+
+    repo.branch_merge_abort(offline=True)
+
+
+@pytest.mark.smoke
+def test_merge_resolve_mine_restores_missing_trailing_newline(new_lore_repo):
+    """resolve mine gives back the committed bytes, without the marker newline."""
+    repo: Lore = new_lore_repo()
+    setup_merge_conflict(
+        repo, {"a.txt": (BASE_NO_EOL, MINE_NO_EOL, THEIRS_NO_EOL)}
+    )
+
+    repo.branch_merge_resolve_mine(["a.txt"], offline=True, json=True)
+
+    with repo.open_file("a.txt", "rb") as f:
+        content = f.read()
+    assert content == MINE_NO_EOL, (
+        f"resolve mine must restore the exact bytes, got {content!r}"
+    )
+
+    repo.branch_merge_abort(offline=True)
+
+
+@pytest.mark.smoke
+def test_merge_resolve_theirs_restores_missing_trailing_newline(new_lore_repo):
+    """resolve theirs gives back the committed bytes, without the marker newline."""
+    repo: Lore = new_lore_repo()
+    setup_merge_conflict(
+        repo, {"a.txt": (BASE_NO_EOL, MINE_NO_EOL, THEIRS_NO_EOL)}
+    )
+
+    repo.branch_merge_resolve_theirs(["a.txt"], offline=True, json=True)
+
+    with repo.open_file("a.txt", "rb") as f:
+        content = f.read()
+    assert content == THEIRS_NO_EOL, (
+        f"resolve theirs must restore the exact bytes, got {content!r}"
+    )
+
+    repo.branch_merge_abort(offline=True)

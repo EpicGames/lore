@@ -35,6 +35,36 @@ mod tests {
         assert_eq!(result_string, expected_string);
     }
 
+    /// Fails without `IncompleteHunkStyle::Git`: the default glues the next
+    /// marker onto the last line when it has no trailing newline.
+    #[test]
+    fn test_conflict_without_trailing_newlines() {
+        let base_string = "This is line 1.
+This is line 2.";
+        let mine_string = "This is line 1.
+This is line 2 as I wrote it.";
+        let theirs_string = "This is line 1.
+This is line 2 as they wrote it.";
+
+        let result_string =
+            match merge3_text(base_string, mine_string, theirs_string, None, None, None) {
+                Err(str) | Ok(str) => str,
+            };
+
+        for marker in [
+            "<<<<<<< ours",
+            "||||||| original",
+            "=======",
+            ">>>>>>> theirs",
+        ] {
+            assert!(
+                result_string.lines().any(|line| line == marker),
+                "`{marker}` must occupy a line of its own, got:
+{result_string}"
+            );
+        }
+    }
+
     #[test]
     fn test_markers() {
         let base_string = "This is line 1.\nThis is line 2.\n";

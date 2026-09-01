@@ -32,7 +32,11 @@ pub fn merge3_text(
     mine_marker: Option<&str>,
     theirs_marker: Option<&str>,
 ) -> Result<String, String> {
-    let merge_result = diffy::merge(base, mine, theirs);
+    // `Git`, not diffy's `Diff3` default: `Diff3` glues the next marker onto a
+    // final line that lacks a newline, which is unparsable.
+    let merge_result = diffy::MergeOptions::new()
+        .set_incomplete_hunk_style(diffy::IncompleteHunkStyle::Git)
+        .merge(base, mine, theirs);
     let merge_conflicts = merge_result.is_err();
     let mut merge_output = match merge_result {
         Ok(str) | Err(str) => str,

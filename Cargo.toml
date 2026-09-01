@@ -61,7 +61,7 @@ config = { version = "0.15.15", features = ["toml"], default-features = false }
 ctor = "0.2"
 crossbeam = "0.8.4"
 dashmap = "6.1.0"
-diffy = "0.4.2"
+diffy = "0.5.2"
 directories = "6.0.0"
 enum_dispatch = "0.3.13"
 tracing-appender = "0.2.3"
