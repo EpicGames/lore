@@ -8,26 +8,23 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /build
 COPY . .
 
-# .cargo/config.toml tunes aarch64-unknown-linux-gnu for Epic's own Graviton3+
-# deployment with -C target-cpu=neoverse-512tvb, which emits instructions that
-# fault on any older arm64 part. A published image has to run anywhere armv8-a
-# runs, so that tuning has to go.
-#
-# It has to go via RUSTFLAGS specifically. CARGO_TARGET_<triple>_RUSTFLAGS is
-# only another source for the same config key, and cargo *joins* config arrays
-# rather than replacing them, so setting it leaves the Graviton flag in place
-# and the image still dies with SIGILL. RUSTFLAGS is a separate, mutually
-# exclusive source: when it is set, cargo ignores [build] and [target.*]
-# rustflags entirely. So everything the build needs has to be repeated here.
-# The two --cfg values are load-bearing, the code does not compile without
-# them; the [build] clippy -W lints are dropped, as they only affect warnings.
+# .cargo/config.toml tunes aarch64 for Graviton3+ with -C
+# target-cpu=neoverse-512tvb, which SIGILLs on older arm64 parts. Dropping it
+# needs RUSTFLAGS, not CARGO_TARGET_<triple>_RUSTFLAGS: that one only joins the
+# config arrays, RUSTFLAGS replaces [build] and [target.*] outright. Hence the
+# repetition; the --cfg values are load-bearing, the clippy lints are not.
 ENV RUSTFLAGS="--cfg tokio_unstable --cfg uuid_unstable -C force-unwind-tables=yes -C force-frame-pointers=yes"
 
+# Not `--release`: that profile is Cargo.toml's local-development build, with
+# debug-assertions and so overflow-checks left on. release-lto is the real one.
+# It asks for full DWARF, which --strip-debug drops again, keeping the symbol
+# table so backtraces still name their frames.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    cargo build --release --bin loreserver && \
-    cp /build/target/release/loreserver /build/loreserver-bin
+    cargo build --profile release-lto --bin loreserver && \
+    cp /build/target/release-lto/loreserver /build/loreserver-bin && \
+    strip --strip-debug /build/loreserver-bin
 
 FROM debian:trixie-slim
 

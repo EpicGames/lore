@@ -5,16 +5,15 @@ name: Publish loreserver image
 
 # Builds lore-server/Dockerfile for linux/amd64 and linux/arm64, publishes a
 # multi-arch image to ghcr.io/epicgames/lore/loreserver, and signs it with
-# keyless cosign so the community Helm chart can reference a public,
-# verifiable tag.
+# keyless cosign so the community Helm chart can reference a verifiable tag.
 #
-# Each architecture builds on its own native runner and is pushed by digest
-# alone; the merge job stitches those digests into one manifest list and signs
-# that. Native runners rather than QEMU, because a release Rust build under
-# emulation is far too slow to be practical.
+# `meta` resolves tags and labels once, so the later jobs cannot disagree and
+# a ref with no tags fails early. Each architecture then builds on its own
+# native runner (QEMU is far too slow for a release Rust build) and is pushed
+# by digest; `merge` stitches the digests into one manifest list and signs it.
 #
-# No secrets are involved: the built-in GITHUB_TOKEN authenticates to GHCR,
-# and cosign signs keylessly against Fulcio via the job's OIDC token.
+# No secrets: GITHUB_TOKEN authenticates to GHCR, and cosign signs keylessly
+# against Fulcio via the job's OIDC token.
 on:
   push:
     tags: ["v*"]
@@ -37,8 +36,67 @@ env:
   IMAGE: ghcr.io/epicgames/lore/loreserver
 
 jobs:
+  meta:
+    name: resolve tags
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # metadata-action reads repository metadata for OCI labels
+    outputs:
+      json: ${{ steps.meta.outputs.json }}
+      labels: ${{ steps.meta.outputs.labels }}
+      annotations: ${{ steps.meta.outputs.annotations }}
+      primary-tag: ${{ steps.primary.outputs.tag }}
+    steps:
+      # The input lands verbatim in the `tags` list below, where a newline
+      # would smuggle in a further directive. Hold it to Docker's grammar.
+      - name: Validate the tag input
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          case "${TAG}" in
+            "") exit 0 ;;
+            [!A-Za-z0-9_]* | *[!A-Za-z0-9._-]*)
+              echo "::error::the 'tag' input is not a valid image tag: expected [A-Za-z0-9_][A-Za-z0-9._-]*"
+              exit 1
+              ;;
+          esac
+          if [ "${#TAG}" -gt 128 ]; then
+            echo "::error::the 'tag' input is longer than the 128 characters a tag allows"
+            exit 1
+          fi
+
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          # Only a stable semver tag moves `latest`; a prerelease publishes
+          # its own tag and nothing else.
+          flavor: latest=auto
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+
+      # An empty list has to stop the run here, not surface as an invalid
+      # reference in the merge job once both architectures are pushed.
+      - id: primary
+        name: Require at least one tag
+        env:
+          JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          set -euo pipefail
+          tag=$(jq -r '.tags[0] // empty' <<< "$JSON")
+          if [ -z "${tag}" ]; then
+            echo "::error::no image tags resolved for ${GITHUB_REF}; push a semver tag or pass the 'tag' input"
+            exit 1
+          fi
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
   build:
     name: build (${{ matrix.arch }})
+    needs: meta
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read # Check out the source the image is built from
@@ -54,11 +112,6 @@ jobs:
         with:
           persist-credentials: false
 
-      - id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: ${{ env.IMAGE }}
-
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -73,8 +126,8 @@ jobs:
           context: .
           file: lore-server/Dockerfile
           platforms: ${{ matrix.platform }}
-          labels: ${{ steps.meta.outputs.labels }}
-          annotations: ${{ steps.meta.outputs.annotations }}
+          labels: ${{ needs.meta.outputs.labels }}
+          annotations: ${{ needs.meta.outputs.annotations }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           # Only the apt and toolchain layers survive a source change. The
           # cargo registry and target directory live in BuildKit cache mounts,
@@ -110,27 +163,22 @@ jobs:
 
   merge:
     name: merge and sign
-    needs: build
+    needs: [meta, build]
     runs-on: ubuntu-latest
     permissions:
       packages: write # Push the manifest list and the cosign signature
       id-token: write # Federate to Fulcio for keyless signing
+    env:
+      PRIMARY_TAG: ${{ needs.meta.outputs.primary-tag }}
+      # Anchored on this workflow's path: a bare repository prefix would
+      # accept a certificate minted by any workflow here.
+      IDENTITY_REGEXP: '^https://github\.com/${{ github.repository }}/\.github/workflows/publish-loreserver-image\.yml@'
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: ${{ runner.temp }}/digests
           pattern: digests-*
           merge-multiple: true
-
-      - id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=raw,value=${{ inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.tag != '' }}
 
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
@@ -142,25 +190,32 @@ jobs:
 
       - name: Create the multi-arch manifest list
         working-directory: ${{ runner.temp }}/digests
+        env:
+          JSON: ${{ needs.meta.outputs.json }}
         run: |
           set -euo pipefail
-          # shellcheck disable=SC2046 # word splitting is how both lists are built
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("--tag " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf "${IMAGE}@sha256:%s " *)
+          args=()
+          while IFS= read -r tag; do
+            args+=(--tag "${tag}")
+          done < <(jq -r '.tags[]' <<< "$JSON")
+          # The build job annotated each per-arch manifest; the index is
+          # created here, so it needs the same annotations applying to it.
+          while IFS= read -r annotation; do
+            args+=(--annotation "index:${annotation}")
+          done < <(jq -r '.labels | to_entries[] | "\(.key)=\(.value)"' <<< "$JSON")
+          for digest in *; do
+            args+=("${IMAGE}@sha256:${digest}")
+          done
+          docker buildx imagetools create "${args[@]}"
 
       - name: Inspect the manifest list
-        run: docker buildx imagetools inspect "${IMAGE}:${VERSION}"
-        env:
-          VERSION: ${{ steps.meta.outputs.version }}
+        run: docker buildx imagetools inspect "${PRIMARY_TAG}"
 
       - id: digest
         name: Resolve the manifest list digest
-        env:
-          VERSION: ${{ steps.meta.outputs.version }}
         run: |
           set -euo pipefail
-          digest=$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" \
+          digest=$(docker buildx imagetools inspect "${PRIMARY_TAG}" \
             --format '{{json .Manifest}}' | jq -r .digest)
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
@@ -179,7 +234,7 @@ jobs:
         run: |
           set -euo pipefail
           cosign verify "${IMAGE}@${DIGEST}" \
-            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/" \
+            --certificate-identity-regexp "${IDENTITY_REGEXP}" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
             > /dev/null
           echo "signature verified"
@@ -187,6 +242,7 @@ jobs:
       - name: Summarise what was published
         env:
           DIGEST: ${{ steps.digest.outputs.digest }}
+          JSON: ${{ needs.meta.outputs.json }}
         run: |
           set -euo pipefail
           {
@@ -197,13 +253,13 @@ jobs:
             echo "Platforms: linux/amd64, linux/arm64"
             echo ""
             echo "Tags:"
-            jq -r '.tags[] | "- `" + . + "`"' <<< "$DOCKER_METADATA_OUTPUT_JSON"
+            jq -r '.tags[] | "- `" + . + "`"' <<< "$JSON"
             echo ""
             echo "Verify the signature with:"
             echo ""
             echo '```sh'
             echo "cosign verify ${IMAGE}@${DIGEST} \\"
-            echo "  --certificate-identity-regexp '^https://github.com/${GITHUB_REPOSITORY}/' \\"
+            echo "  --certificate-identity-regexp '${IDENTITY_REGEXP}' \\"
             echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
