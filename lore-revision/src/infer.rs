@@ -33,12 +33,12 @@ pub fn infer_is_upackage_by_slice(buffer: &[u8]) -> bool {
     // Is it containing an unreal magic marker?
     if buffer.len() >= 4 {
         let package_file_tag = vec![0x9E, 0x2A, 0x83, 0xC1];
-        if buffer[..3] == package_file_tag {
+        if buffer[..4] == package_file_tag {
             return true;
         }
 
         let package_file_tag_swapped = vec![0xC1, 0x83, 0x2A, 0x9E];
-        if buffer[..3] == package_file_tag_swapped {
+        if buffer[..4] == package_file_tag_swapped {
             return true;
         }
     }
@@ -232,6 +232,7 @@ mod tests {
     use super::SCAN_WINDOW;
     use super::infer_is_conflicted_by_path;
     use super::infer_is_diffable_by_slice;
+    use super::infer_is_upackage_by_slice;
     use super::infer_is_utf8_by_slice;
 
     /// A file holding `contents`, alive for as long as the returned directory is.
@@ -287,6 +288,40 @@ mod tests {
         assert!(
             !infer_is_diffable_by_slice(&bytes),
             "UTF-16 BE BOM must be non-diffable so merge falls into the binary-conflict path that preserves bytes"
+        );
+    }
+
+    #[test]
+    fn upackage_tag_is_detected() {
+        let mut bytes = vec![0x9E, 0x2A, 0x83, 0xC1];
+        bytes.extend_from_slice(&[0u8; 16]);
+        assert!(
+            infer_is_upackage_by_slice(&bytes),
+            "An Unreal package file tag must be detected"
+        );
+
+        let mut bad_tag = vec![0x9E, 0x2A, 0x83, 0xC2];
+        bad_tag.extend_from_slice(&[0u8; 16]);
+        assert!(
+            !infer_is_upackage_by_slice(&bad_tag),
+            "A buffer that only shares the first three tag bytes is not an Unreal package"
+        );
+    }
+
+    #[test]
+    fn upackage_swapped_tag_is_detected() {
+        let mut bytes = vec![0xC1, 0x83, 0x2A, 0x9E];
+        bytes.extend_from_slice(&[0u8; 16]);
+        assert!(
+            infer_is_upackage_by_slice(&bytes),
+            "A byte swapped Unreal package file tag must be detected"
+        );
+
+        let mut bad_tag = vec![0xC1, 0x83, 0x2A, 0x9F];
+        bad_tag.extend_from_slice(&[0u8; 16]);
+        assert!(
+            !infer_is_upackage_by_slice(&bad_tag),
+            "A buffer that only shares the first three swapped tag bytes is not an Unreal package"
         );
     }
 
