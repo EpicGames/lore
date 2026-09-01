@@ -7,9 +7,10 @@ telemetry integration, or replication is configured.
 
 - Docker with BuildKit support
 
-Both `linux/amd64` and `linux/arm64` build. The Dockerfile overrides the Graviton-specific
-`target-cpu` that `.cargo/config.toml` sets for `aarch64-unknown-linux-gnu`, so the arm64
-image runs on any armv8-a host rather than Graviton3 and newer only.
+Both `linux/amd64` and `linux/arm64` build. `.cargo/config.toml` pins `aarch64-unknown-linux-gnu`
+to Graviton3+ via `-C target-cpu=neoverse-512tvb`, which faults on older arm64 parts, so the
+Dockerfile assembles `RUSTFLAGS` itself and leaves that tuning off by default. The arm64 image
+therefore runs on any armv8-a host, Apple Silicon included.
 
 ## Building
 
@@ -21,6 +22,24 @@ docker build -f lore-server/Dockerfile -t loreserver .
 
 Pass `--platform linux/amd64` or `--platform linux/arm64` to cross-build; expect it to be slow,
 since a release Rust build under emulation is far slower than a native one.
+
+To tune arm64 for Graviton3 and newer, as Lore is deployed, pass the microarchitecture. The
+resulting binary will not run on older arm64 hardware:
+
+```sh
+docker build -f lore-server/Dockerfile --build-arg ARM64_TARGET_CPU=neoverse-512tvb -t loreserver .
+```
+
+## Published images
+
+The publish workflow ships both variants to `ghcr.io/epicgames/lore/loreserver`:
+
+| Tag | arm64 build |
+| --- | --- |
+| `X.Y.Z`, `X.Y`, `latest` | baseline `armv8-a` — runs on any arm64 host |
+| `X.Y.Z-graviton`, `latest-graviton` | tuned for Graviton3+ — faults on older arm64 |
+
+`linux/amd64` is baseline in both, and is the same image in each manifest list.
 
 The build compiles the `loreserver` binary and generates self-signed TLS certificates for QUIC
 using `scripts/server/make-certs.sh`.

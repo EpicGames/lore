@@ -3,14 +3,23 @@
 
 name: Publish loreserver image
 
-# Builds lore-server/Dockerfile for linux/amd64 and linux/arm64, publishes a
-# multi-arch image to ghcr.io/epicgames/lore/loreserver, and signs it with
+# Builds lore-server/Dockerfile for linux/amd64 and linux/arm64, publishes
+# multi-arch images to ghcr.io/epicgames/lore/loreserver, and signs them with
 # keyless cosign so the community Helm chart can reference a verifiable tag.
 #
+# Two variants ship, differing only in how arm64 is compiled:
+#
+#   :X.Y.Z            baseline armv8-a arm64 — runs on any arm64 host
+#   :X.Y.Z-graviton   arm64 tuned for Graviton3+, as Lore is deployed
+#
+# The default is the portable one, so a community chart works everywhere; the
+# tuned build is opt-in for Graviton deployments. amd64 is baseline in both and
+# is therefore built once, with both manifest lists pointing at that one digest.
+#
 # `meta` resolves tags and labels once, so the later jobs cannot disagree and
-# a ref with no tags fails early. Each architecture then builds on its own
-# native runner (QEMU is far too slow for a release Rust build) and is pushed
-# by digest; `merge` stitches the digests into one manifest list and signs it.
+# a ref with no tags fails early. Each variant then builds on its own native
+# runner (QEMU is far too slow for a release Rust build) and is pushed by
+# digest; `merge` stitches the digests into manifest lists and signs them.
 #
 # No secrets: GITHUB_TOKEN authenticates to GHCR, and cosign signs keylessly
 # against Fulcio via the job's OIDC token.
@@ -34,6 +43,8 @@ concurrency:
 
 env:
   IMAGE: ghcr.io/epicgames/lore/loreserver
+  # Passed to the Dockerfile for the tuned arm64 leg only.
+  GRAVITON_TARGET_CPU: neoverse-512tvb
 
 jobs:
   meta:
@@ -43,9 +54,11 @@ jobs:
       contents: read # metadata-action reads repository metadata for OCI labels
     outputs:
       json: ${{ steps.meta.outputs.json }}
+      graviton-json: ${{ steps.meta-graviton.outputs.json }}
       labels: ${{ steps.meta.outputs.labels }}
       annotations: ${{ steps.meta.outputs.annotations }}
       primary-tag: ${{ steps.primary.outputs.tag }}
+      graviton-primary-tag: ${{ steps.primary.outputs.graviton-tag }}
     steps:
       # The input lands verbatim in the `tags` list below, where a newline
       # would smuggle in a further directive. Hold it to Docker's grammar.
@@ -79,23 +92,42 @@ jobs:
             type=ref,event=branch
             type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
 
+      # The same tag set, suffixed. onlatest carries the suffix onto `latest`
+      # so the tuned stream has its own moving tag rather than fighting for the
+      # shared one.
+      - id: meta-graviton
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: |
+            latest=auto
+            suffix=-graviton,onlatest=true
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+
       # An empty list has to stop the run here, not surface as an invalid
-      # reference in the merge job once both architectures are pushed.
+      # reference in the merge job once every architecture is pushed.
       - id: primary
         name: Require at least one tag
         env:
           JSON: ${{ steps.meta.outputs.json }}
+          GRAVITON_JSON: ${{ steps.meta-graviton.outputs.json }}
         run: |
           set -euo pipefail
           tag=$(jq -r '.tags[0] // empty' <<< "$JSON")
-          if [ -z "${tag}" ]; then
+          graviton_tag=$(jq -r '.tags[0] // empty' <<< "$GRAVITON_JSON")
+          if [ -z "${tag}" ] || [ -z "${graviton_tag}" ]; then
             echo "::error::no image tags resolved for ${GITHUB_REF}; push a semver tag or pass the 'tag' input"
             exit 1
           fi
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "graviton-tag=${graviton_tag}" >> "$GITHUB_OUTPUT"
 
   build:
-    name: build (${{ matrix.arch }})
+    name: build (${{ matrix.arch }}${{ matrix.variant == 'graviton' && ', graviton' || '' }})
     needs: meta
     runs-on: ${{ matrix.runner }}
     permissions:
@@ -105,8 +137,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: amd64, platform: linux/amd64, runner: ubuntu-latest }
-          - { arch: arm64, platform: linux/arm64, runner: ubuntu-24.04-arm }
+          # amd64 is baseline for both variants, so it is built once and both
+          # manifest lists reference this digest.
+          - { arch: amd64, variant: base, platform: linux/amd64, runner: ubuntu-latest, target_cpu: "" }
+          - { arch: arm64, variant: base, platform: linux/arm64, runner: ubuntu-24.04-arm, target_cpu: "" }
+          - { arch: arm64, variant: graviton, platform: linux/arm64, runner: ubuntu-24.04-arm, target_cpu: neoverse-512tvb }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -126,27 +161,32 @@ jobs:
           context: .
           file: lore-server/Dockerfile
           platforms: ${{ matrix.platform }}
+          build-args: ARM64_TARGET_CPU=${{ matrix.target_cpu }}
           labels: ${{ needs.meta.outputs.labels }}
           annotations: ${{ needs.meta.outputs.annotations }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           # Only the apt and toolchain layers survive a source change. The
           # cargo registry and target directory live in BuildKit cache mounts,
           # which the gha backend does not carry between runs, so the compile
-          # itself starts cold every time.
-          cache-from: type=gha,scope=loreserver-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=loreserver-${{ matrix.arch }}
+          # itself starts cold every time. Scoped per variant so the two arm64
+          # legs, built with different codegen flags, cannot share layers.
+          cache-from: type=gha,scope=loreserver-${{ matrix.arch }}-${{ matrix.variant }}
+          cache-to: type=gha,mode=max,scope=loreserver-${{ matrix.arch }}-${{ matrix.variant }}
 
-      # A clean build proves only that the image compiles. Run the binary on
-      # the native runner as well: a codegen flag aimed at the wrong CPU
-      # produces an image that builds happily and then dies with SIGILL the
-      # first time anyone starts it.
+      # A clean build proves only that the image compiles, so start the binary
+      # too. Know the limit: this arm64 runner is Neoverse-N2 and reports SVE,
+      # so it executes the Graviton-tuned build quite happily. This catches a
+      # broken entrypoint or a missing shared library — it does NOT catch
+      # codegen aimed at a CPU the eventual host lacks, which is exactly how a
+      # SIGILL-ing arm64 image once passed a fully green run.
       - name: Smoke test the pushed image
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: docker run --rm "${IMAGE}@${DIGEST}" --version
 
-      # The merge job addresses each architecture by digest. Hand the digests
-      # over as empty files named after themselves.
+      # The merge job addresses each build by digest. Hand the digests over as
+      # empty files named after themselves, one artifact per matrix leg so the
+      # merge job can pick which legs belong in which manifest list.
       - name: Export digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
@@ -156,29 +196,42 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: digests-${{ matrix.arch }}
+          name: digests-${{ matrix.arch }}-${{ matrix.variant }}
           path: ${{ runner.temp }}/digests/*
           if-no-files-found: error
           retention-days: 1
 
   merge:
-    name: merge and sign
+    name: merge and sign (${{ matrix.variant }})
     needs: [meta, build]
     runs-on: ubuntu-latest
     permissions:
       packages: write # Push the manifest list and the cosign signature
       id-token: write # Federate to Fulcio for keyless signing
+    strategy:
+      # One variant failing should not withhold the other; both are
+      # independently useful once published.
+      fail-fast: false
+      matrix:
+        include:
+          - variant: default
+            legs: digests-amd64-base digests-arm64-base
+          - variant: graviton
+            legs: digests-amd64-base digests-arm64-graviton
     env:
-      PRIMARY_TAG: ${{ needs.meta.outputs.primary-tag }}
+      JSON: ${{ matrix.variant == 'graviton' && needs.meta.outputs.graviton-json || needs.meta.outputs.json }}
+      PRIMARY_TAG: ${{ matrix.variant == 'graviton' && needs.meta.outputs.graviton-primary-tag || needs.meta.outputs.primary-tag }}
+      LEGS: ${{ matrix.legs }}
       # Anchored on this workflow's path: a bare repository prefix would
       # accept a certificate minted by any workflow here.
       IDENTITY_REGEXP: '^https://github\.com/${{ github.repository }}/\.github/workflows/publish-loreserver-image\.yml@'
     steps:
+      # No merge-multiple: each leg keeps its own subdirectory so the right
+      # subset can be selected below.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: ${{ runner.temp }}/digests
           pattern: digests-*
-          merge-multiple: true
 
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
@@ -190,8 +243,6 @@ jobs:
 
       - name: Create the multi-arch manifest list
         working-directory: ${{ runner.temp }}/digests
-        env:
-          JSON: ${{ needs.meta.outputs.json }}
         run: |
           set -euo pipefail
           args=()
@@ -203,8 +254,14 @@ jobs:
           while IFS= read -r annotation; do
             args+=(--annotation "index:${annotation}")
           done < <(jq -r '.labels | to_entries[] | "\(.key)=\(.value)"' <<< "$JSON")
-          for digest in *; do
-            args+=("${IMAGE}@sha256:${digest}")
+          for leg in ${LEGS}; do
+            if [ ! -d "${leg}" ]; then
+              echo "::error::${leg} did not produce a digest; refusing to publish a partial manifest list"
+              exit 1
+            fi
+            for digest in "${leg}"/*; do
+              args+=("${IMAGE}@sha256:$(basename "${digest}")")
+            done
           done
           docker buildx imagetools create "${args[@]}"
 
@@ -242,15 +299,19 @@ jobs:
       - name: Summarise what was published
         env:
           DIGEST: ${{ steps.digest.outputs.digest }}
-          JSON: ${{ needs.meta.outputs.json }}
+          VARIANT: ${{ matrix.variant }}
         run: |
           set -euo pipefail
           {
-            echo "## Published \`${IMAGE}\`"
+            echo "## Published \`${IMAGE}\` (${VARIANT})"
             echo ""
             echo "Digest: \`${DIGEST}\`"
             echo ""
-            echo "Platforms: linux/amd64, linux/arm64"
+            if [ "${VARIANT}" = "graviton" ]; then
+              echo "Platforms: linux/amd64 (baseline), linux/arm64 (tuned for Graviton3+ — will not run on older arm64)"
+            else
+              echo "Platforms: linux/amd64, linux/arm64 (baseline armv8-a)"
+            fi
             echo ""
             echo "Tags:"
             jq -r '.tags[] | "- `" + . + "`"' <<< "$JSON"
