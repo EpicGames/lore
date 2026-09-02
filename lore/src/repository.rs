@@ -29,6 +29,7 @@ use lore_revision::repository::create::CreateOptions;
 use lore_revision::repository::status::StatusOptions;
 use lore_revision::revision;
 use lore_revision::util;
+use lore_revision::util::config::SaveableConfig;
 use lore_revision::util::path::RelativePath;
 use serde::Deserialize;
 use serde::Serialize;

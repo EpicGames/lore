@@ -13,6 +13,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use lore_base::fs::lock::FSLock;
+use lore_error_set::HasAll;
 use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
@@ -126,7 +127,7 @@ pub async fn load_with_lock<ConfigType: Default + Serialize + for<'a> Deserializ
     path: impl AsRef<Path>,
 ) -> Result<(ConfigType, FSLock), LoadError> {
     let path = path.as_ref();
-    let lock = FSLock::acquire_file_lock(path).await.map_err(|err| {
+    let lock = FSLock::acquire_file_lock(path, true).await.map_err(|err| {
         LoadError::internal(format!("failed to lock config {}: {err}", path.display()))
     })?;
     let config = load(path).await?;
@@ -180,6 +181,48 @@ pub async fn save<ConfigType: Serialize>(
         })?;
 
     Ok(())
+}
+
+#[allow(async_fn_in_trait)]
+pub trait SaveableConfig: Serialize + for<'a> Deserialize<'a> + Default + Clone {
+    type ErrorType: ErrorSet
+        + HasAll<<LoadError as ErrorSet>::Variants>
+        + HasAll<<SaveError as ErrorSet>::Variants>;
+
+    fn file_location() -> Result<PathBuf, Self::ErrorType>;
+
+    async fn modify_on_load(self) -> Result<Self, Self::ErrorType> {
+        Ok(self)
+    }
+
+    async fn load() -> Result<Self, Self::ErrorType> {
+        Self::load_from_path(&Self::file_location()?).await
+    }
+    async fn load_from_path(path: &Path) -> Result<Self, Self::ErrorType> {
+        let config: Self = load(path)
+            .await
+            .forward::<Self::ErrorType>("Loading global config")?;
+        config.modify_on_load().await
+    }
+
+    async fn load_locked() -> Result<(Self, FSLock), Self::ErrorType> {
+        Self::load_locked_from_path(&Self::file_location()?).await
+    }
+    async fn load_locked_from_path(path: &Path) -> Result<(Self, FSLock), Self::ErrorType> {
+        let (config, lock) = load_with_lock::<Self>(path)
+            .await
+            .forward::<Self::ErrorType>("Loading global config")?;
+        Ok((config.modify_on_load().await?, lock))
+    }
+
+    async fn save(&self, lock: FSLock) -> Result<(), Self::ErrorType> {
+        self.save_at_path(lock, &Self::file_location()?).await
+    }
+    async fn save_at_path(&self, lock: FSLock, path: &Path) -> Result<(), Self::ErrorType> {
+        let result = save(self, path).await;
+        drop(lock);
+        result.forward::<Self::ErrorType>("saving global config")
+    }
 }
 
 #[cfg(test)]

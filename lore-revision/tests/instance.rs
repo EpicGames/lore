@@ -12,8 +12,10 @@ mod tests {
     use lore_revision::instance::ANCHOR_CURRENT_BRANCH;
     use lore_revision::instance::ANCHOR_STAGED;
     use lore_revision::instance::InstanceId;
+    use lore_revision::instance::InstanceMetadata;
     use lore_revision::instance::anchor_key;
     use lore_revision::instance::instance_key;
+    use lore_revision::instance::list_instances;
     use lore_revision::instance::{self};
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::SALT_LORE;
@@ -139,6 +141,93 @@ mod tests {
                     "Instance B metadata not found in list (found {} entries)",
                     found_values.len()
                 );
+            }))
+            .await
+            .expect("Test failed");
+    }
+
+    #[tokio::test]
+    async fn list_instances_for_all_repositories() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let id_a = InstanceId::generate();
+                let id_b = InstanceId::generate();
+                let id_c = InstanceId::generate();
+                let repository =
+                    test_repository(immutable_store.clone(), mutable_store.clone(), id_a).await;
+                let repository_c =
+                    test_repository(immutable_store.clone(), mutable_store.clone(), id_c).await;
+
+                instance::register_instance(&repository, id_a, "/tmp/instance-a")
+                    .await
+                    .expect("register instance A failed");
+                instance::register_instance(&repository, id_b, "/tmp/instance-b")
+                    .await
+                    .expect("register instance B failed");
+                instance::register_instance(&repository_c, id_c, "/tmp/instance-c")
+                    .await
+                    .expect("register instance C failed");
+
+                let instances = list_instances(&repository)
+                    .await
+                    .expect("List instances failed");
+                assert!(instances.iter().any(|metadata| matches!(
+                    metadata,
+                    InstanceMetadata {
+                        instance_id,
+                        ..
+                    } if *instance_id == id_a
+                )));
+                assert!(instances.iter().any(|metadata| matches!(
+                    metadata,
+                    InstanceMetadata {
+                        instance_id,
+                        ..
+                    } if *instance_id == id_b
+                )));
+
+                let instances = list_instances(&repository_c)
+                    .await
+                    .expect("List instances failed");
+                assert!(instances.iter().any(|metadata| matches!(
+                    metadata,
+                    InstanceMetadata {
+                        instance_id,
+                        ..
+                    } if *instance_id == id_c
+                )));
+
+                let instances = list_instances(&Arc::new(RepositoryContext::new_null_context(
+                    immutable_store,
+                    mutable_store,
+                )))
+                .await
+                .expect("List instances failed");
+                assert!(instances.iter().any(|metadata| matches!(
+                    metadata,
+                    InstanceMetadata {
+                        instance_id,
+                        ..
+                    } if *instance_id == id_a
+                )));
+                assert!(instances.iter().any(|metadata| matches!(
+                    metadata,
+                    InstanceMetadata {
+                        instance_id,
+                        ..
+                    } if *instance_id == id_b
+                )));
+                assert!(instances.iter().any(|metadata| matches!(
+                    metadata,
+                    InstanceMetadata {
+                        instance_id,
+                        ..
+                    } if *instance_id == id_c
+                )));
             }))
             .await
             .expect("Test failed");

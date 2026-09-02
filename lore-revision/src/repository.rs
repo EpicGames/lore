@@ -1715,11 +1715,22 @@ pub async fn create_client_immutable_store(
     create_options: ImmutableStoreCreateOptions,
     verify_write: bool,
 ) -> Result<Arc<dyn ImmutableStore>, RepositoryError> {
-    let path = get_shared_store_path_for_repo(config)
-        .await
-        .forward::<RepositoryError>("Failed to access shared store")?
-        .unwrap_or_else(|| dotpath.as_ref().to_owned());
+    create_immutable_store_at_path(
+        get_shared_store_path_for_repo(config)
+            .await
+            .forward::<RepositoryError>("Failed to access shared store")?
+            .unwrap_or_else(|| dotpath.as_ref().to_owned()),
+        create_options,
+        verify_write,
+    )
+    .await
+}
 
+pub async fn create_immutable_store_at_path(
+    path: PathBuf,
+    create_options: ImmutableStoreCreateOptions,
+    verify_write: bool,
+) -> Result<Arc<dyn ImmutableStore>, RepositoryError> {
     // Fast path: upgrade an existing weak reference.
     if let Some(store) = get_cached_immutable_store(&path) {
         lore_debug!("Reusing cached immutable store");
@@ -1800,6 +1811,13 @@ pub async fn create_client_mutable_store(
         dotpath
     };
 
+    create_mutable_store_at_path(path, immutable_store).await
+}
+
+pub async fn create_mutable_store_at_path(
+    path: PathBuf,
+    immutable_store: Arc<dyn ImmutableStore>,
+) -> Result<Arc<crate::store::mutable::MutableStore>, RepositoryError> {
     // Fast path: upgrade an existing weak reference.
     if let Some(store) = get_cached_mutable_store(&path) {
         lore_debug!("Reusing cached mutable store");

@@ -219,6 +219,7 @@ use crate::revision::sync::LoreRevisionSyncRevisionEventData;
 use crate::revision::sync::LoreRevisionSyncTargetEventData;
 use crate::shared_store::LoreSharedStoreCreateEventData;
 use crate::shared_store::LoreSharedStoreInfoEventData;
+use crate::shared_store::LoreSharedStoreListEventData;
 use crate::stage::LoreFileStageBeginEventData;
 use crate::stage::LoreFileStageEndEventData;
 use crate::stage::LoreFileStageFileEventData;
@@ -1150,6 +1151,8 @@ pub enum LoreEvent {
     SharedStoreCreate(LoreSharedStoreCreateEventData),
     /// Information about a shared store.
     SharedStoreInfo(LoreSharedStoreInfoEventData),
+    /// List of all shared stores.
+    SharedStoreList(LoreSharedStoreListEventData),
     /// One staged entry in a link listing.
     LinkStagedEntry(LoreLinkStagedEntryEventData),
     // Content-addressed storage API

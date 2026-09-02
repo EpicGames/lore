@@ -35,7 +35,10 @@ impl FSLock {
     /// Acquires an exclusive lock guarding `path`, waiting asynchronously
     /// — non-blocking lock attempts with timed retries — while another
     /// process holds it, so a contended lock never parks a runtime thread.
-    pub async fn acquire_file_lock(path: impl AsRef<Path>) -> std::io::Result<FSLock> {
+    pub async fn acquire_file_lock(
+        path: impl AsRef<Path>,
+        create_directory_if_necessary: bool,
+    ) -> std::io::Result<FSLock> {
         let mut path = path.as_ref().to_path_buf();
         let mut file_name = path
             .file_name()
@@ -44,6 +47,9 @@ impl FSLock {
             ))?
             .to_owned();
         path.pop();
+        if create_directory_if_necessary && !path.exists() {
+            std::fs::create_dir_all(&path)?;
+        }
         let mut path = path.canonicalize()?;
         file_name.push(".lock");
         path.push(file_name);

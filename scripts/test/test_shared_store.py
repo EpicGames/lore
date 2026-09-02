@@ -15,13 +15,13 @@ from error_types import (
     WrongSharedStoreRemote,
     BadSharedStoreRemoteUrl,
 )
+from lore import Lore
+from lore_parsers import SharedStoreListEntry, SharedStoreList
+from assertion_helpers import AlwaysEqual
 from test_utils import to_posix
 from lore_parsers import SpecificSharedStoreInfo, parse_jsonl
-from lore import Lore
 
 logger = logging.getLogger(__name__)
-
-LORE_GLOBAL_PATH_VAR = "LORE_GLOBAL_PATH"
 
 CONFIG_TOML = "shared_store.toml"
 
@@ -86,8 +86,14 @@ def _per_url_store_path(base: str, remote: str) -> str:
 
 
 def get_shared_store_info(repo: Lore) -> SpecificSharedStoreInfo:
-    logger.error(f"Getting shared store info for {repo.shared_store_info()}")
+    logger.info(f"Getting shared store info for {repo.shared_store_info()}")
     return repo.shared_store_info().stores[_strip_protocol(repo.remote)]
+
+
+def _get_shared_store_list(repo: Lore, path: str) -> SharedStoreListEntry:
+    registry = repo.shared_store_list()
+    logger.info(f"Getting shared store registry for {path} from {registry}")
+    return registry.entries[path]
 
 
 def verify_shared_store_repo(
@@ -438,6 +444,53 @@ def test_create_repo_remote_different_but_correct(new_lore_repo, create_repo):
     repo: Lore = new_lore_repo(create_repo=False)
     repo.repository_create(use_shared_store=True)
     immutable_store_bytes = verify_shared_store_repo(repo.path, shared_store_path)
+
+
+@pytest.mark.smoke
+def test_registry(new_lore_repo, tmp_path_factory):
+    repo: Lore = new_lore_repo(create_repo=False)
+
+    # Create a shared store by creating a repository with --use-shared-store=true and ensure it's in the registry.
+    expected_list = SharedStoreList()
+    assert expected_list == repo.shared_store_list()
+
+    repo.repository_create(use_shared_store=True)
+
+    shared_store_path = to_posix(get_shared_store_info(repo).path).rstrip(
+        "/shared_store"
+    )
+    expected_list.entries[shared_store_path] = SharedStoreListEntry(
+        path=shared_store_path, remote_url=repo.remote.rstrip("/")
+    )
+    assert expected_list == repo.shared_store_list()
+
+    # Create a shared store manually and ensure it's in the registry.
+    additional_shared_store_path = tmp_path_factory.mktemp(
+        "additional_shared_store_path"
+    )
+    repo.shared_store_create(repo.remote, str(additional_shared_store_path))
+
+    # Get the shared store location including the formatted remote URL
+    additional_shared_store_path = to_posix(
+        os.path.join(
+            additional_shared_store_path,
+            repo.remote.strip("lore://").rstrip("/").replace(":", "_"),
+        )
+    )
+    expected_list.entries[additional_shared_store_path] = SharedStoreListEntry(
+        path=additional_shared_store_path,
+        remote_url=repo.remote.rstrip("/"),
+    )
+    assert expected_list == repo.shared_store_list()
+
+    repo.repository_info()
+
+    # Also get the list of instances before and after adding a second repository
+    expected_list.entries[shared_store_path].instances = [
+        (AlwaysEqual(), to_posix(repo.path))
+    ]
+    expected_list.entries[additional_shared_store_path].instances = []
+    assert expected_list == repo.shared_store_list(include_instances=True)
 
 
 @pytest.mark.smoke
@@ -1294,7 +1347,55 @@ def test_background_prune_during_clone(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_backwards_compatible_repo(new_lore_repo, tmp_path_factory):
+def test_backwards_compatible_with_old_location(new_lore_repo, tmp_path_factory):
+    # Create a shared store at a non-default location
+    repo: Lore = new_lore_repo(create_repo=False)
+    non_default_store_path = str(
+        tmp_path_factory.getbasetemp()
+        / Lore.generate_random_name("legacy_store_old_location")
+    )
+    repo.shared_store_create(repo.remote, non_default_store_path)
+    shared_store_path = get_shared_store_info(repo).path
+
+    # Move the shared store to the old global store location
+    legacy_global_store_path = shared_store_path.replace("data/stores/", "data/")
+
+    shutil.move(shared_store_path, legacy_global_store_path)
+
+    # Create a repo using the shared store and verify it correctly found the legacy global_store directory
+    repo: Lore = new_lore_repo(create_repo=False)
+    repo.repository_create(
+        use_shared_store=True, shared_store_path=non_default_store_path
+    )
+    immutable_store_bytes = verify_shared_store_repo(
+        repo.path, legacy_global_store_path
+    )
+
+    # Modify the repo's config file to use the old global_store* field names
+    with repo.open_file(os.path.join(".lore", "config.toml"), mode="r+") as f:
+        modified_contents = (
+            f.read()
+            .replace("shared_store_to_use", "global_store_to_use")
+            .replace("use_shared_store", "use_global_store")
+            .replace("shared_store_path", "global_store_path")
+        )
+        f.seek(0)
+        f.write(modified_contents)
+        f.truncate()
+
+    # Add and commit a file and expect the shared store to have grown
+    file_path = "file.txt"
+    with repo.open_file(file_path, "w+") as file:
+        file.writelines("Testing contents")
+    repo.stage(file_path)
+    repo.commit("Commit")
+    verify_shared_store_repo(
+        repo.path, legacy_global_store_path, previous_data_size=immutable_store_bytes
+    )
+
+
+@pytest.mark.smoke
+def test_backwards_compatible_with_global_store(new_lore_repo, tmp_path_factory):
     # Create a shared store at a non-default location
     repo: Lore = new_lore_repo(create_repo=False)
     non_default_store_path = str(
@@ -1305,7 +1406,8 @@ def test_backwards_compatible_repo(new_lore_repo, tmp_path_factory):
 
     # Move the shared store to the old global store location
     legacy_global_store_path = (
-        shared_store_path.removesuffix("shared_store") + "global_store"
+        shared_store_path.replace("data/stores/", "data/").removesuffix("shared_store")
+        + "global_store"
     )
     shutil.move(shared_store_path, legacy_global_store_path)
 

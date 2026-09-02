@@ -2492,6 +2492,33 @@ typedef struct lore_shared_store_info_event_data_t {
   struct lore_uint8_array_t exists;
 } lore_shared_store_info_event_data_t;
 
+// Data for an event describing a shared store being listed.
+typedef struct lore_shared_store_list_item_event_data_t {
+  // Remote URL the shared store is for.
+  struct lore_string_t remote_url;
+  // Path to the shared store on disk.
+  struct lore_string_t store_path;
+  // Paths to instances using the shared store
+  struct lore_string_array_t instance_paths;
+  // Ids of instances using the shared store
+  struct lore_instance_id_array_t instance_ids;
+} lore_shared_store_list_item_event_data_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_shared_store_list_item_event_data_array_t {
+  // Pointer to the first element.
+  const struct lore_shared_store_list_item_event_data_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_shared_store_list_item_event_data_array_t;
+
+// Data for an event describing all shared stores.
+typedef struct lore_shared_store_list_event_data_t {
+  // All stores from the registry.
+  struct lore_shared_store_list_item_event_data_array_t stores;
+} lore_shared_store_list_event_data_t;
+
 // Data for an event describing a link that has staged changes.
 typedef struct lore_link_staged_entry_event_data_t {
   // Path of the link within the parent repository.
@@ -3559,6 +3586,8 @@ enum lore_event_id_t {
   LORE_EVENT_SHARED_STORE_CREATE,
   // Information about a shared store.
   LORE_EVENT_SHARED_STORE_INFO,
+  // List of all shared stores.
+  LORE_EVENT_SHARED_STORE_LIST,
   // One staged entry in a link listing.
   LORE_EVENT_LINK_STAGED_ENTRY,
   // A store was opened.
@@ -3837,6 +3866,7 @@ typedef struct lore_event_t {
     struct lore_notification_unsubscribed_event_data_t notification_unsubscribed;
     struct lore_shared_store_create_event_data_t shared_store_create;
     struct lore_shared_store_info_event_data_t shared_store_info;
+    struct lore_shared_store_list_event_data_t shared_store_list;
     struct lore_link_staged_entry_event_data_t link_staged_entry;
     struct lore_storage_opened_event_data_t storage_opened;
     struct lore_storage_put_item_complete_event_data_t storage_put_item_complete;

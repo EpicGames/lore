@@ -133,6 +133,7 @@ const CREATED: &str = "created";
 const INSTANCE_ID: &str = "instance-id";
 
 /// Instance metadata stored as a blob in the immutable store.
+#[derive(Debug)]
 pub struct InstanceMetadata {
     pub instance_id: InstanceId,
     pub path: String,
@@ -286,11 +287,7 @@ pub async fn list_instances(
         if metadata_hash.is_zero() {
             continue;
         }
-        if let Ok(metadata) = load_instance_metadata(repository, metadata_hash).await
-            && !metadata.instance_id.is_zero()
-        {
-            instances.push(metadata);
-        }
+        instances.push(load_instance_metadata(repository, metadata_hash).await?);
     }
     Ok(instances)
 }

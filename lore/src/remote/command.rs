@@ -126,6 +126,7 @@ pub enum LoreCommand {
     NotificationUnsubscribe(crate::notification::LoreNotificationUnsubscribeArgs),
     SharedStoreCreate(crate::shared_store::LoreSharedStoreCreateArgs),
     SharedStoreInfo(crate::shared_store::LoreSharedStoreInfoArgs),
+    SharedStoreList(crate::shared_store::LoreSharedStoreListArgs),
     SharedStoreSetUseAutomatically(crate::shared_store::LoreSharedStoreSetUseAutomaticallyArgs),
     StorageOpen(crate::storage::open::LoreStorageOpenArgs),
     StorageClose(crate::storage::close::LoreStorageCloseArgs),

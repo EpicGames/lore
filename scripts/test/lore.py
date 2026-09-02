@@ -46,6 +46,8 @@ from lore_parsers import (
     parse_file_info,
     parse_shared_store_info,
     SharedStoreInfo,
+    parse_shared_store_list,
+    SharedStoreList,
 )
 
 logger = logging.getLogger(__name__)
@@ -1977,13 +1979,25 @@ class Lore:
 
     def dirty_move(self, from_path: str, to_path: str, **kwargs: Unpack[GlobalOptions]):
         return self.run(
-            ["file", "dirty", "move", self._fix_path(from_path), self._fix_path(to_path)],
+            [
+                "file",
+                "dirty",
+                "move",
+                self._fix_path(from_path),
+                self._fix_path(to_path),
+            ],
             **kwargs,
         )
 
     def dirty_copy(self, from_path: str, to_path: str, **kwargs: Unpack[GlobalOptions]):
         return self.run(
-            ["file", "dirty", "copy", self._fix_path(from_path), self._fix_path(to_path)],
+            [
+                "file",
+                "dirty",
+                "copy",
+                self._fix_path(from_path),
+                self._fix_path(to_path),
+            ],
             **kwargs,
         )
 
@@ -2327,6 +2341,32 @@ class Lore:
         output = self.run(["shared-store", "info"])
         if can_parse_output(kwargs):
             return parse_shared_store_info(output)
+        return output
+
+    @overload
+    def shared_store_list(
+        self, include_instances: bool = False, **kwargs: Unpack[GlobalOptionsParseable]
+    ) -> SharedStoreList: ...
+
+    @overload
+    def shared_store_list(
+        self, include_instances: bool = False, **kwargs: Unpack[GlobalOptions]
+    ) -> SharedStoreList | str | None: ...
+
+    def shared_store_list(
+        self, include_instances: bool = False, **kwargs: Unpack[GlobalOptions]
+    ) -> SharedStoreList | str | None:
+        output = self.run(
+            [
+                "shared-store",
+                "list",
+                "--include-instances",
+                "true" if include_instances else "false",
+            ],
+            **kwargs,
+        )
+        if can_parse_output(kwargs):
+            return parse_shared_store_list(output)
         return output
 
     def shared_store_set_use_automatically(self, enabled: bool):

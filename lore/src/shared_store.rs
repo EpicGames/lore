@@ -5,9 +5,15 @@ use std::path::PathBuf;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_revision::global::GlobalConfig;
+use lore_revision::instance::list_instances;
+use lore_revision::repository::RepositoryError;
 use lore_revision::shared_store::LoreSharedStoreInfoEventData;
+use lore_revision::shared_store::LoreSharedStoreListEventData;
+use lore_revision::shared_store::LoreSharedStoreListItemEventData;
 use lore_revision::shared_store::SharedStoreError;
 use lore_revision::shared_store::find_existing_shared_store_in_dir;
+use lore_revision::shared_store::registry::SharedStoreRegistry;
+use lore_revision::util::config::SaveableConfig;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -157,6 +163,85 @@ async fn info_local(
         Ok(())
     };
     no_repository_call(globals, callback, args, info, command).await
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
+#[handler(list_local)]
+/// Arguments for listing the registry of shared stores (no parameters).
+pub struct LoreSharedStoreListArgs {
+    /// Whether to load each shared store to search for each instance using it.
+    pub include_instances: u8,
+}
+
+/// Returns information about all registered shared stores
+///
+/// # Events
+///
+/// ## Standard Events
+///
+/// These events are emitted by all interface functions:
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::Log`](crate::interface::LoreEvent::Log) | Diagnostic messages throughout execution |
+/// | [`LoreEvent::Error`](crate::interface::LoreEvent::Error) | Emitted for a non-fatal error during the operation |
+/// | [`LoreEvent::Complete`](crate::interface::LoreEvent::Complete) | Always emitted at the end; `status` is `0` on success or the error code on failure |
+/// | [`LoreEvent::End`](crate::interface::LoreEvent::End) | Always emitted after `Complete` to signal callback termination |
+///
+/// ## Shared Store Events
+///
+/// | Event | Description |
+/// |-------|-------------|
+/// | [`LoreEvent::SharedStoreList`](crate::interface::LoreEvent::SharedStoreList) | Emitted on success with the path of the configured default shared store |
+pub async fn list(
+    globals: LoreGlobalArgs,
+    args: LoreSharedStoreListArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    dispatch_call(globals, args, callback, list_local).await
+}
+
+async fn list_local(
+    globals: LoreGlobalArgs,
+    args: LoreSharedStoreListArgs,
+    callback: LoreEventCallback,
+) -> i32 {
+    let command = async move |_args| -> Result<(), RepositoryError> {
+        let include_instances = args.include_instances != 0;
+        let registry = SharedStoreRegistry::load()
+            .await
+            .forward::<RepositoryError>("Unable to load registry")?;
+
+        let mut stores = Vec::new();
+        for entry in registry.entries() {
+            let (ids, paths) = if include_instances {
+                let repository = entry.create_null_repository_context().await?;
+                list_instances(&repository)
+                    .await
+                    .forward::<RepositoryError>("Listing instances from repository")?
+                    .into_iter()
+                    .map(|metadata| (metadata.instance_id, metadata.path.into()))
+                    .unzip()
+            } else {
+                Default::default()
+            };
+            let per_store_data = LoreSharedStoreListItemEventData {
+                remote_url: entry.remote_url().into(),
+                store_path: entry.path().into(),
+                instance_paths: LoreArray::from_vec(paths),
+                instance_ids: LoreArray::from_vec(ids),
+            };
+            stores.push(per_store_data);
+        }
+        LoreEvent::SharedStoreList(LoreSharedStoreListEventData {
+            stores: LoreArray::from_vec(stores),
+        })
+        .send();
+
+        Ok(())
+    };
+    no_repository_call(globals, callback, args, list, command).await
 }
 
 #[repr(C)]

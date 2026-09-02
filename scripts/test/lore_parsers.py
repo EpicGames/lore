@@ -134,6 +134,7 @@ class LockStatus:
 class SpecificSharedStoreInfo:
     path: str = ""
     exists: bool = False
+    in_registry: bool = False
 
     def __eq__(self, other) -> bool:
         return self.path == other.path and self.exists == other.exists
@@ -143,6 +144,18 @@ class SpecificSharedStoreInfo:
 class SharedStoreInfo:
     is_automatic: bool = False
     stores: typing.Dict[str, SpecificSharedStoreInfo] = field(default_factory=dict)
+
+
+@dataclass
+class SharedStoreListEntry:
+    path: str = ""
+    remote_url: str = ""
+    instances: typing.List[typing.Tuple[str, str]] | None = None
+
+
+@dataclass
+class SharedStoreList:
+    entries: typing.Dict[str, SharedStoreListEntry] = field(default_factory=dict)
 
 
 BISECT_START_END_PATTERN = re.compile(
@@ -320,7 +333,9 @@ def parse_branch_list(output: str):
 
     # If there's a remote section after archived, split it out
     if "Remote branches:" in archived_string:
-        archived_part, remote_after_archived = archived_string.split("Remote branches:", 1)
+        archived_part, remote_after_archived = archived_string.split(
+            "Remote branches:", 1
+        )
     else:
         archived_part = archived_string
         remote_after_archived = ""
@@ -358,7 +373,9 @@ def parse_branch_list(output: str):
         if branch.strip() and not branch.strip().startswith("No ")
     ]
 
-    return BranchList(current_branch, local_branches, remote_branches, archived_branches)
+    return BranchList(
+        current_branch, local_branches, remote_branches, archived_branches
+    )
 
 
 def parse_branch_list_json(output: str) -> BranchList:
@@ -446,11 +463,7 @@ def parse_revision_list(revision_output: str, oneline: bool) -> list[RevisionInf
                 record["message"] = "\n".join(message_lines)
             revisions.append(
                 RevisionInfo(
-                    **{
-                        k: v
-                        for k, v in record.items()
-                        if k in _REVISION_INFO_FIELDS
-                    }
+                    **{k: v for k, v in record.items() if k in _REVISION_INFO_FIELDS}
                 )
             )
     revisions.reverse()
@@ -515,3 +528,27 @@ def parse_shared_store_info(output: str) -> SharedStoreInfo:
         elif prefix == "Exists":
             info.stores[latest_url].exists = value == "true"
     return info
+
+
+def parse_shared_store_list(output: str) -> SharedStoreList:
+    store_list = SharedStoreList()
+    lines = list(output.splitlines())
+    latest_entry: SharedStoreListEntry | None = None
+    for line in lines:
+        prefix_result = get_prefix(line)
+        if prefix_result is None:
+            continue
+        (prefix, value) = prefix_result
+        if prefix == "Store at path":
+            if latest_entry is not None:
+                store_list.entries[latest_entry.path] = latest_entry
+            latest_entry = SharedStoreListEntry(path=value)
+        elif prefix == "Remote URL":
+            latest_entry.remote_url = value
+        elif prefix == "Instances":
+            latest_entry.instances = []
+        elif prefix.startswith("-"):
+            latest_entry.instances.append((prefix.removeprefix("-"), value))
+    if latest_entry is not None:
+        store_list.entries[latest_entry.path] = latest_entry
+    return store_list
