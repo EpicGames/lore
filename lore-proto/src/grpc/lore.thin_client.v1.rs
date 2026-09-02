@@ -104,6 +104,38 @@ impl ::prost::Name for DiffPartition {
         "/lore.thin_client.v1.DiffPartition".into()
     }
 }
+/// The revision that last modified a tree entry. Directories report the
+/// revision of the most recent change anywhere beneath them.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TreeCommit {
+    /// Content signature of the revision.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub signature: ::prost::bytes::Bytes,
+    /// Free-form commit message.
+    #[prost(string, tag = "2")]
+    pub commit_message: ::prost::alloc::string::String,
+    /// Commit timestamp (Unix epoch milliseconds).
+    #[prost(uint64, tag = "3")]
+    pub timestamp: u64,
+    /// Resolved (branch, number) of the revision. Carried in full rather than as
+    /// a bare number because the number is per-branch and this is not enough to
+    /// describe its' provenance
+    #[prost(message, optional, tag = "4")]
+    pub identifier: ::core::option::Option<crate::lore::model::v1::RevisionIdentifier>,
+    /// Identity that committed the revision.
+    #[prost(string, tag = "5")]
+    pub committed_by: ::prost::alloc::string::String,
+}
+impl ::prost::Name for TreeCommit {
+    const NAME: &'static str = "TreeCommit";
+    const PACKAGE: &'static str = "lore.thin_client.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.thin_client.v1.TreeCommit".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.thin_client.v1.TreeCommit".into()
+    }
+}
 /// A single entry in a revision tree listing.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TreeNode {
@@ -126,6 +158,11 @@ pub struct TreeNode {
     /// and non-link entries.
     #[prost(bool, tag = "6")]
     pub tracking: bool,
+    /// Revision that last modified this entry, set only when the request asks
+    /// for it. Absent wherever the server cannot attribute an entry - most
+    /// commonly the repository root.
+    #[prost(message, optional, tag = "7")]
+    pub last_commit: ::core::option::Option<TreeCommit>,
 }
 impl ::prost::Name for TreeNode {
     const NAME: &'static str = "TreeNode";
@@ -714,6 +751,11 @@ pub struct RevisionTreeRequest {
     /// children plus grandchildren; etc. 0 or unset means unbounded.
     #[prost(uint32, optional, tag = "4")]
     pub max_depth: ::core::option::Option<u32>,
+    /// If true, populate `TreeNode.last_commit`. Off by default.
+    /// Note: Attribution costs one delta-block read per state plus one
+    /// file-metadata-block read per entry.
+    #[prost(bool, tag = "5")]
+    pub include_last_commit: bool,
     /// Revision specifier.
     #[prost(oneof = "revision_tree_request::Query", tags = "1, 2")]
     pub query: ::core::option::Option<revision_tree_request::Query>,

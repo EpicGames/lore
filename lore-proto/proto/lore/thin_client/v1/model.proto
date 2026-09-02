@@ -117,6 +117,23 @@ message DiffPartition {
   bytes link_partition = 2;
 }
 
+// The revision that last modified a tree entry. Directories report the
+// revision of the most recent change anywhere beneath them.
+message TreeCommit {
+  // Content signature of the revision.
+  bytes signature = 1;
+  // Free-form commit message.
+  string commit_message = 2;
+  // Commit timestamp (Unix epoch milliseconds).
+  uint64 timestamp = 3;
+  // Resolved (branch, number) of the revision. Carried in full rather than as
+  // a bare number because the number is per-branch and this is not enough to
+  // describe its' provenance
+  lore.model.v1.RevisionIdentifier identifier = 4;
+  // Identity that committed the revision.
+  string committed_by = 5;
+}
+
 // A single entry in a revision tree listing.
 message TreeNode {
   // Repository-relative path of this entry.
@@ -132,6 +149,10 @@ message TreeNode {
   // True when a link entry tracks its parent's branch; false for pinned links
   // and non-link entries.
   bool tracking = 6;
+  // Revision that last modified this entry, set only when the request asks
+  // for it. Absent wherever the server cannot attribute an entry - most
+  // commonly the repository root.
+  optional TreeCommit last_commit = 7;
 }
 
 // Self-describing revision record. Carries the resolved RevisionIdentifier
