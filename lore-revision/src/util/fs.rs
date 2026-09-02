@@ -78,23 +78,26 @@ pub async fn metadata_set_executable(
         });
 }
 
-#[cfg(target_family = "windows")]
-pub fn metadata_to_mode(metadata: &Metadata, previous: u16) -> u16 {
-    // On Windows we just preserve the previous mode for files
-    if metadata.is_file() {
-        previous & NodeFileMode::Executable.bits()
-    } else {
-        0
+/// The mode to store on a node whose mode is `previous`: the observed executable bit
+/// where the platform gave one, `previous`'s where it did not, and none for a path that
+/// is not a file.
+pub fn mode_from_observed(is_file: bool, executable: Option<bool>, previous: u16) -> u16 {
+    if !is_file {
+        return 0;
+    }
+    match executable {
+        Some(true) => NodeFileMode::Executable.bits(),
+        Some(false) => 0,
+        None => previous & NodeFileMode::Executable.bits(),
     }
 }
 
-#[cfg(target_family = "unix")]
-pub fn metadata_to_mode(metadata: &Metadata, _previous: u16) -> u16 {
-    if metadata.is_file() && ((metadata.permissions().mode() & FILE_MODE_USER_EXEC) != 0) {
-        NodeFileMode::Executable.bits()
-    } else {
-        0
-    }
+pub fn metadata_to_mode(metadata: &Metadata, previous: u16) -> u16 {
+    mode_from_observed(
+        metadata.is_file(),
+        file_executable_observed(metadata),
+        previous,
+    )
 }
 
 pub fn mode_changed(from: u16, to: u16) -> bool {
@@ -132,6 +135,19 @@ pub fn file_is_executable(_metadata: &Metadata) -> bool {
 #[cfg(target_family = "unix")]
 pub fn file_is_executable(metadata: &Metadata) -> bool {
     (metadata.permissions().mode() & FILE_MODE_USER_EXEC) != 0
+}
+
+/// Whether the file carries the executable bit, `None` where the platform has no such
+/// bit to read. [`file_is_executable`] answers `false` for both and cannot tell them
+/// apart, which a caller updating a node's mode needs.
+#[cfg(target_family = "windows")]
+pub fn file_executable_observed(_metadata: &Metadata) -> Option<bool> {
+    None
+}
+
+#[cfg(target_family = "unix")]
+pub fn file_executable_observed(metadata: &Metadata) -> Option<bool> {
+    Some(file_is_executable(metadata))
 }
 
 /// Whether every one of `names` is present in `parent`, compared exactly rather than by the
@@ -1508,5 +1524,25 @@ mod tests {
     async fn all_names_exist_is_false_for_an_unreadable_directory() {
         let dir = temp_dir();
         assert!(!filesystem_names_all_exist(&dir.path().join("absent"), &["any"]).await);
+    }
+
+    const EXEC: u16 = NodeFileMode::Executable.bits();
+
+    #[test]
+    fn an_observed_bit_replaces_the_stored_one() {
+        assert_eq!(EXEC, mode_from_observed(true, Some(true), 0));
+        assert_eq!(0, mode_from_observed(true, Some(false), EXEC));
+    }
+
+    #[test]
+    fn an_unobserved_bit_keeps_the_stored_one() {
+        assert_eq!(EXEC, mode_from_observed(true, None, EXEC));
+        assert_eq!(0, mode_from_observed(true, None, 0));
+    }
+
+    #[test]
+    fn only_a_file_carries_a_mode() {
+        assert_eq!(0, mode_from_observed(false, Some(true), EXEC));
+        assert_eq!(0, mode_from_observed(false, None, EXEC));
     }
 }

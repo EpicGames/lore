@@ -249,6 +249,7 @@ mod tests {
             action: lore_revision::change::FileAction::Add,
             path: RelativePath::from_str("Samples/Content/file.uasset").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,
@@ -299,6 +300,7 @@ mod tests {
             action: lore_revision::change::FileAction::Delete,
             path: RelativePath::from_str("Samples/Content/file.uasset").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,
@@ -353,6 +355,7 @@ mod tests {
             action: lore_revision::change::FileAction::Keep,
             path: RelativePath::from_str("Samples/Content/file.uasset").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,
@@ -408,6 +411,7 @@ mod tests {
             action: lore_revision::change::FileAction::Add,
             path: RelativePath::from_str("Samples/Content/file.uasset").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,
@@ -458,6 +462,7 @@ mod tests {
             action: lore_revision::change::FileAction::Add,
             path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,
@@ -508,6 +513,7 @@ mod tests {
             action: lore_revision::change::FileAction::Delete,
             path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,
@@ -563,6 +569,7 @@ mod tests {
             action: lore_revision::change::FileAction::Keep,
             path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,
@@ -623,6 +630,7 @@ mod tests {
             action: lore_revision::change::FileAction::Keep,
             path: RelativePath::from_str("Samples/Content/merged.txt").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::ConflictAutomerged,
             from: NodeChangeState {
                 node: 1,
@@ -680,6 +688,7 @@ mod tests {
             action: lore_revision::change::FileAction::Add,
             path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,
@@ -726,6 +735,7 @@ mod tests {
             action: lore_revision::change::FileAction::Add,
             path: RelativePath::from_str("Samples/Content/submodule").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,
@@ -771,6 +781,7 @@ mod tests {
             action: lore_revision::change::FileAction::Keep,
             path: RelativePath::from_str("libs/shared/a.txt").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 3,
@@ -828,6 +839,7 @@ mod tests {
             action: lore_revision::change::FileAction::Delete,
             path: RelativePath::from_str("libs/shared/gone.txt").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 3,
@@ -868,6 +880,7 @@ mod tests {
             action: lore_revision::change::FileAction::Keep,
             path: RelativePath::from_str("README.txt").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,

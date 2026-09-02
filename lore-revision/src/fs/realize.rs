@@ -2632,6 +2632,7 @@ mod tests {
             to: side(repository, source),
             path: path.clone(),
             from_path: None,
+            observed: None,
         };
 
         Box::pin(verify_filesystem(

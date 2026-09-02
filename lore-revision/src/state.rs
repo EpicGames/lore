@@ -49,6 +49,7 @@ use crate::errors::Oversized;
 use crate::errors::StateErrors;
 use crate::filter::FilterMode;
 use crate::fragment::FragmentFlags;
+use crate::fs::filesystem_provider::FilesystemTraversal;
 use crate::hash;
 use crate::immutable;
 use crate::immutable::ImmutableError;
@@ -5460,6 +5461,7 @@ async fn add_change(
             to: to.clone(),
             path: path.clone(),
             from_path: from_path.cloned(),
+            observed: None,
         })
         .await?;
 
@@ -6160,13 +6162,6 @@ pub(crate) async fn apply_pending_discards(
     Ok(())
 }
 
-struct FilesystemTraversal {
-    repository: Arc<RepositoryContext>,
-    state: Arc<State>,
-    node_path: RelativePath,
-    root_node: NodeID,
-}
-
 struct DiffFilesystemContext {
     from: FilesystemTraversal,
     current: FilesystemTraversal,
@@ -6556,6 +6551,7 @@ async fn emit_dirty_add_node_single(
         },
         path: path.clone(),
         from_path: None,
+        observed: None,
     })
     .await?;
     stats.file_add.fetch_add(1, Ordering::Relaxed);
@@ -6928,6 +6924,7 @@ async fn emit_single_delete(
         to,
         path: path.clone(),
         from_path: None,
+        observed: None,
     })
     .await
 }

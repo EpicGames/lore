@@ -185,6 +185,7 @@ mod tests {
             to: side(2),
             path: RelativePathBuf::new().push_and_freeze(path),
             from_path: from_path.map(|path| RelativePathBuf::new().push_and_freeze(path)),
+            observed: None,
         }
     }
 

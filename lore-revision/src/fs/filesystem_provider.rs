@@ -50,8 +50,9 @@ pub struct FileInfo {
     pub is_file: bool,
     /// Whether the path is a directory.
     pub is_dir: bool,
-    /// Whether the file is executable.
-    pub executable: bool,
+    /// Whether the file carries the executable bit, `None` where the platform has no
+    /// such bit to read. See [`FileInfo::mode`].
+    pub executable: Option<bool>,
     /// File size in bytes (0 if doesn't exist or is directory).
     pub size: u64,
     /// Modification time as Unix timestamp in milliseconds.
@@ -61,7 +62,7 @@ pub struct FileInfo {
 impl FileInfo {
     pub fn from_metadata(metadata: Metadata) -> Self {
         let (mtime, size) = crate::util::fs::file_mtime_and_size(&metadata);
-        let executable = crate::util::fs::file_is_executable(&metadata);
+        let executable = crate::util::fs::file_executable_observed(&metadata);
         FileInfo {
             exists: true,
             is_file: metadata.is_file(),
@@ -71,6 +72,23 @@ impl FileInfo {
             mtime,
         }
     }
+
+    /// The mode to store on a node whose mode is `previous`, as
+    /// [`crate::util::fs::metadata_to_mode`] answers it for the metadata this was read
+    /// from.
+    pub fn mode(&self, previous: u16) -> u16 {
+        crate::util::fs::mode_from_observed(self.is_file, self.executable, previous)
+    }
+}
+
+/// One side of a filesystem reconcile: which tree, rooted where. `node_path` is where
+/// `root_node` sits in its own tree, which differs from the path being walked once a
+/// link or layer mount has been crossed.
+pub struct FilesystemTraversal {
+    pub repository: Arc<RepositoryContext>,
+    pub state: Arc<State>,
+    pub node_path: RelativePath,
+    pub root_node: NodeID,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

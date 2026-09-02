@@ -6,6 +6,7 @@ use bitflags::bitflags;
 use lore_error_set::prelude::*;
 
 use crate::bitflagsops;
+use crate::fs::filesystem_provider::FileInfo;
 use crate::lore::Address;
 use crate::lore::RepositoryId;
 use crate::node::*;
@@ -180,6 +181,9 @@ pub struct NodeChange {
     pub to: NodeChangeState,
     pub path: RelativePath,
     pub from_path: Option<RelativePath>,
+    /// What a filesystem reconcile measured at `path`, so a consumer does not re-stat
+    /// it. `None` for a change between two revisions, which consulted no filesystem.
+    pub observed: Option<FileInfo>,
 }
 
 impl NodeChange {

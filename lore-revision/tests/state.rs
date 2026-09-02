@@ -1256,6 +1256,7 @@ mod single_file_compare_result_tests {
             to: make_change_state(repository, to_context),
             path: RelativePath::new_from_initial_path(path).unwrap_or_default(),
             from_path: None,
+            observed: None,
         }
     }
 

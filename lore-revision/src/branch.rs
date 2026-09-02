@@ -2898,6 +2898,7 @@ async fn try_auto_resolve_conflict(
             to: change_to.to.clone(),
             path: change_to.path.clone(),
             from_path: change_to.from_path.clone(),
+            observed: change_to.observed,
         }))
     } else {
         Ok(None)
@@ -4869,6 +4870,7 @@ mod tests {
             to: side(2),
             path: RelativePathBuf::new().push_and_freeze(path),
             from_path: from_path.map(|path| RelativePathBuf::new().push_and_freeze(path)),
+            observed: None,
         }
     }
 

@@ -81,6 +81,7 @@ mod tests {
             flags: change::Flags::None,
             path: RelativePath::default(),
             from_path: None,
+            observed: None,
         });
 
         changes.push(NodeChange {
@@ -102,6 +103,7 @@ mod tests {
             flags: change::Flags::Modify | change::Flags::Conflict,
             path: RelativePathBuf::new().push_and_freeze("name"),
             from_path: None,
+            observed: None,
         });
 
         changes.push(NodeChange {
@@ -123,6 +125,7 @@ mod tests {
             flags: change::Flags::Merge,
             path: RelativePath::default(),
             from_path: None,
+            observed: None,
         });
 
         let changes_ref = changes.clone();
@@ -398,6 +401,7 @@ mod tests {
             flags: change::Flags::None,
             path: RelativePath::default(),
             from_path: None,
+            observed: None,
         };
         assert_eq!(
             added_link.content_repository_id(),
@@ -412,6 +416,7 @@ mod tests {
             flags: change::Flags::None,
             path: RelativePath::default(),
             from_path: None,
+            observed: None,
         };
         assert_eq!(
             removed_link.content_repository_id(),
@@ -426,6 +431,7 @@ mod tests {
             flags: change::Flags::None,
             path: RelativePath::default(),
             from_path: None,
+            observed: None,
         };
         assert_eq!(
             file_change.content_repository_id(),

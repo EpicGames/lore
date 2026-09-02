@@ -381,6 +381,7 @@ mod tests {
             action,
             path: RelativePath::from_str("dir/file.txt").unwrap(),
             from_path: None,
+            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 node: 1,

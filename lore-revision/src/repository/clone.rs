@@ -38,6 +38,7 @@ use crate::event;
 use crate::event::EventError;
 use crate::filter;
 use crate::filter::FilterMode;
+use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::FilesystemPath;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
@@ -1789,6 +1790,29 @@ async fn ensure_parent_dir(
     Ok(())
 }
 
+/// Sets the executable bit at `path` to what `node` holds, where the filesystem reported
+/// a bit to compare against. A platform that reports none leaves the file alone.
+async fn match_node_executable(
+    operation: &Arc<InstanceOperationImpl>,
+    path: &RepositoryPath,
+    node: &Node,
+    file_info: &FileInfo,
+) -> Result<(), CloneError> {
+    let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
+    if file_info
+        .executable
+        .is_some_and(|observed| observed != node_executable)
+    {
+        operation
+            .make_executable(FilesystemPath::Repository(path), node_executable)
+            .await
+            .forward_with::<CloneError, _>(|| {
+                format!("Failed to clone file {}", path.absolute().display())
+            })?;
+    }
+    Ok(())
+}
+
 async fn clone_file(
     ctx: CloneContext,
     node: Node,
@@ -1837,21 +1861,7 @@ async fn clone_file(
         );
         if matches_node {
             // Existing file is identical, just use it
-            let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
-            if node_executable != file_info.executable {
-                operation
-                    .make_executable(
-                        FilesystemPath::Repository(&repository_path),
-                        node_executable,
-                    )
-                    .await
-                    .forward_with::<CloneError, _>(|| {
-                        format!(
-                            "Failed to clone file {}",
-                            repository_path.absolute().display()
-                        )
-                    })?;
-            }
+            match_node_executable(&operation, &repository_path, &node, &file_info).await?;
 
             lore_trace!("Retain {}", repository_path.absolute().display());
             stats.complete.file_retain.fetch_add(1, Ordering::Relaxed);
@@ -1955,21 +1965,7 @@ async fn clone_file(
                 })?
         };
 
-        let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
-        if node_executable != file_info.executable {
-            operation
-                .make_executable(
-                    FilesystemPath::Repository(&repository_path),
-                    node_executable,
-                )
-                .await
-                .forward_with::<CloneError, _>(|| {
-                    format!(
-                        "Failed to clone file {}",
-                        repository_path.absolute().display()
-                    )
-                })?;
-        }
+        match_node_executable(&operation, &repository_path, &node, &file_info).await?;
 
         // Compute the (mtime_key, mtime) pair and return it; the caller
         // (`clone_execute`) collects pairs in a stack-local buffer and
