@@ -37,12 +37,15 @@ The publish workflow ships both variants to `ghcr.io/epicgames/lore/loreserver`:
 | Tag | arm64 build |
 | --- | --- |
 | `X.Y.Z`, `X.Y`, `latest` | baseline `armv8-a` — runs on any arm64 host |
-| `X.Y.Z-graviton`, `latest-graviton` | tuned for Graviton3+ — faults on older arm64 |
+| `X.Y.Z-graviton`, `X.Y-graviton`, `latest-graviton` | tuned for Graviton3+ — faults on older arm64 |
 
 `linux/amd64` is baseline in both, and is the same image in each manifest list.
 
-The build compiles the `loreserver` binary and generates self-signed TLS certificates for QUIC
-using `scripts/server/make-certs.sh`.
+Every tag is signed keylessly with cosign, and the build summary for a release prints the
+`cosign verify` invocation for the digest it published. A `sha-<commit>` tag appears alongside each
+release, on the same digest: the signature is made against it before any release tag is pointed at
+that digest, so no release tag is ever briefly unsigned. It stays afterwards as a record of which
+commit built which image.
 
 ## Running
 
@@ -51,6 +54,10 @@ docker run -p 41337:41337/tcp -p 41337:41337/udp -p 41339:41339 loreserver
 ```
 
 Both TCP and UDP mappings are required on port 41337 because gRPC uses TCP and QUIC uses UDP.
+
+No QUIC certificate is baked into the image, so the server generates an ephemeral self-signed one
+at startup and clients have to be told to trust it. For anything durable, mount a real certificate
+and point `[server.quic.certificate]` at it.
 
 ### Persisting data
 
@@ -79,7 +86,7 @@ docker run \
 The image stores config files in `/etc/lore/config/` (`LORE_CONFIG_PATH`):
 
 - `default.toml` — copied from `lore-server/config/default.toml` at image build time. Loaded as the on-disk default layer on top of the compiled-in defaults, so you can mount a custom `default.toml` to override compiled-in values without rebuilding the image.
-- `docker.toml` — overrides store paths to `/data` and configures QUIC TLS certificates. Loaded as the `docker` environment layer (`LORE_ENV=docker`).
+- `docker.toml` — overrides the immutable and mutable store paths to `/data`. Loaded as the `docker` environment layer (`LORE_ENV=docker`). It configures no QUIC certificate, which is what leaves the server generating an ephemeral self-signed one.
 
 Settings can be overridden via environment variables with the `LORE__` prefix and `__` as the
 separator. For example:
