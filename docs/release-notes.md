@@ -28,6 +28,9 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - Fix `stage --scan` keeping an entry `status --scan` discards, which left the two walks with different trees
 - `lore branch merge`, `branch merge into` and `revision cherry-pick` carry nothing from the source revision's metadata unless `--inherit-metadata <KEY>` (repeatable) names it, so `merged-by`, `reviewed-by` and `change-request` record whoever performed the merge rather than whoever produced the branch; actor and provenance keys stay reserved even under `*`
 - Fix `lore branch merge` refusing files that carry no local changes: the working file is measured against the node the current revision holds rather than against the base of the three-way diff, a comparison is answered by the chunking the content was stored under, and one file is read and hashed at most once however many revisions it is measured against
+- `LoreFileHistoryEventData` and `LoreRevisionInfoDeltaEventData` now have a `from_path` field. The field is set for moved files, and is empty for added, modified and deleted file actions.
+- All move actions now print both the from and to paths: `lore branch diff`, `lore revision diff`, `lore file history` and `lore revision info --delta` output moves as `V old -> new`.
+- Fix `lore revision diff` for move actions: now it reports a move as one change instead of as a delete & add.
 
 ## v0.9.0 (Aug 28th 2026) [#782]
 
