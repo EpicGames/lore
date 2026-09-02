@@ -112,14 +112,46 @@ mod storage_remote_tests {
     ///
     /// The rejected fragment is picked by size: leaves carry a full chunk of content, the list
     /// that roots them does not, so no prediction of upload order is needed.
-    struct RejectOneLeafStore {
+    /// Wraps a store to interfere with `put` for one content size, so a test can make an upload
+    /// fail or hold it long enough that a concurrent writer of the same address is still in flight
+    /// when it lands. Other sizes pass straight through.
+    struct InterceptPutStore {
         inner: Arc<dyn lore_storage::ImmutableStore>,
-        leaf_size: u64,
-        rejected: std::sync::atomic::AtomicUsize,
+        size: u64,
+        /// Reject this many `put`s of `size` before letting one through.
+        reject_first: usize,
+        /// Hold each `put` of `size` this long before deciding, so the guard is held meanwhile.
+        delay: Duration,
+        /// `put`s of `size` this store was asked for, whether rejected or forwarded.
+        seen: std::sync::atomic::AtomicUsize,
+        /// `put`s of `size` that reached the inner store.
+        forwarded: std::sync::atomic::AtomicUsize,
+    }
+
+    impl InterceptPutStore {
+        fn new(
+            inner: Arc<dyn lore_storage::ImmutableStore>,
+            size: u64,
+            reject_first: usize,
+            delay: Duration,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                size,
+                reject_first,
+                delay,
+                seen: std::sync::atomic::AtomicUsize::new(0),
+                forwarded: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+
+        fn forwarded(&self) -> usize {
+            self.forwarded.load(std::sync::atomic::Ordering::SeqCst)
+        }
     }
 
     #[async_trait::async_trait]
-    impl lore_storage::ImmutableStore for RejectOneLeafStore {
+    impl lore_storage::ImmutableStore for InterceptPutStore {
         fn is_local(&self) -> bool {
             self.inner.clone().is_local()
         }
@@ -174,15 +206,16 @@ mod storage_remote_tests {
             payload: Option<bytes::Bytes>,
             force: bool,
         ) -> Result<(), lore_storage::StoreError> {
-            if fragment.size_content == self.leaf_size
-                && self
-                    .rejected
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-                    == 0
-            {
-                return Err(lore_storage::StoreError::internal(
-                    "rejected one leaf on purpose",
-                ));
+            if fragment.size_content == self.size {
+                let seen = self.seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if !self.delay.is_zero() {
+                    tokio::time::sleep(self.delay).await;
+                }
+                if seen < self.reject_first {
+                    return Err(lore_storage::StoreError::internal("rejected on purpose"));
+                }
+                self.forwarded
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
             self.inner
                 .clone()
@@ -414,6 +447,21 @@ mod storage_remote_tests {
     /// `backend_immutable` on the returned handle is the *inner* store, so assertions see what
     /// actually landed rather than the refusing wrapper.
     async fn start_server_rejecting_one_leaf(leaf_size: u64) -> TestServer {
+        start_server_intercepting_puts(|inner| {
+            InterceptPutStore::new(inner, leaf_size, 1, Duration::ZERO)
+        })
+        .await
+        .0
+    }
+
+    /// A gRPC server whose immutable store is wrapped by `intercept`, returned alongside it so a
+    /// test can read what the store was asked to do.
+    ///
+    /// `backend_immutable` on the returned handle is the *inner* store, so assertions see what
+    /// actually landed rather than the wrapper.
+    async fn start_server_intercepting_puts(
+        intercept: impl FnOnce(Arc<dyn lore_storage::ImmutableStore>) -> Arc<InterceptPutStore>,
+    ) -> (TestServer, Arc<InterceptPutStore>) {
         let backend_immutable = lore_storage::local::immutable_store::create(
             None::<&str>,
             ImmutableStoreCreateOptions::none(),
@@ -435,12 +483,9 @@ mod storage_remote_tests {
         .await
         .unwrap();
         let backend_for_test = backend_immutable.clone();
-        let backend_immutable: Arc<dyn lore_storage::ImmutableStore> =
-            Arc::new(RejectOneLeafStore {
-                inner: backend_immutable,
-                leaf_size,
-                rejected: std::sync::atomic::AtomicUsize::new(0),
-            });
+        let intercept = intercept(backend_immutable);
+        let intercept_for_test = intercept.clone();
+        let backend_immutable: Arc<dyn lore_storage::ImmutableStore> = intercept;
         let backend_mutable_for_test: Arc<dyn lore_storage::MutableStore> = backend_mutable.clone();
 
         // Bound here and handed over, so nothing can take the port between choosing it and
@@ -452,14 +497,17 @@ mod storage_remote_tests {
             spawn_grpc_server(listener, backend_immutable, backend_mutable);
         await_listening(addr, &mut stopped_rx).await;
 
-        TestServer {
-            url: format!("grpc://127.0.0.1:{}", addr.port()),
-            backend_immutable: backend_for_test,
-            backend_mutable: backend_mutable_for_test,
-            grpc_shutdown: Some(shutdown_tx),
-            grpc_stopped: Some(stopped_rx),
-            quic: None,
-        }
+        (
+            TestServer {
+                url: format!("grpc://127.0.0.1:{}", addr.port()),
+                backend_immutable: backend_for_test,
+                backend_mutable: backend_mutable_for_test,
+                grpc_shutdown: Some(shutdown_tx),
+                grpc_stopped: Some(stopped_rx),
+                quic: None,
+            },
+            intercept_for_test,
+        )
     }
 
     /// A `lore://` server: QUIC for storage, gRPC for everything else.
@@ -4731,6 +4779,965 @@ mod storage_remote_tests {
                     close_handle(reader).await;
                     close_handle(handle_id).await;
                 }
+                Ok(())
+            })
+            .await
+    }
+
+    /// A path inside a fresh `TempDir`, holding `payload` when one is given and not created at all
+    /// when none is — a read target must not exist before the op writes it. The directory cleans
+    /// its whole tree on Drop, so the caller holds the guard for the scope it needs the path in.
+    fn temp_file(tag: &str, payload: Option<&[u8]>) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::Builder::new()
+            .prefix(&format!("lore-file-resolved-{tag}-"))
+            .tempdir()
+            .expect("create tempdir");
+        let path = dir.path().join("content");
+        if let Some(payload) = payload {
+            std::fs::write(&path, payload).expect("write source file");
+        }
+        (dir, path)
+    }
+
+    /// The file-backed pair round-tripping through a real server: a file goes up under a key and
+    /// comes back down into another file for a client that never saw the hash. Neither side holds
+    /// the content, which is the whole reason these exist next to `put_resolved` / `get_resolved`.
+    ///
+    /// The reader is a second handle, so the resolve and the read cannot be served from the
+    /// writer's local store — the round trip under test is the remote one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_file_resolved_then_get_file_resolved_round_trips_via_remote() -> TestResult {
+        use lore::storage::get_file_resolved;
+        use lore::storage::get_file_resolved::LoreStorageGetFileResolvedArgs;
+        use lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem;
+        use lore::storage::put_file_resolved;
+        use lore::storage::put_file_resolved::LoreStoragePutFileResolvedArgs;
+        use lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem;
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::KeyType;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-file-resolved-round-trip".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = Partition::from([0xdau8; 16]);
+                    let key = Hash::hash_buffer(b"file-round-trip-key");
+                    let payload = b"published from a file through the wire".to_vec();
+                    let (_source_guard, source) = temp_file("source", Some(&payload));
+
+                    let handle_id = open_remote_handle(&server).await;
+
+                    let put_outcomes: PutOutcomes = Arc::new(Mutex::new(Vec::new()));
+                    let put_for_cb = put_outcomes.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |event: &LoreEvent| {
+                        if let LoreEvent::StoragePutItemComplete(data) = event {
+                            put_for_cb.lock().unwrap().push((
+                                data.id,
+                                data.address,
+                                data.error_code,
+                                data.stored_local,
+                                data.stored_remote,
+                            ));
+                        }
+                    }));
+
+                    let status = put_file_resolved::put_file_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStoragePutFileResolvedArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id },
+                            items: LoreArray::from_vec(vec![LoreStoragePutFileResolvedItem {
+                                id: 1,
+                                partition,
+                                key,
+                                context: Context::default(),
+                                path: LoreString::from(source.display().to_string().as_str()),
+                                remote_write: 1,
+                                local_cache: 0,
+                                fixed_size_chunk: 0,
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(status, 0, "put_file_resolved must succeed");
+
+                    let put_outcomes = put_outcomes.lock().unwrap().clone();
+                    assert_eq!(put_outcomes.len(), 1);
+                    let (_, published_address, code, _stored_local, stored_remote) =
+                        put_outcomes[0];
+                    assert_eq!(code, LoreErrorCode::None);
+                    assert_eq!(
+                        stored_remote, 1,
+                        "remote_write=1 against a live server must report remote placement"
+                    );
+                    assert_eq!(
+                        published_address.hash,
+                        lore_storage::hash_slice(payload.as_slice()),
+                        "the reported address must be the content the key now resolves to"
+                    );
+
+                    let server_mapping = server
+                        .backend_mutable
+                        .clone()
+                        .load(partition, key, KeyType::Resolve)
+                        .await
+                        .expect("put_file_resolved must publish the key on the server");
+                    assert_eq!(server_mapping, published_address.hash);
+
+                    let reader_handle = open_remote_handle(&server).await;
+                    let (_target_guard, target) = temp_file("target", None);
+                    let outcomes: Arc<Mutex<Vec<(u64, Address, LoreErrorCode)>>> =
+                        Arc::new(Mutex::new(Vec::new()));
+                    let outcomes_for_cb = outcomes.clone();
+                    let data_events = Arc::new(Mutex::new(0usize));
+                    let data_for_cb = data_events.clone();
+                    let callback: LoreEventCallback =
+                        Some(Box::new(move |event: &LoreEvent| match event {
+                            LoreEvent::StorageGetData(_) | LoreEvent::StorageGetHeader(_) => {
+                                *data_for_cb.lock().unwrap() += 1;
+                            }
+                            LoreEvent::StorageGetItemComplete(data) => {
+                                outcomes_for_cb.lock().unwrap().push((
+                                    data.id,
+                                    data.address,
+                                    data.error_code,
+                                ));
+                            }
+                            _ => {}
+                        }));
+
+                    let status = get_file_resolved::get_file_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStorageGetFileResolvedArgs {
+                            handle: lore::storage::handle::LoreStore {
+                                handle_id: reader_handle,
+                            },
+                            items: LoreArray::from_vec(vec![LoreStorageGetFileResolvedItem {
+                                id: 2,
+                                partition,
+                                key,
+                                context: Context::default(),
+                                path: LoreString::from(target.display().to_string().as_str()),
+                                offset: 0,
+                                length: 0,
+                                local_cache: 0,
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(status, 0, "get_file_resolved must succeed");
+
+                    let outcomes = outcomes.lock().unwrap().clone();
+                    assert_eq!(outcomes.len(), 1);
+                    assert_eq!(outcomes[0].2, LoreErrorCode::None, "resolve must succeed");
+                    assert_eq!(
+                        outcomes[0].1, published_address,
+                        "get_file_resolved must report the address put_file_resolved published"
+                    );
+                    assert_eq!(
+                        *data_events.lock().unwrap(),
+                        0,
+                        "the content goes to the file, so no HEADER or DATA event may be emitted"
+                    );
+                    assert_eq!(
+                        std::fs::read(&target).expect("read target file"),
+                        payload,
+                        "the file written must hold the bytes published"
+                    );
+
+                    close_handle(reader_handle).await;
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// A file too large for one fragment. On the way up it chunks straight off disk, on the way
+    /// down it is written leaf by leaf into the target, and the key is published only once the
+    /// whole tree is remote. Nothing on either side is ever content-sized, which is what makes
+    /// this pair usable for the payloads `put_resolved`'s buffer cannot carry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_resolved_round_trips_fragmented_content_via_remote() -> TestResult {
+        use lore::storage::get_file_resolved;
+        use lore::storage::get_file_resolved::LoreStorageGetFileResolvedArgs;
+        use lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem;
+        use lore::storage::put_file_resolved;
+        use lore::storage::put_file_resolved::LoreStoragePutFileResolvedArgs;
+        use lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::KeyType;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-file-resolved-fragmented".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = Partition::from([0xdbu8; 16]);
+                    let key = Hash::hash_buffer(b"file-fragmented-key");
+                    let payload: Vec<u8> = (0..(512 * 1024u32)).map(|i| (i % 251) as u8).collect();
+                    let (_source_guard, source) = temp_file("fragmented", Some(&payload));
+
+                    let handle_id = open_remote_handle(&server).await;
+
+                    let outs: Arc<Mutex<Vec<(LoreErrorCode, u8)>>> =
+                        Arc::new(Mutex::new(Vec::new()));
+                    let cb = outs.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+                        if let LoreEvent::StoragePutItemComplete(d) = e {
+                            cb.lock().unwrap().push((d.error_code, d.stored_remote));
+                        }
+                    }));
+                    put_file_resolved::put_file_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStoragePutFileResolvedArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id },
+                            items: LoreArray::from_vec(vec![LoreStoragePutFileResolvedItem {
+                                id: 1,
+                                partition,
+                                key,
+                                context: Context::default(),
+                                path: LoreString::from(source.display().to_string().as_str()),
+                                remote_write: 1,
+                                local_cache: 0,
+                                fixed_size_chunk: 64 * 1024,
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(
+                        outs.lock().unwrap().clone(),
+                        vec![(LoreErrorCode::None, 1)],
+                        "a fragmented file publish must succeed and report the whole tree remote"
+                    );
+
+                    assert!(
+                        server
+                            .backend_mutable
+                            .clone()
+                            .load(partition, key, KeyType::Resolve)
+                            .await
+                            .is_ok(),
+                        "the key must be published for a fragmented file too"
+                    );
+
+                    let reader = open_remote_handle(&server).await;
+                    let (_target_guard, target) = temp_file("fragmented-target", None);
+                    let codes: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                    let codes_cb = codes.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+                        if let LoreEvent::StorageGetItemComplete(d) = e {
+                            codes_cb.lock().unwrap().push(d.error_code);
+                        }
+                    }));
+                    get_file_resolved::get_file_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStorageGetFileResolvedArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id: reader },
+                            items: LoreArray::from_vec(vec![LoreStorageGetFileResolvedItem {
+                                id: 2,
+                                partition,
+                                key,
+                                context: Context::default(),
+                                path: LoreString::from(target.display().to_string().as_str()),
+                                offset: 0,
+                                length: 0,
+                                local_cache: 0,
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(codes.lock().unwrap().clone(), vec![LoreErrorCode::None]);
+
+                    let written = std::fs::read(&target).expect("read target file");
+                    assert_eq!(
+                        written.len(),
+                        payload.len(),
+                        "the file must hold the whole content the key names"
+                    );
+                    assert_eq!(written, payload);
+
+                    close_handle(reader).await;
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// A range of a fragmented key straight into a file, fetched from a server that holds it and
+    /// a client that does not. Only the leaves the range covers are fetched, so the file is the
+    /// range and nothing else — a partial read of a large blob without a buffer for the blob.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn get_file_resolved_writes_only_the_range_from_a_remote_key() -> TestResult {
+        use lore::storage::get_file_resolved;
+        use lore::storage::get_file_resolved::LoreStorageGetFileResolvedArgs;
+        use lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem;
+        use lore::storage::put_file_resolved;
+        use lore::storage::put_file_resolved::LoreStoragePutFileResolvedArgs;
+        use lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-file-resolved-range".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = Partition::from([0xdcu8; 16]);
+                    let key = Hash::hash_buffer(b"file-range-key");
+                    let payload: Vec<u8> = (0..(512 * 1024u32)).map(|i| (i % 241) as u8).collect();
+                    let (_source_guard, source) = temp_file("range", Some(&payload));
+
+                    let handle_id = open_remote_handle(&server).await;
+                    let codes: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                    let codes_cb = codes.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+                        if let LoreEvent::StoragePutItemComplete(d) = e {
+                            codes_cb.lock().unwrap().push(d.error_code);
+                        }
+                    }));
+                    put_file_resolved::put_file_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStoragePutFileResolvedArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id },
+                            items: LoreArray::from_vec(vec![LoreStoragePutFileResolvedItem {
+                                id: 1,
+                                partition,
+                                key,
+                                context: Context::default(),
+                                path: LoreString::from(source.display().to_string().as_str()),
+                                remote_write: 1,
+                                local_cache: 0,
+                                fixed_size_chunk: 64 * 1024,
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(codes.lock().unwrap().clone(), vec![LoreErrorCode::None]);
+
+                    let reader = open_remote_handle(&server).await;
+                    let (_target_guard, target) = temp_file("range-target", None);
+                    let start = 100_000usize;
+                    let length = 300_000usize;
+                    let codes: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                    let codes_cb = codes.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+                        if let LoreEvent::StorageGetItemComplete(d) = e {
+                            codes_cb.lock().unwrap().push(d.error_code);
+                        }
+                    }));
+                    get_file_resolved::get_file_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStorageGetFileResolvedArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id: reader },
+                            items: LoreArray::from_vec(vec![LoreStorageGetFileResolvedItem {
+                                id: 2,
+                                partition,
+                                key,
+                                context: Context::default(),
+                                path: LoreString::from(target.display().to_string().as_str()),
+                                offset: start as u64,
+                                length: length as u64,
+                                local_cache: 0,
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(codes.lock().unwrap().clone(), vec![LoreErrorCode::None]);
+
+                    let written = std::fs::read(&target).expect("read target file");
+                    assert_eq!(written.len(), length, "the file must be sized to the range");
+                    assert_eq!(written, payload[start..start + length]);
+
+                    close_handle(reader).await;
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// An empty file retracts the key on the server as well as locally, so the whole lifecycle —
+    /// publish from a file, resolve into a file, retract, resolve again — runs through the file
+    /// pair alone. The retraction has to reach the remote: with only the local mapping cleared,
+    /// the next resolve would fall through and find the server's live mapping.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_file_resolved_with_an_empty_file_deletes_the_mapping_remotely() -> TestResult {
+        use lore::storage::get_file_resolved;
+        use lore::storage::get_file_resolved::LoreStorageGetFileResolvedArgs;
+        use lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem;
+        use lore::storage::put_file_resolved;
+        use lore::storage::put_file_resolved::LoreStoragePutFileResolvedArgs;
+        use lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::KeyType;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        let execution = setup_execution("storage-remote-file-resolved-delete".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = Partition::from([0xddu8; 16]);
+                    let key = Hash::hash_buffer(b"file-delete-key");
+                    let (_source_guard, source) = temp_file("delete", Some(b"live for now"));
+                    let (_empty_guard, empty) = temp_file("delete-empty", Some(b""));
+
+                    let handle_id = open_remote_handle(&server).await;
+
+                    for (id, path) in [(1u64, &source), (2u64, &empty)] {
+                        let codes: Arc<Mutex<Vec<LoreErrorCode>>> =
+                            Arc::new(Mutex::new(Vec::new()));
+                        let codes_cb = codes.clone();
+                        let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+                            if let LoreEvent::StoragePutItemComplete(d) = e {
+                                codes_cb.lock().unwrap().push(d.error_code);
+                            }
+                        }));
+                        put_file_resolved::put_file_resolved(
+                            LoreGlobalArgs::default(),
+                            LoreStoragePutFileResolvedArgs {
+                                handle: lore::storage::handle::LoreStore { handle_id },
+                                items: LoreArray::from_vec(vec![LoreStoragePutFileResolvedItem {
+                                    id,
+                                    partition,
+                                    key,
+                                    context: Context::default(),
+                                    path: LoreString::from(path.display().to_string().as_str()),
+                                    remote_write: 1,
+                                    local_cache: 0,
+                                    fixed_size_chunk: 0,
+                                }]),
+                            },
+                            callback,
+                        )
+                        .await;
+                        assert_eq!(
+                            codes.lock().unwrap().clone(),
+                            vec![LoreErrorCode::None],
+                            "publish {id} must succeed"
+                        );
+                    }
+
+                    let mapping = server
+                        .backend_mutable
+                        .clone()
+                        .load(partition, key, KeyType::Resolve)
+                        .await;
+                    assert!(
+                        mapping.is_err() || mapping.as_ref().is_ok_and(|hash| hash.is_zero()),
+                        "the retraction must have reached the server; found {mapping:?}"
+                    );
+
+                    let reader = open_remote_handle(&server).await;
+                    let (_target_guard, target) = temp_file("delete-target", None);
+                    let codes: Arc<Mutex<Vec<LoreErrorCode>>> = Arc::new(Mutex::new(Vec::new()));
+                    let codes_cb = codes.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+                        if let LoreEvent::StorageGetItemComplete(d) = e {
+                            codes_cb.lock().unwrap().push(d.error_code);
+                        }
+                    }));
+                    get_file_resolved::get_file_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStorageGetFileResolvedArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id: reader },
+                            items: LoreArray::from_vec(vec![LoreStorageGetFileResolvedItem {
+                                id: 3,
+                                partition,
+                                key,
+                                context: Context::default(),
+                                path: LoreString::from(target.display().to_string().as_str()),
+                                offset: 0,
+                                length: 0,
+                                local_cache: 0,
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(
+                        codes.lock().unwrap().clone(),
+                        vec![LoreErrorCode::AddressNotFound],
+                        "a retracted key must resolve to nothing for a fresh client"
+                    );
+                    assert!(
+                        !target.exists(),
+                        "a miss must leave the target alone rather than create it empty"
+                    );
+
+                    close_handle(reader).await;
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// The publish rides on the upload of the content's top-level fragment rather than costing a
+    /// `mutable_store` of its own, at both content sizes and from either source.
+    ///
+    /// `StoreResult::published` is the only place that distinction surfaces: both routes leave the
+    /// key naming the content, so nothing about the resulting store state tells them apart. This
+    /// drives `lore_storage` directly against the same server the C API reaches, because the
+    /// per-item event carries the placement flags but not this.
+    ///
+    /// Every case writes distinct content. Content the server already holds uploads nothing, so
+    /// there is no command for its key to ride on and the publish falls back to a `mutable_store`
+    /// — the case this asserts against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resolved_publish_rides_on_the_top_level_fragment_upload() -> TestResult {
+        use lore_base::types::Context;
+        use lore_base::types::FRAGMENT_SIZE_THRESHOLD;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+        use lore_storage::WriteContext;
+        use lore_storage::WriteOptions;
+
+        let execution = setup_execution("storage-remote-fused-publish".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = Partition::from([0xdeu8; 16]);
+                    let handle_id = open_remote_handle(&server).await;
+                    let handle = lore::storage::handle::LoreStore { handle_id };
+                    let immutable = lore::storage::handle::immutable_for_test(handle)
+                        .expect("handle still registered");
+                    let mutable = lore::storage::handle::mutable_for_test(handle)
+                        .expect("handle still registered");
+                    let session = lore::storage::handle::session_for_test(handle, partition)
+                        .expect("a remote-configured handle resolves a session");
+
+                    // Period 251 against a 64 KiB cut, so no two leaves are the same fragment.
+                    let fragmented = |seed: u8| -> Vec<u8> {
+                        (0..(4 * FRAGMENT_SIZE_THRESHOLD))
+                            .map(|i| ((i % 251) as u8).wrapping_add(seed))
+                            .collect()
+                    };
+                    let options = WriteOptions::default().with_fixed_size_chunk(64 * 1024);
+
+                    for (label, payload) in [
+                        ("small", b"one fragment from a buffer".to_vec()),
+                        ("fragmented", fragmented(11)),
+                    ] {
+                        let written = lore_storage::write_resolved(
+                            immutable.clone(),
+                            mutable.clone(),
+                            partition,
+                            Hash::hash_buffer(format!("fused-buffer-{label}").as_bytes()),
+                            Context::default(),
+                            bytes::Bytes::from(payload),
+                            options,
+                            Some(session.clone()),
+                            WriteContext::none(),
+                        )
+                        .await?;
+                        assert!(
+                            written.stored_durable,
+                            "{label} buffer must reach the remote for the key to be publishable"
+                        );
+                        assert!(
+                            written.published,
+                            "{label} buffer: the mapping must ride on the upload, not cost a \
+                             mutable_store of its own"
+                        );
+                    }
+
+                    for (label, payload) in [
+                        ("small", b"one fragment from a file".to_vec()),
+                        ("fragmented", fragmented(13)),
+                    ] {
+                        let (_guard, path) = temp_file(label, Some(&payload));
+                        let written = lore_storage::write_resolved_from_file(
+                            immutable.clone(),
+                            mutable.clone(),
+                            partition,
+                            Hash::hash_buffer(format!("fused-file-{label}").as_bytes()),
+                            Context::default(),
+                            &path,
+                            options,
+                            Some(session.clone()),
+                            WriteContext::none(),
+                        )
+                        .await?;
+                        assert!(
+                            written.stored_durable,
+                            "{label} file must reach the remote for the key to be publishable"
+                        );
+                        assert!(
+                            written.published,
+                            "{label} file: the mapping must ride on the upload, not cost a \
+                             mutable_store of its own"
+                        );
+                    }
+
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// Publish `payload` under each of `keys` in one batch, so the items run concurrently against
+    /// the same content address and one of them meets the other's in-flight guard.
+    async fn publish_keys_concurrently(
+        handle_id: u64,
+        partition: lore_base::types::Partition,
+        keys: &[lore_base::types::Hash],
+        payload: &[u8],
+    ) -> Vec<(lore_revision::event::LoreErrorCode, u8)> {
+        use lore::storage::put_resolved;
+        use lore::storage::put_resolved::LoreStoragePutResolvedArgs;
+        use lore::storage::put_resolved::LoreStoragePutResolvedItem;
+        use lore_base::types::Context;
+        use lore_revision::event::LoreBytes;
+        use lore_revision::interface::LoreArray;
+
+        let outs: Arc<Mutex<Vec<(lore_revision::event::LoreErrorCode, u8)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let cb = outs.clone();
+        let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+            if let LoreEvent::StoragePutItemComplete(d) = e {
+                cb.lock().unwrap().push((d.error_code, d.stored_remote));
+            }
+        }));
+        let items = keys
+            .iter()
+            .enumerate()
+            .map(|(n, key)| LoreStoragePutResolvedItem {
+                id: n as u64,
+                partition,
+                key: *key,
+                context: Context::default(),
+                data: LoreBytes {
+                    ptr: payload.as_ptr().cast(),
+                    len: payload.len(),
+                },
+                remote_write: 1,
+                local_cache: 0,
+                fixed_size_chunk: 0,
+            })
+            .collect();
+        put_resolved::put_resolved(
+            LoreGlobalArgs::default(),
+            LoreStoragePutResolvedArgs {
+                handle: lore::storage::handle::LoreStore { handle_id },
+                items: LoreArray::from_vec(items),
+            },
+            callback,
+        )
+        .await;
+        outs.lock().unwrap().clone()
+    }
+
+    /// Two keys naming one content, published at the same time. The second writer meets the
+    /// first's in-flight guard, and inherits its upload instead of sending the payload again: the
+    /// key it owes follows as a `mutable_store`, which costs the round trip its own upload would
+    /// have cost and none of the bytes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_publishes_of_one_content_upload_it_once() -> TestResult {
+        use lore_base::types::Hash;
+        use lore_base::types::KeyType;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+
+        let execution = setup_execution("storage-remote-publish-dedup".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let payload = b"one content, two keys, one upload".to_vec();
+                let (server, intercept) = start_server_intercepting_puts(|inner| {
+                    InterceptPutStore::new(
+                        inner,
+                        payload.len() as u64,
+                        0,
+                        Duration::from_millis(300),
+                    )
+                })
+                .await;
+                let partition = Partition::from([0xe1u8; 16]);
+                let keys = [
+                    Hash::hash_buffer(b"dedup-key-a"),
+                    Hash::hash_buffer(b"dedup-key-b"),
+                ];
+                let handle_id = open_remote_handle(&server).await;
+
+                let outs = publish_keys_concurrently(handle_id, partition, &keys, &payload).await;
+                assert_eq!(outs.len(), 2);
+                for (code, stored_remote) in &outs {
+                    assert_eq!(*code, LoreErrorCode::None);
+                    assert_eq!(*stored_remote, 1, "both must report the content remote");
+                }
+
+                for key in keys {
+                    assert!(
+                        server
+                            .backend_mutable
+                            .clone()
+                            .load(partition, key, KeyType::Resolve)
+                            .await
+                            .is_ok(),
+                        "every key must be published, whichever writer led"
+                    );
+                }
+                assert_eq!(
+                    intercept.forwarded(),
+                    1,
+                    "the follower must inherit the leader's upload rather than send the payload again"
+                );
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    /// A leader that leaves the content *not* durable cannot satisfy a publish, so the writer that
+    /// met its guard uploads for itself rather than inheriting a placement it needs and the leader
+    /// never achieved. The store rejects the first upload, so the leader fails and the second
+    /// writer has to carry the content.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_publish_does_not_inherit_a_leader_that_left_content_unstored() -> TestResult {
+        use lore_base::types::Hash;
+        use lore_base::types::KeyType;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+
+        let execution = setup_execution("storage-remote-publish-no-inherit".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let payload = b"the first upload of this is refused".to_vec();
+                let (server, intercept) = start_server_intercepting_puts(|inner| {
+                    InterceptPutStore::new(
+                        inner,
+                        payload.len() as u64,
+                        1,
+                        Duration::from_millis(300),
+                    )
+                })
+                .await;
+                let partition = Partition::from([0xe2u8; 16]);
+                let keys = [
+                    Hash::hash_buffer(b"no-inherit-key-a"),
+                    Hash::hash_buffer(b"no-inherit-key-b"),
+                ];
+                let handle_id = open_remote_handle(&server).await;
+
+                let outs = publish_keys_concurrently(handle_id, partition, &keys, &payload).await;
+                assert_eq!(outs.len(), 2);
+                for (code, _) in &outs {
+                    assert_eq!(
+                        *code,
+                        LoreErrorCode::None,
+                        "a refused upload is not an error; the local write stands"
+                    );
+                }
+                assert_eq!(
+                    outs.iter().filter(|(_, remote)| *remote == 1).count(),
+                    1,
+                    "the writer that carried the content reports it remote, the refused one does not"
+                );
+                assert_eq!(
+                    intercept.forwarded(),
+                    1,
+                    "the second writer uploaded rather than inheriting the refused leader"
+                );
+
+                let mut published = 0;
+                for key in keys {
+                    if server
+                        .backend_mutable
+                        .clone()
+                        .load(partition, key, KeyType::Resolve)
+                        .await
+                        .is_ok_and(|hash| !hash.is_zero())
+                    {
+                        published += 1;
+                    }
+                }
+                assert_eq!(
+                    published, 1,
+                    "only the key whose own upload carried the content may be published"
+                );
+
+                close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    /// A file whose blocks repeat produces a tree of identical leaves, so every leaf but one is a
+    /// follower on the in-flight guard rather than an uploader. A follower reports the placement
+    /// the store settled at, not the one it read before waiting — otherwise the aggregate would
+    /// call the tree partly absent and withhold a key naming content the server holds whole.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_file_resolved_publishes_a_file_whose_leaves_are_identical() -> TestResult {
+        use lore::storage::put_file_resolved;
+        use lore::storage::put_file_resolved::LoreStoragePutFileResolvedArgs;
+        use lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::KeyType;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        const CHUNK: u64 = 64 * 1024;
+
+        let execution = setup_execution("storage-remote-identical-leaves".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = Partition::from([0xe0u8; 16]);
+                    let key = Hash::hash_buffer(b"identical-leaves-key");
+                    let payload = vec![0xABu8; CHUNK as usize * 8];
+                    let (_source_guard, source) = temp_file("identical", Some(&payload));
+                    let handle_id = open_remote_handle(&server).await;
+
+                    let outs: Arc<Mutex<Vec<(LoreErrorCode, u8)>>> =
+                        Arc::new(Mutex::new(Vec::new()));
+                    let cb = outs.clone();
+                    let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+                        if let LoreEvent::StoragePutItemComplete(d) = e {
+                            cb.lock().unwrap().push((d.error_code, d.stored_remote));
+                        }
+                    }));
+                    put_file_resolved::put_file_resolved(
+                        LoreGlobalArgs::default(),
+                        LoreStoragePutFileResolvedArgs {
+                            handle: lore::storage::handle::LoreStore { handle_id },
+                            items: LoreArray::from_vec(vec![LoreStoragePutFileResolvedItem {
+                                id: 1,
+                                partition,
+                                key,
+                                context: Context::default(),
+                                path: LoreString::from(source.display().to_string().as_str()),
+                                remote_write: 1,
+                                local_cache: 0,
+                                fixed_size_chunk: CHUNK,
+                            }]),
+                        },
+                        callback,
+                    )
+                    .await;
+                    assert_eq!(
+                        outs.lock().unwrap().clone(),
+                        vec![(LoreErrorCode::None, 1)],
+                        "repeated leaves are one upload and many followers, and the tree is still \
+                         whole on the remote"
+                    );
+
+                    assert!(
+                        server
+                            .backend_mutable
+                            .clone()
+                            .load(partition, key, KeyType::Resolve)
+                            .await
+                            .is_ok(),
+                        "the key must be published for a file of repeated blocks"
+                    );
+
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// The withdrawal gate, reached through the file path: `write_fragmented_from_file` has its own
+    /// chunking loop, and the key must be withheld when one of the leaves it produced never
+    /// reached the remote.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_file_resolved_withholds_the_key_when_a_leaf_fails_to_upload() -> TestResult {
+        use lore::storage::put_file_resolved;
+        use lore::storage::put_file_resolved::LoreStoragePutFileResolvedArgs;
+        use lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem;
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::KeyType;
+        use lore_base::types::Partition;
+        use lore_revision::event::LoreErrorCode;
+        use lore_revision::interface::LoreArray;
+
+        const CHUNK: u64 = 64 * 1024;
+
+        let execution = setup_execution("storage-remote-file-partial-tree".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_server_rejecting_one_leaf(CHUNK).await;
+                let partition = Partition::from([0xdfu8; 16]);
+                let key = Hash::hash_buffer(b"file-partial-tree-key");
+                let payload: Vec<u8> = (0..(CHUNK as u32 * 6)).map(|i| (i % 251) as u8).collect();
+                let (_source_guard, source) = temp_file("partial-tree", Some(&payload));
+                let handle_id = open_remote_handle(&server).await;
+
+                let outs: Arc<Mutex<Vec<(LoreErrorCode, u8)>>> = Arc::new(Mutex::new(Vec::new()));
+                let cb = outs.clone();
+                let callback: LoreEventCallback = Some(Box::new(move |e: &LoreEvent| {
+                    if let LoreEvent::StoragePutItemComplete(d) = e {
+                        cb.lock().unwrap().push((d.error_code, d.stored_remote));
+                    }
+                }));
+                put_file_resolved::put_file_resolved(
+                    LoreGlobalArgs::default(),
+                    LoreStoragePutFileResolvedArgs {
+                        handle: lore::storage::handle::LoreStore { handle_id },
+                        items: LoreArray::from_vec(vec![LoreStoragePutFileResolvedItem {
+                            id: 1,
+                            partition,
+                            key,
+                            context: Context::default(),
+                            path: LoreString::from(source.display().to_string().as_str()),
+                            remote_write: 1,
+                            local_cache: 0,
+                            fixed_size_chunk: CHUNK,
+                        }]),
+                    },
+                    callback,
+                )
+                .await;
+
+                assert_eq!(
+                    outs.lock().unwrap().clone(),
+                    vec![(LoreErrorCode::None, 0)],
+                    "a failed leaf leaves a good local write and no remote placement",
+                );
+
+                let resolved = server
+                    .backend_mutable
+                    .clone()
+                    .load(partition, key, KeyType::Resolve)
+                    .await;
+                let published = resolved.as_ref().is_ok_and(|hash| !hash.is_zero());
+                assert!(
+                    !published,
+                    "the key must not be published while its content is only partly on the \
+                     server; found {resolved:?}",
+                );
+
                 Ok(())
             })
             .await

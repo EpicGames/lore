@@ -26,7 +26,10 @@ use crate::types::Context;
 use crate::types::Fragment;
 use crate::types::FragmentReference;
 use crate::types::Partition;
+use crate::write::FusedPublish;
+use crate::write::StoreResult;
 use crate::write::store_fragment;
+use crate::write::store_fragment_publishing;
 use crate::write_tracker::WriteContext;
 
 /// Figure out where to cut `buffer` into chunks, all in one go.
@@ -65,6 +68,10 @@ fn chunk_boundaries(
 /// When the entire buffer fits in a single chunk, the single-fragment fast path
 /// is used and no fragment list is created. In `hash_only` mode, fragments are
 /// not actually stored — only their hashes are computed.
+///
+/// `publish` asks for a `KeyType::Resolve` mapping to ride along with the upload of the tree's
+/// top-level fragment, saving the round trip a separate mapping write would cost. See
+/// [`FusedPublish`] for how the request travels and when a level withdraws it.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_fragmented(
     store: Arc<dyn ImmutableStore>,
@@ -76,6 +83,7 @@ pub async fn write_fragmented(
     remote_session: Option<Arc<StorageSession>>,
     writes: WriteContext,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    publish: Option<Arc<FusedPublish>>,
 ) -> Result<(Address, bool, bool), StorageError> {
     let size = buffer.len();
     let mut read_permit = permit;
@@ -107,9 +115,8 @@ pub async fn write_fragmented(
         };
 
         if chunk_offset == 0 && chunk_size == size {
-            // Everything was put in a single fragment
             let hash = hash::hash_slice(chunk_buffer.as_ref());
-            let result = store_fragment(
+            let result = store_fragment_publishing(
                 store,
                 partition,
                 Address { context, hash },
@@ -119,8 +126,10 @@ pub async fn write_fragmented(
                 remote_session,
                 writes,
                 chunk_permit,
+                publish.as_ref().map(|publish| publish.key()),
             )
             .await?;
+            record_published(publish.as_ref(), &result);
             return Ok((result.address, result.stored_local, result.stored_durable));
         }
 
@@ -171,6 +180,7 @@ pub async fn write_fragmented(
         hash_only,
         remote_session,
         writes,
+        publish,
     )
     .await
 }
@@ -198,6 +208,10 @@ pub async fn write_fragmented(
 /// This is only reached for files larger than one fragment, so the single-fragment
 /// fast path in [`write_fragmented`] cannot apply — no chunk ever exceeds
 /// `FRAGMENT_SIZE_THRESHOLD`, so such a file always yields at least two chunks.
+///
+/// `publish` fuses a `KeyType::Resolve` mapping into the upload of the tree's top-level fragment,
+/// as it does in [`write_fragmented`]: publishing a file costs no round trip beyond the ones its
+/// content already costs.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_fragmented_from_file(
     store: Arc<dyn ImmutableStore>,
@@ -209,6 +223,7 @@ pub async fn write_fragmented_from_file(
     hash_only: bool,
     remote_session: Option<Arc<StorageSession>>,
     writes: WriteContext,
+    publish: Option<Arc<FusedPublish>>,
 ) -> Result<(Address, bool, bool), StorageError> {
     let mut tasks = JoinSet::<Result<StoredChunk, StorageError>>::new();
 
@@ -296,6 +311,7 @@ pub async fn write_fragmented_from_file(
         hash_only,
         remote_session,
         writes,
+        publish,
     )
     .await
 }
@@ -367,6 +383,7 @@ async fn write_chunk_list(
     hash_only: bool,
     remote_session: Option<Arc<StorageSession>>,
     writes: WriteContext,
+    publish: Option<Arc<FusedPublish>>,
 ) -> Result<(Address, bool, bool), StorageError> {
     results.drain(&mut tasks).await;
 
@@ -411,6 +428,7 @@ async fn write_chunk_list(
         remote_session,
         writes,
         list_permit,
+        publish_if_remote(publish, leaves_remote),
     )
     .await?;
     Ok((
@@ -418,6 +436,29 @@ async fn write_chunk_list(
         root_local && leaves_local,
         root_remote && leaves_remote,
     ))
+}
+
+/// The publish request to hand the level above, withdrawn when a child of this level did not reach
+/// the remote.
+///
+/// The frame that stores the top-level fragment cannot see these children, so each level that can
+/// gates the request as it passes it on. Without that, a tree the server holds only part of would
+/// have its key published with the root's upload.
+fn publish_if_remote(
+    publish: Option<Arc<FusedPublish>>,
+    children_remote: bool,
+) -> Option<Arc<FusedPublish>> {
+    publish.filter(|_| children_remote)
+}
+
+/// Report back that the top-level fragment's upload carried the key, so the caller owes it no
+/// mapping write. Content already durable uploads nothing and leaves the request unmarked.
+fn record_published(publish: Option<&Arc<FusedPublish>>, result: &StoreResult) {
+    if result.published
+        && let Some(publish) = publish
+    {
+        publish.mark_published();
+    }
 }
 
 /// Helper function to write a list of fragment references
@@ -429,6 +470,11 @@ async fn write_chunk_list(
 /// The next level is reserved while this level's chunks still hold their splits. That cannot
 /// deadlock: nothing holding a chunk permit ever waits on the budget, so every holder drains
 /// regardless.
+///
+/// A list that fits one fragment *is* the tree's top level, and it is stored last — every level
+/// below has already been awaited by the frame that called this one. So it is the one place a
+/// [`FusedPublish`] can be honoured, and the only place it is: the recursive branch passes the
+/// request on rather than acting on it.
 #[allow(clippy::too_many_arguments)]
 async fn write_fragmentlist_impl(
     store: Arc<dyn ImmutableStore>,
@@ -441,6 +487,7 @@ async fn write_fragmentlist_impl(
     remote_session: Option<Arc<StorageSession>>,
     writes: WriteContext,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    publish: Option<Arc<FusedPublish>>,
 ) -> Result<(Address, bool, bool), StorageError> {
     let size = buffer.len();
 
@@ -458,7 +505,7 @@ async fn write_fragmentlist_impl(
                 Some(permit) => Some(permit),
                 None => crate::concurrency::acquire_fragment_memory_permit(buffer.len()).await,
             };
-            let result = store_fragment(
+            let result = store_fragment_publishing(
                 store,
                 partition,
                 Address { context, hash },
@@ -468,8 +515,10 @@ async fn write_fragmentlist_impl(
                 remote_session,
                 writes,
                 permit,
+                publish.as_ref().map(|publish| publish.key()),
             )
             .await?;
+            record_published(publish.as_ref(), &result);
             Ok((result.address, result.stored_local, result.stored_durable))
         }
     } else {
@@ -604,6 +653,7 @@ async fn write_fragmentlist_impl(
             remote_session,
             writes,
             next_permit,
+            publish_if_remote(publish, children_remote),
         )
         .await?;
         Ok((
@@ -628,6 +678,7 @@ pub fn write_fragmentlist(
     remote_session: Option<Arc<StorageSession>>,
     writes: WriteContext,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    publish: Option<Arc<FusedPublish>>,
 ) -> std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<(Address, bool, bool), StorageError>> + Send>,
 > {
@@ -642,6 +693,7 @@ pub fn write_fragmentlist(
         remote_session,
         writes,
         permit,
+        publish,
     ))
 }
 
@@ -725,6 +777,7 @@ mod tests {
             true,
             None,
             crate::write_tracker::WriteContext::none(),
+            None,
         )
         .await
         .expect_err("a fragment list with no entries must not be written");

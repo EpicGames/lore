@@ -1,25 +1,30 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! `lore_storage_put_file` — store a file's contents at a content address.
+//! `lore_storage_put_file_resolved` — store a file's contents and publish a mutable key naming
+//! them.
+//!
+//! `lore_storage_put_resolved` taking its content from a path rather than a buffer. Publish
+//! ordering, last-writer-wins, `remote_write` and retraction are that operation's semantics; what
+//! differs is the source and what it costs to read. A file at or below the fragment threshold is
+//! read once into the single fragment it becomes, a larger one chunks straight off disk, so
+//! residency follows the fragment rather than the file and the caller holds neither.
 //!
 //! Per item:
-//! - `partition == Partition::default()` → `INVALID_ARGUMENTS`.
-//! - `stat(path).len == 0` → zero-hash short-circuit; the file is not opened for read.
-//! - missing or unreadable file → `INVALID_ARGUMENTS` (caller supplied a bad path).
-//! - otherwise: `write_from_file` produces a single top-level address which lands in
+//! - `partition == Partition::default()`, a zero `key`, or an empty `path` → `INVALID_ARGUMENTS`.
+//! - missing, unreadable, or non-file `path` → `INVALID_ARGUMENTS`. The path is stated before the
+//!   write, as `lore_storage_put_file` does, so a path the caller got wrong reports that rather
+//!   than the retried open failure the write path would report. It is never taken for a delete: a
+//!   typo would retract a live key.
+//! - a zero-length file **retracts** `key`, exactly as a zero-length `data` does in
+//!   `lore_storage_put_resolved`.
+//! - otherwise: `write_resolved_from_file`, and the stored address is reported in
 //!   `PUT_ITEM_COMPLETE`.
-//!
-//! When `item.remote_write != 0` and the handle has a remote configured, the per-item
-//! storage session is passed through to `write_from_file` so the local write and the remote
-//! upload run within the call's lifecycle and `PUT_ITEM_COMPLETE` only fires after both
-//! terminate — same contract as `lore_storage_put`.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use lore_base::error::InvalidArguments;
 use lore_base::lore_spawn;
-use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
@@ -34,7 +39,7 @@ use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreString;
 use lore_revision::store::event::LoreStoragePutItemCompleteEventData;
 use lore_storage::options::WriteOptions;
-use lore_storage::write::write_from_file;
+use lore_storage::write::write_resolved_from_file;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::task::JoinSet;
@@ -47,60 +52,66 @@ use crate::storage::call::storage_call;
 use crate::storage::handle::LoreStore;
 use crate::storage::store::StoreInternal;
 
-/// One `put_file` item — read the file at `path` and store it at
-/// `(partition, context)`.
+/// One `put_file_resolved` item — the file to store and the mutable key to publish it under.
 #[repr(C)]
 #[derive(Clone, PartialEq, Default, Deserialize, Serialize, ValidateText)]
-pub struct LoreStoragePutFileItem {
+pub struct LoreStoragePutFileResolvedItem {
     /// Caller-chosen id echoed back in `PUT_ITEM_COMPLETE`
     pub id: u64,
     /// Target partition; the zero/default partition rejects with `INVALID_ARGUMENTS`
     pub partition: Partition,
-    /// Dedup tag stored alongside the content hash in the resulting address
+    /// Mutable key to publish the stored hash under; a zero key rejects with `INVALID_ARGUMENTS`
+    pub key: Hash,
+    /// Dedup tag stored alongside the content hash in the resulting address, and the context a
+    /// later `get_file_resolved` must read the key at
     pub context: Context,
-    /// Source path; empty, missing, or non-file rejects with `INVALID_ARGUMENTS`; a zero-length
-    /// file maps to the zero-hash address
+    /// Source path; empty, missing, or non-file rejects with `INVALID_ARGUMENTS`. A zero-length
+    /// file removes the key's mapping instead of publishing one
     pub path: LoreString,
-    /// Opt into remote upload — honored on the remote path, ignored local-only
+    /// Also publish the content and the mapping to the remote; ignored when the handle has no
+    /// remote or the call is offline/local
     pub remote_write: u8,
-    /// Tag the resulting fragment with `PayloadLocalCachePriority` so future remote reads always cache it locally
+    /// Tag the fragments with `PayloadLocalCachePriority` so future remote reads always cache them
+    /// locally
     pub local_cache: u8,
-    /// Leaf fragment size cap for large files; `0` lets `write_content` choose
+    /// Leaf fragment size cap for large files; `0` lets the writer choose. Ignored for files under
+    /// `FRAGMENT_SIZE_THRESHOLD`
     pub fixed_size_chunk: u64,
 }
 
-impl core::fmt::Debug for LoreStoragePutFileItem {
+impl core::fmt::Debug for LoreStoragePutFileResolvedItem {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("LoreStoragePutFileItem")
+        f.debug_struct("LoreStoragePutFileResolvedItem")
             .field("id", &self.id)
             .field("path", &self.path.as_str())
             .field("remote_write", &self.remote_write)
+            .field("local_cache", &self.local_cache)
             .field("fixed_size_chunk", &self.fixed_size_chunk)
             .finish()
     }
 }
 
-/// Arguments for `lore_storage_put_file`.
+/// Arguments for `lore_storage_put_file_resolved`.
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize, LoreArgs)]
-#[handler(put_file_local)]
-pub struct LoreStoragePutFileArgs {
+#[handler(put_file_resolved_local)]
+pub struct LoreStoragePutFileResolvedArgs {
     /// Open storage handle
     pub handle: LoreStore,
-    /// Files to store; each runs independently and emits its own `PUT_ITEM_COMPLETE`
-    pub items: LoreArray<LoreStoragePutFileItem>,
+    /// Files to store and publish; each runs independently and emits its own `PUT_ITEM_COMPLETE`
+    pub items: LoreArray<LoreStoragePutFileResolvedItem>,
 }
 
 #[error_set]
-enum PutFileError {
+enum PutFileResolvedError {
     InvalidArguments,
 }
 
-impl EventError for PutFileError {
+impl EventError for PutFileResolvedError {
     fn translated(&self) -> LoreError {
         match self {
-            PutFileError::InvalidArguments(_) => LoreError::InvalidArguments,
-            PutFileError::Internal(_) => LoreError::Internal,
+            PutFileResolvedError::InvalidArguments(_) => LoreError::InvalidArguments,
+            PutFileResolvedError::Internal(_) => LoreError::Internal,
         }
     }
 
@@ -109,18 +120,18 @@ impl EventError for PutFileError {
     }
 }
 
-/// Read one or more files into the content-addressed store.
-pub async fn put_file(
+/// Store one or more files and publish a mutable key naming each.
+pub async fn put_file_resolved(
     globals: LoreGlobalArgs,
-    args: LoreStoragePutFileArgs,
+    args: LoreStoragePutFileResolvedArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    dispatch_call(globals, args, callback, put_file_local).await
+    dispatch_call(globals, args, callback, put_file_resolved_local).await
 }
 
-async fn put_file_local(
+async fn put_file_resolved_local(
     globals: LoreGlobalArgs,
-    args: LoreStoragePutFileArgs,
+    args: LoreStoragePutFileResolvedArgs,
     callback: LoreEventCallback,
 ) -> i32 {
     let handle = args.handle;
@@ -130,11 +141,11 @@ async fn put_file_local(
         callback,
         handle,
         args,
-        put_file,
+        put_file_resolved,
         async move |store, args| {
             let items = args.items.as_slice().to_vec();
             if items.is_empty() {
-                return Ok::<(), PutFileError>(());
+                return Ok::<(), PutFileResolvedError>(());
             }
             let effective = store.effective_flags(per_call)?;
             let total = items.len();
@@ -147,24 +158,23 @@ async fn put_file_local(
                     item.remote_write != 0 && !effective.no_remote,
                 );
                 let store = store.clone();
-                lore_spawn!(
-                    tasks,
-                    async move { put_file_item(store, item, session).await }
-                );
+                lore_spawn!(tasks, async move {
+                    put_file_resolved_item(store, item, session).await
+                });
             }
             let codes = crate::storage::drain_codes(tasks).await;
-            crate::storage::build_call_error(&codes, total, "put_file")
+            crate::storage::build_call_error(&codes, total, "put_file_resolved")
         },
     )
     .await
 }
 
-async fn put_file_item(
+async fn put_file_resolved_item(
     store: Arc<StoreInternal>,
-    item: LoreStoragePutFileItem,
+    item: LoreStoragePutFileResolvedItem,
     session: Option<Arc<lore_transport::StorageSession>>,
 ) -> LoreErrorCode {
-    let outcome = resolve_put_file_item(store, &item, session).await;
+    let outcome = resolve_put_file_resolved_item(store, &item, session).await;
     LoreEvent::StoragePutItemComplete(LoreStoragePutItemCompleteEventData {
         id: item.id,
         address: outcome.address,
@@ -176,12 +186,16 @@ async fn put_file_item(
     outcome.error_code
 }
 
-async fn resolve_put_file_item(
+async fn resolve_put_file_resolved_item(
     store: Arc<StoreInternal>,
-    item: &LoreStoragePutFileItem,
+    item: &LoreStoragePutFileResolvedItem,
     remote_session: Option<Arc<lore_transport::StorageSession>>,
 ) -> PutItemOutcome {
     if item.partition == Partition::default() {
+        return PutItemOutcome::failed(LoreErrorCode::InvalidArguments);
+    }
+
+    if item.key == Hash::default() {
         return PutItemOutcome::failed(LoreErrorCode::InvalidArguments);
     }
 
@@ -196,19 +210,6 @@ async fn resolve_put_file_item(
         Ok(meta) => {
             if !meta.is_file() {
                 return PutItemOutcome::failed(LoreErrorCode::InvalidArguments);
-            }
-            if meta.len() == 0 {
-                // Zero-hash short-circuit: succeeds without storing anything, so both placement
-                // flags stay clear even though `error_code` is `None`.
-                return PutItemOutcome {
-                    address: Address {
-                        hash: Hash::default(),
-                        context: item.context,
-                    },
-                    error_code: LoreErrorCode::None,
-                    stored_local: false,
-                    stored_remote: false,
-                };
             }
         }
         Err(_) => {
@@ -225,11 +226,13 @@ async fn resolve_put_file_item(
     }
 
     PutItemOutcome::from_write(
-        write_from_file(
+        write_resolved_from_file(
             store.immutable.clone(),
+            store.mutable.clone(),
             item.partition,
-            Path::new(path_str),
+            item.key,
             item.context,
+            Path::new(path_str),
             write_options,
             remote_session,
             lore_revision::immutable::counted_write_context(),

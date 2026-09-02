@@ -1488,7 +1488,7 @@ mod aws_store_tests {
     /// `branch::create` for a default branch (no commits yet) calls
     /// `store_latest(prev=0, latest=0)`, which goes through
     /// `compare_and_swap(expected=0, value=0)` and writes a `{value=0000…}` row
-    /// to DynamoDB. Previously the zero-expected CAS condition was
+    /// to `DynamoDB`. Previously the zero-expected CAS condition was
     /// `attribute_not_exists(pk) AND attribute_not_exists(sk)` — an item-existence
     /// check that fails when the row already exists, even with a zero value. The
     /// handler for the resulting `ConditionalCheckFailedException` returned the
@@ -1816,7 +1816,7 @@ mod aws_store_tests {
     }
 
     /// The contract every `ImmutableStore` owes its callers, checked against the AWS store
-    /// backed by real S3 and DynamoDB. This is the authoritative conformance check for the AWS
+    /// backed by real S3 and `DynamoDB`. This is the authoritative conformance check for the AWS
     /// implementation: unit tests can only validate logic against the in-process model of what AWS
     /// services do, whereas this test runs the full battery against the actual services and will
     /// catch any divergence between that model and reality.

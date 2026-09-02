@@ -2507,9 +2507,10 @@ typedef struct lore_storage_opened_event_data_t {
   uint64_t handle_id;
 } lore_storage_opened_event_data_t;
 
-// Terminal per-item event for `put` and `put_file`. On success
-// `error_code == None` and `address` is the computed content hash; on
-// failure `error_code` is populated and `address` is zero.
+// Terminal per-item event for `put`, `put_file`, `put_resolved` and
+// `put_file_resolved`. On success `error_code == None` and `address` is the
+// computed content hash — for the resolved variants, the content the key now
+// resolves to; on failure `error_code` is populated and `address` is zero.
 typedef struct lore_storage_put_item_complete_event_data_t {
   // Correlation id of the item.
   uint64_t id;
@@ -2563,9 +2564,11 @@ typedef struct lore_storage_get_data_event_data_t {
   struct lore_bytes_t bytes;
 } lore_storage_get_data_event_data_t;
 
-// Terminal per-item event for `get` and `get_file`. For `get_file` this
-// is emitted without any preceding `HEADER`/`DATA` events — the payload
-// is written directly to the filesystem.
+// Terminal per-item event for `get`, `get_file`, `get_resolved` and
+// `get_file_resolved`. For the two file variants this is emitted without any
+// preceding `HEADER`/`DATA` events — the payload is written directly to the
+// filesystem. For the two resolved variants `address` is the address the key
+// resolved to, so it is an output rather than an echo of the request.
 typedef struct lore_storage_get_item_complete_event_data_t {
   // Correlation id of the item.
   uint64_t id;
@@ -5406,6 +5409,94 @@ typedef struct lore_storage_get_file_args_t {
   // Addresses and destination paths; each runs independently
   struct lore_storage_get_file_item_array_t items;
 } lore_storage_get_file_args_t;
+
+// One `put_file_resolved` item — the file to store and the mutable key to publish it under.
+typedef struct lore_storage_put_file_resolved_item_t {
+  // Caller-chosen id echoed back in `PUT_ITEM_COMPLETE`
+  uint64_t id;
+  // Target partition; the zero/default partition rejects with `INVALID_ARGUMENTS`
+  struct lore_partition_t partition;
+  // Mutable key to publish the stored hash under; a zero key rejects with `INVALID_ARGUMENTS`
+  struct lore_hash_t key;
+  // Dedup tag stored alongside the content hash in the resulting address, and the context a
+  // later `get_file_resolved` must read the key at
+  struct lore_context_t context;
+  // Source path; empty, missing, or non-file rejects with `INVALID_ARGUMENTS`. A zero-length
+  // file removes the key's mapping instead of publishing one
+  struct lore_string_t path;
+  // Also publish the content and the mapping to the remote; ignored when the handle has no
+  // remote or the call is offline/local
+  uint8_t remote_write;
+  // Tag the fragments with `PayloadLocalCachePriority` so future remote reads always cache them
+  // locally
+  uint8_t local_cache;
+  // Leaf fragment size cap for large files; `0` lets the writer choose. Ignored for files under
+  // `FRAGMENT_SIZE_THRESHOLD`
+  uint64_t fixed_size_chunk;
+} lore_storage_put_file_resolved_item_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_storage_put_file_resolved_item_array_t {
+  // Pointer to the first element.
+  const struct lore_storage_put_file_resolved_item_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_storage_put_file_resolved_item_array_t;
+
+// Arguments for `lore_storage_put_file_resolved`.
+typedef struct lore_storage_put_file_resolved_args_t {
+  // Open storage handle
+  struct lore_store_t handle;
+  // Files to store and publish; each runs independently and emits its own `PUT_ITEM_COMPLETE`
+  struct lore_storage_put_file_resolved_item_array_t items;
+} lore_storage_put_file_resolved_args_t;
+
+// One `get_file_resolved` item — the mutable key to resolve and the file to write the content it
+// names to.
+typedef struct lore_storage_get_file_resolved_item_t {
+  // Caller-chosen id echoed back in `GET_ITEM_COMPLETE`
+  uint64_t id;
+  // Partition to resolve and read within; the zero/default partition rejects with
+  // `INVALID_ARGUMENTS`
+  struct lore_partition_t partition;
+  // Mutable key to resolve, always read as `KeyType::Resolve`; a zero key rejects with
+  // `INVALID_ARGUMENTS`
+  struct lore_hash_t key;
+  // Paired with the resolved hash to address the immutable read; the mutable store yields only
+  // a hash
+  struct lore_context_t context;
+  // Destination path; empty rejects with `INVALID_ARGUMENTS`. Multi-fragment writes stage via
+  // `<path>.loretmp` then atomically rename
+  struct lore_string_t path;
+  // First content byte to write, counted from the start of the decompressed content. Past the
+  // end of the content rejects with `INVALID_ARGUMENTS`
+  uint64_t offset;
+  // Content bytes to write from `offset`; `0` writes to the end. The file holds exactly the
+  // requested range starting at its own first byte, and is sized to it
+  uint64_t length;
+  // Cache fetched fragments and the mapping back to the local store, not just write the content
+  // to `path`
+  uint8_t local_cache;
+} lore_storage_get_file_resolved_item_t;
+
+// A contiguous array of elements described by a pointer and a count.
+// Holds zero or more values of the element type laid out one after another.
+typedef struct lore_storage_get_file_resolved_item_array_t {
+  // Pointer to the first element.
+  const struct lore_storage_get_file_resolved_item_t *ptr;
+  // Number of elements in the array.
+  uintptr_t count;
+} lore_storage_get_file_resolved_item_array_t;
+
+// Arguments for `lore_storage_get_file_resolved`.
+typedef struct lore_storage_get_file_resolved_args_t {
+  // Open storage handle
+  struct lore_store_t handle;
+  // Keys to resolve and destination paths; each runs independently and emits its own
+  // `GET_ITEM_COMPLETE`
+  struct lore_storage_get_file_resolved_item_array_t items;
+} lore_storage_get_file_resolved_args_t;
 
 // One upload item — the `(partition, address)` of locally-stored content to push to remote.
 typedef struct lore_storage_upload_item_t {
@@ -10914,11 +11005,13 @@ void lore_storage_get_resolved_async(const struct lore_global_args_t *globals,
 
 // Store one or more buffers and publish a mutable key naming each, in one round trip.
 //
-// `lore_storage_put` followed by `lore_storage_mutable_store`, fused into one request when the
-// content fits a single fragment. The key is published under `LORE_KEY_TYPE_RESOLVE`, making it
-// readable by `lore_storage_get_resolved`, and the mapping is written only once the content is
-// stored — so a key published this way never resolves to content that is not there. Writing the
-// same key type directly with `lore_storage_mutable_store` carries no such guarantee.
+// `lore_storage_put` followed by `lore_storage_mutable_store`, with the mapping riding on
+// whichever request carries the content's top-level fragment rather than costing one of its own.
+// The key is published under `LORE_KEY_TYPE_RESOLVE`, making it readable by
+// `lore_storage_get_resolved`, and the mapping is written only once the content is stored — so a
+// key published this way never resolves to content that is not there. Writing the same key type
+// directly with `lore_storage_mutable_store` carries no such guarantee. Content the server
+// already holds uploads nothing, so its key takes a mapping write instead — still one request.
 //
 // The local store always receives both the content and the mapping. `remote_write = 1` also
 // publishes them remotely, matching `lore_storage_put`; there is no local-then-remote fallback.
@@ -11137,10 +11230,12 @@ void lore_storage_put_file_async(const struct lore_global_args_t *globals,
 
 // Write content-addressed payloads to filesystem paths.
 //
-// Each item emits `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE`. No HEADER or
-// DATA events are produced — the payload is written straight to disk.
-// On partial-write failure the library leaves whatever state the
-// failure produced; cleanup is the caller's responsibility.
+// Each item emits `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE`. No HEADER or DATA events are produced —
+// the payload is written straight to disk. Multi-fragment writes stage through `<path>.loretmp`
+// and rename atomically, and a failure mid-write removes the temp file, so the target is either
+// the finished range or untouched. An `offset` past the end of the content is rejected with
+// `INVALID_ARGUMENTS` without opening the target, so a destination that was already there
+// survives.
 int32_t lore_storage_get_file(const struct lore_global_args_t *globals,
                               const struct lore_storage_get_file_args_t *args,
                               struct lore_event_callback_config_t callback);
@@ -11149,6 +11244,80 @@ int32_t lore_storage_get_file(const struct lore_global_args_t *globals,
 void lore_storage_get_file_async(const struct lore_global_args_t *globals,
                                  const struct lore_storage_get_file_args_t *args,
                                  struct lore_event_callback_config_t callback);
+
+// Store one or more files and publish a mutable key naming each, in one round trip.
+//
+// `lore_storage_put_resolved` reading its content from a path instead of a buffer, and identical
+// to it in everything but the source: the key is published under `LORE_KEY_TYPE_RESOLVE`, the
+// mapping is written only once the content is stored, publishing is last-writer-wins, and
+// `remote_write = 1` publishes remotely as well as locally.
+//
+// The caller never loads the file, and the library holds no more than one fragment of it: a file
+// at or below the fragment threshold is read once into the single fragment it becomes, a larger
+// one chunks straight off disk.
+//
+// A zero `key` or a zero `partition` rejects with `INVALID_ARGUMENTS`, as does a missing,
+// unreadable, or non-file `path` — a path that cannot be read is never taken for a delete, so a
+// typo cannot retract a live key. A **zero-length** file does retract it, exactly as a
+// zero-length `data` does in `lore_storage_put_resolved`.
+//
+// A remote content upload that fails still leaves a successful local write, so the key is not
+// published remotely and `stored_remote` is `0` while `error_code` stays `NONE`. Check
+// `stored_remote`, not `error_code`, to confirm the key is visible to other clients.
+//
+// # Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item; `address` is the content the key now resolves to, and `stored_local`/`stored_remote` report where it landed |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
+int32_t lore_storage_put_file_resolved(const struct lore_global_args_t *globals,
+                                       const struct lore_storage_put_file_resolved_args_t *args,
+                                       struct lore_event_callback_config_t callback);
+
+// Store one or more files and publish a mutable key naming each (async variant).
+void lore_storage_put_file_resolved_async(const struct lore_global_args_t *globals,
+                                          const struct lore_storage_put_file_resolved_args_t *args,
+                                          struct lore_event_callback_config_t callback);
+
+// Resolve one or more mutable keys and write the content they name to filesystem paths, in one
+// round trip.
+//
+// `lore_storage_get_resolved` writing to a path instead of to the callback. Nothing is held whole
+// on either side of the boundary: the resolve and the read of the root fragment share one request,
+// and the content goes to disk fragment by fragment at its own offset, so a key naming something
+// large needs neither the `streaming` mode nor a buffer for it. No
+// `LORE_EVENT_STORAGE_GET_HEADER` or `LORE_EVENT_STORAGE_GET_DATA` is emitted, as with
+// `lore_storage_get_file`.
+//
+// The terminal event's `address` is the *resolved* address, so a caller still learns the
+// key-to-hash mapping. A key with no mapping, or one naming absent content, reports
+// `error_code = ADDRESS_NOT_FOUND`, carries a zero address, and leaves `path` untouched — there is
+// no zero-hash truncation as in `lore_storage_get_file`, because a resolve that finds nothing is a
+// miss rather than an address for empty content.
+//
+// `offset` and `length` select part of the content and multi-fragment writes stage through
+// `<path>.loretmp` before an atomic rename, both as in `lore_storage_get_file`: the file holds
+// exactly the requested range from its own first byte, and the target is either the finished range
+// or untouched. A start past the end is rejected with `INVALID_ARGUMENTS` without opening the
+// target, so a destination that was already there survives.
+//
+// # Events
+//
+// | Tag | Data Type | Description |
+// |-----|-----------|-------------|
+// | `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE` | `lore_storage_get_item_complete_event_data_t` | Terminal per-item event, carrying the resolved address |
+// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
+int32_t lore_storage_get_file_resolved(const struct lore_global_args_t *globals,
+                                       const struct lore_storage_get_file_resolved_args_t *args,
+                                       struct lore_event_callback_config_t callback);
+
+// Resolve mutable keys and write the content they name to files (async variant).
+void lore_storage_get_file_resolved_async(const struct lore_global_args_t *globals,
+                                          const struct lore_storage_get_file_resolved_args_t *args,
+                                          struct lore_event_callback_config_t callback);
 
 // Push locally-stored, not-yet-durable content to the remote store.
 //

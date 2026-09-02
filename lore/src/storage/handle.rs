@@ -76,6 +76,18 @@ pub fn mutable_for_test(handle: LoreStore) -> Option<Arc<dyn lore_storage::Mutab
     lookup(handle).map(|store| store.mutable.clone())
 }
 
+/// Test-only helper: return the storage session a partition's ops would use, or `None` when the
+/// handle has no remote. Integration tests use it to drive `lore_storage` directly against the
+/// same server an op would reach, for results the event surface does not carry.
+/// `#[doc(hidden)]` keeps it out of the public surface.
+#[doc(hidden)]
+pub fn session_for_test(
+    handle: LoreStore,
+    partition: lore_base::types::Partition,
+) -> Option<Arc<lore_transport::StorageSession>> {
+    lookup(handle).and_then(|store| store.remote_session_for(partition))
+}
+
 /// Drain every entry in the registry, returning each `(handle_id, Arc<StoreInternal>)` pair
 /// the registry held. After this call the registry is empty. Used by the library-level
 /// shutdown path to walk + close every outstanding handle in one pass without racing against

@@ -5,7 +5,7 @@ authors:
   - mattias.jansson
 status: Draft
 created: 2026-08-02
-updated: 2026-08-02
+updated: 2026-09-01
 discussion: <TBD — fill in CR link when discussion CR is opened>
 ---
 
@@ -78,6 +78,16 @@ This addresses Goals 1 and 2 in part: the key type is implied rather than transm
 
 Both operations are available on QUIC and gRPC (Goal 6) and through `lore_storage_get_resolved` and `lore_storage_put_resolved` in the C API (Goal 7). A resolved read takes the same `streaming` option an ordinary read does: without it the content is reassembled into one buffer, with it the caller receives one event per leaf fragment and peak memory follows the fragment size instead of the content size.
 
+### File-backed variants
+
+Callers whose content lives on disk — which is most of them, for content large enough to fragment — cannot use the two operations above without giving up what each is for. Publishing means reading the whole file into a buffer to hand across the boundary; resolving means receiving the whole content as events and writing it out again. Either way the content passes through the application's memory in full, and the streaming option only moves the problem from one side of the callback to the other.
+
+`get_file_resolved` and `put_file_resolved` name a path instead of a buffer. Neither the caller nor Lore holds the content: a file at or below the fragment threshold is read once into the single fragment it becomes, and a larger one chunks straight off disk on the way in and is written leaf by leaf at each leaf's own offset on the way out, so peak memory follows the fragment size rather than the file size.
+
+They keep the round trip count of the pair they mirror, including for content that fragments. A read fuses the resolve with the fetch of the *first* fragment it needs — the tree's root — exactly as `get_resolved` does, since the root is what the resolve answers with. A write fuses the publish into the upload of the *last* fragment it sends — the fragment list root, or the single fragment of content that does not fragment. Fusing at the root is safe for the reason the ordering in "Two operations" demands: the root is stored after every fragment beneath it, so each level's placement is settled before the level above is written, and a level that finds a child missing from the remote withdraws the key rather than passing it on. A tree that did not reach the remote whole therefore leaves its key unpublished, as it did when the mapping followed as a separate write. `put_resolved` publishes fragmented content the same way, so the two writes differ only in where their bytes come from.
+
+Ranges apply as they do to `lore_storage_get_file`: a read may ask for part of the content, the file holds exactly that range from its first byte, and only the fragments the range covers are fetched. A zero-length file retracts the key, since a publish with nothing to publish is the removal described below rather than a third state.
+
 ### Reporting where content landed
 
 Lore's existing write path treats a remote upload as best-effort: a `put` that stores locally but fails to upload reports success, leaving the fragment marked non-durable so a later write retries it. That contract is sound for `put`, and it is exactly what makes a naive key publish unsafe — a caller cannot tell from a successful write whether the content another client would need is actually there.
@@ -102,19 +112,19 @@ Because the local store is a cache, a mapping cached locally can be stale, and a
 
 - **On-disk format** — Additive. `KeyType::Resolve` is a new discriminant, and the local mutable store encodes the key type into the stored key ([`lore-storage/src/local/mutable_store.rs`](../../lore-storage/src/local/mutable_store.rs)), so the new type extends the persisted key space without disturbing existing entries. An upgraded Lore reads existing repositories unchanged; a downgraded Lore reads everything except keys of the new type, which it does not recognise and does not need.
 
-- **CLI and public API** — Additive. Four new `extern "C"` entry points (`lore_storage_get_resolved`, `lore_storage_put_resolved`, and their `_async` variants) and their argument and item structs. The shared per-item completion event for writes gains two fields, appended after the existing ones: at the C level they occupy the struct's existing tail padding, so its size and every prior field offset are unchanged, and they carry `#[serde(default)]` so that the same event crossing the service IPC boundary still deserializes from a peer that predates them — the pattern `lore_complete_event_data_t` established when error detail was appended to it. No CLI subcommand changes.
+- **CLI and public API** — Additive. Eight new `extern "C"` entry points (`lore_storage_get_resolved`, `lore_storage_put_resolved`, `lore_storage_get_file_resolved`, `lore_storage_put_file_resolved`, and their `_async` variants) and their argument and item structs. The file-backed pair adds no wire format of its own: it composes the same two commands, and is reachable across the service IPC boundary where the buffer-bearing `put_resolved` is not, since a path has a cross-process representation and a `LoreBytes` view into caller memory does not. The shared per-item completion event for writes gains two fields, appended after the existing ones: at the C level they occupy the struct's existing tail padding, so its size and every prior field offset are unchanged, and they carry `#[serde(default)]` so that the same event crossing the service IPC boundary still deserializes from a peer that predates them — the pattern `lore_complete_event_data_t` established when error detail was appended to it. No CLI subcommand changes.
 
 ## Non-Functional Considerations
 
 - **Concurrency** — Publishes to the same key are last-writer-wins, as `mutable_store` is today. Concurrent publishes of identical *content* coalesce on the existing in-flight guard, so N publishers of the same bytes produce one upload. Concurrent resolves of one key may observe different mappings if the key moves between them, which is inherent to reading a mutable value and not introduced here.
 
-- **Memory** — Unchanged in both directions. A publish carries a single fragment, bounded by the existing fragment size threshold, and larger content fragments through the existing write path with its streaming and backpressure intact. A resolved read offers the same `streaming` mode as `lore_storage_get`: set it and the content arrives one leaf fragment at a time, so peak memory follows the fragment size rather than the content. Left unset it reassembles into a single buffer, which is the right default for the small values this API is aimed at but not for a key naming something large.
+- **Memory** — Unchanged in both directions. A publish carries a single fragment, bounded by the existing fragment size threshold, and larger content fragments through the existing write path with its streaming and backpressure intact. A resolved read offers the same `streaming` mode as `lore_storage_get`: set it and the content arrives one leaf fragment at a time, so peak memory follows the fragment size rather than the content. Left unset it reassembles into a single buffer, which is the right default for the small values this API is aimed at but not for a key naming something large. The file-backed variants bound the *caller's* memory too, which the streaming mode does not: the content never exists as a buffer on either side of the boundary.
 
 - **Statelessness** — No new process- or library-level state. The operations reuse the existing per-session transport state and the existing local stores.
 
 - **Determinism** — Content addressing is unchanged, so identical content produces an identical address regardless of which operation stored it. The mapping a key resolves to is by definition not deterministic across time; that is the property the mutable store exists to provide.
 
-- **Latency** — The reason for the proposal. Foreign-keyed reads and single-fragment writes drop from two serially dependent round trips to one. Multi-fragment writes are unchanged in depth, because the leaf uploads dominate and must complete before the key can safely be published.
+- **Latency** — The reason for the proposal. Foreign-keyed reads and writes drop from two serially dependent round trips to one, at every content size. A multi-fragment write pays no publish of its own either: the mapping rides on the upload of the fragment list root, which the write already had to send after its leaves.
 
 ## Migration Plan
 
@@ -152,7 +162,7 @@ No implications. The operations move the same content, under the same repository
 
 - Two more commands on each of two transports, and two more entry points in a C API that is a compatibility commitment once shipped.
 
-- The behaviour depends on whether content fits one fragment: single-fragment publishes save a round trip and multi-fragment publishes do not. That is invisible to the caller and correct in both cases, but it means the performance benefit is not uniform across payload sizes.
+- The publish is fused into whichever fragment's upload comes last, which makes the write path's placement folding load-bearing for correctness rather than only for reporting: a level that mis-reports a child as remote publishes a key naming content the server holds only part of. That is one gate in one place, and the tests that cover it are the mixed-tree ones, but it is a sharper edge than a separate mapping write had.
 
 - Placement reporting adds a concept callers must understand to use writes correctly, where previously a successful write was simply successful. This is a truthfulness improvement rather than a new hazard, but it is new surface area.
 

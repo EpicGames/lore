@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -195,23 +196,12 @@ pub struct StoreResult {
 ///
 /// The local store always receives both the content and the mapping. A `remote_session` also
 /// publishes them remotely — supplying one *is* the request to go remote, decided by the caller
-/// one layer up rather than by any flag in `flags`. Publication takes one of two routes,
-/// depending on how the content fragments:
+/// one layer up rather than by any flag in `flags`. Publication costs no round trip of its own
+/// where there is an upload for it to ride on; see [`write_resolved_content`] for the routing and
+/// [`publish_resolved_mapping`] for the case there is not.
 ///
-/// - A buffer that fits one fragment goes up as a single `put_resolved`, so the content and the
-///   mapping travel in one command — one round trip instead of two, which is the case this
-///   operation exists for. The upload happens inside the ordinary write pipeline rather than
-///   after it, so the content is compressed once and the local store is written once, already
-///   carrying the durable flag and the `local_cache_priority` retention decision. Content that is
-///   already durable uploads nothing, so its key follows as a `mutable_store` instead — still one
-///   round trip, without re-sending a payload the server has.
-/// - A fragmented buffer goes through the ordinary path so its leaves upload as usual, and the
-///   mapping follows as a `mutable_store` — but only once the aggregate placement confirms every
-///   fragment reached the remote. Fusing the *root* instead would publish the key when the root
-///   stores, while a leaf may still have failed.
-///
-/// Either way the mapping is only published remotely once the content it names is there, so a key
-/// never resolves to content the server does not hold. A content upload that fails still leaves a
+/// The mapping is only published remotely once the content it names is there, so a key never
+/// resolves to content the server does not hold. A content upload that fails still leaves a
 /// successful local write: the remote leg is best-effort, so its failure is warned rather than
 /// returned, and the caller reads `stored_durable == false` to tell the difference. The local
 /// mapping is stored regardless, which is what makes the content readable back on this host.
@@ -241,71 +231,175 @@ pub async fn write_resolved(
     }
 
     if buffer.is_empty() {
-        let address = Address {
-            hash: Hash::default(),
-            context,
-        };
-        mutable
-            .store(partition, key, Hash::default(), KeyType::Resolve)
-            .await
-            .map_err(|err| {
-                StorageError::internal_with_context(err, "failed to remove local resolve mapping")
-            })?;
-        let mut remote_cleared = false;
-        if let Some(session) = remote_session {
-            session
-                .put_resolved(&key, address, Fragment::default(), None)
-                .await
-                .map_err(|err| crate::error::protocol_error_to_storage(err, address))?;
-            remote_cleared = true;
-        }
-        return Ok(StoreResult {
-            address,
-            size_content: 0,
-            stored_local: true,
-            stored_durable: remote_cleared,
-            deduplicated: false,
-            published: false,
-        });
+        return retract_resolved_mapping(mutable, partition, key, context, remote_session).await;
     }
 
-    let fuse_with_mapping =
-        buffer.len() <= crate::compress::FRAGMENT_SIZE_THRESHOLD && remote_session.is_some();
+    let written = write_resolved_content(
+        store,
+        partition,
+        key,
+        context,
+        buffer,
+        flags,
+        remote_session.clone(),
+        writes,
+        None,
+    )
+    .await?;
 
-    let written = if fuse_with_mapping {
-        write_content_publishing(
+    publish_resolved_mapping(mutable, partition, key, written, remote_session).await
+}
+
+/// Store `buffer`, fusing a `KeyType::Resolve` mapping to `key` into whichever remote command
+/// carries the content's top-level fragment. The content half of [`write_resolved`], shared with
+/// [`write_resolved_from_file`] for a file small enough to become one fragment; the caller
+/// publishes the mapping afterwards.
+///
+/// Three routes, by what the content needs:
+/// - No session: nothing to fuse into, so an ordinary [`write_content`].
+/// - One fragment: a single `put_resolved` carrying content and mapping together — the case
+///   `write_resolved` exists for. The upload happens inside the ordinary write pipeline rather
+///   than after it, so the content is compressed once and the local store is written once,
+///   already carrying the durable flag and the `local_cache_priority` retention decision.
+/// - Fragmented: the leaves upload through the ordinary path and the mapping fuses into the
+///   upload of the fragment list's *root*, which is stored last — by then every leaf's placement
+///   is known, and a leaf that missed the remote withdraws the key on the way down. See
+///   [`FusedPublish`].
+///
+/// `permit` is the caller's memory reservation for `buffer`, or `None` to let the write reserve
+/// its own.
+#[allow(clippy::too_many_arguments)]
+async fn write_resolved_content(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    key: Hash,
+    context: Context,
+    buffer: Bytes,
+    flags: WriteOptions,
+    remote_session: Option<Arc<StorageSession>>,
+    writes: WriteContext,
+    permit: Option<OwnedSemaphorePermit>,
+) -> Result<StoreResult, StorageError> {
+    if remote_session.is_none() {
+        return write_content(
+            store, partition, context, buffer, flags, None, writes, permit,
+        )
+        .await;
+    }
+
+    if buffer.len() <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
+        return write_content_publishing(
             store,
             partition,
             context,
             buffer,
             flags,
-            remote_session.clone(),
+            remote_session,
             writes,
-            None,
+            permit,
             key,
         )
-        .await?
-    } else {
-        write_content(
-            store,
-            partition,
-            context,
-            buffer,
-            flags,
-            remote_session.clone(),
-            writes,
-            None,
-        )
-        .await?
+        .await;
+    }
+
+    let size_content = buffer.len() as u64;
+    let publish = FusedPublish::new(key);
+    let (address, stored_local, stored_durable) = write_fragmented(
+        store,
+        partition,
+        context,
+        buffer,
+        flags,
+        false,
+        remote_session,
+        writes,
+        permit,
+        Some(publish.clone()),
+    )
+    .await?;
+    Ok(StoreResult {
+        address,
+        size_content,
+        stored_local,
+        stored_durable,
+        deduplicated: false,
+        published: publish.published(),
+    })
+}
+
+/// Retract `key` — the publish with nothing to publish, shared by the empty buffer
+/// [`write_resolved`] takes and the empty file [`write_resolved_from_file`] takes.
+///
+/// The zero hash is the mutable store's tombstone, so removal is a store of it rather than a verb
+/// of its own. The local mapping is cleared *first*, inverting the publish ordering deliberately:
+/// if the remote call then fails, a read falls through to the remote — which still holds the live
+/// mapping — instead of this store answering with a mapping the server has already dropped.
+///
+/// `stored_local` is true because the local mapping is gone by the time this returns;
+/// `stored_durable` reports whether the remote was told, which only a caller that supplied a
+/// session can expect.
+async fn retract_resolved_mapping(
+    mutable: Arc<dyn MutableStore>,
+    partition: Partition,
+    key: Hash,
+    context: Context,
+    remote_session: Option<Arc<StorageSession>>,
+) -> Result<StoreResult, StorageError> {
+    let address = Address {
+        hash: Hash::default(),
+        context,
     };
+    mutable
+        .store(partition, key, Hash::default(), KeyType::Resolve)
+        .await
+        .map_err(|err| {
+            StorageError::internal_with_context(err, "failed to remove local resolve mapping")
+        })?;
+    let mut remote_cleared = false;
+    if let Some(session) = remote_session {
+        session
+            .put_resolved(&key, address, Fragment::default(), None)
+            .await
+            .map_err(|err| crate::error::protocol_error_to_storage(err, address))?;
+        remote_cleared = true;
+    }
+    Ok(StoreResult {
+        address,
+        size_content: 0,
+        stored_local: true,
+        stored_durable: remote_cleared,
+        deduplicated: false,
+        published: false,
+    })
+}
+
+/// Publish `key` as a `KeyType::Resolve` mapping to the content `written` came to rest at — the
+/// tail both [`write_resolved`] and [`write_resolved_from_file`] end in, so a key published from a
+/// buffer and one published from a file are published under the same rules.
+///
+/// Remotely, the mapping is only written once the content it names is there. `published` already
+/// says the mapping rode along with the upload, so nothing more is owed; otherwise a durable
+/// upload earns a `mutable_store` of its own — the case content already on the server takes, since
+/// it uploads nothing for a key to ride on — and content that did not reach the remote earns
+/// nothing but a warning: a failed upload leaves a good local write, so refusing to publish is
+/// better than naming content the server does not hold. The caller reads `stored_durable` to tell
+/// the two apart, and `published` to tell whether the mapping cost a round trip of its own.
+///
+/// The local mapping is stored unconditionally: it is what makes the content readable back on this
+/// host, and it names content the local store took.
+async fn publish_resolved_mapping(
+    mutable: Arc<dyn MutableStore>,
+    partition: Partition,
+    key: Hash,
+    written: StoreResult,
+    remote_session: Option<Arc<StorageSession>>,
+) -> Result<StoreResult, StorageError> {
     let address = written.address;
-    let stored_local = written.stored_local;
-    let stored_durable = written.stored_durable;
 
     if let Some(session) = remote_session {
         if written.published {
             lore_base::lore_trace!("Key {key} published with the upload of {address}");
-        } else if stored_durable {
+        } else if written.stored_durable {
             session
                 .mutable_store(key, address.hash, KeyType::Resolve)
                 .await
@@ -324,14 +418,7 @@ pub async fn write_resolved(
             StorageError::internal_with_context(err, "failed to publish local resolve mapping")
         })?;
 
-    Ok(StoreResult {
-        address,
-        size_content: written.size_content,
-        stored_local,
-        stored_durable,
-        deduplicated: written.deduplicated,
-        published: false,
-    })
+    Ok(written)
 }
 
 /// Put a fragment to a remote session with retry on `SlowDown`.
@@ -419,6 +506,95 @@ pub async fn store_fragment(
     writes: WriteContext,
     permit: Option<OwnedSemaphorePermit>,
 ) -> Result<StoreResult, StorageError> {
+    store_fragment_publishing(
+        store,
+        partition,
+        address,
+        fragment,
+        buffer,
+        cache_local,
+        remote_session,
+        writes,
+        permit,
+        None,
+    )
+    .await
+}
+
+/// A `KeyType::Resolve` mapping to publish in the same remote command that uploads a tree's
+/// top-level fragment, and the report of whether it got there.
+///
+/// One shared value threaded down the fragmentation recursion, rather than a parameter going down
+/// and a return field coming back: the key travels to whichever frame stores the root, and the
+/// answer has to travel back up through every frame in between — none of which has anything of its
+/// own to say about it.
+///
+/// A level **withdraws** the key instead of passing it on when it finds a child that did not reach
+/// the remote, so the frame that stores the root only ever fuses a key naming a tree the server
+/// holds whole. That is what makes the fusion safe: the root is stored last, and every descendant's
+/// placement is already known by the time it is.
+pub struct FusedPublish {
+    key: Hash,
+    published: AtomicBool,
+}
+
+impl FusedPublish {
+    /// A request to publish `key` with the upload of the tree's top-level fragment.
+    pub fn new(key: Hash) -> Arc<Self> {
+        Arc::new(Self {
+            key,
+            published: AtomicBool::new(false),
+        })
+    }
+
+    /// The key to fuse into the top-level fragment's upload.
+    pub(crate) fn key(&self) -> Hash {
+        self.key
+    }
+
+    /// Record that the upload carried the key, so the caller knows it owes no mapping write.
+    pub(crate) fn mark_published(&self) {
+        self.published.store(true, Ordering::Release);
+    }
+
+    /// Whether the key was published as part of an upload. False when the top-level fragment was
+    /// already durable — no upload happened for the key to ride on — or when a level withdrew the
+    /// key because the tree did not reach the remote whole.
+    pub fn published(&self) -> bool {
+        self.published.load(Ordering::Acquire)
+    }
+}
+
+/// [`store_fragment`] for the one fragment whose upload should also publish `publish` as a
+/// `KeyType::Resolve` mapping naming it: the single fragment of content that does not fragment, or
+/// the top-level fragment of a tree that does. `None` is an ordinary store.
+///
+/// A publishing write is never dispatched into the tracker, whatever the caller's `writes` says. A
+/// dispatched write returns before its leader has uploaded anything, so there would be no upload
+/// for the key to ride on and no placement to report — the two are incompatible by construction
+/// rather than by policy. It does take the in-flight guard, so concurrent writers of one address
+/// collapse onto a single upload; a publishing write whose leader left the content durable reports
+/// `published = false` and its key follows as a `mutable_store`, the same round trip its own upload
+/// would have cost and none of the payload. A leader that left the content *not* durable — one
+/// writing locally, or one whose upload failed — cannot satisfy a publish, so this call uploads
+/// unguarded rather than inherit a placement it needs and the leader never wanted.
+///
+/// `StoreResult::published` is false whenever no upload of this call's own carried the key —
+/// content already durable, or another writer's upload deduplicated this one — so the caller still
+/// owes the key a mapping write of its own.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn store_fragment_publishing(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    fragment: Fragment,
+    buffer: Bytes,
+    cache_local: bool,
+    remote_session: Option<Arc<StorageSession>>,
+    writes: WriteContext,
+    permit: Option<OwnedSemaphorePermit>,
+    publish: Option<Hash>,
+) -> Result<StoreResult, StorageError> {
     if address.hash.is_zero() || buffer.is_empty() || fragment.size_payload == 0 {
         return Err(StorageError::internal(
             "zero size or zero hash buffers can not be stored",
@@ -443,7 +619,8 @@ pub async fn store_fragment(
 
     writes.count(|stats| stats.fragment_produced(&fragment));
 
-    let result = match writes.tracker().cloned() {
+    let tracker = writes.tracker().cloned().filter(|_| publish.is_none());
+    let result = match tracker {
         None => {
             store_fragment_inline(
                 store,
@@ -455,7 +632,7 @@ pub async fn store_fragment(
                 remote_session,
                 &writes,
                 permit,
-                None,
+                publish,
             )
             .await
         }
@@ -545,7 +722,7 @@ async fn store_fragment_inline(
 
     // Local-only fast path: skip STORE_IN_FLIGHT entirely. No follower notification needed,
     // no leader-token rendezvous — just compress+write inline.
-    if remote_session.is_none() || publish.is_some() {
+    if remote_session.is_none() {
         let placement = leader_body(
             store,
             partition,
@@ -574,10 +751,10 @@ async fn store_fragment_inline(
     // Remote-coupled path: acquire the in-flight guard so a concurrent writer to the same
     // address dedupes onto one upload.
     let guard = stored_in_flight(partition, address).await;
-    let Some(guard) = guard else {
-        // We waited on another task that finished without satisfying our
-        // preconditions (e.g., they wrote durable but we want local).
-        // Preserve legacy behaviour by returning the current store state.
+    if guard.is_none()
+        && let Some((stored_local, stored_durable)) =
+            inherited_placement(&store, partition, address, publish).await
+    {
         drop(permit);
         writes.count(|stats| stats.fragment_deduplicated(&fragment));
         return Ok(StoreResult {
@@ -588,7 +765,7 @@ async fn store_fragment_inline(
             deduplicated: true,
             published: false,
         });
-    };
+    }
 
     let placement = leader_body(
         store,
@@ -599,10 +776,10 @@ async fn store_fragment_inline(
         cache_local,
         remote_session,
         query,
-        Some(guard),
+        guard,
         writes.stats(),
         permit,
-        None,
+        publish,
     )
     .await?;
     Ok(StoreResult {
@@ -613,6 +790,24 @@ async fn store_fragment_inline(
         deduplicated,
         published: placement.published,
     })
+}
+
+/// The placement a write inherits from the task that was already storing this address, or `None`
+/// when it has to store the content itself after all.
+///
+/// The flags are read after the wait rather than carried across it: the read taken before describes
+/// a store the leader had not written yet, which reports a tree of identical leaves as partly
+/// absent. A publishing write needs the content durable before its key may name it, and a leader
+/// writing locally or failing its upload cannot supply that, so such a write declines to follow.
+async fn inherited_placement(
+    store: &Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    publish: Option<Hash>,
+) -> Option<(bool, bool)> {
+    let (stored_local, stored_durable) =
+        stored_flags(&resolve_or_absent(store, partition, address).await);
+    (publish.is_none() || stored_durable).then_some((stored_local, stored_durable))
 }
 
 /// Tracker-dispatched fragment store: non-blocking in-flight check, spawns a
@@ -1096,11 +1291,8 @@ fn single_fragment(context: Context, buffer: &Bytes, flags: WriteOptions) -> (Ad
 /// stored representation back, upload it, then rewrite the entry — costs two extra local store
 /// operations on every published write.
 ///
-/// A publishing write never dedupes onto a concurrent writer's upload: the other writer is
-/// publishing a different key, or none, so both upload.
-///
-/// `published` is false when the content was already durable: no upload happened for the key to
-/// ride on, so the caller still owes it a mapping write.
+/// Content larger than one fragment is rejected by [`store_fragment_publishing`] as oversized: it
+/// has no single upload for the key to ride on, and reaches [`write_fragmented`] instead.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_content_publishing(
     store: Arc<dyn ImmutableStore>,
@@ -1113,18 +1305,13 @@ pub async fn write_content_publishing(
     permit: Option<OwnedSemaphorePermit>,
     key: Hash,
 ) -> Result<StoreResult, StorageError> {
-    debug_assert!(
-        buffer.len() <= crate::compress::FRAGMENT_SIZE_THRESHOLD,
-        "content that fragments cannot fuse its mapping into a leaf upload",
-    );
     let _in_flight = ContentWriteGuard::new();
     let (address, fragment) = single_fragment(context, &buffer, flags);
     let permit = match permit {
         Some(permit) => Some(permit),
         None => crate::concurrency::acquire_fragment_memory_permit(buffer.len()).await,
     };
-    writes.count(|stats| stats.fragment_produced(&fragment));
-    store_fragment_inline(
+    store_fragment_publishing(
         store,
         partition,
         address,
@@ -1132,7 +1319,7 @@ pub async fn write_content_publishing(
         buffer,
         flags.local_cache_priority,
         remote_session,
-        &writes,
+        writes,
         permit,
         Some(key),
     )
@@ -1194,6 +1381,7 @@ pub async fn write_content(
             remote_session,
             writes,
             permit,
+            None,
         )
         .await?;
         Ok(StoreResult {
@@ -1298,6 +1486,7 @@ pub async fn write_from_file(
             false,
             remote_session,
             writes,
+            None,
         )
         .await?;
     Ok(StoreResult {
@@ -1308,6 +1497,117 @@ pub async fn write_from_file(
         deduplicated: false,
         published: false,
     })
+}
+
+/// [`write_from_file`] plus publication of `key` as a `KeyType::Resolve` mapping to what the file
+/// stored as — [`write_resolved`] taking its content from a path instead of a buffer, so a caller
+/// publishing a file never has to hold it.
+///
+/// Only the fragment being written is resident. A file at or below
+/// [`crate::compress::FRAGMENT_SIZE_THRESHOLD`] is read once into the one fragment it becomes and
+/// takes [`write_resolved_content`]'s routing from there. A larger file chunks straight off disk
+/// through [`crate::fragment_engine::write_fragmented_from_file`], so memory follows the leaf
+/// rather than the file however large it is, and the mapping fuses into the upload of the fragment
+/// list's root under the same rules.
+///
+/// An empty file **retracts** `key`, the same way an empty buffer does in [`write_resolved`]: a
+/// mapping to the zero hash is the mutable store's tombstone, so there is no distinction to draw
+/// between publishing empty content and publishing none.
+///
+/// A missing or unreadable path is a `StorageError` rather than a retraction — the caller named a
+/// file it expected to publish, and taking silence for a delete would retract a live key on a
+/// typo.
+#[allow(clippy::too_many_arguments)]
+pub async fn write_resolved_from_file(
+    store: Arc<dyn ImmutableStore>,
+    mutable: Arc<dyn MutableStore>,
+    partition: Partition,
+    key: Hash,
+    context: Context,
+    path: &Path,
+    flags: WriteOptions,
+    remote_session: Option<Arc<StorageSession>>,
+    writes: WriteContext,
+) -> Result<StoreResult, StorageError> {
+    if key.is_zero() {
+        return Err(StorageError::internal(
+            "a zero key cannot be published; it is the mutable store's tombstone value",
+        ));
+    }
+
+    let _in_flight = ContentWriteGuard::new();
+    let _count_permit = file_count_limit_acquire()
+        .await
+        .forward::<StorageError>("permit failed")?;
+    let mut retry = crate::retry(10, 10_000, 10);
+    let (file, size) = loop {
+        match crate::chunker::open_read(path).await {
+            Ok(result) => break result,
+            Err(err) => {
+                if !retry.wait().await {
+                    return Err(StorageError::internal_with_context(
+                        err,
+                        &format!("open file: {}", path.display()),
+                    ));
+                }
+            }
+        }
+    };
+
+    lore_base::lore_trace!(
+        "Opened file to publish under key {key}: {} size {size}",
+        path.display(),
+    );
+
+    if size == 0 {
+        return retract_resolved_mapping(mutable, partition, key, context, remote_session).await;
+    }
+
+    let size = size as usize;
+    let written = if size <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
+        let read_permit = crate::concurrency::acquire_fragment_memory_permit(size).await;
+        let buffer = file.read_exact_at(size, 0).await.map_err(|e| {
+            StorageError::internal_with_context(e, &format!("read file: {}", path.display()))
+        })?;
+        write_resolved_content(
+            store,
+            partition,
+            key,
+            context,
+            buffer,
+            flags,
+            remote_session.clone(),
+            writes,
+            read_permit,
+        )
+        .await?
+    } else {
+        let publish = remote_session.as_ref().map(|_| FusedPublish::new(key));
+        let (address, stored_local, stored_durable) =
+            crate::fragment_engine::write_fragmented_from_file(
+                store,
+                partition,
+                context,
+                file,
+                size,
+                flags,
+                false,
+                remote_session.clone(),
+                writes,
+                publish.clone(),
+            )
+            .await?;
+        StoreResult {
+            address,
+            size_content: size as u64,
+            stored_local,
+            stored_durable,
+            deduplicated: false,
+            published: publish.is_some_and(|publish| publish.published()),
+        }
+    };
+
+    publish_resolved_mapping(mutable, partition, key, written, remote_session).await
 }
 
 /// Whether a file on disk holds the content a stored object addresses.
@@ -1480,6 +1780,7 @@ async fn hashed_under_current_chunking(
         true,
         None,
         WriteContext::none(),
+        None,
     )
     .await?;
 
@@ -1602,6 +1903,7 @@ pub async fn hash_file(
         true,
         None,
         WriteContext::none(),
+        None,
     )
     .await?;
 

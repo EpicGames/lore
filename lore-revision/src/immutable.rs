@@ -953,12 +953,13 @@ mod session_tests {
     async fn a_write_on_an_offline_context_stores_locally() {
         let context = context_with_state(RemoteState::Offline).await;
         let payload = Bytes::from_static(b"content with no remote to go to");
-        let address = under_execution_context(write(
+        // Boxed: the write pipeline's future sits at the crate's `future-size-threshold`.
+        let address = under_execution_context(Box::pin(write(
             context.clone(),
             Context::from([0x5au8; 16]),
             payload.clone(),
             WriteOptions::default().with_remote_write(),
-        ))
+        )))
         .await
         .expect("a write with no remote still stores locally");
 

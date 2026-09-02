@@ -6434,11 +6434,13 @@ pub type LoreStoragePutResolvedArgs = crate::storage::put_resolved::LoreStorageP
 
 /// Store one or more buffers and publish a mutable key naming each, in one round trip.
 ///
-/// `lore_storage_put` followed by `lore_storage_mutable_store`, fused into one request when the
-/// content fits a single fragment. The key is published under `LORE_KEY_TYPE_RESOLVE`, making it
-/// readable by `lore_storage_get_resolved`, and the mapping is written only once the content is
-/// stored — so a key published this way never resolves to content that is not there. Writing the
-/// same key type directly with `lore_storage_mutable_store` carries no such guarantee.
+/// `lore_storage_put` followed by `lore_storage_mutable_store`, with the mapping riding on
+/// whichever request carries the content's top-level fragment rather than costing one of its own.
+/// The key is published under `LORE_KEY_TYPE_RESOLVE`, making it readable by
+/// `lore_storage_get_resolved`, and the mapping is written only once the content is stored — so a
+/// key published this way never resolves to content that is not there. Writing the same key type
+/// directly with `lore_storage_mutable_store` carries no such guarantee. Content the server
+/// already holds uploads nothing, so its key takes a mapping write instead — still one request.
 ///
 /// The local store always receives both the content and the mapping. `remote_write = 1` also
 /// publishes them remotely, matching `lore_storage_put`; there is no local-then-remote fallback.
@@ -6866,10 +6868,12 @@ pub type LoreStorageGetFileArgs = crate::storage::get_file::LoreStorageGetFileAr
 
 /// Write content-addressed payloads to filesystem paths.
 ///
-/// Each item emits `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE`. No HEADER or
-/// DATA events are produced — the payload is written straight to disk.
-/// On partial-write failure the library leaves whatever state the
-/// failure produced; cleanup is the caller's responsibility.
+/// Each item emits `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE`. No HEADER or DATA events are produced —
+/// the payload is written straight to disk. Multi-fragment writes stage through `<path>.loretmp`
+/// and rename atomically, and a failure mid-write removes the temp file, so the target is either
+/// the finished range or untouched. An `offset` past the end of the content is rejected with
+/// `INVALID_ARGUMENTS` without opening the target, so a destination that was already there
+/// survives.
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_storage_get_file(
     globals: &LoreGlobalArgs,
@@ -6887,6 +6891,130 @@ pub extern "C" fn lore_storage_get_file_async(
     callback: LoreEventCallbackConfig,
 ) {
     run_asynchronously(globals, args, callback, crate::storage::get_file::get_file);
+}
+
+pub type LoreStoragePutFileResolvedItem =
+    crate::storage::put_file_resolved::LoreStoragePutFileResolvedItem;
+pub type LoreStoragePutFileResolvedArgs =
+    crate::storage::put_file_resolved::LoreStoragePutFileResolvedArgs;
+
+/// Store one or more files and publish a mutable key naming each, in one round trip.
+///
+/// `lore_storage_put_resolved` reading its content from a path instead of a buffer, and identical
+/// to it in everything but the source: the key is published under `LORE_KEY_TYPE_RESOLVE`, the
+/// mapping is written only once the content is stored, publishing is last-writer-wins, and
+/// `remote_write = 1` publishes remotely as well as locally.
+///
+/// The caller never loads the file, and the library holds no more than one fragment of it: a file
+/// at or below the fragment threshold is read once into the single fragment it becomes, a larger
+/// one chunks straight off disk.
+///
+/// A zero `key` or a zero `partition` rejects with `INVALID_ARGUMENTS`, as does a missing,
+/// unreadable, or non-file `path` — a path that cannot be read is never taken for a delete, so a
+/// typo cannot retract a live key. A **zero-length** file does retract it, exactly as a
+/// zero-length `data` does in `lore_storage_put_resolved`.
+///
+/// A remote content upload that fails still leaves a successful local write, so the key is not
+/// published remotely and `stored_remote` is `0` while `error_code` stays `NONE`. Check
+/// `stored_remote`, not `error_code`, to confirm the key is visible to other clients.
+///
+/// # Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_STORAGE_PUT_ITEM_COMPLETE` | `lore_storage_put_item_complete_event_data_t` | Emitted once per input item; `address` is the content the key now resolves to, and `stored_local`/`stored_remote` report where it landed |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_put_file_resolved(
+    globals: &LoreGlobalArgs,
+    args: &LoreStoragePutFileResolvedArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::put_file_resolved::put_file_resolved,
+    )
+}
+
+/// Store one or more files and publish a mutable key naming each (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_put_file_resolved_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreStoragePutFileResolvedArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::put_file_resolved::put_file_resolved,
+    );
+}
+
+pub type LoreStorageGetFileResolvedItem =
+    crate::storage::get_file_resolved::LoreStorageGetFileResolvedItem;
+pub type LoreStorageGetFileResolvedArgs =
+    crate::storage::get_file_resolved::LoreStorageGetFileResolvedArgs;
+
+/// Resolve one or more mutable keys and write the content they name to filesystem paths, in one
+/// round trip.
+///
+/// `lore_storage_get_resolved` writing to a path instead of to the callback. Nothing is held whole
+/// on either side of the boundary: the resolve and the read of the root fragment share one request,
+/// and the content goes to disk fragment by fragment at its own offset, so a key naming something
+/// large needs neither the `streaming` mode nor a buffer for it. No
+/// `LORE_EVENT_STORAGE_GET_HEADER` or `LORE_EVENT_STORAGE_GET_DATA` is emitted, as with
+/// `lore_storage_get_file`.
+///
+/// The terminal event's `address` is the *resolved* address, so a caller still learns the
+/// key-to-hash mapping. A key with no mapping, or one naming absent content, reports
+/// `error_code = ADDRESS_NOT_FOUND`, carries a zero address, and leaves `path` untouched — there is
+/// no zero-hash truncation as in `lore_storage_get_file`, because a resolve that finds nothing is a
+/// miss rather than an address for empty content.
+///
+/// `offset` and `length` select part of the content and multi-fragment writes stage through
+/// `<path>.loretmp` before an atomic rename, both as in `lore_storage_get_file`: the file holds
+/// exactly the requested range from its own first byte, and the target is either the finished range
+/// or untouched. A start past the end is rejected with `INVALID_ARGUMENTS` without opening the
+/// target, so a destination that was already there survives.
+///
+/// # Events
+///
+/// | Tag | Data Type | Description |
+/// |-----|-----------|-------------|
+/// | `LORE_EVENT_STORAGE_GET_ITEM_COMPLETE` | `lore_storage_get_item_complete_event_data_t` | Terminal per-item event, carrying the resolved address |
+/// | `LORE_EVENT_ERROR` | `lore_error_event_data_t` | Emitted for a non-fatal error during the operation |
+/// | `LORE_EVENT_COMPLETE` | `lore_complete_event_data_t` | `status` is `0` iff every item succeeded, else the error code |
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_get_file_resolved(
+    globals: &LoreGlobalArgs,
+    args: &LoreStorageGetFileResolvedArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::get_file_resolved::get_file_resolved,
+    )
+}
+
+/// Resolve mutable keys and write the content they name to files (async variant).
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_storage_get_file_resolved_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreStorageGetFileResolvedArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(
+        globals,
+        args,
+        callback,
+        crate::storage::get_file_resolved::get_file_resolved,
+    );
 }
 
 pub type LoreStorageUploadArgs = crate::storage::upload::LoreStorageUploadArgs;

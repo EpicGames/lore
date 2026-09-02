@@ -33,9 +33,10 @@ pub struct LoreStorageOpenedEventData {
     pub handle_id: u64,
 }
 
-/// Terminal per-item event for `put` and `put_file`. On success
-/// `error_code == None` and `address` is the computed content hash; on
-/// failure `error_code` is populated and `address` is zero.
+/// Terminal per-item event for `put`, `put_file`, `put_resolved` and
+/// `put_file_resolved`. On success `error_code == None` and `address` is the
+/// computed content hash — for the resolved variants, the content the key now
+/// resolves to; on failure `error_code` is populated and `address` is zero.
 #[repr(C)]
 #[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -89,9 +90,11 @@ pub struct LoreStorageGetDataEventData {
     pub bytes: LoreBytes,
 }
 
-/// Terminal per-item event for `get` and `get_file`. For `get_file` this
-/// is emitted without any preceding `HEADER`/`DATA` events — the payload
-/// is written directly to the filesystem.
+/// Terminal per-item event for `get`, `get_file`, `get_resolved` and
+/// `get_file_resolved`. For the two file variants this is emitted without any
+/// preceding `HEADER`/`DATA` events — the payload is written directly to the
+/// filesystem. For the two resolved variants `address` is the address the key
+/// resolved to, so it is an output rather than an echo of the request.
 #[repr(C)]
 #[derive(Copy, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

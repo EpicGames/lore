@@ -1405,11 +1405,14 @@ async fn config_get_local(
                     .require_path()?
                     .join(repository.format.dot_dir())
                     .join(lore_revision::repository::CONFIG);
-                let config_str = tokio::fs::read_to_string(&config_path)
+                let config_bytes = lore_io::IoDriver::global()
+                    .read_file_bytes(&config_path)
                     .await
                     .internal("Failed to load config file")?;
+                let config_str =
+                    str::from_utf8(&config_bytes).internal("Failed to load config file")?;
                 let config: lore_revision::repository::RepositoryConfig =
-                    toml::de::from_str(&config_str).internal("Failed to load config file")?;
+                    toml::de::from_str(config_str).internal("Failed to load config file")?;
                 let value = match key.as_str() {
                     "remote_url" => config.remote_url.unwrap_or_default(),
                     "identity" => config.identity.unwrap_or_default(),

@@ -715,106 +715,158 @@ pub async fn read_into_file(
     )
     .await?;
 
-    let range = resolve_content_range(range, fragment.size_content);
+    let metadata = write_root_to_file(
+        store,
+        partition,
+        address,
+        fragment,
+        buffer,
+        path,
+        temp_file_extension,
+        range,
+        options,
+        remote_session,
+    )
+    .await?;
 
+    Ok((fragment, metadata))
+}
+
+/// Write the content a loaded root fragment stands for into `path`: the half of
+/// [`read_into_file`] that follows the load, and the half [`read_resolved_into_file`] reaches
+/// through a resolve rather than through an address.
+///
+/// A single fragment's payload is already in `buffer` and goes out in one whole-file write, whose
+/// open handle answers the metadata the caller gets back. A fragment list streams through the
+/// defragment pipeline into a file sized to the range up front, so each leaf lands at its own
+/// offset and peak memory follows the leaf rather than the content — and no metadata comes back,
+/// because the handle moves into the pipeline. That path stages through
+/// `<path><temp_file_extension>` and renames, unless `options.direct_write` asks for the target to
+/// be written in place.
+///
+/// A range starting past the end of the content selects nothing that exists, and `path` is left
+/// alone: the file is not opened, so a destination that was already there survives a request the
+/// caller got wrong. Nothing is written and no metadata comes back, and the caller decides what an
+/// empty selection means from the fragment it holds. A start exactly at the end is a legitimate
+/// empty read and does produce an empty file.
+///
+/// `options` must already carry `with_decompress`; both entry points load their root with it.
+#[allow(clippy::too_many_arguments)]
+async fn write_root_to_file(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+    fragment: Fragment,
+    buffer: Bytes,
+    path: &Path,
+    temp_file_extension: &str,
+    range: Option<Range<usize>>,
+    options: ReadOptions,
+    remote_session: Option<Arc<StorageSession>>,
+) -> Result<Option<std::fs::Metadata>, StorageError> {
+    if range
+        .as_ref()
+        .is_some_and(|range| range.start as u64 > fragment.size_content)
     {
-        if fragment.flags & FragmentFlags::PayloadFragmented == FragmentFlags::PayloadFragmented {
-            let mut retry = crate::retry(10, 10_000, 10);
-
-            let file_path = if options.direct_write {
-                path.to_path_buf()
-            } else {
-                let mut temporary_ext = path.extension().unwrap_or_default().to_os_string();
-                temporary_ext.push(temp_file_extension);
-
-                let mut temporary_path = path.to_path_buf();
-                temporary_path.set_extension(temporary_ext);
-
-                temporary_path
-            };
-
-            let mut temporary =
-                (!options.direct_write).then(|| TemporaryFile::guard(file_path.clone()));
-
-            let file = loop {
-                match crate::defragment::open_file_write(file_path.as_path(), range.len()).await {
-                    Ok(file) => break file,
-                    Err(err) => {
-                        if !retry.wait().await {
-                            return Err(StorageError::internal_with_context(
-                                err,
-                                &format!("failed to open file: {}", path.display()),
-                            ));
-                        }
-                    }
-                }
-            };
-            let defrag_target = DefragmentSink::File {
-                file: file.clone(),
-                size: range.len(),
-            };
-
-            lore_base::lore_trace!(
-                "Opened file for immutable data write: {} size {}",
-                path.display(),
-                range.len()
-            );
-
-            defragment_pipeline(
-                store,
-                partition,
-                address,
-                fragment,
-                buffer,
-                range.start as u64..range.end as u64,
-                defrag_target,
-                options,
-                remote_session,
-            )
-            .await?;
-
-            if options.sync_data {
-                file.sync_data()
-                    .await
-                    .map_err(|e| StorageError::internal_with_context(e, "flush file"))?;
-            }
-            // The handle holds no userspace buffer, so there is nothing to flush.
-            drop(file);
-
-            if !options.direct_write {
-                let rename_err_msg =
-                    format!("rename {} -> {}", file_path.display(), path.display());
-                lore_io::IoDriver::global()
-                    .rename(file_path.as_path(), path)
-                    .await
-                    .map_err(|e| StorageError::internal_with_context(e, &rename_err_msg))?;
-
-                if let Some(temporary) = temporary.as_mut() {
-                    temporary.renamed();
-                }
-            }
-        } else {
-            // Write directly into the file
-            let mut retry = crate::retry(10, 10_000, 10);
-            let buffer = buffer.slice(range);
-            let metadata = loop {
-                match write_all_to_file(path, buffer.clone(), options.sync_data).await {
-                    Ok(meta) => break meta,
-                    Err(err) => {
-                        if !retry.wait().await {
-                            return Err(StorageError::internal_with_context(
-                                err,
-                                &format!("write to file: {}", path.display()),
-                            ));
-                        }
-                    }
-                }
-            };
-            return Ok((fragment, Some(metadata)));
-        }
+        return Ok(None);
     }
 
-    Ok((fragment, None))
+    let range = resolve_content_range(range, fragment.size_content);
+
+    if fragment.flags & FragmentFlags::PayloadFragmented == FragmentFlags::PayloadFragmented {
+        let mut retry = crate::retry(10, 10_000, 10);
+
+        let file_path = if options.direct_write {
+            path.to_path_buf()
+        } else {
+            let mut temporary_ext = path.extension().unwrap_or_default().to_os_string();
+            temporary_ext.push(temp_file_extension);
+
+            let mut temporary_path = path.to_path_buf();
+            temporary_path.set_extension(temporary_ext);
+
+            temporary_path
+        };
+
+        let mut temporary =
+            (!options.direct_write).then(|| TemporaryFile::guard(file_path.clone()));
+
+        let file = loop {
+            match crate::defragment::open_file_write(file_path.as_path(), range.len()).await {
+                Ok(file) => break file,
+                Err(err) => {
+                    if !retry.wait().await {
+                        return Err(StorageError::internal_with_context(
+                            err,
+                            &format!("failed to open file: {}", path.display()),
+                        ));
+                    }
+                }
+            }
+        };
+        let defrag_target = DefragmentSink::File {
+            file: file.clone(),
+            size: range.len(),
+        };
+
+        lore_base::lore_trace!(
+            "Opened file for immutable data write: {} size {}",
+            path.display(),
+            range.len()
+        );
+
+        defragment_pipeline(
+            store,
+            partition,
+            address,
+            fragment,
+            buffer,
+            range.start as u64..range.end as u64,
+            defrag_target,
+            options,
+            remote_session,
+        )
+        .await?;
+
+        if options.sync_data {
+            file.sync_data()
+                .await
+                .map_err(|e| StorageError::internal_with_context(e, "flush file"))?;
+        }
+        // The handle holds no userspace buffer, so there is nothing to flush.
+        drop(file);
+
+        if !options.direct_write {
+            let rename_err_msg = format!("rename {} -> {}", file_path.display(), path.display());
+            lore_io::IoDriver::global()
+                .rename(file_path.as_path(), path)
+                .await
+                .map_err(|e| StorageError::internal_with_context(e, &rename_err_msg))?;
+
+            if let Some(temporary) = temporary.as_mut() {
+                temporary.renamed();
+            }
+        }
+
+        Ok(None)
+    } else {
+        let mut retry = crate::retry(10, 10_000, 10);
+        let buffer = buffer.slice(range);
+        let metadata = loop {
+            match write_all_to_file(path, buffer.clone(), options.sync_data).await {
+                Ok(meta) => break meta,
+                Err(err) => {
+                    if !retry.wait().await {
+                        return Err(StorageError::internal_with_context(
+                            err,
+                            &format!("write to file: {}", path.display()),
+                        ));
+                    }
+                }
+            }
+        };
+        Ok(Some(metadata))
+    }
 }
 
 /// Writes `buffer` as the whole contents of `path` and returns the resulting metadata.
@@ -1176,6 +1228,74 @@ pub async fn read_resolved_stream(
     }
 
     Ok((root.resolved, root.fragment.size_content))
+}
+
+/// [`read_resolved`] writing the content into a file instead of reassembling it in memory —
+/// [`read_into_file`] reached by key rather than by address.
+///
+/// Returns the resolved hash and the fragment describing the whole content, so a caller can
+/// report the address the key names and check its range against what exists without stating the
+/// file it just wrote.
+///
+/// The round trip is the one [`resolve_root`] pays: the key and the root fragment it names come
+/// back together, so nothing is spent resolving before the read starts. From there the content
+/// goes to disk the way [`read_into_file`] puts it there — a single fragment in one write, a
+/// fragment list leaf by leaf at its own offset through the defragment pipeline — so neither the
+/// caller nor this library ever holds the whole content, and the file is the only place it is
+/// assembled.
+///
+/// `range` selects the content to write and the file holds exactly that range from its first
+/// byte, as [`read_into_file`]'s does; only the leaves the range covers are fetched.
+///
+/// A key with no mapping, or one naming content that cannot be read, fails without touching
+/// `path` — there is no zero-hash truncation here, because a resolve that finds nothing is a miss
+/// rather than an address for empty content.
+#[allow(clippy::too_many_arguments)]
+pub async fn read_resolved_into_file(
+    store: Arc<dyn ImmutableStore>,
+    mutable: Arc<dyn MutableStore>,
+    partition: Partition,
+    key: Hash,
+    context: Context,
+    flags: u32,
+    path: &Path,
+    temp_file_extension: &str,
+    range: Option<Range<usize>>,
+    options: ReadOptions,
+    session: Option<Arc<StorageSession>>,
+) -> Result<(Hash, Fragment), StorageError> {
+    let _count_permit = file_count_limit_acquire()
+        .await
+        .forward::<StorageError>("permit failed")?;
+
+    let options = options.with_decompress();
+    let root = resolve_root(
+        store.clone(),
+        mutable,
+        partition,
+        key,
+        context,
+        flags,
+        options,
+        session,
+    )
+    .await?;
+
+    write_root_to_file(
+        store,
+        partition,
+        root.address,
+        root.fragment,
+        root.buffer,
+        path,
+        temp_file_extension,
+        range,
+        options,
+        root.session,
+    )
+    .await?;
+
+    Ok((root.resolved, root.fragment))
 }
 
 /// [`remote_get_retry`] for `get_resolved`: back off on `SlowDown`, recover from a stale
