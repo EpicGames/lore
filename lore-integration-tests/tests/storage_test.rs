@@ -4732,6 +4732,133 @@ mod open_tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"still live");
     }
 
+    /// A directory opens read-only just as a file does, and the size it reports is whatever the
+    /// filesystem chooses — zero on some. Since a zero-length source retracts the key, a directory
+    /// path must be refused on its type rather than read for its size.
+    #[tokio::test]
+    async fn put_file_resolved_directory_path_rejects_invalid_args_without_retracting() {
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let partition = Partition::from([0x58u8; 16]);
+        let context = Context::from([0x59u8; 16]);
+        let key = Hash::hash_buffer(b"file-resolved-directory");
+
+        let published =
+            publish_file_under_key(handle, partition, context, key, b"still live", 0).await;
+
+        let directory = tempdir("put-file-resolved-directory");
+        let (status, completes) = put_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem {
+                    id: 1,
+                    partition,
+                    key,
+                    context,
+                    path: LoreString::from(directory.path().display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_ne!(status, 0);
+        assert_eq!(
+            completes[0].error_code,
+            lore_revision::event::LoreErrorCode::InvalidArguments
+        );
+
+        let (_target_guard, target) = temp_file_path("get-file-resolved-directory-survives");
+        let (status, events) = get_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::get_file_resolved::LoreStorageGetFileResolvedItem {
+                    id: 2,
+                    partition,
+                    key,
+                    context,
+                    path: LoreString::from(target.display().to_string().as_str()),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert_eq!(
+            item_address(&events),
+            Some(published),
+            "a directory path must leave the key naming what it did"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_file_directory_path_rejects_invalid_args() {
+        use lore_base::types::Context;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let directory = tempdir("put-file-directory");
+
+        let (status, completes) = put_file_items(
+            handle,
+            vec![lore::storage::put_file::LoreStoragePutFileItem {
+                id: 1,
+                partition: Partition::from([0x5Au8; 16]),
+                context: Context::from([0x5Bu8; 16]),
+                path: LoreString::from(directory.path().display().to_string().as_str()),
+                remote_write: 0,
+                local_cache: 0,
+                fixed_size_chunk: 0,
+            }],
+        )
+        .await;
+        assert_ne!(status, 0);
+        assert_eq!(
+            completes[0].error_code,
+            lore_revision::event::LoreErrorCode::InvalidArguments
+        );
+    }
+
+    /// A path that will never open is rejected on the first attempt. The transient-failure back-off
+    /// is ten attempts over roughly ten seconds, so spending it here would stall the caller for
+    /// that long per item; the bound is loose enough not to measure the machine.
+    #[tokio::test]
+    async fn a_path_that_cannot_open_is_rejected_without_the_back_off() {
+        use lore_base::types::Context;
+        use lore_base::types::Hash;
+        use lore_base::types::Partition;
+
+        let handle = open_in_memory_handle().await;
+        let started = std::time::Instant::now();
+
+        let (status, completes) = put_file_resolved_items(
+            handle,
+            vec![
+                lore::storage::put_file_resolved::LoreStoragePutFileResolvedItem {
+                    id: 1,
+                    partition: Partition::from([0x5Cu8; 16]),
+                    key: Hash::hash_buffer(b"file-resolved-no-back-off"),
+                    context: Context::from([0x5Du8; 16]),
+                    path: LoreString::from("/definitely/not/a/real/path/for/lore"),
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        assert_ne!(status, 0);
+        assert_eq!(
+            completes[0].error_code,
+            lore_revision::event::LoreErrorCode::InvalidArguments
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "a missing path must not spend the back-off; took {:?}",
+            started.elapsed()
+        );
+    }
+
     #[tokio::test]
     async fn put_file_resolved_zero_key_rejects_invalid_args() {
         use lore_base::types::Context;

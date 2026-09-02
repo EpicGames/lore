@@ -54,12 +54,24 @@ pub struct Chunk {
 }
 
 /// Open `path` for reading, returning the shared handle and its size.
+///
+/// The size comes off the open handle rather than the path, so it describes the bytes about to be
+/// read rather than what a separate stat of the path once saw. The same stat carries the file type,
+/// so refusing anything but a regular file costs nothing beyond it — and has to happen here:
+/// opening a directory read-only succeeds, and the size it reports is whatever the filesystem
+/// chooses.
 pub async fn open_read(path: &Path) -> std::io::Result<(IoFile, u64)> {
     let file = IoDriver::global()
         .open(path, &OpenOptions::new().read(true))
         .await?;
-    let size = file.metadata().await?.len();
-    Ok((file, size))
+    let metadata = file.metadata().await?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("not a regular file: {}", path.display()),
+        ));
+    }
+    Ok((file, metadata.len()))
 }
 
 /// How the chunker picks cut points.

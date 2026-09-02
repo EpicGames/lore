@@ -216,13 +216,13 @@ impl PutItemOutcome {
 
 /// Map a `StorageError` to the external `LoreErrorCode` surface used by per-item completion
 /// events. Shared by every op that goes through the higher-level storage pipeline so the
-/// translation stays consistent. `SlowDown` surfaces back-pressure; oversized writes are
-/// caller-fixable and reported as `InvalidArguments`; an address lookup miss maps to
-/// `AddressNotFound`; everything else is `Internal`.
+/// translation stays consistent. `SlowDown` surfaces back-pressure; a rejected argument and an
+/// oversized write are both caller-fixable and reported as `InvalidArguments`; an address lookup
+/// miss maps to `AddressNotFound`; everything else is `Internal`.
 pub(crate) fn storage_error_to_code(err: &StorageError) -> LoreErrorCode {
     if err.is_slow_down() {
         LoreErrorCode::SlowDown
-    } else if err.is_oversized() {
+    } else if err.is_invalid_arguments() || err.is_oversized() {
         LoreErrorCode::InvalidArguments
     } else if err.is_address_not_found() || err.is_payload_not_found() {
         LoreErrorCode::AddressNotFound

@@ -11,10 +11,10 @@
 //!
 //! Per item:
 //! - `partition == Partition::default()`, a zero `key`, or an empty `path` → `INVALID_ARGUMENTS`.
-//! - missing, unreadable, or non-file `path` → `INVALID_ARGUMENTS`. The path is stated before the
-//!   write, as `lore_storage_put_file` does, so a path the caller got wrong reports that rather
-//!   than the retried open failure the write path would report. It is never taken for a delete: a
-//!   typo would retract a live key.
+//! - a `path` that does not exist or does not name a regular file → `INVALID_ARGUMENTS`, rejected
+//!   on the first open rather than after the transient-failure back-off. It is never taken for a
+//!   delete: a typo, or a directory whose reported size happens to be zero, would otherwise
+//!   retract a live key.
 //! - a zero-length file **retracts** `key`, exactly as a zero-length `data` does in
 //!   `lore_storage_put_resolved`.
 //! - otherwise: `write_resolved_from_file`, and the stored address is reported in
@@ -203,20 +203,6 @@ async fn resolve_put_file_resolved_item(
     if path_str.is_empty() {
         return PutItemOutcome::failed(LoreErrorCode::InvalidArguments);
     }
-    match lore_io::IoDriver::global()
-        .metadata(Path::new(path_str))
-        .await
-    {
-        Ok(meta) => {
-            if !meta.is_file() {
-                return PutItemOutcome::failed(LoreErrorCode::InvalidArguments);
-            }
-        }
-        Err(_) => {
-            return PutItemOutcome::failed(LoreErrorCode::InvalidArguments);
-        }
-    }
-
     let mut write_options = WriteOptions::default();
     if item.fixed_size_chunk > 0 {
         write_options = write_options.with_fixed_size_chunk(item.fixed_size_chunk as usize);

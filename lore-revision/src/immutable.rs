@@ -42,6 +42,7 @@ pub enum ImmutableError {
     AddressNotFound,
     PayloadNotFound,
     Disconnected,
+    InvalidArguments,
     Maintenance,
     NoRemote,
     NotAuthenticated,

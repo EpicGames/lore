@@ -12,6 +12,7 @@ pub enum StorageError {
     Disconnected,
     SlowDown,
     Oversized,
+    InvalidArguments,
     Maintenance,
     NoRemote,
     NotAuthenticated,

@@ -22,6 +22,7 @@ use zerocopy::FromZeros;
 use crate::compress::COMPRESSION_MODE;
 use crate::concurrency::file_count_limit_acquire;
 use crate::error::StorageError;
+use crate::errors::InvalidArguments;
 use crate::errors::SlowDown;
 use crate::fragment_engine::write_fragmented;
 use crate::fragment_flags::FragmentFlags;
@@ -1395,6 +1396,40 @@ pub async fn write_content(
     }
 }
 
+/// Open `path` for reading and report its size, retrying a transient failure but not a path the
+/// caller got wrong.
+///
+/// A path that does not exist, or does not name a regular file, will not open on any attempt, so
+/// spending the back-off on it costs the caller ten seconds and reports an internal fault for what
+/// is an argument error. Both are `InvalidArguments` on the first attempt. Everything else keeps
+/// the back-off, which is there for a reader holding the file open on Windows.
+async fn open_file_to_read(path: &Path) -> Result<(lore_io::IoFile, u64), StorageError> {
+    let mut retry = crate::retry(10, 10_000, 10);
+    loop {
+        match crate::chunker::open_read(path).await {
+            Ok(result) => return Ok(result),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+                ) =>
+            {
+                return Err(StorageError::from(InvalidArguments {
+                    reason: format!("open file: {}: {err}", path.display()),
+                }));
+            }
+            Err(err) => {
+                if !retry.wait().await {
+                    return Err(StorageError::internal_with_context(
+                        err,
+                        &format!("open file: {}", path.display()),
+                    ));
+                }
+            }
+        }
+    }
+}
+
 /// Write content from a file.
 ///
 /// Takes a store, partition, and optional remote session directly.
@@ -1403,6 +1438,9 @@ pub async fn write_content(
 /// caller that hands over a path has no other way to learn what was actually written: stating the
 /// file again afterwards answers for the file as it is then, not for the bytes this address
 /// stands for.
+///
+/// A `path` that does not exist or does not name a regular file is `InvalidArguments`; see
+/// [`open_file_to_read`]. A zero-length file yields the zero-hash address without being read.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_from_file(
     store: Arc<dyn ImmutableStore>,
@@ -1417,20 +1455,7 @@ pub async fn write_from_file(
     let _count_permit = file_count_limit_acquire()
         .await
         .forward::<StorageError>("permit failed")?;
-    let mut retry = crate::retry(10, 10_000, 10);
-    let (file, size) = loop {
-        match crate::chunker::open_read(path).await {
-            Ok(result) => break result,
-            Err(err) => {
-                if !retry.wait().await {
-                    return Err(StorageError::internal_with_context(
-                        err,
-                        &format!("open file: {}", path.display()),
-                    ));
-                }
-            }
-        }
-    };
+    let (file, size) = open_file_to_read(path).await?;
 
     lore_base::lore_trace!(
         "Opened file to read from for immutable data write: {} size {size}",
@@ -1514,9 +1539,9 @@ pub async fn write_from_file(
 /// mapping to the zero hash is the mutable store's tombstone, so there is no distinction to draw
 /// between publishing empty content and publishing none.
 ///
-/// A missing or unreadable path is a `StorageError` rather than a retraction — the caller named a
-/// file it expected to publish, and taking silence for a delete would retract a live key on a
-/// typo.
+/// A `path` that does not exist or does not name a regular file is `InvalidArguments` rather than a
+/// retraction; see [`open_file_to_read`]. That check is what keeps a directory — whose reported size
+/// is whatever the filesystem chooses, and may be zero — from retracting a live key.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_resolved_from_file(
     store: Arc<dyn ImmutableStore>,
@@ -1539,20 +1564,7 @@ pub async fn write_resolved_from_file(
     let _count_permit = file_count_limit_acquire()
         .await
         .forward::<StorageError>("permit failed")?;
-    let mut retry = crate::retry(10, 10_000, 10);
-    let (file, size) = loop {
-        match crate::chunker::open_read(path).await {
-            Ok(result) => break result,
-            Err(err) => {
-                if !retry.wait().await {
-                    return Err(StorageError::internal_with_context(
-                        err,
-                        &format!("open file: {}", path.display()),
-                    ));
-                }
-            }
-        }
-    };
+    let (file, size) = open_file_to_read(path).await?;
 
     lore_base::lore_trace!(
         "Opened file to publish under key {key}: {} size {size}",

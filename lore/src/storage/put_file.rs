@@ -3,9 +3,10 @@
 //! `lore_storage_put_file` — store a file's contents at a content address.
 //!
 //! Per item:
-//! - `partition == Partition::default()` → `INVALID_ARGUMENTS`.
-//! - `stat(path).len == 0` → zero-hash short-circuit; the file is not opened for read.
-//! - missing or unreadable file → `INVALID_ARGUMENTS` (caller supplied a bad path).
+//! - `partition == Partition::default()` or an empty `path` → `INVALID_ARGUMENTS`.
+//! - a `path` that does not exist or does not name a regular file → `INVALID_ARGUMENTS`, rejected
+//!   on the first open rather than after the transient-failure back-off.
+//! - a zero-length file → zero-hash short-circuit; the file is opened but never read.
 //! - otherwise: `write_from_file` produces a single top-level address which lands in
 //!   `PUT_ITEM_COMPLETE`.
 //!
@@ -19,9 +20,7 @@ use std::sync::Arc;
 
 use lore_base::error::InvalidArguments;
 use lore_base::lore_spawn;
-use lore_base::types::Address;
 use lore_base::types::Context;
-use lore_base::types::Hash;
 use lore_base::types::Partition;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
@@ -189,33 +188,6 @@ async fn resolve_put_file_item(
     if path_str.is_empty() {
         return PutItemOutcome::failed(LoreErrorCode::InvalidArguments);
     }
-    match lore_io::IoDriver::global()
-        .metadata(Path::new(path_str))
-        .await
-    {
-        Ok(meta) => {
-            if !meta.is_file() {
-                return PutItemOutcome::failed(LoreErrorCode::InvalidArguments);
-            }
-            if meta.len() == 0 {
-                // Zero-hash short-circuit: succeeds without storing anything, so both placement
-                // flags stay clear even though `error_code` is `None`.
-                return PutItemOutcome {
-                    address: Address {
-                        hash: Hash::default(),
-                        context: item.context,
-                    },
-                    error_code: LoreErrorCode::None,
-                    stored_local: false,
-                    stored_remote: false,
-                };
-            }
-        }
-        Err(_) => {
-            return PutItemOutcome::failed(LoreErrorCode::InvalidArguments);
-        }
-    }
-
     let mut write_options = WriteOptions::default();
     if item.fixed_size_chunk > 0 {
         write_options = write_options.with_fixed_size_chunk(item.fixed_size_chunk as usize);
