@@ -64,7 +64,13 @@ mod tests {
             &RelativePath::new_from_initial_path("sOme/pAth/teST").expect("Path create"),
             false
         ));
-        assert!(!filter.excludes(
+        // `some/path/*` does not match `some/path/test/sub` -- the asterisk does
+        // not cross a separator -- but the path is still excluded, because
+        // `some/path/test` is, and nothing below an excluded directory is in.
+        //
+        // Ground truth from git: with `.gitignore` holding `some/path/*`,
+        // `git status` reports `some/path/test/sub` as ignored.
+        assert!(filter.excludes(
             &RelativePath::new_from_initial_path("some/path/test/sub").expect("Path create"),
             false
         ));
@@ -247,6 +253,23 @@ mod tests {
         );
     }
 
+    /// An excluded directory on the way to a re-included file is excluded, and
+    /// still descended.
+    ///
+    /// This is the split the filter is built around. `excludes` answers "is this
+    /// path in the tree"; `should_descend` answers "must a walk look inside
+    /// anyway". Before the split, the two were conflated: reaching
+    /// `some/path/this/specific/file.txt` was arranged by injecting re-inclusion
+    /// lines for each ancestor, which made `excludes` report the ancestors as
+    /// *not excluded* -- an answer contradicting the rules the user wrote.
+    ///
+    /// Ground truth from git for the exclusion itself: with `.gitignore` holding
+    /// `some/[pa]?th/**/*`, `git status` reports `some/path/this/x` and
+    /// `some/path/x` as ignored. Git also reports
+    /// `some/path/this/specific/file.txt` as ignored even with the `!` rule,
+    /// because git prunes at the excluded directory and documents re-inclusion
+    /// below one as impossible. Lore deliberately departs there -- see
+    /// `tests/filter_gitignore.rs`.
     #[test]
     fn directory_reinclusion() {
         let _execution = setup_test_execution();
@@ -258,46 +281,47 @@ mod tests {
         filter
             .add_inclusion("some/path/this/specific/file.txt")
             .expect("Failed filter setup");
-        assert!(!filter.excludes(
-            &RelativePath::new_from_initial_path("some").expect("Path create"),
-            true
-        ));
-        assert!(!filter.excludes(
-            &RelativePath::new_from_initial_path("some").expect("Path create"),
-            false
-        ));
-        assert!(!filter.excludes(
-            &RelativePath::new_from_initial_path("some/path").expect("Path create"),
-            true
-        ));
-        assert!(!filter.excludes(
-            &RelativePath::new_from_initial_path("some/path").expect("Path create"),
-            false
-        ));
-        assert!(!filter.excludes(
-            &RelativePath::new_from_initial_path("some/path/this").expect("Path create"),
-            true
-        ));
-        assert!(filter.excludes(
-            &RelativePath::new_from_initial_path("sOme/paTH/this").expect("Path create"),
-            false
-        ));
-        assert!(filter.excludes(
-            &RelativePath::new_from_initial_path("sOMe/PAth/that").expect("Path create"),
-            true
-        ));
-        assert!(filter.excludes(
-            &RelativePath::new_from_initial_path("Some/Path/that").expect("Path create"),
-            false
-        ));
-        assert!(!filter.excludes(
-            &RelativePath::new_from_initial_path("some/path/this/specific").expect("Path create"),
-            true
-        ));
-        assert!(filter.excludes(
-            &RelativePath::new_from_initial_path("some/Path/this/SPecific").expect("Path create"),
-            false
-        ));
+
+        // `some/[pa]?th/**/*` needs at least three components, so the first two
+        // levels match nothing and stay in.
+        for depth in ["some", "some/path"] {
+            let at = RelativePath::new_from_initial_path(depth).expect("Path create");
+            assert!(!filter.excludes(&at, true), "{depth} as a directory");
+            assert!(!filter.excludes(&at, false), "{depth} as a file");
+        }
+
+        // From the third level down the exclusion bites, ancestors of the
+        // re-included file included.
+        for excluded in [
+            "some/path/this",
+            "sOme/paTH/this",
+            "sOMe/PAth/that",
+            "Some/Path/that",
+            "some/path/this/specific",
+            "some/Path/this/SPecific",
+        ] {
+            let at = RelativePath::new_from_initial_path(excluded).expect("Path create");
+            assert!(filter.excludes(&at, true), "{excluded} as a directory");
+            assert!(filter.excludes(&at, false), "{excluded} as a file");
+        }
+
+        // Excluded, but a walk still has to look inside the two that lead to the
+        // re-included file -- and must not bother with the ones that do not.
+        for (dir, descend) in [
+            ("some/path/this", true),
+            ("some/path/this/specific", true),
+            ("sOMe/PAth/that", false),
+        ] {
+            let at = RelativePath::new_from_initial_path(dir).expect("Path create");
+            let state = filter.exclusion_state(&at, true);
+            assert_eq!(
+                filter.should_descend(state, &at),
+                descend,
+                "should_descend({dir})"
+            );
+        }
+
+        // The re-included file itself, reached through both excluded ancestors.
         assert!(
             !filter.excludes(
                 &RelativePath::new_from_initial_path("some/PAth/this/SPecific/filE.txt")
@@ -456,11 +480,16 @@ mod tests {
     fn root_file() {
         let mut filter = FilterInstance::default();
         filter.add_exclusion("/*").expect("Failed filter setup");
-        assert!(!filter.excludes(
+        // `/*` is anchored, so it matches only the top-level entries -- but that
+        // excludes `some`, and nothing below an excluded directory is in.
+        //
+        // Ground truth from git: with `.gitignore` holding `/*`, `git status`
+        // reports `some/path/test/x` as ignored.
+        assert!(filter.excludes(
             &RelativePath::new_from_initial_path("some/path/test").expect("Path create"),
             true
         ));
-        assert!(!filter.excludes(
+        assert!(filter.excludes(
             &RelativePath::new_from_initial_path("some/path/foo.uasset").expect("Path create"),
             false
         ));
@@ -1017,11 +1046,19 @@ mod tests {
             &RelativePath::new_from_initial_path("foo/bar").expect("Path create"),
             true
         ));
-        assert!(!filter.excludes(
+        // The gitignore documentation's point is about the *pattern*: `foo/*`
+        // does not match `foo/bar/hello.c`, because the asterisk does not match
+        // `bar/hello.c`. That is not the same as the path being included. Git
+        // excludes `foo/bar`, never descends into it, and so ignores everything
+        // underneath.
+        //
+        // Ground truth from git: with `.gitignore` holding `foo/*`, `git status`
+        // reports `foo/bar/hello.c` as ignored.
+        assert!(filter.excludes(
             &RelativePath::new_from_initial_path("foo/bar/hello.c").expect("Path create"),
             false
         ));
-        assert!(!filter.excludes(
+        assert!(filter.excludes(
             &RelativePath::new_from_initial_path("foo/bar/hello.c").expect("Path create"),
             true
         ));

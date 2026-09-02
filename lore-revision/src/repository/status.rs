@@ -710,11 +710,11 @@ async fn count_node_children(work: &CountWork, shared: &CountShared) -> Result<(
         let is_link = child_node.is_link();
         let child_path = work.path.push_into_buf(child_name).freeze();
 
-        if work
-            .repository
-            .filter
-            .excludes(&child_path, is_directory || is_link, FilterMode::View)
-        {
+        if work.repository.filter.excludes_tree(
+            &child_path,
+            is_directory || is_link,
+            FilterMode::View,
+        ) {
             continue;
         }
 

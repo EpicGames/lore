@@ -2458,7 +2458,7 @@ async fn commit_file(
     let (address, content_size, mode, modified_time) =
         if repository
             .filter
-            .excludes(&relative_path, false, FilterMode::View)
+            .excludes_tree(&relative_path, false, FilterMode::View)
         {
             (node.address, node.size, node.mode, None)
         } else {

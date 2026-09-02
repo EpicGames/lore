@@ -3349,7 +3349,10 @@ impl State {
                 let node = self.node(repository.clone(), node_id).await?;
                 if node.is_dirty_add()
                     && node.is_directory()
-                    && (force || !repository.filter.excludes(&path, true, FilterMode::Full))
+                    && (force
+                        || !repository
+                            .filter
+                            .excludes_tree(&path, true, FilterMode::Full))
                 {
                     result.push(path);
                 }
@@ -3369,7 +3372,7 @@ impl State {
                 // excludes; they can't be replayed against a checkout that
                 // never materializes them. --force bypasses the filter.
                 if !force
-                    && repository.filter.excludes(
+                    && repository.filter.excludes_tree(
                         &child_path,
                         child.is_directory(),
                         FilterMode::Full,
@@ -4631,9 +4634,11 @@ async fn collect_dirty_paths_inner(
         // excludes — they cannot be re-applied against a checkout that
         // never materializes them. --force bypasses the filter.
         let excluded = !options.force
-            && repository
-                .filter
-                .excludes(&*parent_path, child.is_directory(), FilterMode::Full);
+            && repository.filter.excludes_tree(
+                &*parent_path,
+                child.is_directory(),
+                FilterMode::Full,
+            );
 
         let mut descended = false;
         if !excluded {
@@ -7010,7 +7015,7 @@ async fn emit_filesystem_subtree_deletes(
         drop(child_name);
         if repository
             .filter
-            .excludes(&child_path, child_node.is_directory(), filter_mode)
+            .excludes_tree(&child_path, child_node.is_directory(), filter_mode)
         {
             continue;
         }
@@ -7036,7 +7041,7 @@ async fn emit_filesystem_subtree_deletes(
         return Ok(true);
     }
 
-    if !had_child && !repository.filter.excludes(path, true, filter_mode) {
+    if !had_child && !repository.filter.excludes_tree(path, true, filter_mode) {
         // Empty in-view directory: clone/checkout writes it, so its absence is a
         // real deletion. It is the materializing leaf here, and its own buffered
         // entry (pushed above) is flushed and marked along with its ancestors.

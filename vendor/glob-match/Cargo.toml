@@ -1,0 +1,20 @@
+# Vendored from crates.io glob-match 0.2.1 (MIT, Devon Govett).
+#
+# Vendored to fix a `**` backtracking defect: matching a literal character
+# cleared the globstar backtrack point, so a `**` could never be resumed to skip
+# a path segment it had already entered. `**/*b` did not match `b/b`, and
+# `**/*/a` did not match `d/a`. Lore's filter needs `**` to be correct because
+# gitignore documents these forms and the ignore/view filters accept them
+# verbatim; the defect made lore silently fail to exclude matching paths.
+#
+# The fix is in src/lib.rs, marked with a `LORE:` comment. Upstream this.
+#
+# Benches and their dev-dependencies are dropped; only the library is used.
+[package]
+edition = "2021"
+name = "glob-match"
+version = "0.2.1"
+authors = ["Devon Govett <devongovett@gmail.com>"]
+description = "An extremely fast glob matcher"
+readme = "README.md"
+license = "MIT"

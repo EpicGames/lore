@@ -5930,6 +5930,10 @@ typedef struct lore_revision_tree_commit_args_t {
   struct lore_revision_tree_commit_options_t options;
 } lore_revision_tree_commit_args_t;
 
+
+
+
+
 // Return the tag identifying the type of an event.
 uint32_t lore_event_type(const struct lore_event_t *event);
 

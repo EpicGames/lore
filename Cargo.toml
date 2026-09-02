@@ -211,3 +211,6 @@ debug-assertions = false
 
 [patch.crates-io]
 quinn-proto = { path = "vendor/quinn-proto" }
+# Fixes a `**` backtracking defect that made the filter silently under-exclude;
+# see vendor/glob-match/Cargo.toml.
+glob-match = { path = "vendor/glob-match" }

@@ -59,7 +59,11 @@ documentation_style = "c99"
 ############################# Codegen Options ##################################
 
 [export]
-exclude = []
+# `FilterState` and `FilterStates` are public so a tree walk can thread the
+# filter verdict down as it descends, and so the filter tests can build one.
+# They are Rust-side only -- no C entry point takes or returns them -- so
+# cbindgen would otherwise emit two opaque typedefs no caller can use.
+exclude = ["FilterState", "FilterStates"]
 # `LoreStore` and `LoreRevisionTree` are reachable via `lore_*_args_t::handle`
 # but cbindgen misses transitive types behind a typedef field; emit them
 # explicitly. The `lore_revision_tree_*_args_t` types live here too so the

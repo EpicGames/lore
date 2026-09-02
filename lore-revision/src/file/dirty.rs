@@ -463,7 +463,7 @@ async fn dirty_delete(
             let child_path = path.push_into_buf(&child_name).freeze();
 
             if force
-                || !repository.filter.excludes(
+                || !repository.filter.excludes_tree(
                     &child_path,
                     child_node.is_directory(),
                     FilterMode::Full,

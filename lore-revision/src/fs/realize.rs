@@ -1607,7 +1607,7 @@ async fn realize_change_modify_add(
     // Only on-disk work honours the view. This gates directory creation, link
     // cloning and the file write. The move rename below is not gated, because
     // it repositions a path an earlier in-view realize may have written.
-    let write_to_disk = !view_filter.excludes(path, node.is_directory(), FilterMode::View);
+    let write_to_disk = !view_filter.excludes_tree(path, node.is_directory(), FilterMode::View);
 
     // A move is realized by renaming the file already on disk, which lets the
     // content write be skipped when the content did not change. That only holds
@@ -1615,7 +1615,7 @@ async fn realize_change_modify_add(
     // tree holds nothing at an excluded source, so the rename finds no file and
     // the destination has to be written from the immutable store like any add.
     let moved_from_in_view = change.from_path.as_ref().is_some_and(|from_path| {
-        !view_filter.excludes(from_path, node.is_directory(), FilterMode::View)
+        !view_filter.excludes_tree(from_path, node.is_directory(), FilterMode::View)
     });
 
     lore_trace!(
@@ -2003,7 +2003,7 @@ async fn realize_file_merge(
     let mut conflict = true;
     let mut size = 0;
 
-    let in_view = !view_filter.excludes(&change_to.path, false, FilterMode::View);
+    let in_view = !view_filter.excludes_tree(&change_to.path, false, FilterMode::View);
 
     // A view-excluded path has no working-tree file, so there is nothing to
     // compare and no merge result to edit. Adopt the incoming side, recorded

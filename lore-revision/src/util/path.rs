@@ -144,6 +144,15 @@ fn trim_leading(path: &mut String, prefix: &str) {
     path.drain(..(path.len() - trimmed));
 }
 
+/// xxh3 digest of a path that is already folded to lowercase.
+///
+/// [`crate::hash::hash_string`] folds its input before hashing it. A path that
+/// carries its lowercase form does not need that second pass, and the digest is
+/// the same one -- both fold by the rule in [`make_lowercase`].
+pub fn lowercase_hash(lowercase: &str) -> u64 {
+    crate::hash::hash_string_bytes(lowercase.as_bytes())
+}
+
 /// Fold `path` to lowercase in place where ASCII covers it, and through
 /// [`str::to_lowercase`] where it does not.
 fn make_lowercase(path: &mut String) {
@@ -504,6 +513,26 @@ impl RelativePath {
 
     pub fn parent(&self) -> Option<&str> {
         parent_impl(self.as_str())
+    }
+
+    /// The lowercase form split at the last separator: everything above the last
+    /// component, and the component itself. The first half is empty when the path
+    /// names a single component.
+    ///
+    /// One scan for both halves, where [`parent`](Self::parent) and
+    /// [`name_lowercase`](Self::name_lowercase) would each take their own.
+    pub fn split_lowercase(&self) -> (&str, &str) {
+        let lowercase = self.as_lowercase_str();
+        lowercase.rsplit_once('/').unwrap_or(("", lowercase))
+    }
+
+    /// xxh3 digest of the lowercase form -- the identity a node lookup matches
+    /// on, see [`Node::name_hash`](crate::node::Node::name_hash).
+    ///
+    /// Hashes the stored lowercase form in place, so nothing is folded or
+    /// allocated a second time.
+    pub fn lowercase_hash(&self) -> u64 {
+        lowercase_hash(self.as_lowercase_str())
     }
 
     pub fn len(&self) -> usize {
@@ -1182,6 +1211,23 @@ impl RelativePathBuf {
     /// Returns everything except the last component, or None if the path has no parent.
     pub fn parent(&self) -> Option<&str> {
         parent_impl(self.as_str())
+    }
+
+    /// The lowercase form split at the last separator: everything above the last
+    /// component, and the component itself. The first half is empty when the path
+    /// names a single component.
+    ///
+    /// One scan for both halves, where [`parent`](Self::parent) and
+    /// [`name_lowercase`](Self::name_lowercase) would each take their own.
+    pub fn split_lowercase(&self) -> (&str, &str) {
+        let lowercase = self.as_lowercase_str();
+        lowercase.rsplit_once('/').unwrap_or(("", lowercase))
+    }
+
+    /// xxh3 digest of the lowercase form. See
+    /// [`RelativePath::lowercase_hash`].
+    pub fn lowercase_hash(&self) -> u64 {
+        lowercase_hash(self.as_lowercase_str())
     }
 
     /// Returns the length of the path string.
