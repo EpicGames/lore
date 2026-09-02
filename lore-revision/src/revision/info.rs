@@ -15,6 +15,7 @@ use crate::interface::LoreFileAction;
 use crate::interface::LoreString;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
+use crate::lore_debug;
 use crate::metadata::Metadata;
 use crate::node;
 use crate::node::NodeDelta;
@@ -74,10 +75,12 @@ pub struct LoreRevisionInfoDeltaEventData {
     /// Flag indicating the entry is a file rather than a directory.
     #[serde(with = "u8_as_bool")]
     pub flag_file: u8,
+    /// Path the file was moved from in this revision. Empty otherwise.
+    pub from_path: LoreString,
 }
 
 impl LoreRevisionInfoDeltaEventData {
-    pub fn new(path: &str, delta: &NodeDelta, file: bool, size: u64) -> Self {
+    pub fn new(path: &str, from_path: &str, delta: &NodeDelta, file: bool, size: u64) -> Self {
         LoreRevisionInfoDeltaEventData {
             path: path.into(),
             size,
@@ -85,6 +88,7 @@ impl LoreRevisionInfoDeltaEventData {
             flag_modify: ((delta.flags & Flags::Modify) != 0).into(),
             flag_merged: ((delta.flags & Flags::Merge) != 0).into(),
             flag_file: file.into(),
+            from_path: from_path.into(),
         }
     }
 
@@ -207,6 +211,7 @@ pub async fn info(
             let delta_buffer = delta_buffer.to_aligned::<NodeDelta>();
             for delta in delta_buffer.as_type_slice::<NodeDelta>().iter() {
                 let is_delete = delta.action == FileAction::Delete as u16;
+                let is_move = delta.action == FileAction::Move as u16;
                 let is_parent_loaded = parent_state.is_some();
                 if is_delete && !is_parent_loaded {
                     parent_state = Some(
@@ -214,6 +219,16 @@ pub async fn info(
                             .await
                             .forward::<InfoError>("deserializing state")?,
                     );
+                } else if is_move && !is_parent_loaded {
+                    parent_state =
+                        state::State::deserialize(repository.clone(), state.parent_self())
+                            .await
+                            .inspect_err(|err| {
+                                lore_debug!(
+                                    "Failed to deserialize parent state for move source: {err}"
+                                );
+                            })
+                            .ok();
                 }
 
                 let node_id = delta.node;
@@ -254,8 +269,19 @@ pub async fn info(
                     size = node.size;
                 }
 
+                let from_path = match parent_state.as_ref() {
+                    Some(parent_state) if is_move => parent_state
+                        .node_path(repository.clone(), node_id)
+                        .await
+                        .inspect_err(|err| {
+                            lore_debug!("Node {node_id} has no path in the parent revision: {err}");
+                        })
+                        .unwrap_or_default(),
+                    _ => String::new(),
+                };
+
                 event::LoreEvent::RevisionInfoDelta(LoreRevisionInfoDeltaEventData::new(
-                    &path, delta, file, size,
+                    &path, &from_path, delta, file, size,
                 ))
                 .send();
 

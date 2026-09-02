@@ -484,6 +484,7 @@ pub enum RevisionCommands {
 struct RevisionEntryDelta {
     action: String,
     path: String,
+    from_path: String,
     merged: String,
     metadata: Option<Vec<LoreMetadataEventData>>,
 }
@@ -784,14 +785,26 @@ pub fn handle_revision_info(globals: LoreGlobalArgs, args: &RevisionInfoArgs) ->
                     Some('D') => FileActionStyle::DELETED,
                     _ => FileActionStyle::MODIFIED,
                 };
-                println!(
-                    "{}{}{} {} {}",
-                    action_style,
-                    delta.action,
-                    anstyle::Reset,
-                    display_path(delta.path.as_str()),
-                    delta.merged
-                );
+                if delta.from_path.is_empty() {
+                    println!(
+                        "{}{}{} {} {}",
+                        action_style,
+                        delta.action,
+                        anstyle::Reset,
+                        display_path(delta.path.as_str()),
+                        delta.merged
+                    );
+                } else {
+                    println!(
+                        "{}{}{} {} -> {} {}",
+                        action_style,
+                        delta.action,
+                        anstyle::Reset,
+                        display_path(delta.from_path.as_str()),
+                        display_path(delta.path.as_str()),
+                        delta.merged
+                    );
+                }
                 if let Some(metadata) = delta.metadata.as_ref() {
                     for metadata in metadata.iter() {
                         print_metadata(metadata, Some(&auth_data), None);
@@ -2514,6 +2527,7 @@ fn store_info_delta_data(
         let delta = RevisionEntryDelta {
             action: data.action_as_string_short().to_string(),
             path: data.path.to_string(),
+            from_path: data.from_path.to_string(),
             merged: data.merged_as_string_short().to_string(),
             metadata: None,
         };

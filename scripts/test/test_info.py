@@ -6,6 +6,7 @@ import os
 import pytest
 
 from lore import Lore
+from lore_parsers import parse_jsonl
 
 logger = logging.getLogger(__name__)
 
@@ -53,3 +54,43 @@ def test_info(new_lore_repo):
 
     file = [file for file in files if another_file in file.path][0]
     assert file.status == "Deleted", "Missing file status in info output"
+
+
+@pytest.mark.smoke
+def test_revision_info_delta_move_carries_the_source_path(new_lore_repo):
+    """The delta entry for a moved file must name the path it moved from. The
+    entry reports the node at its new path, so without the source path a
+    consumer reads the move as an add."""
+    repo: Lore = new_lore_repo("InfoMove")
+
+    original_path = "original-file.txt"
+    moved_path = "renamed-file.txt"
+
+    with repo.open_file(original_path, "w+") as output_file:
+        output_file.write("Initial content\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit("Add the file", offline=True)
+
+    repo.move(original_path, moved_path)
+    repo.file_stage_move(original_path, moved_path, offline=True)
+    repo.commit("Move the file", offline=True)
+
+    output = repo.revision_info(delta=True, json=True, offline=True)
+    deltas = parse_jsonl(output, "revisionInfoDelta")
+    moved = [delta for delta in deltas if delta["path"] == moved_path]
+
+    assert len(moved) == 1, f"Expected exactly one delta at {moved_path}, got {deltas}"
+    assert moved[0]["action"] == "move", (
+        f"The delta at {moved_path} should be a move, got {moved[0]}"
+    )
+    assert moved[0]["fromPath"] == original_path, (
+        f"The move should report fromPath={original_path!r}, got {moved[0]}"
+    )
+
+    # Called through `run` because `revision_info` parses its output
+    # into a RevisionInfo, which drops the delta lines.
+    output = repo.run(["revision", "info", "--delta"], offline=True)
+    lines = [" ".join(line.split()) for line in output.splitlines()]
+    assert f"V {original_path} -> {moved_path}" in lines, (
+        f"Revision info did not print the move source path, got:\n{output}"
+    )

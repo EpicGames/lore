@@ -2216,6 +2216,8 @@ typedef struct lore_revision_info_delta_event_data_t {
   uint8_t flag_merged;
   // Flag indicating the entry is a file rather than a directory.
   uint8_t flag_file;
+  // Path the file was moved from in this revision. Empty otherwise.
+  struct lore_string_t from_path;
 } lore_revision_info_delta_event_data_t;
 
 // Details of a single file that differs between two revisions.
