@@ -1063,4 +1063,42 @@ mod tests {
             true
         ));
     }
+
+    /// A rule the filter cannot express must not take the rest of the file with
+    /// it. Regression for the `.loreignore` that stopped ignoring anything at
+    /// all because one line held an unanchored multi-component re-inclusion.
+    #[test]
+    fn unsupported_rule_does_not_discard_the_file() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(".loreignore");
+        let mut file = std::fs::File::create(&path).expect("create");
+        // Line 2 is valid .gitignore but unsupported by lore: an unanchored
+        // multi-component re-inclusion, refused by `add_inclusion`.
+        file.write_all(b"**/DerivedDataCache/\n!**/Plugins/*/Binaries/\n**/Intermediate/\n")
+            .expect("write");
+        drop(file);
+
+        let filter = lore_revision::filter::load_filter(&path).expect("load");
+
+        // The rule before the unsupported line still applies.
+        assert!(filter.excludes(
+            &RelativePath::new_from_initial_path("Unreal/DerivedDataCache").expect("Path create"),
+            true
+        ));
+        // So does the rule after it.
+        assert!(filter.excludes(
+            &RelativePath::new_from_initial_path("Unreal/Intermediate").expect("Path create"),
+            true
+        ));
+        // The unsupported rule itself is skipped, not honoured.
+        assert!(
+            filter.excludes(
+                &RelativePath::new_from_initial_path("Unreal/DerivedDataCache/VT")
+                    .expect("Path create"),
+                true
+            )
+        );
+    }
 }

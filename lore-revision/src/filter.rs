@@ -215,12 +215,25 @@ pub fn load_view(view_path: impl AsRef<Path>) -> Result<Filter, FilterError> {
     })
 }
 
+/// Reads a filter file, one rule per line.
+///
+/// A rule this filter cannot express is reported and skipped, and the rest of
+/// the file still applies. Aborting instead would discard every rule in the
+/// file, including the ones before the offending line, and a filter that
+/// silently excludes nothing is far more damaging than one missing rule: the
+/// only signal the author gets is that everything they meant to ignore turns up
+/// as changed.
 pub fn load_filter(path: impl AsRef<Path>) -> Result<FilterInstance, FilterError> {
+    let path = path.as_ref();
     let mut filter = FilterInstance::default();
     if let Ok(file) = File::open(path) {
         let mut has_include = false;
         let mut has_exclude = false;
-        for line in BufReader::new(file).lines().map_while(Result::ok) {
+        for (index, line) in BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .enumerate()
+        {
             let mut glob = line.trim();
             if glob.is_empty() || glob.starts_with('#') {
                 continue;
@@ -237,12 +250,28 @@ pub fn load_filter(path: impl AsRef<Path>) -> Result<FilterInstance, FilterError
                 glob = &glob[1..];
             }
 
-            if negated {
-                filter.add_inclusion(glob)?;
-                has_include = true;
+            let added = if negated {
+                filter.add_inclusion(glob)
             } else {
-                filter.add_exclusion(glob)?;
-                has_exclude = true;
+                filter.add_exclusion(glob)
+            };
+
+            match added {
+                Ok(()) => {
+                    if negated {
+                        has_include = true;
+                    } else {
+                        has_exclude = true;
+                    }
+                }
+                Err(error) => {
+                    lore_warn!(
+                        "{}:{}: ignoring unsupported rule `{}`: {error}. The remaining rules in this file still apply.",
+                        path.display(),
+                        index + 1,
+                        line.trim(),
+                    );
+                }
             }
         }
 
