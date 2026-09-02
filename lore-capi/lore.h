@@ -1240,6 +1240,8 @@ typedef struct lore_file_history_event_data_t {
   uint64_t size;
   // Action applied to the file at this revision.
   enum lore_file_action_t action;
+  // Path the file was moved from at this revision. Empty otherwise.
+  struct lore_string_t from_path;
 } lore_file_history_event_data_t;
 
 // Data for the event emitted when file content is written to a destination.

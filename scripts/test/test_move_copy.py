@@ -183,7 +183,7 @@ class HistoryEntry:
 
     Example history output after a move operation:
     ```
-    V new_path.txt
+    V original_path.txt -> new_path.txt
     Revision 2
     Signature: ...
     Address: ...
@@ -223,7 +223,12 @@ class HistoryEntry:
     }
 
     def __init__(
-        self, action: str, path: str, revision: Optional[int] = None, message: str = ""
+        self,
+        action: str,
+        path: str,
+        revision: Optional[int] = None,
+        message: str = "",
+        from_path: str = "",
     ):
         """
         Initialize a HistoryEntry.
@@ -233,6 +238,7 @@ class HistoryEntry:
             path: The file path associated with this entry
             revision: Optional revision number
             message: Optional commit message
+            from_path: Path the file moved from, for move entries
         """
         if action not in self.VALID_ACTIONS:
             raise ValueError(
@@ -242,6 +248,7 @@ class HistoryEntry:
         self.path = path
         self.revision = revision
         self.message = message
+        self.from_path = from_path
 
     @property
     def action_name(self) -> str:
@@ -249,7 +256,10 @@ class HistoryEntry:
         return self.ACTION_NAMES.get(self.action, "Unknown")
 
     def __repr__(self) -> str:
-        return f"HistoryEntry(action='{self.action}', path='{self.path}', revision={self.revision})"
+        return (
+            f"HistoryEntry(action='{self.action}', path='{self.path}', "
+            f"from_path='{self.from_path}', revision={self.revision})"
+        )
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, HistoryEntry):
@@ -268,7 +278,7 @@ def parse_history_entries(history_output: str) -> list[HistoryEntry]:
 
     History Format Example:
     ```
-    V moved_file.txt
+    V original_file.txt -> moved_file.txt
     Revision 2
     Signature: abc123
     Address: ...
@@ -303,7 +313,7 @@ def parse_history_entries(history_output: str) -> list[HistoryEntry]:
             continue
 
         # Check if this line is an entry header (action prefix + space + path)
-        # Format: "A path/to/file.txt" or "V new_path.txt"
+        # Format: "A path/to/file.txt" or "V old_path.txt -> new_path.txt"
         if (
             len(stripped) > 2
             and stripped[0] in HistoryEntry.VALID_ACTIONS
@@ -317,7 +327,13 @@ def parse_history_entries(history_output: str) -> list[HistoryEntry]:
             # Start new entry
             action = stripped[0]
             path = stripped[2:]  # Everything after "X "
-            current_entry = HistoryEntry(action=action, path=path)
+            # A move names both ends: "V old/path -> new/path"
+            from_path, _, moved_to = path.partition(" -> ")
+            if moved_to:
+                path = moved_to
+            else:
+                from_path = ""
+            current_entry = HistoryEntry(action=action, path=path, from_path=from_path)
             current_revision = None
 
         elif stripped.startswith("Revision ") and current_entry is not None:
@@ -346,7 +362,7 @@ def verify_history_contains_paths(
     History entries are parsed from lines starting with action prefix (A/M/D/V)
     followed by space and path. For example:
     ```
-    V new_path.txt
+    V original_path.txt -> new_path.txt
     Revision 2
     ...
 
@@ -442,7 +458,7 @@ def verify_move_history(
 
     History Format for Moved File:
     ```
-    V new_path.txt
+    V original_path.txt -> new_path.txt
     Revision 2
     Signature: ...
     Address: ...
@@ -735,7 +751,7 @@ class MoveCopyMergeTester:
         -------------------------
         After a move, the file history should show:
         ```
-        V new_path.txt
+        V original_path.txt -> new_path.txt
         Revision 2
         ...
             Move file message
@@ -969,7 +985,7 @@ class MoveCopyMergeTester:
 
         History Format Example:
         ```
-        V new_path.txt
+        V original_path.txt -> new_path.txt
         Revision 2
         ...
 

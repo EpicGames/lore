@@ -1429,11 +1429,20 @@ pub fn handle_file_history(globals: LoreGlobalArgs, args: &FileHistoryArgs) -> u
                         || data.action == LoreFileAction::Move
                         || data.action == LoreFileAction::Copy
                     {
-                        print!(
-                            " {}{}",
-                            CommonStyles::HEADERS,
-                            display_path(data.path.as_str())
-                        );
+                        if data.from_path.is_empty() {
+                            print!(
+                                " {}{}",
+                                CommonStyles::HEADERS,
+                                display_path(data.path.as_str())
+                            );
+                        } else {
+                            print!(
+                                " {}{} -> {}",
+                                CommonStyles::HEADERS,
+                                display_path(data.from_path.as_str()),
+                                display_path(data.path.as_str())
+                            );
+                        }
                     }
 
                     println!("{}", anstyle::Reset);

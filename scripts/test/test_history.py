@@ -6,6 +6,7 @@ import time
 import pytest
 
 from lore import Lore
+from lore_parsers import parse_jsonl
 
 logger = logging.getLogger(__name__)
 
@@ -316,3 +317,55 @@ def test_history_date_filter(new_lore_repo):
     # A far-future timestamp should return nothing
     future_ts = (time.time_ns() // 1_000_000) + 99_999_999
     assert repo.history(date=future_ts) == []
+
+
+@pytest.mark.smoke
+def test_file_history_move_entry_carries_the_source_path(new_lore_repo):
+    """The move entry in a file's history must name the path the file moved
+    from. The path only shows up on the following entry, so a consumer reading
+    one entry cannot tell where the file came from without it."""
+    repo: Lore = new_lore_repo()
+
+    original_path = "original-file.txt"
+    moved_path = "renamed-file.txt"
+
+    with repo.open_file(original_path, "w+") as f:
+        f.write("Initial content\n")
+    repo.stage(scan=True)
+    repo.commit("Add the file", local=True)
+
+    repo.move(original_path, moved_path)
+    repo.file_stage_move(original_path, moved_path, offline=True)
+    repo.commit("Move the file", local=True)
+
+    output = repo.file_history(moved_path, json=True, offline=True)
+    entries = parse_jsonl(output, "fileHistory")
+
+    assert len(entries) >= 2, f"Expected the move and the add, got {entries}"
+    assert entries[0]["action"] == "move", (
+        f"The newest entry should be the move, got {entries[0]}"
+    )
+    assert entries[0]["path"] == moved_path, (
+        f"The move entry should be at {moved_path}, got {entries[0]}"
+    )
+    assert entries[0]["fromPath"] == original_path, (
+        f"The move entry should report fromPath={original_path!r}, got {entries[0]}"
+    )
+
+    # Only a move has a source path to report.
+    assert entries[1]["action"] == "add", (
+        f"The oldest entry should be the add, got {entries[1]}"
+    )
+    assert entries[1]["fromPath"] == "", (
+        f"The add entry must not report a source path, got {entries[1]}"
+    )
+
+    # The listing names both ends of the move, the add only its own path.
+    output = repo.file_history(moved_path, offline=True)
+    lines = [line.strip() for line in output.splitlines()]
+    assert f"V {original_path} -> {moved_path}" in lines, (
+        f"File history did not print the move source path, got:\n{output}"
+    )
+    assert f"A {original_path}" in lines, (
+        f"File history did not print the add entry, got:\n{output}"
+    )
