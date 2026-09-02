@@ -37,21 +37,21 @@ use crate::util::path::RelativePath;
 
 /// OS-backed filesystem provider.
 pub struct OsFilesystem {
-    repo_path: PathBuf,
+    filesystem_root: PathBuf,
 }
 
 impl OsFilesystem {
     /// Create a new OS-backed filesystem provider.
-    pub fn new(repo_path: impl AsRef<Path>) -> Self {
+    pub fn new(filesystem_root: impl AsRef<Path>) -> Self {
         Self {
-            repo_path: repo_path.as_ref().to_path_buf(),
+            filesystem_root: filesystem_root.as_ref().to_path_buf(),
         }
     }
 
     fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
         Ok(Arc::new(InstanceOperationImpl::new(
             StaticDispatchInstanceOperation::Os(OsOperation {
-                repo_path: self.repo_path.clone(),
+                filesystem_root: self.filesystem_root.clone(),
             }),
         )))
     }
@@ -66,7 +66,9 @@ impl FilesystemProvider for OsFilesystem {
 
 /// OS-backed filesystem operation context.
 pub struct OsOperation {
-    repo_path: PathBuf,
+    /// Where the mounted filesystem starts, which every repository in it shares: a link
+    /// or layer context inherits its parent's path, so this is not a repository's root.
+    filesystem_root: PathBuf,
 }
 
 /// All operations delegate to the regular OS file system.
@@ -253,7 +255,7 @@ impl InstanceOperation for OsOperation {
         result: &RelativePath,
         mode: MergeTextMode<'_>,
     ) -> Result<bool, FsError> {
-        Ok(merge3_text_by_path(&self.repo_path, base, mine, theirs, result, mode).await?)
+        Ok(merge3_text_by_path(&self.filesystem_root, base, mine, theirs, result, mode).await?)
     }
 
     async fn infer_is_diffable(&self, path: FilesystemPath<'_>) -> Result<bool, FsError> {

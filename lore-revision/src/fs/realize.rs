@@ -1691,16 +1691,10 @@ async fn realize_change_modify_add(
 
             let clone_path = RepositoryPath::from_relative(&link, change.path.clone())?;
 
-            let link_operation = operation
-                .associated_operation(link.clone())
-                .await
-                .forward::<SyncError>("Failed starting operation in linked repository")?;
-            // Don't use the existing operation because virtualization needs to be resolved for the
-            // linked repository separately.
             let clone_ctx = CloneContext {
                 repository: link.clone(),
                 state: link_state,
-                operation: link_operation,
+                operation: operation.clone(),
                 options: Arc::default(),
                 stats: Arc::default(),
                 modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),

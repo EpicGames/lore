@@ -8,12 +8,13 @@
 use std::fs::Metadata;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use lore_base::error::InvalidArguments;
 use lore_base::types::Fragment;
 use lore_error_set::error_set;
-use tokio::sync::RwLock;
 
 use crate::change::NodeChange;
 use crate::filter::FilterMode;
@@ -126,7 +127,10 @@ pub struct FileModifiedCheck {
 pub trait FilesystemProvider: Send + Sync + 'static {
     /// Create a new filesystem operation context.
     ///
-    /// This must not be called a second time until the first operation is finalized.
+    /// A filesystem holds one operation at a time and the next begins once that one is
+    /// finalized. The provider covers a whole mounted filesystem, so an operation covers
+    /// every repository mounted in it: a link or layer at a subpath is a subtree of the
+    /// same filesystem and takes the operation its parent already holds.
     ///
     /// # Implementation notes
     ///
@@ -324,11 +328,9 @@ pub enum StaticDispatchInstanceOperation {
     Test(tests::TestOperation),
 }
 
-type AssociatedOperation = (Arc<RepositoryContext>, Arc<InstanceOperationImpl>);
-
 pub struct InstanceOperationImpl {
     dispatch: StaticDispatchInstanceOperation,
-    associated_operations: RwLock<Option<Vec<AssociatedOperation>>>,
+    finalized: AtomicBool,
     modified_times: RecordedModifiedTimes,
 }
 
@@ -336,7 +338,7 @@ impl InstanceOperationImpl {
     pub fn new(dispatch: StaticDispatchInstanceOperation) -> Self {
         Self {
             dispatch,
-            associated_operations: RwLock::new(Some(Vec::new())),
+            finalized: AtomicBool::new(false),
             modified_times: RecordedModifiedTimes::default(),
         }
     }
@@ -358,47 +360,10 @@ impl InstanceOperationImpl {
         self.modified_times.take()
     }
 
-    pub async fn associated_operation(
-        &self,
-        associated_repository: Arc<RepositoryContext>,
-    ) -> Result<Arc<InstanceOperationImpl>, FsError> {
-        let mut associated_operations = self.associated_operations.write().await;
-        let Some(associated_operations) = associated_operations.as_mut() else {
-            return Err(FsError::internal("Operation already finalized"));
-        };
-        for (repository, operation) in associated_operations.iter() {
-            if Arc::ptr_eq(&associated_repository, repository) {
-                return Ok(operation.clone());
-            }
-        }
-        let new_operation = associated_repository
-            .file_system()
-            .begin_operation()
-            .await?;
-        associated_operations.push((associated_repository, new_operation.clone()));
-        Ok(new_operation)
-    }
-
-    async fn recursively_finalize(&self, changes_made: bool) -> Result<(), FsError> {
-        let mut associated_operations_option = self.associated_operations.write().await;
-        let Some(associated_operations) = associated_operations_option.as_mut() else {
-            return Err(FsError::internal("Operation already finalized"));
-        };
-        let mut result = self.dispatched_finalize(changes_made).await;
-        for (_, associated_operation) in &mut *associated_operations {
-            result =
-                result.and(Box::pin(associated_operation.recursively_finalize(changes_made)).await);
-        }
-        *associated_operations_option = None;
-        result
-    }
-
-    async fn dispatched_finalize(&self, changes_made: bool) -> Result<(), FsError> {
-        match &self.dispatch {
-            #[cfg(test)]
-            StaticDispatchInstanceOperation::Test(this) => this.finalize(changes_made).await,
-            StaticDispatchInstanceOperation::Os(this) => this.finalize(changes_made).await,
-        }
+    /// Whether this call is the one that finalizes, so a second is refused rather than
+    /// thawing a filesystem another caller still holds.
+    fn claim_finalize(&self) -> bool {
+        !self.finalized.swap(true, Ordering::AcqRel)
     }
 }
 
@@ -590,7 +555,14 @@ impl InstanceOperation for InstanceOperationImpl {
     }
 
     async fn finalize(&self, changes_made: bool) -> Result<(), FsError> {
-        self.recursively_finalize(changes_made).await
+        if !self.claim_finalize() {
+            return Err(FsError::internal("Operation already finalized"));
+        }
+        match &self.dispatch {
+            #[cfg(test)]
+            StaticDispatchInstanceOperation::Test(this) => this.finalize(changes_made).await,
+            StaticDispatchInstanceOperation::Os(this) => this.finalize(changes_made).await,
+        }
     }
 }
 
@@ -598,6 +570,8 @@ impl InstanceOperation for InstanceOperationImpl {
 pub mod tests {
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use async_trait::async_trait;
     use lore_base::types::Fragment;
@@ -613,6 +587,7 @@ pub mod tests {
     use crate::fs::filesystem_provider::InstanceOperationImpl;
     use crate::fs::filesystem_provider::StaticDispatchInstanceOperation;
     use crate::lore::Hash;
+    use crate::lore::RepositoryId;
     use crate::merge::MergeTextMode;
     use crate::node::Node;
     use crate::node::NodeID;
@@ -626,20 +601,27 @@ pub mod tests {
 
     #[derive(Default)]
     pub struct TestFilesystemProvider {
+        pub begin_count: Arc<AtomicUsize>,
         pub finalize_events: Arc<Mutex<Vec<bool>>>,
     }
 
     impl TestFilesystemProvider {
         pub fn new() -> TestFilesystemProvider {
             Self {
+                begin_count: Arc::new(AtomicUsize::new(0)),
                 finalize_events: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        pub fn begins(&self) -> usize {
+            self.begin_count.load(Ordering::Acquire)
         }
     }
 
     #[async_trait]
     impl FilesystemProvider for TestFilesystemProvider {
         async fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError> {
+            self.begin_count.fetch_add(1, Ordering::AcqRel);
             Ok(Arc::new(InstanceOperationImpl::new(
                 StaticDispatchInstanceOperation::Test(TestOperation {
                     finalize_events: self.finalize_events.clone(),
@@ -764,74 +746,58 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn sub_repository_instance_operation_finalize() {
-        async fn fake_repository() -> (Arc<TestFilesystemProvider>, Arc<RepositoryContext>) {
-            let (immutable_store, mutable_store, _context) =
-                test_store_create().await.expect("Making test stores");
-            let provider = Arc::new(TestFilesystemProvider::new());
-            (
-                provider.clone(),
-                Arc::new(RepositoryContext::new(
-                    default_repository_creation_args(immutable_store, mutable_store)
-                        .with_filesystem_provider(provider),
-                )),
-            )
-        }
+    async fn one_operation_covers_every_repository_in_the_filesystem() {
+        let (immutable_store, mutable_store, _context) =
+            test_store_create().await.expect("Making test stores");
+        let filesystem = Arc::new(TestFilesystemProvider::new());
+        let parent = Arc::new(RepositoryContext::new(
+            default_repository_creation_args(immutable_store, mutable_store)
+                .with_filesystem_provider(filesystem.clone()),
+        ));
+        let link = Arc::new(parent.to_link_context(RepositoryId::from([1; 16])).await);
 
-        let (parent_filesystem, parent_repo) = fake_repository().await;
-        let (child_1_filesystem, child_1_repo) = fake_repository().await;
-        let (child_2_filesystem, child_2_repo) = fake_repository().await;
-        let (grandchild_filesystem, grandchild_repo) = fake_repository().await;
-
-        let parent_operation = parent_repo.file_system().begin_operation().await.unwrap();
-        let child_1_operation = parent_operation
-            .associated_operation(child_1_repo)
-            .await
-            .unwrap();
-        let _child_2_operation = parent_operation
-            .associated_operation(child_2_repo)
-            .await
-            .unwrap();
-        let _grandchild_operation = child_1_operation
-            .associated_operation(grandchild_repo)
-            .await;
-
-        assert_eq!(
-            Vec::<bool>::new(),
-            *(parent_filesystem.finalize_events.lock())
-        );
-        assert_eq!(
-            Vec::<bool>::new(),
-            *(child_1_filesystem.finalize_events.lock())
-        );
-        assert_eq!(
-            Vec::<bool>::new(),
-            *(child_2_filesystem.finalize_events.lock())
-        );
-        assert_eq!(
-            Vec::<bool>::new(),
-            *(grandchild_filesystem.finalize_events.lock())
+        assert!(
+            Arc::ptr_eq(&parent.file_system(), &link.file_system()),
+            "A link takes its parent's provider, which is what makes one operation cover both"
         );
 
-        parent_operation
+        let operation = parent.file_system().begin_operation().await.unwrap();
+
+        assert_eq!(
+            1,
+            filesystem.begins(),
+            "The tree began more than one operation"
+        );
+        assert_eq!(Vec::<bool>::new(), *(filesystem.finalize_events.lock()));
+
+        operation.finalize(true).await.expect("Finalize failed");
+
+        assert_eq!(1, filesystem.begins());
+        assert_eq!(vec![true], *(filesystem.finalize_events.lock()));
+    }
+
+    #[tokio::test]
+    async fn finalizing_twice_is_refused() {
+        let (immutable_store, mutable_store, _context) =
+            test_store_create().await.expect("Making test stores");
+        let filesystem = Arc::new(TestFilesystemProvider::new());
+        let repository = Arc::new(RepositoryContext::new(
+            default_repository_creation_args(immutable_store, mutable_store)
+                .with_filesystem_provider(filesystem.clone()),
+        ));
+
+        let operation = repository.file_system().begin_operation().await.unwrap();
+        operation.finalize(true).await.expect("Finalize failed");
+        operation
             .finalize(true)
             .await
-            .expect("Finalize failed");
+            .expect_err("A second finalize should be refused");
 
-        assert_eq!(vec![true], *(parent_filesystem.finalize_events.lock()));
-        assert_eq!(vec![true], *(child_1_filesystem.finalize_events.lock()));
-        assert_eq!(vec![true], *(child_2_filesystem.finalize_events.lock()));
-        assert_eq!(vec![true], *(grandchild_filesystem.finalize_events.lock()));
-
-        parent_operation
-            .finalize(true)
-            .await
-            .expect_err("Finalize should have failed");
-
-        assert_eq!(vec![true], *(parent_filesystem.finalize_events.lock()));
-        assert_eq!(vec![true], *(child_1_filesystem.finalize_events.lock()));
-        assert_eq!(vec![true], *(child_2_filesystem.finalize_events.lock()));
-        assert_eq!(vec![true], *(grandchild_filesystem.finalize_events.lock()));
+        assert_eq!(
+            vec![true],
+            *(filesystem.finalize_events.lock()),
+            "The refused finalize reached the filesystem"
+        );
     }
 
     pub async fn test_store_create() -> Result<
