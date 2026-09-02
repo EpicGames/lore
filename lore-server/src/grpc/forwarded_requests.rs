@@ -144,6 +144,8 @@ pub struct RpcFlags {
 
     #[serde(default)]
     pub repository_create: bool,
+    #[serde(default)]
+    pub repository_get: bool,
 }
 
 pub trait ForwardedRequests: Send + Sync {

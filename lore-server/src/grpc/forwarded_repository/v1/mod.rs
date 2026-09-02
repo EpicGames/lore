@@ -2,4 +2,5 @@
 // SPDX-License-Identifier: MIT
 
 pub mod repository_create;
+pub mod repository_get;
 pub mod service;

@@ -468,6 +468,14 @@ mod tests {
                     .take()
                     .expect("repository_create called more than once")
             }
+
+            async fn repository_get(
+                &mut self,
+                _request: Request<lore_proto::lore::repository::v1::RepositoryGetRequest>,
+            ) -> ForwardedRequestResult<lore_proto::lore::repository::v1::RepositoryGetResponse>
+            {
+                unreachable!("repository_get should not be called in repository_create tests")
+            }
         }
 
         struct StubForwardedRequests {

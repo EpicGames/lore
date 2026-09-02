@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use lore_proto::lore::repository::v1::RepositoryCreateRequest;
 use lore_proto::lore::repository::v1::RepositoryCreateResponse;
+use lore_proto::lore::repository::v1::RepositoryGetRequest;
+use lore_proto::lore::repository::v1::RepositoryGetResponse;
 use lore_proto::lore::repository::v1::forwarded_repository_service_server::ForwardedRepositoryService;
 use lore_revision::environment::EnvironmentConfig;
 use lore_telemetry::InstrumentProvider;
@@ -14,6 +16,7 @@ use tonic::Response;
 use tonic::Status;
 
 use super::repository_create;
+use super::repository_get;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
 
@@ -79,6 +82,22 @@ impl ForwardedRepositoryService for LoreForwardedRepositoryV1Service {
                 self.mutable_store.clone(),
                 &self.hook_dispatcher,
                 &self.instrument_provider,
+            ),
+        )
+        .await
+    }
+
+    async fn repository_get(
+        &self,
+        request: Request<RepositoryGetRequest>,
+    ) -> Result<Response<RepositoryGetResponse>, Status> {
+        timeout_grpc(
+            self.rpc_timeout,
+            repository_get::handler(
+                request,
+                self.auth_url(),
+                self.immutable_store.clone(),
+                self.mutable_store.clone(),
             ),
         )
         .await

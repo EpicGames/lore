@@ -143,6 +143,7 @@ impl RepositoryService for LoreRepositoryV1Service {
                 self.auth_url(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                &self.forwarded_requests,
             ),
         )
         .await

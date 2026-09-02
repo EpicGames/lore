@@ -14,6 +14,11 @@ pub trait ForwardedRepositoryServiceClient: Send + Sync {
         &mut self,
         request: Request<v1::RepositoryCreateRequest>,
     ) -> ForwardedRequestResult<v1::RepositoryCreateResponse>;
+
+    async fn repository_get(
+        &mut self,
+        request: Request<v1::RepositoryGetRequest>,
+    ) -> ForwardedRequestResult<v1::RepositoryGetResponse>;
 }
 
 pub struct GrpcForwardedRepositoryServiceClient {
@@ -35,5 +40,12 @@ impl ForwardedRepositoryServiceClient for GrpcForwardedRepositoryServiceClient {
         request: Request<v1::RepositoryCreateRequest>,
     ) -> ForwardedRequestResult<v1::RepositoryCreateResponse> {
         Ok(self.client.repository_create(request).await)
+    }
+
+    async fn repository_get(
+        &mut self,
+        request: Request<v1::RepositoryGetRequest>,
+    ) -> ForwardedRequestResult<v1::RepositoryGetResponse> {
+        Ok(self.client.repository_get(request).await)
     }
 }

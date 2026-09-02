@@ -35,6 +35,7 @@ service RepositoryService {
 service ForwardedRepositoryService {
 
   rpc RepositoryCreate  (RepositoryCreateRequest)  returns (RepositoryCreateResponse);
+  rpc RepositoryGet     (RepositoryGetRequest)     returns (RepositoryGetResponse);
 }
 
 // Request to create a new repository. The caller pre-generates `id` and
