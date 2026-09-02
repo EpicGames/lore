@@ -2243,6 +2243,7 @@ pub(crate) async fn stage_node_from_metadata(
                     size,
                     &node_path,
                     !node.is_staged(),
+                    None,
                 )
                 .await
                 .forward::<StageError>("Failed to determine if file is modified")?

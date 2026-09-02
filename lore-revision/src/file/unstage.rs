@@ -893,6 +893,7 @@ async fn unstage_node(
                             file_size,
                             &node_path_rel,
                             true, /* Force hash check */
+                            None,
                         )
                         .await
                         .forward::<UnstageError>("Failed to check if file was modified")?

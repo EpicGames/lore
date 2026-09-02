@@ -552,6 +552,7 @@ async fn dirty_change_is_modified(
         file_size,
         &change.path,
         !node.is_staged(),
+        None,
     )
     .await
     .forward::<StatusError>("comparing dirty file against filesystem")?;

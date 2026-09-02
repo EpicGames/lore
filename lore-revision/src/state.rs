@@ -6369,6 +6369,7 @@ async fn compare_single_file_against_state(
             file_size,
             file_path,
             !force_hash_check,
+            None,
         )
         .await?;
         stats.classify(&modification);
@@ -8048,20 +8049,30 @@ pub async fn file_matches_node(
     node: &Node,
     file_size: u64,
     file_path: &RelativePath,
+    content: Option<&lore_storage::ContentHashMemo<'_>>,
 ) -> Result<NodeComparison, StateError> {
     if file_size != node.size {
         lore_trace!("File {file_path} size differs from node, differs");
         return Ok(NodeComparison::Differs);
     }
 
-    let absolute_path = file_path.to_absolute_path(repository.require_path()?);
-    let matches = immutable::file_matches(
-        repository,
-        &absolute_path,
-        node.address,
-        Some(node.size as usize),
-    )
-    .await;
+    let own_path;
+    let own_content;
+    let content = if let Some(content) = content {
+        debug_assert!(
+            repository
+                .require_path()
+                .is_ok_and(|root| file_path.to_absolute_path(root) == content.path()),
+            "a shared memo answers for another file"
+        );
+        content
+    } else {
+        own_path = file_path.to_absolute_path(repository.require_path()?);
+        own_content = lore_storage::ContentHashMemo::new(&own_path);
+        &own_content
+    };
+    let matches =
+        immutable::file_matches(repository, node.address, Some(node.size as usize), content).await;
 
     match matches {
         Ok(lore_storage::FileMatch::Match) => {
@@ -8147,6 +8158,7 @@ pub async fn file_modification(
     file_size: u64,
     file_path: &RelativePath,
     force_check_hash: bool,
+    content: Option<&lore_storage::ContentHashMemo<'_>>,
 ) -> Result<FileModification, StateError> {
     // Assume files are identical if size and timestamp match
     let node_size = node.size;
@@ -8170,7 +8182,7 @@ pub async fn file_modification(
     );
 
     Ok(
-        match file_matches_node(repository, node, file_size, file_path).await? {
+        match file_matches_node(repository, node, file_size, file_path, content).await? {
             NodeComparison::Matches => FileModification::UnmodifiedByHash,
             NodeComparison::Differs => FileModification::ModifiedByHash,
             NodeComparison::Unreadable => FileModification::Unreadable,
@@ -8192,6 +8204,7 @@ pub async fn file_modified_against_node(
     file_size: u64,
     file_path: &RelativePath,
     node_is_current: bool,
+    content: Option<&lore_storage::ContentHashMemo<'_>>,
 ) -> Result<FileModification, StateError> {
     let modification = file_modification(
         repository.clone(),
@@ -8200,6 +8213,7 @@ pub async fn file_modified_against_node(
         file_size,
         file_path,
         !node_is_current,
+        content,
     )
     .await?;
 
@@ -9754,6 +9768,149 @@ mod tests {
         let mut context = RepositoryContext::new_null_context(immutable_store, mutable_store);
         context.filter = Arc::new(filter);
         Arc::new(context)
+    }
+
+    /// A repository with a working tree, so a file on disk can be measured against a node.
+    async fn working_tree_repository(path: &std::path::Path) -> Arc<RepositoryContext> {
+        let immutable_store = lore_storage::local::immutable_store::create(
+            None::<&str>,
+            lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
+            false,
+            lore_storage::ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("in-memory immutable store");
+        let mutable_store = lore_storage::local::mutable_store::create(
+            None::<&str>,
+            lore_storage::MutableStoreSettings::default(),
+            immutable_store.clone(),
+        )
+        .await
+        .expect("in-memory mutable store");
+
+        let mut context = RepositoryContext::new_null_context(immutable_store, mutable_store);
+        context.path = Some(path.to_path_buf());
+        Arc::new(context)
+    }
+
+    fn pseudo_random_bytes(length: usize) -> Vec<u8> {
+        (0..length)
+            .map(|index| (index.wrapping_mul(2_654_435_761) >> 11) as u8)
+            .collect()
+    }
+
+    fn content_node(content: &[u8]) -> Node {
+        let mut node = Node::new_zeroed();
+        node.address = Address::zero_context_hash(Hash::hash_buffer(content));
+        node.size = content.len() as u64;
+        node
+    }
+
+    /// A file written into the working tree, and the path it is known by.
+    async fn write_working_file(
+        repository: &Arc<RepositoryContext>,
+        name: &str,
+        content: &[u8],
+    ) -> RelativePath {
+        let path = crate::util::path::RelativePathBuf::new().push_and_freeze(name);
+        lore_io::IoDriver::global()
+            .write_file_bytes(
+                path.to_absolute_path(repository.require_path().expect("working tree")),
+                bytes::Bytes::copy_from_slice(content),
+                false,
+            )
+            .await
+            .expect("write working file");
+        path
+    }
+
+    /// A comparison that settles nothing has to read as modified. The address names a list
+    /// nothing stored, so neither the stored chunking nor a rehash can answer, and
+    /// overwriting a file that may hold local work is the one outcome there is no
+    /// recovering from.
+    #[tokio::test]
+    async fn a_comparison_that_settles_nothing_reads_as_modified() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(150 * 1024);
+        let path = write_working_file(&repository, "settles-nothing.bin", &content).await;
+
+        let mut node = content_node(&content);
+        node.address = Address::zero_context_hash(Hash::hash_buffer(b"a list nothing stored"));
+
+        assert!(matches!(
+            file_matches_node(repository.clone(), &node, node.size, &path, None,)
+                .await
+                .expect("comparing a readable file must not error"),
+            NodeComparison::Differs
+        ));
+        assert!(
+            file_modification(repository, &node, 1, node.size, &path, true, None,)
+                .await
+                .expect("comparing a readable file must not error")
+                .is_modified()
+        );
+    }
+
+    /// Content addressed by its own hash needs nothing from the store to be decided,
+    /// either way.
+    #[tokio::test]
+    async fn an_unfragmented_file_is_decided_by_its_own_hash() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(20 * 1024);
+        let path = write_working_file(&repository, "unfragmented.bin", &content).await;
+        let node = content_node(&content);
+
+        assert!(matches!(
+            file_matches_node(repository.clone(), &node, node.size, &path, None,)
+                .await
+                .expect("comparing a readable file must not error"),
+            NodeComparison::Matches
+        ));
+
+        let mut edited = content.clone();
+        edited[content.len() / 2] ^= 0xff;
+        lore_io::IoDriver::global()
+            .write_file_bytes(
+                path.to_absolute_path(repository.require_path().expect("working tree")),
+                bytes::Bytes::from(edited),
+                false,
+            )
+            .await
+            .expect("rewrite working file");
+
+        assert!(
+            file_modification(repository, &node, 1, node.size, &path, true, None,)
+                .await
+                .expect("comparing a readable file must not error")
+                .is_modified()
+        );
+    }
+
+    /// A file of another size is modified without the file being read at all.
+    #[tokio::test]
+    async fn a_file_of_another_size_is_modified_unread() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let repository = working_tree_repository(dir.path()).await;
+        let content = pseudo_random_bytes(20 * 1024);
+        let path = write_working_file(&repository, "resized.bin", &content).await;
+        let node = content_node(&content[..content.len() - 1]);
+
+        assert!(matches!(
+            file_modification(
+                repository,
+                &node,
+                1,
+                content.len() as u64,
+                &path,
+                false,
+                None,
+            )
+            .await
+            .expect("comparing a readable file must not error"),
+            FileModification::ModifiedBySize
+        ));
     }
 
     fn link_id(byte: u8) -> RepositoryId {

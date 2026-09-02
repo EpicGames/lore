@@ -24,6 +24,7 @@ use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::FilesystemPath;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::MeasuredNode;
 use crate::hash;
 use crate::interface::LoreString;
 use crate::link::LinkFlags;
@@ -312,6 +313,165 @@ pub async fn verify_filesystem_for_changes(
     Ok(Arc::new(changes))
 }
 
+/// The address of the content a change brings in. `NodeChangeState` carries it where the
+/// producer set it, and the node holds it otherwise.
+async fn incoming_address(change: &NodeChange) -> crate::lore::Address {
+    if !change.to.address.is_zero() {
+        return change.to.address;
+    }
+
+    change
+        .to
+        .get_node()
+        .await
+        .map(|node| node.address)
+        .unwrap_or_default()
+}
+
+/// Whether the file holds the content the change starts from, which realizing the change
+/// replaces.
+///
+/// A merge measures the file against the node the current revision holds, and a file reset to
+/// an earlier revision matches neither that nor the incoming content while still being content
+/// the change accounts for.
+async fn holds_the_replaced_content(
+    operation: &Arc<InstanceOperationImpl>,
+    change: &NodeChange,
+    file_size: u64,
+    measured: Option<crate::lore::Address>,
+    incoming: crate::lore::Address,
+    content: &lore_storage::ContentHashMemo<'_>,
+) -> Result<bool, SyncError> {
+    if !change.from.node.is_valid_node_id() {
+        return Ok(false);
+    }
+
+    let node_from = change
+        .from
+        .get_node()
+        .await
+        .forward::<SyncError>("Failed loading the node the change starts from")?;
+    if !node_from.is_file() || Some(node_from.address) == measured || node_from.address == incoming
+    {
+        return Ok(false);
+    }
+
+    Ok(matches!(
+        operation
+            .compare_file_to_node(
+                change.from.repository.clone(),
+                &node_from,
+                &change.path,
+                file_size,
+                content,
+            )
+            .await?,
+        NodeComparison::Matches
+    ))
+}
+
+/// How the working file compares to the node it was realized from, and whether the current
+/// revision is what holds that node.
+///
+/// A three-way merge's from side is the base revision, which answers for nothing on disk, so
+/// the node the current revision holds at the path stands in. Where the change starts at the
+/// current revision the two are the same node, reached by id rather than by path, and where
+/// the current revision holds none the from side is all there is. The node is measured in the
+/// context that holds it, whose partition its content lives in.
+async fn modification_against_measured_node(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    change: &NodeChange,
+    state_current: &Arc<State>,
+    force_full_check: bool,
+    repository_path: &RepositoryPath,
+    content: &lore_storage::ContentHashMemo<'_>,
+) -> Result<crate::fs::filesystem_provider::FileModifiedCheck, SyncError> {
+    let info = operation
+        .file_info(FilesystemPath::Repository(repository_path))
+        .await?;
+    if !info.exists {
+        return Ok(crate::fs::filesystem_provider::FileModifiedCheck {
+            info,
+            measured: None,
+            modification: None,
+        });
+    }
+
+    let from_is_current = change.from.state.revision() == state_current.revision();
+    let node_link = if from_is_current {
+        NodeLink::invalid()
+    } else {
+        state_current
+            .find_node_link(repository.clone(), change.path.as_str())
+            .await
+            .unwrap_or_default()
+    };
+
+    let (node, repository_measured, is_current) = if node_link.node.is_valid_node_id() {
+        let (repository_current, state_node) = node_link
+            .resolve(repository.clone(), state_current.clone())
+            .await
+            .forward_with::<SyncError, _>(|| {
+                format!("Failed to deserialize state {}", node_link.revision)
+            })?;
+        let node = state_node
+            .node(repository_current.clone(), node_link.node)
+            .await
+            .forward::<SyncError>("Failed loading the node the current revision holds")?;
+        (Some(node), repository_current, true)
+    } else if change.from.node.is_valid_node_id() {
+        let node = change
+            .from
+            .get_node()
+            .await
+            .forward::<SyncError>("Failed to find node")?;
+        (Some(node), change.from.repository.clone(), from_is_current)
+    } else {
+        (None, repository, from_is_current)
+    };
+
+    let modification = match node.as_ref() {
+        Some(node) if info.is_file && node.is_file() => {
+            let modification = if force_full_check {
+                state::file_modification(
+                    repository_measured,
+                    node,
+                    info.mtime,
+                    info.size,
+                    &change.path,
+                    true,
+                    Some(content),
+                )
+                .await
+            } else {
+                state::file_modified_against_node(
+                    repository_measured,
+                    node,
+                    info.mtime,
+                    info.size,
+                    &change.path,
+                    is_current,
+                    Some(content),
+                )
+                .await
+            }
+            .forward::<SyncError>("Failed to check file modification")?;
+
+            Some(crate::fs::filesystem_provider::FileDifferenceFromNode {
+                modified: modification.is_modified(),
+            })
+        }
+        _ => None,
+    };
+
+    Ok(crate::fs::filesystem_provider::FileModifiedCheck {
+        info,
+        measured: node.map(|node| MeasuredNode { node, is_current }),
+        modification,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn verify_filesystem(
     change: NodeChange,
@@ -324,16 +484,18 @@ pub async fn verify_filesystem(
     filter_mode: FilterMode,
 ) -> Result<Option<NodeChange>, SyncError> {
     lore_trace!("Verify path: {change:?}");
-    // A recorded modified time speaks for the node the current revision holds, so it can only
-    // answer for the from side of a change that starts there.
-    let from_is_current = change.from.state.revision() == state_current.revision();
-    let modifications = operation
-        .is_file_modified(
-            repository.clone(),
-            &change,
-            force_full_check || !from_is_current,
-        )
-        .await?;
+    let repository_path = RepositoryPath::from_relative(&repository, change.path.clone())?;
+    let content = lore_storage::ContentHashMemo::new(repository_path.absolute());
+    let modifications = modification_against_measured_node(
+        &operation,
+        repository.clone(),
+        &change,
+        &state_current,
+        force_full_check,
+        &repository_path,
+        &content,
+    )
+    .await?;
 
     if !modifications.info.exists {
         return match change.action {
@@ -374,6 +536,19 @@ pub async fn verify_filesystem(
     if let Some(modification) = modifications.modification {
         // Check if file is modified
         if !modification.modified {
+            if change.action == change::FileAction::Keep
+                && let Some(measured) = modifications.measured.as_ref()
+                && measured.is_current
+                && !measured.node.address.is_zero()
+                && measured.node.address == incoming_address(&change).await
+            {
+                operation.record_modified_time(
+                    &change.from.repository,
+                    &change.path,
+                    modifications.info.mtime,
+                );
+                return Ok(None);
+            }
             stats.file_retain.fetch_add(1, Ordering::Relaxed);
             return Ok(Some(change));
         }
@@ -436,24 +611,42 @@ pub async fn verify_filesystem(
             return Ok(Some(change));
         }
 
-        // At this point (not deleted and target is a file) the to block is valid and the remaining
-        // check is to see if the local file system file matches the target incoming file. The
-        // file already differs from the from node, so the same comparison is asked again about
-        // the to node: measuring against each node's own fragmentation is the only way to tell,
-        // and the answer for one says nothing about the other.
-        match operation
-            .compare_file_to_node(
-                change.from.repository.clone(),
-                &node_to,
-                &change.path,
-                file_size,
-            )
-            .await?
-        {
+        let differs_from = modifications
+            .modification
+            .and(modifications.measured.as_ref())
+            .map(|measured| measured.node.address);
+        let comparison = if differs_from == Some(node_to.address) {
+            NodeComparison::Differs
+        } else {
+            operation
+                .compare_file_to_node(
+                    change.from.repository.clone(),
+                    &node_to,
+                    &change.path,
+                    file_size,
+                    &content,
+                )
+                .await?
+        };
+
+        match comparison {
             NodeComparison::Differs => {
                 if forward_changes {
                     lore_info!("Keeping modified file as locally modified: {}", change.path);
                     return Ok(None);
+                }
+
+                if holds_the_replaced_content(
+                    &operation,
+                    &change,
+                    file_size,
+                    differs_from,
+                    node_to.address,
+                    &content,
+                )
+                .await?
+                {
+                    return Ok(Some(change));
                 }
 
                 lore_error!(
@@ -2278,5 +2471,532 @@ impl LoreRevisionSyncFileEventData {
             action: node_change.action.into(),
             flag_file: file.into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::change::FileAction;
+    use crate::change::NodeChangeState;
+    use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
+    use crate::repository::test_helpers::default_repository_creation_args;
+    use crate::util::path::RelativePathBuf;
+
+    async fn with_execution<F: Future>(body: F) -> F::Output {
+        let execution = Arc::new(crate::interface::ExecutionContext::new_client(
+            crate::interface::LoreGlobalArgs::default(),
+            crate::relay::EventDispatcher::no_dispatch(),
+        ));
+        lore_base::runtime::LORE_CONTEXT
+            .scope(execution, body)
+            .await
+    }
+
+    async fn working_tree_repository(path: &Path) -> Arc<RepositoryContext> {
+        let immutable_store = lore_storage::local::immutable_store::create(
+            None::<&str>,
+            lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
+            false,
+            lore_storage::ImmutableStoreSettings::default(),
+        )
+        .await
+        .expect("in-memory immutable store");
+        let mutable_store = lore_storage::local::mutable_store::create(
+            None::<&str>,
+            lore_storage::MutableStoreSettings::default(),
+            immutable_store.clone(),
+        )
+        .await
+        .expect("in-memory mutable store");
+
+        Arc::new(
+            RepositoryContext::new(
+                default_repository_creation_args(immutable_store, mutable_store).with_path(path),
+            )
+            .with_write_token(crate::repository::RepositoryWriteToken::acquire(path).await),
+        )
+    }
+
+    fn pseudo_random_bytes(length: usize, salt: usize) -> Vec<u8> {
+        (0..length)
+            .map(|index| (index.wrapping_add(salt).wrapping_mul(2_654_435_761) >> 11) as u8)
+            .collect()
+    }
+
+    fn file_node(content: &[u8]) -> Node {
+        let mut node = Node::new_zeroed();
+        node.flags = NodeFlags::File.bits();
+        node.address = crate::lore::Address::zero_context_hash(hash::hash_slice(content));
+        node.size = content.len() as u64;
+        node
+    }
+
+    /// One side of a change: the state holding a node at a path, and what it addresses.
+    struct Staged {
+        state: Arc<State>,
+        node: NodeID,
+        address: crate::lore::Address,
+    }
+
+    /// A state holding `node` at `path`, under a revision of its own.
+    async fn state_holding(
+        repository: &Arc<RepositoryContext>,
+        path: &RelativePath,
+        node: Node,
+        revision: u8,
+    ) -> Staged {
+        let state = Arc::new(State::new());
+        state.set_revision(crate::lore::Hash::from([revision; 32]));
+        let link = crate::stage::stage_single_node(
+            repository.clone(),
+            state.clone(),
+            path.clone(),
+            node,
+            Arc::default(),
+            None,
+            FilterMode::Full,
+        )
+        .await
+        .expect("stage the node");
+        Staged {
+            state,
+            node: link.node,
+            address: node.address,
+        }
+    }
+
+    async fn write_working_file(
+        repository: &Arc<RepositoryContext>,
+        path: &RelativePath,
+        content: &[u8],
+    ) {
+        lore_io::IoDriver::global()
+            .write_file_bytes(
+                path.to_absolute_path(repository.require_path().expect("working tree")),
+                bytes::Bytes::copy_from_slice(content),
+                false,
+            )
+            .await
+            .expect("write working file");
+    }
+
+    fn side(repository: &Arc<RepositoryContext>, staged: &Staged) -> NodeChangeState {
+        NodeChangeState {
+            repository: repository.clone(),
+            state: staged.state.clone(),
+            node: staged.node,
+            flags: NodeFlags::File,
+            address: staged.address,
+        }
+    }
+
+    /// Verify one merge change, whose from side is the base revision, against the
+    /// working tree at `state_current`.
+    async fn verify(
+        repository: &Arc<RepositoryContext>,
+        path: &RelativePath,
+        base: &Staged,
+        source: &Staged,
+        current: &Staged,
+    ) -> Result<Option<NodeChange>, SyncError> {
+        Box::pin(verify_action(
+            repository,
+            path,
+            base,
+            source,
+            current,
+            FileAction::Keep,
+        ))
+        .await
+    }
+
+    /// [`verify`] for a change of a given action.
+    async fn verify_action(
+        repository: &Arc<RepositoryContext>,
+        path: &RelativePath,
+        base: &Staged,
+        source: &Staged,
+        current: &Staged,
+        action: FileAction,
+    ) -> Result<Option<NodeChange>, SyncError> {
+        let operation = repository
+            .file_system()
+            .begin_operation()
+            .await
+            .expect("filesystem operation");
+        let change = NodeChange {
+            action,
+            flags: change::Flags::None,
+            from: side(repository, base),
+            to: side(repository, source),
+            path: path.clone(),
+            from_path: None,
+        };
+
+        Box::pin(verify_filesystem(
+            change,
+            repository.clone(),
+            operation,
+            current.state.clone(),
+            false,
+            false,
+            Arc::default(),
+            FilterMode::Full,
+        ))
+        .await
+    }
+
+    /// Record that the working file holds the current revision's content, which is what a
+    /// sync or a switch leaves behind.
+    async fn record_time(repository: &Arc<RepositoryContext>, path: &RelativePath) {
+        let operation = repository
+            .file_system()
+            .begin_operation()
+            .await
+            .expect("filesystem operation");
+        let repository_path =
+            RepositoryPath::from_relative(repository, path.clone()).expect("path");
+        let info = operation
+            .file_info(FilesystemPath::Repository(&repository_path))
+            .await
+            .expect("file info");
+        state::file_modified_time_store(repository.clone(), path, info.mtime).await;
+    }
+
+    /// A file the branch never touched, holding what the current revision says it should.
+    /// The merge has to be free to overwrite it.
+    #[tokio::test]
+    async fn a_clean_file_is_overwritten() {
+        Box::pin(with_execution(async {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let repository = working_tree_repository(dir.path()).await;
+            let path = RelativePathBuf::new().push_and_freeze("clean.bin");
+            let base_content = pseudo_random_bytes(20 * 1024, 0);
+            let source_content = pseudo_random_bytes(20 * 1024, 1);
+            write_working_file(&repository, &path, &base_content).await;
+
+            let base = state_holding(&repository, &path, file_node(&base_content), 1).await;
+            let source = state_holding(&repository, &path, file_node(&source_content), 2).await;
+            let current = state_holding(&repository, &path, file_node(&base_content), 3).await;
+
+            assert!(
+                Box::pin(verify(&repository, &path, &base, &source, &current))
+                    .await
+                    .expect("a clean file is not a failure")
+                    .is_some(),
+                "The change has to reach realize"
+            );
+        }))
+        .await;
+    }
+
+    /// A file reset to an earlier revision holds neither the current revision's content nor
+    /// the incoming content, and is still content the change accounts for.
+    #[tokio::test]
+    async fn a_file_holding_the_replaced_content_is_realized() {
+        Box::pin(with_execution(async {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let repository = working_tree_repository(dir.path()).await;
+            let path = RelativePathBuf::new().push_and_freeze("reset.bin");
+            let base_content = pseudo_random_bytes(20 * 1024, 0);
+            let source_content = pseudo_random_bytes(20 * 1024, 1);
+            let current_content = pseudo_random_bytes(20 * 1024, 2);
+            write_working_file(&repository, &path, &base_content).await;
+
+            let base = state_holding(&repository, &path, file_node(&base_content), 1).await;
+            let source = state_holding(&repository, &path, file_node(&source_content), 2).await;
+            let current = state_holding(&repository, &path, file_node(&current_content), 3).await;
+
+            assert!(
+                Box::pin(verify(&repository, &path, &base, &source, &current))
+                    .await
+                    .expect("content the change replaces is not a failure")
+                    .is_some(),
+                "The file holds what the change replaces, so the change reaches realize"
+            );
+        }))
+        .await;
+    }
+
+    /// A file that holds neither the current revision's content nor the incoming content
+    /// is local work, and the merge has to refuse it.
+    #[tokio::test]
+    async fn a_locally_edited_file_is_refused() {
+        Box::pin(with_execution(async {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let repository = working_tree_repository(dir.path()).await;
+            let path = RelativePathBuf::new().push_and_freeze("edited.bin");
+            let base_content = pseudo_random_bytes(20 * 1024, 0);
+            let source_content = pseudo_random_bytes(20 * 1024, 1);
+            write_working_file(&repository, &path, &pseudo_random_bytes(20 * 1024, 2)).await;
+
+            let base = state_holding(&repository, &path, file_node(&base_content), 1).await;
+            let source = state_holding(&repository, &path, file_node(&source_content), 2).await;
+            let current = state_holding(&repository, &path, file_node(&base_content), 3).await;
+
+            assert!(
+                Box::pin(verify(&repository, &path, &base, &source, &current))
+                    .await
+                    .is_err(),
+                "Local work must not be overwritten"
+            );
+        }))
+        .await;
+    }
+
+    /// A file already holding the incoming content has nothing to realize.
+    #[tokio::test]
+    async fn a_file_already_holding_the_incoming_content_is_dropped() {
+        Box::pin(with_execution(async {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let repository = working_tree_repository(dir.path()).await;
+            let path = RelativePathBuf::new().push_and_freeze("incoming.bin");
+            let base_content = pseudo_random_bytes(20 * 1024, 0);
+            let source_content = pseudo_random_bytes(20 * 1024, 1);
+            write_working_file(&repository, &path, &source_content).await;
+
+            let base = state_holding(&repository, &path, file_node(&base_content), 1).await;
+            let source = state_holding(&repository, &path, file_node(&source_content), 2).await;
+            let current = state_holding(&repository, &path, file_node(&base_content), 3).await;
+
+            assert!(
+                Box::pin(verify(&repository, &path, &base, &source, &current))
+                    .await
+                    .expect("a file at the incoming content is not a failure")
+                    .is_none()
+            );
+        }))
+        .await;
+    }
+
+    /// A change the target branch made, which the working tree already holds. Realizing it
+    /// would rewrite the file with the bytes already in it.
+    #[tokio::test]
+    async fn a_target_side_change_the_tree_already_holds_is_dropped() {
+        Box::pin(with_execution(async {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let repository = working_tree_repository(dir.path()).await;
+            let path = RelativePathBuf::new().push_and_freeze("target-side.bin");
+            let base_content = pseudo_random_bytes(20 * 1024, 0);
+            let target_content = pseudo_random_bytes(20 * 1024, 1);
+            write_working_file(&repository, &path, &target_content).await;
+
+            let base = state_holding(&repository, &path, file_node(&base_content), 1).await;
+            let current = state_holding(&repository, &path, file_node(&target_content), 3).await;
+
+            assert!(
+                Box::pin(verify(&repository, &path, &base, &current, &current))
+                    .await
+                    .expect("a file at the target content is not a failure")
+                    .is_none()
+            );
+        }))
+        .await;
+    }
+
+    /// Store `content` under a fragment list cut at boundaries this build never cuts at,
+    /// as a client of another version left it, and return the node addressing it.
+    async fn stored_under_a_list(repository: &Arc<RepositoryContext>, content: &[u8]) -> Node {
+        use zerocopy::IntoBytes;
+
+        let mut list = Vec::new();
+        let mut offset = 0;
+        while offset < content.len() {
+            let end = (offset + 17 * 1024).min(content.len());
+            list.push(crate::lore::FragmentReference {
+                hash: hash::hash_slice(&content[offset..end]),
+                offset_content: offset as u64,
+            });
+            offset = end;
+        }
+
+        let payload = bytes::Bytes::copy_from_slice(list.as_slice().as_bytes());
+        let address = crate::lore::Address::zero_context_hash(hash::hash_slice(&payload));
+        crate::immutable::store_raw_store_retry(
+            repository.immutable_store(),
+            repository.id,
+            address,
+            crate::lore::Fragment {
+                flags: crate::fragment::FragmentFlags::PayloadFragmented.bits(),
+                size_payload: payload.len() as u32,
+                size_content: content.len() as u64,
+            },
+            Some(payload),
+        )
+        .await
+        .expect("store the fragment list");
+
+        let mut node = Node::new_zeroed();
+        node.flags = NodeFlags::File.bits();
+        node.address = address;
+        node.size = content.len() as u64;
+        node
+    }
+
+    /// The reported shape: the current revision addresses the file as a fragment list some
+    /// other version of the client cut, and the file is untouched. The list is what answers
+    /// for it, and the merge has to be free to overwrite it.
+    #[tokio::test]
+    async fn a_clean_file_addressed_as_a_list_is_overwritten() {
+        Box::pin(with_execution(async {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let repository = working_tree_repository(dir.path()).await;
+            let path = RelativePathBuf::new().push_and_freeze("listed.bin");
+            let content = pseudo_random_bytes(150 * 1024, 0);
+            let source_content = pseudo_random_bytes(150 * 1024, 1);
+            write_working_file(&repository, &path, &content).await;
+
+            let listed = stored_under_a_list(&repository, &content).await;
+            assert_ne!(
+                listed.address.hash,
+                hash::hash_slice(&content),
+                "The node has to address a list for this to be the case under test"
+            );
+
+            let base = state_holding(&repository, &path, listed, 1).await;
+            let source = state_holding(&repository, &path, file_node(&source_content), 2).await;
+            let current = state_holding(&repository, &path, listed, 3).await;
+
+            assert!(
+                Box::pin(verify(&repository, &path, &base, &source, &current))
+                    .await
+                    .expect("a clean file is not a failure")
+                    .is_some(),
+                "The stored list answers for the file, so the change reaches realize"
+            );
+        }))
+        .await;
+    }
+
+    /// A change that starts at the current revision measures against the node the from side
+    /// names, reached by id rather than by path.
+    #[tokio::test]
+    async fn a_change_starting_at_the_current_revision_is_measured_by_its_own_node() {
+        Box::pin(with_execution(async {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let repository = working_tree_repository(dir.path()).await;
+            let path = RelativePathBuf::new().push_and_freeze("from-current.bin");
+            let content = pseudo_random_bytes(20 * 1024, 0);
+            let incoming = pseudo_random_bytes(20 * 1024, 1);
+            write_working_file(&repository, &path, &content).await;
+
+            let current = state_holding(&repository, &path, file_node(&content), 1).await;
+            let source = state_holding(&repository, &path, file_node(&incoming), 2).await;
+
+            assert!(
+                Box::pin(verify(&repository, &path, &current, &source, &current))
+                    .await
+                    .expect("a clean file is not a failure")
+                    .is_some()
+            );
+        }))
+        .await;
+    }
+
+    /// A path the current revision holds no node at is measured against the from side. That
+    /// node is not the current revision's, so the file is realized rather than dropped and
+    /// nothing is recorded against a revision that never held it.
+    #[tokio::test]
+    async fn a_path_the_current_revision_does_not_hold_is_realized() {
+        Box::pin(with_execution(async {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let repository = working_tree_repository(dir.path()).await;
+            let path = RelativePathBuf::new().push_and_freeze("untracked.bin");
+            let elsewhere = RelativePathBuf::new().push_and_freeze("elsewhere.bin");
+            let content = pseudo_random_bytes(20 * 1024, 0);
+            write_working_file(&repository, &path, &content).await;
+
+            let base = state_holding(&repository, &path, file_node(&content), 1).await;
+            let source = state_holding(&repository, &path, file_node(&content), 2).await;
+            let current = state_holding(&repository, &elsewhere, file_node(&content), 3).await;
+
+            assert!(
+                Box::pin(verify(&repository, &path, &base, &source, &current))
+                    .await
+                    .expect("a readable file is not a failure")
+                    .is_some(),
+                "The from side is not the current revision's node, so nothing may be dropped"
+            );
+        }))
+        .await;
+    }
+
+    /// A rename carries a source to remove and a destination to create, which equal content
+    /// says nothing about, so it is realized however the addresses compare.
+    #[tokio::test]
+    async fn a_move_of_unchanged_content_is_realized() {
+        Box::pin(with_execution(async {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let repository = working_tree_repository(dir.path()).await;
+            let path = RelativePathBuf::new().push_and_freeze("moved.bin");
+            let content = pseudo_random_bytes(20 * 1024, 0);
+            write_working_file(&repository, &path, &content).await;
+
+            let node = file_node(&content);
+            let base = state_holding(&repository, &path, node, 1).await;
+            let source = state_holding(&repository, &path, node, 2).await;
+            let current = state_holding(&repository, &path, node, 3).await;
+
+            assert!(
+                Box::pin(verify_action(
+                    &repository,
+                    &path,
+                    &base,
+                    &source,
+                    &current,
+                    FileAction::Move
+                ))
+                .await
+                .expect("a clean file is not a failure")
+                .is_some(),
+                "A move must reach realize even where the content is already in place"
+            );
+        }))
+        .await;
+    }
+
+    /// A file addressed as a list nothing in the store holds, so no hash check can
+    /// establish anything about it.
+    ///
+    /// Unresolved has to read as modified, and the merge refuses. What spares an
+    /// untouched file that fate is the modified time recorded against the current
+    /// revision, which the base revision's node could never carry.
+    #[tokio::test]
+    async fn an_unresolvable_chunking_is_refused_until_a_recorded_time_answers() {
+        Box::pin(with_execution(async {
+            let dir = tempfile::TempDir::new().expect("temp dir");
+            let repository = working_tree_repository(dir.path()).await;
+            let path = RelativePathBuf::new().push_and_freeze("unresolvable.bin");
+            let base_content = pseudo_random_bytes(150 * 1024, 0);
+            let source_content = pseudo_random_bytes(150 * 1024, 1);
+            write_working_file(&repository, &path, &base_content).await;
+
+            let mut unresolvable = file_node(&base_content);
+            unresolvable.address =
+                crate::lore::Address::zero_context_hash(hash::hash_slice(b"a list nothing stored"));
+
+            let base = state_holding(&repository, &path, unresolvable, 1).await;
+            let source = state_holding(&repository, &path, file_node(&source_content), 2).await;
+            let current = state_holding(&repository, &path, unresolvable, 3).await;
+
+            assert!(
+                Box::pin(verify(&repository, &path, &base, &source, &current))
+                    .await
+                    .is_err(),
+                "Nothing established means the file may hold local work"
+            );
+
+            record_time(&repository, &path).await;
+
+            assert!(
+                Box::pin(verify(&repository, &path, &base, &source, &current))
+                    .await
+                    .expect("the recorded time answers for the file")
+                    .is_some(),
+                "The time recorded against the current revision spares the file the hash check"
+            );
+        }))
+        .await;
     }
 }

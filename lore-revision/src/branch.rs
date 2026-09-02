@@ -4108,6 +4108,48 @@ mod tests {
             .expect("serializing the revision state")
     }
 
+    /// Write a revision on a branch of its own. Without a distinguishing metadata
+    /// hash it would be addressed as, and so be, the revision the parent's own line
+    /// holds at that number.
+    async fn write_branch_revision(
+        repository: &Arc<RepositoryContext>,
+        parent: Hash,
+        revision_number: u64,
+        distinguisher: u8,
+    ) -> Hash {
+        let token = repository
+            .try_write_token()
+            .expect("a null context carries a write token");
+        let state = Arc::new(State::new());
+        state.set_parent_self(parent);
+        state.set_revision_number(revision_number);
+        state.set_metadata_hash(revision(distinguisher));
+        state
+            .serialize(repository.clone(), token)
+            .await
+            .expect("serializing the revision state")
+    }
+
+    /// Write a merge revision, carrying the revision merged in as its other parent.
+    async fn write_merge_revision(
+        repository: &Arc<RepositoryContext>,
+        parent_self: Hash,
+        parent_other: Hash,
+        revision_number: u64,
+    ) -> Hash {
+        let token = repository
+            .try_write_token()
+            .expect("a null context carries a write token");
+        let state = Arc::new(State::new());
+        state.set_parent_self(parent_self);
+        state.set_parent_other(parent_other);
+        state.set_revision_number(revision_number);
+        state
+            .serialize(repository.clone(), token)
+            .await
+            .expect("serializing the revision state")
+    }
+
     /// Write a line of `count` revisions numbered from `first_revision_number`,
     /// returning them oldest first.
     async fn write_line(
@@ -4427,6 +4469,249 @@ mod tests {
                 found,
                 Some(target_line[1]),
                 "The lower numbered branch point is the guess, and it is never zero"
+            );
+        }))
+        .await;
+    }
+
+    /// A trunk 2000 revisions past the branch point, against a search depth of 500,
+    /// with the branch having merged the trunk once in between. The base is the
+    /// revision that merge carried across, which only the merge search can find.
+    #[tokio::test]
+    async fn common_ancestor_finds_an_earlier_merge_beyond_the_search_depth() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            // Numbers chosen to sit either side of the search depth the way the
+            // reported case does: 2000 revisions of trunk since the branch point,
+            // against a depth of 500.
+            let trunk = write_line(&repository, Hash::default(), 1, 3000).await;
+            let branch_point = trunk[999];
+            let merged_in = trunk[1499];
+            let trunk_tip = *trunk.last().expect("the trunk has revisions");
+
+            let branch_first = write_branch_revision(&repository, branch_point, 1001, 200).await;
+            let branch_merge =
+                write_merge_revision(&repository, branch_first, merged_in, 1501).await;
+
+            let target_stack = [BranchPoint {
+                branch: branch_id(9),
+                revision: branch_point,
+            }];
+
+            let from_points = Box::pin(find_common_ancestor_from_branch_points(
+                repository.clone(),
+                branch_id(9),
+                trunk_tip,
+                &[],
+                branch_id(1),
+                branch_merge,
+                &target_stack,
+            ))
+            .await
+            .expect("exhausting the depth is not a failure");
+
+            assert_eq!(
+                from_points,
+                Some(branch_point),
+                "Out of depth, the branch points can only offer the branch point"
+            );
+
+            let from_merges = find_common_ancestor_from_merges(
+                repository,
+                branch_id(9),
+                trunk_tip,
+                branch_id(1),
+                branch_merge,
+                branch_point,
+            )
+            .await
+            .expect("the walk must not fail on readable history");
+
+            assert_eq!(
+                from_merges,
+                Some(merged_in),
+                "The revision the earlier merge carried across is the base, not the branch point"
+            );
+        }))
+        .await;
+    }
+
+    /// The trunk merged the branch 1499 revisions below its tip, three times the
+    /// search depth. The base is the branch revision the trunk holds, reached through
+    /// the trunk's merge revision.
+    #[tokio::test]
+    async fn common_ancestor_is_what_the_trunk_already_merged_of_the_branch() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let trunk_below = write_line(&repository, Hash::default(), 1, 1500).await;
+            let branch_point = trunk_below[999];
+
+            let branch_first = write_branch_revision(&repository, branch_point, 1001, 220).await;
+            let branch_merged = write_branch_revision(&repository, branch_first, 1002, 221).await;
+            // The branch carried on after the trunk took it, so its tip is not what
+            // the trunk holds.
+            let branch_tip = write_branch_revision(&repository, branch_merged, 1003, 222).await;
+
+            let trunk_merge = write_merge_revision(
+                &repository,
+                *trunk_below.last().expect("the trunk has revisions"),
+                branch_merged,
+                1501,
+            )
+            .await;
+            let trunk_above = write_line(&repository, trunk_merge, 1502, 1499).await;
+            let trunk_tip = *trunk_above.last().expect("the trunk has revisions");
+
+            let target_stack = [BranchPoint {
+                branch: branch_id(9),
+                revision: branch_point,
+            }];
+
+            let from_points = Box::pin(find_common_ancestor_from_branch_points(
+                repository.clone(),
+                branch_id(9),
+                trunk_tip,
+                &[],
+                branch_id(1),
+                branch_tip,
+                &target_stack,
+            ))
+            .await
+            .expect("exhausting the depth is not a failure");
+
+            assert_eq!(
+                from_points,
+                Some(branch_point),
+                "Out of depth, the branch points can only offer the branch point"
+            );
+
+            let from_merges = find_common_ancestor_from_merges(
+                repository,
+                branch_id(9),
+                trunk_tip,
+                branch_id(1),
+                branch_tip,
+                branch_point,
+            )
+            .await
+            .expect("the walk must not fail on readable history");
+
+            assert_eq!(
+                from_merges,
+                Some(branch_merged),
+                "The base is the branch revision the trunk already merged, not the branch point"
+            );
+        }))
+        .await;
+    }
+
+    /// The source carries the earlier merge, and the revision it took sits 1500
+    /// revisions below the target tip. Reaching it means walking the target's line
+    /// three times past the search depth, which the merge search is not bound by.
+    #[tokio::test]
+    async fn common_ancestor_finds_a_merge_the_source_took_far_below_the_target_tip() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let trunk = write_line(&repository, Hash::default(), 1, 3000).await;
+            let branch_point = trunk[999];
+            let merged_in = trunk[1499];
+            let trunk_tip = *trunk.last().expect("the trunk has revisions");
+
+            let source_first = write_branch_revision(&repository, branch_point, 1001, 210).await;
+            let source_merge =
+                write_merge_revision(&repository, source_first, merged_in, 1501).await;
+
+            let source_stack = [BranchPoint {
+                branch: branch_id(9),
+                revision: branch_point,
+            }];
+
+            let from_points = Box::pin(find_common_ancestor_from_branch_points(
+                repository.clone(),
+                branch_id(1),
+                source_merge,
+                &source_stack,
+                branch_id(9),
+                trunk_tip,
+                &[],
+            ))
+            .await
+            .expect("exhausting the depth is not a failure");
+
+            assert_eq!(
+                from_points,
+                Some(branch_point),
+                "Out of depth, the branch points can only offer the branch point"
+            );
+
+            let from_merges = find_common_ancestor_from_merges(
+                repository,
+                branch_id(1),
+                source_merge,
+                branch_id(9),
+                trunk_tip,
+                branch_point,
+            )
+            .await
+            .expect("the walk must not fail on readable history");
+
+            assert_eq!(
+                from_merges,
+                Some(merged_in),
+                "The walk has to follow the target's line 1500 revisions down to the revision the source already took"
+            );
+        }))
+        .await;
+    }
+
+    /// A branch of two commits that never merged the trunk, with the trunk 1417
+    /// revisions further on. The branch point is the answer, and the merge search
+    /// confirms it rather than leaving it a guess.
+    #[tokio::test]
+    async fn common_ancestor_of_a_branch_that_never_merged_is_its_branch_point() {
+        Box::pin(with_execution(async {
+            let repository = null_repository().await;
+            let trunk = write_line(&repository, Hash::default(), 1, 2624).await;
+            let branch_point = trunk[1206];
+            let trunk_tip = *trunk.last().expect("the trunk has revisions");
+
+            let branch_first = write_branch_revision(&repository, branch_point, 1208, 201).await;
+            let branch_tip = write_branch_revision(&repository, branch_first, 1209, 202).await;
+
+            let target_stack = [BranchPoint {
+                branch: branch_id(9),
+                revision: branch_point,
+            }];
+
+            let from_points = Box::pin(find_common_ancestor_from_branch_points(
+                repository.clone(),
+                branch_id(9),
+                trunk_tip,
+                &[],
+                branch_id(1),
+                branch_tip,
+                &target_stack,
+            ))
+            .await
+            .expect("exhausting the depth is not a failure");
+
+            assert_eq!(from_points, Some(branch_point));
+
+            let from_merges = find_common_ancestor_from_merges(
+                repository,
+                branch_id(9),
+                trunk_tip,
+                branch_id(1),
+                branch_tip,
+                branch_point,
+            )
+            .await
+            .expect("the walk must not fail on readable history");
+
+            assert_eq!(
+                from_merges,
+                Some(branch_point),
+                "The walk reaches the branch point from both sides, which is what makes it the answer rather than a guess"
             );
         }))
         .await;

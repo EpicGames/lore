@@ -1634,35 +1634,34 @@ pub enum FileMatch {
     Indeterminate,
 }
 
-/// Whether `path` still holds the content `previous` addresses.
+/// Whether the file `content` answers for still holds the content `previous` addresses.
 ///
 /// Transfers fragment metadata only: the stored object's header and, when it is fragmented,
 /// its fragment lists. Content payloads are never fetched — chunks are compared by hashing
 /// the file's own bytes over the ranges the stored list records, so the cost is bounded by
 /// the file and its metadata however large the object is.
 ///
-/// A file at or below the fragment threshold is one fragment under the current chunking, so
-/// its buffer hash is tried first and settles the question when it matches, without touching
-/// the store at all. A mismatch settles nothing on its own: a commit may reuse a previous
-/// fragmentation, so a stored object of any size may be a fragment list, and no buffer hash
-/// equals a fragment list hash. The stored header then says which it is, and a list is
-/// walked like any other.
+/// Below the minimum cut the content is one fragment whatever cut it, so its own hash is the
+/// address and settles the question without touching the store. Up to the threshold it may be
+/// either, and the stored header says which: one fragment is settled by the content hash, a
+/// list by the chunking it records. Larger content is always a list, which one raw read takes
+/// along with its header.
 ///
-/// A stored object that cannot be described or walked falls back to
-/// [`hashed_under_current_chunking`], which reads nothing but the file.
+/// A stored object that cannot be read falls back to [`hashed_under_current_chunking`],
+/// which reads nothing but the file.
 pub async fn file_matches(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
-    path: impl AsRef<Path>,
     previous: Address,
     previous_size: Option<usize>,
     remote_session: Option<Arc<StorageSession>>,
+    content: &ContentHashMemo<'_>,
 ) -> Result<FileMatch, StorageError> {
     let _count_permit = file_count_limit_acquire()
         .await
         .forward::<StorageError>("permit failed")?;
 
-    let path = path.as_ref();
+    let path = content.path();
     let Ok(metadata) = lore_io::IoDriver::global().metadata(path).await else {
         return Err(StorageError::internal(format!(
             "failed to query file metadata: {}",
@@ -1686,35 +1685,19 @@ pub async fn file_matches(
         return Ok(FileMatch::Differs);
     }
 
-    if file_size <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
-        let data = lore_io::IoDriver::global()
-            .read_file_bytes(path)
-            .await
-            .map_err(|e| {
-                StorageError::internal_with_context(e, &format!("read file: {}", path.display()))
-            })?;
-        if Hash::hash_buffer(&data) == previous.hash {
-            return Ok(FileMatch::Match);
-        }
-
-        // The header says whether the stored object is a list this buffer hash could never
-        // have equalled, or a single fragment whose hash it was directly comparable with.
-        let Ok(described) = store.clone().get_metadata(partition, previous).await else {
-            return Ok(FileMatch::Indeterminate);
-        };
-        if described.match_made == StoreMatch::MatchNone {
-            return Ok(FileMatch::Indeterminate);
-        }
-        if described.fragment.flags & FragmentFlags::PayloadFragmented == 0 {
-            return Ok(FileMatch::Differs);
-        }
-        if described.fragment.size_content != file_size as u64 {
-            return Ok(FileMatch::Differs);
-        }
+    if file_size <= crate::concurrency::FRAGMENT_SIZE_MINIMUM
+        || (file_size <= crate::compress::FRAGMENT_SIZE_THRESHOLD
+            && stored_as_one_fragment(&store, partition, previous).await)
+    {
+        return Ok(if content.get_or_hash(file_size).await? == previous.hash {
+            FileMatch::Match
+        } else {
+            FileMatch::Differs
+        });
     }
 
     let options = ReadOptions::default().no_decompress().no_verify();
-    let loaded = load_fragment(
+    let Some((fragment, payload)) = load_fragment(
         store.clone(),
         partition,
         previous,
@@ -1722,44 +1705,122 @@ pub async fn file_matches(
         remote_session.clone(),
     )
     .await
-    .ok();
+    .ok() else {
+        if file_size <= crate::compress::FRAGMENT_SIZE_THRESHOLD
+            && content.get_or_hash(file_size).await? == previous.hash
+        {
+            return Ok(FileMatch::Match);
+        }
+        return hashed_under_current_chunking(store, partition, previous, path, file_size, content)
+            .await;
+    };
 
-    if let Some((fragment, _)) = loaded.as_ref()
-        && fragment.size_content != file_size as u64
-    {
+    if fragment.size_content != file_size as u64 {
         return Ok(FileMatch::Differs);
     }
 
-    let file = open_for_compare(path).await?;
+    if fragment.flags & FragmentFlags::PayloadFragmented == 0 {
+        return Ok(if content.get_or_hash(file_size).await? == previous.hash {
+            FileMatch::Match
+        } else {
+            FileMatch::Differs
+        });
+    }
 
-    if let Some((fragment, payload)) = loaded
-        && fragment.flags & FragmentFlags::PayloadFragmented != 0
-    {
-        let fragment_list = payload.to_aligned::<FragmentReference>();
-        let previous_fragmentation = fragment_list.as_type_slice::<FragmentReference>();
-        if !previous_fragmentation.is_empty() {
-            match compare_previous_chunks(
-                SublistSource {
-                    store: &store,
-                    partition,
-                    context: previous.context,
-                    remote_session: &remote_session,
-                },
-                path,
-                &file,
-                file_size as u64,
-                previous_fragmentation,
-            )
-            .await?
-            {
-                FileMatch::Match => return Ok(FileMatch::Match),
-                FileMatch::Differs => return Ok(FileMatch::Differs),
-                FileMatch::Indeterminate => {}
-            }
+    let fragment_list = payload.to_aligned::<FragmentReference>();
+    let previous_fragmentation = fragment_list.as_type_slice::<FragmentReference>();
+    if !previous_fragmentation.is_empty() {
+        let file = open_for_compare(path).await?;
+        match compare_previous_chunks(
+            SublistSource {
+                store: &store,
+                partition,
+                context: previous.context,
+                remote_session: &remote_session,
+            },
+            path,
+            &file,
+            file_size as u64,
+            previous_fragmentation,
+        )
+        .await?
+        {
+            FileMatch::Match => return Ok(FileMatch::Match),
+            FileMatch::Differs => return Ok(FileMatch::Differs),
+            FileMatch::Indeterminate => {}
         }
     }
 
-    hashed_under_current_chunking(store, partition, previous, file, file_size).await
+    hashed_under_current_chunking(store, partition, previous, path, file_size, content).await
+}
+
+/// Whether the store describes `previous` as one fragment, whose payload is the content
+/// itself. `false` where it is a list or where nothing describes it, both of which the header
+/// alone cannot settle.
+async fn stored_as_one_fragment(
+    store: &Arc<dyn ImmutableStore>,
+    partition: Partition,
+    previous: Address,
+) -> bool {
+    store
+        .clone()
+        .get_metadata(partition, previous)
+        .await
+        .is_ok_and(|described| {
+            described.match_made != StoreMatch::MatchNone
+                && described.fragment.flags & FragmentFlags::PayloadFragmented == 0
+        })
+}
+
+/// What one run of comparisons against a file computes about its content, each at most once
+/// however many addresses the file is measured against: the hash of the whole content, which
+/// answers for content stored as a single fragment, and the hash the current chunking
+/// produces, which answers where nothing describes the stored object.
+///
+/// Neither answers for a list, so a comparison holding one still walks the chunking it records.
+pub struct ContentHashMemo<'a> {
+    path: &'a Path,
+    whole: tokio::sync::OnceCell<Hash>,
+    chunked: tokio::sync::OnceCell<Hash>,
+}
+
+impl<'a> ContentHashMemo<'a> {
+    /// What is computed is computed about `path`, so one memo serves one file.
+    pub fn new(path: &'a Path) -> Self {
+        Self {
+            path,
+            whole: tokio::sync::OnceCell::new(),
+            chunked: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// The file the memo answers for.
+    pub fn path(&self) -> &Path {
+        self.path
+    }
+
+    /// The whole file is resident while it is hashed, so the budget for it comes from the
+    /// fragment limiter that bounds every other buffer of a fragment's size.
+    async fn get_or_hash(&self, file_size: usize) -> Result<Hash, StorageError> {
+        self.whole
+            .get_or_try_init(|| async {
+                let _memory_permit =
+                    crate::concurrency::acquire_fragment_memory_permit(file_size).await;
+                let data = lore_io::IoDriver::global()
+                    .read_file_bytes(self.path)
+                    .await
+                    .map_err(|e| {
+                        StorageError::internal_with_context(
+                            e,
+                            &format!("read file: {}", self.path.display()),
+                        )
+                    })?;
+
+                Ok(Hash::hash_buffer(&data))
+            })
+            .await
+            .copied()
+    }
 }
 
 /// Whether hashing the file under the current chunking reproduces `previous`.
@@ -1770,33 +1831,38 @@ pub async fn file_matches(
 /// still hashes to the address it was stored under, and that settles it while reading
 /// nothing but the file. A different hash settles nothing, since the stored object may have
 /// been chunked another way.
+///
+/// Called only above the minimum cut, where the content may be a list.
 async fn hashed_under_current_chunking(
     store: Arc<dyn ImmutableStore>,
     partition: Partition,
     previous: Address,
-    file: lore_io::IoFile,
+    path: &Path,
     file_size: usize,
+    content: &ContentHashMemo<'_>,
 ) -> Result<FileMatch, StorageError> {
-    if file_size <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
-        // One fragment covers the file, so its buffer hash was already the whole answer.
-        return Ok(FileMatch::Indeterminate);
-    }
+    let hash = content
+        .chunked
+        .get_or_try_init(|| async {
+            let address = crate::fragment_engine::write_fragmented_from_file(
+                store,
+                partition,
+                previous.context,
+                open_for_compare(path).await?,
+                file_size,
+                WriteOptions::default().no_remote_write(),
+                true,
+                None,
+                WriteContext::none(),
+                None,
+            )
+            .await?;
 
-    let address = crate::fragment_engine::write_fragmented_from_file(
-        store,
-        partition,
-        previous.context,
-        file,
-        file_size,
-        WriteOptions::default().no_remote_write(),
-        true,
-        None,
-        WriteContext::none(),
-        None,
-    )
-    .await?;
+            Ok::<Hash, StorageError>(address.0.hash)
+        })
+        .await?;
 
-    Ok(if address.0.hash == previous.hash {
+    Ok(if *hash == previous.hash {
         FileMatch::Match
     } else {
         FileMatch::Indeterminate
@@ -3685,6 +3751,429 @@ mod tests {
             compare_recursive(&store, partition, &path, &changed, &chunks).await,
             FileMatch::Differs,
             "a changed byte inside the nested range is a difference in content"
+        );
+    }
+
+    /// Store `content` cut the way this build cuts, so a rehash can reproduce it.
+    async fn store_current_chunking(
+        store: &Arc<dyn ImmutableStore>,
+        partition: Partition,
+        path: &Path,
+    ) -> Address {
+        let (file, file_size) = crate::chunker::open_read(path).await.expect("open");
+        crate::fragment_engine::write_fragmented_from_file(
+            Arc::clone(store),
+            partition,
+            Context::default(),
+            file,
+            file_size as usize,
+            WriteOptions::default().no_remote_write(),
+            false,
+            None,
+            WriteContext::none(),
+            None,
+        )
+        .await
+        .expect("store the file")
+        .0
+    }
+
+    /// Store `content` cut at boundaries below the minimum this build cuts at, which
+    /// no rehash of it can reproduce, under a list stating `size_content` bytes.
+    async fn store_foreign_chunking_sized(
+        store: &Arc<dyn ImmutableStore>,
+        partition: Partition,
+        content: &[u8],
+        size_content: u64,
+    ) -> Address {
+        use zerocopy::IntoBytes;
+
+        let list = fragment_list_for(content, &chunk_sizes(content.len(), 17 * 1024));
+        let payload = Bytes::copy_from_slice(list.as_slice().as_bytes());
+        let address = Address {
+            context: Address::default().context,
+            hash: crate::hash::hash_slice(&payload),
+        };
+        store_fragment(
+            Arc::clone(store),
+            partition,
+            address,
+            Fragment {
+                flags: FragmentFlags::PayloadFragmented.bits(),
+                size_payload: payload.len() as u32,
+                size_content,
+            },
+            payload,
+            true,
+            None,
+            WriteContext::none(),
+            None,
+        )
+        .await
+        .expect("store the fragment list");
+        address
+    }
+
+    /// [`store_foreign_chunking_sized`] stating the size the content actually is.
+    async fn store_foreign_chunking(
+        store: &Arc<dyn ImmutableStore>,
+        partition: Partition,
+        content: &[u8],
+    ) -> Address {
+        store_foreign_chunking_sized(store, partition, content, content.len() as u64).await
+    }
+
+    /// Store `content` as one fragment addressed by its own hash, which is the shape
+    /// the buffer-hash comparison is written for.
+    async fn store_single_fragment(
+        store: &Arc<dyn ImmutableStore>,
+        partition: Partition,
+        content: &[u8],
+    ) -> Address {
+        let address = Address {
+            context: Address::default().context,
+            hash: Hash::hash_buffer(content),
+        };
+        store_fragment(
+            Arc::clone(store),
+            partition,
+            address,
+            Fragment {
+                flags: 0,
+                size_payload: content.len() as u32,
+                size_content: content.len() as u64,
+            },
+            Bytes::copy_from_slice(content),
+            true,
+            None,
+            WriteContext::none(),
+            None,
+        )
+        .await
+        .expect("store the fragment");
+        address
+    }
+
+    /// A file of `size` bytes on disk, and a store to compare it against.
+    async fn compare_case(size: usize) -> (Vec<u8>, TempDir, Arc<dyn ImmutableStore>, PathBuf) {
+        let content = hash_test_content(size);
+        let (dir, store) = make_test_store().await;
+        let path = PathBuf::from(dir.as_ref()).join("compare-case.bin");
+        std::fs::write(&path, &content).expect("write test file");
+        (content, dir, store, path)
+    }
+
+    /// Rewrite the file with one byte changed, which keeps its size.
+    fn edit_in_place(path: &Path, content: &[u8]) {
+        let mut edited = content.to_vec();
+        edited[content.len() / 2] ^= 0xff;
+        std::fs::write(path, &edited).expect("rewrite test file");
+    }
+
+    async fn compare(
+        store: Arc<dyn ImmutableStore>,
+        partition: Partition,
+        path: &Path,
+        address: Address,
+        stored_size: usize,
+    ) -> FileMatch {
+        file_matches(
+            store,
+            partition,
+            address,
+            Some(stored_size),
+            None,
+            &ContentHashMemo::new(path),
+        )
+        .await
+        .expect("comparing a readable file must not error")
+    }
+
+    /// Bigger than the minimum cut and smaller than the threshold, which is the band a
+    /// file is stored as a list in and its own hash answers nothing for.
+    const FRAGMENTED_SIZE: usize = 150 * 1024;
+
+    /// Smaller than the minimum cut, so it is one fragment and its own hash is its
+    /// address.
+    const SINGLE_FRAGMENT_SIZE: usize = 20 * 1024;
+
+    /// Larger than a fragment holds, so the content is always a list.
+    const LISTED_SIZE: usize = 300 * 1024;
+
+    /// Between the minimum cut and the threshold, where the content may be either and the
+    /// stored header is what says which.
+    const EITHER_SIZE: usize = 100 * 1024;
+
+    #[tokio::test]
+    async fn current_chunking_matches_the_unchanged_file() {
+        let partition = Partition::from([7u8; 16]);
+        let (content, _dir, store, path) = compare_case(FRAGMENTED_SIZE).await;
+        let address = store_current_chunking(&store, partition, &path).await;
+
+        assert_ne!(
+            address.hash,
+            Hash::hash_buffer(&content),
+            "The file has to be stored as a list for this to be the case under test"
+        );
+        assert_eq!(
+            compare(store, partition, &path, address, content.len()).await,
+            FileMatch::Match
+        );
+    }
+
+    #[tokio::test]
+    async fn current_chunking_differs_from_an_edit_of_the_same_size() {
+        let partition = Partition::from([7u8; 16]);
+        let (content, _dir, store, path) = compare_case(FRAGMENTED_SIZE).await;
+        let address = store_current_chunking(&store, partition, &path).await;
+        edit_in_place(&path, &content);
+
+        assert_eq!(
+            compare(store, partition, &path, address, content.len()).await,
+            FileMatch::Differs
+        );
+    }
+
+    /// Without the list, rehashing the file under the chunking that stored it
+    /// reproduces the address, which settles it.
+    #[tokio::test]
+    async fn current_chunking_matches_the_unchanged_file_without_its_list() {
+        let partition = Partition::from([7u8; 16]);
+        let (content, _dir, store, path) = compare_case(FRAGMENTED_SIZE).await;
+        let address = store_current_chunking(&store, partition, &path).await;
+        let (_empty_dir, empty_store) = make_test_store().await;
+
+        assert_eq!(
+            compare(empty_store, partition, &path, address, content.len()).await,
+            FileMatch::Match
+        );
+    }
+
+    /// A rehash that does not reproduce the address says nothing: the content may have
+    /// changed, or the chunking may have.
+    #[tokio::test]
+    async fn current_chunking_without_its_list_is_indeterminate_on_an_edit() {
+        let partition = Partition::from([7u8; 16]);
+        let (content, _dir, store, path) = compare_case(FRAGMENTED_SIZE).await;
+        let address = store_current_chunking(&store, partition, &path).await;
+        edit_in_place(&path, &content);
+        let (_empty_dir, empty_store) = make_test_store().await;
+
+        assert_eq!(
+            compare(empty_store, partition, &path, address, content.len()).await,
+            FileMatch::Indeterminate
+        );
+    }
+
+    /// Above the threshold the content is always a list, so its own hash is never tested and
+    /// the stored chunking is the only thing that answers.
+    /// One fragment in the band the header decides: its own hash is the address, so the
+    /// content answers without the payload being read.
+    #[tokio::test]
+    async fn one_fragment_in_the_header_decided_band_matches_by_its_own_hash() {
+        let partition = Partition::from([7u8; 16]);
+        let (content, _dir, store, path) = compare_case(EITHER_SIZE).await;
+        let address = store_single_fragment(&store, partition, &content).await;
+
+        assert_eq!(
+            compare(store, partition, &path, address, content.len()).await,
+            FileMatch::Match
+        );
+    }
+
+    #[tokio::test]
+    async fn one_fragment_in_the_header_decided_band_differs_from_an_edit() {
+        let partition = Partition::from([7u8; 16]);
+        let (content, _dir, store, path) = compare_case(EITHER_SIZE).await;
+        let address = store_single_fragment(&store, partition, &content).await;
+        edit_in_place(&path, &content);
+
+        assert_eq!(
+            compare(store, partition, &path, address, content.len()).await,
+            FileMatch::Differs
+        );
+    }
+
+    /// With nothing to describe the object, the content's own hash is still what answers for
+    /// one fragment.
+    #[tokio::test]
+    async fn one_fragment_in_the_header_decided_band_matches_without_its_store() {
+        let partition = Partition::from([7u8; 16]);
+        let (content, _dir, store, path) = compare_case(EITHER_SIZE).await;
+        let address = store_single_fragment(&store, partition, &content).await;
+        let (_empty_dir, empty_store) = make_test_store().await;
+
+        assert_eq!(
+            compare(empty_store, partition, &path, address, content.len()).await,
+            FileMatch::Match
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_above_the_threshold_matches_through_its_list() {
+        let partition = Partition::from([7u8; 16]);
+        let (content, _dir, store, path) = compare_case(LISTED_SIZE).await;
+        let address = store_current_chunking(&store, partition, &path).await;
+
+        assert_eq!(
+            compare(store, partition, &path, address, content.len()).await,
+            FileMatch::Match
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_above_the_threshold_matches_by_rehashing_without_its_list() {
+        let partition = Partition::from([7u8; 16]);
+        let (content, _dir, store, path) = compare_case(LISTED_SIZE).await;
+        let address = store_current_chunking(&store, partition, &path).await;
+        let (_empty_dir, empty_store) = make_test_store().await;
+
+        assert_eq!(
+            compare(empty_store, partition, &path, address, content.len()).await,
+            FileMatch::Match
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_above_the_threshold_is_indeterminate_on_an_edit_without_its_list() {
+        let partition = Partition::from([7u8; 16]);
+        let (content, _dir, store, path) = compare_case(LISTED_SIZE).await;
+        let address = store_current_chunking(&store, partition, &path).await;
+        edit_in_place(&path, &content);
+        let (_empty_dir, empty_store) = make_test_store().await;
+
+        assert_eq!(
+            compare(empty_store, partition, &path, address, content.len()).await,
+            FileMatch::Indeterminate
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_chunking_matches_the_unchanged_file() {
+        let partition = Partition::from([7u8; 16]);
+        let (content, _dir, store, path) = compare_case(FRAGMENTED_SIZE).await;
+        let address = store_foreign_chunking(&store, partition, &content).await;
+
+        assert_eq!(
+            compare(store, partition, &path, address, content.len()).await,
+            FileMatch::Match,
+            "The stored chunking answers for the file whatever cut it"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_chunking_differs_from_an_edit_of_the_same_size() {
+        let partition = Partition::from([7u8; 16]);
+        let (content, _dir, store, path) = compare_case(FRAGMENTED_SIZE).await;
+        let address = store_foreign_chunking(&store, partition, &content).await;
+        edit_in_place(&path, &content);
+
+        assert_eq!(
+            compare(store, partition, &path, address, content.len()).await,
+            FileMatch::Differs
+        );
+    }
+
+    /// A foreign chunking is not reproducible by rehashing, so without the list there is
+    /// nothing left to answer with and an unchanged file reads as indeterminate. Only
+    /// fetching the list settles it.
+    #[tokio::test]
+    async fn foreign_chunking_without_its_list_is_indeterminate() {
+        let partition = Partition::from([7u8; 16]);
+        let (content, _dir, store, path) = compare_case(FRAGMENTED_SIZE).await;
+        let address = store_foreign_chunking(&store, partition, &content).await;
+        let (_empty_dir, empty_store) = make_test_store().await;
+
+        assert_eq!(
+            compare(empty_store, partition, &path, address, content.len()).await,
+            FileMatch::Indeterminate
+        );
+    }
+
+    /// The size the caller states settles it before the store is touched, which is why an
+    /// empty store answers it.
+    #[tokio::test]
+    async fn a_file_of_another_size_differs_before_the_store_is_touched() {
+        let partition = Partition::from([7u8; 16]);
+        let (content, _dir, _store, path) = compare_case(FRAGMENTED_SIZE).await;
+        let (_empty_dir, empty_store) = make_test_store().await;
+        std::fs::write(&path, &content[..content.len() - 1_000]).expect("truncate test file");
+
+        assert_eq!(
+            compare(
+                empty_store,
+                partition,
+                &path,
+                Address {
+                    context: Address::default().context,
+                    hash: Hash::hash_buffer(b"nothing stored"),
+                },
+                content.len()
+            )
+            .await,
+            FileMatch::Differs
+        );
+    }
+
+    /// A stored list describing more content than the file holds describes something else,
+    /// which the caller's own size cannot catch.
+    #[tokio::test]
+    async fn a_list_stating_another_size_differs() {
+        let partition = Partition::from([7u8; 16]);
+        let (content, _dir, store, path) = compare_case(FRAGMENTED_SIZE).await;
+        let address =
+            store_foreign_chunking_sized(&store, partition, &content, content.len() as u64 + 1)
+                .await;
+
+        assert_eq!(
+            compare(store, partition, &path, address, content.len()).await,
+            FileMatch::Differs
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_fragment_matches_the_unchanged_file_from_its_own_hash() {
+        let partition = Partition::from([7u8; 16]);
+        let (content, _dir, store, path) = compare_case(SINGLE_FRAGMENT_SIZE).await;
+        let address = store_single_fragment(&store, partition, &content).await;
+        let (_empty_dir, empty_store) = make_test_store().await;
+        assert_eq!(
+            compare(store, partition, &path, address, content.len()).await,
+            FileMatch::Match
+        );
+        assert_eq!(
+            compare(empty_store, partition, &path, address, content.len()).await,
+            FileMatch::Match,
+            "Its own hash needs no store to answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_fragment_differs_from_an_edit_of_the_same_size() {
+        let partition = Partition::from([7u8; 16]);
+        let (content, _dir, store, path) = compare_case(SINGLE_FRAGMENT_SIZE).await;
+        let address = store_single_fragment(&store, partition, &content).await;
+        edit_in_place(&path, &content);
+
+        assert_eq!(
+            compare(store, partition, &path, address, content.len()).await,
+            FileMatch::Differs
+        );
+    }
+
+    /// Below the minimum cut the content is never chunked, so its own hash settles the edit
+    /// without the store describing anything.
+    #[tokio::test]
+    async fn a_single_fragment_differs_from_an_edit_without_its_store() {
+        let partition = Partition::from([7u8; 16]);
+        let (content, _dir, store, path) = compare_case(SINGLE_FRAGMENT_SIZE).await;
+        let address = store_single_fragment(&store, partition, &content).await;
+        edit_in_place(&path, &content);
+        let (_empty_dir, empty_store) = make_test_store().await;
+
+        assert_eq!(
+            compare(empty_store, partition, &path, address, content.len()).await,
+            FileMatch::Differs
         );
     }
 

@@ -586,6 +586,10 @@ pub struct RepositoryContext {
     /// resolves a fresh one rather than handing out sessions the server has
     /// forgotten.
     session_pool: parking_lot::RwLock<Weak<SessionPool>>,
+    /// The lazy storage session this context's reads and writes carry, built on first
+    /// use. Held strongly: a pending session re-resolves after invalidation, so one
+    /// serves every operation against this context's partition for its lifetime.
+    lazy_session: parking_lot::RwLock<Option<Arc<lore_transport::StorageSession>>>,
 }
 
 impl std::fmt::Debug for RepositoryContext {
@@ -667,6 +671,7 @@ impl RepositoryContext {
             write_token: None,
             repo_lock: None,
             session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system,
         }
     }
@@ -886,6 +891,7 @@ impl RepositoryContext {
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
             session_pool: Default::default(),
+            lazy_session: Default::default(),
         }
     }
 
@@ -906,6 +912,7 @@ impl RepositoryContext {
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
             session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -931,6 +938,7 @@ impl RepositoryContext {
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
             session_pool: Default::default(),
+            lazy_session: Default::default(),
         }
     }
 
@@ -951,6 +959,7 @@ impl RepositoryContext {
             write_token: None,
             repo_lock: None,
             session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -985,6 +994,7 @@ impl RepositoryContext {
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
             session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -1013,6 +1023,7 @@ impl RepositoryContext {
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
             session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -1041,6 +1052,7 @@ impl RepositoryContext {
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
             session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -1062,6 +1074,7 @@ impl RepositoryContext {
             write_token: None,
             repo_lock: self.repo_lock.clone(),
             session_pool: Default::default(),
+            lazy_session: Default::default(),
             file_system: self.file_system.clone(),
         }
     }
@@ -1156,6 +1169,19 @@ impl RepositoryContext {
         let pool = remote.session_pool(self.id, correlation_id).await?;
         *self.session_pool.write() = Arc::downgrade(&pool);
         Ok(pool)
+    }
+
+    /// The lazy storage session for this context, built once and shared. Partition-scoped,
+    /// so a derived context for a link or a layer resolves its own rather than borrowing one
+    /// started for another partition.
+    pub(crate) fn lazy_session(
+        &self,
+        build: impl FnOnce() -> Arc<lore_transport::StorageSession>,
+    ) -> Arc<lore_transport::StorageSession> {
+        if let Some(session) = self.lazy_session.read().as_ref() {
+            return session.clone();
+        }
+        self.lazy_session.write().get_or_insert_with(build).clone()
     }
 
     /// The session pool if one is already resolved and still live, without

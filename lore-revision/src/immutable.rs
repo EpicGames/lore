@@ -155,20 +155,31 @@ pub fn read_options_from_repository(repository: &RepositoryContext) -> ReadOptio
 /// The correlation id is read here rather than inside the resolver because the
 /// resolver runs wherever the read or write ends up, which is not necessarily
 /// under this command's execution context.
+///
+/// The context holds the session it is handed, so the resolver holds the context
+/// weakly: a strong reference there is a cycle neither end can free, and a context
+/// gone by the time a session resolves has no pool left to pick from.
 fn resolve_session(repository: &Arc<RepositoryContext>) -> Option<Arc<StorageSession>> {
     if repository.is_offline() {
         return None;
     }
-    let repository = repository.clone();
-    let correlation_id = crate::lore::execution_context()
-        .globals()
-        .correlation_id
-        .to_string();
-    Some(Arc::new(StorageSession::pending(move || {
-        let repository = repository.clone();
-        let correlation_id = correlation_id.clone();
-        async move { pooled_session(&repository, &correlation_id).await }
-    })))
+    Some(repository.lazy_session(|| {
+        let repository = Arc::downgrade(repository);
+        let correlation_id = crate::lore::execution_context()
+            .globals()
+            .correlation_id
+            .to_string();
+        Arc::new(StorageSession::pending(move || {
+            let repository = repository.clone();
+            let correlation_id = correlation_id.clone();
+            async move {
+                let repository = repository
+                    .upgrade()
+                    .ok_or_else(|| ProtocolError::from(lore_base::error::NoRemote))?;
+                pooled_session(&repository, &correlation_id).await
+            }
+        }))
+    }))
 }
 
 /// A pick from the pool the repository context holds, resolving it on first use.
@@ -510,17 +521,20 @@ pub async fn hash_file(
 /// but never content payloads.
 pub async fn file_matches(
     repository: Arc<RepositoryContext>,
-    path: impl AsRef<Path>,
     previous: Address,
     previous_size: Option<usize>,
+    content: &lore_storage::ContentHashMemo<'_>,
 ) -> Result<lore_storage::FileMatch, ImmutableError> {
+    // Only the fragmentation the content was stored under answers for it, and the
+    // local store need not still hold it.
+    let remote_session = resolve_session(&repository);
     lore_storage::file_matches(
         repository.immutable_store(),
         repository.id,
-        path,
         previous,
         previous_size,
-        None,
+        remote_session,
+        content,
     )
     .await
     .forward("comparing file against stored content")
@@ -929,6 +943,23 @@ mod session_tests {
         let context = context_with_state(RemoteState::Offline).await;
         let session = under_execution_context(async { resolve_session(&context) }).await;
         assert!(session.is_none());
+    }
+
+    /// The context holds the session it is handed, so the session may not hold the
+    /// context back. A strong reference in the resolver is a cycle neither end can
+    /// free, and the command that built it completes with the context still alive.
+    #[tokio::test]
+    async fn a_resolved_session_does_not_keep_the_context_alive() {
+        let context =
+            context_with_state(RemoteState::Failed(ProtocolError::from(Disconnected))).await;
+        let weak = Arc::downgrade(&context);
+
+        under_execution_context(async { resolve_session(&context) })
+            .await
+            .expect("a context that is not offline resolves a session");
+
+        drop(context);
+        assert_eq!(weak.strong_count(), 0);
     }
 
     /// A failed connect is an answer a session carries, so one is still built: the

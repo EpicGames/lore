@@ -1830,6 +1830,7 @@ async fn clone_file(
                 file_info.size,
                 repository_path.relative(),
                 force,
+                None,
             )
             .await,
             Ok(FileModification::UnmodifiedByMtime | FileModification::UnmodifiedByHash)

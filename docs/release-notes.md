@@ -27,6 +27,7 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - Fix a directory staged as an add and then removed before any commit being reported as a delete no command could clear; a scan now discards the entry with its whole subtree, as it already did for a reverted single-file add
 - Fix `stage --scan` keeping an entry `status --scan` discards, which left the two walks with different trees
 - `lore branch merge`, `branch merge into` and `revision cherry-pick` carry nothing from the source revision's metadata unless `--inherit-metadata <KEY>` (repeatable) names it, so `merged-by`, `reviewed-by` and `change-request` record whoever performed the merge rather than whoever produced the branch; actor and provenance keys stay reserved even under `*`
+- Fix `lore branch merge` refusing files that carry no local changes: the working file is measured against the node the current revision holds rather than against the base of the three-way diff, a comparison is answered by the chunking the content was stored under, and one file is read and hashed at most once however many revisions it is measured against
 
 ## v0.9.0 (Aug 28th 2026) [#782]
 

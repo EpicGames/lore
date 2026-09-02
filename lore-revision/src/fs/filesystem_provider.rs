@@ -79,13 +79,22 @@ pub struct FileDifferenceFromNode {
     pub modified: bool,
 }
 
+/// The node a file was measured against, and whether the current revision is what holds it.
+#[derive(Debug, Clone, Copy)]
+pub struct MeasuredNode {
+    /// The node the file was measured against.
+    pub node: Node,
+    /// Whether the current revision is what holds it.
+    pub is_current: bool,
+}
+
 /// Result of checking whether a file differs from a node.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FileModifiedCheck {
     /// Basic file information.
     pub info: FileInfo,
-    /// If the file Merkle tree State had a Node for this file it is included.
-    pub from_node: Option<Node>,
+    /// The node the file was measured against, where the state held one.
+    pub measured: Option<MeasuredNode>,
     /// If it made sense for the difference to be computed (a file exists on the file system and the
     /// Merkle tree State had a node that was a file and not a directory).
     pub modification: Option<FileDifferenceFromNode>,
@@ -177,30 +186,6 @@ pub trait InstanceOperation: Send + Sync {
         path: FilesystemPath<'_>,
     ) -> impl Future<Output = Result<FileInfo, FsError>> + Send;
 
-    /// Check if a file on the filesystem differs from a node in state.
-    ///
-    /// This method combines metadata retrieval and content comparison into a single
-    /// operation. It returns information about the filesystem path's existence, type,
-    /// and size, as well as whether its content differs from the given node.
-    ///
-    /// # Arguments
-    ///
-    /// * `repository` - Repository context for timestamp tracking and content hashing
-    /// * `node` - The node to compare against (may be a file or directory node)
-    /// * `path` - Relative path within the repository
-    /// * `force_full_check` - If true, always compare against the ground truth; if false, use early
-    ///   return optimizations that rely on signals like file modification time
-    ///
-    /// # Returns
-    ///
-    /// A `FileModifiedCheck`
-    fn is_file_modified(
-        &self,
-        repository: Arc<RepositoryContext>,
-        node_change: &NodeChange,
-        force_full_check: bool,
-    ) -> impl Future<Output = Result<FileModifiedCheck, FsError>> + Send;
-
     /// Gets the hash of a file in the repository, optionally providing the Node if it has
     /// separately been loaded.
     fn file_hash(
@@ -224,6 +209,7 @@ pub trait InstanceOperation: Send + Sync {
         node: &Node,
         path: &RelativePath,
         file_size: u64,
+        content: &lore_storage::ContentHashMemo<'_>,
     ) -> impl Future<Output = Result<NodeComparison, FsError>> + Send;
 
     /// Make a file executable (Unix) or set executable bit equivalent.
@@ -437,22 +423,6 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn is_file_modified(
-        &self,
-        repository: Arc<RepositoryContext>,
-        node_change: &NodeChange,
-        force_full_check: bool,
-    ) -> Result<FileModifiedCheck, FsError> {
-        match &self.dispatch {
-            #[cfg(test)]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
-            StaticDispatchInstanceOperation::Os(this) => {
-                this.is_file_modified(repository, node_change, force_full_check)
-                    .await
-            }
-        }
-    }
-
     async fn file_hash(
         &self,
         repository: Arc<RepositoryContext>,
@@ -474,12 +444,13 @@ impl InstanceOperation for InstanceOperationImpl {
         node: &Node,
         path: &RelativePath,
         file_size: u64,
+        content: &lore_storage::ContentHashMemo<'_>,
     ) -> Result<NodeComparison, FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => {
-                this.compare_file_to_node(repository, node, path, file_size)
+                this.compare_file_to_node(repository, node, path, file_size, content)
                     .await
             }
         }
@@ -617,7 +588,6 @@ pub mod tests {
     use crate::change::NodeChange;
     use crate::filter::FilterMode;
     use crate::fs::filesystem_provider::FileInfo;
-    use crate::fs::filesystem_provider::FileModifiedCheck;
     use crate::fs::filesystem_provider::FilesystemPath;
     use crate::fs::filesystem_provider::FilesystemProvider;
     use crate::fs::filesystem_provider::FsError;
@@ -690,15 +660,6 @@ pub mod tests {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn is_file_modified(
-            &self,
-            _repository: Arc<RepositoryContext>,
-            _node_change: &NodeChange,
-            _force_full_check: bool,
-        ) -> Result<FileModifiedCheck, FsError> {
-            panic!("Test operation unimplemented except finalize")
-        }
-
         async fn file_hash(
             &self,
             _repository: Arc<RepositoryContext>,
@@ -714,6 +675,7 @@ pub mod tests {
             _node: &Node,
             _path: &RelativePath,
             _file_size: u64,
+            _content: &lore_storage::ContentHashMemo<'_>,
         ) -> Result<NodeComparison, FsError> {
             panic!("Test operation unimplemented except finalize")
         }

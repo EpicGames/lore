@@ -1698,6 +1698,7 @@ async fn reset_file_realize(
             size,
             &relative_path,
             true, /* Force hash check */
+            None,
         )
         .await
         .forward::<ResetError>("Failed to check whether file changed")?

@@ -704,6 +704,7 @@ fn walk_layer_subtree<'a>(
                                 file_size,
                                 &child_path,
                                 true,
+                                None,
                             )
                             .await
                             .map_or(true, |modification| modification.is_modified());
