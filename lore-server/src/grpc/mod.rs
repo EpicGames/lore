@@ -32,12 +32,14 @@ pub mod tower;
 pub use admin_service::LoreAdminService;
 pub use grpc_internal_server::GrpcInternalServerBuilder;
 use lore_base::types::Context;
+use lore_revision::branch::BranchError;
 use lore_revision::link::LinkError;
 use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::MetadataError;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::repository::ServerContext;
 use lore_revision::state::StateError;
+use lore_storage::StoreError;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use lore_transport::grpc::PARTITION_ID_KEY;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
@@ -486,6 +488,28 @@ impl<T> FilterSlowDownExt<T, LinkError> for Result<T, LinkError> {
 
 impl<T> FilterSlowDownExt<T, MetadataError> for Result<T, MetadataError> {
     fn filter_slow_down(self) -> Result<Result<T, MetadataError>, Status> {
+        if let Err(err) = &self
+            && err.is_slow_down()
+        {
+            return Err(Status::resource_exhausted(err.to_string()));
+        }
+        Ok(self)
+    }
+}
+
+impl<T> FilterSlowDownExt<T, StoreError> for Result<T, StoreError> {
+    fn filter_slow_down(self) -> Result<Result<T, StoreError>, Status> {
+        if let Err(err) = &self
+            && err.is_slow_down()
+        {
+            return Err(Status::resource_exhausted(err.to_string()));
+        }
+        Ok(self)
+    }
+}
+
+impl<T> FilterSlowDownExt<T, BranchError> for Result<T, BranchError> {
+    fn filter_slow_down(self) -> Result<Result<T, BranchError>, Status> {
         if let Err(err) = &self
             && err.is_slow_down()
         {

@@ -13,6 +13,7 @@ use lore_proto::lore::revision::v1::revision_list_request::Start;
 use lore_revision::branch;
 use lore_revision::lore::BranchId;
 use lore_revision::metadata::Metadata;
+use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision;
 use lore_revision::revision::ResolveSearchLocation;
@@ -140,10 +141,9 @@ fn start_to_metric_value(value: &Start) -> &'static str {
 /// `start` anchor, plus optional cursors for the adjacent pages.
 /// `signature_backward` is items[N-1]'s parent — absent when items[N-1]
 /// is the root revision. `signature_forward` is the revision whose
-/// `parent_self` is items[0]'s signature, derived from the
-/// `BranchLatestPointer` step keys; absent when no step key covers
-/// the requested forward position (e.g. items[0] is the branch latest,
-/// or its child sits inside a step block whose key wasn't recorded).
+/// `parent_self` is items[0]'s signature — absent only when items[0]
+/// is the branch's latest revision, i.e. there is genuinely no newer
+/// revision.
 #[tracing::instrument(name = "RevisionList::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<RevisionListRequest>,
@@ -225,7 +225,8 @@ pub async fn handler(
                 }
             };
 
-            let signature_forward = forward_cursor(&repository, &walked, history_step_size).await;
+            let signature_forward =
+                forward_cursor(&repository, &walked, history_step_size, acceleration).await?;
             let signature_backward = walked.next_older;
 
             debug!(
@@ -596,29 +597,420 @@ async fn walk_revisions(
     })
 }
 
-/// Looks up the revision whose `parent_self` is items[0]'s signature
-/// — i.e. the cursor for the next newer page — by querying the
-/// `BranchLatestPointer` step key for `items[0].number + 1` and then
-/// walking that step block back to the exact target number. Returns
-/// `None` when the step key isn't registered (the forward position
-/// isn't covered by recorded boundaries) or when the walk inside the
-/// block can't find the target.
+/// Outcome of reading the step-boundary skip pointer at a boundary `B`.
+/// `B`'s pointer holds the highest revision numbered `<= B`, so a value
+/// other than `first_signature` proves that revision is strictly above
+/// `first_number` (`Found`). A pointer still equal to `first_signature`
+/// proves nothing above `B` exists (`Empty`) — a real, load-bearing fact
+/// callers use to safely widen the search. A missing key proves nothing
+/// either way (`Unknown`): the seal write is best-effort and silently
+/// dropped on failure, and the key type was renamed once already,
+/// orphaning older entries under the previous name. Conflating `Unknown`
+/// with `Empty` would let the search skip past a boundary that is
+/// genuinely non-empty but whose pointer was simply lost.
+enum BoundaryProbe {
+    Found(Hash),
+    Empty,
+    Unknown,
+}
+
+/// Reads the step-boundary skip pointer at `boundary`. See [`BoundaryProbe`].
+async fn probe_step_boundary(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    boundary: u64,
+    first_signature: Hash,
+    history_step_size: u64,
+) -> Result<BoundaryProbe, Status> {
+    let (key, key_type) = branch::revision_step_key(
+        repository::SALT_LORE,
+        repository.id,
+        branch,
+        boundary,
+        history_step_size,
+    );
+    match repository
+        .read_mutable_store()
+        .load(repository.id, key, key_type)
+        .await
+        .filter_slow_down()?
+    {
+        Ok(revision) if revision != first_signature => Ok(BoundaryProbe::Found(revision)),
+        Ok(_) => Ok(BoundaryProbe::Empty),
+        Err(err) if err.is_address_not_found() => Ok(BoundaryProbe::Unknown),
+        Err(err) => Err(warn_error_to_status(&err, |e| {
+            Status::internal(e.to_string())
+        })),
+    }
+}
+
+/// Where the descent to the forward-cursor target should start from, and
+/// how far it is safe to trust a single-band bound.
+enum ForwardAnchor {
+    /// A sealed boundary was found; every boundary below it down to
+    /// `first_number`'s own was proven empty, so its band — at most
+    /// `history_step_size` revisions — is guaranteed to hold the target.
+    Sealed { anchor: Hash, boundary: u64 },
+    /// No boundary above `first_number` is sealed at all: the target
+    /// lives in the branch's latest revision's own (always-open) band,
+    /// likewise bounded to `history_step_size` revisions.
+    LatestBand { anchor: Hash },
+    /// A skip pointer was missing somewhere below `anchor`, so the gap
+    /// between `first_number` and `anchor` cannot be trusted to be a
+    /// single band. `anchor` is still guaranteed to be numbered above
+    /// `first_number` (either a proven `Found` boundary, or the latest
+    /// revision), but the descent must walk further and repair the
+    /// missing pointer(s) it discovers instead of assuming one band.
+    UnverifiedGap { anchor: Hash },
+}
+
+/// Finds where to start descending to the lowest revision numbered
+/// strictly above `first_number`.
+///
+/// A boundary `B`'s skip pointer holds the highest revision numbered
+/// `<= B`, which only increases with `B`. So "boundary `B` is `Empty`" is
+/// monotonic in `B` — true up to some point, then false from there on —
+/// and the lowest boundary where it turns false can be found by binary
+/// search instead of a linear scan, using `Empty` results (not `Unknown`
+/// ones — see [`BoundaryProbe`]) to narrow the range. The search is
+/// bounded above by `latest`'s own boundary, which is never sealed (the
+/// segment holding the branch's latest revision is always open), giving
+/// a correct upper limit no matter how wide the gap above `first_number`
+/// is. A fixed probe budget cannot do this safely: it has no way to tell
+/// "nothing is sealed above this point" (target lives in latest's open
+/// band) apart from "the real answer is just further away than the
+/// budget allows" (which would wrongly fall back to a walk anchored on
+/// latest, spanning however much ordinary history has since accumulated).
+///
+/// Hitting `Unknown` at any point — the boundary's true state cannot be
+/// determined — aborts the binary search and reports [`ForwardAnchor::UnverifiedGap`]
+/// anchored on the best boundary already proven `Found` (or `latest`, if
+/// none has been found yet), rather than risking `Empty`'s optimism on
+/// a boundary that might not actually be empty.
+///
+/// The immediately-following boundary is tried first as a fast path: for
+/// ordinary, non-gapped pagination this resolves in one probe and never
+/// needs to deserialize `latest`. Only a miss there pays for one `latest`
+/// deserialize (to learn its boundary) before binary-searching.
+async fn forward_anchor(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    first_number: u64,
+    first_signature: Hash,
+    latest: Hash,
+    history_step_size: u64,
+) -> Result<ForwardAnchor, Status> {
+    let first_boundary = first_number
+        .saturating_add(1)
+        .div_ceil(history_step_size)
+        .saturating_mul(history_step_size);
+
+    match probe_step_boundary(
+        repository,
+        branch,
+        first_boundary,
+        first_signature,
+        history_step_size,
+    )
+    .await?
+    {
+        BoundaryProbe::Found(revision) => {
+            return Ok(ForwardAnchor::Sealed {
+                anchor: revision,
+                boundary: first_boundary,
+            });
+        }
+        BoundaryProbe::Empty => {}
+        BoundaryProbe::Unknown => return Ok(ForwardAnchor::UnverifiedGap { anchor: latest }),
+    }
+
+    let latest_state = state::State::deserialize(repository.clone(), latest)
+        .await
+        .filter_slow_down()?
+        .map_err(|err| warn_error_to_status(&err, |e| Status::internal(e.to_string())))?;
+    let latest_boundary =
+        latest_state.revision_number().div_ceil(history_step_size) * history_step_size;
+
+    if latest_boundary <= first_boundary {
+        // Nothing above `first_boundary` is sealed at all — the target
+        // lives in latest's own (always-open) band.
+        return Ok(ForwardAnchor::LatestBand { anchor: latest });
+    }
+
+    // Invariant: `low` is a boundary proven `Empty` (established above for
+    // `first_boundary`, or by the loop body below); `high` is either
+    // `latest_boundary` (an unsealed sentinel) or a boundary proven
+    // `Found`, whose hash is cached in `high_anchor`. Both start, and
+    // every `mid` stays, a multiple of `history_step_size`, so
+    // `high - low` is always a multiple of it too; the loop only runs
+    // while that gap exceeds one step, so `mid` strictly separates `low`
+    // and `high` every iteration.
+    let mut low = first_boundary;
+    let mut high = latest_boundary;
+    let mut high_anchor: Option<Hash> = None;
+
+    while high - low > history_step_size {
+        let mid = low + ((high - low) / (2 * history_step_size)) * history_step_size;
+        match probe_step_boundary(repository, branch, mid, first_signature, history_step_size)
+            .await?
+        {
+            BoundaryProbe::Found(revision) => {
+                high = mid;
+                high_anchor = Some(revision);
+            }
+            BoundaryProbe::Empty => low = mid,
+            BoundaryProbe::Unknown => {
+                return Ok(ForwardAnchor::UnverifiedGap {
+                    anchor: high_anchor.unwrap_or(latest),
+                });
+            }
+        }
+    }
+
+    match high_anchor {
+        Some(revision) if high < latest_boundary => Ok(ForwardAnchor::Sealed {
+            anchor: revision,
+            boundary: high,
+        }),
+        _ => Ok(ForwardAnchor::LatestBand { anchor: latest }),
+    }
+}
+
+/// Descends from a [`ForwardAnchor::Sealed`] or [`ForwardAnchor::LatestBand`]
+/// anchor to the lowest revision numbered strictly above `first_number`.
+/// `anchor_boundary`, when set, is the sealed step boundary `anchor` was
+/// read from; when `list_cache_enabled`, the persisted list-cache blob for
+/// that band is tried first (one blob read) before falling back to a
+/// walk. Either way — a sealed boundary's band, or (when `anchor_boundary`
+/// is unset) the branch's latest revision's own open band — the band
+/// holds at most `history_step_size` revisions, so the walk below is
+/// bounded by that alone; no larger cap is needed.
+async fn forward_target(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    anchor: Hash,
+    anchor_boundary: Option<u64>,
+    first_number: u64,
+    history_step_size: u64,
+    list_cache_enabled: bool,
+) -> Result<Hash, Status> {
+    if list_cache_enabled
+        && let Some(boundary) = anchor_boundary
+        && let Some(cached) =
+            cache::revision::load_cached_list(repository, branch, boundary, history_step_size).await
+        && let Some(item) = cached
+            .items()
+            .iter()
+            .rev()
+            .find(|item| item.number > first_number)
+    {
+        return Ok(item.signature);
+    }
+
+    let max_items = history_step_size as usize + 1;
+    let walk =
+        cache::revision::walk_segment_revisions(repository, anchor, first_number, max_items).await;
+    if !walk.reached_terminator {
+        return Err(Status::internal(format!(
+            "forward cursor descent from {anchor} exceeded {max_items} hops without \
+             resolving the successor of revision {first_number}",
+        )));
+    }
+
+    Ok(walk
+        .items
+        .into_iter()
+        .rev()
+        .find(|item| item.number > first_number)
+        .expect("anchor's own item always has number > first_number")
+        .signature)
+}
+
+/// Walks `parent_self` from `anchor` down to the lowest revision numbered
+/// strictly above `first_number`, without assuming the gap fits in one
+/// band. When `step_keys` acceleration is enabled, backfills any
+/// step-boundary skip pointer discovered missing along the way — mirroring
+/// the backfill `walk_revisions` performs for the `FullIteration` strategy
+/// — so a request that pays this walk's cost once repairs the fast path
+/// for later requests instead of leaving every subsequent lookup to
+/// rediscover the same gap.
+///
+/// Deliberately uncapped by hop count: revision numbers strictly decrease
+/// along `parent_self`, so this always terminates at `first_number` or the
+/// root, bounded only by the branch's real history depth — the same
+/// guarantee `resolve_start`'s `FullIteration` fallback already relies on
+/// via `revision::resolve(..., None, ...)` when no acceleration is
+/// available. An item-count cap here would fail requests anchored deep in
+/// a long, legitimately un-accelerated history — worse, retrying such a
+/// request would fail identically every time, since this always restarts
+/// from `anchor` and backfills top-down without ever reaching the
+/// boundary nearer `first_number` that a retry's first probe would check.
+/// `RevisionList` is wrapped in `timeout_grpc` at the service layer, which
+/// is the appropriate backstop for a pathologically deep walk, not a
+/// count that silently caps correctness.
+async fn descend_unverified_gap(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    anchor: Hash,
+    first_number: u64,
+    history_step_size: u64,
+    step_keys_enabled: bool,
+) -> Result<Hash, Status> {
+    let mut hash = anchor;
+    let mut prev_state: Option<Arc<state::State>> = None;
+    // Invariant: `last_above` is the most recently visited hash whose
+    // number was confirmed `> first_number` — initially `anchor` itself,
+    // per the caller's guarantee that every `ForwardAnchor` variant is
+    // numbered above `first_number`.
+    let mut last_above = anchor;
+
+    loop {
+        let current_state = state::State::deserialize(repository.clone(), hash)
+            .await
+            .filter_slow_down()?
+            .map_err(|err| warn_error_to_status(&err, |e| Status::internal(e.to_string())))?;
+        let number = current_state.revision_number();
+
+        if step_keys_enabled
+            && let Some(previous_state) = &prev_state
+            && let Some((lowest_b, highest_b)) = cache::revision::sealed_boundaries(
+                number,
+                previous_state.revision_number(),
+                history_step_size,
+            )
+        {
+            for boundary in (lowest_b..=highest_b).step_by(history_step_size as usize) {
+                let _ = cache::revision::seal_boundary_revision_number(
+                    repository.clone(),
+                    branch,
+                    history_step_size,
+                    boundary,
+                    &current_state,
+                    previous_state,
+                )
+                .await;
+                debug!(boundary, "Backfilled history step key during gap descent");
+            }
+        }
+
+        if number <= first_number {
+            return Ok(last_above);
+        }
+        last_above = hash;
+        hash = current_state.parent_self();
+        prev_state = Some(current_state);
+    }
+}
+
+/// Looks up the revision whose `parent_self` is items[0]'s signature —
+/// i.e. the cursor for the next newer page. Revision numbers increase
+/// strictly along `parent_self`, so that revision is exactly the lowest
+/// one numbered above items[0]; this walks the skip-pointer chain
+/// upward from the current page to find it, rather than assuming
+/// `items[0].number + 1` exists (a merge or fast-forward can leave
+/// numbering gaps). Returns `Ok(None)` only when items[0] is genuinely
+/// the branch's latest revision.
 async fn forward_cursor(
     repository: &Arc<RepositoryContext>,
     walked: &Walked,
     history_step_size: u64,
-) -> Option<Hash> {
-    let first = walked.items.first()?;
-    let target_number = first.number.checked_add(1)?;
-    let branch = walked.branch?;
+    acceleration: crate::grpc::server::RevisionListAcceleration,
+) -> Result<Option<Hash>, Status> {
+    let Some(first) = walked.items.first() else {
+        return Ok(None);
+    };
+    let Some(branch) = walked.branch else {
+        return Ok(None);
+    };
+    let first_number = first.number;
+    let first_signature = Hash::from(first.signature.as_ref());
 
-    cache::revision::resolve_via_step_key(repository, branch, target_number, history_step_size)
+    let latest = branch::load_latest(repository.clone(), branch)
         .await
+        .filter_slow_down()?
+        .map_err(|err| {
+            if err.is_branch_not_found() {
+                Status::not_found(format!("Branch {branch} not found: {err}"))
+            } else {
+                warn_error_to_status(&err, |e| Status::internal(e.to_string()))
+            }
+        })?;
+    if latest.is_zero() || latest == first_signature {
+        return Ok(None);
+    }
+
+    // With step-key acceleration disabled, `forward_anchor` has nothing to
+    // probe — every read it would perform is exactly the data this flag is
+    // documented to gate (`RevisionListAcceleration::step_keys`: "read +
+    // write"). `latest` is the only anchor available; descend from it
+    // directly, same as `resolve_start` falling through to `FullIteration`.
+    if !acceleration.step_keys {
+        return descend_unverified_gap(
+            repository,
+            branch,
+            latest,
+            first_number,
+            history_step_size,
+            false,
+        )
+        .await
+        .map(Some);
+    }
+
+    let anchor = forward_anchor(
+        repository,
+        branch,
+        first_number,
+        first_signature,
+        latest,
+        history_step_size,
+    )
+    .await?;
+
+    let target = match anchor {
+        ForwardAnchor::Sealed { anchor, boundary } => {
+            forward_target(
+                repository,
+                branch,
+                anchor,
+                Some(boundary),
+                first_number,
+                history_step_size,
+                acceleration.list_cache,
+            )
+            .await?
+        }
+        ForwardAnchor::LatestBand { anchor } => {
+            forward_target(
+                repository,
+                branch,
+                anchor,
+                None,
+                first_number,
+                history_step_size,
+                acceleration.list_cache,
+            )
+            .await?
+        }
+        ForwardAnchor::UnverifiedGap { anchor } => {
+            descend_unverified_gap(
+                repository,
+                branch,
+                anchor,
+                first_number,
+                history_step_size,
+                acceleration.step_keys,
+            )
+            .await?
+        }
+    };
+    Ok(Some(target))
 }
 
 #[cfg(test)]
 mod test {
     use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     use lore_base::runtime::LORE_CONTEXT;
@@ -1049,9 +1441,10 @@ mod test {
             assert!(first_page.signature_forward.is_none());
 
             // Page 2: anchor = rev 200, in closed segment 200 (cached).
-            // Cache serves items 200..101. Forward cursor targets rev
-            // 201; seg 300's step key isn't registered (only 250 revs
-            // exist), so no forward cursor.
+            // Cache serves items 200..101. Rev 201 exists (in the open
+            // latest band, since only 250 revisions exist and seg 300's
+            // step key isn't registered), so the forward cursor still
+            // resolves to it via the latest-anchored fallback.
             let second_page = handler(
                 make_request_signature(repository, Hash::from(backward.as_ref())),
                 immutable_store,
@@ -1076,7 +1469,8 @@ mod test {
                 second_page.items[MAX_REVISION_LIST_RESPONSE_ITEMS - 1].number,
                 101,
             );
-            assert!(second_page.signature_forward.is_none());
+            let forward = second_page.signature_forward.expect("forward cursor");
+            assert_eq!(Hash::from(forward.as_ref()), signatures[250 - 201]);
             // Backward cursor: parent of items[N-1] = rev 101 is rev 100,
             // the segment-100 anchor for the next-older page.
             let next_backward = second_page
@@ -1272,7 +1666,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn forward_cursor_is_none_when_no_step_key_covers_target() {
+    async fn forward_cursor_resolves_within_open_latest_band_when_no_step_key_covers_target() {
         let repository = random::<RepositoryId>();
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
@@ -1284,9 +1678,11 @@ mod test {
                 repository,
             ));
             // 50 revisions: only block 0 is populated; no step key
-            // ever registered (no boundary crossing happened).
-            // Anchor at revision 25 — target 26 has no step key
-            // registered, so forward cursor must be None.
+            // ever registered (no boundary crossing happened). Anchor
+            // at revision 25 — target 26 has no step key registered,
+            // but it still exists in the branch's open latest band, so
+            // the forward cursor must resolve to it rather than report
+            // no newer page.
             let (_branch, signatures) = create_branch_with_history(&repository_context, 50).await;
 
             let anchor = signatures[50 - 25];
@@ -1302,7 +1698,8 @@ mod test {
             .expect("Request failed")
             .into_inner();
             assert_eq!(response.items[0].number, 25);
-            assert!(response.signature_forward.is_none());
+            let forward = response.signature_forward.expect("forward cursor");
+            assert_eq!(Hash::from(forward.as_ref()), signatures[50 - 26]);
         }))
         .await;
     }
@@ -2013,6 +2410,686 @@ mod test {
                 sealed, revisions[&99],
                 "boundary 100 holds the highest revision numbered at or below it",
             );
+        }))
+        .await;
+    }
+
+    /// The forward cursor resolves to the real next revision across a
+    /// boundary the branch's numbering skipped, rather than assuming
+    /// `items[0].number + 1` exists.
+    #[tokio::test]
+    async fn forward_cursor_finds_the_real_revision_across_a_jump() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            // 1..=150, then a merge jumping to 400, then 401..=405 —
+            // the last five pushes seal boundary 400, so the target
+            // sits behind a sealed skip pointer rather than the open
+            // latest band.
+            let (branch_id, revisions) =
+                create_branch_with_jump_history(&repository_context, 150, 399, 5).await;
+            assert!(revisions.contains_key(&400));
+
+            let response = handler(
+                make_request_identifier(repository, branch_id, 150),
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration::default(),
+                &make_instruments(),
+            )
+            .await
+            .expect("Request failed")
+            .into_inner();
+            assert_eq!(response.items[0].number, 150);
+            let forward = response
+                .signature_forward
+                .expect("forward cursor across the jump");
+            assert_eq!(Hash::from(forward.as_ref()), revisions[&400]);
+        }))
+        .await;
+    }
+
+    /// Several consecutive empty step boundaries above the current page
+    /// must all be skipped, and the real target beyond them still found.
+    #[tokio::test]
+    async fn forward_cursor_skips_several_empty_bands_to_find_the_target() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            // 1..=150, then a merge jumping to 700 — skipping the empty
+            // boundaries 200, 300, 400, 500 and 600 — then 701..=705 to
+            // seal boundary 700.
+            let (branch_id, revisions) =
+                create_branch_with_jump_history(&repository_context, 150, 699, 5).await;
+            assert!(revisions.contains_key(&700));
+
+            let response = handler(
+                make_request_identifier(repository, branch_id, 150),
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration::default(),
+                &make_instruments(),
+            )
+            .await
+            .expect("Request failed")
+            .into_inner();
+            assert_eq!(response.items[0].number, 150);
+            let forward = response
+                .signature_forward
+                .expect("forward cursor past five empty bands");
+            assert_eq!(Hash::from(forward.as_ref()), revisions[&700]);
+        }))
+        .await;
+    }
+
+    /// A jump wide enough to leave dozens of consecutive sealed boundaries
+    /// pointing at the same pre-jump revision must still resolve in a
+    /// bounded number of probes: the binary search finds the real target's
+    /// boundary directly rather than degrading into a walk proportional
+    /// to the branch's history since the jump.
+    #[tokio::test]
+    async fn forward_cursor_resolves_a_jump_spanning_many_boundaries() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            // 1..=150, then a merge jumping to 5100 — sealing 48
+            // consecutive empty boundaries (200..=5000) at the pre-jump
+            // revision — then 5101..=5110 to seal boundary 5100 itself.
+            let (branch_id, revisions) =
+                create_branch_with_jump_history(&repository_context, 150, 5099, 10).await;
+            assert!(revisions.contains_key(&5100));
+
+            let response = handler(
+                make_request_identifier(repository, branch_id, 150),
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration::default(),
+                &make_instruments(),
+            )
+            .await
+            .expect("Request failed")
+            .into_inner();
+            assert_eq!(response.items[0].number, 150);
+            let forward = response
+                .signature_forward
+                .expect("forward cursor across a wide jump");
+            assert_eq!(Hash::from(forward.as_ref()), revisions[&5100]);
+        }))
+        .await;
+    }
+
+    /// Repeatedly following `signature_forward` from a page anchored well
+    /// before a jump must reach the branch's latest revision, and the
+    /// union of every page visited along the way must cover every
+    /// revision that exists — proving the cursor never skips a real
+    /// revision on its way there.
+    #[tokio::test]
+    async fn paging_forward_via_signature_forward_reaches_every_revision() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            // 1..=150, then a merge jumping to 400, then 401..=405.
+            let (branch_id, revisions) =
+                create_branch_with_jump_history(&repository_context, 150, 399, 5).await;
+
+            let mut seen: BTreeSet<u64> = BTreeSet::new();
+            let mut request = make_request_identifier(repository, branch_id, 1);
+            let mut reached_latest = false;
+
+            // Bounded generously above the number of pages this fixture
+            // can produce; a bug that stalls forward progress should fail
+            // loudly here rather than hang the test.
+            for _ in 0..30 {
+                let response = handler(
+                    request,
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    DEFAULT_HISTORY_STEP_SIZE,
+                    crate::grpc::server::RevisionListAcceleration::default(),
+                    &make_instruments(),
+                )
+                .await
+                .expect("paginated request failed")
+                .into_inner();
+
+                seen.extend(response.items.iter().map(|item| item.number));
+
+                let Some(forward) = response.signature_forward else {
+                    reached_latest = response.items.iter().any(|item| item.number == 405);
+                    break;
+                };
+                request = make_request_signature(repository, Hash::from(forward.as_ref()));
+            }
+
+            assert!(
+                reached_latest,
+                "paging forward never reached the branch's latest revision"
+            );
+            let expected: BTreeSet<u64> = revisions.keys().copied().collect();
+            assert_eq!(seen, expected, "paging forward skipped some revisions");
+        }))
+        .await;
+    }
+
+    /// Evicting the anchor band's cached list — but not its skip pointer
+    /// — must not cause the forward cursor to skip past revisions that
+    /// exist. It falls back to walking the band directly instead.
+    #[tokio::test]
+    async fn forward_cursor_survives_an_evicted_anchor_list_cache() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (branch_id, signatures) =
+                create_branch_with_history(&repository_context, 250).await;
+
+            // Evict segment 200's cached list — the anchor band above
+            // revision 100 — leaving its skip pointer intact.
+            let (key, key_type) = branch::revision_list_step_key(
+                lore_revision::repository::SALT_LORE,
+                repository,
+                branch_id,
+                200,
+                DEFAULT_HISTORY_STEP_SIZE,
+            );
+            mutable_store
+                .clone()
+                .store(repository, key, Hash::default(), key_type)
+                .await
+                .expect("evict anchor list cache");
+
+            let response = handler(
+                make_request_identifier(repository, branch_id, 100),
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration::default(),
+                &make_instruments(),
+            )
+            .await
+            .expect("Request failed")
+            .into_inner();
+            assert_eq!(response.items[0].number, 100);
+            let forward = response
+                .signature_forward
+                .expect("forward cursor via band walk");
+            assert_eq!(Hash::from(forward.as_ref()), signatures[250 - 101]);
+        }))
+        .await;
+    }
+
+    /// A step boundary can go missing below a boundary that is still
+    /// present — the seal write is best-effort, and the key type has been
+    /// renamed once already, orphaning older entries. The forward cursor
+    /// must still find the real successor rather than treat the missing
+    /// boundary as proof its band is empty and anchor on a boundary
+    /// further up, which would silently skip every revision in between.
+    /// The missing pointer is also repaired as a side effect, so a
+    /// second call resolves the fast path directly rather than repeating
+    /// the gap descent.
+    #[tokio::test]
+    async fn forward_cursor_repairs_a_missing_skip_pointer_below_a_found_anchor() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (branch_id, signatures) =
+                create_branch_with_history(&repository_context, 350).await;
+
+            // Evict ONLY boundary 200's skip pointer (REVISION_NUMBER_STEP),
+            // leaving its list cache and boundary 300's skip pointer intact.
+            let (key, key_type) = branch::revision_step_key(
+                lore_revision::repository::SALT_LORE,
+                repository,
+                branch_id,
+                200,
+                DEFAULT_HISTORY_STEP_SIZE,
+            );
+            mutable_store
+                .clone()
+                .store(repository, key, Hash::default(), key_type)
+                .await
+                .expect("evict boundary 200 skip pointer");
+
+            let response = handler(
+                make_request_identifier(repository, branch_id, 100),
+                immutable_store,
+                mutable_store.clone(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration::default(),
+                &make_instruments(),
+            )
+            .await
+            .expect("Request failed")
+            .into_inner();
+            assert_eq!(response.items[0].number, 100);
+            let forward = response
+                .signature_forward
+                .expect("forward cursor across the missing pointer");
+            assert_eq!(Hash::from(forward.as_ref()), signatures[350 - 101]);
+
+            // The gap descent repaired boundary 200's skip pointer: it now
+            // points at revision 200, the highest revision at or below it.
+            let repaired = mutable_store
+                .load(repository, key, key_type)
+                .await
+                .expect("boundary 200 should be repaired");
+            assert_eq!(repaired, signatures[350 - 200]);
+        }))
+        .await;
+    }
+
+    /// When the missing boundary is the very first one `forward_anchor`
+    /// probes (not one it only reaches after a fast binary-search hit),
+    /// the gap descent walks the full, uncapped distance down to
+    /// `first_number` and — since that distance is exactly what it walks
+    /// — necessarily crosses and repairs that same boundary. A second,
+    /// identical request then takes the fast path directly, for both the
+    /// page resolution and the forward cursor: the first call's cost
+    /// heals the exact spot future requests need, not just spots nearer
+    /// the branch's latest revision.
+    #[tokio::test]
+    async fn forward_cursor_repairs_the_boundary_nearest_first_number() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (branch_id, signatures) =
+                create_branch_with_history(&repository_context, 250).await;
+
+            // Evict boundary 100 — the very first boundary `forward_anchor`
+            // would probe for a page anchored at revision 50.
+            let (key, key_type) = branch::revision_step_key(
+                lore_revision::repository::SALT_LORE,
+                repository,
+                branch_id,
+                100,
+                DEFAULT_HISTORY_STEP_SIZE,
+            );
+            mutable_store
+                .clone()
+                .store(repository, key, Hash::default(), key_type)
+                .await
+                .expect("evict boundary 100 skip pointer");
+
+            // Disable the list cache so the page resolves to exactly
+            // revision 50 (not the whole cached segment headed at 100),
+            // landing `first_number` well below the evicted boundary.
+            let acceleration = crate::grpc::server::RevisionListAcceleration {
+                step_keys: true,
+                list_cache: false,
+            };
+
+            let first_response = handler(
+                make_request_identifier(repository, branch_id, 50),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                acceleration,
+                &make_instruments(),
+            )
+            .await
+            .expect("first request failed");
+            assert_eq!(
+                first_response
+                    .metadata()
+                    .get(REVISION_LIST_STRATEGY_HEADER)
+                    .map(|v| v.to_str().unwrap()),
+                Some("full-iteration"),
+                "no acceleration is usable yet for the first call",
+            );
+            let first_response = first_response.into_inner();
+            assert_eq!(first_response.items[0].number, 50);
+            let forward = first_response
+                .signature_forward
+                .expect("forward cursor via the full, uncapped gap descent");
+            assert_eq!(Hash::from(forward.as_ref()), signatures[250 - 51]);
+
+            // The descent crossed boundary 100 on its way down and
+            // repaired it — the boundary nearest `first_number`, not just
+            // ones nearer the branch's latest revision.
+            let repaired = mutable_store
+                .clone()
+                .load(repository, key, key_type)
+                .await
+                .expect("boundary 100 should be repaired");
+            assert_eq!(repaired, signatures[250 - 100]);
+
+            // An identical second request now takes the fast path for
+            // both the page and the forward cursor, with no gap descent
+            // needed at all.
+            let second_response = handler(
+                make_request_identifier(repository, branch_id, 50),
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                acceleration,
+                &make_instruments(),
+            )
+            .await
+            .expect("second request failed");
+            assert_eq!(
+                second_response
+                    .metadata()
+                    .get(REVISION_LIST_STRATEGY_HEADER)
+                    .map(|v| v.to_str().unwrap()),
+                Some("history-step"),
+                "the repaired boundary now serves the page directly",
+            );
+            let second_response = second_response.into_inner();
+            assert_eq!(second_response.items[0].number, 50);
+            let forward = second_response
+                .signature_forward
+                .expect("forward cursor via the now-repaired boundary");
+            assert_eq!(Hash::from(forward.as_ref()), signatures[250 - 51]);
+        }))
+        .await;
+    }
+
+    /// `MutableStore` wrapper that fails `load` for one specific key with
+    /// a non-retryable, non-`AddressNotFound` error, delegating
+    /// everything else to `inner`. Used to exercise the forward cursor's
+    /// error path, which a real store failure should reach unmasked.
+    struct FailingMutableStore {
+        inner: Arc<dyn lore_storage::MutableStore>,
+        fail_key: Hash,
+    }
+
+    #[async_trait::async_trait]
+    impl lore_storage::MutableStore for FailingMutableStore {
+        async fn load(
+            self: Arc<Self>,
+            partition: lore_storage::Partition,
+            key: Hash,
+            key_type: lore_storage::KeyType,
+        ) -> Result<Hash, lore_storage::StoreError> {
+            if key == self.fail_key {
+                return Err(lore_storage::StoreError::from(
+                    lore_storage::errors::Maintenance,
+                ));
+            }
+            self.inner.clone().load(partition, key, key_type).await
+        }
+
+        async fn store(
+            self: Arc<Self>,
+            partition: lore_storage::Partition,
+            key: Hash,
+            value: Hash,
+            key_type: lore_storage::KeyType,
+        ) -> Result<(), lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .store(partition, key, value, key_type)
+                .await
+        }
+
+        async fn compare_and_swap(
+            self: Arc<Self>,
+            partition: lore_storage::Partition,
+            key: Hash,
+            expected: Hash,
+            value: Hash,
+            key_type: lore_storage::KeyType,
+        ) -> Result<Hash, lore_storage::StoreError> {
+            self.inner
+                .clone()
+                .compare_and_swap(partition, key, expected, value, key_type)
+                .await
+        }
+
+        async fn list(
+            self: Arc<Self>,
+            partition: lore_storage::Partition,
+            key_type: lore_storage::KeyType,
+        ) -> Result<lore_storage::KeyValueStream, lore_storage::StoreError> {
+            self.inner.clone().list(partition, key_type).await
+        }
+
+        async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), lore_storage::StoreError> {
+            self.inner.clone().flush(sync_data).await
+        }
+    }
+
+    /// A genuine store failure while probing for the forward cursor must
+    /// surface as an error, not silently collapse into "no newer page".
+    #[tokio::test]
+    async fn forward_cursor_propagates_a_genuine_store_failure() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (branch_id, _) = create_branch_with_history(&repository_context, 250).await;
+
+            // Fail the probe for the anchor band above revision 100
+            // (boundary 200) with something other than `AddressNotFound`
+            // or `SlowDown`.
+            let (fail_key, _) = branch::revision_step_key(
+                lore_revision::repository::SALT_LORE,
+                repository,
+                branch_id,
+                200,
+                DEFAULT_HISTORY_STEP_SIZE,
+            );
+            let failing_store: Arc<dyn lore_storage::MutableStore> =
+                Arc::new(FailingMutableStore {
+                    inner: mutable_store,
+                    fail_key,
+                });
+
+            let err = handler(
+                make_request_identifier(repository, branch_id, 100),
+                immutable_store,
+                failing_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration::default(),
+                &make_instruments(),
+            )
+            .await
+            .expect_err("a genuine store failure must surface, not become a missing cursor");
+            assert_eq!(err.code(), tonic::Code::Internal);
+        }))
+        .await;
+    }
+
+    /// With `step_keys` disabled, the forward cursor must never read the
+    /// skip pointer at all — not just tolerate it being absent. Corrupts
+    /// the pointer with a value that would produce a visibly wrong
+    /// answer if read, and confirms the real answer comes back anyway,
+    /// via the same walk `resolve_start` falls back to for the main page
+    /// when step keys are off.
+    #[tokio::test]
+    async fn forward_cursor_step_keys_disabled_never_reads_a_wrong_skip_pointer() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (branch_id, signatures) =
+                create_branch_with_history(&repository_context, 250).await;
+
+            // Corrupt boundary 100's skip pointer to point at revision 1
+            // instead of revision 100. If this is read despite step_keys
+            // being disabled, the forward cursor would resolve to
+            // something other than revision 51.
+            let (key, key_type) = branch::revision_step_key(
+                lore_revision::repository::SALT_LORE,
+                repository,
+                branch_id,
+                100,
+                DEFAULT_HISTORY_STEP_SIZE,
+            );
+            mutable_store
+                .clone()
+                .store(repository, key, signatures[250 - 1], key_type)
+                .await
+                .expect("corrupt boundary 100 skip pointer");
+
+            let acceleration = crate::grpc::server::RevisionListAcceleration {
+                step_keys: false,
+                list_cache: false,
+            };
+            let response = handler(
+                make_request_identifier(repository, branch_id, 50),
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                acceleration,
+                &make_instruments(),
+            )
+            .await
+            .expect("Request failed")
+            .into_inner();
+            assert_eq!(response.items[0].number, 50);
+            let forward = response
+                .signature_forward
+                .expect("forward cursor via the uncapped walk");
+            assert_eq!(Hash::from(forward.as_ref()), signatures[250 - 51]);
+        }))
+        .await;
+    }
+
+    /// With `list_cache` disabled, the forward cursor must never read the
+    /// cached segment list for a sealed anchor — not just tolerate it
+    /// being missing or malformed. Plants a well-formed but wrong cached
+    /// list at the anchor's boundary and confirms the real answer, from
+    /// the direct walk, comes back instead.
+    #[tokio::test]
+    async fn forward_cursor_list_cache_disabled_never_reads_a_wrong_cached_list() {
+        use zerocopy::IntoBytes;
+
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (branch_id, signatures) =
+                create_branch_with_history(&repository_context, 250).await;
+
+            // Overwrite segment 200's cached list with a well-formed blob
+            // whose sole item is a fabricated revision numbered far above
+            // anything real. If this is read despite list_cache being
+            // disabled, the forward cursor would resolve to that bogus
+            // signature instead of the real revision 101.
+            let bogus_header = branch::CachedRevisionListHeader {
+                magic: branch::CACHED_REVISION_LIST_MAGIC,
+                version: branch::CACHED_REVISION_LIST_VERSION,
+            };
+            let bogus_item = branch::CachedRevisionItem {
+                number: 9999,
+                signature: Hash::from(random::<[u8; 32]>()),
+                metadata: Hash::default(),
+                state: lore_revision::state::StateData::default(),
+            };
+            let mut buffer = bytes::BytesMut::new();
+            buffer.extend_from_slice(bogus_header.as_bytes());
+            buffer.extend_from_slice([bogus_item].as_bytes());
+            let address = lore_revision::immutable::write(
+                repository_context.clone(),
+                lore_storage::Context::default(),
+                buffer.freeze(),
+                lore_revision::immutable::write_options_from_repository(repository_context.clone()),
+            )
+            .await
+            .expect("write bogus blob");
+            let (key, key_type) = branch::revision_list_step_key(
+                lore_revision::repository::SALT_LORE,
+                repository,
+                branch_id,
+                200,
+                DEFAULT_HISTORY_STEP_SIZE,
+            );
+            mutable_store
+                .clone()
+                .store(repository, key, address.hash, key_type)
+                .await
+                .expect("install bogus cached list");
+
+            let acceleration = crate::grpc::server::RevisionListAcceleration {
+                step_keys: true,
+                list_cache: false,
+            };
+            let response = handler(
+                make_request_identifier(repository, branch_id, 100),
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                acceleration,
+                &make_instruments(),
+            )
+            .await
+            .expect("Request failed")
+            .into_inner();
+            assert_eq!(response.items[0].number, 100);
+            let forward = response
+                .signature_forward
+                .expect("forward cursor via the direct walk");
+            assert_eq!(Hash::from(forward.as_ref()), signatures[250 - 101]);
         }))
         .await;
     }
