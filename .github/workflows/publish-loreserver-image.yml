@@ -19,7 +19,10 @@ name: Publish loreserver image
 # `meta` resolves tags and labels once, so the later jobs cannot disagree and
 # a ref with no tags fails early. Each variant then builds on its own native
 # runner (QEMU is far too slow for a release Rust build) and is pushed by
-# digest; `merge` stitches the digests into manifest lists and signs them.
+# digest; `merge` stitches the digests into a manifest list, signs and verifies
+# it under a staging tag, and only then attaches the release tags to the digest
+# it just proved. So no release tag is ever left pointing at an unsigned image,
+# even if Fulcio is having a bad day.
 #
 # No secrets: GITHUB_TOKEN authenticates to GHCR, and cosign signs keylessly
 # against Fulcio via the job's OIDC token.
@@ -57,8 +60,8 @@ jobs:
       graviton-json: ${{ steps.meta-graviton.outputs.json }}
       labels: ${{ steps.meta.outputs.labels }}
       annotations: ${{ steps.meta.outputs.annotations }}
-      primary-tag: ${{ steps.primary.outputs.tag }}
-      graviton-primary-tag: ${{ steps.primary.outputs.graviton-tag }}
+      graviton-labels: ${{ steps.meta-graviton.outputs.labels }}
+      graviton-annotations: ${{ steps.meta-graviton.outputs.annotations }}
     steps:
       # The input lands verbatim in the `tags` list below, where a newline
       # would smuggle in a further directive. Hold it to Docker's grammar.
@@ -110,21 +113,18 @@ jobs:
 
       # An empty list has to stop the run here, not surface as an invalid
       # reference in the merge job once every architecture is pushed.
-      - id: primary
-        name: Require at least one tag
+      - name: Require at least one tag
         env:
           JSON: ${{ steps.meta.outputs.json }}
           GRAVITON_JSON: ${{ steps.meta-graviton.outputs.json }}
         run: |
           set -euo pipefail
-          tag=$(jq -r '.tags[0] // empty' <<< "$JSON")
-          graviton_tag=$(jq -r '.tags[0] // empty' <<< "$GRAVITON_JSON")
-          if [ -z "${tag}" ] || [ -z "${graviton_tag}" ]; then
-            echo "::error::no image tags resolved for ${GITHUB_REF}; push a semver tag or pass the 'tag' input"
-            exit 1
-          fi
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "graviton-tag=${graviton_tag}" >> "$GITHUB_OUTPUT"
+          for json in "$JSON" "$GRAVITON_JSON"; do
+            if [ -z "$(jq -r '.tags[0] // empty' <<< "${json}")" ]; then
+              echo "::error::no image tags resolved for ${GITHUB_REF}; push a semver tag or pass the 'tag' input"
+              exit 1
+            fi
+          done
 
   build:
     name: build (${{ matrix.arch }}${{ matrix.variant == 'graviton' && ', graviton' || '' }})
@@ -139,9 +139,16 @@ jobs:
         include:
           # amd64 is baseline for both variants, so it is built once and both
           # manifest lists reference this digest.
-          - { arch: amd64, variant: base, platform: linux/amd64, runner: ubuntu-latest, target_cpu: "" }
-          - { arch: arm64, variant: base, platform: linux/arm64, runner: ubuntu-24.04-arm, target_cpu: "" }
-          - { arch: arm64, variant: graviton, platform: linux/arm64, runner: ubuntu-24.04-arm, target_cpu: neoverse-512tvb }
+          - { arch: amd64, variant: base, platform: linux/amd64, runner: ubuntu-latest }
+          - { arch: arm64, variant: base, platform: linux/arm64, runner: ubuntu-24.04-arm }
+          - { arch: arm64, variant: graviton, platform: linux/arm64, runner: ubuntu-24.04-arm }
+    env:
+      # The graviton leg carries the suffixed tag's metadata, so that `docker
+      # inspect` on a pulled image distinguishes the two arm64 variants. The
+      # amd64 leg is shared between both manifest lists and can only carry one
+      # set, which is the default's.
+      LABELS: ${{ matrix.variant == 'graviton' && needs.meta.outputs.graviton-labels || needs.meta.outputs.labels }}
+      ANNOTATIONS: ${{ matrix.variant == 'graviton' && needs.meta.outputs.graviton-annotations || needs.meta.outputs.annotations }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -155,15 +162,36 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The build argument below resolves from an expression, and an untuned
+      # build is a perfectly successful one — so were that expression ever to
+      # come back empty, the -graviton tag would quietly ship a baseline image
+      # and every later step would still be green. Assert the same expression
+      # here, where it can only cost a fast failure.
+      - name: Check the graviton leg is tuned
+        if: ${{ matrix.variant == 'graviton' }}
+        env:
+          TARGET_CPU: ${{ matrix.variant == 'graviton' && env.GRAVITON_TARGET_CPU || '' }}
+        run: |
+          if [ -z "${TARGET_CPU}" ]; then
+            echo "::error::no arm64 target CPU resolved for the graviton leg; it would build baseline armv8-a and publish it as tuned"
+            exit 1
+          fi
+          echo "tuning arm64 for ${TARGET_CPU}"
+
       - id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: lore-server/Dockerfile
           platforms: ${{ matrix.platform }}
-          build-args: ARM64_TARGET_CPU=${{ matrix.target_cpu }}
-          labels: ${{ needs.meta.outputs.labels }}
-          annotations: ${{ needs.meta.outputs.annotations }}
+          # Read from the workflow env rather than a matrix column, so retuning
+          # Graviton is one edit that cannot silently miss the build. `env` is
+          # unavailable in `strategy.matrix`, hence deriving it here from the
+          # variant instead. Empty is baseline; the Dockerfile ignores it on
+          # amd64 either way.
+          build-args: ARM64_TARGET_CPU=${{ matrix.variant == 'graviton' && env.GRAVITON_TARGET_CPU || '' }}
+          labels: ${{ env.LABELS }}
+          annotations: ${{ env.ANNOTATIONS }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           # Only the apt and toolchain layers survive a source change. The
           # cargo registry and target directory live in BuildKit cache mounts,
@@ -204,6 +232,13 @@ jobs:
   merge:
     name: merge and sign (${{ matrix.variant }})
     needs: [meta, build]
+    # `needs: build` alone waits on the whole matrix *and* requires all of it to
+    # succeed, which would let the opt-in graviton leg withhold the portable
+    # default image. Depend on the legs having finished, not on all of them
+    # having passed; `meta` is still a hard requirement, since a variant with no
+    # resolved tags has nothing to publish. Which legs a given variant actually
+    # needs is then the leg-existence check's call, further down.
+    if: ${{ !cancelled() && needs.meta.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       packages: write # Push the manifest list and the cosign signature
@@ -220,8 +255,11 @@ jobs:
             legs: digests-amd64-base digests-arm64-graviton
     env:
       JSON: ${{ matrix.variant == 'graviton' && needs.meta.outputs.graviton-json || needs.meta.outputs.json }}
-      PRIMARY_TAG: ${{ matrix.variant == 'graviton' && needs.meta.outputs.graviton-primary-tag || needs.meta.outputs.primary-tag }}
       LEGS: ${{ matrix.legs }}
+      # Where the index lands before it is signed. Commit-addressed, so it never
+      # moves and nothing has to be pointed away from it later; kept afterwards
+      # as a record of which commit produced which digest.
+      STAGING_TAG: sha-${{ github.sha }}${{ matrix.variant == 'graviton' && '-graviton' || '' }}
       # Anchored on this workflow's path: a bare repository prefix would
       # accept a certificate minted by any workflow here.
       IDENTITY_REGEXP: '^https://github\.com/${{ github.repository }}/\.github/workflows/publish-loreserver-image\.yml@'
@@ -241,16 +279,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Publishing happens in two phases. Here the index is created under the
+      # staging tag alone, so a failure between this step and a verified
+      # signature cannot leave a release tag — `latest` above all — pointing at
+      # an unsigned digest. The release tags are attached further down, once a
+      # signature exists and has verified.
       - name: Create the multi-arch manifest list
         working-directory: ${{ runner.temp }}/digests
         run: |
           set -euo pipefail
-          args=()
-          while IFS= read -r tag; do
-            args+=(--tag "${tag}")
-          done < <(jq -r '.tags[]' <<< "$JSON")
+          args=(--tag "${IMAGE}:${STAGING_TAG}")
           # The build job annotated each per-arch manifest; the index is
           # created here, so it needs the same annotations applying to it.
+          # They have to land now: annotations are part of what the digest
+          # covers, and the promotion below must not alter the digest.
           while IFS= read -r annotation; do
             args+=(--annotation "index:${annotation}")
           done < <(jq -r '.labels | to_entries[] | "\(.key)=\(.value)"' <<< "$JSON")
@@ -266,13 +308,13 @@ jobs:
           docker buildx imagetools create "${args[@]}"
 
       - name: Inspect the manifest list
-        run: docker buildx imagetools inspect "${PRIMARY_TAG}"
+        run: docker buildx imagetools inspect "${IMAGE}:${STAGING_TAG}"
 
       - id: digest
         name: Resolve the manifest list digest
         run: |
           set -euo pipefail
-          digest=$(docker buildx imagetools inspect "${PRIMARY_TAG}" \
+          digest=$(docker buildx imagetools inspect "${IMAGE}:${STAGING_TAG}" \
             --format '{{json .Manifest}}' | jq -r .digest)
           echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
@@ -296,6 +338,50 @@ jobs:
             > /dev/null
           echo "signature verified"
 
+      # Promotion below rests on `imagetools create` copying a lone index source
+      # through byte for byte, which is what makes the release tags resolve to
+      # the digest just signed. Prove that on the staging tag first, by copying
+      # the index onto the tag it already occupies: a no-op if the digest is
+      # preserved, and if some later buildx stops preserving it, the tag that
+      # moves out from under the signature is this one, which nothing consumes.
+      # Checking afterwards instead would mean finding out from `latest`.
+      - name: Prove the copy preserves the digest
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --tag "${IMAGE}:${STAGING_TAG}" "${IMAGE}@${DIGEST}"
+          resolved=$(docker buildx imagetools inspect "${IMAGE}:${STAGING_TAG}" \
+            --format '{{json .Manifest}}' | jq -r .digest)
+          if [ "${resolved}" != "${DIGEST}" ]; then
+            echo "::error::copying the index changed its digest (${DIGEST} -> ${resolved}); refusing to move the release tags off the signed digest"
+            exit 1
+          fi
+          echo "copy is digest-preserving"
+
+      # Phase two: the release tags, now that a signature exists over the digest
+      # and verifies. Each tag is re-resolved afterwards, so a tag pointing at
+      # anything other than the signed digest fails the run rather than shipping.
+      - name: Promote the signed digest to the release tags
+        env:
+          DIGEST: ${{ steps.digest.outputs.digest }}
+        run: |
+          set -euo pipefail
+          args=()
+          while IFS= read -r tag; do
+            args+=(--tag "${tag}")
+          done < <(jq -r '.tags[]' <<< "$JSON")
+          docker buildx imagetools create "${args[@]}" "${IMAGE}@${DIGEST}"
+          while IFS= read -r tag; do
+            resolved=$(docker buildx imagetools inspect "${tag}" \
+              --format '{{json .Manifest}}' | jq -r .digest)
+            if [ "${resolved}" != "${DIGEST}" ]; then
+              echo "::error::${tag} resolved to ${resolved}, not the signed ${DIGEST}"
+              exit 1
+            fi
+            echo "${tag} -> ${resolved}"
+          done < <(jq -r '.tags[]' <<< "$JSON")
+
       - name: Summarise what was published
         env:
           DIGEST: ${{ steps.digest.outputs.digest }}
@@ -315,6 +401,7 @@ jobs:
             echo ""
             echo "Tags:"
             jq -r '.tags[] | "- `" + . + "`"' <<< "$JSON"
+            echo "- \`${IMAGE}:${STAGING_TAG}\` (staging tag the signature was made against)"
             echo ""
             echo "Verify the signature with:"
             echo ""
