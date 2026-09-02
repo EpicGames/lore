@@ -643,11 +643,19 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             ),
             history_walk_concurrency: self.0.feature.revision_diff_history_walk_concurrency,
         };
+        let history_step_size = self
+            .0
+            .feature
+            .history_step_size
+            .unwrap_or(DEFAULT_HISTORY_STEP_SIZE);
+        let acceleration = RevisionListAcceleration::from_feature(&self.0.feature);
         let thin_client_v1_svc = LoreThinClientV1Service::new(
             self.0.immutable_store.clone(),
             self.0.mutable_store.clone(),
             rpc_timeout,
             revision_diff_config,
+            history_step_size,
+            acceleration,
         );
 
         let mut admin_svc = self.0.admin_svc;
@@ -659,12 +667,6 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             self.0.local_store.clone(),
             self.0.mutable_store.clone(),
         );
-        let history_step_size = self
-            .0
-            .feature
-            .history_step_size
-            .unwrap_or(DEFAULT_HISTORY_STEP_SIZE);
-        let acceleration = RevisionListAcceleration::from_feature(&self.0.feature);
         let revision_svc = ServiceBuilder::new().service(LoreRevisionService::new(
             self.0.immutable_store.clone(),
             self.0.mutable_store.clone(),

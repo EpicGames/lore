@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::cmp::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,12 +10,8 @@ use lore_proto::RevisionItem;
 use lore_proto::RevisionListRequest;
 use lore_proto::RevisionListResponse;
 use lore_proto::revision_list_request::Start;
-use lore_revision::branch;
-use lore_revision::find::FindMatchResult;
-use lore_revision::find::find_revision;
 use lore_revision::lore::BranchId;
 use lore_revision::metadata::Metadata;
-use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision::ResolveSearchLocation;
 use lore_revision::revision::{self};
@@ -157,50 +152,18 @@ async fn resolve_start(
             let branch = BranchId::from(&identifier.branch);
 
             let step_key_hit = if acceleration.step_keys {
-                let (key, key_type) = branch::revision_step_key(
-                    repository::SALT_LORE,
-                    repository.id,
+                crate::cache::revision::resolve_via_step_key(
+                    repository,
                     branch,
                     identifier.number,
                     history_step_size,
-                );
-                // Ignore errors as this is just an acceleration construct
-                // This will be recreated on the lookup
-                repository
-                    .read_mutable_store()
-                    .load(repository.id, key, key_type)
-                    .await
-                    .ok()
-                    .map(|revision| (key, revision))
+                )
+                .await
             } else {
                 None
             };
 
-            if let Some((key, revision)) = step_key_hit {
-                debug!(
-                    number = %identifier.number,
-                    key = %key,
-                    "Found history step key"
-                );
-                // Now we have found the start revision of the containing HISTORY_STEP_SIZE
-                // block of revisions. Now we search for the exact matching revision.
-                let hash = find_revision(
-                    repository.clone(),
-                    branch,
-                    revision,
-                    false,
-                    None,
-                    |state, _metadata| {
-                        let state_revision_number = state.revision_number();
-                        match state_revision_number.cmp(&identifier.number) {
-                            Ordering::Equal => FindMatchResult::Match,
-                            Ordering::Less => FindMatchResult::Abort,
-                            Ordering::Greater => FindMatchResult::Continue,
-                        }
-                    },
-                )
-                .await
-                .map_err(|err| Status::invalid_argument(format!("invalid identifier {err}")))?;
+            if let Some(hash) = step_key_hit {
                 (hash, RevisionListStrategy::HistoryStep)
             } else {
                 let signature = format!("{}@{}", branch, identifier.number);
@@ -249,9 +212,9 @@ async fn walk_revisions(
     let mut items = Vec::with_capacity(MAX_REVISION_LIST_RESPONSE_ITEMS);
 
     let mut base_revision = true;
-    // Track previous revision for step key backfill during full iteration.
-    // Stores (revision_number, revision_hash, metadata_hash) so the branch
-    // can be read from the revision metadata at boundary crossings.
+    // The revision visited before this one, held for the step key backfill
+    // below: sealing a boundary needs both sides of the crossing, and the
+    // branch comes from the newer side's metadata.
     let mut prev_step_state: Option<Arc<State>> = None;
 
     while items.len() < MAX_REVISION_LIST_RESPONSE_ITEMS {
@@ -304,10 +267,10 @@ async fn walk_revisions(
 
         let current_number = state.revision_number();
 
-        // Backfill missing history step keys during full iteration walks.
-        // When we detect a step boundary crossing between consecutive
-        // revisions, write the step key for the higher-numbered revision
-        // so future lookups can use the HistoryStep strategy. The branch
+        // Backfill missing history step keys during full iteration walks, so
+        // later lookups can take the HistoryStep strategy. Each boundary
+        // crossed between the two revisions is sealed with the older of them,
+        // the highest revision numbered at or below that boundary. The branch
         // is read from the revision metadata rather than carried from the
         // request identifier.
         if matches!(strategy, RevisionListStrategy::FullIteration)

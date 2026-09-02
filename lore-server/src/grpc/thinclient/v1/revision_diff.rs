@@ -113,6 +113,8 @@ pub async fn handler(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     config: RevisionDiffConfig,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<Response<RevisionDiffStream>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
@@ -142,8 +144,20 @@ pub async fn handler(
         .scope(execution, async move {
             // Resolve both sides up-front so unary errors surface before
             // the stream opens.
-            let (from_sig, from_id) = resolve_to_identifier(&repository, query_from.into()).await?;
-            let (to_sig, to_id) = resolve_to_identifier(&repository, query_to.into()).await?;
+            let (from_sig, from_id) = resolve_to_identifier(
+                &repository,
+                query_from.into(),
+                history_step_size,
+                acceleration,
+            )
+            .await?;
+            let (to_sig, to_id) = resolve_to_identifier(
+                &repository,
+                query_to.into(),
+                history_step_size,
+                acceleration,
+            )
+            .await?;
 
             let (tx, rx) = mpsc::channel(256);
 
@@ -760,6 +774,7 @@ mod test {
     use super::*;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
+    use crate::grpc::server::RevisionListAcceleration;
     use crate::store::test_store_create;
 
     fn make_request(
@@ -897,6 +912,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             {
@@ -940,6 +957,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1002,6 +1021,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1095,6 +1116,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1189,6 +1212,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1247,6 +1272,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             {
@@ -1293,6 +1320,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1363,6 +1392,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1419,6 +1450,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             {
@@ -1478,6 +1511,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");
@@ -1574,6 +1609,8 @@ mod test {
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
             )
             .await
             .expect("handler ok");

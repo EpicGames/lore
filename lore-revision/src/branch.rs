@@ -497,7 +497,12 @@ pub fn revision_step_key(
     revision_number: u64,
     step_size: u64,
 ) -> (Hash, KeyType) {
-    let key_revision_number = revision_number.div_ceil(step_size) * step_size;
+    // Saturating: a revision number within a step of `u64::MAX` cannot exist, so the
+    // clamped bucket is a key that never matches rather than an overflow panic on a
+    // number taken straight from a request.
+    let key_revision_number = revision_number
+        .div_ceil(step_size)
+        .saturating_mul(step_size);
     let key_type = mutable_key_type(REVISION_NUMBER_STEP);
     let key = hash::hash_function_strs_slice(
         salt,
@@ -521,7 +526,12 @@ pub fn revision_list_step_key(
     revision_number: u64,
     step_size: u64,
 ) -> (Hash, KeyType) {
-    let key_revision_number = revision_number.div_ceil(step_size) * step_size;
+    // Saturating: a revision number within a step of `u64::MAX` cannot exist, so the
+    // clamped bucket is a key that never matches rather than an overflow panic on a
+    // number taken straight from a request.
+    let key_revision_number = revision_number
+        .div_ceil(step_size)
+        .saturating_mul(step_size);
     let key_type = mutable_key_type(REVISION_LIST_STEP);
     let key = hash::hash_function_strs_slice(
         salt,

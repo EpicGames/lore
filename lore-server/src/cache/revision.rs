@@ -16,6 +16,7 @@
 //! All operations are best-effort: any failure aborts the cache write or
 //! returns `None`, so reads always have a correct fallback path.
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -25,11 +26,16 @@ use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::typed_bytes::TypedBytes;
 use lore_revision::branch;
+use lore_revision::find::FindMatchResult;
+use lore_revision::find::find_revision;
 use lore_revision::immutable;
 use lore_revision::lore::BranchId;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::revision;
+use lore_revision::revision::ResolveSearchLocation;
 use lore_revision::state::State;
+use lore_revision::state::StateError;
 use lore_storage::StoreError;
 use tracing::debug;
 use zerocopy::FromBytes;
@@ -454,6 +460,133 @@ pub async fn store_history_step(
             store_cached_list(&repository, branch, segment_b, history_step_size, &list).await;
         }
     }
+}
+
+/// Resolve `branch` revision `revision_number` to its signature, consulting
+/// the step acceleration structures before walking history.
+///
+/// A cached segment covering the number answers it outright. Otherwise the
+/// sealed boundary at or above the number anchors a bounded walk. Anything not
+/// served from acceleration data falls through to [`revision::resolve`], so an
+/// absent or unusable entry costs time rather than correctness.
+pub async fn resolve_revision_number(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    revision_number: u64,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
+) -> Result<Hash, StateError> {
+    if let Some(signature) = resolve_from_acceleration(
+        repository,
+        branch,
+        revision_number,
+        history_step_size,
+        acceleration,
+    )
+    .await
+    {
+        return Ok(signature);
+    }
+
+    revision::resolve(
+        repository.clone(),
+        format!("{branch}@{revision_number}"),
+        None,
+        ResolveSearchLocation::Local,
+    )
+    .await
+}
+
+/// Signature for `revision_number` if the acceleration structures can supply
+/// it, or `None` when the caller must walk history.
+async fn resolve_from_acceleration(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    revision_number: u64,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
+) -> Option<Hash> {
+    if acceleration.list_cache
+        && let Some(cached) =
+            load_cached_list(repository, branch, revision_number, history_step_size).await
+        && let Some(item) = cached
+            .items()
+            .iter()
+            .find(|item| item.number == revision_number)
+    {
+        debug!(
+            number = revision_number,
+            "Resolved revision number from cached segment"
+        );
+        return Some(item.signature);
+    }
+
+    if !acceleration.step_keys {
+        return None;
+    }
+
+    resolve_via_step_key(repository, branch, revision_number, history_step_size).await
+}
+
+/// Signature for `revision_number`, reached from the sealed boundary covering
+/// it. `None` when the boundary is unsealed or its anchor does not lead to the
+/// number, which leaves the caller to walk history.
+///
+/// The anchor is the highest revision numbered at or below its boundary, so a
+/// walk from it reaches every revision the boundary's segment contains. An
+/// anchor that does not lead to `revision_number` is reported as `None` rather
+/// than as absence: acceleration data can be stale or predate a key change, and
+/// a caller that treated that as "no such revision" would report an existing
+/// revision as missing.
+pub(crate) async fn resolve_via_step_key(
+    repository: &Arc<RepositoryContext>,
+    branch: BranchId,
+    revision_number: u64,
+    history_step_size: u64,
+) -> Option<Hash> {
+    let (key, key_type) = branch::revision_step_key(
+        repository::SALT_LORE,
+        repository.id,
+        branch,
+        revision_number,
+        history_step_size,
+    );
+    let anchor = repository
+        .clone()
+        .read_mutable_store()
+        .load(repository.id, key, key_type)
+        .await
+        .ok()?;
+    if anchor.is_zero() {
+        return None;
+    }
+
+    // An anchor holding the highest revision at or below its boundary is at
+    // most one segment above the target, so a walk longer than that is reading
+    // an anchor that does not describe the branch any more. Give up and let
+    // the caller walk history rather than following it.
+    let search_limit = (history_step_size as usize).saturating_add(1);
+    let signature = find_revision(
+        repository.clone(),
+        branch,
+        anchor,
+        false,
+        Some(search_limit),
+        |state, _metadata| match state.revision_number().cmp(&revision_number) {
+            Ordering::Equal => FindMatchResult::Match,
+            Ordering::Less => FindMatchResult::Abort,
+            Ordering::Greater => FindMatchResult::Continue,
+        },
+    )
+    .await
+    .ok()?;
+
+    debug!(
+        number = revision_number,
+        key = %key,
+        "Resolved revision number from history step key"
+    );
+    Some(signature)
 }
 
 #[cfg(test)]
@@ -938,6 +1071,222 @@ mod tests {
                     load_cached_list(&repository, branch, 150, STEP_ONE_HUNDRED)
                         .await
                         .is_none()
+                );
+            }))
+            .await;
+        }
+    }
+
+    mod resolve_revision_number {
+        use super::*;
+
+        const BOTH: RevisionListAcceleration = RevisionListAcceleration {
+            step_keys: true,
+            list_cache: true,
+        };
+        const STEP_KEYS_ONLY: RevisionListAcceleration = RevisionListAcceleration {
+            step_keys: true,
+            list_cache: false,
+        };
+        const NEITHER: RevisionListAcceleration = RevisionListAcceleration {
+            step_keys: false,
+            list_cache: false,
+        };
+
+        /// Create a branch and push `numbers` as a linear chain, then a merge
+        /// revision whose `parent_other` is numbered `jump_other_number` so the
+        /// branch's numbering gains a gap. Returns the branch and a map of
+        /// revision number to signature.
+        async fn push_history_with_a_gap(
+            repository: &Arc<RepositoryContext>,
+            linear_before: u64,
+            jump_other_number: u64,
+        ) -> (BranchId, std::collections::BTreeMap<u64, Hash>) {
+            let write_token = get_write_token();
+            let branch = BranchId::from(uuid::Uuid::now_v7());
+            branch::create(
+                repository.clone(),
+                &write_token,
+                branch,
+                "test-branch",
+                branch::default_category(),
+                "creator",
+                1,
+                vec![],
+                false,
+                false,
+            )
+            .await
+            .expect("create branch");
+
+            let mut revisions = std::collections::BTreeMap::new();
+            let mut parent = Hash::default();
+            for number in 1..=linear_before {
+                let state = Arc::new(State::new());
+                state.set_parent_self(parent);
+                state.set_revision_number(number);
+                let mut metadata = lore_revision::metadata::Metadata::new();
+                metadata.set_branch(branch).expect("set branch");
+                state.set_metadata_hash(
+                    metadata
+                        .serialize(repository.clone())
+                        .await
+                        .expect("serialize metadata"),
+                );
+                let serialized = state
+                    .serialize(repository.clone(), &write_token)
+                    .await
+                    .expect("serialize state");
+                parent = crate::grpc::handlers::branch_push::push(
+                    repository.clone(),
+                    branch,
+                    serialized,
+                    true,
+                    true,
+                    false,
+                    STEP_ONE_HUNDRED,
+                    BOTH,
+                )
+                .await
+                .expect("push revision")
+                .revision;
+                revisions.insert(number, parent);
+            }
+
+            let other =
+                serialize_jump_revision(repository, Hash::default(), jump_other_number).await;
+            let state = Arc::new(State::new());
+            state.set_parent_self(parent);
+            state.set_parent_other(other.revision());
+            let mut metadata = lore_revision::metadata::Metadata::new();
+            metadata.set_branch(branch).expect("set branch");
+            state.set_metadata_hash(
+                metadata
+                    .serialize(repository.clone())
+                    .await
+                    .expect("serialize metadata"),
+            );
+            let serialized = state
+                .serialize(repository.clone(), &write_token)
+                .await
+                .expect("serialize state");
+            let result = crate::grpc::handlers::branch_push::push(
+                repository.clone(),
+                branch,
+                serialized,
+                true,
+                true,
+                false,
+                STEP_ONE_HUNDRED,
+                BOTH,
+            )
+            .await
+            .expect("push jump revision");
+            revisions.insert(result.revision_number, result.revision);
+
+            (branch, revisions)
+        }
+
+        #[tokio::test]
+        async fn every_acceleration_setting_resolves_the_same_revision() {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository = test_repository(immutable_store, mutable_store);
+                // 1..=250 then a merge jumping to 400, so 251..=399 are absent.
+                let (branch, revisions) = push_history_with_a_gap(&repository, 250, 399).await;
+                assert!(revisions.contains_key(&400));
+
+                for number in [1, 100, 101, 200, 250, 400] {
+                    let expected = revisions[&number];
+                    for acceleration in [BOTH, STEP_KEYS_ONLY, NEITHER] {
+                        let resolved = resolve_revision_number(
+                            &repository,
+                            branch,
+                            number,
+                            STEP_ONE_HUNDRED,
+                            acceleration,
+                        )
+                        .await
+                        .unwrap_or_else(|err| panic!("revision {number} should resolve: {err}"));
+                        assert_eq!(
+                            resolved, expected,
+                            "revision {number} with acceleration {acceleration:?}"
+                        );
+                    }
+                }
+            }))
+            .await;
+        }
+
+        #[tokio::test]
+        async fn a_number_the_gap_skipped_does_not_resolve() {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository = test_repository(immutable_store, mutable_store);
+                let (branch, revisions) = push_history_with_a_gap(&repository, 250, 399).await;
+                assert!(!revisions.contains_key(&300));
+
+                for acceleration in [BOTH, STEP_KEYS_ONLY, NEITHER] {
+                    let err = resolve_revision_number(
+                        &repository,
+                        branch,
+                        300,
+                        STEP_ONE_HUNDRED,
+                        acceleration,
+                    )
+                    .await
+                    .expect_err("absent revision must not resolve");
+                    // Only these two are mapped to a not-found response by the
+                    // callers, so any other error reaches the client as an
+                    // internal fault.
+                    assert!(
+                        err.is_not_found() || err.is_revision_not_found(),
+                        "absent revision must report not found, got {err:?} \
+                         with acceleration {acceleration:?}",
+                    );
+                }
+            }))
+            .await;
+        }
+
+        /// A cached segment answers without consulting the step key, so a
+        /// number inside a closed segment resolves even when every step key
+        /// for the branch has been removed.
+        #[tokio::test]
+        async fn cached_segment_resolves_without_a_step_key() {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository = test_repository(immutable_store, mutable_store);
+                let (branch, revisions) = push_history_with_a_gap(&repository, 250, 399).await;
+
+                let write_token = get_write_token();
+                for boundary in [100, 200, 300, 400] {
+                    let (key, key_type) = branch::revision_step_key(
+                        repository::SALT_LORE,
+                        repository.id,
+                        branch,
+                        boundary,
+                        STEP_ONE_HUNDRED,
+                    );
+                    repository
+                        .clone()
+                        .write_mutable_store(&write_token)
+                        .store(repository.id, key, Hash::default(), key_type)
+                        .await
+                        .expect("remove step key");
+                }
+
+                assert_eq!(
+                    resolve_revision_number(&repository, branch, 100, STEP_ONE_HUNDRED, BOTH)
+                        .await
+                        .expect("cached segment resolves revision 100"),
+                    revisions[&100],
                 );
             }))
             .await;

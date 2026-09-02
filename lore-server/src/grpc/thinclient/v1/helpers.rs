@@ -19,8 +19,6 @@ use lore_revision::lore::BranchId;
 use lore_revision::metadata::Metadata;
 use lore_revision::node::NodeFlags;
 use lore_revision::repository::RepositoryContext;
-use lore_revision::revision;
-use lore_revision::revision::ResolveSearchLocation;
 use lore_revision::state::State;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::METADATA;
@@ -81,13 +79,15 @@ impl From<revision_diff_request::QueryTo> for RevisionSpec {
 ///
 /// Signature queries pass through; identifier queries with `number == 0`
 /// resolve to the branch's latest revision via `branch::load_latest`;
-/// non-zero numbers resolve via `revision::resolve("branch@N")`. The
-/// `is_not_found` / non-not-found split routes user-input misses to
-/// `Status::not_found` (quiet) and server-side faults to
-/// `Status::internal` (with structured warn).
+/// non-zero numbers resolve through the step acceleration structures,
+/// falling back to a full history walk. The `is_not_found` / non-not-found
+/// split routes user-input misses to `Status::not_found` (quiet) and
+/// server-side faults to `Status::internal` (with structured warn).
 pub(super) async fn resolve_signature(
     repository: &Arc<RepositoryContext>,
     spec: RevisionSpec,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<Hash, Status> {
     match spec {
         RevisionSpec::Signature(signature) => Ok(Hash::from(signature)),
@@ -109,12 +109,12 @@ pub(super) async fn resolve_signature(
                         }
                     })
             } else {
-                let signature = format!("{branch_id}@{}", identifier.number);
-                revision::resolve(
-                    repository.clone(),
-                    signature,
-                    None,
-                    ResolveSearchLocation::Local,
+                crate::cache::revision::resolve_revision_number(
+                    repository,
+                    branch_id,
+                    identifier.number,
+                    history_step_size,
+                    acceleration,
                 )
                 .await
                 .map_err(|err| {
@@ -147,8 +147,10 @@ pub(super) async fn resolve_signature(
 pub(super) async fn resolve_to_identifier(
     repository: &Arc<RepositoryContext>,
     spec: RevisionSpec,
+    history_step_size: u64,
+    acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<(Hash, model_v1::RevisionIdentifier), Status> {
-    let signature = resolve_signature(repository, spec).await?;
+    let signature = resolve_signature(repository, spec, history_step_size, acceleration).await?;
     debug!({REVISION} = %signature, "Loaded resolved signature");
     let identifier = identifier_for_signature(repository, signature).await?;
     Ok((signature, identifier))

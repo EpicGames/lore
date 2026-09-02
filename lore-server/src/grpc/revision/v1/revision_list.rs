@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::cmp::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,11 +11,8 @@ use lore_proto::lore::revision::v1::RevisionListRequest;
 use lore_proto::lore::revision::v1::RevisionListResponse;
 use lore_proto::lore::revision::v1::revision_list_request::Start;
 use lore_revision::branch;
-use lore_revision::find::FindMatchResult;
-use lore_revision::find::find_revision;
 use lore_revision::lore::BranchId;
 use lore_revision::metadata::Metadata;
-use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::revision;
 use lore_revision::revision::ResolveSearchLocation;
@@ -339,29 +335,18 @@ async fn resolve_start(
             }
 
             let step_key_hit = if acceleration.step_keys {
-                let (key, key_type) = branch::revision_step_key(
-                    repository::SALT_LORE,
-                    repository.id,
+                cache::revision::resolve_via_step_key(
+                    repository,
                     branch,
                     identifier.number,
                     history_step_size,
-                );
-                repository
-                    .read_mutable_store()
-                    .load(repository.id, key, key_type)
-                    .await
-                    .ok()
-                    .map(|revision| (key, revision))
+                )
+                .await
             } else {
                 None
             };
 
-            if let Some((key, block_revision)) = step_key_hit {
-                debug!(number = identifier.number, key = %key, "Found history step key");
-                let hash =
-                    find_exact_revision(repository, branch, block_revision, identifier.number)
-                        .await
-                        .map_err(|err| Status::not_found(format!("Revision not found: {err}")))?;
+            if let Some(hash) = step_key_hit {
                 Ok(ResolveStart::Walk {
                     start: hash,
                     strategy: RevisionListStrategy::HistoryStep,
@@ -449,27 +434,6 @@ async fn try_serve_signature_from_cache(
         next_older: cached_next_older(cached.items()),
         strategy,
     })
-}
-
-async fn find_exact_revision(
-    repository: &Arc<RepositoryContext>,
-    branch: BranchId,
-    block_revision: Hash,
-    target_number: u64,
-) -> Result<Hash, lore_revision::find::FindError> {
-    find_revision(
-        repository.clone(),
-        branch,
-        block_revision,
-        false,
-        None,
-        |state, _metadata| match state.revision_number().cmp(&target_number) {
-            Ordering::Equal => FindMatchResult::Match,
-            Ordering::Less => FindMatchResult::Abort,
-            Ordering::Greater => FindMatchResult::Continue,
-        },
-    )
-    .await
 }
 
 fn observe_resolve_start()
@@ -648,22 +612,8 @@ async fn forward_cursor(
     let target_number = first.number.checked_add(1)?;
     let branch = walked.branch?;
 
-    let (key, key_type) = branch::revision_step_key(
-        repository::SALT_LORE,
-        repository.id,
-        branch,
-        target_number,
-        history_step_size,
-    );
-    let block_revision = repository
-        .read_mutable_store()
-        .load(repository.id, key, key_type)
+    cache::revision::resolve_via_step_key(repository, branch, target_number, history_step_size)
         .await
-        .ok()?;
-
-    find_exact_revision(repository, branch, block_revision, target_number)
-        .await
-        .ok()
 }
 
 #[cfg(test)]
@@ -679,6 +629,7 @@ mod test {
     use lore_revision::metadata::Metadata;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::state::State;
+    use lore_storage::StoreError;
     use lore_telemetry::InstrumentProvider;
     use lore_transport::grpc::REPOSITORY_ID_KEY;
     use opentelemetry::KeyValue;
@@ -2027,7 +1978,7 @@ mod test {
                 repository,
             ));
             // Head lands at 105 and stops, leaving segment 200 open.
-            let (branch_id, _) =
+            let (branch_id, revisions) =
                 create_branch_with_jump_history(&repository_context, 99, 104, 0).await;
 
             let (key, key_type) = branch::revision_step_key(
@@ -2037,16 +1988,16 @@ mod test {
                 200,
                 DEFAULT_HISTORY_STEP_SIZE,
             );
+            let err = mutable_store
+                .clone()
+                .load(repository, key, key_type)
+                .await
+                .expect_err("segment 200 holds the head and must not be sealed");
             assert!(
-                mutable_store
-                    .clone()
-                    .load(repository, key, key_type)
-                    .await
-                    .is_err(),
-                "segment 200 holds the head and must not be sealed",
+                matches!(err, StoreError::AddressNotFound(_)),
+                "an unsealed boundary must read as missing, got {err:?}",
             );
 
-            // Boundary 100 was crossed by the jump and is sealed with 99.
             let (crossed_key, crossed_key_type) = branch::revision_step_key(
                 lore_revision::repository::SALT_LORE,
                 repository,
@@ -2054,12 +2005,13 @@ mod test {
                 100,
                 DEFAULT_HISTORY_STEP_SIZE,
             );
-            assert!(
-                mutable_store
-                    .load(repository, crossed_key, crossed_key_type)
-                    .await
-                    .is_ok(),
-                "boundary 100 was crossed and must be sealed",
+            let sealed = mutable_store
+                .load(repository, crossed_key, crossed_key_type)
+                .await
+                .expect("boundary 100 was crossed and must be sealed");
+            assert_eq!(
+                sealed, revisions[&99],
+                "boundary 100 holds the highest revision numbered at or below it",
             );
         }))
         .await;
