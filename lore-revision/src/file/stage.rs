@@ -348,16 +348,8 @@ pub async fn stage(
     // Every layer mount is staged by its own task, never the parent walk, so
     // masking every layer subtree on every main-repo walk is correct: an entry
     // not under a given target is never reached anyway.
-    let global_mask: Option<Arc<Vec<String>>> = if layers.is_empty() {
-        None
-    } else {
-        Some(Arc::new(
-            layers
-                .iter()
-                .map(|(layer, _)| layer.target_path.clone())
-                .collect(),
-        ))
-    };
+    let global_mask: Option<Arc<Vec<String>>> = (!layers.is_empty())
+        .then(|| Arc::new(layer::target_paths(layers.iter().map(|(layer, _)| layer))));
     let layer_target_refs: Vec<&str> = global_mask
         .as_deref()
         .map(|paths| paths.iter().map(String::as_str).collect())

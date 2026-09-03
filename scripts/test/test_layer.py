@@ -1806,6 +1806,38 @@ def _layer_config_staged(repo: Lore, target_path: str) -> str:
     return ""
 
 
+def _layer_config_current(repo: Lore, target_path: str) -> str:
+    """Return the `current` pin of the layer at `target_path` from `layer.toml`."""
+    with open(_layer_config_path(repo), "rb") as config_file:
+        config = tomllib.load(config_file)
+    for layer in config.get("layers", []):
+        if layer.get("target_path") == target_path:
+            return layer.get("current", "")
+    return ""
+
+
+def _assert_layer_staged_advanced(repo: Lore, target_path: str) -> str:
+    """Assert the layer at `target_path` pinned a real staged revision.
+
+    Checking only that the pin is non-zero passes on any garbage the writer
+    happens to leave, so this asserts the pin is a well-formed revision hash
+    that names a revision distinct from the layer's committed `current`.
+    """
+    staged = _layer_config_staged(repo, target_path)
+    current = _layer_config_current(repo, target_path)
+    assert re.fullmatch(r"[0-9a-f]{64}", staged), (
+        f"Layer at {target_path} has no well-formed staged pin, got {staged!r}"
+    )
+    assert staged != ZERO_HASH, (
+        f"Layer at {target_path} left its staged pin zeroed, got {staged!r}"
+    )
+    assert staged != current, (
+        f"Layer at {target_path} pinned staged equal to current {current!r}, "
+        "which reads as nothing staged"
+    )
+    return staged
+
+
 @pytest.mark.smoke
 def test_layer_stage_scan_unchanged_layer(new_lore_repo):
     """`stage . --scan` must not stage a layer whose files are all unchanged.
@@ -1863,6 +1895,168 @@ def test_layer_stage_scan_unchanged_layer(new_lore_repo):
         content = out.read()
     assert content == b"layer content v2", (
         f"Expected the layer to be restored to L2 on main, got: {content}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_dirty_modify_records_in_layer(new_lore_repo):
+    """`dirty` on a modified layer file records the change in the layer.
+
+    Layer content is absent from the parent's tree, so the path has to be
+    evaluated against the layer's own current and staged states.
+    """
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    with repo.open_file(LAYER_FILE, mode="wb") as out:
+        out.write(b"layer content v2")
+    repo.dirty(LAYER_FILE)
+
+    _assert_layer_staged_advanced(repo, "lay")
+
+    status_entries = parse_status_json(repo.status(json=True))
+    assert [entry.get("path") for entry in status_entries] == ["lay/layer_file.txt"], (
+        f"Expected only the layer file reported, got {status_entries}"
+    )
+    # A modify has no action of its own: it is `keep` carrying the dirty flag,
+    # which is what separates it from the add the parent used to record.
+    assert (
+        status_entries[0].get("action"),
+        status_entries[0].get("flagDirty"),
+    ) == ("keep", True), (
+        f"Expected the layer file recorded as a dirty modify, got {status_entries}"
+    )
+
+    repo.stage(".")
+    repo.commit("Parent commit", layer_messages={"lay": "Layer commit"})
+    repo.push()
+
+    layer_repo.sync()
+    with layer_repo.open_file(LAYER_FILE, mode="rb") as out:
+        assert out.read() == b"layer content v2", (
+            "The layer repository did not receive the modified content"
+        )
+
+
+@pytest.mark.smoke
+def test_layer_dirty_delete_records_in_layer(new_lore_repo):
+    """`dirty` on a deleted layer file records the delete in the layer.
+
+    Neither the parent's current revision nor its staged tree holds the path,
+    so evaluating it against the parent matches no case at all.
+    """
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    os.remove(os.path.join(repo.path, LAYER_FILE))
+    repo.dirty(LAYER_FILE)
+
+    _assert_layer_staged_advanced(repo, "lay")
+
+    status_entries = parse_status_json(repo.status(json=True))
+    assert [entry.get("path") for entry in status_entries] == ["lay/layer_file.txt"], (
+        f"Expected the deleted layer file reported, got {status_entries}"
+    )
+    assert status_entries[0].get("action") == "delete", (
+        f"Expected the layer file recorded as a delete, got {status_entries}"
+    )
+
+    repo.stage(".")
+    repo.commit("Parent commit", layer_messages={"lay": "Layer delete"})
+    repo.push()
+
+    layer_repo.sync()
+    assert not os.path.exists(os.path.join(layer_repo.path, LAYER_FILE)), (
+        "The delete did not reach the layer repository"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_dirty_mount_path_differs_from_source_path(new_lore_repo):
+    """`dirty` resolves a layer path against the layer's tree but reads disk at the mount.
+
+    The two paths coincide only when `target_path` equals `source_path`. Here the
+    layer's `src/` subtree is mounted at `mnt`, so a state lookup for
+    `src/nested.txt` has to pair with a disk read of `mnt/nested.txt`. Deriving
+    the disk path from the state path instead finds nothing on disk and records
+    the file as a delete.
+    """
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+
+    repo.write_commit_push(None, {MAIN_FILE: b"main content"})
+
+    layer_repo.make_dirs("src")
+    layer_repo.write_commit_push(
+        None, {os.path.join("src", "nested.txt"): b"nested v1"}
+    )
+
+    repo.layer_add("mnt", layer_repo, "src/")
+
+    mounted_file = os.path.join("mnt", "nested.txt")
+    with repo.open_file(mounted_file, mode="wb") as out:
+        out.write(b"nested v2")
+    repo.dirty(mounted_file)
+
+    _assert_layer_staged_advanced(repo, "mnt")
+
+    # `keep` plus the dirty flag is a modify; deriving the disk path from the
+    # state path instead would find nothing on disk and report a `delete`.
+    status_entries = parse_status_json(repo.status(json=True))
+    assert [
+        (entry.get("path"), entry.get("action"), entry.get("flagDirty"))
+        for entry in status_entries
+    ] == [("mnt/nested.txt", "keep", True)], (
+        f"Expected the mounted file recorded as a dirty modify, got {status_entries}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_dirty_ancestor_records_parent_and_layer(new_lore_repo):
+    """`dirty <dir>` above a mount records the parent's own files and the layer's.
+
+    The mount is a child of the dirtied directory, so the parent walk descends
+    into it and would claim the layer's content as parent adds. Masking the mount
+    out has to leave the parent's sibling files still recorded, and has to leave
+    the mount directory itself unrecorded on either side.
+    """
+    repo, layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    with repo.open_file(MAIN_FILE, mode="wb") as out:
+        out.write(b"main content v2")
+    with repo.open_file(LAYER_FILE, mode="wb") as out:
+        out.write(b"layer content v2")
+    repo.dirty(".")
+
+    _assert_layer_staged_advanced(repo, "lay")
+
+    status_entries = parse_status_json(repo.status(json=True))
+    assert sorted(
+        (entry.get("path"), entry.get("action"), entry.get("flagDirty"))
+        for entry in status_entries
+    ) == [
+        ("lay/layer_file.txt", "keep", True),
+        ("main_file.txt", "keep", True),
+    ], (
+        f"Expected both the parent file and the layer file as dirty modifies, got {status_entries}"
+    )
+
+    repo.stage(".")
+    status_entries = parse_status_json(repo.status(json=True))
+    assert sorted(
+        (entry.get("path"), entry.get("flagStaged")) for entry in status_entries
+    ) == [("lay/layer_file.txt", True), ("main_file.txt", True)], (
+        f"Expected exactly the two files staged, got {status_entries}"
+    )
+
+    repo.commit("Parent commit", layer_messages={"lay": "Layer commit"})
+    repo.push()
+
+    layer_repo.sync()
+    with layer_repo.open_file(LAYER_FILE, mode="rb") as out:
+        assert out.read() == b"layer content v2", (
+            "The layer repository did not receive the modified content"
+        )
+    assert not os.path.exists(os.path.join(layer_repo.path, MAIN_FILE)), (
+        "The parent's own file was routed into the layer repository"
     )
 
 

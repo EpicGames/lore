@@ -1843,6 +1843,18 @@ impl State {
         }
     }
 
+    pub fn reparent_onto(&self, current_revision: Hash) {
+        let based_on_current = self.revision() == current_revision;
+
+        self.set_revision_number(0);
+        self.set_parent_self(current_revision);
+
+        if based_on_current {
+            self.set_parent_other(Hash::default());
+            self.set_metadata_hash(Hash::default());
+        }
+    }
+
     pub fn is_merge(&self) -> bool {
         self.data.read().flags & StateFlags::Merge != 0
     }

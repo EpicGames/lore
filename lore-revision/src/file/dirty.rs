@@ -1,14 +1,19 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use lore_error_set::prelude::*;
 
 use crate::errors::*;
+use crate::file::stage::LayerRoute;
+use crate::file::stage::classify_stage_path;
+use crate::file::stage::is_path_under_layer_mask;
 use crate::filter::FilterMode;
 use crate::interface::LoreArray;
 use crate::interface::LoreString;
+use crate::layer;
 use crate::lore::Hash;
 use crate::lore::execution_context;
 use crate::lore_debug;
@@ -128,8 +133,25 @@ pub(crate) async fn dirty_relative_paths(
     let state_staged = state_staged.unwrap_or_else(|| state_current.clone());
     let staged_revision = state_staged.revision();
 
-    let signature =
-        dirty_relative_paths_in(repository.clone(), state_current, state_staged, paths).await?;
+    let layers = layer::list(repository.clone())
+        .await
+        .forward::<DirtyError>("Failed to list layers")?;
+    let (parent_paths, layer_jobs) = route_dirty_paths(&layers, paths);
+
+    let mask = (!layers.is_empty()).then(|| Arc::new(layer::target_paths(&layers)));
+
+    let signature = dirty_relative_paths_in_masked(
+        repository.clone(),
+        state_current,
+        state_staged,
+        parent_paths,
+        mask,
+    )
+    .await?;
+
+    for (layer_index, remains) in layer_jobs {
+        dirty_into_layer(repository.clone(), &layers[layer_index], &remains).await?;
+    }
 
     // Current is never anchored as staged, and matching either input state
     // means nothing was dirtied.
@@ -142,6 +164,158 @@ pub(crate) async fn dirty_relative_paths(
     Ok(signature)
 }
 
+/// Splits paths into those the parent repository owns and, per layer, the mount-relative suffixes
+/// that layer owns.
+///
+/// Layer content is deliberately absent from the parent's tree, so a path under a mount evaluated
+/// against the parent's states matches nothing and every dispatch arm in [`dirty_path`] misfires.
+fn route_dirty_paths(
+    layers: &[layer::Layer],
+    paths: Vec<RelativePath>,
+) -> (Vec<RelativePath>, Vec<(usize, Vec<RelativePath>)>) {
+    if layers.is_empty() {
+        return (paths, Vec::new());
+    }
+
+    let targets: Vec<&str> = layers
+        .iter()
+        .map(|layer| layer.target_path.as_str())
+        .collect();
+
+    let mut parent_paths = Vec::new();
+    let mut remains_per_layer: Vec<Vec<RelativePath>> = vec![Vec::new(); layers.len()];
+
+    for path in paths {
+        match classify_stage_path(path.as_str(), &targets) {
+            LayerRoute::Inside {
+                layer_index,
+                remain,
+            } => remains_per_layer[layer_index].push(remain),
+            LayerRoute::AncestorOf { layer_indices } => {
+                parent_paths.push(path);
+                for layer_index in layer_indices {
+                    remains_per_layer[layer_index].push(RelativePath::new());
+                }
+            }
+            LayerRoute::Disjoint => parent_paths.push(path),
+        }
+    }
+
+    let layer_jobs = remains_per_layer
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, mut remains)| {
+            if remains.is_empty() {
+                return None;
+            }
+            // A mount root subsumes any suffix beneath it.
+            if remains.iter().any(RelativePath::is_empty) {
+                remains = vec![RelativePath::new()];
+            } else {
+                remains.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
+                remains.dedup_by(|a, b| a.as_str() == b.as_str());
+            }
+            Some((index, remains))
+        })
+        .collect();
+
+    (parent_paths, layer_jobs)
+}
+
+/// Each `remain` is mount-relative, so it names the same file twice over: under the layer's
+/// `source_path` for the state lookup, and under the mount for the disk lookup. The two differ
+/// whenever a layer is mounted somewhere other than the path it occupies in its own repository.
+async fn dirty_into_layer(
+    repository: Arc<RepositoryContext>,
+    layer: &layer::Layer,
+    remains: &[RelativePath],
+) -> Result<(), DirtyError> {
+    let mount_root = repository.require_path()?.join(&layer.target_path);
+    let source_path = RelativePath::new_from_initial_path(&layer.source_path)
+        .forward_with::<DirtyError, _>(|| {
+            format!("Invalid layer source path {}", layer.source_path)
+        })?;
+
+    let layer_state = layer
+        .deserialize_current_and_staged(repository.clone())
+        .await
+        .forward::<DirtyError>("Failed to deserialize layer state")?;
+
+    let current_revision = layer_state.state_current.revision();
+
+    let stats = Arc::new(DirtyStats::default());
+    let force = execution_context().globals().force();
+
+    for remain in remains {
+        let state_path = source_path.join(remain.as_str());
+        let absolute_path = remain.to_absolute_path(&mount_root);
+
+        if !force
+            && layer_state
+                .repository
+                .filter
+                .emit_excludes(&state_path, true, FilterMode::Full)
+        {
+            lore_trace!("Layer path excluded by filter: {}", state_path.as_str());
+            continue;
+        }
+
+        dirty_path(
+            layer_state.repository.clone(),
+            layer_state.state_current.clone(),
+            layer_state.state_staged.clone(),
+            &state_path,
+            &absolute_path,
+            DiskState::Unknown,
+            stats.clone(),
+            None,
+        )
+        .await?;
+    }
+
+    let state_staged = layer_state.state_staged.clone();
+
+    // A staged state never hashes equal to the committed current, so pinning an unmutated layer
+    // pins a staged revision with nothing in it, which makes `commit` abort with `NothingStaged`
+    // after the parent has already committed.
+    if !state_staged.is_dirty() {
+        lore_debug!("No dirty markers for layer at {}", layer.target_path);
+        return Ok(());
+    }
+
+    state_staged.reparent_onto(current_revision);
+
+    let token = repository
+        .try_write_token()
+        .expect("dirty requires write access");
+    let signature = state_staged
+        .serialize(layer_state.repository.clone(), token)
+        .await
+        .forward::<DirtyError>("Failed to serialize layer staged revision state")?;
+
+    if signature != layer.current && !execution_context().globals().dry_run() {
+        layer::store_layer_staged(
+            repository.clone(),
+            token,
+            layer.target_path.as_str(),
+            layer.repository,
+            signature,
+        )
+        .await
+        .forward::<DirtyError>("Failed to store layer staged state")?;
+    }
+
+    lore_debug!(
+        "Dirtied {} paths in layer at {}, staged {signature}",
+        stats.modify_count.load(Ordering::Relaxed)
+            + stats.add_count.load(Ordering::Relaxed)
+            + stats.delete_count.load(Ordering::Relaxed),
+        layer.target_path
+    );
+
+    Ok(())
+}
+
 /// Apply dirty markers against explicit states, reading and writing no
 /// anchors. Pass a clone of `state_current` as `state_staged` when nothing is
 /// staged yet. Returns `state_staged`'s own revision when no path produced a
@@ -152,7 +326,20 @@ pub(crate) async fn dirty_relative_paths_in(
     state_staged: Arc<State>,
     paths: Vec<RelativePath>,
 ) -> Result<Hash, DirtyError> {
+    dirty_relative_paths_in_masked(repository, state_current, state_staged, paths, None).await
+}
+
+/// [`dirty_relative_paths_in`] with the layer mount subtrees the parent walk must not descend
+/// into, so layer content is never enqueued as parent nodes.
+async fn dirty_relative_paths_in_masked(
+    repository: Arc<RepositoryContext>,
+    state_current: Arc<State>,
+    state_staged: Arc<State>,
+    paths: Vec<RelativePath>,
+    mask: Option<Arc<Vec<String>>>,
+) -> Result<Hash, DirtyError> {
     let current_revision = state_current.revision();
+    let repository_path = repository.require_path()?.to_path_buf();
 
     let stats = Arc::new(DirtyStats::default());
     let force = execution_context().globals().force();
@@ -167,13 +354,16 @@ pub(crate) async fn dirty_relative_paths_in(
             continue;
         }
 
+        let absolute_path = relative_path.to_absolute_path(&repository_path);
         dirty_path(
             repository.clone(),
             state_current.clone(),
             state_staged.clone(),
             relative_path,
+            &absolute_path,
             DiskState::Unknown,
             stats.clone(),
+            mask.clone(),
         )
         .await?;
     }
@@ -221,15 +411,28 @@ enum DiskState {
 }
 
 /// Process a single path and determine the dirty action.
+///
+/// `absolute_path` is passed in rather than derived from `relative_path` because a layer's content
+/// is mounted at a path in the parent working directory that need not match the path it occupies
+/// in the layer repository's own tree.
+#[allow(clippy::too_many_arguments)]
 async fn dirty_path(
     repository: Arc<RepositoryContext>,
     state_current: Arc<State>,
     state_staged: Arc<State>,
     relative_path: &RelativePath,
+    absolute_path: &Path,
     disk_state: DiskState,
     stats: Arc<DirtyStats>,
+    mask: Option<Arc<Vec<String>>>,
 ) -> Result<(), DirtyError> {
-    let absolute_path = relative_path.to_absolute_path(repository.require_path()?);
+    if let Some(mask) = mask.as_deref()
+        && is_path_under_layer_mask(relative_path.as_str(), mask)
+    {
+        lore_trace!("Path inside layer mount, not a parent path: {relative_path}");
+        return Ok(());
+    }
+
     let (exists_on_disk, is_dir) = match disk_state {
         DiskState::Present(metadata) => (true, metadata.is_dir()),
         DiskState::Absent => (false, false),
@@ -282,8 +485,9 @@ async fn dirty_path(
             state_current.clone(),
             state_staged.clone(),
             relative_path,
-            &absolute_path,
+            absolute_path,
             stats.clone(),
+            mask.clone(),
         )
         .await?;
     } else if exists_on_disk && in_current_revision {
@@ -684,6 +888,7 @@ fn dirty_directory<'a>(
     dir_path: &'a RelativePath,
     absolute_path: &'a std::path::Path,
     stats: Arc<DirtyStats>,
+    mask: Option<Arc<Vec<String>>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DirtyError>> + Send + 'a>> {
     Box::pin(async move {
         let mut entries = lore_io::IoDriver::global()
@@ -717,10 +922,12 @@ fn dirty_directory<'a>(
                 state_current.clone(),
                 state_staged.clone(),
                 &child_path,
+                &absolute_path.join(name_str.as_ref()),
                 entry
                     .metadata
                     .map_or(DiskState::Unknown, DiskState::Present),
                 stats.clone(),
+                mask.clone(),
             )
             .await?;
         }
@@ -756,8 +963,10 @@ fn dirty_directory<'a>(
                         state_current.clone(),
                         state_staged.clone(),
                         &child_rel,
+                        &child_abs,
                         DiskState::Absent,
                         stats.clone(),
+                        mask.clone(),
                     )
                     .await?;
                 }

@@ -737,6 +737,18 @@ pub async fn list(repository: Arc<RepositoryContext>) -> Result<Vec<Layer>, Laye
     Ok(config.layers)
 }
 
+/// The mount paths of `layers`, for routing a path to the layer that owns it and
+/// for masking those subtrees out of a parent-repository walk.
+///
+/// Takes an iterator so callers holding `Layer` alongside its state or context
+/// can project without rebuilding a `Vec<Layer>` first.
+pub fn target_paths<'a>(layers: impl IntoIterator<Item = &'a Layer>) -> Vec<String> {
+    layers
+        .into_iter()
+        .map(|layer| layer.target_path.clone())
+        .collect()
+}
+
 /// For operations that cascade into every configured layer.
 ///
 /// Each context costs its own connection until UCS-19226 lands, so they are
