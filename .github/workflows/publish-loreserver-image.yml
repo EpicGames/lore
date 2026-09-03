@@ -116,8 +116,8 @@ jobs:
           GRAVITON_JSON: ${{ steps.meta-graviton.outputs.json }}
         run: |
           set -euo pipefail
-          for json in "$JSON" "$GRAVITON_JSON"; do
-            if [ -z "$(jq -r '.tags[0] // empty' <<< "${json}")" ]; then
+          for tags_json in "$JSON" "$GRAVITON_JSON"; do
+            if [ -z "$(jq -r '.tags[0] // empty' <<< "${tags_json}")" ]; then
               echo "::error::no image tags resolved for ${GITHUB_REF}; push a semver tag or pass the 'tag' input"
               exit 1
             fi
