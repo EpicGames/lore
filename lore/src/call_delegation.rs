@@ -1,10 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use lore_base::error::InvalidArguments;
+use lore_base::error::ShutDown;
 use lore_base::text::TextNotUtf8;
 use lore_base::text::ValidateText;
 use lore_error_set::prelude::*;
 use lore_revision::event::EventError;
+use lore_revision::event::LoreCompleteEventData;
+use lore_revision::event::LoreEndEventData;
+use lore_revision::event::LoreErrorDetail;
+use lore_revision::event::LoreEvent;
 use lore_revision::interface::LoreGlobalArgs;
 
 use crate::args::InvokableLoreArgs;
@@ -19,6 +24,33 @@ pub(crate) enum ArgumentError {
 }
 
 impl EventError for ArgumentError {}
+
+/// Rejection of a call that arrived after `lore_shutdown()`.
+#[error_set]
+pub(crate) enum ShutdownError {
+    ShutDown,
+}
+
+impl EventError for ShutdownError {}
+
+/// Emits Complete and End events if called after shutdown. Shutdown is terminal
+/// and terminates the runtime. Therefore we cannot use the normal
+/// `crate::runtime().block_on(reject_call(...))` mechanism to emit the error events.
+fn reject_after_shutdown(callback: LoreEventCallbackConfig) -> i32 {
+    let error = ShutdownError::from(ShutDown);
+    let status = error.ffi_code();
+    lore_base::lore_warn!("{error}");
+
+    if let Some(callback) = lore_revision::event::convert_event_callback(callback) {
+        callback(&LoreEvent::Complete(LoreCompleteEventData {
+            status,
+            error: LoreErrorDetail::from_error(&error),
+        }));
+        callback(&LoreEvent::End(LoreEndEventData::default()));
+    }
+
+    status
+}
 
 /// Check every text field a call carries, so a handler can read its arguments
 /// as `&str`.
@@ -47,6 +79,9 @@ pub(crate) fn run_synchronously<
     callback: LoreEventCallbackConfig,
     handler: Handler,
 ) -> i32 {
+    if lore_base::runtime::runtime_shutdown_started() {
+        return reject_after_shutdown(callback);
+    }
     let callback = lore_revision::event::convert_event_callback(callback);
     if let Err(error) = validate_call_text(globals, args) {
         return crate::runtime().block_on(reject_call(globals.clone(), callback, error));
@@ -74,6 +109,10 @@ pub(crate) fn run_asynchronously<
     callback: LoreEventCallbackConfig,
     handler: Handler,
 ) {
+    if lore_base::runtime::runtime_shutdown_started() {
+        reject_after_shutdown(callback);
+        return;
+    }
     let callback = lore_revision::event::convert_event_callback(callback);
     if let Err(error) = validate_call_text(globals, args) {
         drop(lore_base::lore_spawn!(reject_call(

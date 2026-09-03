@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::mpsc::WeakUnboundedSender;
 use tokio::sync::mpsc::unbounded_channel;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::event::EventError;
@@ -37,6 +38,11 @@ pub struct EventDispatcher {
     pub completed: CancellationToken,
     pub weak_sender: Option<WeakUnboundedSender<DispatchedEvent>>,
     pub strong_sender: Mutex<Option<UnboundedSender<DispatchedEvent>>>,
+    /// The forwarder task, kept so `complete` can await the task itself rather
+    /// than only the token it cancels. A runtime torn down under an in-flight
+    /// call drops the task, which leaves the token uncancelled forever, but the
+    /// join still resolves.
+    forwarder: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Default for EventDispatcher {
@@ -46,6 +52,7 @@ impl Default for EventDispatcher {
             completed: CancellationToken::new(),
             weak_sender: None,
             strong_sender: Mutex::new(None),
+            forwarder: Mutex::new(None),
         }
     }
 }
@@ -58,7 +65,7 @@ impl EventDispatcher {
         let completed = CancellationToken::new();
         let (sender, mut receiver) = unbounded_channel();
         let weak_sender = sender.downgrade();
-        if let Some(callback) = callback {
+        let forwarder = if let Some(callback) = callback {
             let completed = completed.clone();
 
             // Spawn a forwarder task which will exit once all dispatchers
@@ -67,7 +74,7 @@ impl EventDispatcher {
             // drops it AFTER the callback returns, so any `LoreBytes`
             // view in the event points at a live buffer for the full
             // callback invocation.
-            lore_spawn_core!(async move {
+            Some(lore_spawn_core!(async move {
                 while let Some((event, _keepalive)) = receiver.recv().await {
                     callback(&event);
                     // `_keepalive` drops here — the referenced buffer
@@ -75,9 +82,10 @@ impl EventDispatcher {
                 }
                 callback(&LoreEvent::End(LoreEndEventData::default()));
                 completed.cancel();
-            });
+            }))
         } else {
             completed.cancel();
+            None
         };
 
         Self {
@@ -85,6 +93,7 @@ impl EventDispatcher {
             completed,
             weak_sender: Some(weak_sender),
             strong_sender: Mutex::new(Some(sender)),
+            forwarder: Mutex::new(forwarder),
         }
     }
 
@@ -94,6 +103,7 @@ impl EventDispatcher {
             completed: CancellationToken::new(),
             weak_sender: None,
             strong_sender: Mutex::new(None),
+            forwarder: Mutex::new(None),
         }
     }
 
@@ -163,7 +173,15 @@ impl EventDispatcher {
             .unwrap_or_default()
             == 0
         {
-            self.completed.cancelled().await;
+            // Await the forwarder task, not just the token it cancels on its way
+            // out. The two finish together in the normal case, but a runtime torn
+            // down under an in-flight call drops the task before it can cancel
+            // anything, and waiting on the token then never returns. Joining a
+            // dropped task resolves as cancelled, so the call fails instead.
+            match self.forwarder.lock().await.take() {
+                Some(forwarder) => drop(forwarder.await),
+                None => self.completed.cancelled().await,
+            }
         }
 
         status

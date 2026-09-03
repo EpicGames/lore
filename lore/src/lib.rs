@@ -35,7 +35,21 @@ pub use lore_error_set as error_set;
 /// runs immediately after it.
 const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-pub fn shutdown() {
+/// Shuts the library down, returning whether this call was the one that did it.
+///
+/// Only the first caller runs the teardown. Every other gets `false`, so a
+/// concurrent caller can report the library as already shut down rather than
+/// racing a second teardown against the first.
+///
+/// Claiming the shutdown also closes admission, so calls that arrive while the
+/// drains below are still running fail instead of being admitted onto runtimes
+/// that are about to go away.
+pub fn shutdown() -> bool {
+    if !lore_base::runtime::claim_runtime_shutdown() {
+        lore_base::lore_warn!("Shutdown was already called");
+        return false;
+    }
+
     // Garbage collection stops alongside the drains rather than before them, so neither
     // takes the other's share of the budget. A tree writes through the stores its parent
     // owns, so trees drain before storage handles. The storage close sequence (mark
@@ -60,6 +74,8 @@ pub fn shutdown() {
     lore_revision::interface::drop_connections();
 
     lore_revision::interface::shutdown();
+
+    true
 }
 
 pub fn runtime() -> tokio::runtime::Handle {

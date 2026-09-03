@@ -4,6 +4,9 @@ use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::LazyLock;
 
+use lore_base::error::ShutDown;
+use lore_error_set::FfiError;
+
 pub type LoreEvent = lore_revision::interface::LoreEvent;
 
 /// Return the tag identifying the type of an event.
@@ -7302,8 +7305,11 @@ pub extern "C" fn lore_log_configure(config: &LoreLogConfig) -> i32 {
 /// Returns 0 on success and a non-zero value on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_shutdown() -> i32 {
-    crate::shutdown();
-    0
+    if crate::shutdown() {
+        0
+    } else {
+        ShutDown.ffi_code()
+    }
 }
 
 /// Limits the total number of threads Lore sizes its pools for.

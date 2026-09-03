@@ -36,7 +36,8 @@
 //! | 118–125 | Resource limits | A size, depth, or efficiency bound was hit. |
 //! | 126–128 | *reserved* | The shell's "found but not executable", "not found", and "bad argument to exit". |
 //! | 129–192 | *reserved* | `128 + signal`, i.e. killed by a signal. 130 is Ctrl-C, 137 is `SIGKILL`, 143 is `SIGTERM`. |
-//! | 193–254 | *reserved* | Free for future groups. |
+//! | 193–200 | Library lifecycle | The library cannot serve the call. |
+//! | 201–254 | *reserved* | Free for future groups. |
 //! | 255 | *reserved* | `Internal`, which is `-1` truncated to a `u8`. |
 //!
 //! The trait carries a code as `i32` rather than a `u8` because `Internal` is
@@ -46,7 +47,7 @@
 //! code in that block. Never renumber an existing code to close a gap: the gaps
 //! are the headroom that keeps a group contiguous, and the tests below hold
 //! every block clear of the reserved values so anything taken from that
-//! headroom is a usable exit status. New groups come out of 193–254. A type
+//! headroom is a usable exit status. New groups come out of 201–254. A type
 //! whose name ends in `NotFound` belongs in the not-found block even when it
 //! also belongs to a subsystem that has its own errors elsewhere —
 //! `PluginNotFound` sits with the other not-found codes, not with the other
@@ -467,6 +468,19 @@ pub struct MaxHistorySearchDepth;
 #[ffi_code(120)]
 pub struct InefficientCompression;
 
+// ---------------------------------------------------------------------------
+// Library lifecycle (193–200)
+//
+// The library itself cannot serve the call. The error is caused by the
+// library's own state rather than the request, the caller's identity, or
+// anything a remote did.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Error, FfiError)]
+#[error("Lore has been shut down")]
+#[ffi_code(193)]
+pub struct ShutDown;
+
 #[cfg(test)]
 mod tests {
     use std::ops::RangeInclusive;
@@ -484,6 +498,7 @@ mod tests {
         NotFound,
         Configuration,
         ResourceLimits,
+        LibraryLifecycle,
     }
 
     impl Group {
@@ -496,6 +511,7 @@ mod tests {
             Self::NotFound,
             Self::Configuration,
             Self::ResourceLimits,
+            Self::LibraryLifecycle,
         ];
 
         fn block(self) -> RangeInclusive<i32> {
@@ -508,6 +524,7 @@ mod tests {
                 Self::NotFound => 79..=99,
                 Self::Configuration => 110..=117,
                 Self::ResourceLimits => 118..=125,
+                Self::LibraryLifecycle => 193..=200,
             }
         }
     }
@@ -753,6 +770,7 @@ mod tests {
                 Group::ResourceLimits,
                 InefficientCompression.ffi_code(),
             ),
+            ("ShutDown", Group::LibraryLifecycle, ShutDown.ffi_code()),
         ]
     }
 

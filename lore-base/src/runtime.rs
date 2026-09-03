@@ -4,6 +4,7 @@ use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -523,6 +524,20 @@ impl SharedRuntime {
 /// Core runtime — see [`core_runtime`].
 static CORE_RUNTIME: OnceLock<SharedRuntime> = OnceLock::new();
 
+/// Whether shutdown has begun. Set once and never cleared, because shutdown is
+/// terminal for the process.
+static SHUTDOWN_STARTED: AtomicBool = AtomicBool::new(false);
+
+pub fn claim_runtime_shutdown() -> bool {
+    SHUTDOWN_STARTED
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+}
+
+pub fn runtime_shutdown_started() -> bool {
+    SHUTDOWN_STARTED.load(Ordering::Relaxed)
+}
+
 /// Network runtime — see [`net_runtime`].
 static NET_RUNTIME: OnceLock<SharedRuntime> = OnceLock::new();
 
@@ -1029,6 +1044,7 @@ pub async fn runtime_flush_guarded() {
 /// `current_thread` runtime, and `Handle::block_on` cannot drive a
 /// `current_thread` runtime's I/O or timers from a foreign thread, so bouncing
 /// the future onto the caller's own handle hangs.
+///
 pub fn shutdown_block_on<F>(future: F, wait_timeout: Duration) -> bool
 where
     F: Future<Output = ()> + Send + 'static,

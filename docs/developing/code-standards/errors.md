@@ -160,12 +160,13 @@ Every code is also a process exit status. The CLI returns the failing error's co
 | 118–125 | Resource limits | A size, depth, or efficiency bound was hit. |
 | 126–128 | *reserved* | The shell's "found but not executable", "not found", and "bad argument to exit". |
 | 129–192 | *reserved* | `128 + signal`, i.e. killed by a signal. 130 is Ctrl-C, 137 is `SIGKILL`, 143 is `SIGTERM`. |
-| 193–254 | *reserved* | Free for future groups. |
+| 193–200 | Library lifecycle | The library can't serve the call. |
+| 201–254 | *reserved* | Free for future groups. |
 | 255 | *reserved* | `Internal`, which is `-1` truncated to a `u8`. |
 
 The trait carries a code as `i32` rather than a `u8` because `Internal` is `-1`, which isn't a code allocated here. A caller reading the library's `int32` return value or `Complete.status` sees `-1`; a caller reading the CLI's exit status sees 255.
 
-**Adding an error type:** put it in the block that matches its group and take the next free code in that block. Never renumber an existing code to close a gap — the gaps are the headroom that keeps a group contiguous, and the tests hold every block clear of the reserved values, so anything taken from that headroom is a usable exit status. New groups come out of 193–254. A type whose name ends in `NotFound` goes in the not-found block even when it belongs to a subsystem with errors elsewhere: `PluginNotFound` sits with the other not-found codes, not with the other plugin codes. The tests at the bottom of `lore-base/src/error.rs` hold these invariants: register the new type in `registry()` there, and they check its code against its group's block, against every other code, and against the reserved ranges.
+**Adding an error type:** put it in the block that matches its group and take the next free code in that block. Never renumber an existing code to close a gap — the gaps are the headroom that keeps a group contiguous, and the tests hold every block clear of the reserved values, so anything taken from that headroom is a usable exit status. New groups come out of 201–254. A type whose name ends in `NotFound` goes in the not-found block even when it belongs to a subsystem with errors elsewhere: `PluginNotFound` sits with the other not-found codes, not with the other plugin codes. The tests at the bottom of `lore-base/src/error.rs` hold these invariants: register the new type in `registry()` there, and they check its code against its group's block, against every other code, and against the reserved ranges.
 
 Codes can only be allocated in that file. `#[derive(FfiError)]` expands to a reference to `__ffi_code_registry_marker`, resolved where the derive is written, and only `lore-base/src/error.rs` declares it — so a `#[ffi_code(N)]` anywhere else fails to compile with `cannot find value __ffi_code_registry_marker in this scope`. An error type that never crosses the FFI boundary should not carry a code at all: use a plain `thiserror` enum rather than an `#[error_set]`, which would demand one for every variant type.
 
