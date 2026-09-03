@@ -8347,13 +8347,7 @@ const MODIFIED_TIME_SETTLE_LIMIT: std::time::Duration = std::time::Duration::fro
 /// The path of the file stamped to read the working copy's clock, `None` when the working copy
 /// has no path to stamp.
 fn modified_time_probe_path(repository: &RepositoryContext) -> Option<std::path::PathBuf> {
-    Some(
-        repository
-            .require_path()
-            .ok()?
-            .join(repository.format.dot_dir())
-            .join(MODIFIED_TIME_PROBE),
-    )
+    Some(repository.dot_dir_path().ok()?.join(MODIFIED_TIME_PROBE))
 }
 
 /// Stamps the probe at `path` and reads back the time the filesystem gave it.
@@ -9649,6 +9643,7 @@ pub async fn apply_tree_changes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::repository::RepositoryPaths;
 
     /// The key every stored modification time is filed under. It has to stay the
     /// digest over the path's own lowercase form, or a scan finds nothing it wrote
@@ -9803,7 +9798,10 @@ mod tests {
         .expect("in-memory mutable store");
 
         let mut context = RepositoryContext::new_null_context(immutable_store, mutable_store);
-        context.path = Some(path.to_path_buf());
+        context.paths = Some(RepositoryPaths::new(
+            path.to_path_buf(),
+            path.join(DOT_LORE),
+        ));
         Arc::new(context)
     }
 

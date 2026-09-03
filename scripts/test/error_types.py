@@ -174,6 +174,9 @@ class NotSupportedError(LoreException):
     configured."""
 
 
+class SwfsOutsideServiceError(LoreException): ...
+
+
 ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("Unable to commit", CommitFailed),
     (
@@ -237,6 +240,10 @@ ERROR_MAP: list[tuple[str | re.Pattern, type[LoreException]]] = [
     ("No commit identity configured", MissingIdentityError),
     ("Operation not supported", NotSupportedError),
     ("Not authenticated", NotAuthenticatedError),
+    (
+        "Attempting to create an SWFS instance outside the service",
+        SwfsOutsideServiceError,
+    ),
 ]
 
 

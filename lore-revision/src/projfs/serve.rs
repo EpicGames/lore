@@ -197,9 +197,8 @@ pub fn serve(
         return;
     }
 
-    let id_path = path
-        .as_ref()
-        .join(crate::repository::RepositoryFormat::detect(path.as_ref()).dot_dir())
+    let id_path = crate::repository::get_dot_lore_path(path.as_ref())
+        .await
         .join(DOT_PROJFSID);
     let mut uuid = uuid::Uuid::nil();
     if let Ok(mut file) = std::fs::OpenOptions::new()

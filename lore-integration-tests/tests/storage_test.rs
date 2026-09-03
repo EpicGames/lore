@@ -122,6 +122,7 @@ mod open_tests {
                 id: LoreString::default(),
                 use_shared_store: LoreSharedStoreMode::Disabled,
                 shared_store_path: LoreString::default(),
+                vfs: Default::default(),
             },
             None,
         )

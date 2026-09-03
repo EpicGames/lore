@@ -101,6 +101,7 @@ mod shared_store_tests {
                 id: LoreString::default(),
                 use_shared_store: mode,
                 shared_store_path,
+                vfs: Default::default(),
             },
             None,
         )

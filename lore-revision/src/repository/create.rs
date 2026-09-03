@@ -6,14 +6,14 @@ use lore_error_set::prelude::*;
 use serde::Deserialize;
 use serde::Serialize;
 
-use super::DOT_LORE;
-use super::DOT_URC;
 use super::FileConfig;
 use super::RepositoryConfig;
 use super::RepositoryMetadata;
 use super::RepositoryWriteToken;
 use super::SharedStoreToUseConfig;
 use super::StoreConfig;
+use super::VfsConfig;
+use super::get_dot_lore_path;
 use crate::branch;
 use crate::errors::*;
 use crate::event;
@@ -115,6 +115,8 @@ pub struct CreateOptions {
     pub description: Option<String>,
     // Whether to use the shared store and options configuring it if desired
     pub shared_store_options: Option<SharedStoreToUseConfig>,
+    // Whether to use VFS for the repository
+    pub vfs_options: VfsConfig,
 }
 
 #[derive(Clone)]
@@ -151,22 +153,19 @@ pub async fn create_with_metadata(
 
     let path = path.as_ref();
 
-    // Check both formats for pre-existence
-    for dot_dir in [DOT_URC, DOT_LORE] {
-        let existing = path.join(dot_dir);
-        if existing.exists() {
-            if call.force() {
-                lore_io::IoDriver::global()
-                    .remove_dir_all(existing.as_path())
-                    .await
-                    .internal_with(|| {
-                        format!("removing previous repository in path {}", path.display())
-                    })?;
-            } else {
-                return Err(CreateError::from(RepositoryAlreadyExists {
-                    path: path.display().to_string(),
-                }));
-            }
+    let existing_dot_dir = get_dot_lore_path(path)?;
+    if existing_dot_dir.exists() {
+        if call.force() {
+            lore_io::IoDriver::global()
+                .remove_dir_all(existing_dot_dir.as_path())
+                .await
+                .internal_with(|| {
+                    format!("removing previous repository in path {}", path.display())
+                })?;
+        } else {
+            return Err(CreateError::from(RepositoryAlreadyExists {
+                path: path.display().to_string(),
+            }));
         }
     }
 
@@ -253,6 +252,7 @@ pub async fn create_with_metadata(
         remote_url: Some(remote_url),
         identity: resolved_identity,
         shared_store_to_use: options.shared_store_options,
+        vfs: Some(options.vfs_options),
         store: Some(StoreConfig::client_default()),
         file: Some(FileConfig::default()),
     };

@@ -331,7 +331,6 @@ mod tests {
     use lore_revision::node::NodeFlags;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryContextCreationArgs;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::state;
     use lore_revision::util::path::RelativePath;
     use lore_storage::Address;
@@ -358,14 +357,13 @@ mod tests {
             .expect("mutable store"),
         );
         Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
-            path: None,
+            paths: None,
             immutable_store: immutable,
             mutable_store: mutable,
             id: Context::from(uuid::Uuid::now_v7()).into(),
             instance_id: lore_revision::instance::InstanceId::generate(),
             remote: Err(ProtocolError::from(lore_base::error::NoRemote)),
             filter: Arc::default(),
-            format: RepositoryFormat::Lore,
             filesystem_provider: None,
         }))
     }

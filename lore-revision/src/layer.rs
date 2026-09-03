@@ -208,10 +208,10 @@ async fn save_config(
         .forward::<LayerError>("Failed to save configuration")
 }
 
-pub fn layer_config_path(repository_path: impl AsRef<Path>) -> PathBuf {
-    let path = repository_path.as_ref();
-    let dotpath = path.join(repository::RepositoryFormat::detect(path).dot_dir());
-    dotpath.join(repository::LAYER)
+pub fn layer_config_path(repository: &Arc<RepositoryContext>) -> Result<PathBuf, InvalidArguments> {
+    repository
+        .dot_dir_path()
+        .map(|path| path.join(repository::LAYER))
 }
 
 pub struct LayerState {
@@ -389,7 +389,8 @@ pub async fn add(
         ));
     }
 
-    let mut config = load_config(layer_config_path(repository.require_path()?)).await?;
+    let config_path = layer_config_path(&repository)?;
+    let mut config = load_config(&config_path).await?;
 
     for layer in config.layers.iter() {
         if layer.repository == layer_repository.id
@@ -460,12 +461,7 @@ pub async fn add(
         .await
         .forward::<LayerError>("Failed to finalize operation")?;
 
-    save_config(
-        token,
-        layer_config_path(repository.require_path()?),
-        &config,
-    )
-    .await?;
+    save_config(token, &config_path, &config).await?;
 
     Ok(())
 }
@@ -511,7 +507,7 @@ pub async fn remove(
     source_repository: RepositoryId,
     purge: bool,
 ) -> Result<(), LayerError> {
-    let config_path = layer_config_path(repository.require_path()?);
+    let config_path = layer_config_path(&repository)?;
     let mut config = load_config(&config_path).await?;
 
     let layer_index = resolve_layer_index(&config.layers, target_path.as_str(), source_repository)?;
@@ -733,7 +729,7 @@ fn walk_layer_subtree<'a>(
 }
 
 pub async fn list(repository: Arc<RepositoryContext>) -> Result<Vec<Layer>, LayerError> {
-    let config = load_config(layer_config_path(repository.require_path()?)).await?;
+    let config = load_config(layer_config_path(&repository)?).await?;
     Ok(config.layers)
 }
 
@@ -1134,7 +1130,8 @@ pub async fn store_layer_current(
     current: Hash,
     staged: Option<Hash>,
 ) -> Result<(), LayerError> {
-    let mut config = load_config(layer_config_path(repository.require_path()?)).await?;
+    let config_path = layer_config_path(&repository)?;
+    let mut config = load_config(&config_path).await?;
 
     for layer in config.layers.iter_mut() {
         if layer.repository == layer_repository && layer.target_path.as_str() == target_path {
@@ -1142,12 +1139,7 @@ pub async fn store_layer_current(
             if let Some(staged) = staged {
                 layer.staged = staged;
             }
-            save_config(
-                token,
-                layer_config_path(repository.require_path()?),
-                &config,
-            )
-            .await?;
+            save_config(token, &config_path, &config).await?;
             lore_debug!("Saved layer config: {config:?}");
             return Ok(());
         }
@@ -1165,7 +1157,8 @@ pub async fn store_layer_current_batch(
         return Ok(());
     }
 
-    let mut config = load_config(layer_config_path(repository.require_path()?)).await?;
+    let config_path = layer_config_path(&repository)?;
+    let mut config = load_config(&config_path).await?;
 
     for (layer_repository, target_path, current) in updates {
         for layer in config.layers.iter_mut() {
@@ -1176,12 +1169,7 @@ pub async fn store_layer_current_batch(
         }
     }
 
-    save_config(
-        token,
-        layer_config_path(repository.require_path()?),
-        &config,
-    )
-    .await?;
+    save_config(token, &config_path, &config).await?;
     lore_debug!(
         "Saved layer config (batch update, {} layers): {config:?}",
         updates.len()
@@ -1197,17 +1185,13 @@ pub async fn store_layer_staged(
     layer_repository: RepositoryId,
     staged: Hash,
 ) -> Result<(), LayerError> {
-    let mut config = load_config(layer_config_path(repository.require_path()?)).await?;
+    let config_path = layer_config_path(&repository)?;
+    let mut config = load_config(&config_path).await?;
 
     for layer in config.layers.iter_mut() {
         if layer.repository == layer_repository && layer.target_path.as_str() == target_path {
             layer.staged = staged;
-            save_config(
-                token,
-                layer_config_path(repository.require_path()?),
-                &config,
-            )
-            .await?;
+            save_config(token, &config_path, &config).await?;
             lore_debug!("Saved layer config: {config:?}");
             return Ok(());
         }

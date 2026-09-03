@@ -6,8 +6,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-// Required, not redundant: `#[error_set]` expands to paths rooted at `lore_error_set`.
-use lore::error_set as lore_error_set;
 use lore::error_set::prelude::*;
 use lore::interface::LoreEvent;
 use lore::lore_spawn;
@@ -24,14 +22,13 @@ use lore::remote::message::write_v1_message;
 use lore::remote::network::UdsListener;
 use lore::remote::network::UdsStream;
 use lore::remote::network::uds_supported;
+use lore::service::initialization::initialize_service;
+use lore::service::service_main::ServiceMainError;
 use tokio::sync::mpsc;
 
 use crate::eprintln;
 use crate::println;
 use crate::util::listen_for_termination;
-
-#[error_set]
-pub enum ServiceMainError {}
 
 /// Bounds how long shutdown waits for the accept loop to unwind, so that a
 /// wake-up connection that never lands cannot keep the process alive. Anything
@@ -71,6 +68,10 @@ pub async fn service_main(
             detached.display()
         );
     }
+
+    initialize_service()
+        .await
+        .forward::<ServiceMainError>("Failed initializing service")?;
 
     let listener: UdsListener =
         UdsListener::new().forward::<ServiceMainError>("Failed to start listener socket")?;

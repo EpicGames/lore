@@ -3,86 +3,8 @@
 mod tests {
     #![allow(clippy::disallowed_methods)] // Test fixture writes; not subject to repository write-token discipline.
 
-    use lore_revision::repository::DOT_LORE;
-    use lore_revision::repository::DOT_LOREIGNORE;
     use lore_revision::repository::DOT_URC;
     use lore_revision::repository::DOT_URCIGNORE;
-    use lore_revision::repository::RepositoryFormat;
-    use lore_revision::repository::SALT_LORE;
-    use lore_revision::repository::SALT_URC;
-
-    #[test]
-    fn format_salt_urc() {
-        assert_eq!(RepositoryFormat::Urc.salt(), SALT_URC);
-    }
-
-    #[test]
-    fn format_salt_lore() {
-        assert_eq!(RepositoryFormat::Lore.salt(), SALT_LORE);
-    }
-
-    #[test]
-    fn format_dot_dir() {
-        assert_eq!(RepositoryFormat::Urc.dot_dir(), DOT_URC);
-        assert_eq!(RepositoryFormat::Lore.dot_dir(), DOT_LORE);
-    }
-
-    #[test]
-    fn format_ignore_file() {
-        // Both formats use .loreignore as the primary ignore file; legacy
-        // .urcignore is honored only as a load_filter fallback.
-        assert_eq!(RepositoryFormat::Urc.ignore_file(), DOT_LOREIGNORE);
-        assert_eq!(RepositoryFormat::Lore.ignore_file(), DOT_LOREIGNORE);
-    }
-
-    #[test]
-    fn detect_urc_directory() {
-        let dir = std::env::temp_dir().join("lore-test-detect-urc");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".urc")).expect("create .urc dir");
-
-        let format = RepositoryFormat::detect(&dir);
-        assert!(matches!(format, RepositoryFormat::Urc));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn detect_lore_directory() {
-        let dir = std::env::temp_dir().join("lore-test-detect-lore");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".lore")).expect("create .lore dir");
-
-        let format = RepositoryFormat::detect(&dir);
-        assert!(matches!(format, RepositoryFormat::Lore));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn detect_neither_defaults_to_lore() {
-        let dir = std::env::temp_dir().join("lore-test-detect-neither");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create dir");
-
-        let format = RepositoryFormat::detect(&dir);
-        assert!(matches!(format, RepositoryFormat::Lore));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn detect_both_prefers_urc() {
-        let dir = std::env::temp_dir().join("lore-test-detect-both");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join(".urc")).expect("create .urc dir");
-        std::fs::create_dir_all(dir.join(".lore")).expect("create .lore dir");
-
-        let format = RepositoryFormat::detect(&dir);
-        assert!(matches!(format, RepositoryFormat::Urc));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     #[test]
     fn hash_salt_divergence_between_formats() {

@@ -180,6 +180,7 @@ mod tests {
             description: LoreString::default(),
             use_shared_store: LoreSharedStoreMode::Disabled,
             shared_store_path: LoreString::default(),
+            vfs: Default::default(),
         }
     }
 

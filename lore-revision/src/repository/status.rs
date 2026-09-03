@@ -1541,7 +1541,6 @@ mod remote_resolve_tests {
     use crate::lore::BranchId;
     use crate::repository::RemoteState;
     use crate::repository::RepositoryContext;
-    use crate::repository::RepositoryFormat;
     use crate::repository::create_client_memory_stores;
 
     fn disconnected() -> ProtocolError {
@@ -1560,7 +1559,6 @@ mod remote_resolve_tests {
             crate::instance::InstanceId::default(),
             state,
             Arc::default(),
-            RepositoryFormat::Lore,
             None,
         ))
     }

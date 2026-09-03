@@ -104,6 +104,10 @@ impl InstanceId {
             .await?;
         Ok(())
     }
+
+    pub fn text_encoding(&self) -> String {
+        hex::encode(self.data())
+    }
 }
 
 /// Derive the mutable store key for an instance's metadata entry.
@@ -111,11 +115,7 @@ impl InstanceId {
 /// The value stored at this key is the hash of the instance metadata blob
 /// in the immutable store (containing instance ID, path, and creation timestamp).
 pub fn instance_key(salt: &[u8], instance: InstanceId) -> (Hash, KeyType) {
-    let key = hash::hash_function_arg(
-        salt,
-        INSTANCE_METADATA,
-        hex::encode(instance.data()).as_str(),
-    );
+    let key = hash::hash_function_arg(salt, INSTANCE_METADATA, instance.text_encoding().as_str());
     (key, KeyType::Instance)
 }
 
@@ -236,14 +236,13 @@ pub async fn recover_instance_id(
 
     // Build a temporary repository context for metadata deserialization
     let temp_repo = Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
-        path: None,
+        paths: None,
         immutable_store,
         mutable_store,
         id: repository_id,
         instance_id: InstanceId::default(),
         remote: Err(lore_transport::ProtocolError::from(crate::errors::NoRemote)),
         filter: Arc::default(),
-        format: crate::repository::RepositoryFormat::Lore,
         filesystem_provider: None,
     }));
 
@@ -413,7 +412,8 @@ pub async fn load_current_anchor(
     // file-based `.urc/current` (32-byte revision + 16-byte branch). Migration
     // into the mutable store only runs in write-mode contexts, so a read-only
     // command on a repository with unmigrated anchors would otherwise fail.
-    let dot_path = repository.require_path()?.join(repository.format.dot_dir());
+
+    let dot_path = repository.dot_dir_path()?;
     let current_anchor_path = dot_path.join(crate::anchor::CURRENT);
     if current_anchor_path.exists()
         && let Ok((file_revision, file_branch)) =
@@ -449,7 +449,7 @@ pub async fn load_staged_revision(
     // file (32-byte revision + 16-byte branch — branch is ignored here, the
     // staged anchor only carries a revision). Mirrors load_current_anchor's
     // file-based fallback for read-only commands on unmigrated repositories.
-    let dot_path = repository.require_path()?.join(repository.format.dot_dir());
+    let dot_path = repository.dot_dir_path()?;
     let staged_anchor_path = dot_path.join(crate::anchor::STAGED);
     if staged_anchor_path.exists()
         && let Ok((file_revision, _branch)) =

@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use lore_error_set::prelude::*;
@@ -8,14 +7,16 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::ID;
+use super::INSTANCE;
 use super::RepositoryAccess;
 use super::RepositoryContext;
 use super::RepositoryContextCreationArgs;
 use super::RepositoryError;
-use super::RepositoryFormat;
 use super::create_client_memory_stores;
+use super::get_dot_lore_path;
 use super::read_id_from_file;
 use crate::event;
+use crate::instance::InstanceId;
 use crate::interface::LoreString;
 use crate::lore::BranchId;
 use crate::lore::RepositoryId;
@@ -33,6 +34,8 @@ pub struct LoreRepositoryDataEventData {
     pub remote_url: LoreString,
     /// Repository identifier.
     pub id: RepositoryId,
+    /// Instance identifier.
+    pub instance_id: InstanceId,
     /// Repository name.
     pub name: LoreString,
     /// Repository description.
@@ -50,26 +53,28 @@ pub struct LoreRepositoryDataEventData {
 
 pub async fn info(repository_url: Option<&str>, identity: &str) -> Result<(), RepositoryError> {
     // Use the url of the working repo if the user didn't provide one.
-    let repository_url = if let Some(repository_url) = repository_url {
-        repository_url.to_owned()
+    let (repository_url, instance_id) = if let Some(repository_url) = repository_url {
+        (repository_url.to_owned(), InstanceId::default())
     } else {
         let execution_context = execution_context();
         let repo_path = execution_context.globals().repository_path();
 
-        let repo_context = read_id_from_file(
-            PathBuf::from(repo_path)
-                .join(RepositoryFormat::detect(std::path::Path::new(repo_path)).dot_dir())
-                .join(ID),
-        )
-        .internal("Invalid repository path")?;
+        let dot_lore_path = get_dot_lore_path(std::path::Path::new(repo_path))?;
+        let repo_context =
+            read_id_from_file(dot_lore_path.join(ID)).internal("Invalid repository path")?;
+        let instance_id = InstanceId::read_from_file(dot_lore_path.join(INSTANCE))
+            .internal("Invalid repository path")?;
 
         let config = crate::repository::load_repository_config(repo_path)?;
-        format!(
-            "{}/{}",
-            config
-                .remote_url
-                .ok_or_else(|| RepositoryError::internal("Invalid URL"))?,
-            repo_context
+        (
+            format!(
+                "{}/{}",
+                config
+                    .remote_url
+                    .ok_or_else(|| RepositoryError::internal("Invalid URL"))?,
+                repo_context
+            ),
+            instance_id,
         )
     };
 
@@ -105,14 +110,13 @@ pub async fn info(repository_url: Option<&str>, identity: &str) -> Result<(), Re
         })?;
 
     let repository = Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
-        path: None,
+        paths: None,
         immutable_store,
         mutable_store,
         id: data.id,
         instance_id: crate::instance::InstanceId::default(),
         remote: Ok(remote),
         filter: Arc::default(),
-        format: super::RepositoryFormat::Lore,
         filesystem_provider: None,
     }));
 
@@ -123,6 +127,7 @@ pub async fn info(repository_url: Option<&str>, identity: &str) -> Result<(), Re
     event::LoreEvent::RepositoryData(LoreRepositoryDataEventData {
         remote_url: remote_url.into(),
         id: data.id,
+        instance_id,
         name: metadata.name.into(),
         description: metadata.description.into(),
         default_branch: metadata.default_branch,
@@ -167,6 +172,7 @@ pub async fn info_local() -> Result<(), RepositoryError> {
     event::LoreEvent::RepositoryData(LoreRepositoryDataEventData {
         remote_url: remote_url.into(),
         id: repository.id,
+        instance_id: repository.instance_id,
         name: metadata.name.into(),
         description: metadata.description.into(),
         default_branch: metadata.default_branch,

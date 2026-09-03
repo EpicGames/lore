@@ -8,6 +8,7 @@ use std::sync::atomic::Ordering;
 use chrono::DateTime;
 use clap::Args;
 use clap::Subcommand;
+use clap::ValueEnum;
 use lore::interface::LoreArray;
 use lore::interface::LoreEvent;
 use lore::interface::LoreFileAction;
@@ -31,6 +32,7 @@ use lore::interface::LoreSharedStoreMode;
 use lore::interface::LoreString;
 use lore::repository;
 use lore::repository::LoreRepositoryDeleteArgs;
+use lore::repository::LoreVfsType;
 use lore::runtime;
 use parking_lot::Mutex;
 
@@ -108,6 +110,28 @@ pub struct RepositoryStatusArgs {
     targets: Option<String>,
 }
 
+/// Virtual File System type for repository operations.
+#[derive(ValueEnum, Clone, Copy, Default)]
+pub enum VfsType {
+    /// No virtual file system; files are materialized directly on disk.
+    #[default]
+    None,
+    /// Use whichever VFS system is preferred based on the user's system.
+    Default,
+    /// Use Epic's Split Write File System as the Virtual File System.
+    Swfs,
+}
+
+impl VfsType {
+    pub fn to_lore(self) -> LoreVfsType {
+        match self {
+            VfsType::None => LoreVfsType::None,
+            VfsType::Default => LoreVfsType::Default,
+            VfsType::Swfs => LoreVfsType::Swfs,
+        }
+    }
+}
+
 #[derive(Args)]
 pub struct RepositoryCreateArgs {
     /// URL of repository
@@ -121,6 +145,10 @@ pub struct RepositoryCreateArgs {
     /// Optional ID of repository
     #[clap(long, value_name = "id")]
     id: Option<String>,
+
+    /// Virtual File System type. When not 'none', creates a VFS as the repository directory.
+    #[clap(long, value_enum, default_value = "none")]
+    vfs: VfsType,
 
     /// Use the shared store rather than create a local immutable store
     #[clap(long)]
@@ -157,13 +185,13 @@ pub struct RepositoryCloneArgs {
     #[clap(long, action)]
     bare: bool,
 
-    /// Clone virtually using split-write filesystem
-    #[clap(long = "virtual", action)]
-    virtually: bool,
-
     /// Write directly to the destination file instead of write to a temporary file and move into place
     #[clap(long, action)]
     direct_file_write: bool,
+
+    /// Virtual File System type. When not 'none', creates a VFS as the repository directory.
+    #[clap(long, value_enum, default_value = "none")]
+    vfs: VfsType,
 
     /// Layer to add
     #[clap(long, value_name = "repository")]
@@ -825,6 +853,14 @@ pub fn handle_repository_info(globals: LoreGlobalArgs, args: &RepositoryInfoArgs
                         anstyle::Reset
                     );
                 }
+                if !data.instance_id.is_zero() {
+                    println!(
+                        "{}Instance:{} {}",
+                        CommonStyles::HEADERS,
+                        anstyle::Reset,
+                        data.instance_id.text_encoding()
+                    );
+                }
             }
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
@@ -890,6 +926,7 @@ pub fn handle_repository_create(globals: LoreGlobalArgs, args: &RepositoryCreate
             LoreSharedStoreMode::Inherit
         },
         shared_store_path: args.shared_store_path.as_ref().into(),
+        vfs: args.vfs.to_lore(),
     };
 
     let callback = output_formatter().unwrap_or(Some(
@@ -1006,8 +1043,8 @@ pub fn handle_repository_clone(globals: LoreGlobalArgs, args: &RepositoryCloneAr
         revision,
         view: args.view.as_ref().into(),
         bare: args.bare.into(),
-        virtually: args.virtually.into(),
         direct_file_write: args.direct_file_write.into(),
+        vfs: args.vfs.to_lore(),
         layer: args.layer.as_ref().into(),
         layer_metadata: args.layer_metadata.as_ref().into(),
         prefetch: args.prefetch.as_ref().into(),

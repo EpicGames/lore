@@ -373,6 +373,7 @@ class Lore:
         remote_path: str | None = None,
         description: str | None = None,
         repo_id: str | None = None,
+        vfs: str | None = None,
         use_shared_store: bool = False,
         shared_store_path: str | None = None,
         **kwargs: Unpack[GlobalOptions],
@@ -381,6 +382,7 @@ class Lore:
             ["repository", "create", remote_path if remote_path else self.name]
             + (["--description", description] if description else [])
             + (["--id", repo_id] if repo_id else [])
+            + (["--vfs", vfs] if vfs else [])
             + (["--use-shared-store"] if use_shared_store else [])
             + (["--shared-store-path", shared_store_path] if shared_store_path else []),
             **kwargs,
@@ -1860,6 +1862,7 @@ class Lore:
         virtually: bool = False,
         direct_file_write: bool = False,
         flush_file: bool = False,
+        vfs: str | None = None,
         layer: str | None = None,
         layer_metadata: str | None = None,
         prefetch: str | None = None,
@@ -1895,6 +1898,7 @@ class Lore:
             + (["--virtually"] if virtually else [])
             + (["--direct-file-write"] if direct_file_write else [])
             + (["--flush-file"] if flush_file else [])
+            + (["--vfs", vfs] if vfs else [])
             + (["--layer", layer] if layer else [])
             + (["--layer-metadata", layer_metadata] if layer_metadata else [])
             + (["--prefetch", prefetch] if prefetch else [])

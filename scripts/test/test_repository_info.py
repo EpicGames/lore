@@ -19,6 +19,13 @@ def get_url(repository_info_output: str) -> str | None:
     return None
 
 
+def get_instance_id(repository_info_output: str) -> str | None:
+    match = re.search(".*Instance: (.*)", repository_info_output)
+    if match is not None:
+        return match.group(1)
+    return None
+
+
 @pytest.mark.smoke
 def test_repository_info_url(new_lore_repo, tmp_path_factory, monkeypatch):
     no_repo_urc: Lore = new_lore_repo(create_repo=False)

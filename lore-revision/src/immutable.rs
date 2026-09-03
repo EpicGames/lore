@@ -880,7 +880,6 @@ mod session_tests {
             crate::instance::InstanceId::default(),
             state,
             Arc::default(),
-            crate::repository::RepositoryFormat::Lore,
             None,
         ))
     }

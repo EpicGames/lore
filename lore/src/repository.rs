@@ -8,6 +8,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::runtime::runtime_flush_guarded;
 use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
+use lore_macro::ValidateText;
 use lore_revision::global::GlobalConfig;
 use lore_revision::interface::LoreArray;
 use lore_revision::interface::LoreEventCallback;
@@ -20,6 +21,8 @@ use lore_revision::repository::LoreSharedStoreMode;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryError;
 use lore_revision::repository::SharedStoreToUseConfig;
+use lore_revision::repository::VfsConfig;
+use lore_revision::repository::VfsType;
 use lore_revision::repository::clone::CloneError;
 use lore_revision::repository::clone::CloneLayer;
 use lore_revision::repository::clone::CloneOptions;
@@ -45,6 +48,36 @@ use crate::util::convert_user_paths;
 use crate::util::log_command_done;
 use crate::util::log_command_info;
 
+/// Virtual File System type for repository operations.
+///
+/// When not `None`, the `vfs` field causes the repository to create a Virtual File System
+/// as the repository directory instead of materializing files directly on disk.
+/// cbindgen:prefix-with-name
+/// cbindgen:rename-all=ScreamingSnakeCase
+#[repr(C)]
+#[derive(Clone, PartialEq, Debug, Default, Serialize, Deserialize, ValidateText)]
+#[serde(rename_all = "camelCase")]
+pub enum LoreVfsType {
+    /// Use no VFS, store all files using the regular file system
+    #[default]
+    None = 0,
+    /// Use whichever VFS is suggested based on the user's environment
+    Default = 1,
+    /// Use SWFS as a VFS
+    Swfs = 2,
+}
+
+impl LoreVfsType {
+    pub fn to_config(&self) -> VfsConfig {
+        VfsConfig {
+            vfs_type: match self {
+                LoreVfsType::None => VfsType::None,
+                LoreVfsType::Swfs | LoreVfsType::Default => VfsType::Swfs,
+            },
+        }
+    }
+}
+
 /// Arguments for cloning a remote repository to the local path.
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, LoreArgs)]
@@ -58,10 +91,10 @@ pub struct LoreRepositoryCloneArgs {
     pub view: LoreString,
     /// Clone without any files
     pub bare: u8,
-    /// Clone virtually using split-write filesystem
-    pub virtually: u8,
     /// Use direct file write
     pub direct_file_write: u8,
+    /// Which VFS to use, if any
+    pub vfs: LoreVfsType,
     /// (Optional) Layer module
     pub layer: LoreString,
     /// (Optional) Layer metadata key to link revisions with
@@ -151,7 +184,6 @@ async fn clone_impl(
         .forward_with::<CloneError, _>(|| format!("Invalid path: {repository_path}"))?;
     let bare = args.bare != 0;
     let ignore_existing = false;
-    let virtually = args.virtually != 0;
     let direct_file_write = args.direct_file_write != 0;
     let no_tracking = args.no_tracking != 0;
 
@@ -168,12 +200,13 @@ async fn clone_impl(
     let global_config = GlobalConfig::load()
         .await
         .forward::<CloneError>("Couldn't load global config")?;
-    let shared_store_options = SharedStoreToUseConfig::from_cli_args(
+    let shared_store_options = SharedStoreToUseConfig::from_api_args(
         &global_config,
         args.use_shared_store,
         &args.shared_store_path,
     )
     .forward_with::<CloneError, _>(|| format!("Invalid path: {}", args.shared_store_path))?;
+    let vfs_options = Some(args.vfs.to_config());
 
     let root_files: Vec<String> = args
         .root_files
@@ -191,10 +224,10 @@ async fn clone_impl(
     let options = CloneOptions {
         bare,
         ignore_existing,
-        virtually,
         direct_file_write,
         prefetch,
         shared_store_options,
+        vfs_options,
         no_tracking,
         root_files,
         dependency_tags,
@@ -387,6 +420,8 @@ pub struct LoreRepositoryCreateArgs {
     pub description: LoreString,
     /// Optional repository ID, set to empty string to generate a new ID
     pub id: LoreString,
+    /// Which VFS to use, if any
+    pub vfs: LoreVfsType,
     /// Whether to use the shared store instead of a local immutable store. Zero-initialized
     /// (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
     pub use_shared_store: LoreSharedStoreMode,
@@ -464,12 +499,13 @@ async fn create_impl(args: &LoreRepositoryCreateArgs) -> Result<(), CreateError>
         } else {
             None
         },
-        shared_store_options: SharedStoreToUseConfig::from_cli_args(
+        shared_store_options: SharedStoreToUseConfig::from_api_args(
             &global_config,
             args.use_shared_store,
             &args.shared_store_path,
         )
         .forward::<CreateError>("resolving shared store config")?,
+        vfs_options: args.vfs.to_config(),
     };
 
     lore_revision::repository::create::create(repository_url, repository_path, options).await
@@ -527,12 +563,13 @@ async fn create_with_metadata_impl(
         } else {
             None
         },
-        shared_store_options: SharedStoreToUseConfig::from_cli_args(
+        shared_store_options: SharedStoreToUseConfig::from_api_args(
             &global_config,
             args.use_shared_store,
             &args.shared_store_path,
         )
         .forward::<CreateError>("resolving shared store config")?,
+        vfs_options: args.vfs.to_config(),
     };
     let metadata = Some(CreateMetadata {
         creator: metadata.creator.to_string(),
@@ -1403,8 +1440,7 @@ async fn config_get_local(
             let key = args.key.to_string();
             async move {
                 let config_path = repository
-                    .require_path()?
-                    .join(repository.format.dot_dir())
+                    .dot_dir_path()?
                     .join(lore_revision::repository::CONFIG);
                 let config_bytes = lore_io::IoDriver::global()
                     .read_file_bytes(&config_path)

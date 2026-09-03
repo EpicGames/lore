@@ -31,6 +31,7 @@ use lore_revision::interface::LoreError;
 use lore_revision::interface::LoreString;
 use lore_revision::lore::execution_context;
 use lore_revision::repository;
+use lore_revision::repository::get_dot_lore_path;
 use lore_revision::store::event::LoreStorageOpenedEventData;
 use lore_revision::util::path::make_absolute;
 use lore_storage::MutableStore;
@@ -233,8 +234,14 @@ async fn open_local(
                 // Canonicalize for cache-key consistency, but fall back to the raw path on
                 // canonicalize failure so the dotpath check below surfaces the real error.
                 let absolute = make_absolute(path).unwrap_or_else(|_| PathBuf::from(path));
-                let dot_dir = repository::RepositoryFormat::detect(&absolute).dot_dir();
-                let dotpath = absolute.join(dot_dir);
+                let dotpath = get_dot_lore_path(&absolute).map_err(|_err| {
+                    OpenError::from(InvalidArguments {
+                        reason: format!(
+                            "unable to find .lore directory for repository at {}",
+                            absolute.display(),
+                        ),
+                    })
+                })?;
                 // Without this guard, `load_repository_config` would return defaults and
                 // `LocalImmutableStore` would create the directory tree, silently fabricating
                 // a fresh repo on any path.
@@ -243,7 +250,7 @@ async fn open_local(
                         reason: format!(
                             "no lore repository at {} (missing {})",
                             absolute.display(),
-                            dot_dir
+                            dotpath.display()
                         ),
                     }));
                 }

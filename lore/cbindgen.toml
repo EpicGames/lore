@@ -348,6 +348,7 @@ include = [
 "LoreDependencyResolveBeginEventData" = "lore_dependency_resolve_begin_event_data_t"
 "LoreDependencyResolveItemEventData" = "lore_dependency_resolve_item_event_data_t"
 "LoreDependencyResolveEndEventData" = "lore_dependency_resolve_end_event_data_t"
+"LoreVfsType" = "lore_vfs_type_t"
 "LoreRepositoryCloneArgs" = "lore_repository_clone_args_t"
 "LoreRepositoryCloneBeginEventData" = "lore_repository_clone_begin_event_data_t"
 "LoreRepositoryCloneCountData" = "lore_repository_clone_count_data_t"

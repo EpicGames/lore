@@ -169,6 +169,19 @@ typedef enum lore_error_code_t {
   LORE_ERROR_CODE_SLOW_DOWN = 31,
 } lore_error_code_t;
 
+// Virtual File System type for repository operations.
+//
+// When not `None`, the `vfs` field causes the repository to create a Virtual File System
+// as the repository directory instead of materializing files directly on disk.
+typedef enum lore_vfs_type_t {
+  // Use no VFS, store all files using the regular file system
+  LORE_VFS_TYPE_NONE = 0,
+  // Use whichever VFS is suggested based on the user's environment
+  LORE_VFS_TYPE_DEFAULT = 1,
+  // Use SWFS as a VFS
+  LORE_VFS_TYPE_SWFS = 2,
+} lore_vfs_type_t;
+
 // Whether a repository being created or cloned should be backed by a shared store.
 //
 // `Inherit` is zero so a zero-initialized C struct keeps following the machine's
@@ -1831,6 +1844,8 @@ typedef struct lore_repository_data_event_data_t {
   struct lore_string_t remote_url;
   // Repository identifier.
   lore_repository_id_t id;
+  // Instance identifier.
+  struct lore_instance_id_t instance_id;
   // Repository name.
   struct lore_string_t name;
   // Repository description.
@@ -4605,10 +4620,10 @@ typedef struct lore_repository_clone_args_t {
   struct lore_string_t view;
   // Clone without any files
   uint8_t bare;
-  // Clone virtually using split-write filesystem
-  uint8_t virtually;
   // Use direct file write
   uint8_t direct_file_write;
+  // Which VFS to use, if any
+  enum lore_vfs_type_t vfs;
   // (Optional) Layer module
   struct lore_string_t layer;
   // (Optional) Layer metadata key to link revisions with
@@ -4656,6 +4671,8 @@ typedef struct lore_repository_create_args_t {
   struct lore_string_t description;
   // Optional repository ID, set to empty string to generate a new ID
   struct lore_string_t id;
+  // Which VFS to use, if any
+  enum lore_vfs_type_t vfs;
   // Whether to use the shared store instead of a local immutable store. Zero-initialized
   // (`LORE_SHARED_STORE_MODE_INHERIT`) follows the machine's global setting.
   enum lore_shared_store_mode_t use_shared_store;

@@ -1,5 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+pub mod initialization;
+pub mod service_main;
+
 use lore_macro::LoreArgs;
 use lore_revision::interface::LoreGlobalArgs;
 use serde::Deserialize;

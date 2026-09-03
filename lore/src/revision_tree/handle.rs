@@ -32,7 +32,6 @@ use lore_revision::metadata::Metadata;
 use lore_revision::repository::InMemoryContext;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryContextCreationArgs;
-use lore_revision::repository::RepositoryFormat;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::state::State;
 use lore_transport::ProtocolError;
@@ -323,14 +322,13 @@ pub(crate) async fn synth_repository_context(
     };
     Arc::new(
         RepositoryContext::new(RepositoryContextCreationArgs {
-            path: None,
+            paths: None,
             immutable_store: store.immutable.clone(),
             mutable_store: store.mutable.clone(),
             id: repository,
             instance_id: InstanceId::default(),
             remote: remote_result,
             filter: Arc::new(Filter::default()),
-            format: RepositoryFormat::Lore,
             filesystem_provider: None,
         })
         .with_write_token(RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER)),
@@ -407,7 +405,6 @@ pub(crate) mod test_support {
     use lore_base::types::Partition;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::repository::RepositoryContextCreationArgs;
-    use lore_revision::repository::RepositoryFormat;
     use lore_revision::repository::create_client_memory_stores;
     use lore_revision::state::State;
     use lore_transport::ProtocolError;
@@ -433,14 +430,13 @@ pub(crate) mod test_support {
             .expect("create_client_memory_stores");
         let repository = Partition::default();
         let repository_context = Arc::new(RepositoryContext::new(RepositoryContextCreationArgs {
-            path: None,
+            paths: None,
             immutable_store: immutable,
             mutable_store: mutable,
             id: repository,
             instance_id: Default::default(),
             remote: Err(ProtocolError::from(lore_base::error::NoRemote)),
             filter: Arc::default(),
-            format: RepositoryFormat::Lore,
             filesystem_provider: None,
         }));
         let state = Arc::new(State::new());
@@ -476,7 +472,7 @@ mod synth_repository_context_tests {
             .expect("zero hash must deserialize to an empty state");
 
         assert!(
-            repo_context.path.is_none(),
+            repo_context.paths.is_none(),
             "synthesized context must have no working-tree path"
         );
         assert_eq!(
