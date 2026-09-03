@@ -217,12 +217,13 @@ pub fn load_view(view_path: impl AsRef<Path>) -> Result<Filter, FilterError> {
 
 /// Reads a filter file, one rule per line.
 ///
-/// A rule this filter cannot express is reported and skipped, and the rest of
-/// the file still applies. Aborting instead would discard every rule in the
-/// file, including the ones before the offending line, and a filter that
-/// silently excludes nothing is far more damaging than one missing rule: the
-/// only signal the author gets is that everything they meant to ignore turns up
-/// as changed.
+/// A rule this filter cannot express is a hard error, and the error names the
+/// file, the 1-based line number and the rule as written. Skipping the line
+/// instead would leave a filter that no longer represents the author's intent
+/// and whose inclusions and exclusions may differ arbitrarily from what was
+/// meant, which is at least as bad as having no filter; and the only signal a
+/// warning gives is a line in a log the author of an integration toolchain
+/// never reads.
 pub fn load_filter(path: impl AsRef<Path>) -> Result<FilterInstance, FilterError> {
     let path = path.as_ref();
     let mut filter = FilterInstance::default();
@@ -265,12 +266,17 @@ pub fn load_filter(path: impl AsRef<Path>) -> Result<FilterInstance, FilterError
                     }
                 }
                 Err(error) => {
-                    lore_warn!(
-                        "{}:{}: ignoring unsupported rule `{}`: {error}. The remaining rules in this file still apply.",
+                    // The line info goes in the message rather than in
+                    // `internal_with_context`: `Display for Traced` forwards to
+                    // the inner error and never prints the trace, so a context
+                    // string would name the line somewhere the reader of the
+                    // error never looks.
+                    return Err(FilterError::internal(format!(
+                        "{}:{}: unsupported rule `{}`: {error}",
                         path.display(),
                         index + 1,
                         line.trim(),
-                    );
+                    )));
                 }
             }
         }
