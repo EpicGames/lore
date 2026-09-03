@@ -2492,8 +2492,8 @@ typedef struct lore_shared_store_info_event_data_t {
   struct lore_uint8_array_t exists;
 } lore_shared_store_info_event_data_t;
 
-// Data for an event describing a shared store being listed.
-typedef struct lore_shared_store_list_item_event_data_t {
+// Shared store array list item.
+typedef struct lore_shared_store_list_item_t {
   // Remote URL the shared store is for.
   struct lore_string_t remote_url;
   // Path to the shared store on disk.
@@ -2502,21 +2502,21 @@ typedef struct lore_shared_store_list_item_event_data_t {
   struct lore_string_array_t instance_paths;
   // Ids of instances using the shared store
   struct lore_instance_id_array_t instance_ids;
-} lore_shared_store_list_item_event_data_t;
+} lore_shared_store_list_item_t;
 
 // A contiguous array of elements described by a pointer and a count.
 // Holds zero or more values of the element type laid out one after another.
-typedef struct lore_shared_store_list_item_event_data_array_t {
+typedef struct lore_shared_store_list_item_array_t {
   // Pointer to the first element.
-  const struct lore_shared_store_list_item_event_data_t *ptr;
+  const struct lore_shared_store_list_item_t *ptr;
   // Number of elements in the array.
   uintptr_t count;
-} lore_shared_store_list_item_event_data_array_t;
+} lore_shared_store_list_item_array_t;
 
 // Data for an event describing all shared stores.
 typedef struct lore_shared_store_list_event_data_t {
   // All stores from the registry.
-  struct lore_shared_store_list_item_event_data_array_t stores;
+  struct lore_shared_store_list_item_array_t stores;
 } lore_shared_store_list_event_data_t;
 
 // Data for an event describing a link that has staged changes.

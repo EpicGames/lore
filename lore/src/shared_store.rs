@@ -9,7 +9,7 @@ use lore_revision::instance::list_instances;
 use lore_revision::repository::RepositoryError;
 use lore_revision::shared_store::LoreSharedStoreInfoEventData;
 use lore_revision::shared_store::LoreSharedStoreListEventData;
-use lore_revision::shared_store::LoreSharedStoreListItemEventData;
+use lore_revision::shared_store::LoreSharedStoreListItem;
 use lore_revision::shared_store::SharedStoreError;
 use lore_revision::shared_store::find_existing_shared_store_in_dir;
 use lore_revision::shared_store::registry::SharedStoreRegistry;
@@ -226,7 +226,7 @@ async fn list_local(
             } else {
                 Default::default()
             };
-            let per_store_data = LoreSharedStoreListItemEventData {
+            let per_store_data = LoreSharedStoreListItem {
                 remote_url: entry.remote_url().into(),
                 store_path: entry.path().into(),
                 instance_paths: LoreArray::from_vec(paths),

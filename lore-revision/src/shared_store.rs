@@ -536,14 +536,14 @@ pub struct LoreSharedStoreInfoEventData {
 #[serde(rename_all = "camelCase")]
 pub struct LoreSharedStoreListEventData {
     /// All stores from the registry.
-    pub stores: LoreArray<LoreSharedStoreListItemEventData>,
+    pub stores: LoreArray<LoreSharedStoreListItem>,
 }
 
-/// Data for an event describing a shared store being listed.
+/// Shared store array list item.
 #[repr(C)]
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LoreSharedStoreListItemEventData {
+pub struct LoreSharedStoreListItem {
     /// Remote URL the shared store is for.
     pub remote_url: LoreString,
     /// Path to the shared store on disk.
