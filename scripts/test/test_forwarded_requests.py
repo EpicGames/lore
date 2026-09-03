@@ -4,16 +4,113 @@
 import logging
 import os
 import uuid
+from pathlib import Path
+from time import sleep
 
+import grpc
 import pytest
+from grpc_probe import call
 from lore_server import (
     _kill_server_by_pid,
     allocate_free_port,
     generate_server_config,
     launch_lore_server,
 )
+from protobuf_wire import encode_bytes_field, field_bytes, field_string, parse_fields
 
 logger = logging.getLogger(__name__)
+
+REPOSITORY_GET = "/lore.repository.v1.RepositoryService/RepositoryGet"
+
+
+def allocate_server_ports() -> dict[str, int]:
+    """Ports for one server. QUIC and gRPC share a number, one being UDP and
+    the other TCP."""
+    shared_port = allocate_free_port()
+    return {
+        "quic": shared_port,
+        "grpc": shared_port,
+        "http": allocate_free_port(),
+        "internal": allocate_free_port(),
+    }
+
+
+def delegation_target_config(request, tmp_path_factory):
+    """Config for a delegation target. Its internal gRPC server is enabled
+    without mTLS so the delegating server can reach it over plain HTTP/2."""
+    server_root, server_env = generate_server_config(
+        request, tmp_path_factory, allocate_server_ports()
+    )
+    server_env["LORE__SERVER__GRPC_INTERNAL__ENABLED"] = "true"
+    server_env["LORE__SERVER__GRPC_INTERNAL__VERIFY_CLIENT_CERTS"] = "false"
+    return server_root, server_env
+
+
+def delegation_source_config(request, tmp_path_factory, target_config, enabled_rpcs):
+    """Config for a delegation source, forwarding `enabled_rpcs` to the target's
+    internal gRPC port. No certs are needed because the target's internal
+    listener runs without TLS."""
+    server_root, server_env = generate_server_config(
+        request, tmp_path_factory, allocate_server_ports()
+    )
+
+    _, target_env = target_config
+    target_internal_port = target_env["LORE__SERVER__GRPC_INTERNAL__PORT"]
+    server_hostname = request.config.getoption("--lore-server-hostname")
+
+    with open(
+        os.path.join(server_root, "lore-server", "config", "local.toml"),
+        "a",
+        encoding="utf-8",
+    ) as f:
+        f.write("[server.grpc_public_services.forwarded_requests.client]\n")
+        f.write(f'url = "http://{server_hostname}:{target_internal_port}"\n')
+        f.write("[server.grpc_public_services.forwarded_requests.enabled_rpcs]\n")
+        f.writelines(f"{rpc} = true\n" for rpc in enabled_rpcs)
+
+    return server_root, server_env
+
+
+def grpc_target(request, server_config) -> str:
+    """The `host:port` of a server's public gRPC endpoint."""
+    server_hostname = request.config.getoption("--lore-server-hostname")
+    _, server_env = server_config
+    return f"{server_hostname}:{server_env['LORE__SERVER__GRPC__PORT']}"
+
+
+def remote_url(request, server_config) -> str:
+    """The `lore://` URL a client uses to reach a server."""
+    return f"lore://{grpc_target(request, server_config)}"
+
+
+def repository_get_by_name_request(name: str) -> bytes:
+    """A `RepositoryGetRequest` selecting a repository by name.
+
+    `name` is field 2 of the `query` oneof. The call carries no repository
+    metadata: RepositoryGet names its subject in the request body, so the
+    handler never reads a repository id from metadata."""
+    return encode_bytes_field(2, name.encode("utf-8"))
+
+
+def repository_name_in_response(body: bytes) -> str:
+    """The `name` of the `Repository` a `RepositoryGetResponse` carries.
+
+    `repository` is field 1 of the response and `name` is field 2 of
+    `lore.model.v1.Repository`."""
+    repository = field_bytes(parse_fields(body), 1)
+    return field_string(parse_fields(repository), 2)
+
+
+def log_contains(log_path: Path, expected: str, attempts: int = 30) -> bool:
+    """Whether `expected` reaches `log_path`, polling because the line is
+    written after the response the test already observed."""
+    for _ in range(attempts):
+        if log_path.exists() and expected in log_path.read_text(
+            encoding="utf-8", errors="ignore"
+        ):
+            return True
+        sleep(1)
+    return False
 
 
 @pytest.mark.smoke
@@ -389,4 +486,238 @@ class TestForwardedRepositoryCreate:
         assert repo_name not in server_2_list, (
             f"Repository '{repo_name}' should not exist in Server 2's store "
             "(request was delegated, not written locally)"
+        )
+
+
+@pytest.mark.smoke
+@pytest.mark.xdist_group("forwarded_requests")
+class TestForwardedRepositoryGet:
+    """
+    Smoke tests for the forwarded-request delegation path for RepositoryGet.
+
+    Server 2 forwards RepositoryGet and nothing else, so the two repository
+    read RPCs disagree about what exists: RepositoryList is answered from
+    Server 2's own store while RepositoryGet is answered from Server 1's. A
+    repository created only on Server 1 is therefore missing from Server 2's
+    list and still resolvable through Server 2's get, which Server 2 could not
+    do by executing the read locally.
+
+    The second test pins the opposite direction. An error the peer itself
+    produced must reach the client as the peer wrote it, rather than being
+    reported as a failure of the forwarding call — the two are distinguished by
+    whether the status arrived from the peer or was synthesized locally, so
+    over-reporting one as the other is the risk this covers.
+    """
+
+    @pytest.fixture(scope="class")
+    def server_1_config(self, request, tmp_path_factory):
+        return delegation_target_config(request, tmp_path_factory)
+
+    @pytest.fixture(scope="class")
+    def server_1(self, server_1_config, lore_server_executable_path):
+        server_root, server_env = server_1_config
+        server_proc, log_path, log_fd = launch_lore_server(
+            server_root, server_env, lore_server_executable_path
+        )
+        yield server_proc, log_path, log_fd
+        _kill_server_by_pid(
+            server_proc.pid, log_path, label="forwarded repository get server 1"
+        )
+        log_fd.close()
+
+    @pytest.fixture(scope="class")
+    def server_2_config(self, request, tmp_path_factory, server_1_config):
+        return delegation_source_config(
+            request, tmp_path_factory, server_1_config, ["repository_get"]
+        )
+
+    @pytest.fixture(scope="class")
+    def server_2(self, server_2_config, server_1, lore_server_executable_path):
+        """
+        Depends on server_1 so the target's internal gRPC port is ready before
+        Server 2 starts. Server 2 connects to its peer while starting up and
+        fails to start if that connection is refused.
+        """
+        server_root, server_env = server_2_config
+        server_proc, log_path, log_fd = launch_lore_server(
+            server_root, server_env, lore_server_executable_path
+        )
+        yield server_proc, log_path, log_fd
+        _kill_server_by_pid(
+            server_proc.pid, log_path, label="forwarded repository get server 2"
+        )
+        log_fd.close()
+
+    @pytest.fixture()
+    def repository_on_server_1(
+        self, request, server_1_config, server_1, server_2, new_lore_repo
+    ):
+        """A repository written only to Server 1's store. Returns its name."""
+        server_1_url = remote_url(request, server_1_config)
+        repo_name = f"delegated-get-{uuid.uuid4().hex[:8]}"
+        new_lore_repo(
+            remote_url=server_1_url,
+            remote_path=f"{server_1_url}/{repo_name}",
+            repo_id=uuid.uuid4().hex,
+        )
+        return repo_name
+
+    @pytest.mark.smoke
+    def test_repository_get_delegates_read_to_server_1(
+        self, request, server_1_config, server_2_config, repository_on_server_1
+    ):
+        """Verify delegation by resolving a repository Server 2's own store never held."""
+        repo_name = repository_on_server_1
+        server_2_target = grpc_target(request, server_2_config)
+
+        code, body, details = call(
+            server_2_target, REPOSITORY_GET, repository_get_by_name_request(repo_name)
+        )
+        assert code == grpc.StatusCode.OK, (
+            f"RepositoryGet for '{repo_name}' via server 2 should succeed, got "
+            f"{code} '{details}'"
+        )
+        assert repository_name_in_response(body) == repo_name, (
+            f"The delegated response should carry repository '{repo_name}'"
+        )
+
+    @pytest.mark.smoke
+    def test_repository_list_on_server_2_does_not_see_it(
+        self, request, server_2_config, repository_on_server_1, new_lore_repo
+    ):
+        """RepositoryList is not forwarded, so Server 2's own store answers it."""
+        repo_name = repository_on_server_1
+        server_2_client = new_lore_repo(
+            remote_url=remote_url(request, server_2_config),
+            create_repo=False,
+        )
+
+        assert repo_name not in server_2_client.repository_list(), (
+            f"Repository '{repo_name}' should be absent from server 2's store — "
+            "only the forwarded RepositoryGet can resolve it"
+        )
+
+    @pytest.mark.smoke
+    def test_peer_error_reaches_the_client_as_the_peer_wrote_it(
+        self, request, server_1, server_2, server_2_config
+    ):
+        """An unknown repository is the peer's NOT_FOUND, not a forwarding failure."""
+        unknown_name = f"absent-repo-{uuid.uuid4().hex[:8]}"
+        server_2_target = grpc_target(request, server_2_config)
+
+        code, _body, details = call(
+            server_2_target,
+            REPOSITORY_GET,
+            repository_get_by_name_request(unknown_name),
+        )
+        assert code == grpc.StatusCode.NOT_FOUND, (
+            f"An unknown repository should be NOT_FOUND, got {code} '{details}'"
+        )
+        assert unknown_name in details, (
+            "The peer's own message names the repository it could not find; "
+            f"got '{details}'"
+        )
+
+
+@pytest.mark.smoke
+@pytest.mark.xdist_group("forwarded_requests")
+class TestForwardedRequestUnreachablePeer:
+    """
+    Smoke test for what a client sees when the server it called cannot reach the
+    server that server forwards to.
+
+    The peer is killed part-way through the test rather than never started: a
+    delegating server connects to its peer while starting up and refuses to
+    start if that connection is refused, so a peer that was never there cannot
+    be configured in the first place.
+
+    This class owns its own pair of servers because the test kills one of them.
+    The other classes in this file keep their pair for the whole class and would
+    find the target gone underneath them.
+    """
+
+    @pytest.fixture(scope="class")
+    def server_1_config(self, request, tmp_path_factory):
+        return delegation_target_config(request, tmp_path_factory)
+
+    @pytest.fixture(scope="class")
+    def server_1(self, server_1_config, lore_server_executable_path):
+        server_root, server_env = server_1_config
+        server_proc, log_path, log_fd = launch_lore_server(
+            server_root, server_env, lore_server_executable_path
+        )
+        yield server_proc, log_path, log_fd
+        # Safe to call for a process the test already killed.
+        _kill_server_by_pid(
+            server_proc.pid, log_path, label="unreachable peer server 1"
+        )
+        log_fd.close()
+
+    @pytest.fixture(scope="class")
+    def server_2_config(self, request, tmp_path_factory, server_1_config):
+        return delegation_source_config(
+            request, tmp_path_factory, server_1_config, ["repository_get"]
+        )
+
+    @pytest.fixture(scope="class")
+    def server_2(self, server_2_config, server_1, lore_server_executable_path):
+        server_root, server_env = server_2_config
+        server_proc, log_path, log_fd = launch_lore_server(
+            server_root, server_env, lore_server_executable_path
+        )
+        yield server_proc, log_path, log_fd
+        _kill_server_by_pid(
+            server_proc.pid, log_path, label="unreachable peer server 2"
+        )
+        log_fd.close()
+
+    @pytest.mark.smoke
+    def test_unreachable_peer_is_reported_as_the_origin_own_error(
+        self,
+        request,
+        server_1_config,
+        server_2_config,
+        server_1,
+        server_2,
+        new_lore_repo,
+    ):
+        """The client gets the origin's INTERNAL, and the origin logs the cause."""
+        server_1_proc, _server_1_log, _server_1_fd = server_1
+        _server_2_proc, server_2_log, _server_2_fd = server_2
+        server_2_target = grpc_target(request, server_2_config)
+
+        server_1_url = remote_url(request, server_1_config)
+        repo_name = f"unreachable-peer-{uuid.uuid4().hex[:8]}"
+        new_lore_repo(
+            remote_url=server_1_url,
+            remote_path=f"{server_1_url}/{repo_name}",
+            repo_id=uuid.uuid4().hex,
+        )
+
+        # Forwarding answers while the peer is up, so a failure after the kill
+        # is the peer being gone rather than a misconfigured delegation.
+        code, _body, details = call(
+            server_2_target, REPOSITORY_GET, repository_get_by_name_request(repo_name)
+        )
+        assert code == grpc.StatusCode.OK, (
+            f"Delegation should work before the peer is killed, got {code} '{details}'"
+        )
+
+        logger.info("Killing server 1 to make server 2's forwarding peer unreachable")
+        _kill_server_by_pid(server_1_proc.pid, label="unreachable peer server 1")
+
+        code, _body, details = call(
+            server_2_target, REPOSITORY_GET, repository_get_by_name_request(repo_name)
+        )
+        assert code == grpc.StatusCode.INTERNAL, (
+            "A peer that cannot be reached is the origin's own failure, not an "
+            f"answer from the peer; got {code} '{details}'"
+        )
+        assert "Error making forwarded request" in details, (
+            f"The client should get the origin's own message, got '{details}'"
+        )
+
+        assert log_contains(server_2_log, "forwarded request did not reach the peer"), (
+            "Server 2 should record why the forwarded request failed; a status "
+            "the client can act on is not enough to diagnose a peer outage"
         )
