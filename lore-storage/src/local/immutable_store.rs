@@ -998,6 +998,17 @@ impl ImmutableStoreGroup {
                 )
                 .await;
             }
+
+            let flush_guard = group.flush_lock.clone().lock_owned().await;
+            crate::local::fan_out::commit_if_initial_level(
+                &flush_guard,
+                &group.committed_level,
+                &group.bucket_count,
+                path,
+                group_index,
+                false,
+            )
+            .await;
         }
     }
 }
@@ -2324,7 +2335,7 @@ impl LocalImmutableStore {
             total_evicted_count += evicted_payload_count;
 
             if let Some(path) = path.as_ref() {
-                let path = Arc::new(path.as_ref().clone());
+                let path = path.clone();
                 let store = self.clone();
                 lore_base::lore_spawn!(serialize_tasks, async move {
                     let group = store.group[group_index].clone();
@@ -2346,6 +2357,19 @@ impl LocalImmutableStore {
 
         // Await all serialization
         while serialize_tasks.join_next().await.is_some() {}
+
+        if let Some(path) = path.as_ref() {
+            let flush_guard = group.flush_lock.clone().lock_owned().await;
+            crate::local::fan_out::commit_if_initial_level(
+                &flush_guard,
+                &group.committed_level,
+                &group.bucket_count,
+                path.as_ref(),
+                group_index,
+                sync_data,
+            )
+            .await;
+        }
 
         if total_evicted_count > 0 {
             lore_base::lore_debug!(
@@ -2802,7 +2826,6 @@ impl LocalImmutableStore {
                     lore_base::lore_trace!(
                         "Packstore compactor serializing group {group_index} bucket {bucket_index}"
                     );
-                    let path = Arc::new(path.as_ref().clone());
                     let bucket = group.bucket(bucket_index).clone();
                     // Narrow scope on purpose: this fn already called
                     // evict_group_sized above, which takes the same lock.
@@ -2828,6 +2851,19 @@ impl LocalImmutableStore {
                         "Packstore compactor verification failed after a bucket pass: {err}"
                     );
                 }
+            }
+
+            if let Some(path) = path.as_ref() {
+                let flush_guard = group.flush_lock.clone().lock_owned().await;
+                crate::local::fan_out::commit_if_initial_level(
+                    &flush_guard,
+                    &group.committed_level,
+                    &group.bucket_count,
+                    path.as_ref(),
+                    group_index,
+                    sync_data,
+                )
+                .await;
             }
 
             lore_base::lore_debug!(
@@ -3213,7 +3249,10 @@ impl LocalImmutableStore {
         for group_index in 0..self.group.len() {
             let group = self.group[group_index].clone();
 
-            // Lock-free scan: skip the group entirely when no bucket is dirty. No dirty bucket means no put/store operation has touched this group since the last flush, so the packstore has no new content to flush AND no marker write is needed (an empty group with no marker defaults to bucket_count = 256 on reload, which is fine — empty groups have no entries to interpret at any level, and the first write to such a group will fire the two-phase commit at that point). This restores ~zero per-group overhead for empty groups in fresh-store flushes, matching pre-fan-out behaviour.
+            // Lock-free scan: a group with no dirty bucket has taken no write since the last
+            // flush, so it has nothing to serialize and owes no marker. A marker-less group
+            // reloads at bucket_count = 256, correct for an empty group at any level, and its
+            // first write fires the two-phase commit. Empty groups cost ~nothing per flush.
             let any_dirty = group
                 .dirty
                 .iter()
@@ -4902,6 +4941,338 @@ mod tests {
             );
             assert_eq!(entry[index].data.size_content, index as u64);
             assert_eq!(entry[index].data.pack_offset, index as u32);
+        }
+    }
+
+    /// Client-shaped settings: the ones a repository store is opened with.
+    fn client_settings() -> ImmutableStoreSettings {
+        ImmutableStoreSettings {
+            protect_local_fragment: true,
+            implicit_durable_stored: false,
+            ..Default::default()
+        }
+    }
+
+    /// Server-shaped settings: groups start at the full 256 buckets.
+    fn server_settings() -> ImmutableStoreSettings {
+        ImmutableStoreSettings {
+            protect_local_fragment: false,
+            implicit_durable_stored: true,
+            initial_fan_out_level: BUCKET_COUNT,
+            ..Default::default()
+        }
+    }
+
+    /// Store `count` fragments and return their addresses.
+    async fn put_fragments(
+        store: &Arc<LocalImmutableStore>,
+        partition: Partition,
+        count: u16,
+    ) -> Vec<Address> {
+        let dyn_store: Arc<dyn crate::immutable_store::ImmutableStore> = store.clone();
+        let mut addresses = Vec::new();
+        for seed in 0..count {
+            let (address, payload) = payload_off_bucket_zero(seed);
+            let fragment = Fragment {
+                flags: 0,
+                size_payload: payload.len() as u32,
+                size_content: payload.len() as u64,
+            };
+            dyn_store
+                .clone()
+                .put(partition, address, fragment, Some(payload), false)
+                .await
+                .expect("put succeeds");
+            addresses.push(address);
+        }
+        addresses
+    }
+
+    /// Run the background timer's flush for every group, and nothing else.
+    async fn run_delayed_flush(store: &Arc<LocalImmutableStore>) {
+        let weak = Arc::downgrade(store);
+        for group_index in 0..GROUP_COUNT {
+            ImmutableStoreGroup::flush_delayed(weak.clone(), group_index, 0).await;
+        }
+    }
+
+    /// Every `level` marker under a store's index directory.
+    fn level_markers(index_root: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let Ok(groups) = std::fs::read_dir(index_root) else {
+            return found;
+        };
+        for group in groups.flatten() {
+            let marker = group.path().join(crate::local::fan_out::MARKER_FILENAME);
+            if marker.exists() {
+                found.push(marker);
+            }
+        }
+        found
+    }
+
+    /// Content whose hash puts it in a bucket other than 0 once a group is at level 256, so a
+    /// group misread as pre-fan-out sends a lookup to a different bucket than the one holding it.
+    fn payload_off_bucket_zero(seed: u16) -> (Address, Bytes) {
+        for salt in 0..1024u16 {
+            let payload = Bytes::from(seed.to_le_bytes().repeat(32 + salt as usize));
+            let hash = hash::hash_slice(payload.as_ref());
+            if hash.data()[1] != 0 {
+                return (
+                    Address {
+                        hash,
+                        context: Context::from([0u8; 16]),
+                    },
+                    payload,
+                );
+            }
+        }
+        panic!("no payload hashed away from bucket 0");
+    }
+
+    /// The delayed background flush writes bucket files without going through the two-phase
+    /// commit, and clears the dirty flags as it goes — so the flush that ends the command finds
+    /// the group clean and skips it. Left like that, the group has committed bucket files and no
+    /// level marker, which [`crate::local::fan_out::read_group_level`] reads back as a legacy
+    /// pre-fan-out layout at 256 buckets. A client group is written at level 1, where everything
+    /// lands in `index_00`; at 256 the hash maps somewhere else entirely and that file is never
+    /// opened again, so the entry is on disk and unreachable — `Address not found` with the
+    /// payload still sitting in the packstore.
+    #[tokio::test]
+    async fn a_group_the_delayed_flush_persisted_reopens_at_its_written_level() {
+        let dir = crate::test_util::TempDir::new("is_delayed_level_");
+        let partition = Partition::from([7u8; 16]);
+
+        let addresses = {
+            let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+                .await
+                .expect("store opens");
+            assert_eq!(
+                store.group[0].bucket_count.load(atomic::Ordering::Relaxed),
+                1,
+                "a client store starts its groups at level 1"
+            );
+
+            let addresses = put_fragments(&store, partition, 32).await;
+            // Persist exactly the way the background timer does, and nothing else: no
+            // `flush`, so the two-phase commit that would write the markers never runs.
+            run_delayed_flush(&store).await;
+            addresses
+        };
+
+        let index_root = dir.path().join("immutable").join("index");
+        let mut checked = 0;
+        for group in std::fs::read_dir(&index_root)
+            .expect("index dir exists")
+            .flatten()
+        {
+            let has_bucket = std::fs::read_dir(group.path())
+                .expect("group dir")
+                .flatten()
+                .any(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with("index_"))
+                });
+            if !has_bucket {
+                continue;
+            }
+            checked += 1;
+            assert_eq!(
+                crate::local::fan_out::read_level_marker(&group.path())
+                    .await
+                    .expect("marker readable"),
+                Some(1),
+                "group {} must record the level its bucket files were written at",
+                group.path().display()
+            );
+        }
+        assert!(
+            checked > 0,
+            "the delayed flush has to have written something"
+        );
+
+        let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+            .await
+            .expect("store reopens");
+        let dyn_store: Arc<dyn crate::immutable_store::ImmutableStore> = store.clone();
+        for address in &addresses {
+            let group = &store.group[address.hash.data()[0] as usize];
+            assert_eq!(
+                group.bucket_count.load(atomic::Ordering::Relaxed),
+                1,
+                "group for {address} reopened at the wrong level"
+            );
+            dyn_store
+                .clone()
+                .get(partition, *address)
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("{address} was written and persisted but reads back as {err:?}")
+                });
+        }
+    }
+
+    /// A store written before lazy fan-out carries no level markers and a flat 256-bucket
+    /// layout, which `read_group_level` reports as `PreFanOut`. Such a group already reads back
+    /// at the level it was written at, so nothing may start writing markers into it: that would
+    /// change which flush path the next flush takes on a store this version has to leave alone.
+    #[tokio::test]
+    async fn a_pre_fan_out_store_gains_no_level_markers() {
+        let dir = crate::test_util::TempDir::new("is_prefanout_");
+        let partition = Partition::from([3u8; 16]);
+        let index_root = dir.path().join("immutable").join("index");
+
+        // A group as the previous format left it: one bucket file at the pre-fan-out version,
+        // no marker beside it.
+        let legacy_group = index_root.join("2a");
+        std::fs::create_dir_all(&legacy_group).expect("group dir");
+        write_bucket_file(
+            &legacy_group.join("index_10"),
+            ImmutableStoreVersion::LastAccessInEntry as u32,
+        );
+
+        let addresses = {
+            let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+                .await
+                .expect("store opens");
+            assert_eq!(
+                store.group[0x2a]
+                    .bucket_count
+                    .load(atomic::Ordering::Relaxed),
+                BUCKET_COUNT,
+                "a marker-less group holding bucket files opens pre-fan-out"
+            );
+            assert_eq!(
+                store.group[0].bucket_count.load(atomic::Ordering::Relaxed),
+                BUCKET_COUNT,
+                "a legacy store keeps even its fresh groups at the flat layout"
+            );
+
+            let addresses = put_fragments(&store, partition, 32).await;
+            run_delayed_flush(&store).await;
+            addresses
+        };
+
+        assert_eq!(
+            level_markers(&index_root),
+            Vec::<PathBuf>::new(),
+            "a pre-fan-out store must come back out with the layout it went in with"
+        );
+
+        let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+            .await
+            .expect("store reopens");
+        let dyn_store: Arc<dyn crate::immutable_store::ImmutableStore> = store.clone();
+        for address in &addresses {
+            let group = &store.group[address.hash.data()[0] as usize];
+            assert_eq!(
+                group.bucket_count.load(atomic::Ordering::Relaxed),
+                BUCKET_COUNT,
+                "group for {address} reopened at the wrong level"
+            );
+            dyn_store
+                .clone()
+                .get(partition, *address)
+                .await
+                .unwrap_or_else(|err| panic!("{address} reads back as {err:?}"));
+        }
+    }
+
+    /// A server store starts its groups at the full 256 buckets, where a missing marker is read
+    /// back as exactly that. It gains no markers either, for the same reason.
+    #[tokio::test]
+    async fn a_server_shaped_store_gains_no_level_markers() {
+        let dir = crate::test_util::TempDir::new("is_server_level_");
+        let partition = Partition::from([9u8; 16]);
+        let index_root = dir.path().join("immutable").join("index");
+
+        let addresses = {
+            let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), server_settings())
+                .await
+                .expect("store opens");
+            assert_eq!(
+                store.group[0].bucket_count.load(atomic::Ordering::Relaxed),
+                BUCKET_COUNT,
+                "a server store starts at the flat layout"
+            );
+
+            let addresses = put_fragments(&store, partition, 32).await;
+            run_delayed_flush(&store).await;
+            addresses
+        };
+
+        assert_eq!(
+            level_markers(&index_root),
+            Vec::<PathBuf>::new(),
+            "a group already at 256 reads back at 256 without a marker"
+        );
+
+        let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), server_settings())
+            .await
+            .expect("store reopens");
+        let dyn_store: Arc<dyn crate::immutable_store::ImmutableStore> = store.clone();
+        for address in &addresses {
+            let group = &store.group[address.hash.data()[0] as usize];
+            assert_eq!(
+                group.bucket_count.load(atomic::Ordering::Relaxed),
+                BUCKET_COUNT,
+                "group for {address} reopened at the wrong level"
+            );
+            dyn_store
+                .clone()
+                .get(partition, *address)
+                .await
+                .unwrap_or_else(|err| panic!("{address} reads back as {err:?}"));
+        }
+    }
+
+    /// A group that already carries a marker keeps the level it records: the initial-level write
+    /// is for groups that have never had one, and must not overwrite a committed level.
+    #[tokio::test]
+    async fn a_marked_group_keeps_the_level_it_recorded() {
+        let dir = crate::test_util::TempDir::new("is_marked_level_");
+        let partition = Partition::from([5u8; 16]);
+        let index_root = dir.path().join("immutable").join("index");
+
+        {
+            let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+                .await
+                .expect("store opens");
+            let dyn_store: Arc<dyn crate::immutable_store::ImmutableStore> = store.clone();
+            let _ = put_fragments(&store, partition, 8).await;
+            // A real flush commits the level through the two-phase path.
+            dyn_store.flush(false).await.expect("flush succeeds");
+        }
+
+        let before: Vec<(PathBuf, Vec<u8>)> = level_markers(&index_root)
+            .into_iter()
+            .map(|path| {
+                let bytes = std::fs::read(&path).expect("marker readable");
+                (path, bytes)
+            })
+            .collect();
+        assert!(
+            !before.is_empty(),
+            "the flush has to have committed a level"
+        );
+
+        {
+            let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), client_settings())
+                .await
+                .expect("store reopens");
+            let _ = put_fragments(&store, partition, 16).await;
+            run_delayed_flush(&store).await;
+        }
+
+        for (path, bytes) in before {
+            assert_eq!(
+                std::fs::read(&path).expect("marker still readable"),
+                bytes,
+                "marker at {} was rewritten",
+                path.display()
+            );
         }
     }
 

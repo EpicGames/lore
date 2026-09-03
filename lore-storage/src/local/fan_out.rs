@@ -5,7 +5,10 @@
 
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
+use tokio::sync::OwnedMutexGuard;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
 use zerocopy::Immutable;
@@ -169,6 +172,9 @@ pub async fn write_level_marker(
 /// Number of bytes a bucket file name occupies: the prefix plus two hex digits.
 const BUCKET_FILENAME_LEN: usize = BUCKET_FILENAME_PREFIX.len() + 2;
 
+/// Bytes a marker path adds to a store root: `/index`, `/<gg>` and `/<MARKER_FILENAME>`.
+const MARKER_PATH_LEN: usize = "/index".len() + 1 + 2 + 1 + MARKER_FILENAME.len();
+
 /// Write `value` as lowercase two-digit hex into the first two bytes of `out`.
 ///
 /// Path components are built through this rather than `format!`: on the per-bucket flush and
@@ -250,6 +256,47 @@ pub async fn read_group_level(group_path: &Path) -> std::io::Result<GroupLevel> 
         Some(level) => Ok(GroupLevel::Marked(level)),
         None if group_has_buckets(group_path).await => Ok(GroupLevel::PreFanOut),
         None => Ok(GroupLevel::Unwritten),
+    }
+}
+
+/// Record the level a group's bucket files are laid out at, when the group has no marker yet.
+/// `store_path` is the store root; the group directory is `<store_path>/index/<gg>`.
+/// `_flush_guard` is the group's held flush lock, which orders the `Relaxed` `committed_level`
+/// store against `flush_all`'s reads of it; it is taken to make the caller prove it holds one.
+///
+/// A bucket file is only interpretable at the level it was written at, and [`read_group_level`]
+/// reads a marker-less group holding bucket files as [`GroupLevel::PreFanOut`]. Anything a lower
+/// level wrote then sits in a file no lookup opens again. Every path that writes a bucket file
+/// outside the two-phase commit therefore owes the group a marker.
+///
+/// A group that already has a marker is left alone, as committing a level is the two-phase
+/// commit's business. So is a group at [`FAN_OUT_LEVEL_MAX`], which already reads back at that
+/// level — keeping this inert for pre-fan-out and server stores, whose groups are all there.
+pub async fn commit_if_initial_level(
+    _flush_guard: &OwnedMutexGuard<()>,
+    committed_level: &AtomicUsize,
+    bucket_count: &AtomicUsize,
+    store_path: &Path,
+    group_index: usize,
+    sync_data: bool,
+) {
+    if committed_level.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let active_buckets = bucket_count.load(Ordering::Relaxed);
+    if active_buckets == FAN_OUT_LEVEL_MAX {
+        return;
+    }
+    let mut marker_path = PathBuf::with_capacity(store_path.as_os_str().len() + MARKER_PATH_LEN);
+    marker_path.push(store_path);
+    marker_path.push("index");
+    push_group_dir(&mut marker_path, group_index);
+    marker_path.push(MARKER_FILENAME);
+    match write_level_header_file(&marker_path, active_buckets, sync_data).await {
+        Ok(()) => committed_level.store(active_buckets, Ordering::Relaxed),
+        Err(err) => {
+            lore_base::lore_warn!("Failed to write level marker for group {group_index}: {err}");
+        }
     }
 }
 
@@ -599,6 +646,85 @@ mod tests {
     async fn read_level_marker_missing_returns_none() {
         let dir = temp_group_dir();
         assert_eq!(read_level_marker(dir.path()).await.unwrap(), None);
+    }
+
+    /// A held flush guard, standing in for the one a caller owns.
+    async fn held_flush_guard() -> OwnedMutexGuard<()> {
+        std::sync::Arc::new(tokio::sync::Mutex::new(()))
+            .lock_owned()
+            .await
+    }
+
+    /// A store root whose group directory exists, ready for a marker write.
+    fn temp_store_with_group(group_index: usize) -> (crate::test_util::TempDir, PathBuf) {
+        let dir = crate::test_util::TempDir::new("fan_out_commit_");
+        let mut group_path = dir.path().to_path_buf();
+        group_path.push("index");
+        push_group_dir(&mut group_path, group_index);
+        std::fs::create_dir_all(&group_path).expect("group dir");
+        (dir, group_path)
+    }
+
+    #[tokio::test]
+    async fn commit_if_initial_level_records_the_level_below_the_maximum() {
+        for &level in &LEVEL_LADDER[..LEVEL_LADDER.len() - 1] {
+            let (dir, group_path) = temp_store_with_group(0x2a);
+            let committed = AtomicUsize::new(0);
+            let bucket_count = AtomicUsize::new(level);
+
+            commit_if_initial_level(
+                &held_flush_guard().await,
+                &committed,
+                &bucket_count,
+                dir.path(),
+                0x2a,
+                false,
+            )
+            .await;
+
+            assert_eq!(read_level_marker(&group_path).await.unwrap(), Some(level));
+            assert_eq!(committed.load(Ordering::Relaxed), level);
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_if_initial_level_leaves_a_committed_group_alone() {
+        let (dir, group_path) = temp_store_with_group(0x2a);
+        let committed = AtomicUsize::new(32);
+        let bucket_count = AtomicUsize::new(64);
+
+        commit_if_initial_level(
+            &held_flush_guard().await,
+            &committed,
+            &bucket_count,
+            dir.path(),
+            0x2a,
+            false,
+        )
+        .await;
+
+        assert_eq!(read_level_marker(&group_path).await.unwrap(), None);
+        assert_eq!(committed.load(Ordering::Relaxed), 32);
+    }
+
+    #[tokio::test]
+    async fn commit_if_initial_level_leaves_a_group_at_the_maximum_alone() {
+        let (dir, group_path) = temp_store_with_group(0x2a);
+        let committed = AtomicUsize::new(0);
+        let bucket_count = AtomicUsize::new(FAN_OUT_LEVEL_MAX);
+
+        commit_if_initial_level(
+            &held_flush_guard().await,
+            &committed,
+            &bucket_count,
+            dir.path(),
+            0x2a,
+            false,
+        )
+        .await;
+
+        assert_eq!(read_level_marker(&group_path).await.unwrap(), None);
+        assert_eq!(committed.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

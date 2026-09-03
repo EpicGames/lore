@@ -33,6 +33,7 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 - `LoreFileHistoryEventData` and `LoreRevisionInfoDeltaEventData` now have a `from_path` field. The field is set for moved files, and is empty for added, modified and deleted file actions.
 - All move actions now print both the from and to paths: `lore branch diff`, `lore revision diff`, `lore file history` and `lore revision info --delta` output moves as `V old -> new`.
 - Fix `lore revision diff` for move actions: now it reports a move as one change instead of as a delete & add.
+- `lore-storage`: fix local store entries becoming unreachable — reported as `Address not found` while the payload is still in the packstore — when the background flush wrote a group's bucket files without recording their fan-out level, leaving the next open to read the group at the flat 256-bucket layout. Every path that writes a bucket file outside the two-phase commit now records the level
 
 ## v0.9.0 (Aug 28th 2026) [#782]
 

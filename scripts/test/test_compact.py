@@ -11,6 +11,7 @@ import pytest
 
 from lore import Lore
 from lore_parsers import parse_jsonl
+from store_layout import assert_all_index_entries_reachable
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,7 @@ def test_store_compaction(new_lore_repo, lore_executable_path):
     # Verify full gc run
     repo.repository_gc(debug=True)
     repo.repository_verify()
+    assert_all_index_entries_reachable(repo)
 
 
 @pytest.mark.smoke
