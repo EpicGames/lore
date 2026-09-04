@@ -17,6 +17,13 @@ name = "integration"
 path = "tests/integration.rs"
 required-features = ["integration_tests"]
 
+# Its own target rather than a module of the suite: it installs a process-wide GC event sink
+# provider, which takes the first registration and would otherwise race the suite's own.
+# Needs no service from compose.yaml, so it is not behind `integration_tests`.
+[[test]]
+name = "store_gc_trigger"
+path = "tests/store_gc_trigger_test.rs"
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }

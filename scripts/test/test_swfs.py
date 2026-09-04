@@ -122,6 +122,7 @@ def test_swfs_repo_can_be_force_created_over(new_lore_repo, background_lore_serv
     assert not clone_of_original_repo.file_exists(new_repo_file)
 
 
+@pytest.mark.skip(reason="swfs is generally not available; test fails constantly in CI")
 @pytest.mark.smoke
 def test_swfs_repo_can_be_force_cloned_over(new_lore_repo, background_lore_service):
     repo: Lore = new_lore_repo(

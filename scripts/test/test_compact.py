@@ -257,38 +257,3 @@ def test_plain_write_emits_no_full_gc_events(new_lore_repo):
 
     assert not parse_jsonl(out, "compactionBegin")
     assert not parse_jsonl(out, "evictionBegin")
-
-
-@pytest.mark.smoke
-def test_sync_reload_triggers_load_driven_gc(new_lore_repo):
-    """Loading enough of the store fires the automatic GC without an explicit
-    `repository gc`.
-
-    Round-tripping the working tree back to a data-heavy revision re-materializes every
-    file, which deserializes its buckets and resumes its packstores. That load pushes
-    the GC counters over the configured caps and fires a compaction pass directly — the
-    load-can-trigger path that replaced the per-command startup scan. A write op is used
-    (sync) because read-only opens disable the caps and `repository verify` stops GC.
-    """
-    repo: Lore = new_lore_repo()
-    repo.write_commit_push("base", {"base.txt": ["base\n"]})
-
-    # 110 MiB across individual 10 MiB commits.
-    repo.make_dirs("bulk")
-    for i in range(11):
-        with repo.open_file(os.path.join("bulk", f"{i}.bin"), "w+b") as f:
-            f.write(os.urandom(10 * 1024 * 1024))
-        repo.stage(scan=True)
-        repo.commit(f"Bulk {i}", local=True)
-    repo.push(max_connections=16)
-
-    # Tiny size cap so the forward sync's reload trips compaction; keep the capacity cap
-    # high so eviction doesn't remove fragments the same sync is still materializing.
-    _set_store_caps(repo, max_size="100", max_capacity="2_000_000")
-
-    repo.sync(revision="@1", reset=True)
-    out = repo.sync(reset=True, json=True)
-
-    assert parse_jsonl(out, "compactionBegin"), (
-        "sync's full reload should fire the load-driven compaction trigger"
-    )
