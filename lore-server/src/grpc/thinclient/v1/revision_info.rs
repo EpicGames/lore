@@ -68,6 +68,13 @@ pub async fn handler(
             let signature =
                 resolve_signature(&repository, query.into(), history_step_size, acceleration)
                     .await?;
+            // Only the default branch can exist with no revisions; its
+            // latest then resolves to the zero hash. That is not an error:
+            // answer successfully with no revision to describe, rather than
+            // proceeding into state/metadata loads that fail as Internal.
+            if signature.is_zero() {
+                return Ok(Response::new(RevisionInfoResponse { revision: None }));
+            }
             debug!({REVISION} = %signature, "Loading revision info");
 
             let revision = load_revision(&repository, signature).await?;
@@ -671,6 +678,82 @@ mod test {
             assert_eq!(revision.metadata.len(), 1);
             assert_eq!(revision.metadata[0].key, "custom");
             assert_eq!(revision.metadata[0].value, "value");
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn empty_branch_returns_success_without_revision() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        // A branch that exists but has no revisions resolves its latest to
+        // the zero hash; the handler must answer successfully with no
+        // revision, not Internal (regression: empty repositories surfaced
+        // "file not found: metadata key").
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let write_token = get_write_token();
+            let branch_id = BranchId::from(uuid::Uuid::now_v7());
+            branch::create(
+                repository_context,
+                &write_token,
+                branch_id,
+                "empty-branch",
+                branch::default_category(),
+                "creator",
+                1,
+                vec![],
+                false,
+                false,
+            )
+            .await
+            .expect("create branch");
+
+            let response = handler(
+                make_request(
+                    repository,
+                    Query::Identifier(model_v1::RevisionIdentifier {
+                        branch_id: branch_id.into(),
+                        number: 0,
+                    }),
+                ),
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+            )
+            .await
+            .expect("empty branch should answer successfully")
+            .into_inner();
+            assert!(response.revision.is_none());
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn zero_signature_returns_success_without_revision() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let response = handler(
+                make_request(repository, Query::Signature(Hash::default().into())),
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+            )
+            .await
+            .expect("zero signature should answer successfully")
+            .into_inner();
+            assert!(response.revision.is_none());
         }))
         .await;
     }
