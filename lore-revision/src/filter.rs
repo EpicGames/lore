@@ -215,12 +215,26 @@ pub fn load_view(view_path: impl AsRef<Path>) -> Result<Filter, FilterError> {
     })
 }
 
+/// Reads a filter file, one rule per line.
+///
+/// A rule this filter cannot express is a hard error, and the error names the
+/// file, the 1-based line number and the rule as written. Skipping the line
+/// instead would leave a filter that no longer represents the author's intent
+/// and whose inclusions and exclusions may differ arbitrarily from what was
+/// meant, which is at least as bad as having no filter; and the only signal a
+/// warning gives is a line in a log the author of an integration toolchain
+/// never reads.
 pub fn load_filter(path: impl AsRef<Path>) -> Result<FilterInstance, FilterError> {
+    let path = path.as_ref();
     let mut filter = FilterInstance::default();
     if let Ok(file) = File::open(path) {
         let mut has_include = false;
         let mut has_exclude = false;
-        for line in BufReader::new(file).lines().map_while(Result::ok) {
+        for (index, line) in BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .enumerate()
+        {
             let mut glob = line.trim();
             if glob.is_empty() || glob.starts_with('#') {
                 continue;
@@ -237,12 +251,33 @@ pub fn load_filter(path: impl AsRef<Path>) -> Result<FilterInstance, FilterError
                 glob = &glob[1..];
             }
 
-            if negated {
-                filter.add_inclusion(glob)?;
-                has_include = true;
+            let added = if negated {
+                filter.add_inclusion(glob)
             } else {
-                filter.add_exclusion(glob)?;
-                has_exclude = true;
+                filter.add_exclusion(glob)
+            };
+
+            match added {
+                Ok(()) => {
+                    if negated {
+                        has_include = true;
+                    } else {
+                        has_exclude = true;
+                    }
+                }
+                Err(error) => {
+                    // The line info goes in the message rather than in
+                    // `internal_with_context`: `Display for Traced` forwards to
+                    // the inner error and never prints the trace, so a context
+                    // string would name the line somewhere the reader of the
+                    // error never looks.
+                    return Err(FilterError::internal(format!(
+                        "{}:{}: unsupported rule `{}`: {error}",
+                        path.display(),
+                        index + 1,
+                        line.trim(),
+                    )));
+                }
             }
         }
 

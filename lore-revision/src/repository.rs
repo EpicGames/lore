@@ -2572,10 +2572,17 @@ pub fn load_filter(root_path: &Path) -> Option<Arc<filter::Filter>> {
 
     let view_path = get_dot_lore_path(root_path).ok()?.join(VIEW_FILTER);
 
-    if let Ok(filter) = filter::load(&ignore_path, &view_path) {
-        Some(Arc::new(filter))
-    } else {
-        None
+    match filter::load(&ignore_path, &view_path) {
+        Ok(filter) => Some(Arc::new(filter)),
+        Err(error) => {
+            // Returning `None` here means nothing is filtered at all, which looks
+            // to the user like every ignored file suddenly changed. Say why.
+            lore_warn!(
+                "Failed to load the filter from {}: {error}. Nothing will be ignored until this is fixed.",
+                ignore_path.display(),
+            );
+            None
+        }
     }
 }
 
