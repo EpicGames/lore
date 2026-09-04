@@ -13,8 +13,14 @@ This example uses **c8gd.8xlarge** Graviton instances (32 vCPU, 64 GB RAM, 1.9 T
 From the Lore repo root:
 
 ```sh
-docker buildx build --platform linux/arm64 -f lore-server/Dockerfile -t loreserver:v0.8.7 --load .
+docker buildx build --platform linux/arm64 \
+  --build-arg ARM64_TARGET_CPU=neoverse-512tvb \
+  -f lore-server/Dockerfile -t loreserver:v0.8.7 --load .
 ```
+
+> `ARM64_TARGET_CPU` tunes codegen for Graviton3+, matching the `c8gd` instances below. Without it
+> the build is baseline `armv8-a`, which runs here but leaves performance on the table. The
+> resulting binary uses SVE and will not run on older arm64 hardware.
 
 > If building on an x86 host, [register QEMU](https://docs.docker.com/build/building/multi-platform/#qemu) first:
 > `docker run --rm --privileged multiarch/qemu-user-static --reset -p yes`
