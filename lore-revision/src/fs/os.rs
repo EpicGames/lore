@@ -15,6 +15,7 @@ use lore_base::types::Hash;
 use lore_error_set::prelude::*;
 
 use super::filesystem_provider::FileInfo;
+use super::filesystem_provider::FilesystemDiffContext;
 use super::filesystem_provider::FilesystemPath;
 use super::filesystem_provider::FilesystemProvider;
 use super::filesystem_provider::FsError;
@@ -22,16 +23,13 @@ use super::filesystem_provider::InstanceOperation;
 use super::filesystem_provider::InstanceOperationImpl;
 use super::filesystem_provider::StaticDispatchInstanceOperation;
 use crate::change::NodeChange;
-use crate::filter::FilterMode;
 use crate::immutable;
 use crate::merge::MergeTextMode;
 use crate::merge::merge3_text_by_path;
 use crate::node::Node;
-use crate::node::NodeID;
 use crate::repository::RepositoryContext;
 use crate::state::FilesystemDiffStats;
 use crate::state::NodeComparison;
-use crate::state::State;
 use crate::util;
 use crate::util::path::RelativePath;
 
@@ -75,30 +73,16 @@ pub struct OsOperation {
 impl InstanceOperation for OsOperation {
     async fn changes_from_filesystem_to_state(
         &self,
-        repository_from: Arc<RepositoryContext>,
-        state_from: Arc<State>,
-        repository_current: Arc<RepositoryContext>,
-        state_current: Arc<State>,
-        node_path: RelativePath,
-        root_node_from: NodeID,
-        root_node_to: NodeID,
-        filter_mode: FilterMode,
-    ) -> Result<(Vec<NodeChange>, FilesystemDiffStats), FsError> {
-        crate::state::diff_filesystem_subtree(
-            repository_from,
-            state_from,
-            repository_current,
-            state_current,
-            node_path,
-            root_node_from,
-            root_node_to,
-            filter_mode,
-            std::sync::Arc::new(Vec::new()),
-        )
-        .await
-        .forward_any::<FsError>("Failed to diff filesystem")
+        diff: FilesystemDiffContext,
+        changes: &mut Vec<NodeChange>,
+    ) -> Result<FilesystemDiffStats, FsError> {
+        crate::state::diff_os_filesystem(diff, changes)
+            .await
+            .forward_any::<FsError>("Failed to diff filesystem")
     }
 
+    /// A path mid-deletion stats as `PermissionDenied` on Windows rather than
+    /// `NotFound`, so both report a non-existent path.
     async fn file_info(&self, path: FilesystemPath<'_>) -> Result<FileInfo, FsError> {
         match lore_io::IoDriver::global()
             .metadata(path.as_absolute_path())
@@ -106,6 +90,12 @@ impl InstanceOperation for OsOperation {
         {
             Ok(metadata) => Ok(FileInfo::from_metadata(metadata)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileInfo::default()),
+            Err(e)
+                if cfg!(target_family = "windows")
+                    && e.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                Ok(FileInfo::default())
+            }
             Err(e) => Err(e.into()),
         }
     }

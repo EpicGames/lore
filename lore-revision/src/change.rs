@@ -181,7 +181,7 @@ pub struct NodeChange {
     pub to: NodeChangeState,
     pub path: RelativePath,
     pub from_path: Option<RelativePath>,
-    /// What a filesystem reconcile measured at `path`, so a consumer does not re-stat
+    /// What a filesystem diff measured at `path`, so a consumer does not re-stat
     /// it. `None` for a change between two revisions, which consulted no filesystem.
     pub observed: Option<FileInfo>,
 }

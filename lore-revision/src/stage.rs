@@ -25,6 +25,9 @@ use crate::errors::*;
 use crate::event;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+use crate::fs::filesystem_provider::FilesystemDiffIntent;
+use crate::fs::filesystem_provider::FilesystemTraversal;
+use crate::fs::filesystem_provider::with_operation;
 use crate::hash;
 use crate::infer::infer_is_conflicted_by_path;
 use crate::interface::LoreArray;
@@ -3480,19 +3483,33 @@ pub(crate) async fn stage_from_parent_state(
         Node::default()
     };
 
-    let (mut changes, _) = state::diff_filesystem_subtree(
-        repository_target.clone(),
-        state_target.clone(),
-        repository_current.clone(),
-        state_current.clone(),
-        relative_path.clone(),
-        node.parent,
-        node_current.parent,
-        FilterMode::Full,
-        Arc::new(Vec::new()),
-    )
-    .await
-    .forward::<StageError>("Failed to calculate diff between file system and target state")?;
+    let mut changes = with_operation(repository_current.file_system(), false, async |operation| {
+        let mut changes = Vec::new();
+        state::diff_filesystem_subtree(
+            &operation,
+            FilesystemTraversal {
+                repository: repository_target.clone(),
+                state: state_target.clone(),
+                node_path: relative_path.clone(),
+                root_node: node.parent,
+            },
+            FilesystemTraversal {
+                repository: repository_current.clone(),
+                state: state_current.clone(),
+                node_path: relative_path.clone(),
+                root_node: node_current.parent,
+            },
+            relative_path.clone(),
+            FilterMode::Full,
+            FilesystemDiffIntent::Report,
+            Arc::new(Vec::new()),
+            &mut changes,
+        )
+        .await
+        .forward::<StageError>("Failed to calculate diff between file system and target state")?;
+        Ok::<_, StageError>(changes)
+    })
+    .await?;
 
     // Reverse changes to make it change from file system to state
     change::reverse(changes.as_mut_slice());

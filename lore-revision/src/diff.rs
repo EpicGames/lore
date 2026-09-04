@@ -11,6 +11,12 @@ use crate::change;
 use crate::change::NodeChange;
 use crate::errors::InvalidArguments;
 use crate::filter::FilterMode;
+use crate::fs::filesystem_provider::FilesystemDiffIntent;
+use crate::fs::filesystem_provider::FilesystemDiffTree;
+use crate::fs::filesystem_provider::FilesystemPath;
+use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::with_operation;
 use crate::lore_debug;
 use crate::path::emit_path_ignore;
 use crate::repository::RepositoryContext;
@@ -18,6 +24,7 @@ use crate::state;
 use crate::state::ChangeSink;
 use crate::state::State;
 use crate::util::path::RelativePath;
+use crate::util::path::RepositoryPath;
 
 #[error_set]
 pub enum DiffError {
@@ -137,6 +144,22 @@ pub async fn diff_filesystem_paths(
     state_current: Arc<State>,
     paths: Option<Vec<RelativePath>>,
 ) -> Result<Vec<NodeChange>, DiffError> {
+    let filesystem = repository.file_system();
+    with_operation(filesystem, false, async |operation| {
+        diff_filesystem_paths_in(operation, repository, state_from, state_current, paths).await
+    })
+    .await
+}
+
+/// The changes every path in `paths` shows against the filesystem, walked concurrently
+/// through one operation.
+async fn diff_filesystem_paths_in(
+    operation: Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    state_from: Arc<State>,
+    state_current: Arc<State>,
+    paths: Option<Vec<RelativePath>>,
+) -> Result<Vec<NodeChange>, DiffError> {
     let mut tasks: JoinSet<Result<Vec<NodeChange>, DiffError>> = JoinSet::new();
     let paths = paths.unwrap_or_else(|| vec![RelativePath::new()]);
     for path in paths.iter() {
@@ -144,6 +167,7 @@ pub async fn diff_filesystem_paths(
         let state_from = state_from.clone();
         let state_current = state_current.clone();
         let path = path.clone();
+        let operation = operation.clone();
         let exists = if !path.is_empty() {
             let mut exists_in_state = false;
             let mut exists_in_filesystem = false;
@@ -155,11 +179,11 @@ pub async fn diff_filesystem_paths(
             if node_link.is_valid() {
                 exists_in_state = true;
             } else {
-                let absolute_path = path.to_absolute_path(repository.require_path()?);
-                exists_in_filesystem = lore_io::IoDriver::global()
-                    .metadata(absolute_path)
+                let repository_path = RepositoryPath::from_relative(&repository, path.clone())?;
+                exists_in_filesystem = operation
+                    .file_info(FilesystemPath::Repository(&repository_path))
                     .await
-                    .is_ok();
+                    .is_ok_and(|info| info.exists);
             }
 
             if !exists_in_state && !exists_in_filesystem {
@@ -184,14 +208,22 @@ pub async fn diff_filesystem_paths(
                         lore_debug!("Calculating deltas against filesystem for full repository");
                     }
 
-                    let (mut changes, _) = state::diff_filesystem(
-                        repository.clone(),
-                        state_from,
-                        repository.clone(),
-                        state_current,
+                    let mut changes = Vec::new();
+                    state::diff_filesystem(
+                        &operation,
+                        FilesystemDiffTree {
+                            repository: repository.clone(),
+                            state: state_from,
+                        },
+                        FilesystemDiffTree {
+                            repository: repository.clone(),
+                            state: state_current,
+                        },
                         if !path.is_empty() { Some(path) } else { None },
                         FilterMode::Full,
+                        FilesystemDiffIntent::Report,
                         std::sync::Arc::new(Vec::new()),
+                        &mut changes,
                     )
                     .await
                     .forward_any::<DiffError>("calculating filesystem diff")?;

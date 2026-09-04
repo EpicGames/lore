@@ -16,7 +16,11 @@ use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
 use crate::find;
+use crate::fs::filesystem_provider::FilesystemDiffIntent;
+use crate::fs::filesystem_provider::FilesystemDiffTree;
 use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lore::BranchId;
@@ -841,6 +845,33 @@ pub async fn sync(
     source_path: RelativePath,
     options: SyncOptions,
 ) -> Result<(), LayerError> {
+    let filesystem = repository.file_system();
+    with_operation(filesystem, true, async |operation| {
+        sync_in_operation(
+            operation,
+            repository,
+            state_current,
+            state_target,
+            target_path,
+            source_path,
+            options,
+        )
+        .await
+    })
+    .await
+}
+
+/// Realizes the layer's target state over its mount, within `operation`.
+#[allow(clippy::too_many_arguments)]
+async fn sync_in_operation(
+    operation: Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    state_current: Arc<State>,
+    state_target: Arc<State>,
+    target_path: RelativePath,
+    source_path: RelativePath,
+    options: SyncOptions,
+) -> Result<(), LayerError> {
     let stats: Arc<SyncRealizeStats> = Arc::default();
     let changes = if !options.reset {
         lore_info!(
@@ -882,18 +913,26 @@ pub async fn sync(
             "Calculating deltas from filesystem -> {}",
             state_target.revision_number()
         );
-        let (mut changes, _diff_stats) = state::diff_filesystem(
-            repository.clone(),
-            state_target.clone(),
-            repository.clone(),
-            state_current.clone(),
+        let mut changes = Vec::new();
+        state::diff_filesystem(
+            &operation,
+            FilesystemDiffTree {
+                repository: repository.clone(),
+                state: state_target.clone(),
+            },
+            FilesystemDiffTree {
+                repository: repository.clone(),
+                state: state_current.clone(),
+            },
             if !source_path.is_empty() {
                 Some(source_path)
             } else {
                 None
             },
             options.filter_mode,
+            FilesystemDiffIntent::Report,
             Arc::new(Vec::new()),
+            &mut changes,
         )
         .await
         .forward::<LayerError>("Failed to calculate file system diff when synchronizing")?;
@@ -905,11 +944,6 @@ pub async fn sync(
     let options = Arc::new(options);
     let changes = Arc::new(changes);
     let force = execution_context().globals().force();
-    let operation = repository
-        .file_system()
-        .begin_operation()
-        .await
-        .forward::<LayerError>("Failed to start filesystem operation")?;
     let changes = if !changes.is_empty() && !force {
         lore_info!(
             "Verifying {} layer changes with local file system",
@@ -942,11 +976,6 @@ pub async fn sync(
     )
     .await
     .forward::<LayerError>("Failed to sync layer files")?;
-
-    operation
-        .finalize(true)
-        .await
-        .forward::<LayerError>("Failed to finalize operation")?;
 
     Ok(())
 }

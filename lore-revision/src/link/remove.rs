@@ -10,6 +10,9 @@ use crate::errors::LocalModifications;
 use crate::errors::NotALink;
 use crate::event;
 use crate::filter::FilterMode;
+use crate::fs::filesystem_provider::FilesystemDiffIntent;
+use crate::fs::filesystem_provider::FilesystemDiffTree;
+use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreFileAction;
 use crate::link::LoreLinkChangeEventData;
 use crate::lore::Context;
@@ -185,21 +188,34 @@ async fn verify_no_local_changes_under_link(
 ) -> Result<(), LinkError> {
     // TODO(vri): narrow this to `link_path` once a scoped diff works.
     // `find_relative_node_link` returns a mount as the parent's own link node,
-    // so `diff_filesystem_ex` has nothing to resolve and walks a node with no
+    // so `diff_filesystem` has nothing to resolve and walks a node with no
     // children, reporting every file under the mount as added.
-    let (changes, _stats) = state::diff_filesystem(
-        repository.clone(),
-        state_staged,
-        repository,
-        state_current,
-        None,
-        // Not `Full`: removal deletes the mount with `unlink_recursive`, which
-        // takes ignored files with it, so they have to count as local changes.
-        FilterMode::View,
-        Arc::new(Vec::new()),
-    )
-    .await
-    .forward::<LinkError>("Failed comparing link content with the file system")?;
+    let filesystem = repository.file_system();
+    let changes = with_operation(filesystem, false, async |operation| {
+        let mut changes = Vec::new();
+        state::diff_filesystem(
+            &operation,
+            FilesystemDiffTree {
+                repository: repository.clone(),
+                state: state_staged,
+            },
+            FilesystemDiffTree {
+                repository,
+                state: state_current,
+            },
+            None,
+            // Not `Full`: removal deletes the mount with `unlink_recursive`, which
+            // takes ignored files with it, so they have to count as local changes.
+            FilterMode::View,
+            FilesystemDiffIntent::Report,
+            Arc::new(Vec::new()),
+            &mut changes,
+        )
+        .await
+        .forward::<LinkError>("Failed comparing link content with the file system")?;
+        Ok::<_, LinkError>(changes)
+    })
+    .await?;
 
     if changes
         .iter()

@@ -243,18 +243,33 @@ pub async fn test_scan(
     state_staged: std::sync::Arc<lore_revision::state::State>,
     state_current: std::sync::Arc<lore_revision::state::State>,
 ) -> Vec<lore_revision::change::NodeChange> {
-    let (changes, _stats) = lore_revision::state::diff_filesystem_ex(
-        repository.clone(),
-        state_staged,
-        repository,
-        state_current,
+    let operation = lore_revision::fs::filesystem_provider::FilesystemProvider::begin_operation(
+        repository.file_system().as_ref(),
+    )
+    .await
+    .expect("Failed to start filesystem operation");
+    let mut changes = Vec::new();
+    lore_revision::state::diff_filesystem(
+        &operation,
+        lore_revision::fs::filesystem_provider::FilesystemDiffTree {
+            repository: repository.clone(),
+            state: state_staged,
+        },
+        lore_revision::fs::filesystem_provider::FilesystemDiffTree {
+            repository,
+            state: state_current,
+        },
         None, /* full tree */
         lore_revision::filter::FilterMode::Full,
-        true, /* scan_dirty */
+        lore_revision::fs::filesystem_provider::FilesystemDiffIntent::MarkDirty,
         std::sync::Arc::new(Vec::new()),
+        &mut changes,
     )
     .await
     .expect("Failed to diff filesystem");
+    lore_revision::fs::filesystem_provider::InstanceOperation::finalize(operation.as_ref(), false)
+        .await
+        .expect("Failed to finish filesystem operation");
     changes
 }
 

@@ -23,8 +23,8 @@ use crate::filter::FilterMode;
 use crate::find;
 use crate::fs::filesystem_provider::FilesystemProvider;
 use crate::fs::filesystem_provider::FsError;
-use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::with_operation;
 use crate::history;
 use crate::interface::LoreBranchLocation;
 use crate::interface::LoreError;
@@ -876,11 +876,11 @@ async fn shim_with_operation<T>(
     changes_made: bool,
     callback: impl AsyncFnOnce(Arc<InstanceOperationImpl>) -> T,
 ) -> Result<(T, RecordedModifiedTimes), FsError> {
-    let operation = filesystem.begin_operation().await?;
-    let result = callback(operation.clone()).await;
-    let modified_times = operation.take_modified_times();
-    operation.finalize(changes_made).await?;
-    Ok((result, modified_times))
+    with_operation(filesystem, changes_made, async |operation| {
+        let result = callback(operation.clone()).await;
+        Ok((result, operation.take_modified_times()))
+    })
+    .await
 }
 
 /// Realizes `state_target` over the working copy, returning the modified times of the files

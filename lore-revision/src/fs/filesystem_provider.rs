@@ -14,10 +14,13 @@ use std::sync::atomic::Ordering;
 use async_trait::async_trait;
 use lore_base::error::InvalidArguments;
 use lore_base::types::Fragment;
+use lore_error_set::ErrorSet;
 use lore_error_set::error_set;
+use lore_error_set::prelude::*;
 
 use crate::change::NodeChange;
 use crate::filter::FilterMode;
+use crate::filter::FilterStates;
 use crate::fs::os::OsOperation;
 use crate::lore::Hash;
 use crate::merge::MergeTextMode;
@@ -25,6 +28,8 @@ use crate::node::Node;
 use crate::node::NodeID;
 use crate::repository::RepositoryContext;
 use crate::state::FilesystemDiffStats;
+use crate::state::LayerMountInfo;
+use crate::state::LinkMountInfo;
 use crate::state::NodeComparison;
 use crate::state::RecordedModifiedTimes;
 use crate::state::State;
@@ -82,7 +87,7 @@ impl FileInfo {
     }
 }
 
-/// One side of a filesystem reconcile: which tree, rooted where. `node_path` is where
+/// One side of a filesystem diff: which tree, rooted where. `node_path` is where
 /// `root_node` sits in its own tree, which differs from the path being walked once a
 /// link or layer mount has been crossed.
 pub struct FilesystemTraversal {
@@ -90,6 +95,50 @@ pub struct FilesystemTraversal {
     pub state: Arc<State>,
     pub node_path: RelativePath,
     pub root_node: NodeID,
+}
+
+/// A tree to diff against, before a path in it is resolved to a root. Resolving one
+/// yields the [`FilesystemTraversal`] the diff walks.
+pub struct FilesystemDiffTree {
+    pub repository: Arc<RepositoryContext>,
+    pub state: Arc<State>,
+}
+
+/// What a filesystem diff does with the differences it finds.
+#[derive(Debug, Clone, Copy)]
+pub enum FilesystemDiffIntent {
+    /// Report them, leaving the trees untouched.
+    Report,
+    /// Set and clear `Dirty` on each node as the walk settles it.
+    MarkDirty,
+}
+
+impl FilesystemDiffIntent {
+    /// Whether the walk persists what it finds as dirty flags rather than only reporting.
+    pub fn marks_dirty(self) -> bool {
+        matches!(self, FilesystemDiffIntent::MarkDirty)
+    }
+}
+
+/// What to diff against the filesystem: `from` is the tree it is compared against and
+/// `current` is what the working copy last held, which is how an unstaged add is told
+/// apart from a tracked file.
+pub struct FilesystemDiffContext {
+    pub from: FilesystemTraversal,
+    pub current: FilesystemTraversal,
+    pub filesystem_path: RelativePath,
+    /// The filter's verdict at `filesystem_path`, which each child steps from rather
+    /// than refolding the ancestors it already accounts for.
+    pub states: FilterStates,
+    /// The same verdict on the `from` side, which diverges from `states` once a move
+    /// puts the two sides at different paths.
+    pub from_states: FilterStates,
+    pub filter_mode: FilterMode,
+    pub intent: FilesystemDiffIntent,
+    pub layer_mounts: Arc<Vec<LayerMountInfo>>,
+    /// Every link mount in the compared tree, so a mount is told from a directory only
+    /// the filesystem holds. Read from the trees, which is why the caller supplies it.
+    pub link_mounts: Arc<Vec<LinkMountInfo>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -140,6 +189,34 @@ pub trait FilesystemProvider: Send + Sync + 'static {
     async fn begin_operation(&self) -> Result<Arc<InstanceOperationImpl>, FsError>;
 }
 
+/// Runs `work` inside one filesystem operation, finalizing it whether or not the work
+/// succeeded so a failure never leaves a filesystem frozen.
+///
+/// `changes_made` reports whether the work wrote to the filesystem. The work's error is
+/// reported ahead of a finalize failure, being the one that explains the run.
+pub async fn with_operation<T, E, F>(
+    filesystem: Arc<dyn FilesystemProvider>,
+    changes_made: bool,
+    work: F,
+) -> Result<T, E>
+where
+    E: ErrorSet,
+    F: AsyncFnOnce(Arc<InstanceOperationImpl>) -> Result<T, E>,
+{
+    let operation = filesystem
+        .begin_operation()
+        .await
+        .forward_any::<E>("Failed to start filesystem operation")?;
+    let result = work(operation.clone()).await;
+    let finalized = operation
+        .finalize(changes_made)
+        .await
+        .forward_any::<E>("Failed to finish filesystem operation");
+    let value = result?;
+    finalized?;
+    Ok(value)
+}
+
 /// A path that can be either relative to the repository root or an absolute scratch path.
 ///
 /// Use `Repository` for paths within the working directory, and `Scratch` for temporary
@@ -177,27 +254,18 @@ impl<'a> FilesystemPath<'a> {
 /// This type is not dyn-safe, async methods don't have their future boxed to allow static dispatch
 /// though an `impl InstanceOperation`
 pub trait InstanceOperation: Send + Sync {
-    /// Compute differences between the given state and the current filesystem.
+    /// Diff the filesystem under `diff.filesystem_path` against the trees it names,
+    /// pushing a change per difference onto `changes`.
     ///
-    /// Returns a Vec of `NodeChange` describing what changed:
-    /// - Files added on disk but not in state
-    /// - Files modified on disk vs. their state content hash
-    /// - Files deleted from disk but present in state
-    /// - Metadata changes (permissions, etc.)
+    /// Reports files added, modified or deleted on disk, and metadata changes.
+    /// `diff.intent` decides whether the trees are marked as it goes.
     ///
-    /// TODO(UCS-19486): Stream results rather than return a single Vec
-    #[allow(clippy::too_many_arguments)]
+    /// TODO(UCS-19486): Stream results rather than fill a Vec
     fn changes_from_filesystem_to_state(
         &self,
-        repository_from: Arc<RepositoryContext>,
-        state_from: Arc<State>,
-        repository_current: Arc<RepositoryContext>,
-        state_current: Arc<State>,
-        node_path: RelativePath,
-        root_node_from: NodeID,
-        root_node_to: NodeID,
-        filter_mode: FilterMode,
-    ) -> impl Future<Output = Result<(Vec<NodeChange>, FilesystemDiffStats), FsError>> + Send;
+        diff: FilesystemDiffContext,
+        changes: &mut Vec<NodeChange>,
+    ) -> impl Future<Output = Result<FilesystemDiffStats, FsError>> + Send;
 
     /// Get basic file information for a path.
     ///
@@ -370,30 +438,14 @@ impl InstanceOperationImpl {
 impl InstanceOperation for InstanceOperationImpl {
     async fn changes_from_filesystem_to_state(
         &self,
-        repository_from: Arc<RepositoryContext>,
-        state_from: Arc<State>,
-        repository_current: Arc<RepositoryContext>,
-        state_current: Arc<State>,
-        node_path: RelativePath,
-        root_node_from: NodeID,
-        root_node_to: NodeID,
-        filter_mode: FilterMode,
-    ) -> Result<(Vec<NodeChange>, FilesystemDiffStats), FsError> {
+        diff: FilesystemDiffContext,
+        changes: &mut Vec<NodeChange>,
+    ) -> Result<FilesystemDiffStats, FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => {
-                this.changes_from_filesystem_to_state(
-                    repository_from,
-                    state_from,
-                    repository_current,
-                    state_current,
-                    node_path,
-                    root_node_from,
-                    root_node_to,
-                    filter_mode,
-                )
-                .await
+                this.changes_from_filesystem_to_state(diff, changes).await
             }
         }
     }
@@ -578,19 +630,21 @@ pub mod tests {
     use parking_lot::Mutex;
 
     use crate::change::NodeChange;
-    use crate::filter::FilterMode;
     use crate::fs::filesystem_provider::FileInfo;
+    use crate::fs::filesystem_provider::FilesystemDiffContext;
+    use crate::fs::filesystem_provider::FilesystemDiffIntent;
+    use crate::fs::filesystem_provider::FilesystemDiffTree;
     use crate::fs::filesystem_provider::FilesystemPath;
     use crate::fs::filesystem_provider::FilesystemProvider;
     use crate::fs::filesystem_provider::FsError;
     use crate::fs::filesystem_provider::InstanceOperation;
     use crate::fs::filesystem_provider::InstanceOperationImpl;
     use crate::fs::filesystem_provider::StaticDispatchInstanceOperation;
+    use crate::fs::filesystem_provider::with_operation;
     use crate::lore::Hash;
     use crate::lore::RepositoryId;
     use crate::merge::MergeTextMode;
     use crate::node::Node;
-    use crate::node::NodeID;
     use crate::repository::RepositoryContext;
     use crate::repository::test_helpers::RepositoryContextCreationArgsExt;
     use crate::repository::test_helpers::default_repository_creation_args;
@@ -603,6 +657,7 @@ pub mod tests {
     pub struct TestFilesystemProvider {
         pub begin_count: Arc<AtomicUsize>,
         pub finalize_events: Arc<Mutex<Vec<bool>>>,
+        finalize_fails: bool,
     }
 
     impl TestFilesystemProvider {
@@ -610,12 +665,31 @@ pub mod tests {
             Self {
                 begin_count: Arc::new(AtomicUsize::new(0)),
                 finalize_events: Arc::new(Mutex::new(Vec::new())),
+                finalize_fails: false,
+            }
+        }
+
+        /// A provider whose operations record the finalize and then report it failed.
+        pub fn failing_finalize() -> TestFilesystemProvider {
+            Self {
+                finalize_fails: true,
+                ..Self::new()
             }
         }
 
         pub fn begins(&self) -> usize {
             self.begin_count.load(Ordering::Acquire)
         }
+    }
+
+    /// A repository over `filesystem`, with the stores every context needs.
+    async fn test_repository(filesystem: Arc<TestFilesystemProvider>) -> Arc<RepositoryContext> {
+        let (immutable_store, mutable_store, _context) =
+            test_store_create().await.expect("Making test stores");
+        Arc::new(RepositoryContext::new(
+            default_repository_creation_args(immutable_store, mutable_store)
+                .with_filesystem_provider(filesystem),
+        ))
     }
 
     #[async_trait]
@@ -625,6 +699,7 @@ pub mod tests {
             Ok(Arc::new(InstanceOperationImpl::new(
                 StaticDispatchInstanceOperation::Test(TestOperation {
                     finalize_events: self.finalize_events.clone(),
+                    finalize_fails: self.finalize_fails,
                 }),
             )))
         }
@@ -632,6 +707,7 @@ pub mod tests {
 
     pub struct TestOperation {
         finalize_events: Arc<Mutex<Vec<bool>>>,
+        finalize_fails: bool,
     }
 
     impl InstanceOperation for TestOperation {
@@ -639,20 +715,17 @@ pub mod tests {
         /// test that calls them.
         async fn finalize(&self, changes_made: bool) -> Result<(), FsError> {
             self.finalize_events.lock().push(changes_made);
+            if self.finalize_fails {
+                return Err(FsError::internal("Finalize failed"));
+            }
             Ok(())
         }
 
         async fn changes_from_filesystem_to_state(
             &self,
-            _repository_from: Arc<RepositoryContext>,
-            _state_from: Arc<State>,
-            _repository_current: Arc<RepositoryContext>,
-            _state_current: Arc<State>,
-            _node_path: RelativePath,
-            _root_node_from: NodeID,
-            _root_node_to: NodeID,
-            _filter_mode: FilterMode,
-        ) -> Result<(Vec<NodeChange>, FilesystemDiffStats), FsError> {
+            _diff: FilesystemDiffContext,
+            _changes: &mut Vec<NodeChange>,
+        ) -> Result<FilesystemDiffStats, FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 
@@ -777,14 +850,121 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn finalizing_twice_is_refused() {
-        let (immutable_store, mutable_store, _context) =
-            test_store_create().await.expect("Making test stores");
+    async fn a_failing_operation_is_still_finalized() {
         let filesystem = Arc::new(TestFilesystemProvider::new());
-        let repository = Arc::new(RepositoryContext::new(
-            default_repository_creation_args(immutable_store, mutable_store)
-                .with_filesystem_provider(filesystem.clone()),
-        ));
+        let repository = test_repository(filesystem.clone()).await;
+
+        let result: Result<(), FsError> =
+            with_operation(repository.file_system(), false, async |_operation| {
+                Err(FsError::internal("Work failed"))
+            })
+            .await;
+
+        result.expect_err("The work's error should be reported");
+        assert_eq!(
+            vec![false],
+            *(filesystem.finalize_events.lock()),
+            "A failed operation was left unfinalized"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_operation_reports_its_value() {
+        let filesystem = Arc::new(TestFilesystemProvider::new());
+        let repository = test_repository(filesystem.clone()).await;
+
+        let value: u32 = with_operation(repository.file_system(), true, async |_operation| {
+            Ok::<_, FsError>(7)
+        })
+        .await
+        .expect("The work succeeded");
+
+        assert_eq!(7, value);
+        assert_eq!(1, filesystem.begins());
+        assert_eq!(vec![true], *(filesystem.finalize_events.lock()));
+    }
+
+    #[tokio::test]
+    async fn a_finalize_failure_is_reported_where_the_work_succeeded() {
+        let filesystem = Arc::new(TestFilesystemProvider::failing_finalize());
+        let repository = test_repository(filesystem.clone()).await;
+
+        let result: Result<(), FsError> =
+            with_operation(repository.file_system(), false, async |_operation| Ok(())).await;
+
+        result.expect_err("A finalize failure should be reported");
+    }
+
+    #[tokio::test]
+    async fn the_works_error_is_reported_ahead_of_a_finalize_failure() {
+        let filesystem = Arc::new(TestFilesystemProvider::failing_finalize());
+        let repository = test_repository(filesystem.clone()).await;
+
+        let result: Result<(), FsError> =
+            with_operation(repository.file_system(), false, async |_operation| {
+                Err(FsError::internal("Work failed"))
+            })
+            .await;
+
+        let error = result.expect_err("The work failed");
+        assert!(
+            format!("{error}").contains("Work failed"),
+            "The finalize failure displaced the work's error: {error}"
+        );
+    }
+
+    /// `TestOperation` panics when the walk is reached, so the diff returning at all is
+    /// the assertion: a filter-excluded path is answered without an operation.
+    #[tokio::test]
+    async fn an_excluded_path_reaches_no_operation() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Making test stores");
+        lore_base::runtime::LORE_CONTEXT
+            .scope(execution, async move {
+                let mut filter = crate::filter::Filter::default();
+                filter
+                    .ignore
+                    .add_exclusion("secret")
+                    .expect("exclusion rule");
+                let repository = Arc::new(RepositoryContext::new(
+                    default_repository_creation_args(immutable_store, mutable_store)
+                        .with_filesystem_provider(Arc::new(TestFilesystemProvider::new()))
+                        .with_filter(Arc::new(filter)),
+                ));
+                let operation = repository.file_system().begin_operation().await.unwrap();
+                let state = Arc::new(State::new());
+                let tree = || FilesystemDiffTree {
+                    repository: repository.clone(),
+                    state: state.clone(),
+                };
+                let mut changes = Vec::new();
+
+                let stats = crate::state::diff_filesystem(
+                    &operation,
+                    tree(),
+                    tree(),
+                    Some(
+                        crate::util::path::RelativePath::new_from_initial_path("secret")
+                            .expect("path"),
+                    ),
+                    crate::filter::FilterMode::Full,
+                    FilesystemDiffIntent::Report,
+                    Arc::new(Vec::new()),
+                    &mut changes,
+                )
+                .await
+                .expect("An excluded path is not an error");
+
+                assert!(changes.is_empty(), "An excluded path reported changes");
+                assert_eq!(0, stats.file_add.load(std::sync::atomic::Ordering::Relaxed));
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn finalizing_twice_is_refused() {
+        let filesystem = Arc::new(TestFilesystemProvider::new());
+        let repository = test_repository(filesystem.clone()).await;
 
         let operation = repository.file_system().begin_operation().await.unwrap();
         operation.finalize(true).await.expect("Finalize failed");

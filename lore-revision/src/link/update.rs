@@ -10,6 +10,9 @@ use crate::errors::InvalidPath;
 use crate::errors::NotALink;
 use crate::event;
 use crate::filter::FilterMode;
+use crate::fs::filesystem_provider::FilesystemDiffIntent;
+use crate::fs::filesystem_provider::FilesystemTraversal;
+use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreFileAction;
 use crate::link;
 use crate::link::LoreLinkChangeEventData;
@@ -87,19 +90,33 @@ pub async fn update(
     // TODO(vri): Verify filesystem in any case for local modifications
     // Tree roots at the innermost node; filesystem path is the full link path.
     if state_current.revision() != state_staged.revision() {
-        let (linked_changes, _changes_stats) = state::diff_filesystem_subtree(
-            inner_repository.clone(),
-            inner_state.clone(),
-            inner_repository.clone(),
-            inner_state.clone(),
-            link_path.clone(),
-            node_link.node,
-            node_link.node,
-            FilterMode::View,
-            std::sync::Arc::new(Vec::new()),
-        )
-        .await
-        .forward::<LinkError>("Failed to diff link with filesystem")?;
+        let linked_changes = with_operation(repository.file_system(), false, async |operation| {
+            let mut linked_changes = Vec::new();
+            state::diff_filesystem_subtree(
+                &operation,
+                FilesystemTraversal {
+                    repository: inner_repository.clone(),
+                    state: inner_state.clone(),
+                    node_path: link_path.clone(),
+                    root_node: node_link.node,
+                },
+                FilesystemTraversal {
+                    repository: inner_repository.clone(),
+                    state: inner_state.clone(),
+                    node_path: link_path.clone(),
+                    root_node: node_link.node,
+                },
+                link_path.clone(),
+                FilterMode::View,
+                FilesystemDiffIntent::Report,
+                std::sync::Arc::new(Vec::new()),
+                &mut linked_changes,
+            )
+            .await
+            .forward::<LinkError>("Failed to diff link with filesystem")?;
+            Ok::<_, LinkError>(linked_changes)
+        })
+        .await?;
 
         if !linked_changes.is_empty() {
             return Err(LinkError::internal("Link has filesystem changes"));

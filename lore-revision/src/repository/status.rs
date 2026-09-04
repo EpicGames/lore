@@ -1,10 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-#[cfg(target_family = "unix")]
-use std::os::unix::fs::MetadataExt;
-#[cfg(target_family = "windows")]
-use std::os::windows::fs::MetadataExt;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
@@ -30,6 +25,12 @@ use crate::event::EventError;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::find;
+use crate::fs::filesystem_provider::FilesystemDiffIntent;
+use crate::fs::filesystem_provider::FilesystemDiffTree;
+use crate::fs::filesystem_provider::FilesystemPath;
+use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
 use crate::interface::LoreNodeType;
@@ -49,6 +50,7 @@ use crate::node::ROOT_NODE;
 use crate::path::emit_path_ignore;
 use crate::state;
 use crate::util::path::RelativePath;
+use crate::util::path::RepositoryPath;
 use crate::util::serde::u8_as_bool;
 
 /// Revision status of a repository, describing the current, local, and remote
@@ -468,39 +470,30 @@ async fn file_size_from_node_change_id(change: &NodeChange) -> Result<u64, Statu
     }
 }
 
+/// The size a filesystem change reports, taken from the same view the diff walked.
+///
+/// Reuses what the walk already measured when it recorded an observation, and asks
+/// the operation otherwise, so a file that exists only in a provider's view is sized
+/// from that view rather than from the host filesystem. A path the operation reports
+/// as absent — deleted, or vanished under a concurrent `branch switch` between the
+/// walk and here — is size 0, matching a delete.
 async fn file_size_from_node_change_path(
-    repository_path: &Path,
+    operation: &InstanceOperationImpl,
+    repository: &Arc<RepositoryContext>,
     change: &NodeChange,
 ) -> Result<u64, StatusError> {
     if change.action == FileAction::Delete {
-        Ok(0)
-    } else {
-        let path_str = change.path.as_str().to_string();
-        let result = lore_io::IoDriver::global()
-            .metadata(change.path.to_absolute_path(repository_path))
-            .await;
-        // The file may have vanished between the diff's filesystem walk and
-        // this stat — e.g. a concurrent `branch switch` deleted it from the
-        // working directory. Treat the concurrent deletion as benign and
-        // report size 0 (matching the `FileAction::Delete` branch above)
-        // rather than failing the whole status command with an Internal error.
-        // On Windows a file mid-deletion stats as PermissionDenied rather than
-        // NotFound, so treat that as benign too.
-        if let Err(err) = &result
-            && (err.kind() == std::io::ErrorKind::NotFound
-                || (cfg!(target_family = "windows")
-                    && err.kind() == std::io::ErrorKind::PermissionDenied))
-        {
-            return Ok(0);
-        }
-        let metadata =
-            result.internal_with(|| format!("accessing metadata for file {path_str}"))?;
-        #[cfg(target_family = "windows")]
-        let size = metadata.file_size();
-        #[cfg(target_family = "unix")]
-        let size = metadata.size();
-        Ok(size)
+        return Ok(0);
     }
+    if let Some(observed) = &change.observed {
+        return Ok(observed.size);
+    }
+    let repository_path = RepositoryPath::from_relative(repository, change.path.clone())?;
+    let info = operation
+        .file_info(FilesystemPath::Repository(&repository_path))
+        .await
+        .forward::<StatusError>("accessing metadata for file")?;
+    Ok(info.size)
 }
 
 /// Verify whether a dirty file change reflects a real on-disk modification,
@@ -888,6 +881,129 @@ async fn resolve_remote_latest(
             (None, false, true)
         }
     }
+}
+
+/// Reconciles every requested path against the filesystem within `operation`, marking
+/// dirty as it goes and emitting a status event per change the caller did not stage.
+#[allow(clippy::too_many_arguments)]
+async fn scan_paths(
+    operation: Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    paths: &[Option<RelativePath>],
+    state_current: &Arc<state::State>,
+    state_staged: &Arc<state::State>,
+    layer_mounts: &Arc<Vec<state::LayerMountInfo>>,
+    summary: &Arc<StatusSummaryStats>,
+    has_staged: bool,
+) -> Result<(), StatusError> {
+    let mut tasks = JoinSet::new();
+    for path in paths.iter() {
+        let repository = repository.clone();
+        let state_current = state_current.clone();
+        let state_staged = state_staged.clone();
+        let path = path.clone();
+        let layer_mounts = layer_mounts.clone();
+        let summary = summary.clone();
+        let operation = operation.clone();
+        let exists = if let Some(path) = path.as_ref() {
+            let mut exists_in_state = false;
+            let mut exists_in_filesystem = false;
+
+            let state = if has_staged {
+                state_staged.clone()
+            } else {
+                state_current.clone()
+            };
+
+            let node_link = state
+                .find_node_link(repository.clone(), path.as_str())
+                .await
+                .unwrap_or_default();
+            if node_link.is_valid() {
+                exists_in_state = true;
+            } else {
+                let repository_path = RepositoryPath::from_relative(&repository, path.clone())?;
+                exists_in_filesystem = operation
+                    .file_info(FilesystemPath::Repository(&repository_path))
+                    .await
+                    .is_ok_and(|info| info.exists);
+            }
+
+            if !exists_in_state && !exists_in_filesystem {
+                emit_path_ignore(path.as_str()).await;
+                lore_trace!("Ignoring invalid path: {path}");
+            }
+
+            exists_in_state || exists_in_filesystem
+        } else {
+            true
+        };
+
+        if exists {
+            lore_spawn!(tasks, {
+                async move {
+                    if let Some(path) = path.as_ref() {
+                        lore_debug!(
+                            "Calculating deltas against filesystem path: {}",
+                            path.as_str()
+                        );
+                    } else {
+                        lore_debug!("Calculating deltas against filesystem for full repository");
+                    }
+
+                    let start = Instant::now();
+
+                    let mut changes = Vec::new();
+                    let diff_stats = state::diff_filesystem(
+                        &operation,
+                        FilesystemDiffTree {
+                            repository: repository.clone(),
+                            state: state_staged.clone(),
+                        },
+                        FilesystemDiffTree {
+                            repository: repository.clone(),
+                            state: state_current.clone(),
+                        },
+                        path,
+                        FilterMode::Full,
+                        FilesystemDiffIntent::MarkDirty,
+                        layer_mounts.clone(),
+                        &mut changes,
+                    )
+                    .await
+                    .forward::<StatusError>("computing diff against filesystem")?;
+                    summary.append_diff(&diff_stats);
+
+                    lore_debug!(
+                        "Scan found {} file system changes in {:.3}s",
+                        changes.len(),
+                        start.elapsed().as_secs_f64(),
+                    );
+
+                    for change in changes.iter() {
+                        let size = file_size_from_node_change_path(&operation, &repository, change)
+                            .await?;
+
+                        // Emit event for display (dirty set/clear handled inline by diff)
+                        if !change.flags.is_stage() {
+                            summary.classify(change);
+                            event::LoreEvent::RepositoryStatusFile(
+                                LoreRepositoryStatusFileEventData::from_node_change(change, size),
+                            )
+                            .send();
+                        } else {
+                            lore_debug!("Ignore staged file {}", change.path);
+                        }
+                    }
+
+                    Ok(())
+                }
+            });
+        }
+
+        lore_drain_tasks!(tasks, StatusError::internal("Recursion task failed"))?;
+    }
+    Ok(())
 }
 
 pub async fn status(
@@ -1386,118 +1502,20 @@ pub async fn status(
             paths.len()
         );
 
-        let mut tasks = JoinSet::new();
-        for path in paths.iter() {
-            let repository = repository.clone();
-            let state_current = state_current.clone();
-            let state_staged = state_staged.clone();
-            let path = path.clone();
-            let layer_mounts = layer_mounts.clone();
-            let summary = summary.clone();
-            let exists = if let Some(path) = path.as_ref() {
-                let mut exists_in_state = false;
-                let mut exists_in_filesystem = false;
-
-                let state = if has_staged {
-                    state_staged.clone()
-                } else {
-                    state_current.clone()
-                };
-
-                let node_link = state
-                    .find_node_link(repository.clone(), path.as_str())
-                    .await
-                    .unwrap_or_default();
-                if node_link.is_valid() {
-                    exists_in_state = true;
-                } else {
-                    let absolute_path = path.to_absolute_path(repository.require_path()?);
-                    exists_in_filesystem = lore_io::IoDriver::global()
-                        .metadata(absolute_path)
-                        .await
-                        .is_ok();
-                }
-
-                if !exists_in_state && !exists_in_filesystem {
-                    emit_path_ignore(path.as_str()).await;
-                    lore_trace!("Ignoring invalid path: {path}");
-                }
-
-                exists_in_state || exists_in_filesystem
-            } else {
-                true
-            };
-
-            if exists {
-                lore_spawn!(tasks, {
-                    async move {
-                        if let Some(path) = path.as_ref() {
-                            lore_debug!(
-                                "Calculating deltas against filesystem path: {}",
-                                path.as_str()
-                            );
-                        } else {
-                            lore_debug!(
-                                "Calculating deltas against filesystem for full repository"
-                            );
-                        }
-
-                        let start = Instant::now();
-
-                        // Scan uses staged state as diff base with scan_dirty=true.
-                        // Content hashes in staged state are either zero (add nodes)
-                        // or equal to current revision hashes, so the comparison is
-                        // effectively filesystem vs committed content.
-                        // The current revision is passed as the second pair so the
-                        // walk can distinguish "node exists in staged but not in
-                        // committed" — i.e. unstaged adds — from regular tracked
-                        // files. Dirty flags are set/cleared inline during the walk.
-                        let (changes, diff_stats) = state::diff_filesystem_ex(
-                            repository.clone(),
-                            state_staged.clone(),
-                            repository.clone(),
-                            state_current.clone(),
-                            path,
-                            FilterMode::Full,
-                            true, // scan_dirty
-                            layer_mounts.clone(),
-                        )
-                        .await
-                        .forward::<StatusError>("computing diff against filesystem")?;
-                        summary.append_diff(&diff_stats);
-
-                        lore_debug!(
-                            "Scan found {} file system changes in {:.3}s",
-                            changes.len(),
-                            start.elapsed().as_secs_f64(),
-                        );
-
-                        for change in changes.iter() {
-                            let size =
-                                file_size_from_node_change_path(repository.require_path()?, change)
-                                    .await?;
-
-                            // Emit event for display (dirty set/clear handled inline by diff)
-                            if !change.flags.is_stage() {
-                                summary.classify(change);
-                                event::LoreEvent::RepositoryStatusFile(
-                                    LoreRepositoryStatusFileEventData::from_node_change(
-                                        change, size,
-                                    ),
-                                )
-                                .send();
-                            } else {
-                                lore_debug!("Ignore staged file {}", change.path);
-                            }
-                        }
-
-                        Ok(())
-                    }
-                });
-            }
-
-            lore_drain_tasks!(tasks, StatusError::internal("Recursion task failed"))?;
-        }
+        with_operation(repository.file_system(), false, async |operation| {
+            scan_paths(
+                operation,
+                &repository,
+                &paths,
+                &state_current,
+                &state_staged,
+                &layer_mounts,
+                &summary,
+                has_staged,
+            )
+            .await
+        })
+        .await?;
     }
 
     // Emit the aggregate dirty-node summary for reconciling status runs. For

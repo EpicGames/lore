@@ -21,6 +21,9 @@ mod tests {
     use lore_revision::file::reset;
     use lore_revision::file::reset::ResetOptions;
     use lore_revision::filter::FilterMode;
+    use lore_revision::fs::filesystem_provider::FilesystemDiffIntent;
+    use lore_revision::fs::filesystem_provider::FilesystemDiffTree;
+    use lore_revision::fs::filesystem_provider::InstanceOperation;
     use lore_revision::interface::ExecutionContext;
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreGlobalArgs;
@@ -33,6 +36,43 @@ mod tests {
     use lore_revision::repository::load_filter;
     use lore_revision::stage::StageOptions;
     use lore_revision::state;
+
+    /// The changes the working tree shows against `state`, reported without marking
+    /// anything, which is what these tests check a reset by.
+    async fn filesystem_changes(
+        repository: &Arc<repository::RepositoryContext>,
+        state: &Arc<state::State>,
+    ) -> Vec<lore_revision::change::NodeChange> {
+        let operation = repository
+            .file_system()
+            .begin_operation()
+            .await
+            .expect("Failed to start filesystem operation");
+        let mut changes = Vec::new();
+        state::diff_filesystem(
+            &operation,
+            FilesystemDiffTree {
+                repository: repository.clone(),
+                state: state.clone(),
+            },
+            FilesystemDiffTree {
+                repository: repository.clone(),
+                state: state.clone(),
+            },
+            None, /* No subpath */
+            FilterMode::Full,
+            FilesystemDiffIntent::Report,
+            Arc::new(Vec::new()),
+            &mut changes,
+        )
+        .await
+        .expect("Failed to diff filesystem");
+        operation
+            .finalize(false)
+            .await
+            .expect("Failed to finish filesystem operation");
+        changes
+    }
 
     include!("helper.rs");
 
@@ -234,17 +274,7 @@ mod tests {
                     .expect("Failed to deserialize current state");
 
                 // Check the current filesystem status
-                let (changes, _) = state::diff_filesystem(
-                    repository.clone(),
-                    state_current.clone(),
-                    repository.clone(),
-                    state_current.clone(),
-                    None, /* No subpath */
-                    FilterMode::Full,
-                    std::sync::Arc::new(Vec::new()),
-                )
-                .await
-                .expect("Failed to diff filesystem");
+                let changes = filesystem_changes(&repository, &state_current).await;
 
                 // Couple of changes are expected
                 assert!(!changes.is_empty());
@@ -261,17 +291,7 @@ mod tests {
                 .expect("Failed to reset changes");
 
                 // Check the current filesystem status again
-                let (changes, _) = state::diff_filesystem(
-                    repository.clone(),
-                    state_current.clone(),
-                    repository.clone(),
-                    state_current.clone(),
-                    None, /* No subpath */
-                    FilterMode::Full,
-                    std::sync::Arc::new(Vec::new()),
-                )
-                .await
-                .expect("Failed to diff filesystem");
+                let changes = filesystem_changes(&repository, &state_current).await;
 
                 // We expect four untracked changes
                 assert_eq!(changes.len(), 4);
@@ -297,17 +317,7 @@ mod tests {
                 .expect("Failed to reset changes");
 
                 // Check the current filesystem status again after reset with purging
-                let (changes, _) = state::diff_filesystem(
-                    repository.clone(),
-                    state_current.clone(),
-                    repository.clone(),
-                    state_current.clone(),
-                    None, /* No subpath */
-                    FilterMode::Full,
-                    std::sync::Arc::new(Vec::new()),
-                )
-                .await
-                .expect("Failed to diff filesystem");
+                let changes = filesystem_changes(&repository, &state_current).await;
 
                 // We expect the ignored file to still be changed (and extant)
                 let file_ignored_reset_contents =
@@ -482,17 +492,7 @@ mod tests {
                     .expect("Failed to deserialize current state");
 
                 // Check the current filesystem status
-                let (changes, _) = state::diff_filesystem(
-                    repository.clone(),
-                    state_current.clone(),
-                    repository.clone(),
-                    state_current.clone(),
-                    None, /* No subpath */
-                    FilterMode::Full,
-                    std::sync::Arc::new(Vec::new()),
-                )
-                .await
-                .expect("Failed to diff filesystem");
+                let changes = filesystem_changes(&repository, &state_current).await;
 
                 // Couple of changes are expected
                 assert!(!changes.is_empty());
@@ -509,17 +509,7 @@ mod tests {
                 .expect("Failed to reset changes");
 
                 // Check the current filesystem status again
-                let (changes, _) = state::diff_filesystem(
-                    repository.clone(),
-                    state_current.clone(),
-                    repository.clone(),
-                    state_current.clone(),
-                    None, /* No subpath */
-                    FilterMode::Full,
-                    std::sync::Arc::new(Vec::new()),
-                )
-                .await
-                .expect("Failed to diff filesystem");
+                let changes = filesystem_changes(&repository, &state_current).await;
 
                 // We expect no changes
                 assert_eq!(changes.len(), 0);
@@ -668,17 +658,7 @@ mod tests {
                     .expect("Failed to deserialize current state");
 
                 // Check the current filesystem status
-                let (changes, _) = state::diff_filesystem(
-                    repository.clone(),
-                    state_current.clone(),
-                    repository.clone(),
-                    state_current.clone(),
-                    None, /* No subpath */
-                    FilterMode::Full,
-                    std::sync::Arc::new(Vec::new()),
-                )
-                .await
-                .expect("Failed to diff filesystem");
+                let changes = filesystem_changes(&repository, &state_current).await;
 
                 // We expect one change
                 assert_eq!(changes.len(), 1);
