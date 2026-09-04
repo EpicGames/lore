@@ -676,20 +676,20 @@ fn the_walk_verdict_keeps_a_directory_it_must_descend_into() {
     assert!(filter.excludes_tree(&dropped, false, FilterMode::View));
 }
 
-/// The walk the client actually performs reaches the same files as the
-/// state-threaded one.
+/// The two shapes a walk can take reach the same files.
 ///
-/// Those walkers carry no [`FilterState`] down, so they cannot pair
-/// `child_exclusion_state` with `should_descend`: they ask `excludes_tree` for
-/// one whole path per node and prune a directory on its answer. That has to
-/// agree with [`walk_tree`] on every case in the ground-truth table, or a walk
-/// drops content the filter includes.
+/// A walk that holds its parent's [`FilterStates`] steps them with
+/// `child_excludes_tree`; one handed a path with no walk behind it -- a change
+/// list, a clone dependency, a path named on the command line -- asks
+/// `excludes_tree` for the whole path. Both have to agree with [`walk_tree`] on
+/// every case in the ground-truth table, or the same tree yields different
+/// content depending on how it was reached.
 #[test]
 fn the_whole_path_walk_reaches_the_same_files_as_the_stepped_walk() {
     use lore_revision::filter::Filter;
     use lore_revision::filter::FilterMode;
 
-    fn walk(filter: &Filter, tree: &[&str]) -> BTreeSet<String> {
+    fn walk_whole_paths(filter: &Filter, tree: &[&str]) -> BTreeSet<String> {
         let mut included = BTreeSet::new();
         let mut stack = vec![String::new()];
         while let Some(dir) = stack.pop() {
@@ -702,6 +702,29 @@ fn the_whole_path_walk_reaches_the_same_files_as_the_stepped_walk() {
             for subdir in subdirs {
                 if !filter.excludes_tree(&path(&subdir), true, FilterMode::Ignore) {
                     stack.push(subdir);
+                }
+            }
+        }
+        included
+    }
+
+    fn walk_threaded(filter: &Filter, tree: &[&str]) -> BTreeSet<String> {
+        let mut included = BTreeSet::new();
+        let mut stack = vec![(String::new(), FilterStates::ROOT)];
+        while let Some((dir, states)) = stack.pop() {
+            let (subdirs, files) = children(tree, &dir);
+            for file in files {
+                let (_, excluded) =
+                    filter.child_excludes_tree(states, &path(&file), false, FilterMode::Ignore);
+                if !excluded {
+                    included.insert(file);
+                }
+            }
+            for subdir in subdirs {
+                let (child, excluded) =
+                    filter.child_excludes_tree(states, &path(&subdir), true, FilterMode::Ignore);
+                if !excluded {
+                    stack.push((subdir, child));
                 }
             }
         }
@@ -721,10 +744,17 @@ fn the_whole_path_walk_reaches_the_same_files_as_the_stepped_walk() {
             };
             outcome.expect("the instance above accepted the same rules");
         }
+        let stepped = walk_tree(&instance, FILES);
         assert_eq!(
-            walk(&filter, FILES),
-            walk_tree(&instance, FILES),
+            walk_whole_paths(&filter, FILES),
+            stepped,
             "the whole-path walk and the stepped walk disagree for {:?}",
+            case.patterns
+        );
+        assert_eq!(
+            walk_threaded(&filter, FILES),
+            stepped,
+            "the threaded walk and the stepped walk disagree for {:?}",
             case.patterns
         );
         compared += 1;
@@ -733,6 +763,245 @@ fn the_whole_path_walk_reaches_the_same_files_as_the_stepped_walk() {
         compared > 3_000,
         "expected a broad comparison, got {compared}"
     );
+}
+
+/// A walk that starts partway down the tree sees what a walk from the root sees
+/// there.
+///
+/// Every walk entry point that is handed a subdirectory seeds itself with
+/// `exclusion_states` (or `parent_exclusion_states` where the first step is the
+/// path itself) rather than with [`FilterStates::ROOT`]. If that seed differed
+/// from what the root walk reached, `lore status <dir>` would filter its subtree
+/// differently from `lore status`.
+#[test]
+fn a_walk_seeded_partway_down_matches_one_from_the_root() {
+    use lore_revision::filter::Filter;
+    use lore_revision::filter::FilterMode;
+
+    /// Every directory's states, as reached by stepping down from the root.
+    fn stepped_states(
+        filter: &Filter,
+        tree: &[&str],
+    ) -> std::collections::BTreeMap<String, FilterStates> {
+        let mut reached = std::collections::BTreeMap::new();
+        let mut stack = vec![(String::new(), FilterStates::ROOT)];
+        while let Some((dir, states)) = stack.pop() {
+            let (subdirs, _) = children(tree, &dir);
+            for subdir in subdirs {
+                let child = path(&subdir);
+                let (child_states, excluded) =
+                    filter.child_excludes_tree(states, &child, true, FilterMode::Ignore);
+                reached.insert(subdir.clone(), child_states);
+                if !excluded {
+                    stack.push((subdir, child_states));
+                }
+            }
+        }
+        reached
+    }
+
+    let mut compared = 0usize;
+    for case in CASES {
+        if build(case.patterns).is_none() {
+            continue;
+        }
+        let mut filter = Filter::default();
+        for pattern in case.patterns {
+            let outcome = match pattern.strip_prefix('!') {
+                Some(rest) => filter.ignore.add_inclusion(rest),
+                None => filter.ignore.add_exclusion(pattern),
+            };
+            outcome.expect("build accepted the same rules");
+        }
+
+        for (dir, walked) in stepped_states(&filter, FILES) {
+            let directory = path(&dir);
+            // The seed a walk rooted at `dir` uses for its children.
+            let seeded = filter.exclusion_states(&directory);
+            // The seed a recursion that asks about `dir` itself uses, stepped
+            // the one component it is about to ask about.
+            let (from_parent, _) = filter.child_excludes_tree(
+                filter.parent_exclusion_states(&directory),
+                &directory,
+                true,
+                FilterMode::Ignore,
+            );
+
+            let (_, walked_excludes) = filter.child_excludes_tree(
+                walked,
+                &path(&format!("{dir}/probe")),
+                false,
+                FilterMode::Ignore,
+            );
+            for (label, seed) in [("exclusion_states", seeded), ("parent step", from_parent)] {
+                let (_, seed_excludes) = filter.child_excludes_tree(
+                    seed,
+                    &path(&format!("{dir}/probe")),
+                    false,
+                    FilterMode::Ignore,
+                );
+                assert_eq!(
+                    seed_excludes, walked_excludes,
+                    "{label} at {dir} disagrees with the walk for {:?}",
+                    case.patterns
+                );
+                assert_eq!(
+                    filter.should_descend(seed, &directory, FilterMode::Ignore),
+                    filter.should_descend(walked, &directory, FilterMode::Ignore),
+                    "{label} descent at {dir} disagrees with the walk for {:?}",
+                    case.patterns
+                );
+            }
+            compared += 1;
+        }
+    }
+    assert!(
+        compared > 10_000,
+        "expected a broad comparison, got {compared}"
+    );
+}
+
+/// A threaded walk answers for both slots the way a whole-path query does.
+///
+/// The equivalence tests above run one slot, where a verdict cannot be reached
+/// by the other. This puts rules in both and holds the threaded walk against
+/// `excludes_tree`, which is the shape `FilterMode::Full` operations -- stage,
+/// reset, unstage, dirty -- ask in.
+#[test]
+fn a_threaded_walk_agrees_with_a_whole_path_query_across_both_slots() {
+    use lore_revision::filter::Filter;
+    use lore_revision::filter::FilterMode;
+
+    let mut compared = 0usize;
+    for ignore_case in CASES {
+        let Some(_) = build(ignore_case.patterns) else {
+            continue;
+        };
+        for view_case in CASES.iter().rev().take(8) {
+            let Some(_) = build(view_case.patterns) else {
+                continue;
+            };
+            let mut filter = Filter::default();
+            for pattern in ignore_case.patterns {
+                let outcome = match pattern.strip_prefix('!') {
+                    Some(rest) => filter.ignore.add_inclusion(rest),
+                    None => filter.ignore.add_exclusion(pattern),
+                };
+                outcome.expect("build accepted the same rules");
+            }
+            for pattern in view_case.patterns {
+                let outcome = match pattern.strip_prefix('!') {
+                    Some(rest) => filter.view.add_inclusion(rest),
+                    None => filter.view.add_exclusion(pattern),
+                };
+                outcome.expect("build accepted the same rules");
+            }
+
+            let mut stack = vec![(String::new(), FilterStates::ROOT)];
+            while let Some((dir, states)) = stack.pop() {
+                let (subdirs, files) = children(FILES, &dir);
+                for file in files {
+                    let file_path = path(&file);
+                    let (_, threaded) =
+                        filter.child_excludes_tree(states, &file_path, false, FilterMode::Full);
+                    assert_eq!(
+                        threaded,
+                        filter.excludes_tree(&file_path, false, FilterMode::Full),
+                        "file {file} disagrees for ignore {:?} view {:?}",
+                        ignore_case.patterns,
+                        view_case.patterns
+                    );
+                    compared += 1;
+                }
+                for subdir in subdirs {
+                    let dir_path = path(&subdir);
+                    let (child, threaded) =
+                        filter.child_excludes_tree(states, &dir_path, true, FilterMode::Full);
+                    assert_eq!(
+                        threaded,
+                        filter.excludes_tree(&dir_path, true, FilterMode::Full),
+                        "directory {subdir} disagrees for ignore {:?} view {:?}",
+                        ignore_case.patterns,
+                        view_case.patterns
+                    );
+                    compared += 1;
+                    if !threaded {
+                        stack.push((subdir, child));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        compared > 10_000,
+        "expected a broad comparison, got {compared}"
+    );
+}
+
+/// A forced walk is answered without consulting the filter.
+///
+/// `--force` drops nothing, so it must report nothing excluded and emit no
+/// event. It also reads no verdict -- every step below a forced one is forced
+/// too -- so the state handed back is [`FilterStates::ROOT`] rather than one the
+/// walk would have paid a line scan to produce.
+#[test]
+fn a_forced_step_excludes_nothing_and_carries_no_verdict() {
+    use lore_revision::filter::Filter;
+    use lore_revision::filter::FilterMode;
+
+    let mut filter = Filter::default();
+    filter
+        .ignore
+        .add_exclusion("intermediate")
+        .expect("exclusion");
+    filter.view.add_exclusion("binaries").expect("exclusion");
+
+    for (name, is_directory) in [
+        ("intermediate", true),
+        ("binaries", true),
+        ("keep.txt", false),
+    ] {
+        let subject = path(name);
+        // The unforced control asks the non-emitting query: emitting needs a
+        // task-local execution context this test has no other use for.
+        let (unforced_states, unforced) = filter.child_excludes_tree(
+            FilterStates::ROOT,
+            &subject,
+            is_directory,
+            FilterMode::Full,
+        );
+        let (forced_states, forced) = filter.child_emit_excludes_unless_forced(
+            true,
+            FilterStates::ROOT,
+            &subject,
+            is_directory,
+            FilterMode::Full,
+        );
+        assert!(
+            !forced,
+            "a forced step excludes nothing, {name} was dropped"
+        );
+        assert_eq!(
+            forced_states,
+            FilterStates::ROOT,
+            "a forced step carries no verdict, {name} returned one"
+        );
+        let (tree_states, tree) = filter.child_excludes_tree_unless_forced(
+            true,
+            FilterStates::ROOT,
+            &subject,
+            is_directory,
+            FilterMode::Full,
+        );
+        assert!(!tree, "a forced step excludes nothing, {name} was dropped");
+        assert_eq!(tree_states, FilterStates::ROOT);
+        // The rules do bite when the walk is not forced, or the assertions above
+        // would hold for a filter that excludes nothing.
+        if name != "keep.txt" {
+            assert!(unforced, "{name} should be excluded when not forced");
+            assert_ne!(unforced_states, FilterStates::ROOT);
+        }
+    }
 }
 
 /// `save` writes back rules that load to the same filter, and leaves out the

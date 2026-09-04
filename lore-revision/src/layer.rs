@@ -453,9 +453,16 @@ pub async fn add(
         stats: Arc::default(),
         modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
     };
-    clone::clone_node(clone_ctx, layer_storage, target_path, layer_node_link.node)
-        .await
-        .forward::<LayerError>("Failed cloning target layer")?;
+    let target_states = layer_repository.filter.mount_states(target_path.relative());
+    clone::clone_node(
+        clone_ctx,
+        layer_storage,
+        target_path,
+        layer_node_link.node,
+        target_states,
+    )
+    .await
+    .forward::<LayerError>("Failed cloning target layer")?;
     layer_operation
         .finalize(true)
         .await

@@ -39,6 +39,7 @@ use crate::event;
 use crate::event::EventError;
 use crate::filter;
 use crate::filter::FilterMode;
+use crate::filter::FilterStates;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::FilesystemPath;
 use crate::fs::filesystem_provider::InstanceOperation;
@@ -351,6 +352,10 @@ struct BlockDiscoverItem {
     /// In tree walk mode: the parent directory's path.
     /// In dependency mode: the file's own path.
     repository_path: RepositoryPath,
+    /// The view filter's verdict for `repository_path`, which each node reached
+    /// from this item steps from rather than folding its whole path.
+    /// Unused in dependency mode, where each path arrives whole.
+    states: FilterStates,
     /// When Some, this item is part of a dependency-driven discovery walk.
     /// When None, the existing tree walk (child/sibling iteration) is used.
     dep_context: Option<Arc<DependencyDiscoverContext>>,
@@ -579,11 +584,13 @@ async fn process_block_item(
 
         let node_path = item.repository_path.get_child(&node_name);
 
-        if !dispatcher.repository.filter.emit_excludes(
+        let (node_states, excluded) = dispatcher.repository.filter.child_emit_excludes(
+            item.states,
             node_path.relative(),
             node.is_directory(),
             FilterMode::View,
-        ) {
+        );
+        if !excluded {
             visited_child = true;
             if node.is_file() {
                 dispatcher
@@ -645,6 +652,7 @@ async fn process_block_item(
                         node_id: first_child,
                         expected_parent: current_node_id,
                         repository_path: node_path,
+                        states: node_states,
                         dep_context: None,
                         follow_deps: false,
                         depth: 0,
@@ -668,6 +676,8 @@ async fn process_block_item(
                     node_id: sibling_id,
                     expected_parent,
                     repository_path: item.repository_path,
+                    // Siblings share the parent this item walks under.
+                    states: item.states,
                     dep_context: None,
                     follow_deps: false,
                     depth: 0,
@@ -803,6 +813,8 @@ async fn process_block_item_dependency(
                 node_id: entry.node,
                 expected_parent: INVALID_NODE,
                 repository_path: dep_path,
+                // Dependency mode asks about a whole path, not a walk step.
+                states: FilterStates::ROOT,
                 dep_context: Some(dep_ctx.clone()),
                 follow_deps: dep_ctx.recursive,
                 depth: item.depth + 1,
@@ -1385,6 +1397,7 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
                 node_id: first_child,
                 expected_parent: ROOT_NODE,
                 repository_path: RepositoryPath::from_relative(&repository, RelativePath::new())?,
+                states: FilterStates::ROOT,
                 dep_context: None,
                 follow_deps: false,
                 depth: 0,
@@ -1432,6 +1445,8 @@ async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
                 node_id,
                 expected_parent: INVALID_NODE,
                 repository_path,
+                // Dependency mode asks about a whole path, not a walk step.
+                states: FilterStates::ROOT,
                 dep_context: Some(dep_ctx.clone()),
                 follow_deps: true,
                 depth: 0,
@@ -1533,10 +1548,12 @@ async fn clone_discover_link(
                 .forward::<CloneError>("Failed to deserialize revision state node block")?;
 
             if let Some(first_child) = root_node.child() {
+                let link_states = linked_repository.filter.mount_states(link_path.relative());
                 link_dispatcher.dispatch(BlockDiscoverItem {
                     node_id: first_child,
                     expected_parent: link_node,
                     repository_path: link_path,
+                    states: link_states,
                     dep_context: None,
                     follow_deps: false,
                     depth: 0,
@@ -1638,12 +1655,15 @@ pub async fn clone_execute(
     }
 }
 
+/// `states` is the view filter's verdict for `repository_path`, which each child
+/// steps from rather than folding its whole path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn clone_node(
     ctx: CloneContext,
     storage: Arc<lore_transport::StorageSession>,
     repository_path: RepositoryPath,
     node: NodeID,
+    states: FilterStates,
 ) -> Result<(), CloneError> {
     let repository = ctx.repository.clone();
     let state = ctx.state.clone();
@@ -1665,11 +1685,13 @@ pub(crate) async fn clone_node(
         }
         let child_repository_path = repository_path.get_child(&child_name);
 
-        if !repository.filter.emit_excludes(
+        let (child_states, excluded) = repository.filter.child_emit_excludes(
+            states,
             child_repository_path.relative(),
             child_node.is_directory(),
             FilterMode::View,
-        ) {
+        );
+        if !excluded {
             if child_node.is_file() {
                 spawn_clone_file(&mut tasks, ctx.clone(), child_node, child_repository_path).await;
             } else if child_node.is_link() {
@@ -1681,6 +1703,7 @@ pub(crate) async fn clone_node(
                     storage.clone(),
                     child_id,
                     child_repository_path,
+                    child_states,
                 )
                 .await;
                 failure = failure.or(result.err());
@@ -1718,8 +1741,9 @@ fn clone_child_node(
     storage: Arc<lore_transport::StorageSession>,
     repository_path: RepositoryPath,
     node: NodeID,
+    states: FilterStates,
 ) -> Pin<Box<dyn Future<Output = Result<(), CloneError>> + Send>> {
-    Box::pin(clone_node(ctx, storage, repository_path, node))
+    Box::pin(clone_node(ctx, storage, repository_path, node, states))
 }
 
 /// Ensure the parent directory of `path` exists; second and later files under the same parent hit the `DashSet` cache and skip the syscall.
@@ -2026,6 +2050,10 @@ fn spawn_clone_link(
                         )
                     })?;
 
+                let link_states = linked_repository
+                    .filter
+                    .mount_states(repository_path.relative());
+
                 clone_child_node(
                     CloneContext {
                         repository: linked_repository,
@@ -2035,6 +2063,7 @@ fn spawn_clone_link(
                     link_storage,
                     repository_path,
                     link_node,
+                    link_states,
                 )
                 .await?;
             } else {
@@ -2054,6 +2083,7 @@ async fn spawn_clone_directory(
     storage: Arc<lore_transport::StorageSession>,
     node: NodeID,
     repository_path: RepositoryPath,
+    states: FilterStates,
 ) -> Result<(), CloneError> {
     let stats = ctx.stats.clone();
     let inflight = stats
@@ -2079,7 +2109,7 @@ async fn spawn_clone_directory(
             lore_info!("{}", repository_path.absolute().display());
         }
 
-        let result = clone_child_node(ctx, storage, repository_path, node).await;
+        let result = clone_child_node(ctx, storage, repository_path, node, states).await;
 
         stats
             .directory_inflight

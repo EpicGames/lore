@@ -11,6 +11,7 @@ use crate::file::stage::LayerRoute;
 use crate::file::stage::classify_stage_path;
 use crate::file::stage::is_path_under_layer_mask;
 use crate::filter::FilterMode;
+use crate::filter::FilterStates;
 use crate::interface::LoreArray;
 use crate::interface::LoreString;
 use crate::layer;
@@ -250,12 +251,21 @@ async fn dirty_into_layer(
         let state_path = source_path.join(remain.as_str());
         let absolute_path = remain.to_absolute_path(&mount_root);
 
-        if !force
-            && layer_state
-                .repository
-                .filter
-                .emit_excludes(&state_path, true, FilterMode::Full)
-        {
+        let parent_states = layer_state
+            .repository
+            .filter
+            .parent_exclusion_states(&state_path);
+        let (states, excluded) = layer_state
+            .repository
+            .filter
+            .child_emit_excludes_unless_forced(
+                force,
+                parent_states,
+                &state_path,
+                true,
+                FilterMode::Full,
+            );
+        if excluded {
             lore_trace!("Layer path excluded by filter: {}", state_path.as_str());
             continue;
         }
@@ -268,6 +278,7 @@ async fn dirty_into_layer(
             &absolute_path,
             DiskState::Unknown,
             stats.clone(),
+            states,
             None,
         )
         .await?;
@@ -345,11 +356,15 @@ async fn dirty_relative_paths_in_masked(
     let force = execution_context().globals().force();
 
     for relative_path in paths.iter() {
-        if !force
-            && repository
-                .filter
-                .emit_excludes(relative_path, true, FilterMode::Full)
-        {
+        let parent_states = repository.filter.parent_exclusion_states(relative_path);
+        let (states, excluded) = repository.filter.child_emit_excludes_unless_forced(
+            force,
+            parent_states,
+            relative_path,
+            true,
+            FilterMode::Full,
+        );
+        if excluded {
             lore_trace!("Path excluded by filter: {}", relative_path.as_str());
             continue;
         }
@@ -363,6 +378,7 @@ async fn dirty_relative_paths_in_masked(
             &absolute_path,
             DiskState::Unknown,
             stats.clone(),
+            states,
             mask.clone(),
         )
         .await?;
@@ -415,6 +431,9 @@ enum DiskState {
 /// `absolute_path` is passed in rather than derived from `relative_path` because a layer's content
 /// is mounted at a path in the parent working directory that need not match the path it occupies
 /// in the layer repository's own tree.
+///
+/// `states` is the filter verdict the caller reached for `relative_path`, which
+/// the recursions below inherit instead of folding the path again per node.
 #[allow(clippy::too_many_arguments)]
 async fn dirty_path(
     repository: Arc<RepositoryContext>,
@@ -424,6 +443,7 @@ async fn dirty_path(
     absolute_path: &Path,
     disk_state: DiskState,
     stats: Arc<DirtyStats>,
+    states: FilterStates,
     mask: Option<Arc<Vec<String>>>,
 ) -> Result<(), DirtyError> {
     if let Some(mask) = mask.as_deref()
@@ -487,6 +507,7 @@ async fn dirty_path(
             relative_path,
             absolute_path,
             stats.clone(),
+            states,
             mask.clone(),
         )
         .await?;
@@ -534,6 +555,7 @@ async fn dirty_path(
             link.node,
             relative_path,
             stats.clone(),
+            states,
         )
         .await?;
     } else if let Some(link) = staged_link {
@@ -628,6 +650,7 @@ async fn dirty_delete(
     node_id: NodeID,
     path: &RelativePath,
     stats: Arc<DirtyStats>,
+    states: FilterStates,
 ) -> Result<(), DirtyError> {
     let block_index = NodeBlock::index(node_id);
     let node_index = Node::index(node_id);
@@ -666,19 +689,21 @@ async fn dirty_delete(
                 .forward::<DirtyError>("Failed to get child name")?;
             let child_path = path.push_into_buf(&child_name).freeze();
 
-            if force
-                || !repository.filter.excludes_tree(
-                    &child_path,
-                    child_node.is_directory(),
-                    FilterMode::Full,
-                )
-            {
+            let (child_states, excluded) = repository.filter.child_excludes_tree_unless_forced(
+                force,
+                states,
+                &child_path,
+                child_node.is_directory(),
+                FilterMode::Full,
+            );
+            if !excluded {
                 dirty_delete_recurse(
                     repository.clone(),
                     state.clone(),
                     child_node_id,
                     child_path,
                     stats.clone(),
+                    child_states,
                 )
                 .await?;
             } else {
@@ -704,8 +729,9 @@ fn dirty_delete_recurse(
     node_id: NodeID,
     path: RelativePath,
     stats: Arc<DirtyStats>,
+    states: FilterStates,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DirtyError>> + Send>> {
-    Box::pin(async move { dirty_delete(repository, state, node_id, &path, stats).await })
+    Box::pin(async move { dirty_delete(repository, state, node_id, &path, stats, states).await })
 }
 
 /// Add a new file node to the staged tree with Dirty+Add.
@@ -881,6 +907,9 @@ async fn mark_children_dirty_moved(
 }
 
 /// Recursively process a directory, marking each child as dirty based on filesystem state.
+///
+/// `states` is the filter verdict for `dir_path`, which each child steps from.
+#[allow(clippy::too_many_arguments)]
 fn dirty_directory<'a>(
     repository: Arc<RepositoryContext>,
     state_current: Arc<State>,
@@ -888,6 +917,7 @@ fn dirty_directory<'a>(
     dir_path: &'a RelativePath,
     absolute_path: &'a std::path::Path,
     stats: Arc<DirtyStats>,
+    states: FilterStates,
     mask: Option<Arc<Vec<String>>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DirtyError>> + Send + 'a>> {
     Box::pin(async move {
@@ -909,11 +939,14 @@ fn dirty_directory<'a>(
             let child_path = dir_path.push_into_buf(&name_str).freeze();
 
             let force = execution_context().globals().force();
-            if !force
-                && repository
-                    .filter
-                    .emit_excludes(&child_path, true, FilterMode::Full)
-            {
+            let (child_states, excluded) = repository.filter.child_emit_excludes_unless_forced(
+                force,
+                states,
+                &child_path,
+                true,
+                FilterMode::Full,
+            );
+            if excluded {
                 continue;
             }
 
@@ -927,6 +960,7 @@ fn dirty_directory<'a>(
                     .metadata
                     .map_or(DiskState::Unknown, DiskState::Present),
                 stats.clone(),
+                child_states,
                 mask.clone(),
             )
             .await?;
@@ -958,6 +992,14 @@ fn dirty_directory<'a>(
                     .is_err()
                 {
                     let child_rel = child_path_buf.freeze();
+                    // Deletes are reported whatever the filter says, so the step
+                    // is taken only to carry the verdict into the recursion.
+                    let (child_states, _) = repository.filter.child_excludes_tree(
+                        states,
+                        &child_rel,
+                        true,
+                        FilterMode::Full,
+                    );
                     dirty_path(
                         repository.clone(),
                         state_current.clone(),
@@ -966,6 +1008,7 @@ fn dirty_directory<'a>(
                         &child_abs,
                         DiskState::Absent,
                         stats.clone(),
+                        child_states,
                         mask.clone(),
                     )
                     .await?;

@@ -1699,9 +1699,16 @@ async fn realize_change_modify_add(
                 stats: Arc::default(),
                 modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
             };
-            clone::clone_node(clone_ctx, link_storage, clone_path, node.child)
-                .await
-                .forward::<SyncError>("Failed to sync link")?;
+            let clone_states = link.filter.mount_states(clone_path.relative());
+            clone::clone_node(
+                clone_ctx,
+                link_storage,
+                clone_path,
+                node.child,
+                clone_states,
+            )
+            .await
+            .forward::<SyncError>("Failed to sync link")?;
         }
     } else if node.is_file() && !dry_run && write_to_disk {
         // For move changes where content didn't change, the rename already positioned the file correctly and the current branch's content should be preserved.

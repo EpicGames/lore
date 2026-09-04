@@ -21,6 +21,7 @@ use crate::event::EventError;
 use crate::file::unstage;
 use crate::file::unstage::UnstageOptions;
 use crate::filter::FilterMode;
+use crate::filter::FilterStates;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
@@ -953,8 +954,15 @@ fn reset_walk_directory_recurse(
     directory_path: RelativePath,
     node: Node,
     node_id: NodeID,
+    states: FilterStates,
 ) -> Pin<Box<dyn Future<Output = Result<(), ResetError>> + Send>> {
-    Box::pin(reset_walk_directory(ctx, directory_path, node, node_id))
+    Box::pin(reset_walk_directory(
+        ctx,
+        directory_path,
+        node,
+        node_id,
+        states,
+    ))
 }
 
 /// Drive the directory walk for a single user-supplied path.
@@ -1014,9 +1022,12 @@ async fn reset_walk_path(ctx: ResetContext, relative_path: RelativePath) -> Resu
             relative_path,
             node,
             ROOT_NODE,
+            FilterStates::ROOT,
         )
         .await;
     }
+
+    let parent_states = repository.filter.parent_exclusion_states(&relative_path);
 
     let node_name = relative_path.name().to_string();
 
@@ -1061,6 +1072,7 @@ async fn reset_walk_path(ctx: ResetContext, relative_path: RelativePath) -> Resu
                 node_name,
                 node_link.node,
                 node,
+                parent_states,
             )
             .await
         }
@@ -1187,12 +1199,15 @@ async fn reset_delete_path(
 /// Apply view/ignore filter, staged check, and dispatch a single child node
 /// (file, directory, or link) to its appropriate handler. Files are pushed to
 /// `file_tx`; directories and links recurse via `reset_walk_directory`.
+/// `parent_states` is the filter verdict for the directory holding
+/// `relative_path`, which this node's own query steps from.
 async fn reset_walk_node(
     ctx: ResetContext,
     relative_path: RelativePath,
     name: String,
     node_id: u32,
     node: Node,
+    parent_states: FilterStates,
 ) -> Result<(), ResetError> {
     let ResetContext {
         repository,
@@ -1204,11 +1219,14 @@ async fn reset_walk_node(
     } = ctx;
 
     let force = execution_context().globals().force();
-    if !force
-        && repository
-            .filter
-            .emit_excludes(&relative_path, node.is_directory(), FilterMode::Full)
-    {
+    let (states, excluded) = repository.filter.child_emit_excludes_unless_forced(
+        force,
+        parent_states,
+        &relative_path,
+        node.is_directory(),
+        FilterMode::Full,
+    );
+    if excluded {
         lore_trace!("Path excluded by filter: {}", relative_path.as_str());
         return Ok(());
     }
@@ -1305,6 +1323,8 @@ async fn reset_walk_node(
             .await
             .forward::<ResetError>("Failed to deserialize revision state")?;
 
+        let link_states = linked_repository.filter.mount_states(&relative_path);
+
         return reset_walk_directory_recurse(
             ResetContext {
                 repository: linked_repository,
@@ -1317,6 +1337,7 @@ async fn reset_walk_node(
             relative_path,
             linked_root_node,
             link.node,
+            link_states,
         )
         .await;
     }
@@ -1341,6 +1362,7 @@ async fn reset_walk_node(
             relative_path,
             node,
             node_id,
+            states,
         )
         .await;
     }
@@ -1372,6 +1394,7 @@ async fn reset_walk_directory(
     directory_path: RelativePath,
     node: Node,
     node_id: NodeID,
+    states: FilterStates,
 ) -> Result<(), ResetError> {
     let ResetContext {
         repository,
@@ -1467,8 +1490,15 @@ async fn reset_walk_directory(
 
             let future = async move {
                 let task_stats = task_ctx.stats.clone();
-                let result =
-                    reset_walk_node(task_ctx, task_path, task_name, child_node_id, task_node).await;
+                let result = reset_walk_node(
+                    task_ctx,
+                    task_path,
+                    task_name,
+                    child_node_id,
+                    task_node,
+                    states,
+                )
+                .await;
                 task_stats
                     .directory_inflight
                     .fetch_sub(1, Ordering::Relaxed);
@@ -1498,6 +1528,7 @@ async fn reset_walk_directory(
                 child_node_name,
                 child_node_id,
                 child_node,
+                states,
             )
             .await;
             if let Err(err) = result {
@@ -1559,13 +1590,14 @@ async fn reset_walk_directory(
 
         let child_path = directory_path.join(&filesystem_child.name);
 
-        if !force
-            && repository.filter.emit_excludes(
-                &child_path,
-                filesystem_child.metadata.is_dir(),
-                FilterMode::Full,
-            )
-        {
+        let (_, excluded) = repository.filter.child_emit_excludes_unless_forced(
+            force,
+            states,
+            &child_path,
+            filesystem_child.metadata.is_dir(),
+            FilterMode::Full,
+        );
+        if excluded {
             lore_trace!("Path excluded by filter: {}", child_path.as_str());
             continue;
         }

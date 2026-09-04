@@ -722,6 +722,11 @@ impl FilterInstance {
         } else {
             0
         };
+        debug_assert!(
+            floor <= self.lines.len(),
+            "a state from another filter: decided_at {floor} exceeds {} lines",
+            self.lines.len()
+        );
         let pruned = parent.excluded;
         let mut state = parent;
         for (offset, line) in self.lines[floor..].iter().enumerate() {
@@ -770,7 +775,7 @@ impl FilterInstance {
         path: &impl FilterPath,
         is_directory: bool,
     ) -> FilterState {
-        if path.is_empty() || path.as_str() == "." {
+        if self.lines.is_empty() || path.is_empty() || path.as_str() == "." {
             return parent;
         }
         let lowercase = path.as_lowercase_str();
@@ -990,13 +995,159 @@ impl Filter {
         path: &impl FilterPath,
         mode: FilterMode,
     ) -> bool {
+        self.descend_reason(states, path, mode).is_none()
+    }
+
+    /// The slot that stops a walk at `path`, or `None` when it descends.
+    ///
+    /// Ignore is consulted before view, which is the order
+    /// [`exclude_reason`](Self::exclude_reason) reports a path both slots
+    /// exclude in.
+    fn descend_reason(
+        &self,
+        states: FilterStates,
+        path: &impl FilterPath,
+        mode: FilterMode,
+    ) -> Option<FilterReason> {
         if mode.contains(FilterMode::Ignore) && !self.ignore.should_descend(states.ignore, path) {
-            return false;
+            return Some(FilterReason::Ignore);
         }
         if mode.contains(FilterMode::View) && !self.view.should_descend(states.view, path) {
-            return false;
+            return Some(FilterReason::View);
         }
-        true
+        None
+    }
+
+    /// One step of a walk: the states `path`'s children inherit, and why the
+    /// walk drops `path` with everything under it -- `None` to keep it and, for
+    /// a directory, to descend into it.
+    ///
+    /// The threaded form of [`exclude_reason`](Self::exclude_reason) at
+    /// [`Scope::Tree`]. The caller holds the parent's states, so no ancestor is
+    /// folded and the subtree half is one index lookup rather than a second pass
+    /// over the lines.
+    fn child_exclude_reason(
+        &self,
+        parent: FilterStates,
+        path: &impl FilterPath,
+        is_directory: bool,
+        mode: FilterMode,
+    ) -> (FilterStates, Option<FilterReason>) {
+        let (states, reason) = self.child_exclusion_states(parent, path, is_directory, mode);
+        // A file has no subtree, so both scopes ask the same question of one.
+        if !is_directory {
+            return (states, reason);
+        }
+        let reason = self.descend_reason(states, path, mode);
+        (states, reason)
+    }
+
+    /// [`excludes_tree`](Self::excludes_tree) for a walk that threads state:
+    /// whether the walk drops `path`, and the states its children inherit.
+    pub fn child_excludes_tree(
+        &self,
+        parent: FilterStates,
+        path: &impl FilterPath,
+        is_directory: bool,
+        mode: FilterMode,
+    ) -> (FilterStates, bool) {
+        let (states, reason) = self.child_exclude_reason(parent, path, is_directory, mode);
+        (states, reason.is_some())
+    }
+
+    /// [`child_excludes_tree`](Self::child_excludes_tree), emitting a
+    /// [`LoreEvent::FilterExclude`] when it hits, as
+    /// [`emit_excludes`](Self::emit_excludes) does for a whole path.
+    pub fn child_emit_excludes(
+        &self,
+        parent: FilterStates,
+        path: &RelativePath,
+        is_directory: bool,
+        mode: FilterMode,
+    ) -> (FilterStates, bool) {
+        let (states, reason) = self.child_exclude_reason(parent, path, is_directory, mode);
+        (states, Self::emit(path, reason))
+    }
+
+    /// [`child_excludes_tree`](Self::child_excludes_tree) unless `force` puts
+    /// the walk past the filter.
+    ///
+    /// See [`child_emit_excludes_unless_forced`](Self::child_emit_excludes_unless_forced)
+    /// for why a forced walk is answered without asking the filter.
+    pub fn child_excludes_tree_unless_forced(
+        &self,
+        force: bool,
+        parent: FilterStates,
+        path: &impl FilterPath,
+        is_directory: bool,
+        mode: FilterMode,
+    ) -> (FilterStates, bool) {
+        if force {
+            return (FilterStates::ROOT, false);
+        }
+        self.child_excludes_tree(parent, path, is_directory, mode)
+    }
+
+    /// [`child_emit_excludes`](Self::child_emit_excludes) unless `force` puts
+    /// the walk past the filter.
+    ///
+    /// A forced operation drops nothing, so it must report nothing as excluded
+    /// either, and it needs no verdict at all: `force` is one flag on the
+    /// operation -- `ExecutionContext::globals` or `DirtyWalkOptions` -- so
+    /// every step below is forced too and none of them reads one. The walk is
+    /// answered without touching the lines, and the state handed back is
+    /// [`FilterStates::ROOT`] rather than a verdict nothing will consult.
+    pub fn child_emit_excludes_unless_forced(
+        &self,
+        force: bool,
+        parent: FilterStates,
+        path: &RelativePath,
+        is_directory: bool,
+        mode: FilterMode,
+    ) -> (FilterStates, bool) {
+        if force {
+            return (FilterStates::ROOT, false);
+        }
+        self.child_emit_excludes(parent, path, is_directory, mode)
+    }
+
+    /// The folded verdicts at the directory `path`, seeding a walk that starts
+    /// there.
+    ///
+    /// A walk threads its root's states down; one rooted at a named
+    /// subdirectory has no parent to inherit from and folds them here instead,
+    /// once for the whole walk. Every component is folded as a directory, which
+    /// is what a walk standing in one has behind it.
+    pub fn exclusion_states(&self, path: &impl FilterPath) -> FilterStates {
+        if self.is_empty(FilterMode::Full) {
+            return FilterStates::ROOT;
+        }
+        self.ancestor(path.as_lowercase_str()).states
+    }
+
+    /// The verdict at a link or layer mount, seeding the walk over what is
+    /// mounted there.
+    ///
+    /// [`exclusion_states`](Self::exclusion_states) at `mount_path`, so every
+    /// component is folded as a directory. The mount node's own step does not
+    /// stand in for it: a link node is not a directory, so a directory-only rule
+    /// naming the mount is skipped there, while the same rule reaches the
+    /// content below, which does sit in a directory.
+    pub fn mount_states(&self, mount_path: &impl FilterPath) -> FilterStates {
+        self.exclusion_states(mount_path)
+    }
+
+    /// [`exclusion_states`](Self::exclusion_states) for `path`'s parent, seeding
+    /// a walk whose first step is `path` itself.
+    ///
+    /// A recursion that asks the filter about the node it was handed, rather
+    /// than about each child before recursing, needs the states that node's own
+    /// query starts from.
+    pub fn parent_exclusion_states(&self, path: &impl FilterPath) -> FilterStates {
+        if self.is_empty(FilterMode::Full) {
+            return FilterStates::ROOT;
+        }
+        self.ancestor(path.split_lowercase().0).states
     }
 
     /// Why `path` is excluded, its ancestors accounted for, or `None` if it is
@@ -1138,11 +1289,12 @@ impl Filter {
     /// exist to descend into -- a sparse working tree cannot hold
     /// `engine/content/a.uasset` without `engine/content`.
     ///
-    /// This is the verdict every tree walk in the client asks for. They query a
-    /// whole path per node rather than threading a [`FilterStates`] down, so
-    /// they cannot pair [`child_exclusion_states`](Self::child_exclusion_states)
-    /// with [`should_descend`](Self::should_descend); this folds the ancestors
-    /// through the memo and answers both halves in one call.
+    /// This is the verdict a walk asks for. A walk that threads a
+    /// [`FilterStates`] down asks it of
+    /// [`child_excludes_tree`](Self::child_excludes_tree) instead, which is the
+    /// same verdict for the price of one step; this is for a path that arrives
+    /// whole, and folds the ancestors through the memo to answer both halves in
+    /// one call.
     pub fn excludes_tree(
         &self,
         path: &impl FilterPath,

@@ -28,6 +28,7 @@ use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
 use crate::filter::FilterMode;
+use crate::filter::FilterStates;
 use crate::find;
 use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
@@ -582,6 +583,9 @@ struct CountWork {
     repository: Arc<RepositoryContext>,
     node_id: NodeID,
     path: RelativePath,
+    /// The view filter's verdict for `path`, which each child steps from
+    /// instead of folding its whole path.
+    states: FilterStates,
 }
 
 /// Shared state for the bounded worker pool counting view-filtered nodes.
@@ -618,6 +622,11 @@ async fn count_at_path_root(
     source_path: &RelativePath,
     target_path: &RelativePath,
 ) -> Result<(u64, u64, Option<CountWork>), StatusError> {
+    // Every work item below is rooted at `target_path`, so its ancestors are
+    // folded once here and the walk steps from there. Link resolution keeps the
+    // filter, so the verdict holds for the resolved repository too.
+    let states = repository.filter.exclusion_states(target_path);
+
     if source_path.is_empty() {
         return Ok((
             1,
@@ -627,6 +636,7 @@ async fn count_at_path_root(
                 repository,
                 node_id: ROOT_NODE,
                 path: target_path.clone(),
+                states,
             }),
         ));
     }
@@ -668,6 +678,7 @@ async fn count_at_path_root(
                 repository,
                 node_id: inner.node,
                 path: target_path.clone(),
+                states,
             }),
         ));
     }
@@ -680,6 +691,7 @@ async fn count_at_path_root(
             repository,
             node_id: link.node,
             path: target_path.clone(),
+            states,
         }),
     ))
 }
@@ -710,11 +722,13 @@ async fn count_node_children(work: &CountWork, shared: &CountShared) -> Result<(
         let is_link = child_node.is_link();
         let child_path = work.path.push_into_buf(child_name).freeze();
 
-        if work.repository.filter.excludes_tree(
+        let (child_states, excluded) = work.repository.filter.child_excludes_tree(
+            work.states,
             &child_path,
             is_directory || is_link,
             FilterMode::View,
-        ) {
+        );
+        if excluded {
             continue;
         }
 
@@ -725,6 +739,7 @@ async fn count_node_children(work: &CountWork, shared: &CountShared) -> Result<(
                 repository: work.repository.clone(),
                 node_id: child_id,
                 path: child_path,
+                states: child_states,
             });
         } else if is_link {
             directories += 1;
@@ -738,6 +753,7 @@ async fn count_node_children(work: &CountWork, shared: &CountShared) -> Result<(
                 repository: link_repository,
                 node_id: link.node,
                 path: child_path,
+                states: child_states,
             });
         } else if child_node.is_file() {
             files += 1;
@@ -1170,6 +1186,7 @@ pub async fn status(
                         repository: repository.clone(),
                         node_id: ROOT_NODE,
                         path: RelativePath::default(),
+                        states: FilterStates::ROOT,
                     });
                 }
                 Some(path) => {

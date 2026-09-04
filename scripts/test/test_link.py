@@ -2125,6 +2125,168 @@ def test_link_reset(new_lore_repo):
         )
 
 
+@pytest.mark.smoke
+def test_link_reset_honours_a_directory_rule_naming_the_mount(new_lore_repo):
+    """A directory rule naming a link mount excludes the content mounted there.
+
+    The mount node is a link, not a directory, so the rule does not match the
+    node itself. It matches the mount path, which is what the content below it
+    sits in, and every walk folds the mount path that way. Reset has to reach
+    the same verdict or it restores files the filter excludes.
+    """
+    repo: Lore = new_lore_repo()
+
+    outside_file = "outside.txt"
+    with repo.open_file(outside_file, "w+") as output_file:
+        output_file.writelines(["outside original\n"])
+
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
+
+    link_repo = new_lore_repo()
+    link_file = "inside.txt"
+    with link_repo.open_file(link_file, "w+") as output_file:
+        output_file.writelines(["inside original\n"])
+
+    link_repo.stage(scan=True)
+    link_repo.commit()
+    link_repo.push()
+
+    link_path = "linked"
+    repo.link_add(link_path, link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+
+    mounted_file = f"{link_path}/{link_file}"
+    assert repo.compare_file(repo, mounted_file)
+
+    # A rooted directory rule naming the mount, the shape a sparse view uses.
+    with repo.open_file(repo.ignore_file(), "w+") as ignore_file:
+        ignore_file.write(f"/{link_path}/\n")
+
+    with repo.open_file(mounted_file, "w+") as output_file:
+        output_file.writelines(["inside modified\n"])
+    with repo.open_file(outside_file, "w+") as output_file:
+        output_file.writelines(["outside modified\n"])
+
+    repo.reset(".")
+
+    with repo.open_file(outside_file, "r") as f:
+        assert "outside original" in f.read(), (
+            "Reset should restore a file the filter does not exclude"
+        )
+    with repo.open_file(mounted_file, "r") as f:
+        assert "inside modified" in f.read(), (
+            "Reset should not descend into a link mount the filter excludes"
+        )
+
+
+def _staged_paths(repo: Lore) -> list[str]:
+    """Paths `status` reports as staged. It reports unstaged changes too, marked
+    with `flagStaged` false, so the flag is what separates the two."""
+    return [
+        entry["path"]
+        for entry in parse_status_json(repo.status(json=True))
+        if entry["flagStaged"]
+    ]
+
+
+@pytest.mark.smoke
+def test_link_unstage_honours_a_rule_naming_the_mount(new_lore_repo):
+    """The filter matches link content by its mount path, not its source path.
+
+    A link mounted at `linked` onto `/sub` reaches `sub/inside.txt` in the source
+    repository for a file the flattened tree spells `linked/inside.txt`. Rules are
+    written against the flattened tree, so unstage has to match the mount path or
+    it unstages content the filter excludes.
+
+    Both crossings are covered: unstaging the repository root reaches the link
+    node itself, and unstaging a path inside the link resolves through it to a
+    directory in the source repository.
+    """
+    repo: Lore = new_lore_repo()
+
+    outside_file = "outside.txt"
+    with repo.open_file(outside_file, "w+") as output_file:
+        output_file.writelines(["outside original\n"])
+
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
+
+    link_repo = new_lore_repo()
+    link_repo.make_dirs("sub/nested")
+    with link_repo.open_file("sub/inside.txt", "w+") as output_file:
+        output_file.writelines(["inside original\n"])
+    with link_repo.open_file("sub/nested/deep.txt", "w+") as output_file:
+        output_file.writelines(["deep original\n"])
+
+    link_repo.stage(scan=True)
+    link_repo.commit()
+    link_repo.push()
+
+    link_path = "linked"
+    repo.link_add(link_path, link_repo.get_id(), "/sub")
+    repo.commit()
+    repo.push()
+
+    mounted_file = f"{link_path}/inside.txt"
+    deep_file = f"{link_path}/nested/deep.txt"
+    assert repo.file_exists(mounted_file), f"{mounted_file} should be materialized"
+    assert repo.file_exists(deep_file), f"{deep_file} should be materialized"
+
+    def restage_everything():
+        with repo.open_file(mounted_file, "w+") as output_file:
+            output_file.writelines(["inside modified\n"])
+        with repo.open_file(deep_file, "w+") as output_file:
+            output_file.writelines(["deep modified\n"])
+        with repo.open_file(outside_file, "w+") as output_file:
+            output_file.writelines(["outside modified\n"])
+        repo.stage(scan=True)
+
+    restage_everything()
+
+    staged = _staged_paths(repo)
+    assert mounted_file in staged, f"{mounted_file} should be staged"
+    assert outside_file in staged, f"{outside_file} should be staged"
+
+    # Names the file below the mount rather than the mount, so the walk descends
+    # and the verdict is reached inside the link. It matches the flattened
+    # `linked/inside.txt` and cannot match the source path `sub/inside.txt`.
+    with repo.open_file(repo.ignore_file(), "w+") as ignore_file:
+        ignore_file.write(f"/{link_path}/inside.txt\n")
+
+    repo.unstage(".")
+
+    # Dropped so the status below reports the mounted file either way.
+    repo.remove_file(repo.ignore_file())
+
+    staged = _staged_paths(repo)
+    assert outside_file not in staged, (
+        "Unstage should unstage a file the filter does not exclude"
+    )
+    assert mounted_file in staged, (
+        "Unstage should skip link content the filter excludes"
+    )
+
+    # The same verdict, reached the other way: `linked/nested` resolves through
+    # the link to a directory in the source repository, which is the crossing
+    # the root walk above does not take.
+    restage_everything()
+    with repo.open_file(repo.ignore_file(), "w+") as ignore_file:
+        ignore_file.write(f"/{link_path}/nested/deep.txt\n")
+
+    repo.unstage(f"{link_path}/nested")
+
+    repo.remove_file(repo.ignore_file())
+
+    staged = _staged_paths(repo)
+    assert deep_file in staged, (
+        "Unstage should skip content the filter excludes below a resolved link"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers for the link-reset tests below.
 # ---------------------------------------------------------------------------

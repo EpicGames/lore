@@ -16,6 +16,7 @@ use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
 use crate::filter::FilterMode;
+use crate::filter::FilterStates;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
@@ -263,7 +264,7 @@ pub async fn unstage(
             let stats = stats.clone();
             let link_tracker = link_tracker.clone();
             lore_spawn!(async move {
-                unstage_path(
+                Box::pin(unstage_path(
                     repository,
                     state_current,
                     state_staged,
@@ -272,7 +273,7 @@ pub async fn unstage(
                     options,
                     stats,
                     link_tracker,
-                )
+                ))
                 .await
             })
         };
@@ -407,6 +408,49 @@ pub async fn unstage(
     Ok(())
 }
 
+/// Where the walk stands in the flattened tree the working copy materializes,
+/// which is the tree the filter is defined over.
+///
+/// A walk that crosses a link mount continues in the linked repository's own
+/// tree, so its node paths stop spelling the flattened path: a link mounted at
+/// `some/path` onto `another/dir` reaches `another/dir/file.txt` for a file the
+/// filter knows as `some/path/file.txt`. `path` carries the flattened spelling
+/// for those nodes and is `None` while the two agree, which is every node above
+/// the first mount.
+struct FilterCursor {
+    path: Option<RelativePath>,
+    /// The verdict the next step starts from.
+    states: FilterStates,
+}
+
+impl FilterCursor {
+    /// The cursor for the child `name`, which steps from the same verdict as
+    /// every other child of this path.
+    fn child(&self, name: &str) -> Self {
+        Self {
+            path: self.path.as_ref().map(|path| path.join(name)),
+            states: self.states,
+        }
+    }
+
+    /// This cursor with the verdict a walk below its path steps from.
+    fn stepped(&self, states: FilterStates) -> Self {
+        Self {
+            path: self.path.clone(),
+            states,
+        }
+    }
+
+    /// The cursor for a walk that crosses the link mounted at `node_path` and so
+    /// leaves the flattened path behind.
+    fn mount(&self, node_path: &RelativePath, states: FilterStates) -> Self {
+        Self {
+            path: Some(self.path.clone().unwrap_or_else(|| node_path.clone())),
+            states,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn unstage_path(
     repository: Arc<RepositoryContext>,
@@ -433,11 +477,15 @@ async fn unstage_path(
     };
 
     let force = execution_context().globals().force();
-    if !force
-        && repository
-            .filter
-            .emit_excludes(&relative_path, true, FilterMode::Full)
-    {
+    let parent_states = repository.filter.parent_exclusion_states(&relative_path);
+    let (states, excluded) = repository.filter.child_emit_excludes_unless_forced(
+        force,
+        parent_states,
+        &relative_path,
+        true,
+        FilterMode::Full,
+    );
+    if excluded {
         lore_trace!("Path excluded by filter: {}", relative_path.as_str());
         return Ok(());
     }
@@ -460,6 +508,7 @@ async fn unstage_path(
             options,
             stats.clone(),
             link_tracker.clone(),
+            FilterCursor { path: None, states },
         )
         .await;
     }
@@ -476,10 +525,15 @@ async fn unstage_path(
         options,
         stats,
         link_tracker,
+        FilterCursor {
+            path: None,
+            states: parent_states,
+        },
     )
     .await
 }
 
+/// `cursor` stands at `directory_path`, and each child steps from its verdict.
 #[allow(clippy::too_many_arguments)]
 async fn unstage_directory(
     repository: Arc<RepositoryContext>,
@@ -491,6 +545,7 @@ async fn unstage_directory(
     options: UnstageOptions,
     stats: Arc<UnstageStats>,
     link_tracker: Arc<LinkTracker>,
+    cursor: FilterCursor,
 ) -> Result<(), UnstageError> {
     lore_trace!(
         "Unstaging directory: path='{}', node={}, repository={}",
@@ -521,6 +576,8 @@ async fn unstage_directory(
             repository.id
         );
 
+        let child_cursor = cursor.child(child_node_name.as_str());
+
         unstage_node_recurse(
             repository.clone(),
             state_current.clone(),
@@ -531,6 +588,7 @@ async fn unstage_directory(
             options,
             stats.clone(),
             link_tracker.clone(),
+            child_cursor,
         )
         .await?;
     }
@@ -596,6 +654,10 @@ async fn unstage_parent_chain(
     Ok(())
 }
 
+/// `cursor` stands at `node_path` and carries the verdict this node's own query
+/// steps from. The query asks about the cursor's path rather than `node_path`,
+/// which below a link mount names the same node in the linked repository's tree
+/// and so is not a path the filter describes.
 #[allow(clippy::too_many_arguments)]
 async fn unstage_node(
     repository: Arc<RepositoryContext>,
@@ -607,6 +669,7 @@ async fn unstage_node(
     options: UnstageOptions,
     stats: Arc<UnstageStats>,
     link_tracker: Arc<LinkTracker>,
+    cursor: FilterCursor,
 ) -> Result<(), UnstageError> {
     if name.is_empty() || name.as_str() == "." {
         return Ok(());
@@ -617,11 +680,14 @@ async fn unstage_node(
         return Ok(());
     }
 
-    if !execution_context().globals().force()
-        && repository
-            .filter
-            .emit_excludes(&node_path, true, FilterMode::Full)
-    {
+    let (states, excluded) = repository.filter.child_emit_excludes_unless_forced(
+        execution_context().globals().force(),
+        cursor.states,
+        cursor.path.as_ref().unwrap_or(&node_path),
+        true,
+        FilterMode::Full,
+    );
+    if excluded {
         lore_debug!("Node excluded by filter: {}", node_path.as_str());
         return Ok(());
     }
@@ -1055,6 +1121,7 @@ async fn unstage_node(
                         options,
                         stats.clone(),
                         link_tracker.clone(),
+                        cursor.mount(&node_path, states),
                     )
                     .await?;
                 }
@@ -1066,6 +1133,12 @@ async fn unstage_node(
                 let resolved_path = RelativePath::new_from_initial_path(resolved_node_path.clone())
                     .forward::<UnstageError>("Failed to find subnode")?;
 
+                let resolved_cursor = if found_node_link.repository == repository.id {
+                    cursor.stepped(states)
+                } else {
+                    cursor.mount(&node_path, states)
+                };
+
                 unstage_directory(
                     current_repository.clone(),
                     current_state.clone(),
@@ -1076,6 +1149,7 @@ async fn unstage_node(
                     options,
                     stats.clone(),
                     link_tracker.clone(),
+                    resolved_cursor,
                 )
                 .await?;
 
@@ -1116,6 +1190,7 @@ fn unstage_node_recurse<'a>(
     options: UnstageOptions,
     stats: Arc<UnstageStats>,
     link_tracker: Arc<LinkTracker>,
+    cursor: FilterCursor,
 ) -> Pin<Box<dyn Future<Output = Result<(), UnstageError>> + Send + 'a>> {
     Box::pin(unstage_node(
         repository,
@@ -1127,6 +1202,7 @@ fn unstage_node_recurse<'a>(
         options,
         stats,
         link_tracker,
+        cursor,
     ))
 }
 

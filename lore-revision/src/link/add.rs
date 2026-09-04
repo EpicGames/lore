@@ -437,9 +437,16 @@ pub async fn add(
         modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
     };
 
-    clone::clone_node(clone_ctx, storage, clone_path, link_node_link.node)
-        .await
-        .forward::<LinkError>("Failed cloning target link")?;
+    let clone_states = link.filter.mount_states(clone_path.relative());
+    clone::clone_node(
+        clone_ctx,
+        storage,
+        clone_path,
+        link_node_link.node,
+        clone_states,
+    )
+    .await
+    .forward::<LinkError>("Failed cloning target link")?;
     operation
         .finalize(true)
         .await

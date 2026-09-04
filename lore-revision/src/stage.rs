@@ -24,6 +24,7 @@ use crate::change;
 use crate::errors::*;
 use crate::event;
 use crate::filter::FilterMode;
+use crate::filter::FilterStates;
 use crate::hash;
 use crate::infer::infer_is_conflicted_by_path;
 use crate::interface::LoreArray;
@@ -429,6 +430,9 @@ pub(crate) async fn stage_filesystem_path(
         let mut current_absolute_path = base_absolute_path;
         let mut current_node = base_node;
         let mut current_state = state.clone();
+        // The descent below builds the path a component at a time, so the
+        // verdict is folded once for the base and stepped from there.
+        let mut current_states = repository.filter.exclusion_states(&current_relative_path);
 
         while !relative_path.is_empty() {
             // The final component is the staged path, whose metadata is read above.
@@ -476,7 +480,7 @@ pub(crate) async fn stage_filesystem_path(
                 }
             }
 
-            let node_link = stage_node_from_metadata(
+            let staged = stage_node_from_metadata(
                 current_repository.clone(),
                 current_state.clone(),
                 current_absolute_path.as_path(),
@@ -488,8 +492,10 @@ pub(crate) async fn stage_filesystem_path(
                 stats.clone(),
                 link_tracker.clone(),
                 KnownChild::Unresolved,
+                current_states,
             )
             .await?;
+            let node_link = staged.link;
 
             if !node_link.is_valid() {
                 return Ok(node_link);
@@ -505,6 +511,8 @@ pub(crate) async fn stage_filesystem_path(
                 current_absolute_path.push(&*final_name);
                 current_relative_path.push(&final_name);
             }
+
+            current_states = staged.states;
 
             let node = current_state
                 .node(current_repository.clone(), node_link.node)
@@ -576,6 +584,7 @@ pub(crate) async fn stage_filesystem_path(
                 link_tracker.clone(),
                 layer_mask.clone(),
                 discards.clone(),
+                current_states,
             )
             .await;
             stats.task_count.fetch_sub(1, Ordering::Release);
@@ -1349,6 +1358,8 @@ fn directory_task_semaphore() -> &'static Arc<Semaphore> {
         .get_or_init(|| Arc::new(Semaphore::new(max_concurrent_stage_directory_tasks())))
 }
 
+/// `states` is the filter verdict for `relative_path`, which each child steps
+/// from rather than folding its whole path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn stage_directory(
     repository: Arc<RepositoryContext>,
@@ -1362,6 +1373,7 @@ pub(crate) async fn stage_directory(
     link_tracker: Option<Arc<crate::link::LinkTracker>>,
     layer_mask: Option<Arc<Vec<String>>>,
     discards: PendingDiscards,
+    states: FilterStates,
 ) -> Result<(), StageError> {
     let mut children = DirectoryChildren::new(
         state
@@ -1495,7 +1507,7 @@ pub(crate) async fn stage_directory(
                 }
             }
 
-            let node_link = match stage_node_from_metadata(
+            let staged = match stage_node_from_metadata(
                 repository.clone(),
                 state.clone(),
                 absolute_path,
@@ -1507,15 +1519,18 @@ pub(crate) async fn stage_directory(
                 stats.clone(),
                 link_tracker.clone(),
                 KnownChild::Resolved(claimed),
+                states,
             )
             .await
             {
-                Ok(node_link) => node_link,
+                Ok(staged) => staged,
                 Err(err) => {
                     failure = failure.or(Some(err));
                     break;
                 }
             };
+            let node_link = staged.link;
+            let child_states = staged.states;
 
             // Inline fallback rather than a blocking acquire: a parent awaiting
             // its children must never block on a permit a descendant needs, or
@@ -1544,6 +1559,7 @@ pub(crate) async fn stage_directory(
                             link_tracker,
                             layer_mask,
                             discards,
+                            child_states,
                         )
                         .await
                     }
@@ -1561,6 +1577,7 @@ pub(crate) async fn stage_directory(
                     link_tracker.clone(),
                     layer_mask.clone(),
                     discards.clone(),
+                    child_states,
                 )
                 .await;
                 failure = failure.or(result.err());
@@ -1610,6 +1627,7 @@ pub(crate) async fn stage_directory(
                 stats.clone(),
                 link_tracker.clone(),
                 KnownChild::Resolved(claimed),
+                states,
             )
             .await;
             failure = failure.or(result.err());
@@ -1645,10 +1663,13 @@ pub(crate) async fn stage_directory(
         };
         let mut filter_path = relative_path.clone();
         filter_path.push(node_name);
-        if repository
-            .filter
-            .emit_excludes(&filter_path.clone().freeze(), true, FilterMode::Full)
-        {
+        let (_, excluded) = repository.filter.child_emit_excludes(
+            states,
+            &filter_path.clone().freeze(),
+            true,
+            FilterMode::Full,
+        );
+        if excluded {
             lore_trace!("Node excluded by filter: {}", filter_path.as_str());
             continue;
         }
@@ -1682,6 +1703,8 @@ pub(crate) async fn stage_directory(
 /// Descend into one child directory of `stage_directory`. Split out from the
 /// child loop so the bounded fan-out there can either spawn this or await it
 /// inline without duplicating the body.
+///
+/// `states` is the child's own filter verdict, which staging it already reached.
 #[allow(clippy::too_many_arguments)]
 async fn stage_child_directory(
     repository: Arc<RepositoryContext>,
@@ -1695,6 +1718,7 @@ async fn stage_child_directory(
     link_tracker: Option<Arc<crate::link::LinkTracker>>,
     layer_mask: Option<Arc<Vec<String>>>,
     discards: PendingDiscards,
+    states: FilterStates,
 ) -> Result<(), StageError> {
     if !node_link.is_valid() {
         return Ok(());
@@ -1745,6 +1769,8 @@ async fn stage_child_directory(
             link_relative_path.push(&node_name);
         }
 
+        let link_states = linked_repository.filter.mount_states(&link_relative_path);
+
         let result = stage_directory_recurse(
             linked_repository.clone(),
             linked_state.clone(),
@@ -1757,6 +1783,7 @@ async fn stage_child_directory(
             link_tracker.clone(),
             layer_mask.clone(),
             None,
+            link_states,
         )
         .await;
 
@@ -1788,6 +1815,7 @@ async fn stage_child_directory(
             link_tracker.clone(),
             layer_mask.clone(),
             discards.clone(),
+            states,
         )
         .await;
         stats.task_count.fetch_sub(1, Ordering::Release);
@@ -1808,6 +1836,7 @@ fn stage_directory_recurse(
     link_tracker: Option<Arc<crate::link::LinkTracker>>,
     layer_mask: Option<Arc<Vec<String>>>,
     discards: PendingDiscards,
+    states: FilterStates,
 ) -> Pin<Box<dyn Future<Output = Result<(), StageError>> + Send + '_>> {
     Box::pin(stage_directory(
         repository,
@@ -1821,6 +1850,7 @@ fn stage_directory_recurse(
         link_tracker,
         layer_mask,
         discards,
+        states,
     ))
 }
 
@@ -1831,6 +1861,29 @@ fn stage_directory_recurse(
 /// [`KnownChild::Unresolved`] where nothing has. A resolved answer is taken as
 /// given, one holding no child included, so a caller giving one has to account
 /// for the children linked into the chain since it looked.
+///
+/// What staging a child established: the node it linked, and the filter verdict
+/// for the child itself, which a walk descending into it steps from.
+///
+/// The verdict is handed back rather than recomputed below, because staging the
+/// child had to reach it to decide whether the child was excluded at all.
+pub(crate) struct StagedChild {
+    pub link: NodeLink,
+    pub states: FilterStates,
+}
+
+impl StagedChild {
+    /// A child that was not staged, which nothing descends into.
+    fn invalid() -> Self {
+        Self {
+            link: NodeLink::invalid(),
+            states: FilterStates::ROOT,
+        }
+    }
+}
+
+/// `parent_states` is the filter verdict for `base_relative_path`, which the
+/// child named here steps from rather than folding its whole path.
 #[allow(clippy::too_many_arguments, unused_assignments)]
 pub(crate) async fn stage_node_from_metadata(
     repository: Arc<RepositoryContext>,
@@ -1844,41 +1897,48 @@ pub(crate) async fn stage_node_from_metadata(
     stats: Arc<StageStats>,
     link_tracker: Option<Arc<crate::link::LinkTracker>>,
     known_child: KnownChild,
-) -> Result<NodeLink, StageError> {
+    parent_states: FilterStates,
+) -> Result<StagedChild, StageError> {
     if base_relative_path.is_empty() && (name.is_empty() || name.as_str() == ".") {
-        return Ok(NodeLink {
-            node: base_node,
-            repository: repository.id,
-            revision: state.revision(),
+        return Ok(StagedChild {
+            link: NodeLink {
+                node: base_node,
+                repository: repository.id,
+                revision: state.revision(),
+            },
+            states: parent_states,
         });
     }
 
     if name == DOT_URC || name == DOT_LORE {
         lore_trace!("Ignore dot directory {name}");
-        return Ok(NodeLink::invalid());
+        return Ok(StagedChild::invalid());
     }
     if name.ends_with(TEMP_FILE_EXTENSION) {
         lore_trace!("Ignore {TEMP_FILE_EXTENSION} file");
-        return Ok(NodeLink::invalid());
+        return Ok(StagedChild::invalid());
     }
     if name.ends_with(BASE_SUFFIX) {
         lore_trace!("Ignore {BASE_SUFFIX} file");
-        return Ok(NodeLink::invalid());
+        return Ok(StagedChild::invalid());
     }
     if name.ends_with(THEIRS_SUFFIX) {
         lore_trace!("Ignore {THEIRS_SUFFIX} file");
-        return Ok(NodeLink::invalid());
+        return Ok(StagedChild::invalid());
     }
 
     let force = execution_context().globals().force();
     let filter_path = base_relative_path.join(name.as_str());
-    if !force
-        && repository
-            .filter
-            .emit_excludes(&filter_path, true, FilterMode::Full)
-    {
+    let (states, excluded) = repository.filter.child_emit_excludes_unless_forced(
+        force,
+        parent_states,
+        &filter_path,
+        true,
+        FilterMode::Full,
+    );
+    if excluded {
         lore_trace!("Node excluded by filter: {}", filter_path.as_str());
-        return Ok(NodeLink::invalid());
+        return Ok(StagedChild::invalid());
     }
 
     lore_trace!(
@@ -2038,10 +2098,13 @@ pub(crate) async fn stage_node_from_metadata(
             .send();
         }
 
-        return Ok(NodeLink {
-            node: node_id,
-            repository: repository.id,
-            revision: state.revision(),
+        return Ok(StagedChild {
+            link: NodeLink {
+                node: node_id,
+                repository: repository.id,
+                revision: state.revision(),
+            },
+            states,
         });
     }
 
@@ -2387,7 +2450,10 @@ pub(crate) async fn stage_node_from_metadata(
         }
     }
 
-    Ok(node_link)
+    Ok(StagedChild {
+        link: node_link,
+        states,
+    })
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -3508,6 +3574,9 @@ pub(crate) async fn stage_from_parent_state(
                             absolute_path.display()
                         )
                     })?;
+                // One change per task, each naming a whole path, so the base is
+                // folded here rather than threaded from a walk.
+                let parent_states = repository.filter.exclusion_states(&relative_path);
                 stage_node_from_metadata(
                     repository,
                     state,
@@ -3520,6 +3589,7 @@ pub(crate) async fn stage_from_parent_state(
                     stats,
                     None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
                     KnownChild::Unresolved,
+                    parent_states,
                 )
                 .await
             });

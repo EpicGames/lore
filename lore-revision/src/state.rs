@@ -48,6 +48,7 @@ use crate::errors::NotFound;
 use crate::errors::Oversized;
 use crate::errors::StateErrors;
 use crate::filter::FilterMode;
+use crate::filter::FilterStates;
 use crate::fragment::FragmentFlags;
 use crate::fs::filesystem_provider::FilesystemTraversal;
 use crate::hash;
@@ -3350,9 +3351,11 @@ impl State {
         // the parent (no per-sibling clone) and a single `freeze` per retained
         // child is reused as the stored stack/result value, so the filter check
         // borrows it without an extra allocation.
-        let mut stack: Vec<(NodeID, RelativePath)> = vec![(root_node, base_path.freeze())];
+        let base_states = repository.filter.exclusion_states(&base_path);
+        let mut stack: Vec<(NodeID, RelativePath, FilterStates)> =
+            vec![(root_node, base_path.freeze(), base_states)];
 
-        while let Some((node_id, path)) = stack.pop() {
+        while let Some((node_id, path, states)) = stack.pop() {
             let children = self
                 .node_children(repository.clone(), node_id)
                 .await
@@ -3363,9 +3366,9 @@ impl State {
                 if node.is_dirty_add()
                     && node.is_directory()
                     && (force
-                        || !repository
+                        || repository
                             .filter
-                            .excludes_tree(&path, true, FilterMode::Full))
+                            .should_descend(states, &path, FilterMode::Full))
                 {
                     result.push(path);
                 }
@@ -3384,13 +3387,14 @@ impl State {
                 // Don't carry forward dirty paths the view/ignore filter
                 // excludes; they can't be replayed against a checkout that
                 // never materializes them. --force bypasses the filter.
-                if !force
-                    && repository.filter.excludes_tree(
-                        &child_path,
-                        child.is_directory(),
-                        FilterMode::Full,
-                    )
-                {
+                let (child_states, excluded) = repository.filter.child_excludes_tree_unless_forced(
+                    force,
+                    states,
+                    &child_path,
+                    child.is_directory(),
+                    FilterMode::Full,
+                );
+                if excluded {
                     continue;
                 }
 
@@ -3410,7 +3414,7 @@ impl State {
                     if child.is_dirty_delete() {
                         result.push(child_path);
                     } else {
-                        stack.push((child_id, child_path));
+                        stack.push((child_id, child_path, child_states));
                     }
                 }
             }
@@ -4555,6 +4559,9 @@ struct DirtyWalkLevel {
     cycle: SiblingCycleGuard,
     cursor: BlockCursor,
     appended: bool,
+    /// The filter's verdict for the directory this level walks, which each of
+    /// its children steps from rather than folding its whole path.
+    states: FilterStates,
 }
 
 /// Tree depth a dirty walk's stack is sized for. A deeper tree grows it.
@@ -4569,6 +4576,7 @@ async fn dirty_walk_level(
     repository: &Arc<RepositoryContext>,
     node_id: NodeID,
     appended: bool,
+    states: FilterStates,
 ) -> Result<Option<DirtyWalkLevel>, StateError> {
     let mut cursor = BlockCursor::open(state, repository, node_id).await?;
     let node = cursor.node(state, repository, node_id).await?;
@@ -4581,6 +4589,7 @@ async fn dirty_walk_level(
         cycle: SiblingCycleGuard::new(node_id),
         cursor,
         appended,
+        states,
     }))
 }
 
@@ -4616,7 +4625,10 @@ async fn collect_dirty_paths_inner(
     options: DirtyWalkOptions,
 ) -> Result<(), StateError> {
     let mut levels: Vec<DirtyWalkLevel> = Vec::with_capacity(DIRTY_WALK_LEVELS);
-    levels.extend(dirty_walk_level(&state, &repository, parent_node, false).await?);
+    // The parent is folded once; every level below carries the verdict its own
+    // children step from.
+    let parent_states = repository.filter.exclusion_states(&*parent_path);
+    levels.extend(dirty_walk_level(&state, &repository, parent_node, false, parent_states).await?);
 
     while let Some(level) = levels.last_mut() {
         let Some(child_id) = level.next_child else {
@@ -4626,6 +4638,7 @@ async fn collect_dirty_paths_inner(
             continue;
         };
 
+        let level_states = level.states;
         let child = level.cursor.node(&state, &repository, child_id).await?;
         child.walk_step(child_id, level.node, &mut level.cycle)?;
         level.next_child = child.sibling();
@@ -4646,12 +4659,13 @@ async fn collect_dirty_paths_inner(
         // Don't carry forward dirty paths that the view/ignore filter
         // excludes — they cannot be re-applied against a checkout that
         // never materializes them. --force bypasses the filter.
-        let excluded = !options.force
-            && repository.filter.excludes_tree(
-                &*parent_path,
-                child.is_directory(),
-                FilterMode::Full,
-            );
+        let (child_states, excluded) = repository.filter.child_excludes_tree_unless_forced(
+            options.force,
+            level_states,
+            &*parent_path,
+            child.is_directory(),
+            FilterMode::Full,
+        );
 
         let mut descended = false;
         if !excluded {
@@ -4660,7 +4674,8 @@ async fn collect_dirty_paths_inner(
             }
 
             if descends {
-                let opened = dirty_walk_level(&state, &repository, child_id, appended).await?;
+                let opened =
+                    dirty_walk_level(&state, &repository, child_id, appended, child_states).await?;
                 descended = opened.is_some();
                 levels.extend(opened);
             }
@@ -5426,6 +5441,40 @@ async fn load_node_for_change(
     }
 }
 
+/// [`add_change`] for an action that emits and stops.
+///
+/// Only [`FileAction::Delete`] and [`FileAction::Add`] walk the hierarchy under
+/// the change, so only they read a verdict. A caller emitting anything else owes
+/// none, and is spared the step it would take to produce one.
+async fn emit_change(
+    from: NodeChangeState,
+    to: NodeChangeState,
+    action: change::FileAction,
+    path: &RelativePath,
+    from_path: Option<&RelativePath>,
+    sink: &mut ChangeSink<'_>,
+    filter_mode: FilterMode,
+) -> Result<(), StateError> {
+    debug_assert!(
+        !matches!(action, FileAction::Delete | FileAction::Add),
+        "{action:?} walks the hierarchy and needs a verdict"
+    );
+    add_change(
+        from,
+        to,
+        action,
+        path,
+        from_path,
+        sink,
+        filter_mode,
+        FilterStates::ROOT,
+    )
+    .await
+}
+
+/// `states` is the filter's verdict for `path`, which the hierarchy walk below
+/// steps its children from rather than folding each whole path.
+#[allow(clippy::too_many_arguments)]
 async fn add_change(
     from: NodeChangeState,
     to: NodeChangeState,
@@ -5434,6 +5483,7 @@ async fn add_change(
     from_path: Option<&RelativePath>,
     sink: &mut ChangeSink<'_>,
     filter_mode: FilterMode,
+    states: FilterStates,
 ) -> Result<(), StateError> {
     // Avoid adding repository root node in case it was to/from an empty repository
     if from.node != ROOT_NODE || to.node != ROOT_NODE {
@@ -5487,8 +5537,10 @@ async fn add_change(
         return Ok(());
     }
 
-    Box::pin(async move { add_change_hierarchy(from, to, action, path, sink, filter_mode).await })
-        .await
+    Box::pin(async move {
+        add_change_hierarchy(from, to, action, path, sink, filter_mode, states).await
+    })
+    .await
 }
 
 /// Dispatch hierarchy traversal to the appropriate handler based on action.
@@ -5499,22 +5551,28 @@ async fn add_change_hierarchy(
     path: &RelativePath,
     sink: &mut ChangeSink<'_>,
     filter_mode: FilterMode,
+    states: FilterStates,
 ) -> Result<(), StateError> {
     match action {
-        FileAction::Delete => add_hierarchy_delete(from, to, path, sink, filter_mode).await?,
-        FileAction::Add => add_hierarchy_add(from, to, path, sink, filter_mode).await?,
+        FileAction::Delete => {
+            add_hierarchy_delete(from, to, path, sink, filter_mode, states).await?;
+        }
+        FileAction::Add => add_hierarchy_add(from, to, path, sink, filter_mode, states).await?,
         _ => {} // Keep/Copy/Move don't recurse here
     }
     Ok(())
 }
 
 /// Recursively add delete changes for an entire directory hierarchy.
+///
+/// `states` is the filter's verdict for `path`, which each child steps from.
 async fn add_hierarchy_delete(
     from: NodeChangeState,
     to: NodeChangeState,
     path: &RelativePath,
     sink: &mut ChangeSink<'_>,
     filter_mode: FilterMode,
+    states: FilterStates,
 ) -> Result<(), StateError> {
     // Try to get nodes from both states first
     let from_node = if from.node.is_valid_or_root_node_id() {
@@ -5563,11 +5621,13 @@ async fn add_hierarchy_delete(
         let child_path = path.push_into_buf(child_name).freeze();
 
         // Skip excluded paths
-        if iteration_state.repository.filter.emit_excludes(
+        let (child_states, excluded) = iteration_state.repository.filter.child_emit_excludes(
+            states,
             &child_path,
             child_node.is_directory(),
             filter_mode,
-        ) {
+        );
+        if excluded {
             continue;
         }
 
@@ -5581,6 +5641,7 @@ async fn add_hierarchy_delete(
             None,
             sink,
             filter_mode,
+            child_states,
         ))
         .await?;
     }
@@ -5588,12 +5649,15 @@ async fn add_hierarchy_delete(
 }
 
 /// Recursively add add changes for an entire directory hierarchy.
+///
+/// `states` is the filter's verdict for `path`, which each child steps from.
 async fn add_hierarchy_add(
     from: NodeChangeState,
     to: NodeChangeState,
     path: &RelativePath,
     sink: &mut ChangeSink<'_>,
     filter_mode: FilterMode,
+    states: FilterStates,
 ) -> Result<(), StateError> {
     // Check early exit conditions
     let to_node = if to.node.is_valid_or_root_node_id() {
@@ -5623,11 +5687,13 @@ async fn add_hierarchy_add(
         let child_path = path.push_into_buf(child_name).freeze();
 
         // Skip excluded paths
-        if to
-            .repository
-            .filter
-            .emit_excludes(&child_path, child_node.is_directory(), filter_mode)
-        {
+        let (child_states, excluded) = to.repository.filter.child_emit_excludes(
+            states,
+            &child_path,
+            child_node.is_directory(),
+            filter_mode,
+        );
+        if excluded {
             continue;
         }
 
@@ -5640,6 +5706,7 @@ async fn add_hierarchy_add(
             None,
             sink,
             filter_mode,
+            child_states,
         ))
         .await?;
     }
@@ -6017,9 +6084,11 @@ pub async fn diff_filesystem_ex(
 ) -> Result<(Vec<NodeChange>, FilesystemDiffStats), StateError> {
     let link_mounts = Arc::new(collect_link_mounts(&state_current, &repository_current).await?);
     if let Some(path) = path {
-        let excluded = repository_from
-            .filter
-            .emit_excludes(&path, true, filter_mode);
+        let parent_states = repository_from.filter.parent_exclusion_states(&path);
+        let (states, excluded) =
+            repository_from
+                .filter
+                .child_emit_excludes(parent_states, &path, true, filter_mode);
         if excluded {
             return Ok((Vec::new(), FilesystemDiffStats::default()));
         }
@@ -6062,6 +6131,8 @@ pub async fn diff_filesystem_ex(
                 root_node: node_link_to.node,
             },
             filesystem_path: path,
+            states,
+            from_states: states,
             filter_mode,
             scan_dirty,
             layer_mounts,
@@ -6083,6 +6154,8 @@ pub async fn diff_filesystem_ex(
                 root_node: ROOT_NODE,
             },
             filesystem_path: RelativePath::new(),
+            states: FilterStates::ROOT,
+            from_states: FilterStates::ROOT,
             filter_mode,
             scan_dirty,
             layer_mounts,
@@ -6178,6 +6251,12 @@ struct DiffFilesystemContext {
     from: FilesystemTraversal,
     current: FilesystemTraversal,
     filesystem_path: RelativePath,
+    /// The filter's verdict for `filesystem_path`, which every entry the walk
+    /// finds on disk steps from rather than folding its whole path.
+    states: FilterStates,
+    /// The same for `from.node_path`, which a rename spells differently from
+    /// the entry on disk, so the nodes the walk did not find need their own.
+    from_states: FilterStates,
     filter_mode: FilterMode,
     scan_dirty: bool,
     layer_mounts: Arc<Vec<LayerMountInfo>>,
@@ -6199,6 +6278,7 @@ pub async fn diff_filesystem_subtree(
     layer_mounts: Arc<Vec<LayerMountInfo>>,
 ) -> Result<(Vec<NodeChange>, FilesystemDiffStats), StateError> {
     let link_mounts = Arc::new(collect_link_mounts(&state_current, &repository_current).await?);
+    let states = repository_from.filter.exclusion_states(&node_path);
     diff_filesystem_subtree_impl(DiffFilesystemContext {
         from: FilesystemTraversal {
             repository: repository_from,
@@ -6213,6 +6293,8 @@ pub async fn diff_filesystem_subtree(
             root_node: root_node_to,
         },
         filesystem_path: node_path,
+        states,
+        from_states: states,
         filter_mode,
         scan_dirty: false,
         layer_mounts,
@@ -6298,6 +6380,7 @@ async fn diff_filesystem_subtree_impl(
             diff_filesystem_missing(
                 ctx.from,
                 ctx.filesystem_path,
+                ctx.states,
                 ctx.filter_mode,
                 ctx.scan_dirty,
             )
@@ -6407,6 +6490,9 @@ struct FileDiffContext {
     parent_node_id: Option<NodeID>,
     /// When true, set Dirty on modified files and clear Dirty on retained files inline.
     scan_dirty: bool,
+    /// The filter's verdict for the path this context describes, carried into
+    /// the changes it emits so a hierarchy walk below one does not fold again.
+    states: FilterStates,
 }
 
 impl FileDiffContext {
@@ -6479,6 +6565,7 @@ async fn emit_unstaged_add(
     sink: &mut ChangeSink<'_>,
     stats: &FilesystemDiffStats,
     filter_mode: FilterMode,
+    states: FilterStates,
 ) -> Result<(), StateError> {
     if from_node.is_dirty_move() {
         lore_trace!("File {file_path} is a dirty move destination, not an unstaged add");
@@ -6513,6 +6600,7 @@ async fn emit_unstaged_add(
         None,
         sink,
         filter_mode,
+        states,
     )
     .await?;
     stats.file_add.fetch_add(1, Ordering::Relaxed);
@@ -6617,6 +6705,7 @@ async fn handle_single_file_compare_result(
                     from_path,
                     sink,
                     filter_mode,
+                    ctx.states,
                 )
                 .await?;
                 stats.file_replace.fetch_add(1, Ordering::Relaxed);
@@ -6670,6 +6759,7 @@ async fn handle_single_file_compare_result(
                 from_path,
                 sink,
                 filter_mode,
+                ctx.states,
             )
             .await?;
 
@@ -6748,6 +6838,7 @@ async fn handle_single_file_compare_result(
                 None,
                 sink,
                 filter_mode,
+                ctx.states,
             )
             .await?;
 
@@ -6768,6 +6859,7 @@ async fn handle_single_file_compare_result(
                 None,
                 sink,
                 filter_mode,
+                ctx.states,
             )
             .await?;
 
@@ -6780,6 +6872,7 @@ async fn handle_single_file_compare_result(
                 None,
                 sink,
                 filter_mode,
+                ctx.states,
             )
             .await?;
         }
@@ -6798,6 +6891,7 @@ async fn handle_single_file_compare_result(
                 None,
                 sink,
                 filter_mode,
+                ctx.states,
             )
             .await?;
 
@@ -6810,6 +6904,7 @@ async fn handle_single_file_compare_result(
                 None,
                 sink,
                 filter_mode,
+                ctx.states,
             )
             .await?;
         }
@@ -6993,6 +7088,7 @@ async fn emit_filesystem_subtree_deletes(
     node_id: NodeID,
     node: &Node,
     path: &RelativePath,
+    states: FilterStates,
     filter_mode: FilterMode,
     scan_dirty: bool,
     sink: &mut ChangeSink<'_>,
@@ -7022,10 +7118,13 @@ async fn emit_filesystem_subtree_deletes(
         let child_path = path.push_into_buf(&child_name).freeze();
         // Release the block read lock before recursing (see NodeNameLock docs).
         drop(child_name);
-        if repository
-            .filter
-            .excludes_tree(&child_path, child_node.is_directory(), filter_mode)
-        {
+        let (child_states, excluded) = repository.filter.child_excludes_tree(
+            states,
+            &child_path,
+            child_node.is_directory(),
+            filter_mode,
+        );
+        if excluded {
             continue;
         }
         if Box::pin(emit_filesystem_subtree_deletes(
@@ -7034,6 +7133,7 @@ async fn emit_filesystem_subtree_deletes(
             child_id,
             &child_node,
             &child_path,
+            child_states,
             filter_mode,
             scan_dirty,
             sink,
@@ -7050,7 +7150,7 @@ async fn emit_filesystem_subtree_deletes(
         return Ok(true);
     }
 
-    if !had_child && !repository.filter.excludes_tree(path, true, filter_mode) {
+    if !had_child && repository.filter.should_descend(states, path, filter_mode) {
         // Empty in-view directory: clone/checkout writes it, so its absence is a
         // real deletion. It is the materializing leaf here, and its own buffered
         // entry (pushed above) is flushed and marked along with its ancestors.
@@ -7131,11 +7231,13 @@ async fn diff_filesystem_directory_walk(
             .push_into_buf(item.name.as_str())
             .freeze();
 
-        if ctx.from.repository.filter.emit_excludes(
+        let (item_states, excluded) = ctx.from.repository.filter.child_emit_excludes(
+            ctx.states,
             &item_path,
             item.metadata.is_dir(),
             ctx.filter_mode,
-        ) {
+        );
+        if excluded {
             continue;
         }
 
@@ -7206,6 +7308,7 @@ async fn diff_filesystem_directory_walk(
                     &mut ChangeSink::Vec(&mut *changes),
                     stats,
                     ctx.filter_mode,
+                    item_states,
                 )
                 .await?;
                 continue;
@@ -7235,6 +7338,7 @@ async fn diff_filesystem_directory_walk(
                 from_node: Some(from_node),
                 parent_node_id: Some(ctx.from.root_node),
                 scan_dirty: ctx.scan_dirty,
+                states: item_states,
             };
 
             // This handles renames (via from_path_for_rename), modifications, and unmodified cases
@@ -7270,6 +7374,14 @@ async fn diff_filesystem_directory_walk(
                 (link_from.clone(), state_from.clone(), subnode_from)
             };
             let subpath = item_path.clone();
+            // The node's own path is what the from side walks under, and a
+            // rename spells it differently from the entry on disk.
+            let from_item_states = ctx
+                .from
+                .repository
+                .filter
+                .child_excludes_tree(ctx.from_states, &from_path, true, ctx.filter_mode)
+                .0;
             diff_filesystem_subtree_dispatch(
                 DiffFilesystemContext {
                     from: FilesystemTraversal {
@@ -7285,6 +7397,8 @@ async fn diff_filesystem_directory_walk(
                         root_node: subnode_current,
                     },
                     filesystem_path: subpath,
+                    states: item_states,
+                    from_states: from_item_states,
                     filter_mode: ctx.filter_mode,
                     scan_dirty: ctx.scan_dirty,
                     layer_mounts: ctx.layer_mounts.clone(),
@@ -7336,10 +7450,19 @@ async fn diff_filesystem_directory_walk(
                     Some(&from_path),
                     &mut ChangeSink::Vec(&mut *changes),
                     ctx.filter_mode,
+                    item_states,
                 )
                 .await?;
             }
             let subpath = item_path.clone();
+            // The node's own path is what the from side walks under, and a
+            // rename spells it differently from the entry on disk.
+            let from_item_states = ctx
+                .from
+                .repository
+                .filter
+                .child_excludes_tree(ctx.from_states, &from_path, true, ctx.filter_mode)
+                .0;
             let repository_from = node_list.repository.clone();
             let state_from = node_list.state.clone();
             let repository_current = current_node_list.repository.clone();
@@ -7378,6 +7501,8 @@ async fn diff_filesystem_directory_walk(
                         root_node: subnode_current,
                     },
                     filesystem_path: subpath,
+                    states: item_states,
+                    from_states: from_item_states,
                     filter_mode: ctx.filter_mode,
                     scan_dirty: ctx.scan_dirty,
                     layer_mounts: ctx.layer_mounts.clone(),
@@ -7397,6 +7522,7 @@ async fn diff_filesystem_directory_walk(
                 from_node: Some(from_node),
                 parent_node_id: Some(ctx.from.root_node),
                 scan_dirty: ctx.scan_dirty,
+                states: item_states,
             };
 
             // Determine the type change direction
@@ -7432,10 +7558,11 @@ async fn diff_filesystem_directory_walk(
             continue;
         }
 
-        let Some(from_node) = get_filtered_node_and_path(
+        let Some((from_node, from_node_states)) = get_filtered_node_and_path(
             node_list,
             from_named_node.node,
             &ctx.from.node_path,
+            ctx.from_states,
             ctx.filter_mode,
         )
         .await?
@@ -7471,6 +7598,7 @@ async fn diff_filesystem_directory_walk(
                 from_named_node.node,
                 &from_node.node,
                 &from_node.path,
+                from_node_states,
                 ctx.filter_mode,
                 ctx.scan_dirty,
                 &mut ChangeSink::Vec(&mut *changes),
@@ -7540,6 +7668,7 @@ async fn diff_filesystem_directory_walk(
             None,
             &mut ChangeSink::Vec(&mut *changes),
             ctx.filter_mode,
+            from_node_states,
         )
         .await?;
     }
@@ -7552,11 +7681,13 @@ async fn diff_filesystem_directory_walk(
             .push_into_buf(file.name.as_str())
             .freeze();
 
-        if ctx.from.repository.filter.emit_excludes(
+        let (child_states, excluded) = ctx.from.repository.filter.child_emit_excludes(
+            ctx.states,
             &child_file_path,
             file.metadata.is_dir(),
             ctx.filter_mode,
-        ) {
+        );
+        if excluded {
             continue 'new_file_iter;
         }
 
@@ -7618,6 +7749,10 @@ async fn diff_filesystem_directory_walk(
                             root_node: layer_source_node,
                         },
                         filesystem_path: subpath,
+                        states: child_states,
+                        // The layer is walked at its mount path, which is the
+                        // path on disk.
+                        from_states: child_states,
                         filter_mode: ctx.filter_mode,
                         scan_dirty: ctx.scan_dirty,
                         // Non-overlapping layers: no nested mounts inside a layer.
@@ -7648,6 +7783,7 @@ async fn diff_filesystem_directory_walk(
             // against it so a rescan matches the persisted subtree.
             let mut dir_from_root = INVALID_NODE;
             let mut dir_from_path = RelativePath::new();
+            let mut dir_from_states = FilterStates::ROOT;
             if ctx.scan_dirty {
                 // The new directory is a child of the directory currently being
                 // walked; its node is the correct parent even across link/layer
@@ -7689,6 +7825,7 @@ async fn diff_filesystem_directory_walk(
                     .await?;
                 dir_from_root = new_dir_id;
                 dir_from_path = child_file_path.clone();
+                dir_from_states = child_states;
             }
 
             let repository_from = ctx.from.repository.clone();
@@ -7711,6 +7848,8 @@ async fn diff_filesystem_directory_walk(
                         root_node: INVALID_NODE,
                     },
                     filesystem_path: subpath,
+                    states: child_states,
+                    from_states: dir_from_states,
                     filter_mode: ctx.filter_mode,
                     scan_dirty: ctx.scan_dirty,
                     layer_mounts: ctx.layer_mounts.clone(),
@@ -7737,6 +7876,7 @@ async fn diff_filesystem_directory_walk(
             from_node: None,
             parent_node_id: Some(ctx.from.root_node),
             scan_dirty: ctx.scan_dirty,
+            states: child_states,
         };
 
         lore_trace!("Filesystem has new item in path {child_file_path}, add add change");
@@ -7883,6 +8023,7 @@ async fn diff_filesystem_single_file(
             &mut ChangeSink::Vec(&mut changes),
             &stats,
             ctx.filter_mode,
+            ctx.states,
         )
         .await?;
         return Ok((changes, stats));
@@ -7906,6 +8047,7 @@ async fn diff_filesystem_single_file(
         from_node,
         parent_node_id: None,
         scan_dirty: ctx.scan_dirty,
+        states: ctx.states,
     };
 
     handle_single_file_compare_result(
@@ -7928,6 +8070,7 @@ async fn diff_filesystem_single_file(
 async fn diff_filesystem_missing(
     from: FilesystemTraversal,
     node_path: RelativePath,
+    states: FilterStates,
     filter_mode: FilterMode,
     scan_dirty: bool,
 ) -> Result<(Vec<NodeChange>, FilesystemDiffStats), StateError> {
@@ -7979,6 +8122,7 @@ async fn diff_filesystem_missing(
             None,
             &mut ChangeSink::Vec(&mut changes),
             filter_mode,
+            states,
         )
         .await?;
     }

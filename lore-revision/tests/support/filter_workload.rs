@@ -183,3 +183,228 @@ pub fn target_list(dirs: usize, files_per_dir: usize) -> Vec<String> {
     out.sort();
     out
 }
+
+/// One node of [`tree`].
+pub struct TreeNode {
+    pub name: String,
+    pub is_dir: bool,
+    pub children: Vec<u32>,
+}
+
+/// Adds directories and files to a node arena.
+struct TreeBuilder {
+    nodes: Vec<TreeNode>,
+}
+
+impl TreeBuilder {
+    fn new() -> Self {
+        Self {
+            nodes: vec![TreeNode {
+                name: String::new(),
+                is_dir: true,
+                children: Vec::new(),
+            }],
+        }
+    }
+
+    fn add(&mut self, parent: usize, name: &str, is_dir: bool) -> usize {
+        let index = self.nodes.len();
+        self.nodes.push(TreeNode {
+            name: name.to_owned(),
+            is_dir,
+            children: Vec::new(),
+        });
+        self.nodes[parent].children.push(index as u32);
+        index
+    }
+
+    fn dir(&mut self, parent: usize, name: &str) -> usize {
+        self.add(parent, name, true)
+    }
+
+    fn file(&mut self, parent: usize, name: &str) {
+        self.add(parent, name, false);
+    }
+
+    /// A chain of directories, returning the deepest.
+    fn chain(&mut self, parent: usize, names: &[&str]) -> usize {
+        let mut at = parent;
+        for name in names {
+            at = self.dir(at, name);
+        }
+        at
+    }
+}
+
+/// A tree of the shape [`rules`] describes, as a node arena a walk descends
+/// without parsing paths.
+///
+/// The point is that a walk over it meets every case the rules set up: subtrees
+/// pruned at the root, exclusions re-included one level down and re-excluded the
+/// level below that, directory-only and bare-name rules biting at depth, and
+/// deep paths matching nothing at all. Timing a walk over a tree that only ever
+/// matched one rule kind would say nothing about a real one.
+///
+/// Held as an arena rather than a path list so a walk costs a name push per node
+/// and nothing else: the filter is what is being timed, not path arithmetic.
+pub fn tree(modules: usize, files_per_dir: usize) -> Vec<TreeNode> {
+    let mut b = TreeBuilder::new();
+    let root = 0;
+
+    // Subtrees a rooted rule prunes whole. A walk should reach the directory and
+    // stop, so these cost one call each however much is under them.
+    for pruned in ["Intermediate", "Saved", "Build", "DerivedDataCache"] {
+        let at = b.chain(root, &[pruned, "Win64", "Inner"]);
+        for file in 0..files_per_dir {
+            b.file(at, &format!("Pruned{file:03}.obj"));
+        }
+    }
+
+    for project in [
+        "Engine",
+        "Game",
+        "Plugins",
+        "Programs",
+        "Templates",
+        "Samples",
+    ] {
+        let project_node = b.dir(root, project);
+
+        // Source: mostly matching nothing, which is the full line scan.
+        let runtime = b.chain(project_node, &["Source", "Runtime"]);
+        for module in 0..modules {
+            let module_node = b.dir(runtime, &format!("Module{module:04}"));
+            for visibility in ["Public", "Private"] {
+                let at = b.dir(module_node, visibility);
+                for file in 0..files_per_dir {
+                    b.file(at, &format!("File{file:03}.cpp"));
+                    b.file(at, &format!("File{file:03}.h"));
+                }
+                // Extension rules biting at depth.
+                b.file(at, "scratch.tmp");
+                b.file(at, "build.log");
+                b.file(at, "Module.o");
+            }
+            // Bare-name rules biting at depth.
+            let modules_dir = b.chain(module_node, &["Web", "node_modules", "react"]);
+            for file in 0..files_per_dir {
+                b.file(modules_dir, &format!("index{file:03}.js"));
+            }
+            let target = b.chain(module_node, &["target", "debug"]);
+            for file in 0..files_per_dir {
+                b.file(target, &format!("artifact{file:03}.rlib"));
+            }
+        }
+
+        // Content, including the developers tree whose Shared branch is
+        // re-included below an exclusion.
+        let maps = b.chain(project_node, &["Content", "Maps"]);
+        for module in 0..modules {
+            let at = b.dir(maps, &format!("Area{module:04}"));
+            for file in 0..files_per_dir {
+                b.file(at, &format!("Asset{file:03}.uasset"));
+            }
+        }
+        let developers = b.chain(project_node, &["Content", "Developers"]);
+        for developer in ["Shared", "alice", "bob", "carol"] {
+            let at = b.dir(developers, developer);
+            for file in 0..files_per_dir {
+                b.file(at, &format!("Work{file:03}.uasset"));
+            }
+        }
+
+        // Binaries: excluded, with Win64 re-included and its .pdb re-excluded.
+        let binaries = b.dir(project_node, "Binaries");
+        for platform in ["Win64", "Linux", "Mac"] {
+            let at = b.dir(binaries, platform);
+            for module in 0..modules {
+                b.file(at, &format!("Module{module:04}.dll"));
+                b.file(at, &format!("Module{module:04}.pdb"));
+                b.file(at, &format!("Module{module:04}.exe"));
+            }
+        }
+
+        // Intermediate: excluded, with Config re-included for half the projects.
+        let intermediate = b.dir(project_node, "Intermediate");
+        let build = b.chain(intermediate, &["Build", "Win64"]);
+        for module in 0..modules {
+            b.file(build, &format!("Module{module:04}.obj"));
+        }
+        let config = b.dir(intermediate, "Config");
+        for file in 0..files_per_dir {
+            b.file(config, &format!("Base{file:03}.ini"));
+        }
+
+        // Nested plugins, each with the same excluded/re-included shape.
+        let plugins = b.dir(project_node, "Plugins");
+        for plugin in 0..modules / 4 {
+            let plugin_node = b.dir(plugins, &format!("Plugin{plugin:04}"));
+            let source = b.chain(plugin_node, &["Source", "Private"]);
+            for file in 0..files_per_dir {
+                b.file(source, &format!("File{file:03}.cpp"));
+            }
+            let plugin_binaries = b.chain(plugin_node, &["Binaries", "Win64"]);
+            for file in 0..files_per_dir {
+                b.file(plugin_binaries, &format!("Plugin{file:03}.dll"));
+            }
+            let temp = b.chain(plugin_node, &["Content", "Temp"]);
+            for file in 0..files_per_dir {
+                b.file(temp, &format!("Cooked{file:03}.uasset"));
+            }
+        }
+
+        let logs = b.chain(project_node, &["Saved", "Logs"]);
+        for file in 0..files_per_dir {
+            b.file(logs, &format!("Run{file:03}.log"));
+        }
+    }
+
+    // The sparse-view tail: everything under Restricted excluded, named modules
+    // back in. Half the modules here are named, half are not.
+    let restricted_source = b.chain(root, &["Restricted", "Source"]);
+    let named = [
+        "Core",
+        "CoreUObject",
+        "Engine",
+        "RenderCore",
+        "RHI",
+        "Slate",
+        "SlateCore",
+        "InputCore",
+        "Json",
+        "Sockets",
+        "Networking",
+        "AudioMixer",
+        "Chaos",
+    ];
+    for module in named {
+        let at = b.chain(restricted_source, &[module, "Public"]);
+        for file in 0..files_per_dir {
+            b.file(at, &format!("{module}{file:03}.h"));
+        }
+    }
+    for module in 0..modules {
+        let at = b.chain(
+            restricted_source,
+            &[&format!("Private{module:04}"), "Public"],
+        );
+        for file in 0..files_per_dir {
+            b.file(at, &format!("Hidden{file:03}.h"));
+        }
+    }
+    let docs = b.chain(root, &["Restricted", "Docs"]);
+    for file in 0..files_per_dir {
+        b.file(docs, &format!("README{file:03}.md"));
+    }
+
+    // A deep chain, where a whole-path query pays for depth and a walk does not.
+    let deep = b.chain(
+        root,
+        &["Deep", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J"],
+    );
+    for file in 0..files_per_dir * 4 {
+        b.file(deep, &format!("Deep{file:03}.cpp"));
+    }
+
+    b.nodes
+}

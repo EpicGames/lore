@@ -15,6 +15,7 @@ use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
 use crate::filter::FilterMode;
+use crate::filter::FilterStates;
 use crate::immutable;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
@@ -401,10 +402,14 @@ async fn calculate_local_filtered_size_hash(
     local: bool,
     filtered: bool,
 ) -> Result<LocalFiltered, InfoError> {
-    if repository
-        .filter
-        .emit_excludes(&relative_path, node.is_directory(), FilterMode::Full)
-    {
+    let parent_states = repository.filter.parent_exclusion_states(&relative_path);
+    let (_, excluded) = repository.filter.child_emit_excludes(
+        parent_states,
+        &relative_path,
+        node.is_directory(),
+        FilterMode::Full,
+    );
+    if excluded {
         return Ok(LocalFiltered::default());
     }
 
@@ -448,7 +453,12 @@ async fn calculate_local_filtered_size_hash(
         let local_size_task = lore_spawn!(async move {
             if local {
                 lore_debug!("Calculating local size");
-                calculate_local_size_recurse(local_size_repository, local_size_relative_path).await
+                calculate_local_size_recurse(
+                    local_size_repository,
+                    local_size_relative_path,
+                    parent_states,
+                )
+                .await
             } else {
                 Ok(0)
             }
@@ -467,6 +477,7 @@ async fn calculate_local_filtered_size_hash(
                     filtered_state,
                     node,
                     node_id,
+                    parent_states,
                 )
                 .await
             } else {
@@ -499,9 +510,13 @@ async fn calculate_local_filtered_size_hash(
     }
 }
 
+/// `parent_states` is the filter verdict for the directory holding
+/// `relative_path`, which this walk steps once per node rather than folding the
+/// whole path per node.
 fn calculate_local_size_recurse(
     repository: Arc<RepositoryContext>,
     relative_path: RelativePath,
+    parent_states: FilterStates,
 ) -> Pin<Box<dyn Future<Output = Result<u64, InfoError>> + Send>> {
     Box::pin(async move {
         if relative_path.as_str() == DOT_URC || relative_path.as_str() == DOT_LORE {
@@ -513,10 +528,13 @@ fn calculate_local_size_recurse(
             .metadata(absolute_path.as_path())
             .await
         {
-            if repository
-                .filter
-                .emit_excludes(&relative_path, metadata.is_dir(), FilterMode::Full)
-            {
+            let (states, excluded) = repository.filter.child_emit_excludes(
+                parent_states,
+                &relative_path,
+                metadata.is_dir(),
+                FilterMode::Full,
+            );
+            if excluded {
                 return Ok(0);
             }
 
@@ -536,7 +554,7 @@ fn calculate_local_size_recurse(
                     let repository = repository.clone();
                     let relative_path = relative_path.push_into_buf(item.name.as_str()).freeze();
                     lore_spawn!(local_size_tasks, async move {
-                        calculate_local_size_recurse(repository, relative_path).await
+                        calculate_local_size_recurse(repository, relative_path, states).await
                     });
                 }
 
@@ -567,18 +585,25 @@ fn calculate_local_size_recurse(
     })
 }
 
+/// `parent_states` is the filter verdict for the directory holding
+/// `relative_path`, which this walk steps once per node rather than folding the
+/// whole path per node.
 fn calculate_filtered_size_recurse(
     repository: Arc<RepositoryContext>,
     relative_path: RelativePath,
     state: Arc<State>,
     node: Node,
     node_id: NodeID,
+    parent_states: FilterStates,
 ) -> Pin<Box<dyn Future<Output = Result<u64, InfoError>> + Send>> {
     Box::pin(async move {
-        if repository
-            .filter
-            .emit_excludes(&relative_path, node.is_directory(), FilterMode::Full)
-        {
+        let (states, excluded) = repository.filter.child_emit_excludes(
+            parent_states,
+            &relative_path,
+            node.is_directory(),
+            FilterMode::Full,
+        );
+        if excluded {
             return Ok(0);
         }
         if node.is_file() {
@@ -617,8 +642,15 @@ fn calculate_filtered_size_recurse(
                         "Failed to calculate filtered size, encountered an invalid node",
                     )?;
                 let relative_path = relative_path.push_into_buf(name).freeze();
-                calculate_filtered_size_recurse(repository, relative_path, state, child_node, child)
-                    .await
+                calculate_filtered_size_recurse(
+                    repository,
+                    relative_path,
+                    state,
+                    child_node,
+                    child,
+                    states,
+                )
+                .await
             });
 
             child_iter = sibling;

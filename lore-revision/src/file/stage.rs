@@ -426,7 +426,7 @@ pub async fn stage(
             let link_tracker = link_tracker.clone();
             let global_mask = global_mask.clone();
             lore_spawn!(level_tasks, async move {
-                let result = stage::stage_filesystem_path(
+                let result = Box::pin(stage::stage_filesystem_path(
                     repository,
                     state,
                     base.absolute,
@@ -439,7 +439,7 @@ pub async fn stage(
                     global_mask,
                     base.prefixes,
                     None, // Pre-create stages no children, so it reaches no boundary
-                )
+                ))
                 .await;
                 (index, result)
             });
