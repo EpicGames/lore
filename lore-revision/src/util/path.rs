@@ -692,6 +692,12 @@ impl RelativePath {
         covers_impl(self.as_lowercase_str(), child.as_lowercase_str())
     }
 
+    /// [`overlaps`](Self::overlaps) on the lowercased form, for the same reason
+    /// as [`covers_ignore_case`](Self::covers_ignore_case).
+    pub fn overlaps_ignore_case(&self, other: &RelativePath) -> bool {
+        overlaps_impl(self.as_lowercase_str(), other.as_lowercase_str())
+    }
+
     /// Reduces a set of paths to the minimal covering set by removing exact
     /// duplicates and replacing any descendant path with its ancestor — so each
     /// returned path is a superset of the input paths it covers.

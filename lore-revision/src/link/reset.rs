@@ -114,6 +114,23 @@ pub(crate) async fn reset_staged_remove_link(
         .await
         .forward::<LinkError>("Failed to find link registry entry")?;
 
+    let linked_repository = Arc::new(repository.to_link_context(link_id).await);
+
+    // A mount added while this removal was staged can overlap the one being
+    // restored.
+    let source_path = link::pinned_source_path(linked_repository.clone(), &current_link_node)
+        .await
+        .forward::<LinkError>("Failed resolving link source path")?;
+    link::check_source_path_overlap(
+        &state_staged,
+        repository.clone(),
+        linked_repository.clone(),
+        source_path,
+        link_node_id,
+    )
+    .await
+    .forward::<LinkError>("Failed checking link source paths")?;
+
     state_staged
         .link_add(
             repository.clone(),
@@ -132,7 +149,6 @@ pub(crate) async fn reset_staged_remove_link(
         .await
         .internal("recreating the link directory")?;
 
-    let linked_repository = Arc::new(repository.to_link_context(link_id).await);
     link::realize_link_pin_change(
         repository.clone(),
         linked_repository,

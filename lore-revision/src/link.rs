@@ -32,6 +32,7 @@ use crate::lore_info;
 use crate::node::Node;
 use crate::node::NodeBlock;
 use crate::node::NodeID;
+use crate::node::NodeIDExt;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::revision;
@@ -239,14 +240,14 @@ pub struct LoreLinkChangeEventData {
     pub action: LoreFileAction,
 }
 
-/// A link mounted at the repository root carries an empty path; report it as
-/// `/` so every link event names a path.
+/// A mount at a repository root carries an empty path; report it as `/` so
+/// every message and event names a path.
+pub(crate) fn display_path(path: &str) -> &str {
+    if path.is_empty() { "/" } else { path }
+}
+
 fn event_link_path(link_path: &str) -> LoreString {
-    if link_path.is_empty() {
-        LoreString::from("/")
-    } else {
-        LoreString::from(link_path)
-    }
+    LoreString::from(display_path(link_path))
 }
 
 impl LoreLinkChangeEventData {
@@ -1457,6 +1458,34 @@ pub struct DescribedLink {
     pub source_path: String,
 }
 
+/// The path a link exposes from the repository it points at, as stored, so a
+/// root mount is the empty path.
+pub async fn link_source_path(
+    link_context: Arc<RepositoryContext>,
+    link_state: &State,
+    source_node: NodeID,
+) -> Result<RelativePath, StateError> {
+    let source_path = link_state
+        .node_path(link_context, source_node)
+        .await
+        .forward::<StateError>("Failed resolving link node")?;
+
+    RelativePath::new_from_initial_path(source_path)
+        .forward::<StateError>("Invalid link source path")
+}
+
+/// The source path a link node exposes, read from the revision it pins.
+pub async fn pinned_source_path(
+    link_context: Arc<RepositoryContext>,
+    link_node: &Node,
+) -> Result<RelativePath, StateError> {
+    let link_state = State::deserialize(link_context.clone(), link_node.address.hash)
+        .await
+        .forward::<StateError>("Failed deserializing state")?;
+
+    link_source_path(link_context, &link_state, link_node.child).await
+}
+
 /// Reads the pinned state of a linked repository and the path the link exposes
 /// from it, normalising a root mount to `/`.
 pub async fn describe_link(
@@ -1468,21 +1497,146 @@ pub async fn describe_link(
         .await
         .forward::<LinkError>("Failed deserializing state node block")?;
 
-    let source_path = link_state
-        .node_path(link_context.clone(), link_node.child)
+    let source_path = link_source_path(link_context, &link_state, link_node.child)
         .await
-        .forward::<LinkError>("Failed resolving link node")?;
-
-    let source_path = if source_path.is_empty() {
-        String::from("/")
-    } else {
-        source_path
-    };
+        .forward::<LinkError>("Failed resolving link source path")?;
 
     Ok(DescribedLink {
         link_state,
-        source_path,
+        source_path: display_path(source_path.as_str()).to_string(),
     })
+}
+
+/// Two mounts of one repository whose source subtrees strictly nest place the
+/// same content at both mount paths under separate pins, so an edit through one
+/// is invisible to the other and whichever mount the stage walk reaches last
+/// decides the content. Identical subtrees resolve to one shared linked state
+/// and advance together, so they are left alone.
+///
+/// Rejects an incoming mount whose source subtree nests with one `state_target`
+/// already holds, or with another mount arriving in the same set of changes.
+///
+/// Runs before realization: the realize loop clones a mount's content and stages
+/// its node before the registry write that would reject it, so rejecting there
+/// would leave untracked content behind with no merge state to abort.
+pub async fn check_incoming_mount_overlaps(
+    repository: Arc<RepositoryContext>,
+    state_target: &State,
+    changes: &[NodeChange],
+) -> Result<(), StateError> {
+    let mut incoming: Vec<(RepositoryId, RelativePath)> = Vec::new();
+
+    for change in changes.iter() {
+        if change.action == crate::change::FileAction::Delete || !change.to.node.is_valid_node_id()
+        {
+            continue;
+        }
+
+        let node = change
+            .to
+            .state
+            .node(change.to.repository.clone(), change.to.node)
+            .await?;
+
+        if !node.is_link() {
+            continue;
+        }
+
+        let link_id: RepositoryId = node.address.context.into();
+        let link_context = Arc::new(repository.to_link_context(link_id).await);
+        let source_path = pinned_source_path(link_context.clone(), &node).await?;
+
+        check_source_path_overlap(
+            state_target,
+            repository.clone(),
+            link_context,
+            source_path.clone(),
+            change.from.node,
+        )
+        .await?;
+
+        if let Some((_, other)) = incoming.iter().find(|(other_id, other_path)| {
+            *other_id == link_id && source_paths_nest(&source_path, other_path)
+        }) {
+            return Err(InvalidArguments {
+                reason: format!(
+                    "incoming source path {} overlaps incoming source path {} in the same \
+                     repository",
+                    display_path(source_path.as_str()),
+                    display_path(other.as_str()),
+                ),
+            }
+            .into());
+        }
+
+        incoming.push((link_id, source_path));
+    }
+
+    Ok(())
+}
+
+/// Whether two source subtrees overlap without being the same subtree.
+///
+/// Compared case-insensitively: the two paths are read from the revisions their
+/// own mounts pin, so a case-only rename between those revisions leaves one
+/// spelling of a subtree both still address.
+pub fn source_paths_nest(left: &RelativePath, right: &RelativePath) -> bool {
+    left.as_lowercase_str() != right.as_lowercase_str() && left.overlaps_ignore_case(right)
+}
+
+/// `source_path` must be the path as stored in the linked repository, so that it
+/// compares directly against what the existing mounts resolve to.
+/// `exclude_node` is the mount being written, which must not be compared against
+/// itself.
+pub async fn check_source_path_overlap(
+    state: &State,
+    repository: Arc<RepositoryContext>,
+    link_context: Arc<RepositoryContext>,
+    source_path: RelativePath,
+    exclude_node: NodeID,
+) -> Result<(), StateError> {
+    let link_list = state
+        .link_list(repository.clone())
+        .await
+        .forward::<StateError>("Failed to list links")?;
+
+    for link_reference in link_list.iter().filter(|reference| {
+        reference.repository == link_context.id && reference.local_node != exclude_node
+    }) {
+        let Ok(link_node) = state
+            .node(repository.clone(), link_reference.local_node)
+            .await
+        else {
+            lore_debug!(
+                "Skipping unresolvable link node {}",
+                link_reference.local_node
+            );
+            continue;
+        };
+
+        let mounted_source = pinned_source_path(link_context.clone(), &link_node).await?;
+
+        if !source_paths_nest(&source_path, &mounted_source) {
+            continue;
+        }
+
+        let link_path = state
+            .node_path(repository.clone(), link_reference.local_node)
+            .await
+            .forward::<StateError>("Failed resolving link node")?;
+
+        return Err(InvalidArguments {
+            reason: format!(
+                "source path {} overlaps the link already mounted at {} from source path {}",
+                display_path(source_path.as_str()),
+                display_path(&link_path),
+                display_path(mounted_source.as_str()),
+            ),
+        }
+        .into());
+    }
+
+    Ok(())
 }
 
 /// A link's node and the repository that owns the mount, without consulting the

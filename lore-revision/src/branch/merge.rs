@@ -2110,6 +2110,11 @@ pub async fn apply_diff(
     // diff paths are link-root-relative.
     let stats = Arc::new(sync::SyncRealizeStats::default());
     let changes = Arc::new(diff.changes);
+
+    link::check_incoming_mount_overlaps(repository.clone(), &state_current, &changes)
+        .await
+        .forward::<MergeError>("checking incoming link source paths")?;
+
     let dry_run = execution_context().globals().dry_run();
     sync::realize_changes(
         repository.clone(),

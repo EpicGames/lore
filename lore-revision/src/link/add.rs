@@ -265,6 +265,22 @@ pub async fn add(
     let inner_state = chain.innermost_state.clone();
     let remainder_path = chain.remainder_path.clone();
 
+    // The stored path rather than the argument, which resolved case-insensitively.
+    let resolved_source_path =
+        link::link_source_path(link.clone(), &link_state, link_node_link.node)
+            .await
+            .forward::<LinkError>("Failed resolving link source path")?;
+
+    link::check_source_path_overlap(
+        &inner_state,
+        inner_repository.clone(),
+        link.clone(),
+        resolved_source_path,
+        crate::node::INVALID_NODE,
+    )
+    .await
+    .forward::<LinkError>("Failed checking link source paths")?;
+
     if let Ok(node_link) = inner_state
         .find_relative_node_link(
             inner_repository.clone(),
