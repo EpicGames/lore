@@ -28,7 +28,7 @@ pub struct JWTUserInfo {
     pub issuer: String,
     #[serde(rename = "sub")]
     pub user_id: String,
-    pub name: String,
+    pub name: Option<String>,
     pub preferred_username: Option<String>,
     pub is_service_account: Option<bool>,
     #[serde(rename = "exp")]
@@ -104,7 +104,7 @@ pub fn user_info_from_token(token: String) -> Option<UserInfo> {
     };
     Some(UserInfo {
         id: token_data.claims.user_id.clone(),
-        name: token_data.claims.name.clone(),
+        name: token_data.claims.name.clone().unwrap_or_default(),
         token,
         preferred_username: token_data.claims.preferred_username.unwrap_or_default(),
         is_service_account: token_data.claims.is_service_account.unwrap_or_default(),
@@ -162,5 +162,45 @@ mod tests {
         assert!(identity_from_token("not-a-jwt").is_empty());
         // Well-formed base64 segments that are not JWT claims.
         assert!(identity_from_token("aaaa.bbbb.cccc").is_empty());
+    }
+
+    fn token_with_claims(claims: &str) -> String {
+        use base64::Engine;
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+
+        let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#);
+        let claims = URL_SAFE_NO_PAD.encode(claims);
+        format!("{header}.{claims}.signature")
+    }
+
+    /// A Keycloak-shaped token carries no `name` claim. It must still decode,
+    /// with the subject as the id, rather than failing the whole decode.
+    #[test]
+    fn a_token_without_a_name_decodes_with_its_subject_as_the_id() {
+        let token = token_with_claims(
+            r#"{"iss":"lore","sub":"alice","exp":2000000000,"aud":["example.com"]}"#,
+        );
+
+        let info = user_info_from_token(token).expect("a nameless token decodes");
+        assert_eq!(info.id, "alice");
+        assert!(info.name.is_empty());
+    }
+
+    /// Regression: a required `name` made `user_info_from_token` return `None`
+    /// for a nameless token, so callers reading `expires` silently skipped the
+    /// expiry check. An expired nameless token must report its expiry.
+    #[test]
+    fn an_expired_nameless_token_still_reports_its_expiry() {
+        let token = token_with_claims(
+            r#"{"iss":"lore","sub":"alice","exp":1000000000,"aud":["example.com"]}"#,
+        );
+
+        let info = user_info_from_token(token).expect("an expired nameless token still decodes");
+        assert_eq!(info.expires, 1_000_000_000_000, "expiry in milliseconds");
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        assert!(info.expires < now_ms, "the token reads as expired");
     }
 }
