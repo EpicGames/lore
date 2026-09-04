@@ -428,14 +428,15 @@ mod tests {
                     issuer: "test".to_string(),
                     issued_at: 123456700,
                     audience: vec!["Lore".to_string()],
-                    env: "DEV".to_string(),
-                    name: "test".to_string(),
-                    preferred_username: "test".to_string(),
+                    env: Some("DEV".to_string()),
+                    name: Some("test".to_string()),
+                    preferred_username: Some("test".to_string()),
+                    client_id: None,
                     resources: None,
                     groups: None,
                     is_service_account: Some(false),
                     expires: expiration,
-                    idp: "test".to_string(),
+                    idp: Some("test".to_string()),
                 };
                 let jwt_key = EncodingKey::from_secret("test-secret".as_ref());
                 let bearer = encode(&jwt_header, &jwt_claims, &jwt_key).unwrap();

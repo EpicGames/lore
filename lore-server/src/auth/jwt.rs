@@ -18,26 +18,6 @@ use tracing::warn;
 use super::jwk::JWKServiceError;
 use crate::auth::jwk::JWKService;
 
-#[serde_as]
-#[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
-pub struct JWTUserInfo {
-    #[serde(rename = "sub")]
-    pub user_id: String,
-    #[serde(rename = "iss")]
-    pub issuer: String,
-    #[serde(rename = "iat")]
-    pub issued_at: u64,
-    #[serde_as(as = "OneOrMany<_, PreferMany>")]
-    #[serde(rename = "aud")]
-    pub audience: Vec<String>,
-    pub env: String,
-    pub name: String,
-    pub preferred_username: String,
-    pub is_service_account: Option<bool>,
-    #[serde(rename = "exp")]
-    pub expires: u64,
-}
-
 /// From Lore protos, but cannot derive deserialize on external type
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq)]
 pub struct ResourcePermission {
@@ -55,6 +35,7 @@ impl ResourcePermission {
     }
 }
 
+/// The required set is `iss`, `sub`, `aud`, `exp`, `iat`.
 #[serde_as]
 #[derive(Debug, Deserialize, Clone, Serialize, PartialEq, Default)]
 pub struct AuthorizationToken {
@@ -69,13 +50,14 @@ pub struct AuthorizationToken {
     #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(rename = "aud")]
     pub audience: Vec<String>,
-    pub env: String,
-    pub name: String,
-    pub preferred_username: String,
+    pub env: Option<String>,
+    pub name: Option<String>,
+    pub preferred_username: Option<String>,
+    pub client_id: Option<String>,
     pub resources: Option<Vec<ResourcePermission>>,
     pub groups: Option<Vec<String>>,
     pub is_service_account: Option<bool>,
-    pub idp: String,
+    pub idp: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -189,38 +171,21 @@ impl JwtVerifier {
 
         debug!("Decoding JWT token");
 
-        if let Ok(token_data) = decode::<AuthorizationToken>(token, key, &validation) {
-            debug!("Decoded user info: {:?}", token_data.claims);
-            Ok(token_data.claims)
-        } else {
-            let token_data = decode::<JWTUserInfo>(token, key, &validation).map_err(|error| {
+        let token_data =
+            decode::<AuthorizationToken>(token, key, &validation).map_err(|error| {
                 if matches!(
                     error.kind(),
                     jsonwebtoken::errors::ErrorKind::ExpiredSignature
                 ) {
-                    debug!(error = ?error, "Allowable error decoding JWT AuthN token");
+                    debug!(error = ?error, "Allowable error decoding JWT token");
                 } else {
-                    warn!(error = ?error, "Unexpected error decoding JWT AuthN token");
+                    warn!(error = ?error, "Unexpected error decoding JWT token");
                 }
                 JwtVerifierError::ValidationFailed(error)
             })?;
 
-            let token = token_data.claims;
-            Ok(AuthorizationToken {
-                user_id: token.user_id,
-                issuer: token.issuer,
-                issued_at: token.issued_at,
-                expires: token.expires,
-                audience: token.audience,
-                env: token.env,
-                name: token.name,
-                preferred_username: token.preferred_username,
-                resources: None,
-                groups: None,
-                is_service_account: token.is_service_account,
-                idp: String::default(),
-            })
-        }
+        debug!("Decoded user info: {:?}", token_data.claims);
+        Ok(token_data.claims)
     }
 }
 
@@ -292,13 +257,14 @@ mod tests {
         };
         let authorization_token = AuthorizationToken {
             audience: vec!["test".to_string()],
-            env: "test".to_string(),
+            env: Some("test".to_string()),
             expires: 1234,
             user_id: "test".to_string(),
-            idp: "test".to_string(),
+            idp: Some("test".to_string()),
             issuer: "test".to_string(),
-            name: "test".to_string(),
-            preferred_username: "test".to_string(),
+            name: Some("test".to_string()),
+            preferred_username: Some("test".to_string()),
+            client_id: None,
             groups: None,
             is_service_account: Some(false),
             issued_at: 123,
@@ -324,13 +290,14 @@ mod tests {
         };
         let wildcard_authorization_token = AuthorizationToken {
             audience: vec!["test".to_string()],
-            env: "test".to_string(),
+            env: Some("test".to_string()),
             expires: 1234,
             user_id: "test".to_string(),
-            idp: "test".to_string(),
+            idp: Some("test".to_string()),
             issuer: "test".to_string(),
-            name: "test".to_string(),
-            preferred_username: "test".to_string(),
+            name: Some("test".to_string()),
+            preferred_username: Some("test".to_string()),
+            client_id: None,
             groups: None,
             is_service_account: Some(false),
             issued_at: 123,
@@ -790,9 +757,10 @@ mod tests {
                 issuer: "the issuer".to_string(),
                 issued_at: 1,
                 audience,
-                env: "the env".to_string(),
-                name: "the name".to_string(),
-                preferred_username: "pu".to_string(),
+                env: Some("the env".to_string()),
+                name: Some("the name".to_string()),
+                preferred_username: Some("pu".to_string()),
+                client_id: None,
                 resources: None,
                 groups: None,
                 is_service_account: Some(false),
@@ -801,36 +769,12 @@ mod tests {
                     .unwrap()
                     .add(Duration::from_secs(5))
                     .as_secs(),
-                idp: "the idp".to_string(),
-            }
-        }
-
-        fn mock_authn_token(audience: Vec<String>) -> JWTUserInfo {
-            JWTUserInfo {
-                user_id: "the u".to_string(),
-                issuer: "the issuer".to_string(),
-                issued_at: 1,
-                audience,
-                env: "the env".to_string(),
-                name: "the name".to_string(),
-                preferred_username: "pu".to_string(),
-                is_service_account: Some(false),
-                expires: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .add(Duration::from_secs(5))
-                    .as_secs(),
+                idp: Some("the idp".to_string()),
             }
         }
 
         fn make_authz_token_with_audience(audience: Vec<String>) -> (AuthorizationToken, String) {
             let jwt_claims = mock_authz_token(audience);
-            let encoded = encode_jwt(&jwt_claims);
-            (jwt_claims, encoded)
-        }
-
-        fn make_authn_token_with_audience(audience: Vec<String>) -> (JWTUserInfo, String) {
-            let jwt_claims = mock_authn_token(audience);
             let encoded = encode_jwt(&jwt_claims);
             (jwt_claims, encoded)
         }
@@ -929,16 +873,51 @@ mod tests {
             };
             let (original_authz_token, encoded_authz_token) =
                 make_authz_token_with_audience(vec!["Lore".to_string()]);
-            let (original_authn_token, encoded_authn_token) =
-                make_authn_token_with_audience(vec!["Lore".to_string()]);
 
             let verified_authz_token = verifier.verify_token(&encoded_authz_token).await?;
-            let verified_authn_token = verifier.verify_token(&encoded_authn_token).await?;
             assert_eq!(original_authz_token, verified_authz_token);
-            assert_eq!(
-                original_authn_token.audience,
-                verified_authn_token.audience.clone()
-            );
+
+            Ok(())
+        }
+
+        /// A Keycloak-shaped token: only the required claims — `iss`, `sub`, `aud`, `exp`,
+        /// `iat` — no `name`, no `env`, no `idp`. Everything else must default, not
+        /// fail the decode.
+        #[tokio::test]
+        async fn verify_token_with_only_required_claims() -> Result<(), Box<dyn Error>> {
+            let mut service = MockTestJWKService::new();
+            service.expect_get_key().returning(|_| {
+                Ok((
+                    DecodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref()),
+                    AGREED_UPON_ALGORITHM,
+                ))
+            });
+
+            let verifier = JwtVerifier {
+                jwk_service: Arc::new(service),
+                jwt_issuer: None,
+                jwt_audience: Some(vec!["Lore".to_string()]),
+            };
+
+            let minimal_claims = json!({
+                "iss": "https://keycloak.example.com/realms/lore",
+                "sub": "f7d3a1c2-0000-0000-0000-000000000000",
+                "aud": "Lore",
+                "iat": 1,
+                "exp": SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .add(Duration::from_secs(5))
+                    .as_secs(),
+            });
+            let encoded = encode_jwt(&minimal_claims);
+
+            let verified = verifier.verify_token(&encoded).await?;
+            assert_eq!(verified.user_id, "f7d3a1c2-0000-0000-0000-000000000000");
+            assert_eq!(verified.name, None);
+            assert_eq!(verified.env, None);
+            assert_eq!(verified.idp, None);
+            assert_eq!(verified.client_id, None);
 
             Ok(())
         }

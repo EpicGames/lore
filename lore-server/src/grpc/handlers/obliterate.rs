@@ -206,13 +206,14 @@ mod tests {
                 .add(Duration::from_secs(60))
                 .as_secs(),
             audience: vec![TEST_AUDIENCE.to_string()],
-            env: "test".to_string(),
-            name: "test".to_string(),
-            preferred_username: "test".to_string(),
+            env: Some("test".to_string()),
+            name: Some("test".to_string()),
+            preferred_username: Some("test".to_string()),
+            client_id: None,
             resources,
             groups: None,
             is_service_account: Some(false),
-            idp: "test".to_string(),
+            idp: Some("test".to_string()),
         };
         let key = EncodingKey::from_secret(SIGNING_SECRET.as_ref());
         let mut header = Header::new(ALGORITHM);
