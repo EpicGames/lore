@@ -77,7 +77,7 @@ pub async fn handler(
                 )
             })
             .await;
-            match result {
+            match result.filter_slow_down()? {
                 Ok((_, mut changes)) => {
                     change::sort_by_path(&mut changes);
                     debug!("Found {} changes", changes.len());

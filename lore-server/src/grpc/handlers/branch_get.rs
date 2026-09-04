@@ -15,6 +15,7 @@ use tonic::Status;
 use tracing::debug;
 use tracing::warn;
 
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
@@ -54,6 +55,7 @@ async fn branch_get_handler(
 ) -> Result<Response<BranchGetResponse>, Status> {
     let metadata = branch::metadata(repository.clone(), branch)
         .await
+        .filter_slow_down()?
         .map_err(|err| {
             warn!("Failed to get branch metadata: {err}");
             Status::not_found(err.to_string())
@@ -61,6 +63,7 @@ async fn branch_get_handler(
 
     let branch = branch::branch_metadata(repository.clone(), branch, &metadata)
         .await
+        .filter_slow_down()?
         .map_err(|err| {
             warn!("Failed to resolve branch metadata: {err}");
             Status::not_found(err.to_string())

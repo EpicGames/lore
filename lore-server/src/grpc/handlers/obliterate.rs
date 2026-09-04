@@ -18,6 +18,7 @@ use tracing::warn;
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_interceptor::extract_bearer_token;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::can_obliterate;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
@@ -95,6 +96,7 @@ pub async fn handler(
             immutable_store
                 .obliterate(repository, address, stats.clone())
                 .await
+                .filter_slow_down()?
                 .map_err(|e| {
                     warn!("Failed to obliterate {address}: {e}");
                     if e.is_address_not_found() {

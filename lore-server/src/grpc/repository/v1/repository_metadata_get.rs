@@ -13,6 +13,7 @@ use tonic::Response;
 use tonic::Status;
 
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
@@ -57,6 +58,7 @@ pub async fn handler(
 
             let metadata_hash = repository::metadata_hash(repository)
                 .await
+                .filter_slow_down()?
                 .map_err(|err| Status::not_found(err.to_string()))?;
 
             Ok(Response::new(RepositoryMetadataGetResponse {

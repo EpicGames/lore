@@ -17,6 +17,7 @@ use tonic::Status;
 use tracing::debug;
 use tracing::info;
 
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
@@ -62,6 +63,7 @@ pub async fn handler(
         .scope(execution, async move {
             tree(repository.clone(), revision, path, max_depth, can_read)
                 .await
+                .filter_slow_down()?
                 .map(|result| {
                     debug!("Got tree");
                     Response::new(RevisionTreeResponse {

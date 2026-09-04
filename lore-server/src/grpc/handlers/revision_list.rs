@@ -159,6 +159,8 @@ async fn resolve_start(
                     history_step_size,
                 )
                 .await
+                .filter_slow_down()?
+                .unwrap_or_default()
             } else {
                 None
             };
@@ -174,6 +176,7 @@ async fn resolve_start(
                     ResolveSearchLocation::Local,
                 )
                 .await
+                .filter_slow_down()?
                 .map_err(|err| Status::invalid_argument(format!("invalid identifier {err}")))?;
 
                 (hash, RevisionListStrategy::FullIteration)
@@ -252,6 +255,9 @@ async fn walk_revisions(
             break;
         }
 
+        // no filter_slow_down()? usage here: this read only feeds an age
+        // metric, and a request must not fail because a metric could not be
+        // recorded.
         if base_revision
             && let Ok(metadata) =
                 Metadata::deserialize(repository.clone(), state.metadata_hash()).await
@@ -280,6 +286,8 @@ async fn walk_revisions(
                 previous_state.revision_number(),
                 history_step_size,
             )
+            // no filter_slow_down()? usage here: this read only enables the
+            // best-effort step-key backfill below.
             && let Ok(metadata) =
                 Metadata::deserialize(repository.clone(), previous_state.metadata_hash()).await
             && let Ok(branch) = metadata.get_branch()

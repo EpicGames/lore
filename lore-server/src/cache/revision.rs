@@ -13,8 +13,11 @@
 //! resulting hash is stored in the mutable store under a
 //! `revision_list_step_key`.
 //!
-//! All operations are best-effort: any failure aborts the cache write or
-//! returns `None`, so reads always have a correct fallback path.
+//! Cache writes are best-effort: any failure aborts the write, and the entry
+//! is rebuilt on the next lookup. Cache reads distinguish a missing entry —
+//! answered by the slower fallback path — from a store that is overloaded or
+//! failing, which is reported so the caller does not escalate to a full
+//! parent-chain walk against a store that cannot serve it.
 
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -25,6 +28,7 @@ use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_base::types::typed_bytes::TypedBytes;
+use lore_error_set::prelude::*;
 use lore_revision::branch;
 use lore_revision::find::FindMatchResult;
 use lore_revision::find::find_revision;
@@ -107,15 +111,43 @@ impl CachedRevisionList {
     }
 }
 
+/// Interpret a cache read. `Ok(None)` is a miss the caller answers from the
+/// slower fallback path; `is_missing` decides which failures count as one.
+/// Every other failure is forwarded rather than reported as a miss.
+#[track_caller]
+fn interpret_cache_read<T, E: ErrorSet>(
+    result: Result<T, E>,
+    is_missing: impl FnOnce(&E) -> bool,
+) -> Result<Option<T>, StateError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if is_missing(&err) => Ok(None),
+        Err(err) => Err(err).forward_any::<StateError>("reading revision acceleration data"),
+    }
+}
+
+/// Acceleration data is an optimisation, so an entry that cannot be read
+/// costs time rather than correctness: every failure but backpressure is
+/// answered as a miss and left to the slower path. Backpressure is the one
+/// failure that must not be, since the slower path is more work against the
+/// store that asked for less.
+fn acceleration_miss<T>(result: Result<Option<T>, StateError>) -> Result<Option<T>, StateError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(err) if err.is_slow_down() => Err(err),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Load the cached list at the boundary containing `revision_number`.
-/// Returns `None` on any error or missing/invalid data. The returned
-/// list lets callers iterate items in place without copying.
+/// Returns `Ok(None)` when no valid entry exists. The returned list lets
+/// callers iterate items in place without copying.
 pub(crate) async fn load_cached_list(
     repository: &Arc<RepositoryContext>,
     branch: BranchId,
     revision_number: u64,
     step_size: u64,
-) -> Option<CachedRevisionList> {
+) -> Result<Option<CachedRevisionList>, StateError> {
     let (key, key_type) = branch::revision_list_step_key(
         repository::SALT_LORE,
         repository.id,
@@ -124,41 +156,51 @@ pub(crate) async fn load_cached_list(
         step_size,
     );
 
-    let blob_hash = repository
-        .clone()
-        .read_mutable_store()
-        .load(repository.id, key, key_type)
-        .await
-        .ok()?;
+    let blob_hash = interpret_cache_read(
+        repository
+            .clone()
+            .read_mutable_store()
+            .load(repository.id, key, key_type)
+            .await,
+        StoreError::is_address_not_found,
+    )?;
 
-    if blob_hash.is_zero() {
-        return None;
-    }
+    let Some(blob_hash) = blob_hash.filter(|hash| !hash.is_zero()) else {
+        return Ok(None);
+    };
 
-    let bytes = immutable::read(
-        repository.clone(),
-        Address::zero_context_hash(blob_hash),
-        None,
-        immutable::read_options_from_repository(repository).with_cache(),
-    )
-    .await
-    .ok()?
-    .to_aligned::<branch::CachedRevisionItem>();
+    // A blob whose payload has been reclaimed is as good as absent: the
+    // entry is rebuilt from the parent chain on the next backfill.
+    let bytes = interpret_cache_read(
+        immutable::read(
+            repository.clone(),
+            Address::zero_context_hash(blob_hash),
+            None,
+            immutable::read_options_from_repository(repository).with_cache(),
+        )
+        .await,
+        |err| err.is_address_not_found() || err.is_payload_not_found() || err.is_not_found(),
+    )?;
 
-    CachedRevisionList::from_blob(bytes)
+    Ok(bytes.and_then(|bytes| {
+        CachedRevisionList::from_blob(bytes.to_aligned::<branch::CachedRevisionItem>())
+    }))
 }
 
 /// If segment B containing `revision_number` is closed (proven by the
 /// skip pointer at B + `step_size`), walk `parent_self` from that anchor to
-/// populate `List_B`. Returns the cached segment items on success.
+/// populate `List_B`. Returns the cached segment items on success, or
+/// `Ok(None)` when the segment is not provably closed.
 pub(crate) async fn try_backfill_segment(
     repository: &Arc<RepositoryContext>,
     branch: BranchId,
     revision_number: u64,
     step_size: u64,
-) -> Option<CachedRevisionList> {
+) -> Result<Option<CachedRevisionList>, StateError> {
     let target_b = revision_number.div_ceil(step_size) * step_size;
-    let next_b = target_b.checked_add(step_size)?;
+    let Some(next_b) = target_b.checked_add(step_size) else {
+        return Ok(None);
+    };
 
     let (next_key, next_key_type) = branch::revision_step_key(
         repository::SALT_LORE,
@@ -167,21 +209,23 @@ pub(crate) async fn try_backfill_segment(
         next_b,
         step_size,
     );
-    let anchor = repository
-        .clone()
-        .read_mutable_store()
-        .load(repository.id, next_key, next_key_type)
-        .await
-        .ok()?;
-    if anchor.is_zero() {
-        return None;
-    }
+    let anchor = interpret_cache_read(
+        repository
+            .clone()
+            .read_mutable_store()
+            .load(repository.id, next_key, next_key_type)
+            .await,
+        StoreError::is_address_not_found,
+    )?;
+    let Some(anchor) = anchor.filter(|anchor| !anchor.is_zero()) else {
+        return Ok(None);
+    };
 
     let stop_below = target_b.saturating_sub(step_size);
     let max_items = (step_size as usize).saturating_mul(2).saturating_add(2);
-    let walk = walk_segment_revisions(repository, anchor, stop_below, max_items).await;
+    let walk = walk_segment_revisions(repository, anchor, stop_below, max_items).await?;
     if !walk.reached_terminator {
-        return None;
+        return Ok(None);
     }
 
     let segments = partition_into_segments(&walk.items, step_size);
@@ -218,6 +262,9 @@ pub(crate) async fn store_cached_list(
     buffer.extend_from_slice(items_bytes);
     let buffer = buffer.freeze();
 
+    // no filter_slow_down()? usage here: the read that prompted this write has
+    // already been answered, so a throttled blob write costs the next reader a
+    // slower lookup rather than failing anything.
     let Ok(address) = immutable::write(
         repository.clone(),
         Context::default(),
@@ -237,6 +284,8 @@ pub(crate) async fn store_cached_list(
         step_size,
     );
     let write_token = get_write_token();
+    // no filter_slow_down()? usage here: same reason — a throttled key write
+    // leaves the entry to be rebuilt by a later backfill.
     if repository
         .clone()
         .write_mutable_store(&write_token)
@@ -258,13 +307,14 @@ pub(crate) async fn store_cached_list(
 /// pushed, (b) the parent chain reaches the root (zero hash), (c) the walk
 /// exceeds `max_items`, or (d) a state deserialization fails. Cases (a) and
 /// (b) set `reached_terminator = true`, signalling that the lowest segment
-/// touched is fully traversed.
+/// touched is fully traversed. A store asking the caller to back off aborts the
+/// walk instead of reporting a partial traversal as a complete one.
 pub(crate) async fn walk_segment_revisions(
     repository: &Arc<RepositoryContext>,
     anchor_hash: Hash,
     stop_below: u64,
     max_items: usize,
-) -> SegmentWalk {
+) -> Result<SegmentWalk, StateError> {
     let mut items: Vec<branch::CachedRevisionItem> = Vec::new();
     let mut hash = anchor_hash;
     let mut reached_terminator = false;
@@ -274,8 +324,10 @@ pub(crate) async fn walk_segment_revisions(
             reached_terminator = true;
             break;
         }
-        let Ok(state) = State::deserialize(repository.clone(), hash).await else {
-            break;
+        let state = match State::deserialize(repository.clone(), hash).await {
+            Ok(state) => state,
+            Err(err) if err.is_slow_down() => return Err(err),
+            Err(_) => break,
         };
         let number = state.revision_number();
         items.push(branch::CachedRevisionItem {
@@ -291,10 +343,10 @@ pub(crate) async fn walk_segment_revisions(
         hash = state.parent_self();
     }
 
-    SegmentWalk {
+    Ok(SegmentWalk {
         items,
         reached_terminator,
-    }
+    })
 }
 
 /// Partition a contiguous walk of items (highest number first) into per-segment
@@ -417,6 +469,9 @@ pub async fn store_history_step(
 
     if acceleration.step_keys {
         for boundary in (lowest_b..=highest_b).step_by(history_step_size as usize) {
+            // no filter_slow_down()? usage here: sealing is a best-effort
+            // acceleration write, so a throttled store costs the next reader a
+            // slower lookup rather than failing this push.
             let _ = seal_boundary_revision_number(
                 repository.clone(),
                 branch,
@@ -445,8 +500,13 @@ pub async fn store_history_step(
         .saturating_add(history_step_size as usize)
         .saturating_add(1);
 
-    let walk =
-        walk_segment_revisions(&repository, newer_state.revision(), stop_below, max_items).await;
+    // no filter_slow_down()? usage here: the list-cache write is best-effort,
+    // so a throttled walk leaves the entry to be rebuilt by a later backfill.
+    let Ok(walk) =
+        walk_segment_revisions(&repository, newer_state.revision(), stop_below, max_items).await
+    else {
+        return;
+    };
 
     if !walk.reached_terminator {
         // Walk was bounded by max_items; the last segment may be partial.
@@ -468,7 +528,9 @@ pub async fn store_history_step(
 /// A cached segment covering the number answers it outright. Otherwise the
 /// sealed boundary at or above the number anchors a bounded walk. Anything not
 /// served from acceleration data falls through to [`revision::resolve`], so an
-/// absent or unusable entry costs time rather than correctness.
+/// absent or unusable entry costs time rather than correctness. The one
+/// exception is a store asking the caller to back off: the fallback is more
+/// work against that store, so it is reported instead of walked.
 pub async fn resolve_revision_number(
     repository: &Arc<RepositoryContext>,
     branch: BranchId,
@@ -483,7 +545,7 @@ pub async fn resolve_revision_number(
         history_step_size,
         acceleration,
     )
-    .await
+    .await?
     {
         return Ok(signature);
     }
@@ -505,10 +567,11 @@ async fn resolve_from_acceleration(
     revision_number: u64,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
-) -> Option<Hash> {
+) -> Result<Option<Hash>, StateError> {
     if acceleration.list_cache
-        && let Some(cached) =
-            load_cached_list(repository, branch, revision_number, history_step_size).await
+        && let Some(cached) = acceleration_miss(
+            load_cached_list(repository, branch, revision_number, history_step_size).await,
+        )?
         && let Some(item) = cached
             .items()
             .iter()
@@ -518,11 +581,11 @@ async fn resolve_from_acceleration(
             number = revision_number,
             "Resolved revision number from cached segment"
         );
-        return Some(item.signature);
+        return Ok(Some(item.signature));
     }
 
     if !acceleration.step_keys {
-        return None;
+        return Ok(None);
     }
 
     resolve_via_step_key(repository, branch, revision_number, history_step_size).await
@@ -543,7 +606,7 @@ pub(crate) async fn resolve_via_step_key(
     branch: BranchId,
     revision_number: u64,
     history_step_size: u64,
-) -> Option<Hash> {
+) -> Result<Option<Hash>, StateError> {
     let (key, key_type) = branch::revision_step_key(
         repository::SALT_LORE,
         repository.id,
@@ -551,15 +614,17 @@ pub(crate) async fn resolve_via_step_key(
         revision_number,
         history_step_size,
     );
-    let anchor = repository
-        .clone()
-        .read_mutable_store()
-        .load(repository.id, key, key_type)
-        .await
-        .ok()?;
-    if anchor.is_zero() {
-        return None;
-    }
+    let anchor = acceleration_miss(interpret_cache_read(
+        repository
+            .clone()
+            .read_mutable_store()
+            .load(repository.id, key, key_type)
+            .await,
+        StoreError::is_address_not_found,
+    ))?;
+    let Some(anchor) = anchor.filter(|anchor| !anchor.is_zero()) else {
+        return Ok(None);
+    };
 
     // An anchor holding the highest revision at or below its boundary is at
     // most one segment above the target, so a walk longer than that is reading
@@ -578,19 +643,27 @@ pub(crate) async fn resolve_via_step_key(
             Ordering::Greater => FindMatchResult::Continue,
         },
     )
-    .await
-    .ok()?;
+    .await;
+    let Some(signature) = acceleration_miss(
+        signature
+            .forward_any::<StateError>("resolving revision from history step key")
+            .map(Some),
+    )?
+    else {
+        return Ok(None);
+    };
 
     debug!(
         number = revision_number,
         key = %key,
         "Resolved revision number from history step key"
     );
-    Some(signature)
+    Ok(Some(signature))
 }
 
 #[cfg(test)]
 mod tests {
+    use lore_base::error::SlowDown;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::Hash;
     use lore_revision::branch::CachedRevisionItem;
@@ -601,6 +674,7 @@ mod tests {
 
     use super::*;
     use crate::grpc::server::RevisionListAcceleration;
+    use crate::store::FailingLoadStore;
     use crate::store::test_store_create;
 
     const STEP_ONE_HUNDRED: u64 = 100;
@@ -688,6 +762,138 @@ mod tests {
             .await
             .ok()
             .filter(|revision| !revision.is_zero())
+    }
+
+    mod load_cached_list {
+        use super::*;
+
+        #[tokio::test]
+        async fn absent_entry_is_a_miss() {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository = test_repository(immutable_store, mutable_store);
+                let branch = BranchId::from(uuid::Uuid::now_v7());
+
+                assert!(
+                    load_cached_list(&repository, branch, 150, STEP_ONE_HUNDRED)
+                        .await
+                        .expect("absent entry is not an error")
+                        .is_none()
+                );
+            }))
+            .await;
+        }
+
+        #[tokio::test]
+        async fn slow_down_is_reported_rather_than_read_as_a_miss() {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository = test_repository(
+                    immutable_store,
+                    FailingLoadStore::all(mutable_store, StoreError::from(SlowDown)),
+                );
+                let branch = BranchId::from(uuid::Uuid::now_v7());
+
+                let Err(err) = load_cached_list(&repository, branch, 150, STEP_ONE_HUNDRED).await
+                else {
+                    panic!("backpressure must not be read as a miss");
+                };
+                assert!(err.is_slow_down());
+            }))
+            .await;
+        }
+
+        #[tokio::test]
+        async fn store_failure_is_reported() {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository = test_repository(
+                    immutable_store,
+                    FailingLoadStore::all(mutable_store, StoreError::internal("store unusable")),
+                );
+                let branch = BranchId::from(uuid::Uuid::now_v7());
+
+                let Err(err) = load_cached_list(&repository, branch, 150, STEP_ONE_HUNDRED).await
+                else {
+                    panic!("a failing store must not be read as a miss");
+                };
+                assert!(!err.is_slow_down() && !err.is_address_not_found());
+            }))
+            .await;
+        }
+    }
+
+    mod try_backfill_segment {
+        use super::*;
+
+        #[tokio::test]
+        async fn absent_skip_pointer_is_a_miss() {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository = test_repository(immutable_store, mutable_store);
+                let branch = BranchId::from(uuid::Uuid::now_v7());
+
+                assert!(
+                    try_backfill_segment(&repository, branch, 150, STEP_ONE_HUNDRED)
+                        .await
+                        .expect("an unsealed segment is not an error")
+                        .is_none()
+                );
+            }))
+            .await;
+        }
+
+        #[tokio::test]
+        async fn slow_down_is_reported_rather_than_read_as_a_miss() {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository = test_repository(
+                    immutable_store,
+                    FailingLoadStore::all(mutable_store, StoreError::from(SlowDown)),
+                );
+                let branch = BranchId::from(uuid::Uuid::now_v7());
+
+                let Err(err) =
+                    try_backfill_segment(&repository, branch, 150, STEP_ONE_HUNDRED).await
+                else {
+                    panic!("backpressure must not be read as an unsealed segment");
+                };
+                assert!(err.is_slow_down());
+            }))
+            .await;
+        }
+
+        #[tokio::test]
+        async fn store_failure_is_reported() {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository = test_repository(
+                    immutable_store,
+                    FailingLoadStore::all(mutable_store, StoreError::internal("store unusable")),
+                );
+                let branch = BranchId::from(uuid::Uuid::now_v7());
+
+                let Err(err) =
+                    try_backfill_segment(&repository, branch, 150, STEP_ONE_HUNDRED).await
+                else {
+                    panic!("a failing store must not be read as an unsealed segment");
+                };
+                assert!(!err.is_slow_down() && !err.is_address_not_found());
+            }))
+            .await;
+        }
     }
 
     mod partition_into_segments {
@@ -1015,6 +1221,7 @@ mod tests {
                 // Segment 200 spans (100, 200] and really holds 150..=101.
                 let cached = load_cached_list(&repository, branch, 150, STEP_ONE_HUNDRED)
                     .await
+                    .expect("load cached list")
                     .expect("segment 200 cached");
                 let numbers: Vec<u64> = cached.items().iter().map(|item| item.number).collect();
                 assert_eq!(numbers.len(), 50);
@@ -1026,6 +1233,7 @@ mod tests {
                 assert!(
                     load_cached_list(&repository, branch, 250, STEP_ONE_HUNDRED)
                         .await
+                        .expect("load cached list")
                         .is_none()
                 );
 
@@ -1033,6 +1241,7 @@ mod tests {
                 assert!(
                     load_cached_list(&repository, branch, 400, STEP_ONE_HUNDRED)
                         .await
+                        .expect("load cached list")
                         .is_none()
                 );
             }))
@@ -1070,6 +1279,7 @@ mod tests {
                 assert!(
                     load_cached_list(&repository, branch, 150, STEP_ONE_HUNDRED)
                         .await
+                        .expect("load cached list")
                         .is_none()
                 );
             }))

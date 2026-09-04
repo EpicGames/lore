@@ -19,6 +19,7 @@ use tracing::info;
 use tracing::warn;
 
 use super::branch_record::build_branch;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
@@ -126,11 +127,14 @@ pub async fn branch_delete_implementation(
             // can still build the response from the preserved metadata.
             let pre_metadata = branch::metadata(repository.clone(), branch_id)
                 .await
+                .filter_slow_down()?
                 .map_err(|_err| Status::not_found(format!("Branch {branch_id} not found")))?;
 
             debug!({BRANCH_ID} = %branch_id, "Deleting branch");
 
-            let delete_result = branch::delete(repository.clone(), branch_id).await;
+            let delete_result = branch::delete(repository.clone(), branch_id)
+                .await
+                .filter_slow_down()?;
             let actually_deleted = match delete_result {
                 Ok(()) => true,
                 Err(err) if err.is_branch_not_found() => {
@@ -168,12 +172,20 @@ pub async fn branch_delete_implementation(
                 hook_dispatcher.spawn_post(HookPoint::BranchDelete, hook_ctx);
             }
 
+            // no filter_slow_down()? usage here: the delete has already
+            // happened, so this response read must not return a retryable
+            // status.
             let metadata_hash = branch::metadata_hash(repository.clone(), branch_id)
                 .await
                 .warn_map_err(|err| Status::internal(err.to_string()))?;
 
+            // no filter_slow_down()? usage here: the delete has already
+            // happened, so an unreadable latest must not fail it.
+            let latest = branch::load_latest(repository, branch_id)
+                .await
+                .unwrap_or_default();
             let response_branch =
-                build_branch(repository, branch_id, &pre_metadata, metadata_hash, true).await?;
+                build_branch(branch_id, &pre_metadata, metadata_hash, true, latest);
 
             Ok(Response::new(BranchDeleteResponse {
                 branch: Some(response_branch),

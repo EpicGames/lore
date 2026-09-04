@@ -140,7 +140,9 @@ async fn stream_tree(
     let result = match tree(repository.clone(), signature, path, max_depth, can_read).await {
         Ok(result) => result,
         Err(err) => {
-            let status = if err.is_invalid_path() {
+            let status = if err.is_slow_down() {
+                Status::resource_exhausted(err.to_string())
+            } else if err.is_invalid_path() {
                 Status::invalid_argument("Cannot calculate tree for path that is not a directory")
             } else if err.is_node_not_found() {
                 Status::not_found("A node in the tree could not be found")

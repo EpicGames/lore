@@ -97,6 +97,7 @@ pub(super) async fn resolve_signature(
                 debug!({BRANCH_ID} = %branch_id, "Resolving branch latest");
                 branch::load_latest(repository.clone(), branch_id)
                     .await
+                    .filter_slow_down()?
                     .map_err(|err| {
                         if err.is_branch_not_found() {
                             Status::not_found(format!("Branch {branch_id} not found"))
@@ -117,6 +118,7 @@ pub(super) async fn resolve_signature(
                     acceleration,
                 )
                 .await
+                .filter_slow_down()?
                 .map_err(|err| {
                     if err.is_not_found() || err.is_revision_not_found() {
                         Status::not_found(format!(
@@ -188,6 +190,7 @@ pub(super) async fn identifier_for_signature(
     let metadata_hash = state.metadata_hash();
     let metadata = Metadata::deserialize(repository.clone(), metadata_hash)
         .await
+        .filter_slow_down()?
         .map_err(|err| {
             warn!(
                 {REPOSITORY_ID} = %repository.id,

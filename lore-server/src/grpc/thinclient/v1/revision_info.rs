@@ -105,6 +105,7 @@ async fn load_revision(
     let metadata_fut = async {
         Metadata::deserialize(repository.clone(), metadata_hash)
             .await
+            .filter_slow_down()?
             .map_err(|err| {
                 warn!(
                     {REPOSITORY_ID} = %repository.id,
@@ -247,6 +248,7 @@ async fn load_optional_parent(
     let metadata_hash = state.metadata_hash();
     let metadata = Metadata::deserialize(repository.clone(), metadata_hash)
         .await
+        .filter_slow_down()?
         .map_err(|err| {
             warn!(
                 {REPOSITORY_ID} = %repository.id,

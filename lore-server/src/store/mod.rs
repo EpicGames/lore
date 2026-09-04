@@ -134,6 +134,100 @@ pub fn spawn_immutable_store_availability_monitor(health: Arc<ServerHealth>) {
     }
 }
 
+/// A [`lore_storage::MutableStore`] that fails `load` with a chosen error —
+/// for every key, or for one key when `key` is set — while every other
+/// operation delegates to the wrapped store.
+#[cfg(test)]
+pub struct FailingLoadStore {
+    inner: Arc<dyn lore_storage::MutableStore>,
+    key: Option<lore_base::types::Hash>,
+    error: StoreError,
+}
+
+#[cfg(test)]
+impl FailingLoadStore {
+    /// Fails every `load`.
+    pub fn all(
+        inner: Arc<dyn lore_storage::MutableStore>,
+        error: StoreError,
+    ) -> Arc<dyn lore_storage::MutableStore> {
+        Arc::new(Self {
+            inner,
+            key: None,
+            error,
+        })
+    }
+
+    /// Fails `load` for `key` alone, so a single lookup in a larger call
+    /// chain can be failed in isolation.
+    pub fn for_key(
+        inner: Arc<dyn lore_storage::MutableStore>,
+        key: lore_base::types::Hash,
+        error: StoreError,
+    ) -> Arc<dyn lore_storage::MutableStore> {
+        Arc::new(Self {
+            inner,
+            key: Some(key),
+            error,
+        })
+    }
+}
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl lore_storage::MutableStore for FailingLoadStore {
+    async fn load(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        key: lore_base::types::Hash,
+        key_type: lore_base::types::KeyType,
+    ) -> Result<lore_base::types::Hash, StoreError> {
+        if self.key.is_none_or(|failing| failing == key) {
+            return Err(self.error.clone());
+        }
+        self.inner.clone().load(partition, key, key_type).await
+    }
+
+    async fn store(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        key: lore_base::types::Hash,
+        value: lore_base::types::Hash,
+        key_type: lore_base::types::KeyType,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .clone()
+            .store(partition, key, value, key_type)
+            .await
+    }
+
+    async fn compare_and_swap(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        key: lore_base::types::Hash,
+        expected: lore_base::types::Hash,
+        value: lore_base::types::Hash,
+        key_type: lore_base::types::KeyType,
+    ) -> Result<lore_base::types::Hash, StoreError> {
+        self.inner
+            .clone()
+            .compare_and_swap(partition, key, expected, value, key_type)
+            .await
+    }
+
+    async fn list(
+        self: Arc<Self>,
+        partition: lore_base::types::Partition,
+        key_type: lore_base::types::KeyType,
+    ) -> Result<lore_storage::KeyValueStream, StoreError> {
+        self.inner.clone().list(partition, key_type).await
+    }
+
+    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+        self.inner.clone().flush(sync_data).await
+    }
+}
+
 #[cfg(test)]
 pub async fn test_store_create() -> Result<
     (

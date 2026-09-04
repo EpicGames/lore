@@ -18,6 +18,7 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
@@ -65,7 +66,10 @@ pub async fn handler(
                 .dispatch_pre(HookPoint::BranchDelete, &hook_ctx)
                 .map_err(hook_error_to_status)?;
 
-            match branch::delete(repository, branch).await {
+            match branch::delete(repository, branch)
+                .await
+                .filter_slow_down()?
+            {
                 Ok(_) => {
                     debug!({BRANCH_ID} = %branch, "Branch deleted");
                     let num_branches_deleted = instrument_provider.counter("num_branches_deleted");

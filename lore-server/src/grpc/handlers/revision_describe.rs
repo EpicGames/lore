@@ -52,6 +52,7 @@ pub async fn handler(
 
             let metadata = Metadata::deserialize(repository.clone(), state.metadata_hash())
                 .await
+                .filter_slow_down()?
                 .map_err(|_err| Status::invalid_argument("Invalid revision metadata"))?;
 
             let parent_self_revision_number = if !state.parent_self().is_zero() {

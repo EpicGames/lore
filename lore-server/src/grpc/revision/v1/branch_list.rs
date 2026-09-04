@@ -26,9 +26,11 @@ use tracing::info;
 use tracing::warn;
 
 use super::branch_record::build_branch;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
+use crate::grpc::log_server_error;
 use crate::util::setup_execution;
 
 pub type BranchListStream =
@@ -129,6 +131,21 @@ async fn stream_branches(
     include_deleted: bool,
     tx: mpsc::Sender<Result<BranchListResponse, Status>>,
 ) {
+    if let Err(status) = produce_branches(repository, creator_filter, include_deleted, &tx).await {
+        log_server_error(&status);
+        let _ = tx.send(Err(status)).await;
+    }
+}
+
+/// Emit one response per branch. A per-branch metadata failure is logged and
+/// that branch skipped; a per-branch failure the client must see — a store
+/// asking the caller to back off above all — ends the stream instead.
+async fn produce_branches(
+    repository: Arc<RepositoryContext>,
+    creator_filter: Option<String>,
+    include_deleted: bool,
+    tx: &mpsc::Sender<Result<BranchListResponse, Status>>,
+) -> Result<(), Status> {
     debug!(
         creator = ?creator_filter,
         include_deleted,
@@ -138,32 +155,35 @@ async fn stream_branches(
     let mut emitted: u64 = 0;
     let mut live_ids: HashSet<BranchId> = HashSet::new();
 
-    let id_stream = match repository
+    let id_stream = repository
         .read_mutable_store()
         .list(repository.id, KeyType::BranchId)
         .await
-    {
-        Ok(stream) => stream,
-        Err(err) => {
+        .filter_slow_down()?
+        .map_err(|err| {
             warn!(?err, "Failed to list branch id keys");
-            let _ = tx.send(Err(Status::internal(err.to_string()))).await;
-            return;
-        }
-    };
+            Status::internal(err.to_string())
+        })?;
     let mut ids = UnboundedReceiverStream::new(id_stream.channel());
 
     while let Some((_key, id)) = ids.next().await {
         let branch_id: BranchId = id.to_context();
         live_ids.insert(branch_id);
 
-        let metadata_hash = match branch::metadata_hash(repository.clone(), branch_id).await {
+        let metadata_hash = match branch::metadata_hash(repository.clone(), branch_id)
+            .await
+            .filter_slow_down()?
+        {
             Ok(hash) => hash,
             Err(err) => {
                 info!({BRANCH_ID} = %branch_id, ?err, "Skipping branch: metadata hash load failed");
                 continue;
             }
         };
-        let metadata = match branch::load_metadata(repository.clone(), metadata_hash).await {
+        let metadata = match branch::load_metadata(repository.clone(), metadata_hash)
+            .await
+            .filter_slow_down()?
+        {
             Ok(metadata) => metadata,
             Err(err) => {
                 info!({BRANCH_ID} = %branch_id, ?err, "Skipping branch: metadata load failed");
@@ -184,32 +204,32 @@ async fn stream_branches(
             &metadata,
             metadata_hash,
             false,
-            &tx,
+            tx,
             &mut emitted,
         )
-        .await
+        .await?
         {
-            return;
+            return Ok(());
         }
     }
 
     if include_deleted {
-        let metadata_stream = match repository
+        let metadata_stream = repository
             .read_mutable_store()
             .list(repository.id, KeyType::BranchMetadata)
             .await
-        {
-            Ok(stream) => stream,
-            Err(err) => {
+            .filter_slow_down()?
+            .map_err(|err| {
                 warn!(?err, "Failed to list branch metadata keys");
-                let _ = tx.send(Err(Status::internal(err.to_string()))).await;
-                return;
-            }
-        };
+                Status::internal(err.to_string())
+            })?;
         let mut entries = UnboundedReceiverStream::new(metadata_stream.channel());
 
         while let Some((_key, metadata_hash)) = entries.next().await {
-            let metadata = match branch::load_metadata(repository.clone(), metadata_hash).await {
+            let metadata = match branch::load_metadata(repository.clone(), metadata_hash)
+                .await
+                .filter_slow_down()?
+            {
                 Ok(metadata) => metadata,
                 Err(err) => {
                     info!(?err, "Skipping entry: metadata load failed");
@@ -239,22 +259,25 @@ async fn stream_branches(
                 &metadata,
                 metadata_hash,
                 true,
-                &tx,
+                tx,
                 &mut emitted,
             )
-            .await
+            .await?
             {
-                return;
+                return Ok(());
             }
         }
     }
 
     debug!(emitted, "BranchList complete");
+    Ok(())
 }
 
-/// Build and send one branch record. Returns `false` if the receiver has
-/// been dropped (caller should stop producing); a per-branch build
-/// failure is logged and skipped, returning `true`.
+/// Build and send one branch record. Returns `Ok(false)` if the receiver has
+/// been dropped (caller should stop producing); a per-branch build failure is
+/// logged and skipped, returning `Ok(true)`. A store asking the caller to back
+/// off is returned instead, so the stream ends with that signal rather than
+/// completing successfully with branches silently missing from it.
 async fn emit_branch(
     repository: &Arc<RepositoryContext>,
     branch_id: BranchId,
@@ -263,22 +286,14 @@ async fn emit_branch(
     deleted: bool,
     tx: &mpsc::Sender<Result<BranchListResponse, Status>>,
     emitted: &mut u64,
-) -> bool {
-    let response_branch = match build_branch(
-        repository.clone(),
-        branch_id,
-        metadata,
-        metadata_hash,
-        deleted,
-    )
-    .await
-    {
-        Ok(branch) => branch,
-        Err(status) => {
-            info!({BRANCH_ID} = %branch_id, ?status, "Skipping branch: response build failed");
-            return true;
-        }
-    };
+) -> Result<bool, Status> {
+    // A throttled latest read ends the stream rather than omitting this branch;
+    // any other unreadable latest is reported as a zero latest, as before.
+    let latest = branch::load_latest(repository.clone(), branch_id)
+        .await
+        .filter_slow_down()?
+        .unwrap_or_default();
+    let response_branch = build_branch(branch_id, metadata, metadata_hash, deleted, latest);
 
     if tx
         .send(Ok(BranchListResponse {
@@ -289,10 +304,10 @@ async fn emit_branch(
     {
         // Client dropped the stream; stop producing.
         debug!(emitted = *emitted, "BranchList receiver dropped");
-        return false;
+        return Ok(false);
     }
     *emitted += 1;
-    true
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -461,6 +476,62 @@ pub mod test {
                 assert!(names.contains(&"main".to_string()));
                 assert!(names.contains(&"feature".to_string()));
                 assert!(items.iter().all(|r| !r.branch.as_ref().unwrap().deleted));
+            }))
+            .await;
+        }
+
+        /// A throttled store must end the stream with `RESOURCE_EXHAUSTED`
+        /// rather than completing successfully with that branch absent: a
+        /// client cannot tell an omitted branch from one that does not exist,
+        /// so a silently short listing is worse than an error.
+        #[tokio::test]
+        async fn throttled_branch_record_ends_the_stream_rather_than_omitting_it() {
+            let repository = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+                let repository_context = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository,
+                ));
+                let main = create_root_branch(&repository_context, "main", "alice").await;
+                let main_latest = seed_revision(&repository_context, main).await;
+                let feature =
+                    create_child_branch(&repository_context, "feature", "bob", main, main_latest)
+                        .await;
+
+                // Throttle only the branch-latest lookup that emit_branch makes
+                // for `feature`. Listing the branch ids and reading its
+                // metadata still succeed, so the request reaches emit_branch.
+                let (latest_key, _key_type) = branch::mutable_key(
+                    lore_revision::repository::SALT_LORE,
+                    branch::LATEST,
+                    repository,
+                    feature,
+                );
+                let throttled = crate::store::FailingLoadStore::for_key(
+                    mutable_store,
+                    latest_key,
+                    lore_storage::StoreError::from(lore_base::error::SlowDown),
+                );
+
+                let response = handler(
+                    make_request(repository, None, false),
+                    immutable_store,
+                    throttled,
+                    &None, /* no forwarded requests */
+                )
+                .await
+                .expect("handler returns a stream");
+
+                let items = collect_response(response).await;
+                let status = items
+                    .iter()
+                    .find_map(|item| item.as_ref().err())
+                    .expect("stream must carry the backpressure signal");
+                assert_eq!(status.code(), tonic::Code::ResourceExhausted);
             }))
             .await;
         }

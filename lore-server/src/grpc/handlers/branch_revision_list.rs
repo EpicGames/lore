@@ -16,6 +16,7 @@ use tonic::Status;
 use tracing::debug;
 use tracing::warn;
 
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
@@ -61,6 +62,7 @@ pub async fn handler(
         .scope(execution, async move {
             list_revisions(repository, branch, Some(limit as usize), source, target)
                 .await
+                .filter_slow_down()?
                 .map(|result| {
                     debug!("Found {} revisions", result.revisions.len());
                     Response::new(BranchRevisionListResponse {

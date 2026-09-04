@@ -77,6 +77,7 @@ pub(crate) async fn validate_binary_blobs(
         let options = lore_revision::immutable::read_options_from_repository(&repo).with_cache();
         if lore_revision::immutable::read(repo.clone(), address, None, options)
             .await
+            .filter_slow_down()?
             .is_err()
         {
             return Err(Status::not_found(format!(
@@ -133,6 +134,7 @@ pub async fn handler(
 
             let proposed_metadata = Metadata::deserialize(repository.clone(), new_hash)
                 .await
+                .filter_slow_down()?
                 .map_err(|err| {
                     warn_error_to_status(&err, |err| {
                         Status::invalid_argument(format!(
@@ -165,6 +167,7 @@ pub async fn handler(
                     key_type,
                 )
                 .await
+                .filter_slow_down()?
                 .map_err(|err| {
                     warn_error_to_status(&err, |err| {
                         Status::internal(format!("failed to update metadata: {err}"))

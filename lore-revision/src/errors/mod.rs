@@ -127,3 +127,28 @@ impl EventError for StateErrors {
         self.to_string()
     }
 }
+
+/// Reduces a fallible result to an optional value, holding back the failures
+/// the caller must still see.
+///
+/// `propagate` selects those failures; they are forwarded into `Target` with
+/// their variant preserved. Every other failure becomes `Ok(None)`, letting a
+/// caller that already handles an absent value reuse that path without
+/// distinguishing absence from failure — while keeping a failure it does need
+/// to act on from vanishing into it.
+#[track_caller]
+pub(crate) fn absent_unless<T, Source, Target>(
+    result: Result<T, Source>,
+    propagate: impl FnOnce(&Source) -> bool,
+    context: &str,
+) -> Result<Option<T>, Target>
+where
+    Source: ErrorSet,
+    Target: ErrorSet,
+{
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if propagate(&err) => Err(err).forward_any::<Target>(context),
+        Err(_) => Ok(None),
+    }
+}

@@ -29,12 +29,14 @@ use super::repository_query::repository_query_name;
 use crate::authnz::common::create_request_with_authorization;
 use crate::authnz::rebac::RebacApiClient;
 use crate::authnz::rebac::grpc_get_rebac_client;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
+use crate::grpc::none_or_status;
 use crate::grpc::warn_error_to_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
@@ -179,6 +181,7 @@ async fn repository_create(
         None, /* authorization */
     )
     .await
+    .filter_slow_down()?
     {
         return if data.name == name {
             info!(
@@ -194,12 +197,15 @@ async fn repository_create(
                 None, /* authorization */
             )
             .await
+            .filter_slow_down()?
             .is_err()
             {
                 info!(
                     "Recreating repository name {} -> ID {} mapping",
                     name, repository.id
                 );
+                // no filter_slow_down()? usage here: the create has already
+                // succeeded, so this mapping repair must not fail it.
                 let _ = repository::store_name_to_id(repository.clone(), name, repository.id)
                     .await
                     .inspect_err(|err| info!("Recreate name -> ID mapping failed: {err}"));
@@ -213,14 +219,18 @@ async fn repository_create(
             )))
         };
     }
-    if let Ok(data) = repository_query_name(
-        repository.clone(),
-        name,
-        None, /* auth url */
-        None, /* authorization */
-    )
-    .await
-    {
+    // Name-collision guard: its absent path lets the create below rebind the
+    // name, so an unreadable answer must not be read as absence.
+    if let Some(data) = none_or_status(
+        repository_query_name(
+            repository.clone(),
+            name,
+            None, /* auth url */
+            None, /* authorization */
+        )
+        .await,
+        |err| err.is_address_not_found() || err.is_repository_not_found(),
+    )? {
         return if data.id == repository.id {
             info!(
                 "Repository {} already exist with id {}, early out create successful",
@@ -256,6 +266,7 @@ async fn repository_create(
 
     let metadata = repository::metadata_store(repository.clone(), metadata)
         .await
+        .filter_slow_down()?
         .warn_map_err(|err| {
             Status::internal(format!("Failed to serialize repository metadata: {err}"))
         })?;
@@ -277,6 +288,7 @@ async fn repository_create(
         false,
     )
     .await
+    .filter_slow_down()?
     {
         Ok(_) => {}
         Err(err) if err.is_branch_already_exists() => {}
@@ -290,6 +302,7 @@ async fn repository_create(
 
     repository::metadata_store_hash(repository.clone(), metadata)
         .await
+        .filter_slow_down()?
         .warn_map_err(|err| {
             Status::internal(format!(
                 "Failed to store metadata hash for {name}/{}: {err}",
@@ -299,6 +312,7 @@ async fn repository_create(
 
     repository::store_name_to_id(repository.clone(), name, repository.id)
         .await
+        .filter_slow_down()?
         .warn_map_err(|err| {
             Status::internal(format!(
                 "Failed to store name to ID lookup for {name} -> {}: {err}",

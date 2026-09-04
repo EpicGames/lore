@@ -10,6 +10,7 @@ use tokio::task::JoinSet;
 use crate::change;
 use crate::change::NodeChange;
 use crate::errors::InvalidArguments;
+use crate::errors::SlowDown;
 use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
 use crate::fs::filesystem_provider::FilesystemDiffTree;
@@ -29,6 +30,7 @@ use crate::util::path::RepositoryPath;
 #[error_set]
 pub enum DiffError {
     InvalidArguments,
+    SlowDown,
 }
 
 /// Calculate the difference between two revisions, as the set of changes

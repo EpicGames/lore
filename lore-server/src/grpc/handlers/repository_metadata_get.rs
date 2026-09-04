@@ -14,6 +14,7 @@ use tonic::Status;
 use tracing::warn;
 
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
@@ -51,10 +52,13 @@ pub async fn handler(
                 .await
                 .map_err(|_err| no_repository_access_status())?;
 
-            let metadata_hash = repository::metadata_hash(repository).await.map_err(|err| {
-                warn!(%err, "Failed to load repository metadata hash");
-                Status::not_found(err.to_string())
-            })?;
+            let metadata_hash = repository::metadata_hash(repository)
+                .await
+                .filter_slow_down()?
+                .map_err(|err| {
+                    warn!(%err, "Failed to load repository metadata hash");
+                    Status::not_found(err.to_string())
+                })?;
 
             Ok(Response::new(RepositoryMetadataGetResponse {
                 metadata_hash: metadata_hash.into(),

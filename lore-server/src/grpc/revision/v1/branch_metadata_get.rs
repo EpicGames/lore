@@ -16,6 +16,7 @@ use tonic::Status;
 use tracing::debug;
 use tracing::info;
 
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
@@ -53,12 +54,13 @@ pub async fn handler(
         .scope(execution, async move {
             debug!({BRANCH_ID} = %branch_id, "Reading branch metadata pointer");
 
-            let metadata_hash = branch::metadata_hash(repository, branch_id).await.map_err(
-                |err| {
+            let metadata_hash = branch::metadata_hash(repository, branch_id)
+                .await
+                .filter_slow_down()?
+                .map_err(|err| {
                     info!({BRANCH_ID} = %branch_id, ?err, "Failed to load branch metadata pointer");
                     Status::not_found(format!("Branch {branch_id} not found"))
-                },
-            )?;
+                })?;
 
             debug!(
                 {BRANCH_ID} = %branch_id,

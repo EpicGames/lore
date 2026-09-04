@@ -10,9 +10,12 @@ use serde::Serialize;
 use tokio_stream::StreamExt;
 
 use crate::branch;
+use crate::errors::SlowDown;
+use crate::errors::absent_unless;
 use crate::event;
 use crate::immutable;
 use crate::immutable::ReadFromImmutable;
+use crate::interface::LoreError;
 use crate::interface::LoreString;
 use crate::lore::Address;
 use crate::lore::BranchId;
@@ -29,9 +32,18 @@ use crate::state::StateData;
 pub const DEFAULT_SEARCH_LIMIT: usize = 1000;
 
 #[error_set]
-pub enum FindError {}
+pub enum FindError {
+    SlowDown,
+}
 
-impl crate::event::EventError for FindError {}
+impl event::EventError for FindError {
+    fn translated(&self) -> LoreError {
+        match self {
+            FindError::SlowDown(_) => LoreError::SlowDown,
+            FindError::Internal(_) => LoreError::Internal,
+        }
+    }
+}
 
 pub enum FindMatchResult {
     Match,
@@ -61,14 +73,20 @@ where
         if !execution_context().globals().offline_or_local()
             && let Ok(remote) = repository.remote().await
         {
+            // no propagation here: a throttled or unreachable remote is what
+            // the local fallback below exists for, so it stays a zero latest
+            // rather than a failure.
             revision = branch::load_remote_latest(remote, repository.id, branch)
                 .await
                 .unwrap_or_default();
         }
         if revision.is_zero() {
-            revision = branch::load_latest(repository.clone(), branch)
-                .await
-                .unwrap_or_default();
+            revision = absent_unless::<_, _, FindError>(
+                branch::load_latest(repository.clone(), branch).await,
+                branch::BranchError::is_slow_down,
+                "loading branch latest",
+            )?
+            .unwrap_or_default();
         }
     }
     lore_debug!("Find start revision {}", revision);
@@ -250,43 +268,64 @@ pub async fn revision_by_string(
     search_remote: bool,
 ) -> Result<Hash, FindError> {
     if !current_branch.is_zero()
-        && let Ok(revision) = crate::find::revision_by_string_in_branch(
-            repository.clone(),
-            signature,
-            current_branch,
-            search_limit,
-        )
-        .await
+        && let Some(revision) = absent_unless::<_, _, FindError>(
+            crate::find::revision_by_string_in_branch(
+                repository.clone(),
+                signature,
+                current_branch,
+                search_limit,
+            )
+            .await,
+            FindError::is_slow_down,
+            "searching current branch",
+        )?
     {
         return Ok(revision);
     }
 
     // TODO(mjansson): This should use partial match in immutable store instead
     // TODO(mjansson): Default branch first
-    if let Ok(mut list) = branch::list(repository.clone()).await {
+    let local_branches = absent_unless::<_, _, FindError>(
+        branch::list(repository.clone()).await,
+        branch::BranchError::is_slow_down,
+        "listing branches",
+    )?;
+    if let Some(mut list) = local_branches {
         while let Some(branch) = list.next().await {
             if branch == current_branch {
                 continue;
             }
 
-            if let Ok(revision) =
+            if let Some(revision) = absent_unless::<_, _, FindError>(
                 revision_by_string_in_branch(repository.clone(), signature, branch, search_limit)
-                    .await
-            {
+                    .await,
+                FindError::is_slow_down,
+                "searching branch",
+            )? {
                 return Ok(revision);
             }
         }
     }
 
     if search_remote && let Ok(remote) = repository.remote().await {
-        let list = branch::list_remote(remote, repository.id)
-            .await
-            .unwrap_or_default();
+        let list = absent_unless::<_, _, FindError>(
+            branch::list_remote(remote, repository.id).await,
+            branch::BranchError::is_slow_down,
+            "listing remote branches",
+        )?
+        .unwrap_or_default();
         for branch in &list {
-            if let Ok(revision) =
-                revision_by_string_in_branch(repository.clone(), signature, branch.id, search_limit)
-                    .await
-            {
+            if let Some(revision) = absent_unless::<_, _, FindError>(
+                revision_by_string_in_branch(
+                    repository.clone(),
+                    signature,
+                    branch.id,
+                    search_limit,
+                )
+                .await,
+                FindError::is_slow_down,
+                "searching remote branch",
+            )? {
                 return Ok(revision);
             }
         }

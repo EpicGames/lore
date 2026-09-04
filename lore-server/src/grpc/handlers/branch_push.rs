@@ -236,6 +236,8 @@ pub(crate) async fn dispatch_response_message(
         .branch(branch)
         .revision(revision);
 
+    // no filter_slow_down()? usage here: these reads only decorate the hook
+    // context, and the push they describe has already succeeded.
     if let Ok(metadata_hash) = repository::metadata_hash(repository.clone()).await
         && let Ok(repository_metadata) =
             repository::metadata(repository.clone(), metadata_hash).await
@@ -296,6 +298,7 @@ pub async fn push(
     // Check if branch is protected
     let branch_metadata = metadata(repository.clone(), branch)
         .await
+        .filter_slow_down()?
         .warn_map_err(|err| Status::internal(format!("Failed to load branch metadata: {err}")))?;
 
     if branch_metadata.get_bool(PROTECT).unwrap_or_default() {
@@ -313,6 +316,7 @@ pub async fn push(
     {
         let is_mapped = branch::load_name_to_id_local(repository.clone(), branch_name)
             .await
+            .filter_slow_down()?
             .is_ok_and(|id| id == branch);
         if !is_mapped {
             debug!("Branch push rejected, name-to-id mapping missing for deleted branch");
@@ -322,6 +326,7 @@ pub async fn push(
 
     let mut current_head = load_latest(repository.clone(), branch)
         .await
+        .filter_slow_down()?
         .unwrap_or_default();
 
     // Verify the validity of the revision to push to latest
@@ -414,6 +419,7 @@ pub async fn push(
             new_head = state
                 .serialize(repository.clone(), &write_token)
                 .await
+                .filter_slow_down()?
                 .warn_map_err(|err| {
                     Status::internal(format!("Failed to serialize state: {err}"))
                 })?;
@@ -421,6 +427,7 @@ pub async fn push(
 
         let previous_head = try_store_latest(repository.clone(), branch, current_head, new_head)
             .await
+            .filter_slow_down()?
             .warn_map_err(|err| {
                 Status::internal(format!("Failed to store new latest pointer: {err}"))
             })?;
@@ -514,6 +521,7 @@ async fn try_fast_forward_merge(
             false,
         )
         .await
+        .filter_slow_down()?
         .warn_map_err(|err| {
             Status::internal(format!(
                 "Failed to compute diff3 for fast-forward merge: {err}"
@@ -587,6 +595,7 @@ async fn try_fast_forward_merge(
                 incoming_metadata_hash,
             )
             .await
+            .filter_slow_down()?
             .warn_map_err(|err| {
                 Status::internal(format!("Failed to load incoming revision metadata: {err}"))
             })?;
@@ -612,6 +621,7 @@ async fn try_fast_forward_merge(
             let metadata_hash = metadata
                 .serialize(repository.clone())
                 .await
+                .filter_slow_down()?
                 .warn_map_err(|_| Status::internal("Failed to serialize metadata"))?;
             state_current.set_metadata_hash(metadata_hash);
         }
@@ -621,6 +631,7 @@ async fn try_fast_forward_merge(
         let new_revision = state_current
             .serialize(repository.clone(), &write_token)
             .await
+            .filter_slow_down()?
             .warn_map_err(|err| {
                 Status::internal(format!(
                     "Failed to serialize fast-forward merge state: {err}"
@@ -631,6 +642,7 @@ async fn try_fast_forward_merge(
         let previous_head =
             try_store_latest(repository.clone(), branch, current_head, new_revision)
                 .await
+                .filter_slow_down()?
                 .warn_map_err(|err| {
                     Status::internal(format!("Failed to store fast-forward merge latest: {err}"))
                 })?;

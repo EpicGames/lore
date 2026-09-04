@@ -13,6 +13,7 @@ use tonic::Response;
 use tonic::Status;
 use tracing::warn;
 
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
@@ -45,6 +46,7 @@ pub async fn handler(
         .scope(execution, async move {
             let metadata_hash = branch::metadata_hash(repository, branch)
                 .await
+                .filter_slow_down()?
                 .map_err(|err| {
                     warn!(%err, "Failed to load branch metadata hash");
                     Status::not_found(err.to_string())

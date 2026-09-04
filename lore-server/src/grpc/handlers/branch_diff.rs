@@ -112,12 +112,14 @@ async fn branch_diff_handler(
 ) -> Result<Response<BranchDiffResponse>, Status> {
     let metadata = branch::metadata(repository.clone(), branch_source)
         .await
+        .filter_slow_down()?
         .map_err(|err| {
             warn!("Failed to get source branch metadata: {branch_source}");
             Status::not_found(err.to_string())
         })?;
     let source = branch::branch_metadata(repository.clone(), branch_source, &metadata)
         .await
+        .filter_slow_down()?
         .map_err(|e| {
             warn!("Failed to resolve source branch: {branch_source}");
             Status::not_found(e.to_string())
@@ -125,12 +127,14 @@ async fn branch_diff_handler(
 
     let metadata = branch::metadata(repository.clone(), branch_target)
         .await
+        .filter_slow_down()?
         .map_err(|err| {
             warn!("Failed to get target branch metadata: {branch_target}");
             Status::not_found(err.to_string())
         })?;
     let target = branch::branch_metadata(repository.clone(), branch_target, &metadata)
         .await
+        .filter_slow_down()?
         .map_err(|e| {
             warn!("Failed to resolve target branch: {branch_target}");
             Status::not_found(e.to_string())
@@ -149,7 +153,7 @@ async fn branch_diff_handler(
         auto_resolve,
     )
     .await;
-    match result {
+    match result.filter_slow_down()? {
         Ok(result) => {
             debug!("Found {} changes", result.changes.len());
             // The changes are base -> source; compare the registries over the

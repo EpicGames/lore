@@ -19,6 +19,7 @@ use lore_revision::revision;
 use lore_revision::revision::ResolveSearchLocation;
 use lore_revision::state;
 use lore_revision::util;
+use lore_storage::StoreError;
 use lore_telemetry::LabelArray;
 use lore_telemetry::observe::Observe;
 use lore_telemetry::observe::ObserveResult;
@@ -42,6 +43,7 @@ use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
+use crate::grpc::none_or_status;
 use crate::grpc::revision::v1::service::RevisionListInstruments;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
@@ -265,7 +267,7 @@ async fn resolve_start(
             let hash = Hash::from(signature);
             if acceleration.list_cache
                 && let Some(cached) =
-                    try_serve_signature_from_cache(repository, hash, history_step_size).await
+                    try_serve_signature_from_cache(repository, hash, history_step_size).await?
             {
                 return Ok(cached);
             }
@@ -279,6 +281,7 @@ async fn resolve_start(
             if identifier.number == 0 {
                 let hash = branch::load_latest(repository.clone(), branch)
                     .await
+                    .filter_slow_down()?
                     .warn_map_err(|err| {
                         Status::not_found(format!("Branch {branch} not found: {err}"))
                     })?;
@@ -296,6 +299,8 @@ async fn resolve_start(
                     history_step_size,
                 )
                 .await
+                .filter_slow_down()?
+                .unwrap_or_default()
                     && cached
                         .items()
                         .iter()
@@ -320,6 +325,8 @@ async fn resolve_start(
                     history_step_size,
                 )
                 .await
+                .filter_slow_down()?
+                .unwrap_or_default()
                     && cached
                         .items()
                         .iter()
@@ -343,6 +350,8 @@ async fn resolve_start(
                     history_step_size,
                 )
                 .await
+                .filter_slow_down()?
+                .unwrap_or_default()
             } else {
                 None
             };
@@ -361,6 +370,7 @@ async fn resolve_start(
                     ResolveSearchLocation::Local,
                 )
                 .await
+                .filter_slow_down()?
                 .map_err(|err| Status::not_found(format!("Revision not found: {err}")))?;
                 Ok(ResolveStart::Walk {
                     start: hash,
@@ -379,62 +389,69 @@ async fn try_serve_signature_from_cache(
     repository: &Arc<RepositoryContext>,
     signature: Hash,
     history_step_size: u64,
-) -> Option<ResolveStart> {
-    let state = match state::State::deserialize(repository.clone(), signature).await {
+) -> Result<Option<ResolveStart>, Status> {
+    let state = match state::State::deserialize(repository.clone(), signature)
+        .await
+        .filter_slow_down()?
+    {
         Ok(state) => state,
         Err(err) => {
             debug!(%signature, ?err, "Cache fast path: state deserialize failed");
-            return None;
+            return Ok(None);
         }
     };
-    let metadata = match Metadata::deserialize(repository.clone(), state.metadata_hash()).await {
+    let metadata = match Metadata::deserialize(repository.clone(), state.metadata_hash())
+        .await
+        .filter_slow_down()?
+    {
         Ok(metadata) => metadata,
         Err(err) => {
             debug!(%signature, ?err, "Cache fast path: metadata deserialize failed");
-            return None;
+            return Ok(None);
         }
     };
     let branch = match metadata.get_branch() {
         Ok(branch) => branch,
         Err(err) => {
             debug!(%signature, ?err, "Cache fast path: metadata missing branch");
-            return None;
+            return Ok(None);
         }
     };
     let revision_number = state.revision_number();
-    let (cached, strategy) = match cache::revision::load_cached_list(
-        repository,
-        branch,
-        revision_number,
-        history_step_size,
-    )
-    .await
+    let (cached, strategy) = if let Some(items) =
+        cache::revision::load_cached_list(repository, branch, revision_number, history_step_size)
+            .await
+            .filter_slow_down()?
+            .unwrap_or_default()
     {
-        Some(items) => (items, RevisionListStrategy::ListCache),
-        None => (
-            cache::revision::try_backfill_segment(
-                repository,
-                branch,
-                revision_number,
-                history_step_size,
-            )
-            .await?,
-            RevisionListStrategy::ListCacheBackfill,
-        ),
+        (items, RevisionListStrategy::ListCache)
+    } else {
+        let Some(backfilled) = cache::revision::try_backfill_segment(
+            repository,
+            branch,
+            revision_number,
+            history_step_size,
+        )
+        .await
+        .filter_slow_down()?
+        .unwrap_or_default() else {
+            return Ok(None);
+        };
+        (backfilled, RevisionListStrategy::ListCacheBackfill)
     };
     if !cached
         .items()
         .iter()
         .any(|item| item.signature == signature)
     {
-        return None;
+        return Ok(None);
     }
-    Some(ResolveStart::Items {
+    Ok(Some(ResolveStart::Items {
         items: cached_to_proto(cached.items()),
         branch,
         next_older: cached_next_older(cached.items()),
         strategy,
-    })
+    }))
 }
 
 fn observe_resolve_start()
@@ -504,8 +521,9 @@ async fn walk_revisions(
             })?;
 
         if first
-            && let Ok(metadata) =
-                Metadata::deserialize(repository.clone(), state.metadata_hash()).await
+            && let Ok(metadata) = Metadata::deserialize(repository.clone(), state.metadata_hash())
+                .await
+                .filter_slow_down()?
         {
             if let Ok(b) = metadata.get_branch() {
                 branch = Some(b);
@@ -536,6 +554,8 @@ async fn walk_revisions(
                 previous_state.revision_number(),
                 history_step_size,
             )
+            // no filter_slow_down()? usage here: this read only enables the
+            // best-effort step-key backfill below.
             && let Ok(metadata) =
                 Metadata::deserialize(repository.clone(), previous_state.metadata_hash()).await
             && let Ok(branch_id) = metadata.get_branch()
@@ -629,18 +649,16 @@ async fn probe_step_boundary(
         boundary,
         history_step_size,
     );
-    match repository
-        .read_mutable_store()
-        .load(repository.id, key, key_type)
-        .await
-        .filter_slow_down()?
-    {
-        Ok(revision) if revision != first_signature => Ok(BoundaryProbe::Found(revision)),
-        Ok(_) => Ok(BoundaryProbe::Empty),
-        Err(err) if err.is_address_not_found() => Ok(BoundaryProbe::Unknown),
-        Err(err) => Err(warn_error_to_status(&err, |e| {
-            Status::internal(e.to_string())
-        })),
+    match none_or_status(
+        repository
+            .read_mutable_store()
+            .load(repository.id, key, key_type)
+            .await,
+        StoreError::is_address_not_found,
+    )? {
+        Some(revision) if revision != first_signature => Ok(BoundaryProbe::Found(revision)),
+        Some(_) => Ok(BoundaryProbe::Empty),
+        None => Ok(BoundaryProbe::Unknown),
     }
 }
 
@@ -797,7 +815,10 @@ async fn forward_target(
     if list_cache_enabled
         && let Some(boundary) = anchor_boundary
         && let Some(cached) =
-            cache::revision::load_cached_list(repository, branch, boundary, history_step_size).await
+            cache::revision::load_cached_list(repository, branch, boundary, history_step_size)
+                .await
+                .filter_slow_down()?
+                .unwrap_or_default()
         && let Some(item) = cached
             .items()
             .iter()
@@ -808,8 +829,10 @@ async fn forward_target(
     }
 
     let max_items = history_step_size as usize + 1;
-    let walk =
-        cache::revision::walk_segment_revisions(repository, anchor, first_number, max_items).await;
+    let walk = cache::revision::walk_segment_revisions(repository, anchor, first_number, max_items)
+        .await
+        .filter_slow_down()?
+        .map_err(|err| warn_error_to_status(&err, |e| Status::internal(e.to_string())))?;
     if !walk.reached_terminator {
         return Err(Status::internal(format!(
             "forward cursor descent from {anchor} exceeded {max_items} hops without \
@@ -1031,6 +1054,7 @@ mod test {
     use super::*;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
+    use crate::store::FailingLoadStore;
     use crate::store::test_store_create;
 
     struct TestInstrumentProvider {}
@@ -1581,6 +1605,55 @@ mod test {
                 inner.items[0].state.len(),
                 std::mem::size_of::<lore_revision::state::StateData>(),
             );
+        }))
+        .await;
+    }
+
+    /// The forward cursor is served from the `BranchLatestPointer` step key.
+    /// Failing that one lookup with backpressure must reach the client as
+    /// `RESOURCE_EXHAUSTED`; reporting an absent cursor instead would send
+    /// the client back to paging from the branch tip.
+    #[tokio::test]
+    async fn forward_cursor_slow_down_returns_resource_exhausted() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (branch_id, signatures) =
+                create_branch_with_history(&repository_context, 250).await;
+
+            // The cursor for the page anchored at revision 100 targets
+            // revision 101, whose step key is the only lookup failed here.
+            let (forward_key, _key_type) = branch::revision_step_key(
+                repository::SALT_LORE,
+                repository,
+                branch_id,
+                101,
+                DEFAULT_HISTORY_STEP_SIZE,
+            );
+            let throttled = FailingLoadStore::for_key(
+                mutable_store,
+                forward_key,
+                lore_storage::StoreError::from(lore_base::error::SlowDown),
+            );
+
+            let status = handler(
+                make_request_signature(repository, signatures[250 - 100]),
+                immutable_store,
+                throttled,
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration::default(),
+                &make_instruments(),
+            )
+            .await
+            .expect_err("backpressure must not be reported as an absent cursor");
+            assert_eq!(status.code(), tonic::Code::ResourceExhausted);
         }))
         .await;
     }
@@ -2184,6 +2257,53 @@ mod test {
                     .map(|v| v.to_str().unwrap()),
                 Some("full-iteration"),
             );
+        }))
+        .await;
+    }
+
+    /// The full-iteration path resolves `branch@number` through
+    /// `revision::resolve`, which reads the branch latest first. Throttling that
+    /// read must reach the client as `RESOURCE_EXHAUSTED`: reporting it as
+    /// `NOT_FOUND` claims a revision does not exist and gives the client no
+    /// reason to retry.
+    #[tokio::test]
+    async fn throttled_branch_latest_resolves_to_resource_exhausted_not_not_found() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (branch_id, _) = create_branch_with_history(&repository_context, 250).await;
+
+            let (latest_key, _key_type) =
+                branch::mutable_key(repository::SALT_LORE, branch::LATEST, repository, branch_id);
+            let throttled = FailingLoadStore::for_key(
+                mutable_store,
+                latest_key,
+                lore_storage::StoreError::from(lore_base::error::SlowDown),
+            );
+
+            // Acceleration off, so the request takes the full-iteration path
+            // through revision::resolve rather than a step key or the cache.
+            let status = handler(
+                make_request_identifier(repository, branch_id, 100),
+                immutable_store,
+                throttled,
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration {
+                    step_keys: false,
+                    list_cache: false,
+                },
+                &make_instruments(),
+            )
+            .await
+            .expect_err("a throttled branch latest must not resolve");
+            assert_eq!(status.code(), tonic::Code::ResourceExhausted);
         }))
         .await;
     }

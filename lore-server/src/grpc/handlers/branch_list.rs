@@ -19,6 +19,7 @@ use tracing::debug;
 use tracing::info_span;
 use tracing::warn;
 
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
@@ -56,7 +57,7 @@ pub async fn handler(
 async fn branch_list_handler(
     repository: Arc<RepositoryContext>,
 ) -> Result<Response<BranchListResponse>, Status> {
-    let mut branch_list = match branch::list(repository.clone()).await {
+    let mut branch_list = match branch::list(repository.clone()).await.filter_slow_down()? {
         Ok(branch_list) => branch_list,
         Err(err) if err.is_branch_not_found() => {
             warn!("No branches found for repository: {}", repository.id);
@@ -90,8 +91,9 @@ async fn branch_list_handler(
 
     let mut branches: Vec<lore_proto::Branch> = vec![];
     while let Some(task_result) = branch_meta_tasks.join_next().await {
-        if let Ok(Ok(metadata)) = task_result
+        if let Ok(branch_metadata) = task_result
             .warn_map_err(|err| Status::internal(format!("Failed branch metadata task: {err:?}")))
+            && let Ok(metadata) = branch_metadata.filter_slow_down()?
         {
             branches.push(metadata.into());
         }
@@ -99,8 +101,12 @@ async fn branch_list_handler(
 
     // Ensure the default branch is included in the response. If missing,
     // recreate the branch name-to-id mutable key and include its metadata.
-    if let Ok(metadata_hash) = repository::metadata_hash(repository.clone()).await
-        && let Ok(repo_metadata) = repository::metadata(repository.clone(), metadata_hash).await
+    if let Ok(metadata_hash) = repository::metadata_hash(repository.clone())
+        .await
+        .filter_slow_down()?
+        && let Ok(repo_metadata) = repository::metadata(repository.clone(), metadata_hash)
+            .await
+            .filter_slow_down()?
     {
         let default_branch = repo_metadata.default_branch;
         if !default_branch.is_zero()
@@ -113,6 +119,8 @@ async fn branch_list_handler(
                 name = repo_metadata.default_branch_name,
                 "Default branch missing from list, recreating name-to-id mapping"
             );
+            // no filter_slow_down()? usage here: recreating the mapping is a
+            // best-effort repair; the listing is still answered without it.
             if let Err(err) = branch::store_name_to_id(
                 repository.clone(),
                 default_branch,
@@ -123,9 +131,13 @@ async fn branch_list_handler(
                 warn!(%err, "Failed to recreate default branch name-to-id mapping");
             }
 
-            if let Ok(metadata) = branch::metadata(repository.clone(), default_branch).await
+            if let Ok(metadata) = branch::metadata(repository.clone(), default_branch)
+                .await
+                .filter_slow_down()?
                 && let Ok(branch_meta) =
-                    branch::branch_metadata(repository.clone(), default_branch, &metadata).await
+                    branch::branch_metadata(repository.clone(), default_branch, &metadata)
+                        .await
+                        .filter_slow_down()?
             {
                 branches.push(branch_meta.into());
             }

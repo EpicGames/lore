@@ -24,6 +24,7 @@ use tracing::info;
 use tracing::warn;
 
 use super::record::build_repository;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
@@ -130,6 +131,7 @@ pub async fn repository_get_implementation(
                     let (metadata, metadata_hash) =
                         repository_load_id(repository.clone(), id, auth_url, authorization)
                             .await
+                            .filter_slow_down()?
                             .map_err(|_err| {
                                 Status::not_found(format!("Repository {id} not found"))
                             })?;
@@ -144,6 +146,7 @@ pub async fn repository_get_implementation(
                         authorization,
                     )
                     .await
+                    .filter_slow_down()?
                     .map_err(|_err| Status::not_found(format!("Repository {name} not found")))?;
                     (id, metadata, metadata_hash)
                 }
@@ -203,6 +206,8 @@ pub(super) async fn repository_load_id(
                 "Repairing missing name -> ID mapping: {} -> {}",
                 metadata.name, id
             );
+            // no filter_slow_down()? usage here: repairing the name mapping is
+            // best-effort, and the repository has already been resolved.
             let _ = repository::store_name_to_id(repository.clone(), &metadata.name, id)
                 .await
                 .inspect_err(|err| warn!("Failed to repair name -> ID mapping: {err}"));

@@ -24,6 +24,7 @@ use tracing::Instrument;
 use tracing::debug;
 
 use super::record::build_repository;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
@@ -129,6 +130,7 @@ async fn list_candidate_ids(
         ));
         let mut stream = repository::list_local(repository)
             .await
+            .filter_slow_down()?
             .warn_map_err(|err| Status::internal(format!("Failed to list repositories: {err}")))?;
         let mut out = Vec::new();
         while let Some(id) = stream.next().await {
@@ -138,6 +140,11 @@ async fn list_candidate_ids(
     }
 }
 
+/// Build one repository record. A repository whose metadata cannot be read is
+/// skipped with `None`, since a partially-written repository should not fail
+/// the whole listing. A store asking the caller to back off is emitted onto
+/// the stream instead, so the client is told to retry rather than handed a
+/// listing with repositories silently missing from it.
 async fn load_and_filter_repository(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
@@ -150,16 +157,24 @@ async fn load_and_filter_repository(
         id,
     ));
 
-    let metadata_hash = match repository::metadata_hash(repository.clone()).await {
-        Ok(hash) => hash,
-        Err(err) => {
+    let metadata_hash = match repository::metadata_hash(repository.clone())
+        .await
+        .filter_slow_down()
+    {
+        Err(status) => return Some(Err(status)),
+        Ok(Ok(hash)) => hash,
+        Ok(Err(err)) => {
             debug!(%id, %err, "Repository list: metadata hash unavailable, skipping");
             return None;
         }
     };
-    let metadata = match repository::metadata(repository.clone(), metadata_hash).await {
-        Ok(metadata) => metadata,
-        Err(err) => {
+    let metadata = match repository::metadata(repository.clone(), metadata_hash)
+        .await
+        .filter_slow_down()
+    {
+        Err(status) => return Some(Err(status)),
+        Ok(Ok(metadata)) => metadata,
+        Ok(Err(err)) => {
             debug!(%id, %err, "Repository list: metadata blob unavailable, skipping");
             return None;
         }

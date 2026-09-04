@@ -17,6 +17,7 @@ use tonic::Status;
 use tracing::debug;
 use tracing::info;
 
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
@@ -81,6 +82,7 @@ async fn query_by_name(
     // Step 1: name→ID mapping
     let branch = branch::load_name_to_id_local(repository.clone(), name)
         .await
+        .filter_slow_down()?
         .map_err(|err| {
             debug!(name, error = ?err, "Branch name not found");
             Status::not_found("Branch does not exist")
@@ -89,6 +91,7 @@ async fn query_by_name(
     // Step 2: ID→metadata
     let metadata_hash = branch::metadata_hash(repository.clone(), branch)
         .await
+        .filter_slow_down()?
         .map_err(|err| {
             info!({BRANCH_ID} = %branch, error = ?err, "Stale name mapping, metadata missing");
             Status::not_found("Branch does not exist")
@@ -97,6 +100,7 @@ async fn query_by_name(
     // Step 3: Load metadata and verify name matches
     let branch_metadata = branch::load_metadata(repository.clone(), metadata_hash)
         .await
+        .filter_slow_down()?
         .map_err(|err| {
             info!({BRANCH_ID} = %branch, error = ?err, "Failed to load branch metadata");
             Status::not_found("Branch does not exist")
@@ -110,6 +114,7 @@ async fn query_by_name(
 
     let revision = branch::load_latest(repository.clone(), branch)
         .await
+        .filter_slow_down()?
         .unwrap_or_default();
 
     debug!({BRANCH_ID} = %branch, {REVISION} = %revision, {METADATA} = %metadata_hash, "Branch query by name response");
@@ -128,6 +133,7 @@ async fn query_by_id(
     // Step 1: ID→metadata
     let metadata_hash = branch::metadata_hash(repository.clone(), branch)
         .await
+        .filter_slow_down()?
         .map_err(|err| {
             info!({BRANCH_ID} = %branch, error = ?err, "Branch metadata not found");
             Status::not_found("Branch does not exist")
@@ -136,6 +142,7 @@ async fn query_by_id(
     // Step 2: Load metadata
     let branch_metadata = branch::load_metadata(repository.clone(), metadata_hash)
         .await
+        .filter_slow_down()?
         .map_err(|err| {
             info!({BRANCH_ID} = %branch, error = ?err, "Failed to load branch metadata");
             Status::not_found("Branch does not exist")
@@ -143,6 +150,7 @@ async fn query_by_id(
 
     let revision = branch::load_latest(repository.clone(), branch)
         .await
+        .filter_slow_down()?
         .unwrap_or_default();
 
     // Step 3: Check name→ID(metadata.name) to determine deleted status
@@ -151,6 +159,7 @@ async fn query_by_id(
     {
         let name_maps_to_us = branch::load_name_to_id_local(repository.clone(), metadata_name)
             .await
+            .filter_slow_down()?
             .is_ok_and(|id| id == branch);
         if !name_maps_to_us {
             info!({BRANCH_ID} = %branch, metadata_name, "Branch deleted (name mapping missing or points elsewhere)");

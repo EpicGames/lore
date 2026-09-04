@@ -33,9 +33,15 @@ pub use admin_service::LoreAdminService;
 pub use grpc_internal_server::GrpcInternalServerBuilder;
 use lore_base::types::Context;
 use lore_revision::branch::BranchError;
+use lore_revision::diff::DiffError;
+use lore_revision::find::FindError;
+use lore_revision::immutable::ImmutableError;
 use lore_revision::link::LinkError;
 use lore_revision::lore::RepositoryId;
 use lore_revision::metadata::MetadataError;
+use lore_revision::metadata::branch::BranchMetadataError;
+use lore_revision::metadata::repository::RepositoryMetadataError;
+use lore_revision::repository::RepositoryError;
 use lore_revision::repository::RepositoryWriteToken;
 use lore_revision::repository::ServerContext;
 use lore_revision::state::StateError;
@@ -464,58 +470,61 @@ pub trait FilterSlowDownExt<T, E> {
     fn filter_slow_down(self) -> Result<Result<T, E>, Status>;
 }
 
-impl<T> FilterSlowDownExt<T, StateError> for Result<T, StateError> {
-    fn filter_slow_down(self) -> Result<Result<T, StateError>, Status> {
-        if let Err(err) = &self
-            && err.is_slow_down()
-        {
-            return Err(Status::resource_exhausted(err.to_string()));
-        }
-        Ok(self)
-    }
+/// Implements [`FilterSlowDownExt`] for error sets that declare a `SlowDown`
+/// variant: the backpressure signal becomes `RESOURCE_EXHAUSTED`, and every
+/// other outcome passes through for the caller to match on.
+macro_rules! impl_filter_slow_down {
+    ($($error:ty),+ $(,)?) => {
+        $(
+            impl<T> FilterSlowDownExt<T, $error> for Result<T, $error> {
+                fn filter_slow_down(self) -> Result<Result<T, $error>, Status> {
+                    if let Err(err) = &self
+                        && err.is_slow_down()
+                    {
+                        return Err(Status::resource_exhausted(err.to_string()));
+                    }
+                    Ok(self)
+                }
+            }
+        )+
+    };
 }
 
-impl<T> FilterSlowDownExt<T, LinkError> for Result<T, LinkError> {
-    fn filter_slow_down(self) -> Result<Result<T, LinkError>, Status> {
-        if let Err(err) = &self
-            && err.is_slow_down()
-        {
-            return Err(Status::resource_exhausted(err.to_string()));
-        }
-        Ok(self)
-    }
-}
+impl_filter_slow_down!(
+    BranchError,
+    BranchMetadataError,
+    DiffError,
+    FindError,
+    ImmutableError,
+    LinkError,
+    MetadataError,
+    RepositoryError,
+    RepositoryMetadataError,
+    StateError,
+    StoreError,
+);
 
-impl<T> FilterSlowDownExt<T, MetadataError> for Result<T, MetadataError> {
-    fn filter_slow_down(self) -> Result<Result<T, MetadataError>, Status> {
-        if let Err(err) = &self
-            && err.is_slow_down()
-        {
-            return Err(Status::resource_exhausted(err.to_string()));
-        }
-        Ok(self)
-    }
-}
-
-impl<T> FilterSlowDownExt<T, StoreError> for Result<T, StoreError> {
-    fn filter_slow_down(self) -> Result<Result<T, StoreError>, Status> {
-        if let Err(err) = &self
-            && err.is_slow_down()
-        {
-            return Err(Status::resource_exhausted(err.to_string()));
-        }
-        Ok(self)
-    }
-}
-
-impl<T> FilterSlowDownExt<T, BranchError> for Result<T, BranchError> {
-    fn filter_slow_down(self) -> Result<Result<T, BranchError>, Status> {
-        if let Err(err) = &self
-            && err.is_slow_down()
-        {
-            return Err(Status::resource_exhausted(err.to_string()));
-        }
-        Ok(self)
+/// Converts a failed result into `Ok(None)` when `discard` accepts the error,
+/// and into a [`Status`] otherwise.
+///
+/// The failing path routes through [`FilterSlowDownExt::filter_slow_down`]
+/// first, so an error that carries its own status keeps it and only the
+/// remainder is reported as internal. A caller that can act on `None` keeps
+/// that path without also discarding the errors it cannot act on.
+pub fn none_or_status<T, E>(
+    result: Result<T, E>,
+    discard: impl FnOnce(&E) -> bool,
+) -> Result<Option<T>, Status>
+where
+    Result<T, E>: FilterSlowDownExt<T, E>,
+    E: std::error::Error,
+{
+    match result.filter_slow_down()? {
+        Ok(value) => Ok(Some(value)),
+        Err(err) if discard(&err) => Ok(None),
+        Err(err) => Err(warn_error_to_status(&err, |err| {
+            Status::internal(err.to_string())
+        })),
     }
 }
 
@@ -900,6 +909,118 @@ mod tests {
             let filtered = result.filter_slow_down().unwrap();
             let underlying_error = filtered.expect_err("Should be err");
             assert!(!underlying_error.is_slow_down());
+        }
+
+        #[test]
+        fn store_ok_passes_through() {
+            let result: Result<i32, StoreError> = Ok(42);
+            let filtered = result.filter_slow_down().unwrap();
+            assert_eq!(filtered.unwrap(), 42);
+        }
+
+        #[test]
+        fn store_slow_down_returns_resource_exhausted() {
+            let result: Result<i32, StoreError> = Err(StoreError::from(SlowDown));
+            let status = result.filter_slow_down().unwrap_err();
+            assert_eq!(status.code(), Code::ResourceExhausted);
+        }
+
+        #[test]
+        fn store_error_passes_through() {
+            let result: Result<i32, StoreError> = Err(StoreError::internal("other error"));
+            let filtered = result.filter_slow_down().unwrap();
+            let underlying_error = filtered.expect_err("Should be err");
+            assert!(!underlying_error.is_slow_down());
+        }
+
+        #[test]
+        fn branch_slow_down_returns_resource_exhausted() {
+            let result: Result<i32, BranchError> = Err(BranchError::from(SlowDown));
+            let status = result.filter_slow_down().unwrap_err();
+            assert_eq!(status.code(), Code::ResourceExhausted);
+        }
+
+        #[test]
+        fn branch_error_passes_through() {
+            let result: Result<i32, BranchError> = Err(BranchError::internal("other error"));
+            let filtered = result.filter_slow_down().unwrap();
+            let underlying_error = filtered.expect_err("Should be err");
+            assert!(!underlying_error.is_slow_down());
+        }
+
+        #[test]
+        fn repository_slow_down_returns_resource_exhausted() {
+            let result: Result<i32, RepositoryError> = Err(RepositoryError::from(SlowDown));
+            let status = result.filter_slow_down().unwrap_err();
+            assert_eq!(status.code(), Code::ResourceExhausted);
+        }
+
+        #[test]
+        fn immutable_slow_down_returns_resource_exhausted() {
+            let result: Result<i32, ImmutableError> = Err(ImmutableError::from(SlowDown));
+            let status = result.filter_slow_down().unwrap_err();
+            assert_eq!(status.code(), Code::ResourceExhausted);
+        }
+
+        #[test]
+        fn branch_metadata_slow_down_returns_resource_exhausted() {
+            let result: Result<i32, BranchMetadataError> = Err(BranchMetadataError::from(SlowDown));
+            let status = result.filter_slow_down().unwrap_err();
+            assert_eq!(status.code(), Code::ResourceExhausted);
+        }
+
+        /// `filter_slow_down`'s mapping must survive: flattening every
+        /// undiscarded error into the internal arm loses it silently, because
+        /// both arms still produce a `Status`.
+        #[test]
+        fn discarded_error_is_none_and_others_keep_their_status() {
+            let absent: Result<i32, StoreError> = Err(StoreError::from(
+                lore_base::error::AddressNotFound::from(lore_base::types::Address::default()),
+            ));
+            assert_eq!(
+                none_or_status(absent, StoreError::is_address_not_found).unwrap(),
+                None
+            );
+
+            let throttled: Result<i32, StoreError> = Err(StoreError::from(SlowDown));
+            let status = none_or_status(throttled, StoreError::is_address_not_found)
+                .expect_err("an undiscarded error must not become None");
+            assert_eq!(status.code(), Code::ResourceExhausted);
+
+            let failed: Result<i32, StoreError> = Err(StoreError::internal("store unusable"));
+            let status = none_or_status(failed, StoreError::is_address_not_found)
+                .expect_err("an undiscarded error must not become None");
+            assert_eq!(status.code(), Code::Internal);
+        }
+
+        #[test]
+        fn find_slow_down_returns_resource_exhausted() {
+            let result: Result<i32, FindError> = Err(FindError::from(SlowDown));
+            let status = result.filter_slow_down().unwrap_err();
+            assert_eq!(status.code(), Code::ResourceExhausted);
+        }
+
+        #[test]
+        fn find_error_passes_through() {
+            let result: Result<i32, FindError> = Err(FindError::internal("no revision found"));
+            let filtered = result.filter_slow_down().unwrap();
+            let underlying_error = filtered.expect_err("Should be err");
+            assert!(!underlying_error.is_slow_down());
+        }
+
+        #[test]
+        fn diff_slow_down_returns_resource_exhausted() {
+            let result: Result<i32, DiffError> = Err(DiffError::from(SlowDown));
+            let status = result.filter_slow_down().unwrap_err();
+            assert_eq!(status.code(), Code::ResourceExhausted);
+        }
+
+        #[test]
+        fn repository_metadata_slow_down_returns_resource_exhausted() {
+            let result: Result<i32, RepositoryMetadataError> =
+                Err(RepositoryMetadataError::from(SlowDown));
+            let status = result.filter_slow_down().unwrap_err();
+            assert_eq!(status.code(), Code::ResourceExhausted);
         }
     }
 }

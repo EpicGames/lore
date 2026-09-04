@@ -29,6 +29,7 @@ use crate::change::NodeChange;
 use crate::change::is_conflict;
 use crate::errors::Oversized;
 use crate::errors::RevisionNotFound;
+use crate::errors::absent_unless;
 use crate::event;
 use crate::filter::Filter;
 use crate::filter::FilterMode;
@@ -1170,6 +1171,31 @@ pub enum ResolveSearchLocation {
     Local,
 }
 
+/// Reduces a fallible result to an optional value, propagating the failures
+/// `propagate` selects only when `backup_source` cannot answer in its place.
+///
+/// `backup_source` is a latest another source has already produced. A usable one
+/// means the resolution can still succeed without this result, so every failure
+/// here becomes `Ok(None)` and the caller falls through to that source. With no
+/// usable `backup_source` this result is the last one that can answer, and a
+/// failure `propagate` selects has to reach the caller rather than arrive as a
+/// missing revision.
+///
+/// A zero `backup_source` counts as none, leaving this result as the sole
+/// answer.
+#[track_caller]
+fn absent_unless_sole_source<T, Source: ErrorSet>(
+    result: Result<T, Source>,
+    backup_source: Option<Hash>,
+    propagate: impl FnOnce(&Source) -> bool,
+    context: &str,
+) -> Result<Option<T>, StateError> {
+    if backup_source.is_some_and(|hash| !hash.is_zero()) {
+        return Ok(result.ok());
+    }
+    absent_unless(result, propagate, context)
+}
+
 pub async fn resolve(
     repository: Arc<RepositoryContext>,
     signature: impl AsRef<str>,
@@ -1241,6 +1267,9 @@ pub async fn resolve(
         };
 
         let remote_latest = if should_search_remote && let Ok(remote) = repository.remote().await {
+            // no propagation here: a throttled or unreachable remote is what
+            // the local latest below exists to cover, so it stays `None` rather
+            // than failing here.
             branch::load_remote_latest(remote.clone(), repository.id, branch)
                 .await
                 .ok()
@@ -1249,7 +1278,14 @@ pub async fn resolve(
         };
 
         let local_latest = if should_search_local {
-            branch::load_latest(repository.clone(), branch).await.ok()
+            // The remote latest stands in for this one: the resolution below
+            // answers from it alone when the local one is absent.
+            absent_unless_sole_source(
+                branch::load_latest(repository.clone(), branch).await,
+                remote_latest,
+                branch::BranchError::is_slow_down,
+                "loading branch latest",
+            )?
         } else {
             None
         };
@@ -1327,17 +1363,29 @@ pub async fn resolve(
 
             if revision.is_zero()
                 && let Some(head) = remote_latest
-                && let Ok(found_revision) =
-                    find::revision_by_number(repository.clone(), branch, head, revision_number)
-                        .await
             {
-                revision = found_revision;
+                // The local latest stands in for this search: the
+                // local-anchored attempt below runs next. A zero one cannot —
+                // a search anchored on it finds nothing.
+                let found = absent_unless_sole_source(
+                    find::revision_by_number(repository.clone(), branch, head, revision_number)
+                        .await,
+                    local_latest,
+                    find::FindError::is_slow_down,
+                    "finding revision by number",
+                )?;
+                if let Some(found_revision) = found {
+                    revision = found_revision;
+                }
             }
             if revision.is_zero()
                 && let Some(head) = local_latest
-                && let Ok(found_revision) =
+                && let Some(found_revision) = absent_unless::<_, _, StateError>(
                     find::revision_by_number(repository.clone(), branch, head, revision_number)
-                        .await
+                        .await,
+                    find::FindError::is_slow_down,
+                    "finding revision by number",
+                )?
             {
                 revision = found_revision;
             }
@@ -1371,15 +1419,18 @@ pub async fn resolve(
             .send();
         }
 
-        if let Ok(found_revision) = find::revision_by_string(
-            repository.clone(),
-            branch,
-            signature,
-            search_limit,
-            should_search_remote,
-        )
-        .await
-        {
+        if let Some(found_revision) = absent_unless::<_, _, StateError>(
+            find::revision_by_string(
+                repository.clone(),
+                branch,
+                signature,
+                search_limit,
+                should_search_remote,
+            )
+            .await,
+            find::FindError::is_slow_down,
+            "finding revision by partial signature",
+        )? {
             revision = found_revision;
             lore_debug!("Resolved partial match revision {revision}");
         }

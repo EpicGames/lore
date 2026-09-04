@@ -17,6 +17,7 @@ use tonic::Status;
 use tracing::debug;
 
 use super::branch_record::build_branch;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
@@ -115,21 +116,27 @@ async fn get_by_id(
 ) -> Result<Response<BranchGetResponse>, Status> {
     let metadata_hash = branch::metadata_hash(repository.clone(), branch_id)
         .await
+        .filter_slow_down()?
         .map_err(|_err| Status::not_found(format!("Branch {branch_id} not found")))?;
     let metadata = branch::load_metadata(repository.clone(), metadata_hash)
         .await
+        .filter_slow_down()?
         .warn_map_err(|err| Status::internal(err.to_string()))?;
 
     // Delete leaves metadata intact but clears the name → id mapping.
     let deleted = match branch::name(&metadata) {
         Ok(name) if !name.is_empty() => !branch::load_name_to_id_local(repository.clone(), name)
             .await
+            .filter_slow_down()?
             .is_ok_and(|id| id == branch_id),
         _ => false,
     };
 
-    let response_branch =
-        build_branch(repository, branch_id, &metadata, metadata_hash, deleted).await?;
+    let latest = branch::load_latest(repository, branch_id)
+        .await
+        .filter_slow_down()?
+        .unwrap_or_default();
+    let response_branch = build_branch(branch_id, &metadata, metadata_hash, deleted, latest);
     debug!({BRANCH_ID} = %branch_id, {METADATA} = %metadata_hash, deleted, "Branch get by id response");
     Ok(Response::new(BranchGetResponse {
         branch: Some(response_branch),
@@ -142,18 +149,24 @@ async fn get_by_name(
 ) -> Result<Response<BranchGetResponse>, Status> {
     let branch_id_ctx = branch::load_name_to_id_local(repository.clone(), name)
         .await
+        .filter_slow_down()?
         .map_err(|_err| Status::not_found(format!("Branch named '{name}' not found")))?;
     let branch_id = BranchId::from(branch_id_ctx);
 
     let metadata_hash = branch::metadata_hash(repository.clone(), branch_id)
         .await
+        .filter_slow_down()?
         .map_err(|_err| Status::not_found(format!("Branch named '{name}' not found")))?;
     let metadata = branch::load_metadata(repository.clone(), metadata_hash)
         .await
+        .filter_slow_down()?
         .warn_map_err(|err| Status::internal(err.to_string()))?;
 
-    let response_branch =
-        build_branch(repository, branch_id, &metadata, metadata_hash, false).await?;
+    let latest = branch::load_latest(repository, branch_id)
+        .await
+        .filter_slow_down()?
+        .unwrap_or_default();
+    let response_branch = build_branch(branch_id, &metadata, metadata_hash, false, latest);
     debug!({BRANCH_ID} = %branch_id, {METADATA} = %metadata_hash, "Branch get by name response");
     Ok(Response::new(BranchGetResponse {
         branch: Some(response_branch),

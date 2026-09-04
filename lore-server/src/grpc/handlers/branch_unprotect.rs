@@ -14,6 +14,7 @@ use tonic::Status;
 use tracing::info;
 use tracing::warn;
 
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
@@ -43,7 +44,10 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            match branch::unprotect(repository, branch).await {
+            match branch::unprotect(repository, branch)
+                .await
+                .filter_slow_down()?
+            {
                 Ok(_) => {
                     info!("Branch unprotected in repository {repository_id}: branch {branch}");
                     Ok(Response::new(BranchUnprotectResponse {}))

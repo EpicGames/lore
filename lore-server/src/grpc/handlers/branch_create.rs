@@ -18,6 +18,7 @@ use tonic::Response;
 use tonic::Status;
 use tracing::debug;
 
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
@@ -125,6 +126,7 @@ pub async fn handler(
                 false, /* Do not create linked repository branches */
             )
             .await
+            .filter_slow_down()?
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
 
             notification_sender
@@ -135,6 +137,9 @@ pub async fn handler(
 
             let revision = branch::load_latest(repository, branch)
                 .await
+                // no filter_slow_down()? usage here: the branch is already
+                // created, so a retryable status would invite a retry that can
+                // only fail with BranchAlreadyExists.
                 .unwrap_or_default();
 
             debug!("Created branch {name} ({branch}) at revision {revision}");

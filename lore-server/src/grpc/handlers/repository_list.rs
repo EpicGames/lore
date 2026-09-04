@@ -25,6 +25,7 @@ use tracing::warn;
 
 use crate::authnz::auth::grpc_get_auth_client;
 use crate::authnz::common::create_request_with_authorization;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
@@ -75,6 +76,7 @@ pub async fn handler(
             } else {
                 let mut repository_list = repository::list_local(repository.clone())
                     .await
+                    .filter_slow_down()?
                     .warn_map_err(|err| {
                         Status::internal(format!("Failed to list repositories: {err}"))
                     })?;
@@ -106,10 +108,13 @@ pub async fn handler(
                     Status::internal(format!("Failed repository metadata task: {err:?}"))
                 })?;
 
-                match result {
+                match result.filter_slow_down()? {
                     Ok(metadata_hash) => {
                         let repository = Arc::new(repository.to_server_context(id.into()));
-                        match repository::metadata(repository, metadata_hash).await {
+                        match repository::metadata(repository, metadata_hash)
+                            .await
+                            .filter_slow_down()?
+                        {
                             Ok(metadata) => {
                                 repositories.push(lore_proto::Repository {
                                     id: id.into(),
