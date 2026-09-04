@@ -116,7 +116,9 @@ pub enum JwtVerifierError {
 #[derive(Clone)]
 pub struct JwtVerifier {
     pub jwk_service: Arc<dyn JWKService>,
-    pub jwt_issuer: Option<String>,
+    /// Every `iss` value verification accepts. Two entries during an issuer's
+    /// cutover, one otherwise (see [`AuthSettings::jwt_issuer`](crate::settings::AuthSettings)).
+    pub jwt_issuer: Option<Vec<String>>,
     pub jwt_audience: Option<Vec<String>>,
 }
 
@@ -202,7 +204,7 @@ impl JwtVerifier {
     ) -> Result<AuthorizationToken, JwtVerifierError> {
         let mut validation = Validation::new(*alg);
         if let Some(iss) = self.jwt_issuer.as_ref() {
-            validation.set_issuer(&[iss]);
+            validation.set_issuer(iss);
         }
         if let Some(aud) = self.jwt_audience.as_ref() {
             validation.set_audience(aud);
@@ -1002,6 +1004,71 @@ mod tests {
             let verified_authz_token = verifier.verify_token(&encoded_authz_token).await?;
             assert_eq!(original_authz_token, verified_authz_token);
 
+            Ok(())
+        }
+
+        fn verifier_with_issuers(issuers: Vec<String>) -> JwtVerifier {
+            let mut service = MockTestJWKService::new();
+            service.expect_get_key().returning(|_| {
+                Ok((
+                    DecodingKey::from_secret(AGREED_UPON_SIGNING_SECRET.as_ref()),
+                    AGREED_UPON_ALGORITHM,
+                ))
+            });
+
+            JwtVerifier {
+                jwk_service: Arc::new(service),
+                jwt_issuer: Some(issuers),
+                jwt_audience: Some(vec!["Lore".to_string()]),
+            }
+        }
+
+        fn token_with_issuer(issuer: &str) -> String {
+            let mut claims = mock_authz_token(vec!["Lore".to_string()]);
+            claims.issuer = issuer.to_string();
+            encode_jwt(&claims)
+        }
+
+        /// The test that makes an issuer's `iss` cutover a rollout rather than
+        /// an outage: with the old keyword and the new URL both configured,
+        /// tokens carrying either verify.
+        #[tokio::test]
+        async fn either_of_two_configured_issuers_verifies() -> Result<(), Box<dyn Error>> {
+            let verifier = verifier_with_issuers(vec![
+                "URC_AUTH_GAMEDEV".to_string(),
+                "https://auth.example.com/realms/lore".to_string(),
+            ]);
+
+            verifier
+                .verify_token(&token_with_issuer("URC_AUTH_GAMEDEV"))
+                .await?;
+            verifier
+                .verify_token(&token_with_issuer("https://auth.example.com/realms/lore"))
+                .await?;
+
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn an_issuer_in_neither_entry_is_refused() {
+            let verifier = verifier_with_issuers(vec![
+                "URC_AUTH_GAMEDEV".to_string(),
+                "https://auth.example.com/realms/lore".to_string(),
+            ]);
+
+            let error = verifier
+                .verify_token(&token_with_issuer("https://attacker.example.com"))
+                .await
+                .expect_err("an unlisted issuer is refused");
+            assert!(matches!(error, JwtVerifierError::ValidationFailed(_)));
+        }
+
+        #[tokio::test]
+        async fn a_single_configured_issuer_still_verifies() -> Result<(), Box<dyn Error>> {
+            let verifier = verifier_with_issuers(vec!["URC_AUTH_GAMEDEV".to_string()]);
+            verifier
+                .verify_token(&token_with_issuer("URC_AUTH_GAMEDEV"))
+                .await?;
             Ok(())
         }
 

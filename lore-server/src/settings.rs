@@ -216,12 +216,21 @@ fn trace_config_error_to_config(err: TraceConfigError) -> config::ConfigError {
 /// Server-related settings
 ///
 
+#[serde_with::serde_as]
 #[derive(Clone, Debug, Deserialize)]
 //#[serde(deny_unknown_fields)]
 pub struct AuthSettings {
     pub jwk: Option<JWKServiceSettings>,
     pub jwt_audience: Option<Vec<String>>,
-    pub jwt_issuer: Option<String>,
+    /// The `iss` values verification accepts. A bare string still parses, so
+    /// existing configs need no edit. Two entries is for the length of an
+    /// issuer's cutover — accepting tokens minted under both the old and the
+    /// new `iss` while they are both in flight — and one entry otherwise. The
+    /// list is not for discovering several providers: discovery resolves
+    /// against the first entry, and two entries with different discovery
+    /// documents is a configuration error.
+    #[serde_as(as = "Option<serde_with::OneOrMany<_, serde_with::formats::PreferMany>>")]
+    pub jwt_issuer: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -550,6 +559,42 @@ mod tests {
     fn http_settings(extra_keys: &str) -> HttpSettings {
         toml::from_str(&format!("{MINIMAL_HTTP_SETTINGS}\n{extra_keys}\n"))
             .expect("[server.http] should deserialize")
+    }
+
+    /// A bare-string `jwt_issuer` and a one-entry list are the same
+    /// configuration, so existing config files need no edit.
+    #[test]
+    fn jwt_issuer_accepts_a_bare_string_and_a_list() {
+        let bare: AuthSettings = toml::from_str(r#"jwt_issuer = "URC_AUTH_GAMEDEV""#)
+            .expect("[server.auth] with a bare string should deserialize");
+        let list: AuthSettings = toml::from_str(r#"jwt_issuer = ["URC_AUTH_GAMEDEV"]"#)
+            .expect("[server.auth] with a list should deserialize");
+
+        assert_eq!(bare.jwt_issuer, list.jwt_issuer);
+        assert_eq!(bare.jwt_issuer, Some(vec!["URC_AUTH_GAMEDEV".to_string()]));
+    }
+
+    #[test]
+    fn jwt_issuer_accepts_two_entries_for_a_cutover() {
+        let auth: AuthSettings = toml::from_str(
+            r#"jwt_issuer = ["URC_AUTH_GAMEDEV", "https://auth.example.com/realms/lore"]"#,
+        )
+        .expect("[server.auth] with two issuers should deserialize");
+
+        assert_eq!(
+            auth.jwt_issuer,
+            Some(vec![
+                "URC_AUTH_GAMEDEV".to_string(),
+                "https://auth.example.com/realms/lore".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn jwt_issuer_absent_stays_none() {
+        let auth: AuthSettings =
+            toml::from_str("").expect("an empty [server.auth] should deserialize");
+        assert_eq!(auth.jwt_issuer, None);
     }
 
     /// Both keys absent means an empty policy, which resolves to the built-in set.

@@ -305,7 +305,7 @@ directory. The server does not load the example in place.
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `jwt_issuer` | none | Expected JWT `iss` claim. When set, tokens with a different issuer are rejected; when unset, issuer validation is skipped. |
+| `jwt_issuer` | none | Accepted JWT `iss` values, as a string or an array. When set, tokens whose issuer matches no entry are rejected. When unset, issuer validation is skipped. Two entries are for the duration of an issuer's `iss` cutover if the issuer is changed. The validator accepts tokens minted under both the old and the new value while both are in flight. |
 | `jwt_audience` | none | Array of accepted JWT `aud` values. A token's audience must match one entry; when unset, audience validation is skipped. |
 | `jwk` | none | The `[server.auth.jwk]` sub-table below. Its presence enables JWT verification. |
 
