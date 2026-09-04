@@ -48,6 +48,7 @@ use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::repository::THEIRS_SUFFIX;
 use crate::revision;
+use crate::revision::ResolveSearchLocation;
 use crate::state;
 use crate::state::RecordedModifiedTimes;
 use crate::state::State;
@@ -326,6 +327,36 @@ pub async fn sync(
         .await
         .forward::<SyncError>("Failed to find revision")?;
         lore_debug!("Sync resolved revision target is {revision}");
+
+        // Determine location for the explicitly-provided revision.
+        // When the user passes --remote, check whether the resolved
+        // revision is on the remote timeline.  Without this, location
+        // stays Local and the local branch Latest pointer is never
+        // updated, leaving status reporting the branch as behind remote.
+        if matches!(
+            execution_context().globals().search_location(),
+            ResolveSearchLocation::Remote
+        ) {
+            if let Ok(remote) = repository.remote().await {
+                remote_latest =
+                    branch::load_remote_latest(remote.clone(), repository.id, branch_id)
+                        .await
+                        .unwrap_or_default();
+            }
+            if !remote_latest.is_zero() {
+                if revision == remote_latest {
+                    location = LoreBranchLocation::Remote;
+                } else if let Ok((_bp, _remote_history, local_history)) =
+                    history::find_branch_point(repository.clone(), remote_latest, revision).await
+                {
+                    // revision is an ancestor of remote_latest (on the
+                    // remote timeline) when local_history is empty.
+                    if local_history.is_empty() {
+                        location = LoreBranchLocation::Remote;
+                    }
+                }
+            }
+        }
     } else {
         // If there is no revision given, then we determine if the local and remote
         // latest revisions are in line or divergent.
@@ -503,8 +534,12 @@ pub async fn sync(
     }
 
     if !state_current.revision().is_zero() && !force {
-        // Check if we have diverged and need to resort to a merge flow
-        if location == LoreBranchLocation::Remote
+        // Check if we have diverged and need to resort to a merge flow.
+        // Only enter the merge path for implicit (no revision given) syncs;
+        // an explicit revision targets a specific point in history and must
+        // not trigger divergence resolution.
+        if options.revision.is_none()
+            && location == LoreBranchLocation::Remote
             && local_latest_diverged
             && find::find_revision(
                 repository.clone(),
