@@ -437,6 +437,7 @@ mod tests {
                     is_service_account: Some(false),
                     expires: expiration,
                     idp: Some("test".to_string()),
+                    extra: Default::default(),
                 };
                 let jwt_key = EncodingKey::from_secret("test-secret".as_ref());
                 let bearer = encode(&jwt_header, &jwt_claims, &jwt_key).unwrap();

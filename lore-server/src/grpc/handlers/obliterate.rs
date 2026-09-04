@@ -214,6 +214,7 @@ mod tests {
             groups: None,
             is_service_account: Some(false),
             idp: Some("test".to_string()),
+            extra: Default::default(),
         };
         let key = EncodingKey::from_secret(SIGNING_SECRET.as_ref());
         let mut header = Header::new(ALGORITHM);

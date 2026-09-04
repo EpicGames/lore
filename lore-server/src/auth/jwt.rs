@@ -58,6 +58,47 @@ pub struct AuthorizationToken {
     pub groups: Option<Vec<String>>,
     pub is_service_account: Option<bool>,
     pub idp: Option<String>,
+    /// Every claim the named fields do not consume, kept so configurable
+    /// claim paths (`permission_claim = "realm_access.roles"`) can reach
+    /// claims this struct does not name.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl AuthorizationToken {
+    /// Resolve a dotted claim path (`realm_access.roles`) against the named
+    /// fields first and then [`extra`](Self::extra). The value is returned by
+    /// clone: named fields are not stored as JSON values, so a borrowed
+    /// return cannot cover them.
+    pub fn claim_at(&self, dotted_path: &str) -> Option<serde_json::Value> {
+        let mut segments = dotted_path.split('.');
+        let root = self.root_claim(segments.next()?)?;
+        segments.try_fold(root, |value, segment| value.get(segment).cloned())
+    }
+
+    /// The value of a single top-level claim. Named fields shadow `extra`,
+    /// which mirrors decoding: a claim a named field consumes never lands in
+    /// `extra`, so the named field is the only truth for it.
+    fn root_claim(&self, claim: &str) -> Option<serde_json::Value> {
+        use serde_json::json;
+
+        match claim {
+            "sub" => Some(json!(self.user_id)),
+            "iss" => Some(json!(self.issuer)),
+            "iat" => Some(json!(self.issued_at)),
+            "exp" => Some(json!(self.expires)),
+            "aud" => Some(json!(self.audience)),
+            "env" => self.env.as_ref().map(|v| json!(v)),
+            "name" => self.name.as_ref().map(|v| json!(v)),
+            "preferred_username" => self.preferred_username.as_ref().map(|v| json!(v)),
+            "client_id" => self.client_id.as_ref().map(|v| json!(v)),
+            "resources" => self.resources.as_ref().map(|v| json!(v)),
+            "groups" => self.groups.as_ref().map(|v| json!(v)),
+            "is_service_account" => self.is_service_account.map(|v| json!(v)),
+            "idp" => self.idp.as_ref().map(|v| json!(v)),
+            other => self.extra.get(other).cloned(),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -269,6 +310,7 @@ mod tests {
             is_service_account: Some(false),
             issued_at: 123,
             resources: Some(vec![resource_permission]),
+            extra: Default::default(),
         };
         let allowed_context: RepositoryId = Context::from_str("0194b726b34e72b0b45550b88a967076")
             .unwrap()
@@ -302,6 +344,7 @@ mod tests {
             is_service_account: Some(false),
             issued_at: 123,
             resources: Some(vec![resource_permission]),
+            extra: Default::default(),
         };
         let test_contexts: Vec<RepositoryId> = vec![
             Context::from_str("0194b726b34e72b0b45550b88a967076")
@@ -318,6 +361,87 @@ mod tests {
         for context in test_contexts {
             verify_authorization(&wildcard_authorization_token, context)
                 .expect("verify auth failed");
+        }
+    }
+
+    mod claim_at {
+        use serde_json::json;
+
+        use super::*;
+
+        fn token_with_extra(extra: serde_json::Value) -> AuthorizationToken {
+            let serde_json::Value::Object(extra) = extra else {
+                panic!("extra claims must be a JSON object");
+            };
+            AuthorizationToken {
+                user_id: "the u".to_string(),
+                name: Some("the name".to_string()),
+                groups: Some(vec!["readers".to_string()]),
+                extra,
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn resolves_a_nested_path() {
+            let token = token_with_extra(json!({
+                "realm_access": { "roles": ["obliterate", "admin"] }
+            }));
+            assert_eq!(
+                token.claim_at("realm_access.roles"),
+                Some(json!(["obliterate", "admin"]))
+            );
+        }
+
+        #[test]
+        fn resolves_a_flat_named_field() {
+            let token = token_with_extra(json!({}));
+            assert_eq!(token.claim_at("groups"), Some(json!(["readers"])));
+        }
+
+        #[test]
+        fn a_missing_path_is_none() {
+            let token = token_with_extra(json!({}));
+            assert_eq!(token.claim_at("realm_access.roles"), None);
+            assert_eq!(token.claim_at("no_such_claim"), None);
+        }
+
+        #[test]
+        fn a_path_through_a_non_object_is_none() {
+            let token = token_with_extra(json!({ "realm_access": "a string" }));
+            assert_eq!(token.claim_at("realm_access.roles"), None);
+            assert_eq!(token.claim_at("name.first"), None);
+        }
+
+        #[test]
+        fn a_named_field_shadows_extra() {
+            // Decoding never puts a consumed claim into `extra`, but a
+            // constructed token can. The named field must win.
+            let token = token_with_extra(json!({ "name": "the impostor" }));
+            assert_eq!(token.claim_at("name"), Some(json!("the name")));
+        }
+
+        /// Decode then re-serialize preserves unknown claims.
+        #[test]
+        fn unknown_claims_survive_a_round_trip() {
+            let claims = json!({
+                "iss": "the issuer",
+                "sub": "the u",
+                "aud": ["Lore"],
+                "iat": 1,
+                "exp": 2,
+                "realm_access": { "roles": ["obliterate"] },
+                "custom_scalar": 42,
+            });
+
+            let token: AuthorizationToken = serde_json::from_value(claims).unwrap();
+            let reserialized = serde_json::to_value(&token).unwrap();
+
+            assert_eq!(
+                reserialized.get("realm_access"),
+                Some(&json!({ "roles": ["obliterate"] }))
+            );
+            assert_eq!(reserialized.get("custom_scalar"), Some(&json!(42)));
         }
     }
 
@@ -770,6 +894,7 @@ mod tests {
                     .add(Duration::from_secs(5))
                     .as_secs(),
                 idp: Some("the idp".to_string()),
+                extra: Default::default(),
             }
         }
 
