@@ -4,6 +4,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use lore_proto::lore::repository::v1::RepositoryCountRequest;
+use lore_proto::lore::repository::v1::RepositoryCountResponse;
 use lore_proto::lore::repository::v1::RepositoryCreateRequest;
 use lore_proto::lore::repository::v1::RepositoryCreateResponse;
 use lore_proto::lore::repository::v1::RepositoryDeleteRequest;
@@ -24,6 +26,7 @@ use tonic::Response;
 use tonic::Status;
 use tonic::codegen::tokio_stream::Stream;
 
+use super::repository_count;
 use super::repository_create;
 use super::repository_delete;
 use super::repository_get;
@@ -160,6 +163,22 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.auth_url(),
             self.immutable_store.clone(),
             self.mutable_store.clone(),
+        )
+        .await
+    }
+
+    async fn repository_count(
+        &self,
+        request: Request<RepositoryCountRequest>,
+    ) -> Result<Response<RepositoryCountResponse>, Status> {
+        timeout_grpc(
+            self.rpc_timeout,
+            repository_count::handler(
+                request,
+                self.auth_url(),
+                self.immutable_store.clone(),
+                self.mutable_store.clone(),
+            ),
         )
         .await
     }
