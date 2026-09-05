@@ -140,29 +140,42 @@ impl Put {
         &self.address
     }
 
+    /// Verify the caller holds the content named by the address.
+    ///
+    /// The payload is that proof: the hash is recomputed from it and compared to
+    /// the address. A put carrying none proves nothing and is refused — skipping
+    /// is not equivalent to passing. The store deduplicates on hash across
+    /// partitions; sharing content across them is `Copy`'s job, which names a
+    /// `source_repository` and authorizes the caller against it.
     fn validate_hash(&self) -> Result<(), MessageHandleError> {
-        if let Some(payload) = self.payload.as_ref() {
-            match lore_storage::hash_fragment(self.fragment, payload.as_ref()) {
-                Ok(hash) => {
-                    if hash != self.address.hash {
-                        warn!(
-                            fragment = ?self.fragment,
-                            {ADDRESS} = %self.address,
-                            computed_hash = %hash,
-                            "Hash validation failed, computed hash does not match address"
-                        );
-                        return Err(MessageHandleError::HashMismatch);
-                    }
-                }
-                Err(err) => {
+        let Some(payload) = self.payload.as_ref() else {
+            warn!(
+                fragment = ?self.fragment,
+                {ADDRESS} = %self.address,
+                "Hash validation failed, put carries no payload to prove the address"
+            );
+            return Err(MessageHandleError::HashFailed);
+        };
+        match lore_storage::hash_fragment(self.fragment, payload.as_ref()) {
+            Ok(hash) => {
+                if hash != self.address.hash {
                     warn!(
                         fragment = ?self.fragment,
                         {ADDRESS} = %self.address,
-                        error = ?err,
-                        "Hash validation failed, unable to hash"
+                        computed_hash = %hash,
+                        "Hash validation failed, computed hash does not match address"
                     );
-                    return Err(MessageHandleError::HashFailed);
+                    return Err(MessageHandleError::HashMismatch);
                 }
+            }
+            Err(err) => {
+                warn!(
+                    fragment = ?self.fragment,
+                    {ADDRESS} = %self.address,
+                    error = ?err,
+                    "Hash validation failed, unable to hash"
+                );
+                return Err(MessageHandleError::HashFailed);
             }
         }
         Ok(())
@@ -722,12 +735,10 @@ mod tests {
         }
 
         #[test]
-        fn fragmented_dedup_put_no_payload_ok() {
-            // Dedup puts (payload omitted by the client; server relies on
-            // existing fragment in the repository) skip fragment-list
-            // validation because there's nothing to validate. Metadata
-            // validation — which runs earlier in the flow — already covers
-            // these fragments.
+        fn fragmented_no_payload_skips_fragment_list_validation() {
+            // No payload, no fragment list to walk: this check defers.
+            // `validate_hash` refuses such a put — see
+            // `put_without_payload_is_refused`. Both run in `handle_put`.
             let put = Put {
                 address: Address::default(),
                 fragment: Fragment {
@@ -738,6 +749,26 @@ mod tests {
                 payload: None,
             };
             assert!(put.validate_fragment().is_ok());
+        }
+
+        #[test]
+        fn put_without_payload_is_refused() {
+            // No payload, nothing to hash: refuse rather than pass. The store
+            // deduplicates on hash across partitions, so an unproven address
+            // would associate another partition's content with the caller's.
+            let put = Put {
+                address: Address::default(),
+                fragment: Fragment {
+                    flags: 0,
+                    size_payload: 80,
+                    size_content: 80,
+                },
+                payload: None,
+            };
+            assert!(matches!(
+                put.validate_hash(),
+                Err(MessageHandleError::HashFailed)
+            ));
         }
     }
 }
