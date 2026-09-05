@@ -24,9 +24,14 @@ mod shared_store_tests {
     use lore_base::types::Context;
     use lore_base::types::Partition;
     use lore_revision::event::LoreEvent;
+    use lore_revision::instance::InstanceId;
+    use lore_revision::instance::LoreRepositoryInstanceEventData;
     use lore_revision::interface::LoreEventCallback;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
+    use lore_revision::lore::RepositoryId;
+    use lore_revision::repository::DOT_LORE;
+    use lore_revision::repository::INSTANCE;
     use lore_revision::repository::LoreSharedStoreMode;
 
     const REMOTE_URL: &str = "lore://localhost/test-shared-store";
@@ -84,29 +89,96 @@ mod shared_store_tests {
     }
 
     async fn create_repo(repo_path: &Path, mode: LoreSharedStoreMode, shared_path: &Path) {
+        create_repo_with(repo_path, mode, shared_path, "", false).await;
+    }
+
+    /// Create a repository at `repo_path` and return its ID. A non-empty `id`
+    /// (hex) pins the repository ID; `force` replaces an existing `.lore`, as
+    /// `lore repository create --force` does.
+    async fn create_repo_with(
+        repo_path: &Path,
+        mode: LoreSharedStoreMode,
+        shared_path: &Path,
+        id: &str,
+        force: bool,
+    ) -> RepositoryId {
         let mut repo_globals = globals();
         repo_globals.repository_path = repo_path.into();
         repo_globals.offline = 1;
+        repo_globals.force = force as u8;
         let shared_store_path = match mode {
             LoreSharedStoreMode::Enabled => {
                 LoreString::from(shared_path.display().to_string().as_str())
             }
             _ => LoreString::default(),
         };
+        let (sink, callback) = capture_sink();
         let status = repository::create(
             repo_globals,
             repository::LoreRepositoryCreateArgs {
                 repository_url: REMOTE_URL.into(),
                 description: LoreString::default(),
-                id: LoreString::default(),
+                id: LoreString::from(id),
                 use_shared_store: mode,
                 shared_store_path,
                 vfs: Default::default(),
             },
-            None,
+            callback,
         )
         .await;
         assert_eq!(status, 0, "repository create failed for {repo_path:?}");
+        let events = sink.lock().unwrap().clone();
+        events
+            .iter()
+            .find_map(|e| match e {
+                LoreEvent::RepositoryCreate(data) => Some(data.id),
+                _ => None,
+            })
+            .expect("RepositoryCreate")
+    }
+
+    /// The instances registered for the repository at `repo_path`, as
+    /// `lore repository instance list` reports them.
+    async fn list_instances(repo_path: &Path) -> Vec<LoreRepositoryInstanceEventData> {
+        let mut list_globals = globals();
+        list_globals.repository_path = repo_path.into();
+        list_globals.offline = 1;
+        let (sink, callback) = capture_sink();
+        let status = repository::instance_list(
+            list_globals,
+            repository::LoreRepositoryInstanceListArgs {},
+            callback,
+        )
+        .await;
+        assert_eq!(status, 0, "instance list failed for {repo_path:?}");
+        let events = sink.lock().unwrap().clone();
+        events
+            .iter()
+            .filter_map(|e| match e {
+                LoreEvent::RepositoryInstance(data) => Some(data.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Run `lore repository instance prune` and return how many instances it removed.
+    async fn prune_instances(repo_path: &Path) -> usize {
+        let mut prune_globals = globals();
+        prune_globals.repository_path = repo_path.into();
+        prune_globals.offline = 1;
+        let (sink, callback) = capture_sink();
+        let status = repository::instance_prune(
+            prune_globals,
+            repository::LoreRepositoryInstancePruneArgs {},
+            callback,
+        )
+        .await;
+        assert_eq!(status, 0, "instance prune failed for {repo_path:?}");
+        let events = sink.lock().unwrap().clone();
+        events
+            .iter()
+            .filter(|e| matches!(e, LoreEvent::RepositoryInstance(_)))
+            .count()
     }
 
     async fn open_repo(repo_path: &Path) -> lore::storage::handle::LoreStore {
@@ -212,6 +284,67 @@ mod shared_store_tests {
 
         close(handle_a).await;
         close(handle_b).await;
+    }
+
+    /// `lore repository create --force` wipes `.lore` and mints a new instance ID, while the
+    /// shared mutable store keeps the registration of the instance it replaced. The instance
+    /// list must show the one checkout the directory holds, not both.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recreating_a_repository_on_a_shared_store_keeps_one_instance() {
+        let shared_dir = tempdir("recreate-shared");
+        create_shared_store(shared_dir.path()).await;
+
+        let repo = tempdir("recreate");
+        let id = create_repo_with(
+            repo.path(),
+            LoreSharedStoreMode::Enabled,
+            shared_dir.path(),
+            "",
+            false,
+        )
+        .await;
+        let before = list_instances(repo.path()).await;
+        assert_eq!(before.len(), 1, "a fresh repository has one instance");
+
+        create_repo_with(
+            repo.path(),
+            LoreSharedStoreMode::Enabled,
+            shared_dir.path(),
+            &id.to_string(),
+            true,
+        )
+        .await;
+
+        let after = list_instances(repo.path()).await;
+        let listed: Vec<(InstanceId, String, u8)> = after
+            .iter()
+            .map(|data| (data.instance_id, data.path.to_string(), data.stale))
+            .collect();
+        assert_eq!(
+            after.len(),
+            1,
+            "one root directory must be listed once: {listed:?}"
+        );
+        assert_ne!(
+            after[0].instance_id, before[0].instance_id,
+            "re-creating the checkout mints a new instance",
+        );
+        assert_eq!(
+            after[0].stale, 0,
+            "the surviving entry is the live checkout"
+        );
+        let on_disk = InstanceId::read_from_file(repo.path().join(DOT_LORE).join(INSTANCE))
+            .expect("read .lore/instance");
+        assert_eq!(
+            after[0].instance_id, on_disk,
+            "the listed instance is the one `.lore/instance` names",
+        );
+
+        assert_eq!(
+            prune_instances(repo.path()).await,
+            0,
+            "nothing stale is left for prune to remove",
+        );
     }
 
     /// Content written through one repository is readable through another on the same store.

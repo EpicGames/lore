@@ -7517,7 +7517,10 @@ pub extern "C" fn lore_repository_instance_list_async(
 
 pub type LoreRepositoryInstancePruneArgs = crate::repository::LoreRepositoryInstancePruneArgs;
 
-/// Remove stale instances of the repository that are no longer present.
+/// Remove stale instances of the repository: those whose path no longer
+/// exists, and those whose path now holds a repository naming a different
+/// current instance. Each removed instance is reported through a
+/// `RepositoryInstance` event whose `stale` field gives the reason.
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_repository_instance_prune(
     globals: &LoreGlobalArgs,

@@ -552,7 +552,7 @@ Instance management
 ###### **Subcommands:**
 
 * `list` — List all registered instances for this repository
-* `prune` — Remove stale instance entries
+* `prune` — Remove stale instance entries: paths that no longer exist, and paths that now hold a different instance
 
 
 
@@ -566,7 +566,7 @@ List all registered instances for this repository
 
 ## `lore repository instance prune`
 
-Remove stale instance entries
+Remove stale instance entries: paths that no longer exist, and paths that now hold a different instance
 
 **Usage:** `lore repository instance prune`
 
