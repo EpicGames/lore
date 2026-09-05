@@ -1903,7 +1903,10 @@ typedef struct lore_repository_instance_event_data_t {
   lore_branch_id_t branch;
   // Current revision hash for the instance
   struct lore_hash_t revision;
-  // Non-zero if the instance path no longer exists on disk
+  // Non-zero if the registration no longer describes a live checkout: 1 when
+  // the path no longer exists on disk, 2 when the path holds a repository
+  // whose `.lore/instance` names a different instance (superseded by a
+  // re-create or re-clone)
   uint8_t stale;
 } lore_repository_instance_event_data_t;
 
@@ -11704,7 +11707,10 @@ void lore_repository_instance_list_async(const struct lore_global_args_t *global
                                          const struct lore_repository_instance_list_args_t *args,
                                          struct lore_event_callback_config_t callback);
 
-// Remove stale instances of the repository that are no longer present.
+// Remove stale instances of the repository: those whose path no longer
+// exists, and those whose path now holds a repository naming a different
+// current instance. Each removed instance is reported through a
+// `RepositoryInstance` event whose `stale` field gives the reason.
 int32_t lore_repository_instance_prune(const struct lore_global_args_t *globals,
                                        const struct lore_repository_instance_prune_args_t *args,
                                        struct lore_event_callback_config_t callback);
