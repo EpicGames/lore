@@ -735,8 +735,23 @@ async fn verify_fragments(
         .unwrap_or(1000)
         .clamp(100, 10000);
 
+    // Query batches in flight at once. Each one is a store round trip holding its
+    // addresses and, on a remote store, an HTTP request with its buffers; spawning
+    // every batch of a large push at once made server memory and CPU scale with the
+    // push size. The budget scales with the host, since what a batch costs is CPU and
+    // memory. Batches that answered SlowDown wait for the retry back-off together
+    // rather than being reissued straight away.
+    const QUERY_BATCHES_IN_FLIGHT_PER_CPU: usize = 8;
+    const MIN_QUERY_BATCHES_IN_FLIGHT: usize = 16;
+    const MAX_QUERY_BATCHES_IN_FLIGHT: usize = 128;
+    let max_batches_in_flight = (std::thread::available_parallelism().map_or(1, |n| n.get())
+        * QUERY_BATCHES_IN_FLIGHT_PER_CPU)
+        .clamp(MIN_QUERY_BATCHES_IN_FLIGHT, MAX_QUERY_BATCHES_IN_FLIGHT);
+
     let mut tasks = JoinSet::new();
-    while !new_fragments.is_empty() || !tasks.is_empty() {
+    let mut slowed_down: Vec<Address> = Vec::new();
+    let mut num_slow_downs = 0;
+    loop {
         let batch_span = span!(
             Level::DEBUG,
             "exist_batch",
@@ -745,7 +760,7 @@ async fn verify_fragments(
         );
 
         batch_span.in_scope(|| {
-            while !new_fragments.is_empty() {
+            while !new_fragments.is_empty() && tasks.len() < max_batches_in_flight {
                 let repository = repository.clone();
                 let batch =
                     new_fragments.split_off(new_fragments.len().saturating_sub(max_batch_size));
@@ -765,39 +780,43 @@ async fn verify_fragments(
             }
         });
 
-        let mut num_slow_downs = 0;
-        while let Some(result) = tasks.join_next().await {
-            let (mut batch, result) =
-                result.warn_map_err(|err| Status::internal(format!("Query task failed: {err}")))?;
-            match result {
-                Ok(result) => {
-                    if result.iter().enumerate().any(|(pos, resolved)| {
-                        if resolved.match_made != StoreMatch::MatchFull {
-                            warn!("Branch push failed, fragment not found for {}", batch[pos]);
-                            true
-                        } else {
-                            false
-                        }
-                    }) {
-                        return Err(Status::failed_precondition("Missing fragments"));
+        let Some(result) = tasks.join_next().await else {
+            if slowed_down.is_empty() {
+                break;
+            }
+            if !retry.wait().await {
+                warn!("Exhausted {num_slow_downs} fragment exist retries");
+                return Err(Status::resource_exhausted("Slow down"));
+            }
+            new_fragments.append(&mut slowed_down);
+            continue;
+        };
+
+        let (mut batch, result) =
+            result.warn_map_err(|err| Status::internal(format!("Query task failed: {err}")))?;
+        match result {
+            Ok(result) => {
+                if result.iter().enumerate().any(|(pos, resolved)| {
+                    if resolved.match_made != StoreMatch::MatchFull {
+                        warn!("Branch push failed, fragment not found for {}", batch[pos]);
+                        true
+                    } else {
+                        false
                     }
-                }
-                Err(StoreError::SlowDown(_)) => {
-                    new_fragments.append(&mut batch);
-                    num_slow_downs += 1;
-                }
-                Err(err) => {
-                    let response = warn_error_to_status(&err, |err| {
-                        Status::internal(format!("Store query failed: {err}"))
-                    });
-                    return Err(response);
+                }) {
+                    return Err(Status::failed_precondition("Missing fragments"));
                 }
             }
-        }
-
-        if !new_fragments.is_empty() && !retry.wait().await {
-            warn!("Exhausted {num_slow_downs} fragment exist retries");
-            return Err(Status::resource_exhausted("Slow down"));
+            Err(StoreError::SlowDown(_)) => {
+                slowed_down.append(&mut batch);
+                num_slow_downs += 1;
+            }
+            Err(err) => {
+                let response = warn_error_to_status(&err, |err| {
+                    Status::internal(format!("Store query failed: {err}"))
+                });
+                return Err(response);
+            }
         }
     }
 
