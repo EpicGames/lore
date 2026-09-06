@@ -9796,7 +9796,7 @@ static STORE_LOOKUP_LIMITER: OnceLock<Semaphore> = OnceLock::new();
 
 fn store_lookup_limiter() -> &'static Semaphore {
     STORE_LOOKUP_LIMITER.get_or_init(|| {
-        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let cpus = lore_base::runtime::processor_count();
         Semaphore::new(
             (cpus * STORE_LOOKUPS_IN_FLIGHT_PER_CPU)
                 .clamp(MIN_STORE_LOOKUPS_IN_FLIGHT, MAX_STORE_LOOKUPS_IN_FLIGHT),

@@ -767,7 +767,7 @@ async fn verify_fragments(
     const QUERY_BATCHES_IN_FLIGHT_PER_CPU: usize = 8;
     const MIN_QUERY_BATCHES_IN_FLIGHT: usize = 16;
     const MAX_QUERY_BATCHES_IN_FLIGHT: usize = 128;
-    let max_batches_in_flight = (std::thread::available_parallelism().map_or(1, |n| n.get())
+    let max_batches_in_flight = (lore_base::runtime::processor_count()
         * QUERY_BATCHES_IN_FLIGHT_PER_CPU)
         .clamp(MIN_QUERY_BATCHES_IN_FLIGHT, MAX_QUERY_BATCHES_IN_FLIGHT);
 
