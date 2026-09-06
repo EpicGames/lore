@@ -359,7 +359,7 @@ pub(crate) async fn stage_filesystem_path(
     prefixes: Option<Arc<util::fs::ResolvedPrefixes>>,
     discards: PendingDiscards,
 ) -> Result<NodeLink, StageError> {
-    lore_debug!(
+    lore_trace!(
         "Staging path: {}/{}",
         base_absolute_path.display(),
         relative_path.as_str(),
@@ -406,17 +406,9 @@ pub(crate) async fn stage_filesystem_path(
     if let Some(metadata) = util::fs::metadata_or_stat(resolved_metadata, &full_absolute_path).await
     {
         if metadata.is_dir() {
-            lore_debug!(
-                "Stage directory: {}/{}",
-                repository.path_for_display(),
-                relative_path.as_str(),
-            );
+            lore_trace!("Stage directory: {}", full_absolute_path.display());
         } else if metadata.is_file() {
-            lore_debug!(
-                "Stage file: {}/{}",
-                repository.path_for_display(),
-                relative_path.as_str(),
-            );
+            lore_trace!("Stage file: {}", full_absolute_path.display());
         } else {
             return Err(StageError::internal(format!(
                 "Failed to stage path {}, unsupported type",

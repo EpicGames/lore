@@ -585,13 +585,22 @@ pub async fn filesystem_path_and_metadata(
         found_path.push(fs_names[0].as_str());
     }
 
-    lore_debug!(
-        "Found full path case variation {} for path {} in path {}",
-        found_path.as_str(),
-        find_path.as_str(),
-        base_path.display()
-    );
+    log_resolved_case(found_path.as_str(), find_path.as_str(), base_path);
     Ok((found_path.freeze(), None))
+}
+
+/// Record a resolved path: at debug where the file system holds the name in a
+/// different case than the caller asked for, at trace where it matches, which is
+/// every other path a walk resolves.
+fn log_resolved_case(found: &str, requested: &str, base: &Path) {
+    if found == requested {
+        lore_trace!("Resolved path {found} in {}", base.display());
+    } else {
+        lore_debug!(
+            "Found full path case variation {found} for path {requested} in path {}",
+            base.display()
+        );
+    }
 }
 
 pub fn filesystem_path_fork(

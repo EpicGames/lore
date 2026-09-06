@@ -552,12 +552,20 @@ impl<T> Default for LoreArray<T> {
     }
 }
 
+/// Elements a `Debug` rendering prints before it reports the count alone.
+/// Arguments are logged whole, and a caller's path list runs to thousands.
+const DEBUG_ELEMENT_LIMIT: usize = 16;
+
 impl<T> Debug for LoreArray<T>
 where
     T: Debug,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{:?}", self.as_slice()))
+        let elements = self.as_slice();
+        if elements.len() > DEBUG_ELEMENT_LIMIT {
+            return write!(f, "[{} items...]", elements.len());
+        }
+        f.write_fmt(format_args!("{elements:?}"))
     }
 }
 
@@ -1617,6 +1625,23 @@ pub fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Arguments are logged whole, so a rendering that named every element of a
+    /// caller's path list would be the bulk of a log.
+    #[test]
+    fn a_long_array_renders_as_its_count() {
+        let at_limit = LoreArray::from_vec(vec![7u32; DEBUG_ELEMENT_LIMIT]);
+        assert_eq!(
+            format!("{at_limit:?}"),
+            format!("{:?}", [7u32; DEBUG_ELEMENT_LIMIT])
+        );
+
+        let over_limit = LoreArray::from_vec(vec![7u32; DEBUG_ELEMENT_LIMIT + 1]);
+        assert_eq!(
+            format!("{over_limit:?}"),
+            format!("[{} items...]", DEBUG_ELEMENT_LIMIT + 1)
+        );
+    }
 
     /// `{"iss":"lore","sub":"alice","name":"Alice","exp":2000000000,"aud":["example.com"]}`
     const ALICE_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJuYW1lIjoiQWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdfQ.signature";
