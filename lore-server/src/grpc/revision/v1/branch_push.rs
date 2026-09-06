@@ -52,6 +52,11 @@ use crate::util::setup_execution;
 /// deleted branch reinstates the name → id mapping if the name is
 /// still free, or returns `AlreadyExists` if claimed by a different
 /// live branch.
+///
+/// A fragment of the pushed revision the server does not hold is the
+/// other `FailedPrecondition`, and the only one carrying an address in
+/// the status details. `NotFound` names an absent branch alone, so a
+/// caller reads it as one without inspecting the status further.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "BranchPush::v1::handle", skip_all)]
 pub async fn handler(

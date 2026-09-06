@@ -3,6 +3,7 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use lore_base::error::AddressNotFound;
 use lore_base::lore_spawn;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
@@ -27,8 +28,10 @@ use lore_storage::StoreError;
 use lore_storage::StoreMatch;
 use lore_storage::StoreMatchResult;
 use lore_telemetry::InstrumentProvider;
+use lore_telemetry::tracing::fields::ADDRESS;
 use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::REVISION;
+use lore_transport::grpc::address_not_found_status;
 use tokio::task::JoinSet;
 use tonic::Request;
 use tonic::Response;
@@ -688,9 +691,26 @@ fn next_revision_number(parent_self_number: u64, parent_other_number: u64) -> u6
     std::cmp::max(parent_self_number, parent_other_number) + 1
 }
 
+/// The first address in `batch` the store did not answer with a full match,
+/// warned where it is found.
+fn first_missing_fragment(batch: &[Address], answers: &[StoreMatchResult]) -> Option<Address> {
+    let address = batch
+        .iter()
+        .zip(answers.iter())
+        .find(|(_, answer)| answer.match_made != StoreMatch::MatchFull)
+        .map(|(address, _)| *address)?;
+
+    warn!({ADDRESS} = %address, "Branch push failed, fragment not found");
+    Some(address)
+}
+
 /// Verify that all new fragments between `parent_state` and `state` exist in the
 /// immutable store. Also includes the other parent hash if the state is a merge.
 /// Returns an error if any fragment is missing.
+///
+/// A missing fragment is reported as `FAILED_PRECONDITION` naming the address,
+/// whether the walk cannot read it or the store answers that it is absent.
+/// `NOT_FOUND` is left to name an absent branch, which a caller reinstates.
 async fn verify_fragments(
     repository: Arc<RepositoryContext>,
     parent_state: Arc<State>,
@@ -706,9 +726,12 @@ async fn verify_fragments(
     .await
     .warn_map_err(|err| {
         if let Some(converted_error) = err.as_address_not_found() {
-            return Status::not_found(format!(
-                "Failed to collect new fragments for verification. Missing address '{converted_error}'"
-            ));
+            return address_not_found_status(
+                converted_error,
+                format!(
+                    "Failed to collect new fragments for verification. Missing address '{converted_error}'"
+                ),
+            );
         }
 
         Status::internal(format!(
@@ -771,15 +794,11 @@ async fn verify_fragments(
                 result.warn_map_err(|err| Status::internal(format!("Query task failed: {err}")))?;
             match result {
                 Ok(result) => {
-                    if result.iter().enumerate().any(|(pos, resolved)| {
-                        if resolved.match_made != StoreMatch::MatchFull {
-                            warn!("Branch push failed, fragment not found for {}", batch[pos]);
-                            true
-                        } else {
-                            false
-                        }
-                    }) {
-                        return Err(Status::failed_precondition("Missing fragments"));
+                    if let Some(missing) = first_missing_fragment(&batch, &result) {
+                        return Err(address_not_found_status(
+                            &AddressNotFound::from(missing),
+                            format!("Missing fragment '{missing}'"),
+                        ));
                     }
                 }
                 Err(StoreError::SlowDown(_)) => {
@@ -828,6 +847,9 @@ mod tests {
     use std::net::SocketAddr;
 
     use lore_revision::branch::DEFAULT_HISTORY_STEP_SIZE;
+    use lore_revision::node::Node;
+    use lore_revision::node::NodeFlags;
+    use lore_revision::node::ROOT_NODE;
     use rand::random;
     use tonic::Code;
     use tonic::Request;
@@ -885,6 +907,65 @@ mod tests {
             .await
             .expect("serialize state");
         state
+    }
+
+    /// A revision holding one file, so its state references node and name
+    /// fragments the walk has to read rather than a bare metadata hash.
+    async fn serialize_revision_with_a_file(
+        repository: &Arc<RepositoryContext>,
+        branch: BranchId,
+    ) -> Arc<State> {
+        let write_token = get_write_token();
+        let mut metadata = lore_revision::metadata::Metadata::new();
+        metadata.set_branch(branch).expect("set branch");
+        let metadata_hash = metadata
+            .serialize(repository.clone())
+            .await
+            .expect("serialize metadata");
+
+        let state = Arc::new(State::new());
+        state.set_parent_self(Hash::default());
+        state.set_revision_number(1);
+        state.set_metadata_hash(metadata_hash);
+        state
+            .node_add(
+                repository.clone(),
+                ROOT_NODE,
+                Node {
+                    flags: NodeFlags::File.bits(),
+                    name_hash: lore_storage::hash::hash_string("file.txt"),
+                    ..Default::default()
+                },
+                "file.txt",
+            )
+            .await
+            .expect("node_add");
+        state
+            .serialize(repository.clone(), &write_token)
+            .await
+            .expect("serialize state");
+        state
+    }
+
+    /// Copy the revision fragment alone, leaving everything it references absent
+    /// in `target`.
+    async fn hand_over_revision(
+        source: &Arc<dyn lore_storage::ImmutableStore>,
+        target: &Arc<dyn lore_storage::ImmutableStore>,
+        repository: RepositoryId,
+        revision: Hash,
+    ) {
+        let address = Address::zero_context_hash(revision);
+        let data = source
+            .clone()
+            .get(repository, address)
+            .await
+            .expect("read the serialized revision");
+        target
+            .clone()
+            .put(repository, address, data.fragment, data.payload, false)
+            .await
+            .expect("hand over the revision");
     }
 
     /// Push revisions `numbers`, chained from `parent`. Returns the pushed
@@ -1112,8 +1193,125 @@ mod tests {
                 )
                 .await;
 
-                assert!(result.is_err());
-                assert_eq!(result.err().unwrap().code(), Code::NotFound);
+                let Err(status) = result else {
+                    panic!("an unknown revision cannot be pushed");
+                };
+                assert_eq!(status.code(), Code::NotFound);
+                let error = lore_transport::ProtocolError::from(status);
+                assert!(error.is_not_found(), "{error:?}");
+            }))
+            .await;
+        }
+
+        /// A fragment the walk cannot read is named as an address the caller
+        /// reconstructs. Both detections share a code, so the message is what
+        /// pins which one this reaches.
+        #[tokio::test]
+        async fn a_fragment_the_walk_cannot_read_names_its_address() {
+            let repository_id = random::<RepositoryId>();
+
+            let (peer_store, peer_mutable, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let (store, mutable_store, _) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let peer = Arc::new(RepositoryContext::new_server_context(
+                    peer_store.clone(),
+                    peer_mutable,
+                    repository_id,
+                ));
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    store.clone(),
+                    mutable_store,
+                    repository_id,
+                ));
+
+                let branch = create_test_branch(&repository).await;
+                let state = serialize_revision_with_a_file(&peer, branch).await;
+
+                hand_over_revision(&peer_store, &store, repository_id, state.revision()).await;
+
+                let Err(status) = push(
+                    repository,
+                    branch,
+                    state.revision(),
+                    true,
+                    true,
+                    false,
+                    DEFAULT_HISTORY_STEP_SIZE,
+                    RevisionListAcceleration::default(),
+                )
+                .await
+                else {
+                    panic!("a revision missing its fragments cannot be pushed");
+                };
+
+                assert_eq!(status.code(), Code::FailedPrecondition);
+                assert!(
+                    status
+                        .message()
+                        .starts_with("Failed to collect new fragments"),
+                    "{}",
+                    status.message()
+                );
+                let error = lore_transport::ProtocolError::from(status);
+                assert!(error.is_address_not_found(), "{error:?}");
+            }))
+            .await;
+        }
+
+        /// A fragment the store answers as absent is named the same way, so the
+        /// two paths that detect it report one condition.
+        #[tokio::test]
+        async fn a_fragment_the_store_reports_absent_names_its_address() {
+            let repository_id = random::<RepositoryId>();
+
+            let (peer_store, peer_mutable, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let (store, mutable_store, _) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let peer = Arc::new(RepositoryContext::new_server_context(
+                    peer_store.clone(),
+                    peer_mutable,
+                    repository_id,
+                ));
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    store.clone(),
+                    mutable_store,
+                    repository_id,
+                ));
+
+                let branch = create_test_branch(&repository).await;
+                let state =
+                    serialize_revision(&peer, branch, Hash::default(), Hash::default(), 1).await;
+                hand_over_revision(&peer_store, &store, repository_id, state.revision()).await;
+
+                let Err(status) = push(
+                    repository,
+                    branch,
+                    state.revision(),
+                    true,
+                    true,
+                    false,
+                    DEFAULT_HISTORY_STEP_SIZE,
+                    RevisionListAcceleration::default(),
+                )
+                .await
+                else {
+                    panic!("a revision missing its metadata cannot be pushed");
+                };
+
+                assert_eq!(status.code(), Code::FailedPrecondition);
+                assert!(
+                    status.message().starts_with("Missing fragment"),
+                    "{}",
+                    status.message()
+                );
+                let error = lore_transport::ProtocolError::from(status);
+                assert!(error.is_address_not_found(), "{error:?}");
             }))
             .await;
         }

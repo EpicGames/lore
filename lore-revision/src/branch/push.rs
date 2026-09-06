@@ -1074,6 +1074,8 @@ async fn collect_fragments_and_push(
                         .await
                         .forward::<PushError>("pushing branch to remote")?
                 }
+                Err(err @ ProtocolError::AddressNotFound(_)) => Err(err)
+                    .forward::<PushError>("pushing branch to remote, peer is missing a fragment")?,
                 result => result.forward::<PushError>("pushing branch to remote")?,
             };
             if response.fast_forward_merged {
@@ -1589,6 +1591,21 @@ mod tests {
             assert_eq!(stats.registered(), 2, "statistics {statistics}");
             assert_eq!(stats.put_bytes(), 64, "statistics {statistics}");
         }
+    }
+
+    /// A fragment the peer is missing reaches the caller as the address it is, rather than as a
+    /// generic failure.
+    #[test]
+    fn a_fragment_the_peer_is_missing_keeps_its_address_on_the_way_out() {
+        let result: Result<(), ProtocolError> =
+            Err(ProtocolError::from(AddressNotFound { address: [7u8; 48] }));
+
+        let error = result
+            .forward::<PushError>("pushing branch to remote, peer is missing a fragment")
+            .expect_err("an error was forwarded");
+
+        assert!(error.is_address_not_found(), "{error:?}");
+        assert!(error.translated() == LoreError::AddressNotFound);
     }
 
     /// What the push does with a fragment is decided entirely by the status byte the peer answered

@@ -28,6 +28,7 @@ pub enum UserInfoError {
     NoRemote,
     Maintenance,
     NotFound,
+    AddressNotFound,
     NotSupported,
     Oversized,
     SlowDown,

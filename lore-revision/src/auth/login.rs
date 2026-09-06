@@ -18,6 +18,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::auth::LoreAuthUrlEventData;
+use crate::errors::AddressNotFound;
 use crate::errors::Disconnected;
 use crate::errors::Maintenance;
 use crate::errors::NoRemote;
@@ -41,6 +42,7 @@ pub enum LoginError {
     NotAuthenticated,
     Maintenance,
     NotFound,
+    AddressNotFound,
     NoRemote,
     NotSupported,
     Oversized,
@@ -71,6 +73,7 @@ pub enum InteractiveLoginError {
     NotAuthenticated,
     Maintenance,
     NotFound,
+    AddressNotFound,
     NoRemote,
     NotSupported,
     Oversized,

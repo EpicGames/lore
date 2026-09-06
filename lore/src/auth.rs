@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
+use lore_base::error::AddressNotFound;
 use lore_base::error::Disconnected;
 use lore_base::error::Maintenance;
 use lore_base::error::NoRemote;
@@ -49,6 +50,7 @@ pub enum AuthStoreError {
     NotAuthenticated,
     Maintenance,
     NotFound,
+    AddressNotFound,
     NoRemote,
     NotSupported,
     Oversized,

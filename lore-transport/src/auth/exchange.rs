@@ -5,6 +5,7 @@ use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use lore_base::error::AddressNotFound;
 use lore_base::error::Disconnected;
 use lore_base::error::Maintenance;
 use lore_base::error::NoRemote;
@@ -36,6 +37,7 @@ pub enum ExchangeError {
     SlowDown,
     Maintenance,
     NotFound,
+    AddressNotFound,
     NoRemote,
     NotSupported,
     Oversized,
