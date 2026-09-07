@@ -41,7 +41,10 @@ struct JWKServiceKey {
 
 #[derive(Clone, Default, Deserialize, Debug)]
 pub struct JWKServiceSettings {
-    pub endpoint: String,
+    /// Where to fetch the key set. Optional: when unset the `jwks_uri` is
+    /// resolved through OIDC discovery against `jwt_issuer`, so this is the
+    /// override for providers with non-standard discovery.
+    pub endpoint: Option<String>,
 }
 
 #[derive(Error, Debug)]
@@ -58,6 +61,18 @@ pub enum JWKServiceError {
     NoUsableKeys,
     #[error("JWKS document is larger than this server will read")]
     ResponseTooLarge,
+    #[error(
+        "no JWKS endpoint: set [server.auth.jwk].endpoint, or set jwt_issuer to an issuer URL \
+         for OIDC discovery"
+    )]
+    EndpointUnresolvable,
+    #[error("OIDC discovery document names issuer '{actual}', but jwt_issuer expects '{expected}'")]
+    DiscoveryIssuerMismatch { expected: String, actual: String },
+    #[error(
+        "OIDC discovery returned jwks_uri '{jwks_uri}', which this server will not fetch keys \
+         over: an https issuer's keys are only fetched over https"
+    )]
+    JwksUriNotHttps { jwks_uri: String },
 }
 
 #[async_trait]
@@ -125,29 +140,33 @@ fn body_excerpt(body: &str) -> String {
 ///
 /// `Content-Length` is consulted first when the endpoint offers one, but it is a claim
 /// rather than a fact — it can be absent, understated, or the response chunked — so the
-/// accumulating read is what actually enforces the cap.
-async fn read_capped_body(response: &mut reqwest::Response) -> Result<String, JWKServiceError> {
+/// accumulating read is what actually enforces the cap. `what` names the document in the
+/// log ("JWKS", "OIDC discovery"), which both fetches share.
+async fn read_capped_body(
+    what: &str,
+    response: &mut reqwest::Response,
+) -> Result<String, JWKServiceError> {
     if let Some(declared) = response.content_length()
         && declared > JWKS_MAX_RESPONSE_BYTES as u64
     {
-        warn!("JWKS response declares {declared} bytes, over the {JWKS_MAX_RESPONSE_BYTES} cap");
+        warn!("{what} response declares {declared} bytes, over the {JWKS_MAX_RESPONSE_BYTES} cap");
         return Err(JWKServiceError::ResponseTooLarge);
     }
 
     let mut body: Vec<u8> = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|e| {
-        warn!("failed to read JWKS response body: {e:?}");
+        warn!("failed to read {what} response body: {e:?}");
         JWKServiceError::InternalError
     })? {
         if body.len() + chunk.len() > JWKS_MAX_RESPONSE_BYTES {
-            warn!("JWKS response exceeded the {JWKS_MAX_RESPONSE_BYTES} byte cap");
+            warn!("{what} response exceeded the {JWKS_MAX_RESPONSE_BYTES} byte cap");
             return Err(JWKServiceError::ResponseTooLarge);
         }
         body.extend_from_slice(&chunk);
     }
 
     String::from_utf8(body).map_err(|e| {
-        warn!("JWKS response was not valid UTF-8: {e}");
+        warn!("{what} response was not valid UTF-8: {e}");
         JWKServiceError::InternalError
     })
 }
@@ -247,19 +266,79 @@ fn http_client() -> Result<&'static reqwest::Client, JWKServiceError> {
     if let Some(client) = CLIENT.get() {
         return Ok(client);
     }
-    let client = reqwest::Client::builder()
+    let client = client_builder().build().map_err(|e| {
+        warn!("Failed to construct HTTP client: {e:?}");
+        JWKServiceError::InternalError
+    })?;
+    Ok(CLIENT.get_or_init(|| client))
+}
+
+/// The client for the OIDC discovery fetch, which follows no redirects.
+///
+/// The scheme check on the discovered `jwks_uri` ensures that the discovered JWKS URI
+/// follows the same security scheme as the original issuer. The issuer can still answer
+/// with a 302 to `http://…`, and we want to prevent that class of downgrades by not
+/// following redirects.
+fn no_redirect_client() -> Result<&'static reqwest::Client, JWKServiceError> {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let client = client_builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| {
+            warn!("Failed to construct no-redirect HTTP client: {e:?}");
+            JWKServiceError::InternalError
+        })?;
+    Ok(CLIENT.get_or_init(|| client))
+}
+
+fn client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
         .use_rustls_tls()
         .tls_built_in_webpki_certs(true)
         .tls_built_in_native_certs(true)
         .user_agent(user_agent())
         .connect_timeout(JWKS_CONNECT_TIMEOUT)
         .timeout(JWKS_REQUEST_TIMEOUT)
-        .build()
-        .map_err(|e| {
-            warn!("Failed to construct HTTP client: {e:?}");
-            JWKServiceError::InternalError
-        })?;
-    Ok(CLIENT.get_or_init(|| client))
+}
+
+/// Where the JWKS endpoint came from, which decides how it is fetched.
+#[derive(Clone, Copy)]
+enum EndpointSource {
+    /// Operator-authored `[server.auth.jwk].endpoint`.
+    Explicit,
+    /// The `jwks_uri` of the issuer's discovery document.
+    Discovered,
+}
+
+/// The two fields this server needs from an OIDC discovery document
+/// (RFC 8414 / `OpenID` Connect Discovery §3).
+#[derive(Deserialize)]
+struct DiscoveryDocument {
+    issuer: String,
+    jwks_uri: String,
+}
+
+/// Whether a discovered `jwks_uri` may be fetched from.
+///
+/// `https` always may. `http` may only when the configured issuer is itself plain
+/// `http`. This supports local testing, and the decision is made at server configuration,
+/// not through an external discovery document. An `https` issuer's discovery
+/// response must never downgrade key retrieval to a connection that can be intercepted.
+/// Every other scheme is refused outright: unlike the operator-authored
+/// `endpoint` (where `file://` is legitimate), this URL arrives over the network, and
+/// following it anywhere else is an SSRF primitive.
+fn discovered_jwks_uri_scheme_permitted(issuer: &str, jwks_uri: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(jwks_uri) else {
+        return false;
+    };
+    match url.scheme() {
+        "https" => true,
+        "http" => issuer.starts_with("http://"),
+        _ => false,
+    }
 }
 
 #[derive(Clone, Default)]
@@ -272,8 +351,11 @@ pub struct JwkServiceImpl {
     /// When the last refresh completed, for [`MIN_REFRESH_INTERVAL`]. Separate from
     /// `refresh` so a throttled caller answers without queueing behind a live fetch.
     last_refresh: Arc<std::sync::Mutex<Option<Instant>>>,
-    #[allow(dead_code)]
     settings: JWKServiceSettings,
+    /// The issuer discovery resolves against when no explicit endpoint is configured.
+    discovery_issuer: Option<String>,
+    /// `jwks_uri` per issuer, so discovery runs once rather than on every key refresh.
+    discovered_jwks_uri: Arc<DashMap<String, String>>,
 }
 
 impl JwkServiceImpl {
@@ -283,7 +365,129 @@ impl JwkServiceImpl {
             refresh: Default::default(),
             last_refresh: Default::default(),
             settings,
+            discovery_issuer: None,
+            discovered_jwks_uri: Default::default(),
         }
+    }
+
+    /// Construct with the configured issuers so an unset `endpoint` can be resolved
+    /// through OIDC discovery. An explicit `endpoint` wins and discovery is never
+    /// attempted. Otherwise the **first** issuer is the discovery target — the list
+    /// exists for accepting tokens during an issuer cutover, not for discovering
+    /// several providers, and two entries with different discovery documents is a
+    /// configuration error.
+    pub fn with_issuers(
+        settings: JWKServiceSettings,
+        issuers: Option<&[String]>,
+    ) -> Result<Self, JWKServiceError> {
+        let mut service = Self::new(settings);
+        if service.settings.endpoint.is_some() {
+            info!("JWKS endpoint configured explicitly. OIDC discovery is skipped");
+            return Ok(service);
+        }
+
+        let issuer = issuers
+            .and_then(|issuers| issuers.first())
+            .filter(|issuer| {
+                reqwest::Url::parse(issuer)
+                    .is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+            })
+            .ok_or(JWKServiceError::EndpointUnresolvable)?;
+
+        if let Some([_]) = issuers {
+            info!(%issuer, "Resolving jwks_uri through OIDC discovery");
+        } else {
+            info!(
+                %issuer,
+                "Resolving jwks_uri through OIDC discovery against the first configured issuer"
+            );
+        }
+        service.discovery_issuer = Some(issuer.clone());
+        Ok(service)
+    }
+
+    /// The URL to fetch the key set from: the explicit endpoint when configured,
+    /// otherwise the `jwks_uri` the issuer's discovery document names. The flag says
+    /// which, because the two are fetched differently: a discovered endpoint follows
+    /// no redirects (see [`no_redirect_client`]), while the operator-authored one
+    /// keeps the historical redirect-following behaviour.
+    async fn resolve_jwks_endpoint(&self) -> Result<(String, EndpointSource), JWKServiceError> {
+        if let Some(endpoint) = self.settings.endpoint.as_ref() {
+            return Ok((endpoint.clone(), EndpointSource::Explicit));
+        }
+        let issuer = self
+            .discovery_issuer
+            .as_ref()
+            .ok_or(JWKServiceError::EndpointUnresolvable)?;
+        if let Some(cached) = self.discovered_jwks_uri.get(issuer) {
+            return Ok((cached.clone(), EndpointSource::Discovered));
+        }
+
+        let url = format!(
+            "{}/.well-known/openid-configuration",
+            issuer.trim_end_matches('/')
+        );
+        let client = no_redirect_client()?;
+        let mut response = client.get(&url).send().await.map_err(|e| {
+            warn!("failed to fetch OIDC discovery document: {e:?}");
+            JWKServiceError::InternalError
+        })?;
+
+        let status = response.status();
+        let body = read_capped_body("OIDC discovery", &mut response).await?;
+        if status.is_redirection() {
+            warn!(
+                status = %status.as_u16(),
+                "OIDC discovery endpoint answered with a redirect."
+            );
+            return Err(JWKServiceError::InternalError);
+        }
+        if !status.is_success() {
+            warn!(
+                status = %status.as_u16(),
+                "OIDC discovery endpoint returned error, response: {}",
+                body_excerpt(&body)
+            );
+            return Err(JWKServiceError::InternalError);
+        }
+
+        let document: DiscoveryDocument = serde_json::from_str(&body).map_err(|e| {
+            warn!(
+                "failed to parse OIDC discovery document: {}",
+                body_excerpt(&body)
+            );
+            JWKServiceError::ParseError(e)
+        })?;
+
+        // The document vouching for itself is what stops a hijacked or substituted
+        // document from pointing key fetches somewhere else.
+        if document.issuer != *issuer {
+            warn!(
+                expected = %issuer,
+                actual = %document.issuer,
+                "OIDC discovery document names a different issuer than jwt_issuer"
+            );
+            return Err(JWKServiceError::DiscoveryIssuerMismatch {
+                expected: issuer.clone(),
+                actual: document.issuer,
+            });
+        }
+
+        if !discovered_jwks_uri_scheme_permitted(issuer, &document.jwks_uri) {
+            warn!(
+                %issuer,
+                jwks_uri = %document.jwks_uri,
+                "refusing discovered jwks_uri: keys for an https issuer are only fetched over https"
+            );
+            return Err(JWKServiceError::JwksUriNotHttps {
+                jwks_uri: document.jwks_uri,
+            });
+        }
+
+        info!(%issuer, jwks_uri = %document.jwks_uri, "Resolved jwks_uri through OIDC discovery");
+        self.discovered_jwks_uri
+            .insert(issuer.clone(), document.jwks_uri.clone());
+        Ok((document.jwks_uri, EndpointSource::Discovered))
     }
 
     /// Whether a refresh happened too recently to warrant another. Always false while
@@ -347,7 +551,8 @@ impl JwkServiceImpl {
         // way out so a healthy interval is measured from completion.
         self.mark_refreshed();
 
-        let endpoint = reqwest::Url::parse(&self.settings.endpoint).map_err(|e| {
+        let (endpoint, endpoint_source) = self.resolve_jwks_endpoint().await?;
+        let endpoint = reqwest::Url::parse(&endpoint).map_err(|e| {
             warn!("failed to parse JWKS endpoint as a URL: {e:?}");
             JWKServiceError::InternalError
         })?;
@@ -382,7 +587,13 @@ impl JwkServiceImpl {
                 JWKServiceError::InternalError
             })?
         } else {
-            let client = http_client()?;
+            // A discovered endpoint follows no redirects for the same reason discovery
+            // itself does not: the scheme check on the discovered jwks_uri ensures
+            // nothing if a redirect can then steer the key fetch onto a plaintext fetch.
+            let client = match endpoint_source {
+                EndpointSource::Explicit => http_client()?,
+                EndpointSource::Discovered => no_redirect_client()?,
+            };
 
             let mut response = timed!(
                 self.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME),
@@ -397,8 +608,15 @@ impl JwkServiceImpl {
             .result?;
 
             let status = response.status();
-            let body = read_capped_body(&mut response).await?;
+            let body = read_capped_body("JWKS", &mut response).await?;
 
+            if status.is_redirection() {
+                warn!(
+                    status = %status.as_u16(),
+                    "Discovered JWKS endpoint answered a redirect. Not supported."
+                );
+                return Err(JWKServiceError::InternalError);
+            }
             if !status.is_success() {
                 warn!(
                     status = %status.as_u16(),
@@ -602,7 +820,7 @@ mod tests {
         let requests = Arc::new(AtomicUsize::new(0));
         let address = spawn_jwks_server(requests.clone()).await;
         let service = JwkServiceImpl::new(JWKServiceSettings {
-            endpoint: format!("http://{address}/jwks"),
+            endpoint: Some(format!("http://{address}/jwks")),
         });
 
         service
@@ -636,7 +854,9 @@ mod tests {
         let endpoint = reqwest::Url::from_file_path(&jwks_path)
             .unwrap()
             .to_string();
-        let settings = JWKServiceSettings { endpoint };
+        let settings = JWKServiceSettings {
+            endpoint: Some(endpoint),
+        };
         let service = JwkServiceImpl::new(settings);
 
         let result = service.fetch_new_keys(None).await;
@@ -654,7 +874,7 @@ mod tests {
     #[tokio::test]
     async fn file_url_missing_file_returns_error() {
         let settings = JWKServiceSettings {
-            endpoint: "file:///tmp/jwk_test_file_that_does_not_exist.json".to_string(),
+            endpoint: Some("file:///tmp/jwk_test_file_that_does_not_exist.json".to_string()),
         };
         let service = JwkServiceImpl::new(settings);
 
@@ -665,7 +885,7 @@ mod tests {
 
     fn service() -> JwkServiceImpl {
         JwkServiceImpl::new(JWKServiceSettings {
-            endpoint: "http://127.0.0.1:1/jwks".to_string(),
+            endpoint: Some("http://127.0.0.1:1/jwks".to_string()),
         })
     }
 
@@ -1038,7 +1258,12 @@ mod tests {
             .expect("jwks path as a file url")
             .to_string();
 
-        (JwkServiceImpl::new(JWKServiceSettings { endpoint }), path)
+        (
+            JwkServiceImpl::new(JWKServiceSettings {
+                endpoint: Some(endpoint),
+            }),
+            path,
+        )
     }
 
     /// One unusable key must not cost the usable ones. A JWKS carrying an encryption key
@@ -1327,7 +1552,7 @@ mod tests {
         })
         .await;
         let service = JwkServiceImpl::new(JWKServiceSettings {
-            endpoint: format!("http://{address}/jwks"),
+            endpoint: Some(format!("http://{address}/jwks")),
         });
 
         let attempts: Vec<_> = (0..8)
@@ -1380,7 +1605,7 @@ mod tests {
     async fn an_oversized_chunked_response_is_refused_while_reading() {
         let address = spawn_chunked_oversized_server().await;
         let service = JwkServiceImpl::new(JWKServiceSettings {
-            endpoint: format!("http://{address}/jwks"),
+            endpoint: Some(format!("http://{address}/jwks")),
         });
 
         let result = service.fetch_new_keys(None).await;
@@ -1388,6 +1613,422 @@ mod tests {
             matches!(result, Err(JWKServiceError::ResponseTooLarge)),
             "a body with no declared length must still be capped: {result:?}"
         );
+    }
+
+    /// A provider stub serving both the discovery document and the key set, counting
+    /// requests to each. `issuer_override` lets a test serve a document that vouches
+    /// for someone else. `oversized` pads the document past the response cap.
+    struct DiscoveryProvider {
+        base: String,
+        discovery_requests: Arc<AtomicUsize>,
+        jwks_requests: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone)]
+    struct DiscoveryState {
+        base: String,
+        issuer_override: Option<String>,
+        jwks_uri_override: Option<String>,
+        oversized: bool,
+        redirect: bool,
+        redirect_jwks: bool,
+        discovery_requests: Arc<AtomicUsize>,
+        jwks_requests: Arc<AtomicUsize>,
+    }
+
+    async fn discovery_handler(State(state): State<DiscoveryState>) -> axum::response::Response {
+        use axum::response::IntoResponse;
+
+        state.discovery_requests.fetch_add(1, Ordering::SeqCst);
+        if state.redirect {
+            // Points at a route that serves a perfectly valid document, so a client
+            // that followed redirects would succeed — refusing is the test.
+            return axum::response::Redirect::temporary(&format!("{}/moved-discovery", state.base))
+                .into_response();
+        }
+        if state.oversized {
+            return format!(
+                r#"{{"issuer":"{}","jwks_uri":"{}/jwks","padding":"{}"}}"#,
+                state.base,
+                state.base,
+                "x".repeat(JWKS_MAX_RESPONSE_BYTES)
+            )
+            .into_response();
+        }
+        let issuer = state.issuer_override.as_ref().unwrap_or(&state.base);
+        let default_jwks_uri = format!("{}/jwks", state.base);
+        let jwks_uri = state
+            .jwks_uri_override
+            .as_ref()
+            .unwrap_or(&default_jwks_uri);
+        format!(r#"{{"issuer":"{issuer}","jwks_uri":"{jwks_uri}"}}"#).into_response()
+    }
+
+    /// The target of the redirecting discovery route: a valid document for this
+    /// provider, so only the refusal to follow explains a failed fetch.
+    async fn moved_discovery_handler(State(state): State<DiscoveryState>) -> String {
+        let default_jwks_uri = format!("{}/jwks", state.base);
+        format!(
+            r#"{{"issuer":"{}","jwks_uri":"{default_jwks_uri}"}}"#,
+            state.base
+        )
+    }
+
+    const STUB_JWKS: &str =
+        r#"{"keys":[{"kty":"oct","use":"sig","kid":"sig","alg":"HS256","k":"dGhlLXNlY3JldA"}]}"#;
+
+    /// One HS256 key, so a discovery test can verify a real token end to end.
+    /// `dGhlLXNlY3JldA` is `the-secret`.
+    async fn discovered_jwks_handler(
+        State(state): State<DiscoveryState>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+
+        state.jwks_requests.fetch_add(1, Ordering::SeqCst);
+        if state.redirect_jwks {
+            // Like the discovery redirect: the target serves perfectly valid keys, so
+            // only the client's refusal to follow explains a failed fetch.
+            return axum::response::Redirect::temporary(&format!("{}/moved-jwks", state.base))
+                .into_response();
+        }
+        STUB_JWKS.to_string().into_response()
+    }
+
+    async fn moved_jwks_handler() -> String {
+        STUB_JWKS.to_string()
+    }
+
+    async fn spawn_discovery_provider(
+        issuer_override: Option<String>,
+        oversized: bool,
+    ) -> DiscoveryProvider {
+        spawn_discovery_provider_serving(issuer_override, None, oversized, false, false).await
+    }
+
+    async fn spawn_discovery_provider_serving(
+        issuer_override: Option<String>,
+        jwks_uri_override: Option<String>,
+        oversized: bool,
+        redirect: bool,
+        redirect_jwks: bool,
+    ) -> DiscoveryProvider {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind discovery provider");
+        let base = format!(
+            "http://{}",
+            listener.local_addr().expect("discovery provider address")
+        );
+        let state = DiscoveryState {
+            base: base.clone(),
+            issuer_override,
+            jwks_uri_override,
+            oversized,
+            redirect,
+            redirect_jwks,
+            discovery_requests: Arc::new(AtomicUsize::new(0)),
+            jwks_requests: Arc::new(AtomicUsize::new(0)),
+        };
+        let provider = DiscoveryProvider {
+            base,
+            discovery_requests: state.discovery_requests.clone(),
+            jwks_requests: state.jwks_requests.clone(),
+        };
+        let app = Router::new()
+            .route("/.well-known/openid-configuration", get(discovery_handler))
+            .route("/moved-discovery", get(moved_discovery_handler))
+            .route("/jwks", get(discovered_jwks_handler))
+            .route("/moved-jwks", get(moved_jwks_handler))
+            .with_state(state);
+
+        lore_base::lore_spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve discovery provider");
+        });
+
+        provider
+    }
+
+    fn discovering_service(provider: &DiscoveryProvider) -> JwkServiceImpl {
+        JwkServiceImpl::with_issuers(
+            JWKServiceSettings { endpoint: None },
+            Some(std::slice::from_ref(&provider.base)),
+        )
+        .expect("an issuer URL resolves discovery")
+    }
+
+    /// If there is no explicit endpoint, keys resolve through the
+    /// issuer's discovery document, and a real token verifies against them.
+    #[tokio::test]
+    async fn keys_resolve_through_discovery_and_a_token_verifies() {
+        let provider = spawn_discovery_provider(None, false).await;
+        let service = discovering_service(&provider);
+
+        service.fetch_new_keys(None).await.expect("discovery fetch");
+        assert!(service.get_cached_key("sig").is_some());
+
+        let verifier = crate::auth::jwt::JwtVerifier {
+            jwk_service: Arc::new(service),
+            jwt_issuer: Some(vec![provider.base.clone()]),
+            jwt_audience: Some(vec!["Lore".to_string()]),
+        };
+        let token = {
+            let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+            header.kid = Some("sig".to_string());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let claims = json!({
+                "iss": provider.base,
+                "sub": "alice",
+                "aud": "Lore",
+                "iat": now,
+                "exp": now + 60,
+            });
+            jsonwebtoken::encode(
+                &header,
+                &claims,
+                &jsonwebtoken::EncodingKey::from_secret(b"the-secret"),
+            )
+            .expect("encode test token")
+        };
+
+        let verified = verifier
+            .verify_token(&token)
+            .await
+            .expect("a token signed by the discovered key verifies");
+        assert_eq!(verified.user_id, "alice");
+    }
+
+    /// An explicit endpoint wins over discovery and skips the fetch entirely.
+    #[tokio::test]
+    async fn an_explicit_endpoint_skips_discovery() {
+        let provider = spawn_discovery_provider(None, false).await;
+        let service = JwkServiceImpl::with_issuers(
+            JWKServiceSettings {
+                endpoint: Some(format!("{}/jwks", provider.base)),
+            },
+            Some(std::slice::from_ref(&provider.base)),
+        )
+        .expect("an explicit endpoint always resolves");
+
+        service.fetch_new_keys(None).await.expect("fetch");
+
+        assert!(service.get_cached_key("sig").is_some());
+        assert_eq!(
+            provider.discovery_requests.load(Ordering::SeqCst),
+            0,
+            "the discovery document must never be fetched"
+        );
+    }
+
+    /// The issuer check: a document vouching for someone else is refused, and the error
+    /// names both values so the operator can see which side is misconfigured.
+    #[tokio::test]
+    async fn a_discovery_document_naming_another_issuer_is_refused() {
+        let provider =
+            spawn_discovery_provider(Some("https://impostor.example.com".to_string()), false).await;
+        let service = discovering_service(&provider);
+
+        let error = service
+            .fetch_new_keys(None)
+            .await
+            .expect_err("a mismatched issuer must fail the fetch");
+
+        let JWKServiceError::DiscoveryIssuerMismatch { expected, actual } = &error else {
+            panic!("expected DiscoveryIssuerMismatch, got {error:?}");
+        };
+        assert_eq!(*expected, provider.base);
+        assert_eq!(actual, "https://impostor.example.com");
+        let message = error.to_string();
+        assert!(message.contains(&provider.base) && message.contains("impostor.example.com"));
+    }
+
+    /// The downgrade matrix. An `https` issuer's keys are only ever fetched over
+    /// `https`. a plain-`http` issuer (local testing) has already waived transport
+    /// security. The other schemes are not allowed, `file://` included.
+    #[test]
+    fn discovered_jwks_uri_scheme_rules() {
+        let https_issuer = "https://auth.example.com";
+        let http_issuer = "http://127.0.0.1:8080";
+
+        assert!(discovered_jwks_uri_scheme_permitted(
+            https_issuer,
+            "https://keys.example.com/jwks"
+        ));
+        assert!(
+            !discovered_jwks_uri_scheme_permitted(https_issuer, "http://keys.example.com/jwks"),
+            "an https issuer must never downgrade key retrieval to http"
+        );
+        assert!(discovered_jwks_uri_scheme_permitted(
+            http_issuer,
+            "http://127.0.0.1:8080/jwks"
+        ));
+        assert!(discovered_jwks_uri_scheme_permitted(
+            http_issuer,
+            "https://keys.example.com/jwks"
+        ));
+        for issuer in [https_issuer, http_issuer] {
+            assert!(
+                !discovered_jwks_uri_scheme_permitted(issuer, "file:///etc/passwd"),
+                "a discovered URL must never reach a non-http scheme"
+            );
+            assert!(!discovered_jwks_uri_scheme_permitted(issuer, "not a url"));
+        }
+    }
+
+    /// The refusal end to end: a discovery document steering key retrieval at a
+    /// non-https target is rejected and nothing is fetched from it.
+    #[tokio::test]
+    async fn a_discovered_jwks_uri_with_a_forbidden_scheme_is_refused() {
+        let provider = spawn_discovery_provider_serving(
+            None,
+            Some("file:///etc/passwd".to_string()),
+            false,
+            false,
+            false,
+        )
+        .await;
+        let service = discovering_service(&provider);
+
+        let error = service
+            .fetch_new_keys(None)
+            .await
+            .expect_err("a file:// jwks_uri must be refused");
+
+        assert!(
+            matches!(error, JWKServiceError::JwksUriNotHttps { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            provider.jwks_requests.load(Ordering::SeqCst),
+            0,
+            "nothing may be fetched from the refused URL"
+        );
+    }
+
+    /// A discovered JWKS endpoint that answers a redirect is refused too — the scheme
+    /// check on the discovered `jwks_uri` would ensure nothing if a redirect could
+    /// then steer the key fetch elsewhere.
+    #[tokio::test]
+    async fn a_redirecting_discovered_jwks_endpoint_is_refused() {
+        let provider = spawn_discovery_provider_serving(None, None, false, false, true).await;
+        let service = discovering_service(&provider);
+
+        let result = service.fetch_new_keys(None).await;
+
+        assert!(
+            result.is_err(),
+            "the redirect must fail the fetch: {result:?}"
+        );
+        assert!(
+            service.get_cached_key("sig").is_none(),
+            "no key may be cached through a redirected fetch"
+        );
+    }
+
+    /// The operator-authored endpoint keeps its historical behaviour: redirects are
+    /// followed. Compatibility for existing deployments whose endpoint sits behind one.
+    #[tokio::test]
+    async fn an_explicit_endpoint_may_still_redirect() {
+        let provider = spawn_discovery_provider_serving(None, None, false, false, true).await;
+        let service = JwkServiceImpl::new(JWKServiceSettings {
+            endpoint: Some(format!("{}/jwks", provider.base)),
+        });
+
+        service
+            .fetch_new_keys(None)
+            .await
+            .expect("an explicit endpoint follows the redirect as it always has");
+        assert!(service.get_cached_key("sig").is_some());
+    }
+
+    /// A redirect from the discovery endpoint is refused, not followed. The redirect
+    /// here targets a route serving a perfectly valid document, so a client that
+    /// followed it would succeed.
+    #[tokio::test]
+    async fn a_redirecting_discovery_endpoint_is_refused() {
+        let provider = spawn_discovery_provider_serving(None, None, false, true, false).await;
+        let service = discovering_service(&provider);
+
+        let result = service.fetch_new_keys(None).await;
+
+        assert!(
+            result.is_err(),
+            "a redirect must fail the fetch: {result:?}"
+        );
+        assert_eq!(
+            provider.jwks_requests.load(Ordering::SeqCst),
+            0,
+            "no keys may be fetched through a redirected discovery"
+        );
+    }
+
+    /// The discovery response is capped like the JWKS response.
+    #[tokio::test]
+    async fn an_oversized_discovery_document_is_refused() {
+        let provider = spawn_discovery_provider(None, true).await;
+        let service = discovering_service(&provider);
+
+        let result = service.fetch_new_keys(None).await;
+        assert!(
+            matches!(result, Err(JWKServiceError::ResponseTooLarge)),
+            "{result:?}"
+        );
+    }
+
+    /// The document is cached per issuer: key refreshes must not re-run discovery.
+    #[tokio::test]
+    async fn discovery_runs_once_per_issuer() {
+        let provider = spawn_discovery_provider(None, false).await;
+        let service = discovering_service(&provider);
+
+        service.fetch_new_keys(None).await.expect("first fetch");
+        expire_the_throttle(&service);
+        service.fetch_new_keys(None).await.expect("second fetch");
+
+        assert_eq!(provider.jwks_requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            provider.discovery_requests.load(Ordering::SeqCst),
+            1,
+            "the discovery document is resolved once, not per key refresh"
+        );
+    }
+
+    /// with two issuers configured, discovery runs against the first.
+    #[tokio::test]
+    async fn discovery_uses_the_first_of_several_issuers() {
+        let provider = spawn_discovery_provider(None, false).await;
+        let service = JwkServiceImpl::with_issuers(
+            JWKServiceSettings { endpoint: None },
+            Some(&[provider.base.clone(), "https://old.example.com".to_string()]),
+        )
+        .expect("the first issuer is a URL");
+
+        service.fetch_new_keys(None).await.expect("fetch");
+        assert!(service.get_cached_key("sig").is_some());
+    }
+
+    /// No endpoint and nothing to discover against is a configuration error at
+    /// construction — a startup failure, not a request-time surprise.
+    #[test]
+    fn no_endpoint_and_no_issuer_url_fails_construction() {
+        let keyword_issuer = JwkServiceImpl::with_issuers(
+            JWKServiceSettings { endpoint: None },
+            Some(&["LEGACY_AUTH_KEYWORD".to_string()]),
+        );
+        assert!(matches!(
+            keyword_issuer,
+            Err(JWKServiceError::EndpointUnresolvable)
+        ));
+
+        let no_issuers = JwkServiceImpl::with_issuers(JWKServiceSettings { endpoint: None }, None);
+        assert!(matches!(
+            no_issuers,
+            Err(JWKServiceError::EndpointUnresolvable)
+        ));
     }
 
     /// An oversized HTTP response is refused, and the cached keys are not disturbed by it.
@@ -1404,7 +2045,7 @@ mod tests {
         })
         .await;
         let service = JwkServiceImpl::new(JWKServiceSettings {
-            endpoint: format!("http://{address}/jwks"),
+            endpoint: Some(format!("http://{address}/jwks")),
         });
         cache_a_key(&service);
 

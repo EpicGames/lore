@@ -1815,21 +1815,18 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     };
 
     let jwt_verifier = match settings.server.auth.as_ref() {
-        Some(auth) => match auth.jwk.as_ref() {
-            Some(jwk) => {
-                let jwk_service = JwkServiceImpl::new(jwk.clone());
-                jwk_service
-                    .fetch_new_keys(None /* fetch all keys */)
-                    .await?;
-                let jwt_verifier = JwtVerifier {
-                    jwk_service: Arc::new(jwk_service),
-                    jwt_issuer: auth.jwt_issuer.clone(),
-                    jwt_audience: auth.jwt_audience.clone(),
-                };
-                Some(jwt_verifier)
-            }
-            None => None,
-        },
+        Some(auth) => {
+            let jwk = auth.jwk.clone().unwrap_or_default();
+            let jwk_service = JwkServiceImpl::with_issuers(jwk, auth.jwt_issuer.as_deref())?;
+            jwk_service
+                .fetch_new_keys(None /* fetch all keys */)
+                .await?;
+            Some(JwtVerifier {
+                jwk_service: Arc::new(jwk_service),
+                jwt_issuer: auth.jwt_issuer.clone(),
+                jwt_audience: auth.jwt_audience.clone(),
+            })
+        }
         None => None,
     };
 

@@ -338,27 +338,27 @@ repository_get = true
 
 ### Authentication
 
-`[server.auth]` configures JWT verification for the gRPC API. When `[server.auth]` (or its `[server.auth.jwk]` sub-table) is absent — as in every shipped config — JWT verification is disabled and the gRPC services accept unauthenticated requests.
+`[server.auth]` configures JWT verification for the gRPC API. When `[server.auth]` is defined, JWT verification is enabled. If it is absent, the services accept unauthenticated requests. If `[server.auth.jwk].endpoint` is set, it will be used as the JWKS endpoint. If not, the validation keys will be discovered from JWT issuer OIDC discovery document.
 
 | Field | Default | Description |
 | --- | --- | --- |
 | `jwt_issuer` | none | Accepted JWT `iss` values, as a string or an array. When set, tokens whose issuer matches no entry are rejected. When unset, issuer validation is skipped. Two entries are for the duration of an issuer's `iss` cutover if the issuer is changed. The validator accepts tokens minted under both the old and the new value while both are in flight. |
 | `jwt_audience` | none | Array of accepted JWT `aud` values. A token's audience must match one entry; when unset, audience validation is skipped. |
-| `jwk` | none | The `[server.auth.jwk]` sub-table below. Its presence enables JWT verification. |
+| `jwk` | none | The optional `[server.auth.jwk]` override sub-table below. |
 
 `[server.auth.jwk]`:
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `endpoint` | none (required) | URL of the JWKS (JSON Web Key Set) endpoint. The server fetches and caches signing keys from it at startup and re-fetches on an unknown key ID. |
+| `endpoint` | none | URL of the JWKS (JSON Web Key Set) endpoint, as an override for providers with non-standard discovery. When unset and `jwt_issuer` is an issuer URL, the server resolves the endpoint through OIDC discovery: it fetches `<jwt_issuer>/.well-known/openid-configuration` (the first jwt_issuer entry, when several issuers are configured) and takes `jwks_uri` from it. The server fetches and caches signing keys at startup and re-fetches on an unknown key ID. If this is unset, and `jwt_issuer` has no issuer URL, this is a startup error. |
 
 ```toml
+# Presence of `[server.auth]` enables JWT verification. By default the
+# JWKS endpoint is resolved through OIDC discovery against jwt_issuer.
+# Add [server.auth.jwk] endpoint = "..." to override discovery.
 [server.auth]
 jwt_issuer = "https://accounts.example.com"
 jwt_audience = ["lore-service"]
-
-[server.auth.jwk]
-endpoint = "https://accounts.example.com/.well-known/jwks.json"
 ```
 
 ## Store settings

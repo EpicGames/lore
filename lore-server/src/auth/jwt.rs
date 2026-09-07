@@ -1035,12 +1035,12 @@ mod tests {
         #[tokio::test]
         async fn either_of_two_configured_issuers_verifies() -> Result<(), Box<dyn Error>> {
             let verifier = verifier_with_issuers(vec![
-                "URC_AUTH_GAMEDEV".to_string(),
+                "LEGACY_AUTH_KEYWORD".to_string(),
                 "https://auth.example.com/realms/lore".to_string(),
             ]);
 
             verifier
-                .verify_token(&token_with_issuer("URC_AUTH_GAMEDEV"))
+                .verify_token(&token_with_issuer("LEGACY_AUTH_KEYWORD"))
                 .await?;
             verifier
                 .verify_token(&token_with_issuer("https://auth.example.com/realms/lore"))
@@ -1052,7 +1052,7 @@ mod tests {
         #[tokio::test]
         async fn an_issuer_in_neither_entry_is_refused() {
             let verifier = verifier_with_issuers(vec![
-                "URC_AUTH_GAMEDEV".to_string(),
+                "LEGACY_AUTH_KEYWORD".to_string(),
                 "https://auth.example.com/realms/lore".to_string(),
             ]);
 
@@ -1065,9 +1065,9 @@ mod tests {
 
         #[tokio::test]
         async fn a_single_configured_issuer_still_verifies() -> Result<(), Box<dyn Error>> {
-            let verifier = verifier_with_issuers(vec!["URC_AUTH_GAMEDEV".to_string()]);
+            let verifier = verifier_with_issuers(vec!["LEGACY_AUTH_KEYWORD".to_string()]);
             verifier
-                .verify_token(&token_with_issuer("URC_AUTH_GAMEDEV"))
+                .verify_token(&token_with_issuer("LEGACY_AUTH_KEYWORD"))
                 .await?;
             Ok(())
         }

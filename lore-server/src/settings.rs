@@ -220,6 +220,9 @@ fn trace_config_error_to_config(err: TraceConfigError) -> config::ConfigError {
 #[derive(Clone, Debug, Deserialize)]
 //#[serde(deny_unknown_fields)]
 pub struct AuthSettings {
+    /// Optional JWK override. Verification is enabled by `[server.auth]`.
+    /// If this or its `endpoint` is absent, the JWKS endpoint is
+    /// resolved through OIDC discovery against `jwt_issuer`.
     pub jwk: Option<JWKServiceSettings>,
     pub jwt_audience: Option<Vec<String>>,
     /// The `iss` values verification accepts. A bare string still parses, so
@@ -604,26 +607,29 @@ mod tests {
     /// configuration, so existing config files need no edit.
     #[test]
     fn jwt_issuer_accepts_a_bare_string_and_a_list() {
-        let bare: AuthSettings = toml::from_str(r#"jwt_issuer = "URC_AUTH_GAMEDEV""#)
+        let bare: AuthSettings = toml::from_str(r#"jwt_issuer = "LEGACY_AUTH_KEYWORD""#)
             .expect("[server.auth] with a bare string should deserialize");
-        let list: AuthSettings = toml::from_str(r#"jwt_issuer = ["URC_AUTH_GAMEDEV"]"#)
+        let list: AuthSettings = toml::from_str(r#"jwt_issuer = ["LEGACY_AUTH_KEYWORD"]"#)
             .expect("[server.auth] with a list should deserialize");
 
         assert_eq!(bare.jwt_issuer, list.jwt_issuer);
-        assert_eq!(bare.jwt_issuer, Some(vec!["URC_AUTH_GAMEDEV".to_string()]));
+        assert_eq!(
+            bare.jwt_issuer,
+            Some(vec!["LEGACY_AUTH_KEYWORD".to_string()])
+        );
     }
 
     #[test]
     fn jwt_issuer_accepts_two_entries_for_a_cutover() {
         let auth: AuthSettings = toml::from_str(
-            r#"jwt_issuer = ["URC_AUTH_GAMEDEV", "https://auth.example.com/realms/lore"]"#,
+            r#"jwt_issuer = ["LEGACY_AUTH_KEYWORD", "https://auth.example.com/realms/lore"]"#,
         )
         .expect("[server.auth] with two issuers should deserialize");
 
         assert_eq!(
             auth.jwt_issuer,
             Some(vec![
-                "URC_AUTH_GAMEDEV".to_string(),
+                "LEGACY_AUTH_KEYWORD".to_string(),
                 "https://auth.example.com/realms/lore".to_string(),
             ])
         );
