@@ -81,6 +81,10 @@ pub struct LoreRevisionSyncTargetEventData {
     pub is_latest: u8,
     /// Flag indicating revision was from local revision history, not remote
     pub local: u8,
+    /// Remote configured for the repository.
+    pub remote_available: u8,
+    /// Remote branch query returned an authoritative answer, identity is authorized to access the repository.
+    pub remote_authorized: u8,
 }
 
 /// Progress counters reported while a sync updates the working files.
@@ -310,10 +314,38 @@ pub async fn sync(
         .await
         .unwrap_or_default();
     let mut remote_latest = Hash::default();
+    let mut remote_available = false;
+    let mut remote_authorized = false;
 
     let mut local_latest_diverged = branch::load_latest_divergent(repository.clone(), branch_id)
         .await
         .unwrap_or_default();
+
+    match repository.remote().await {
+        Ok(remote) => {
+            remote_available = true;
+            match branch::load_remote(remote.clone(), repository.id, branch_id).await {
+                Ok(status) => {
+                    remote_latest = status.latest;
+                    remote_authorized = true;
+                }
+                Err(err) if err.is_branch_not_found() => {
+                    remote_authorized = true;
+                }
+                Err(err) => {
+                    lore_debug!("Remote branch query failed: {err}");
+                }
+            }
+            lore_debug!("Remote latest revision is {remote_latest}");
+        }
+        // No remote configured for this repository, nothing to report
+        Err(err) if err.is_no_remote() => {}
+        // Remote is configured but the connection failed
+        Err(err) => {
+            lore_debug!("Remote connection failed: {err}");
+            remote_available = true;
+        }
+    }
 
     let mut revision;
     if let Some(revision_string) = options.revision.as_ref() {
@@ -346,13 +378,6 @@ pub async fn sync(
         // BranchLatestStatus remains Divergent until the user pushes, which is
         // correct — the divergence is between local and remote.
         lore_debug!("Local latest revision is {local_latest}");
-
-        if let Ok(remote) = repository.remote().await {
-            remote_latest = branch::load_remote_latest(remote.clone(), repository.id, branch_id)
-                .await
-                .unwrap_or_default();
-            lore_debug!("Remote latest revision is {remote_latest}");
-        }
 
         if !local_latest_diverged && !remote_latest.is_zero() {
             lore_debug!("Local latest is synchronized with remote, pick remote latest as target");
@@ -491,6 +516,8 @@ pub async fn sync(
         target_revision_number: state_target.revision_number(),
         is_latest: at_latest.into(),
         local: (location == LoreBranchLocation::Local).into(),
+        remote_available: remote_available.into(),
+        remote_authorized: remote_authorized.into(),
     })
     .send();
 

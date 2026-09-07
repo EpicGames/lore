@@ -2384,6 +2384,10 @@ typedef struct lore_revision_sync_target_event_data_t {
   uint8_t is_latest;
   // Flag indicating revision was from local revision history, not remote
   uint8_t local;
+  // Remote configured for the repository.
+  uint8_t remote_available;
+  // Remote branch query returned an authoritative answer, identity is authorized to access the repository.
+  uint8_t remote_authorized;
 } lore_revision_sync_target_event_data_t;
 
 // Details of a single file changed by a sync.

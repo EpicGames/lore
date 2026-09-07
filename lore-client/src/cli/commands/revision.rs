@@ -1391,9 +1391,20 @@ fn revision_info_display(revision: &LoreRevisionSyncRevisionEventData) -> String
     )
 }
 
+fn print_sync_remote_warning(remote_available: u8, remote_authorized: u8) {
+    if remote_available != 0 && remote_authorized == 0 {
+        println!(
+            "{}Remote reachable but could not read remote revision (not authorized or unavailable), synchronizing against local history only{}",
+            LogStyles::WARNING,
+            anstyle::Reset,
+        );
+    }
+}
+
 pub fn handle_sync_event(event: &LoreEvent, progress_bar: &ProgressBar, debug: bool) {
     match event {
         LoreEvent::RevisionSyncTarget(data) if data.source_revision == data.target_revision => {
+            print_sync_remote_warning(data.remote_available, data.remote_authorized);
             if data.is_latest != 0 {
                 println!(
                     "Already on branch {} latest revision {} -> {}",
@@ -1407,6 +1418,7 @@ pub fn handle_sync_event(event: &LoreEvent, progress_bar: &ProgressBar, debug: b
             }
         }
         LoreEvent::RevisionSyncTarget(data) => {
+            print_sync_remote_warning(data.remote_available, data.remote_authorized);
             if !data.remote.is_empty() {
                 println!("Sync from remote {}", data.remote);
             }
