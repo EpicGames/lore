@@ -1668,6 +1668,69 @@ mod tests {
             .await;
     }
 
+    /// **A composite claims the local store it wraps.**
+    ///
+    /// `hold_for_command` has a trait default answering `None`, which is right for a
+    /// store with nothing on disk and wrong for a wrapper around one that has. Left
+    /// inherited, a storage handle over a composite opens holding nothing and then
+    /// reads and writes a store no process has claimed — silently, since an empty
+    /// claim is indistinguishable from a store that needed none.
+    #[tokio::test]
+    async fn a_composite_claims_the_local_store_it_wraps() {
+        use lore_storage::local::immutable_store::ImmutableStoreSettings;
+        use lore_storage::local::immutable_store::LocalImmutableStore;
+
+        let local_dir = lore_base::test_util::TempDir::new("lore-composite-claim-local-");
+        let durable_dir = lore_base::test_util::TempDir::new("lore-composite-claim-durable-");
+
+        let execution = setup_test_execution();
+        let local_path = local_dir.path().to_path_buf();
+        let durable_path = durable_dir.path().to_path_buf();
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let local: Arc<dyn lore_storage::ImmutableStore> = LocalImmutableStore::new(
+                    Some(local_path.clone()),
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("local store");
+                // A store of its own as the durable target, so the claim can be seen to land
+                // on the local store and not on the one a durable read would reach.
+                let durable: Arc<dyn lore_storage::ImmutableStore> = LocalImmutableStore::new(
+                    Some(durable_path.clone()),
+                    ImmutableStoreSettings::default(),
+                )
+                .await
+                .expect("durable store");
+                let composite = Arc::new(
+                    CompositeStoreBuilder::default()
+                        .with_local("local".to_string(), local)
+                        .expect("local target")
+                        .with_durable("durable".to_string(), durable)
+                        .expect("durable target")
+                        .build()
+                        .expect("composite builds"),
+                );
+
+                let claim = composite.hold_for_command().await.expect("claim taken");
+                assert!(
+                    claim.is_some(),
+                    "a composite wrapping a store with files on disk must claim it, \
+                     not inherit the default that claims nothing"
+                );
+                // A lock opened on a store directory shares that directory's state, so it
+                // reports what the composite's claim holds.
+                let held = |path: &std::path::Path| {
+                    lore_storage::local::store_lock::StoreLock::new(path.join("immutable"))
+                        .expect("a store directory")
+                        .is_held()
+                };
+                assert!(held(&local_path), "the claim holds the local store");
+                assert!(!held(&durable_path), "and not the durable one");
+            })
+            .await;
+    }
+
     /// A put whose content the durable store already holds, under an association the local store
     /// can name, is a write the durable store can answer with a copy. The caller supplying the
     /// payload is what makes naming that source its own to use, since ingress verified the payload

@@ -224,8 +224,9 @@ fn open_local(
                 (immutable, mutable)
             }
             (false, false) => {
-                // Canonicalize for cache-key consistency, but fall back to the raw path on
-                // canonicalize failure so the dotpath check below surfaces the real error.
+                // Made absolute against the call's working directory, falling back to the raw
+                // path on failure so the dotpath check below surfaces the real error. The store
+                // caches resolve whichever spelling arrives to the directory it names.
                 let absolute = make_absolute(path).unwrap_or_else(|_| PathBuf::from(path));
                 let dotpath = get_dot_lore_path(&absolute).map_err(|_err| {
                     StorageError::from(InvalidArguments {
@@ -291,6 +292,28 @@ fn open_local(
             None
         };
 
+        // Claim the stores for as long as this handle is open. An open store is one
+        // this process is using, and the flock is how other processes are told; the
+        // claim therefore belongs to the handle's lifetime, not to each call made
+        // through it. Every operation below then joins this claim instead of taking
+        // a lock and reading the epoch of its own.
+        let mut guards = Vec::new();
+        if let Some(guard) = immutable
+            .clone()
+            .hold_for_command()
+            .await
+            .forward_any::<StorageError>("claiming the immutable store")?
+        {
+            guards.push(guard);
+        }
+        if let Some(guard) = mutable
+            .clone()
+            .hold_for_command()
+            .await
+            .forward_any::<StorageError>("claiming the mutable store")?
+        {
+            guards.push(guard);
+        }
         let store = Arc::new(StoreInternal::new(
             identity,
             immutable,
@@ -298,6 +321,7 @@ fn open_local(
             remote,
             bound_flags,
             args.skip_verify != 0,
+            lore_storage::local::store_lock::StoreHold::new(guards),
         ));
         let handle = handle::register(store);
         LoreEvent::StorageOpened(LoreStorageOpenedEventData {

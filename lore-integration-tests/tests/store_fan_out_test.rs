@@ -186,7 +186,11 @@ mod tests {
         // All 100k addresses must be findable.
         for address in &addresses {
             let result = store
-                .find(partition, *address)
+                .find(
+                    partition,
+                    *address,
+                    lore_storage::local::immutable_store::Lookup::Read,
+                )
                 .await
                 .expect("find returned an error");
             assert_eq!(
@@ -372,7 +376,11 @@ mod tests {
         );
         for address in [written, untouched] {
             let result = store
-                .find(partition, address)
+                .find(
+                    partition,
+                    address,
+                    lore_storage::local::immutable_store::Lookup::Read,
+                )
                 .await
                 .expect("find returned an error");
             assert_eq!(
@@ -1031,7 +1039,14 @@ mod tests {
         assert_eq!(marker_level, 32, "Marker level mismatches in-memory level");
 
         for address in &addresses {
-            let result = store.find(partition, *address).await.unwrap();
+            let result = store
+                .find(
+                    partition,
+                    *address,
+                    lore_storage::local::immutable_store::Lookup::Read,
+                )
+                .await
+                .unwrap();
             assert_eq!(
                 result.matching,
                 lore_storage::StoreMatch::MatchFull,
@@ -1927,7 +1942,13 @@ mod tests {
         let reader = lore_base::lore_spawn!(async move {
             for _ in 0..40 {
                 for address in &reader_addresses {
-                    let _ = reader_store.find(partition, *address).await;
+                    let _ = reader_store
+                        .find(
+                            partition,
+                            *address,
+                            lore_storage::local::immutable_store::Lookup::Read,
+                        )
+                        .await;
                 }
             }
         });
@@ -1948,7 +1969,11 @@ mod tests {
         let mut missing = 0usize;
         for address in &addresses {
             let result = store
-                .find(partition, *address)
+                .find(
+                    partition,
+                    *address,
+                    lore_storage::local::immutable_store::Lookup::Read,
+                )
                 .await
                 .expect("find returned an error");
             if result.matching != lore_storage::StoreMatch::MatchFull {
@@ -2027,7 +2052,11 @@ mod tests {
         .await
         .expect("Failed to reopen immutable store");
         let result = store
-            .find(partition, address)
+            .find(
+                partition,
+                address,
+                lore_storage::local::immutable_store::Lookup::Read,
+            )
             .await
             .expect("find returned an error");
         assert_eq!(

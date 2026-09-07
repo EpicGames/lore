@@ -14,14 +14,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use lore_base::allocator::GrowVec;
-use lore_base::fs::lock::FSLock;
 use lore_error_set::prelude::*;
 use tokio::sync::Mutex;
 use tokio::sync::OwnedRwLockReadGuard;
 use tokio::sync::RwLock;
 use tokio::sync::RwLockReadGuard;
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::task::JoinHandle;
 use tokio::task::JoinSet;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
@@ -37,6 +35,9 @@ use crate::immutable_store::StoreError;
 use crate::local::fan_out::GroupLevel;
 use crate::local::immutable_store::SerializeFailureGuard;
 use crate::local::immutable_store::format_bucket_path;
+use crate::local::store_lock::Intent;
+use crate::local::store_lock::StoreGuard;
+use crate::local::store_lock::StoreLock;
 use crate::store_types::KeyType;
 use crate::store_types::KeyValueStream;
 
@@ -119,10 +120,29 @@ pub struct MutableStoreEntry {
 pub struct MutableStoreBucket {
     pub entry: GrowVec<MutableStoreEntry, CHUNK_SIZE_ENTRY>,
     pub sorted_index: GrowVec<u32, CHUNK_SIZE_U32>,
-    flush: Option<JoinHandle<()>>,
     deserialized: bool,
     pub version: u32,
     serialize_lock: Arc<Mutex<()>>,
+}
+
+/// One group's bucket levels, as a survey read them.
+#[derive(Clone, Copy)]
+struct GroupLevels {
+    /// Active buckets in the group: slots `[0..count]` are addressable.
+    count: usize,
+    /// Bucket count the on-disk `level` marker records; `0` when there is no marker.
+    committed: usize,
+}
+
+/// What a survey of the store directory found.
+///
+/// The store-wide version and the per-group levels travel together because the
+/// version depends on whether *any* group has a marker.
+struct GroupSurvey {
+    /// Version to write into bucket file headers, the same for every group.
+    serialize_version: u32,
+    /// One entry per group, in group order, always [`GROUP_COUNT`] long.
+    levels: Vec<GroupLevels>,
 }
 
 pub struct MutableStoreGroup {
@@ -169,9 +189,72 @@ pub struct MutableStoreGroup {
     /// Contention is per group, and only between concurrent flushes of the *same*
     /// group; the 256 groups still flush in parallel.
     pub flush_lock: Arc<Mutex<()>>,
+    /// The delayed flush for this group, if one is pending.
+    ///
+    /// One task per group that sweeps every dirty bucket, which is the shape the
+    /// immutable store uses. Kept on the group rather than on a bucket: a reload resets
+    /// buckets, and a handle reset with one would detach its task rather than end it,
+    /// leaving the next write free to schedule a second sweep beside it.
+    ///
+    /// The set is also its own reaping: `try_join_next` clears finished tasks, where
+    /// an `Option<JoinHandle>` needs an `is_finished` poll to do the same job.
+    pub flush: Mutex<JoinSet<()>>,
+    /// Whether a delayed flush is due for this group and has not yet begun its sweep.
+    ///
+    /// A writer that flags a bucket schedules a sweep only when it is the one to set this,
+    /// and a sweep clears it as it wakes, before it reads a single flag. A bucket flagged
+    /// while a sweep runs — after the sweep has passed it — therefore schedules the next
+    /// sweep rather than being left to the one already past it, where it would keep the
+    /// store claimed with nothing coming to write it.
+    pub scheduled: AtomicBool,
+}
+
+impl MutableStoreBucket {
+    /// Drops everything this bucket holds from disk, keeping what identifies it.
+    ///
+    /// For a store discarding state another process invalidated. Deliberately not
+    /// `*self = Self::default()`: that would replace `serialize_lock` with a fresh
+    /// one, leaving any task holding a clone of the old `Arc` excluding against a
+    /// lock nobody else takes.
+    fn reset_content(&mut self) {
+        self.entry = GrowVec::default();
+        self.sorted_index = GrowVec::default();
+        self.deserialized = false;
+        self.version = 0;
+    }
 }
 
 impl MutableStoreGroup {
+    /// Drop everything this group has cached from disk, and take the levels a fresh
+    /// survey read.
+    ///
+    /// The mutable counterpart of [`crate::local::immutable_store::ImmutableStoreGroup::invalidate`],
+    /// and smaller: with no packstore here, a group is its buckets and the counters
+    /// its level marker carries.
+    ///
+    /// A materialized bucket is reset through its own `RwLock`, the one every read and
+    /// write already takes, so this adds no synchronization to any path; untouched
+    /// slots are not locked, and the dirty flags are cleared for every slot. Does no
+    /// I/O and cannot fail.
+    ///
+    /// # Requirements
+    ///
+    /// The caller must hold the store's flock with nothing else in flight.
+    pub async fn invalidate(&self, count: usize, committed: usize, serialize_version: u32) {
+        for slot in 0..BUCKET_COUNT {
+            if let Some(bucket) = self.try_bucket(slot) {
+                bucket.write().await.reset_content();
+            }
+            self.dirty[slot].store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.bucket_count
+            .store(count, std::sync::atomic::Ordering::Relaxed);
+        self.committed_level
+            .store(committed, std::sync::atomic::Ordering::Relaxed);
+        self.serialize_version
+            .store(serialize_version, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Resolve a bucket slot, creating its `Arc<RwLock<MutableStoreBucket>>` on
     /// first touch.
     #[inline]
@@ -187,16 +270,31 @@ impl MutableStoreGroup {
     }
 }
 
+#[lore_macro::test_pub]
 pub struct LocalMutableStore {
     pub path: Option<Arc<PathBuf>>,
+    /// The groups, one per leading key byte.
+    ///
+    /// A plain vector for the reason the immutable store's is: it is indexed on every
+    /// operation, and a lock here would sit in front of the bucket lock those paths
+    /// already take. [`GROUP_COUNT`] is a constant and the length never changes, so a
+    /// reload invalidates the groups where they stand — see
+    /// [`MutableStoreGroup::invalidate`].
     pub group: Vec<Arc<MutableStoreGroup>>,
     pub flush_delay_seconds: u64,
     pub needs_upgrade: AtomicBool,
     pub authoritative: bool,
 
-    // This field must be dropped last so it must be declared last
-    #[allow(dead_code)]
-    pub lock: Option<FSLock>,
+    /// This store's cross-process lock, or `None` for an in-memory store.
+    ///
+    /// Held for a span of use rather than for the store's lifetime, so a store kept
+    /// only by the keep-alive cache holds no flock — see [`crate::local::store_lock`].
+    lock: Option<Arc<StoreLock>>,
+    /// The on-disk format version this store was opened at, which a reload needs
+    /// in order to rebuild its groups the same way.
+    version: MutableStoreVersion,
+    /// The settings the groups were built from, kept for the same reason.
+    settings: MutableStoreSettings,
 }
 
 #[repr(u32)]
@@ -471,23 +569,17 @@ impl MutableStoreBucket {
         sync_data: bool,
     ) -> Result<(), LocalMutableStoreError> {
         // Append `.tmp` rather than replacing the extension, so a fan-out-commit path like `index_<bb>.new` becomes `index_<bb>.new.tmp`. set_extension would clobber `.new` to `.tmp`, colliding with the regular flush path's tmp file.
-        let temporary_path = if sync_data {
+        let temporary_path = sync_data.then(|| {
             let mut p = path.as_os_str().to_owned();
             p.push(".tmp");
             PathBuf::from(p)
-        } else {
-            path.clone()
-        };
-        let mut temporary_guard = if sync_data {
-            Some(SerializeFailureGuard::new(
-                &group.dirty[bucket_index],
-                &temporary_path,
-            ))
-        } else {
-            None
-        };
+        });
+        // Re-arms the bucket's flag if the write fails, synced or not: it was cleared before
+        // the write either way.
+        let mut failure_guard =
+            SerializeFailureGuard::new(&group.dirty[bucket_index], temporary_path.as_deref());
 
-        if let Some(parent_path) = temporary_path.parent()
+        if let Some(parent_path) = path.parent()
             && !parent_path.exists()
         {
             let _ = lore_io::IoDriver::global()
@@ -519,19 +611,18 @@ impl MutableStoreBucket {
             .write(true)
             .create(true)
             .truncate(true);
-        if let Some(mut guard) = temporary_guard.take() {
+        if let Some(temporary_path) = &temporary_path {
             lore_io::IoDriver::global()
-                .write_file_segments_atomic(&temporary_path, &path, &file_options, segments)
+                .write_file_segments_atomic(temporary_path, &path, &file_options, segments)
                 .await
                 .internal("writing mutable store bucket")?;
-
-            guard.success();
         } else {
             lore_io::IoDriver::global()
                 .write_file_segments(&path, &file_options, segments, false)
                 .await
                 .internal("writing mutable store bucket")?;
         }
+        failure_guard.success();
 
         Ok(())
     }
@@ -714,94 +805,23 @@ impl MutableStoreBucket {
 }
 
 impl LocalMutableStore {
-    pub async fn new(
-        path: Option<impl AsRef<Path>>,
-        settings: MutableStoreSettings,
-        _immutable_store: Arc<dyn ImmutableStore>,
-    ) -> Result<Self, LocalMutableStoreError> {
-        let flush_delay_seconds = settings.flush_delay_seconds;
-        let authoritative = settings.authoritative;
-        let mutable_path = path.as_ref().map(|path| {
-            let mut path = path.as_ref().to_path_buf();
-            path.push("mutable");
-            Arc::new(path)
-        });
-
-        let mut needs_upgrade = false;
-        let mut version = MutableStoreVersion::Initial;
-        let lock = if let Some(path) = mutable_path.as_deref() {
-            if !path.exists() {
-                let _ = lore_io::IoDriver::global()
-                    .create_dir_all(path.as_path())
-                    .await;
-            }
-            let lock = FSLock::acquire_directory_lock(path.as_path())
-                .await
-                .internal("acquiring mutable store lock")?;
-
-            let index_existed = std::fs::exists(path.join("index")).unwrap_or_default();
-
-            // Check store version
-            let version_path = path.join("version");
-            if let Ok(bytes) = lore_io::IoDriver::global()
-                .read_file_bytes(&version_path)
-                .await
-            {
-                let stored = bytes
-                    .as_ref()
-                    .get(..4)
-                    .map(|value| u32::from_ne_bytes(value.try_into().expect("4 bytes")))
-                    .unwrap_or_default();
-                match stored {
-                    x if x == MutableStoreVersion::LazyFanOut as u32 => {
-                        version = MutableStoreVersion::LazyFanOut;
-                    }
-                    x if x == MutableStoreVersion::TypedItems as u32 => {
-                        version = MutableStoreVersion::TypedItems;
-                    }
-                    _ => {
-                        lore_base::lore_debug!("Mutable store NOT at latest version: {version:?}");
-                    }
-                }
-            };
-
-            if version == MutableStoreVersion::Initial {
-                // Pre-existing stores need migration (defer until remote is
-                // available); brand new stores write LazyFanOut directly.
-                let stored_version = if index_existed {
-                    needs_upgrade = true;
-                    version as u32
-                } else {
-                    MutableStoreVersion::LazyFanOut as u32
-                };
-                lore_io::IoDriver::global()
-                    .write_file_bytes(
-                        &version_path,
-                        bytes::Bytes::copy_from_slice(&stored_version.to_ne_bytes()),
-                        false,
-                    )
-                    .await
-                    .map_err(|err| {
-                        LocalMutableStoreError::internal_with_context(
-                            err,
-                            "Failed to upgrade mutable store",
-                        )
-                    })?;
-            }
-            Some(lock)
-        } else {
-            None
-        };
-
-        // Groups are surveyed before their levels are decided: the decision needs the store's
-        // serialize version, which is only known once every marker has been read.
-        let index_existed_on_disk = mutable_path
-            .as_ref()
-            .is_some_and(|p| p.join("index").exists());
-        // Every group is read at once, for the reasons the immutable store's open records:
-        // awaiting the groups in turn puts a store open behind `GROUP_COUNT` round trips to the
-        // I/O engine, and each task carries the group it answers for because completions arrive
-        // in whatever order the reads finish.
+    /// Reads every group's level marker and decides the store's serialize version.
+    ///
+    /// Shared by [`Self::build_groups`] and [`Self::refresh`], which need the same
+    /// answer and must not disagree about it. It is also the whole of the fallible
+    /// part of a refresh, which is what lets that do all its I/O before it touches a
+    /// group.
+    ///
+    /// # Errors
+    ///
+    /// [`LocalMutableStoreError`] if a group's pending level transition cannot be
+    /// recovered or its marker cannot be read.
+    async fn survey_groups(
+        mutable_path: Option<&Arc<PathBuf>>,
+        settings: &MutableStoreSettings,
+        version: MutableStoreVersion,
+    ) -> Result<GroupSurvey, LocalMutableStoreError> {
+        let index_existed = mutable_path.is_some_and(|path| path.join("index").exists());
         let mut group_levels = vec![GroupLevel::Unwritten; GROUP_COUNT];
         if let Some(path) = mutable_path.as_ref() {
             let index_path = path.join("index");
@@ -837,11 +857,26 @@ impl LocalMutableStore {
                 });
             }
 
+            // Drained to the end rather than returned from at the first failure, for the
+            // reason the immutable store's survey gives.
+            let mut failure = None;
             while let Some(joined) = tasks.join_next().await {
-                let (group_index, level) = joined.map_err(|err| {
-                    LocalMutableStoreError::internal_with_context(err, "level marker task")
-                })?;
-                group_levels[group_index] = level?;
+                let surveyed = joined
+                    .map_err(|err| {
+                        LocalMutableStoreError::internal_with_context(err, "level marker task")
+                    })
+                    .and_then(|(group_index, level)| Ok((group_index, level?)));
+                match surveyed {
+                    Ok((group_index, level)) => group_levels[group_index] = level,
+                    Err(err) => {
+                        if failure.is_none() {
+                            failure = Some(err);
+                        }
+                    }
+                }
+            }
+            if let Some(err) = failure {
+                return Err(err);
             }
         }
 
@@ -852,45 +887,209 @@ impl LocalMutableStore {
         // Determine serialize_version per Decision 8. Fresh stores and stores with markers / older
         // versions becoming fan-out-aware all go to LazyFanOut. Existing TypedItems stores with no
         // markers stay at TypedItems for backward compatibility.
-        let serialize_version: u32 = if !index_existed_on_disk
-            || any_marker_seen
-            || version != MutableStoreVersion::TypedItems
-        {
-            MutableStoreVersion::LazyFanOut as u32
-        } else {
-            MutableStoreVersion::TypedItems as u32
-        };
+        let serialize_version: u32 =
+            if !index_existed || any_marker_seen || version != MutableStoreVersion::TypedItems {
+                MutableStoreVersion::LazyFanOut as u32
+            } else {
+                MutableStoreVersion::TypedItems as u32
+            };
 
         let unwritten_level = crate::local::fan_out::unwritten_group_level(
             serialize_version == MutableStoreVersion::LazyFanOut as u32,
             settings.initial_fan_out_level,
         );
 
-        let mut store = LocalMutableStore {
+        let levels = group_levels
+            .into_iter()
+            .map(|level| match level {
+                GroupLevel::Marked(level) => GroupLevels {
+                    count: level,
+                    committed: level,
+                },
+                GroupLevel::PreFanOut => GroupLevels {
+                    count: BUCKET_COUNT,
+                    committed: 0,
+                },
+                GroupLevel::Unwritten => GroupLevels {
+                    count: unwritten_level,
+                    committed: 0,
+                },
+            })
+            .collect();
+        Ok(GroupSurvey {
+            serialize_version,
+            levels,
+        })
+    }
+
+    /// Discards what the groups cache and re-reads the store from disk.
+    ///
+    /// Invalidates the groups where they stand, which is what leaves
+    /// [`Self::group`] reachable without a lock. The survey does every fallible thing
+    /// first and touches nothing, so a failure leaves the store exactly as it was;
+    /// applying it does no I/O and cannot fail.
+    ///
+    /// # Errors
+    ///
+    /// [`LocalMutableStoreError`] if the store's groups cannot be surveyed.
+    async fn refresh(&self) -> Result<(), LocalMutableStoreError> {
+        let survey = Self::survey_groups(self.path.as_ref(), &self.settings, self.version).await?;
+        for (group, level) in self.group.iter().zip(survey.levels.iter()) {
+            group
+                .invalidate(level.count, level.committed, survey.serialize_version)
+                .await;
+        }
+        Ok(())
+    }
+
+    /// Builds one group per bucket group. Used by [`Self::new`] only; a reload applies
+    /// a fresh survey to the groups that already exist.
+    ///
+    /// # Errors
+    ///
+    /// [`LocalMutableStoreError`] if the survey fails.
+    async fn build_groups(
+        mutable_path: Option<&Arc<PathBuf>>,
+        settings: &MutableStoreSettings,
+        version: MutableStoreVersion,
+    ) -> Result<Vec<Arc<MutableStoreGroup>>, LocalMutableStoreError> {
+        let survey = Self::survey_groups(mutable_path, settings, version).await?;
+        let mut group = Vec::with_capacity(GROUP_COUNT);
+        for level in survey.levels {
+            group.push(Arc::new(MutableStoreGroup {
+                bucket: [const { OnceLock::new() }; BUCKET_COUNT],
+                dirty: std::array::from_fn(|_| AtomicBool::new(false)),
+                bucket_count: std::sync::atomic::AtomicUsize::new(level.count),
+                serialize_version: std::sync::atomic::AtomicU32::new(survey.serialize_version),
+                fan_out_threshold: settings.fan_out_threshold,
+                committed_level: std::sync::atomic::AtomicUsize::new(level.committed),
+                flush_lock: Arc::new(Mutex::new(())),
+                flush: Mutex::new(JoinSet::new()),
+                scheduled: AtomicBool::new(false),
+            }));
+        }
+        Ok(group)
+    }
+
+    pub async fn new(
+        path: Option<impl AsRef<Path>>,
+        settings: MutableStoreSettings,
+        _immutable_store: Arc<dyn ImmutableStore>,
+    ) -> Result<Self, LocalMutableStoreError> {
+        let flush_delay_seconds = settings.flush_delay_seconds;
+        let authoritative = settings.authoritative;
+        let mutable_path = path.as_ref().map(|path| {
+            let mut path = path.as_ref().to_path_buf();
+            path.push("mutable");
+            Arc::new(path)
+        });
+
+        let mut needs_upgrade = false;
+        let mut version = MutableStoreVersion::Initial;
+        let mut opening = None;
+        let lock = if let Some(path) = mutable_path.as_deref() {
+            if !path.exists() {
+                let _ = lore_io::IoDriver::global()
+                    .create_dir_all(path.as_path())
+                    .await;
+            }
+            let lock = StoreLock::new(path.as_path())
+                .internal("Failed to open the store's lock directory")?;
+
+            // Claimed across the probe, the version read, the stamp and the group survey
+            // below. All of them are decisions about the store's on-disk state, so another
+            // process must not rewrite it between them — and the stamp is itself a write.
+            // One claim for all of it, so the version and the groups describe one store.
+            let mut probing = lock
+                .acquire(Intent::Read)
+                .await
+                .internal("Failed to claim the mutable store to read its version")?;
+            probing.note_refreshed();
+
+            let index_existed = std::fs::exists(path.join("index")).unwrap_or_default();
+
+            // Check store version
+            let version_path = path.join("version");
+            if let Ok(bytes) = lore_io::IoDriver::global()
+                .read_file_bytes(&version_path)
+                .await
+            {
+                let stored = bytes
+                    .as_ref()
+                    .get(..4)
+                    .map(|value| u32::from_ne_bytes(value.try_into().expect("4 bytes")))
+                    .unwrap_or_default();
+                match stored {
+                    x if x == MutableStoreVersion::LazyFanOut as u32 => {
+                        version = MutableStoreVersion::LazyFanOut;
+                    }
+                    x if x == MutableStoreVersion::TypedItems as u32 => {
+                        version = MutableStoreVersion::TypedItems;
+                    }
+                    _ => {
+                        lore_base::lore_debug!("Mutable store NOT at latest version: {version:?}");
+                    }
+                }
+            };
+
+            if version == MutableStoreVersion::Initial {
+                // A write claim, taken only on the branch that writes. It joins the flock
+                // the read claim above already holds, so this costs one epoch advance and
+                // no second acquisition — and an open that finds a version it recognises
+                // pays neither.
+                //
+                // Worth claiming rather than not: a `version` file holding an
+                // unrecognised value — what a newer client writes — leaves `version` at
+                // `Initial`, so every older client re-stamps it and re-flags a migration
+                // on every open. That is a repeated write, between live processes, over
+                // a store they share.
+                let _stamping = lock
+                    .acquire(Intent::Write)
+                    .await
+                    .internal("Failed to claim the mutable store to stamp its version")?;
+
+                // Pre-existing stores need migration (defer until remote is
+                // available); brand new stores write LazyFanOut directly.
+                let stored_version = if index_existed {
+                    needs_upgrade = true;
+                    version as u32
+                } else {
+                    MutableStoreVersion::LazyFanOut as u32
+                };
+                lore_io::IoDriver::global()
+                    .write_file_bytes(
+                        &version_path,
+                        bytes::Bytes::copy_from_slice(&stored_version.to_ne_bytes()),
+                        false,
+                    )
+                    .await
+                    .map_err(|err| {
+                        LocalMutableStoreError::internal_with_context(
+                            err,
+                            "Failed to upgrade mutable store",
+                        )
+                    })?;
+            }
+            opening = Some(probing);
+            Some(lock)
+        } else {
+            None
+        };
+
+        // Read under the claim taken for the version probe, whose acquisition already
+        // adopted the epoch — so the first operation does not reload what is read here.
+        let group = Self::build_groups(mutable_path.as_ref(), &settings, version).await?;
+        drop(opening);
+        let store = LocalMutableStore {
             path: mutable_path,
             lock,
-            group: Vec::with_capacity(GROUP_COUNT),
+            group,
             flush_delay_seconds,
             needs_upgrade: AtomicBool::new(needs_upgrade),
             authoritative,
+            version,
+            settings,
         };
-
-        for level in group_levels {
-            let (count, committed) = match level {
-                GroupLevel::Marked(level) => (level, level),
-                GroupLevel::PreFanOut => (BUCKET_COUNT, 0),
-                GroupLevel::Unwritten => (unwritten_level, 0),
-            };
-            store.group.push(Arc::new(MutableStoreGroup {
-                bucket: [const { OnceLock::new() }; BUCKET_COUNT],
-                dirty: std::array::from_fn(|_| AtomicBool::new(false)),
-                bucket_count: std::sync::atomic::AtomicUsize::new(count),
-                serialize_version: std::sync::atomic::AtomicU32::new(serialize_version),
-                fan_out_threshold: settings.fan_out_threshold,
-                committed_level: std::sync::atomic::AtomicUsize::new(committed),
-                flush_lock: Arc::new(Mutex::new(())),
-            }));
-        }
 
         Ok(store)
     }
@@ -899,66 +1098,214 @@ impl LocalMutableStore {
         self.needs_upgrade.load(atomic::Ordering::Relaxed)
     }
 
-    pub fn group(&self, index: usize) -> Arc<MutableStoreGroup> {
-        self.group[index].clone()
-    }
-
-    fn mark_dirty(
-        self: Arc<Self>,
-        bucket: &mut MutableStoreBucket,
-        group_index: usize,
-        bucket_index: usize,
-    ) {
-        let was_dirty =
-            self.group[group_index].dirty[bucket_index].swap(true, atomic::Ordering::Relaxed);
-        if !was_dirty {
-            if let Some(flush_task) = bucket.flush.as_ref()
-                && flush_task.is_finished()
-            {
-                let _ = bucket.flush.take();
-            }
-
-            if bucket.flush.is_none() && self.flush_delay_seconds > 0 {
-                let weak_self = Arc::downgrade(&self);
-                bucket.flush = Some(Self::flush_delayed(
-                    weak_self,
-                    group_index,
-                    bucket_index,
-                    self.flush_delay_seconds,
-                ));
-            }
+    /// A store view over `path` with groups the caller has already built.
+    ///
+    /// For the initial-to-typed migration, which reads an old layout that
+    /// [`Self::new`] cannot describe.
+    ///
+    /// # Requirements
+    ///
+    /// It holds **no** store lock, so it takes no claim and advances no epoch of its
+    /// own. **The caller must hold a write claim on this directory across the whole
+    /// migration** — otherwise the rewrite is invisible to every other process, which
+    /// goes on serving the state it had before and can flush that back over the
+    /// migrated files.
+    #[must_use]
+    pub fn for_migration(path: PathBuf, groups: Vec<Arc<MutableStoreGroup>>) -> Self {
+        Self {
+            path: Some(Arc::new(path)),
+            lock: None,
+            group: groups,
+            flush_delay_seconds: 0,
+            needs_upgrade: AtomicBool::new(false),
+            // Authoritative: a corrupt bucket must fail the upgrade, not be
+            // silently dropped.
+            authoritative: true,
+            version: MutableStoreVersion::LazyFanOut,
+            settings: MutableStoreSettings::default(),
         }
     }
 
-    #[lore_macro::test_pub]
-    fn flush_delayed(
-        weak_ref: Weak<LocalMutableStore>,
-        group_index: usize,
-        bucket_index: usize,
-        delay: u64,
-    ) -> JoinHandle<()> {
-        lore_base::lore_spawn!(async move {
-            tokio::time::sleep(Duration::from_secs(delay)).await;
-            if let Some(store) = weak_ref.upgrade()
-                && let Some(path) = store.path.as_ref()
-            {
-                let group = store.group[group_index].clone();
-                let Some(bucket) = group.try_bucket(bucket_index).cloned() else {
-                    return;
-                };
+    /// Claims this store's cross-process lock for an operation, reloading first if
+    /// another process changed the store while this one held nothing.
+    ///
+    /// Joins the span claim when one is held. Methods that touch the store's files hold
+    /// a guard from this for as long as that work runs, including work handed to other
+    /// tasks.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::mutable_store::StoreError`] if the lock cannot be taken, or the
+    /// reload a stale acquisition demands cannot read the store.
+    pub async fn hold(
+        &self,
+        intent: Intent,
+    ) -> Result<Option<StoreGuard>, crate::immutable_store::StoreError> {
+        self.claim(intent, intent == Intent::Write).await
+    }
 
+    /// Claims this store to rewrite its files wholesale — the version migration — with a
+    /// write claim that advances the epoch before anything is rewritten, but without
+    /// marking the store dirty.
+    ///
+    /// Nothing such a rewrite writes goes through a bucket a flush would write, so a dirty
+    /// mark would have nothing to clear it: a command that only reads, whose closing flush
+    /// leaves the mutable store alone, would keep the store claimed for as long as the
+    /// process ran.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::hold`].
+    pub async fn hold_to_rewrite(
+        &self,
+    ) -> Result<Option<StoreGuard>, crate::immutable_store::StoreError> {
+        self.claim(Intent::Write, false).await
+    }
+
+    /// Claims the store with `intent`, reloading first if another process changed it, and
+    /// marks it dirty when `dirties` says the claim's writes go through its buckets.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::hold`].
+    async fn claim(
+        &self,
+        intent: Intent,
+        dirties: bool,
+    ) -> Result<Option<StoreGuard>, crate::immutable_store::StoreError> {
+        let Some(lock) = self.lock.as_ref() else {
+            return Ok(None);
+        };
+        let mut guard = lock.acquire(intent).await.map_err(|err| {
+            crate::immutable_store::StoreError::internal(format!(
+                "failed to acquire mutable store lock: {err}"
+            ))
+        })?;
+        if guard.is_stale() {
+            // Boxed: a reload is rare, and carried inline its state would be part of every
+            // operation's future.
+            Box::pin(self.refresh()).await.map_err(|err| {
+                crate::immutable_store::StoreError::internal(format!(
+                    "failed to reload a store another process changed: {err}"
+                ))
+            })?;
+            // Adopted only once the reload succeeded — see the immutable store's
+            // `hold` for why the epoch cannot be taken at acquisition time.
+            guard.note_refreshed();
+        }
+        if dirties {
+            // Below the refresh because `dirty` is what keeps the flock and only a
+            // flush clears it, so it is set solely for a store that has loaded state
+            // worth protecting — see the immutable store's `hold`.
+            lock.mark_dirty();
+        }
+        Ok(Some(guard))
+    }
+
+    /// Releases the flock's hold on unflushed state, if there is none left.
+    fn note_flushed(&self) {
+        let Some(lock) = self.lock.as_ref() else {
+            return;
+        };
+        // Taken before scanning, so a write that ends while the scan runs refuses the
+        // clear — and a store with nothing to clear is not scanned at all.
+        let Some(scan) = lock.clean_scan_start() else {
+            return;
+        };
+        let dirty = self.group.iter().any(|group| {
+            group
+                .dirty
+                .iter()
+                .any(|bucket| bucket.load(atomic::Ordering::Relaxed))
+        });
+        if !dirty {
+            lock.clear_dirty(scan);
+        }
+    }
+
+    /// Schedules the group's delayed flush, for a bucket that has just gone from clean
+    /// to dirty. The writer sets the bucket's flag itself, under its write lock.
+    async fn schedule_flush(self: Arc<Self>, group_index: usize) {
+        if self.flush_delay_seconds == 0 {
+            return;
+        }
+        let group = &self.group[group_index];
+        // Through the group's flag, set after the bucket's, so a sweep that has already
+        // cleared it sees the bucket — see [`MutableStoreGroup::scheduled`].
+        if group.scheduled.swap(true, atomic::Ordering::Relaxed) {
+            return;
+        }
+        let mut flush = group.flush.lock().await;
+        // Clears a finished sweep, which the set would otherwise keep.
+        let _ = flush.try_join_next();
+        let weak_self = Arc::downgrade(&self);
+        lore_base::lore_spawn!(
+            flush,
+            Self::flush_delayed(weak_self, group_index, self.flush_delay_seconds)
+        );
+    }
+
+    /// Writes out every dirty bucket in one group, after a delay.
+    ///
+    /// One sweep per group rather than a task per bucket — the shape the immutable
+    /// store's delayed flush has. See [`MutableStoreGroup::flush`] for why the handle
+    /// does not live in the bucket.
+    ///
+    /// **Claimed before anything is written, and only when there is something to
+    /// write.** This wakes long after the operation that scheduled it, by which time the
+    /// claim that operation held may be gone — the flock is released once nothing has
+    /// the store open and nothing is dirty, and an explicit flush in between does exactly
+    /// that. Writing then would put bucket files and a level marker on disk with no claim
+    /// and no epoch advance, over whatever another process has since written, and tell
+    /// nobody.
+    ///
+    /// A stale claim is the case that matters most: `hold` reloads first, which empties
+    /// the buckets, so this finds nothing to flush. That is the right answer — the state
+    /// it was about to write had already been invalidated and must not reach disk.
+    #[lore_macro::test_pub]
+    async fn flush_delayed(weak_ref: Weak<LocalMutableStore>, group_index: usize, delay: u64) {
+        tokio::time::sleep(Duration::from_secs(delay)).await;
+        if let Some(store) = weak_ref.upgrade()
+            && let Some(path) = store.path.as_ref()
+        {
+            let group = store.group[group_index].clone();
+            // Cleared before a single flag is read, as the immutable store's sweep does.
+            group.scheduled.store(false, atomic::Ordering::Relaxed);
+            // Looked at before claiming, for the reason the immutable store's sweep gives:
+            // a sweep that finds nothing must not claim to write.
+            let level_pending = group.committed_level.load(atomic::Ordering::Relaxed) == 0
+                && group.bucket_count.load(atomic::Ordering::Relaxed)
+                    != crate::local::fan_out::FAN_OUT_LEVEL_MAX;
+            let flagged = group
+                .dirty
+                .iter()
+                .any(|flag| flag.load(atomic::Ordering::Relaxed));
+            if !level_pending && !flagged {
+                store.note_flushed();
+                return;
+            }
+            let Ok(claim) = store.hold(Intent::Write).await else {
+                return;
+            };
+
+            for bucket_index in 0..group.bucket.len() {
+                // Atomic pre-check avoids acquiring the bucket RwLock for clean buckets.
+                if !group.dirty[bucket_index].load(atomic::Ordering::Relaxed) {
+                    continue;
+                }
+                let Some(bucket) = group.try_bucket(bucket_index).cloned() else {
+                    continue;
+                };
                 // Same group lock as `flush_all`, so a delayed bucket write cannot be
                 // clobbered by a concurrent two-phase commit's rename. Acquired before
                 // the bucket guard to keep the lock order
-                // flush_lock -> bucket RwLock -> serialize_lock uniform with
-                // `flush_all`, which would otherwise be an inversion.
-                let flush_guard = group.flush_lock.clone().lock_owned().await;
+                // flush_lock -> bucket RwLock -> serialize_lock uniform with `flush_all`.
+                let _flush_guard = group.flush_lock.clone().lock_owned().await;
 
                 // Re-check under the lock: a flush that ran while we waited may already
-                // have written this bucket. `serialize` would claim the dirty flag and
-                // bail out anyway, but only after taking the bucket guard.
+                // have written this bucket, so the read above is stale.
                 if !group.dirty[bucket_index].load(atomic::Ordering::Relaxed) {
-                    return;
+                    continue;
                 }
 
                 let bucket = bucket.read_owned().await;
@@ -971,18 +1318,24 @@ impl LocalMutableStore {
                     false, /* Don't wait and sync all data to storage media */
                 )
                 .await;
-
-                crate::local::fan_out::commit_if_initial_level(
-                    &flush_guard,
-                    &group.committed_level,
-                    &group.bucket_count,
-                    path,
-                    group_index,
-                    false,
-                )
-                .await;
             }
-        })
+
+            let flush_guard = group.flush_lock.clone().lock_owned().await;
+            crate::local::fan_out::commit_if_initial_level(
+                &flush_guard,
+                &group.committed_level,
+                &group.bucket_count,
+                path,
+                group_index,
+                false,
+            )
+            .await;
+            // Dropped before declaring the store clean, for the reason `flush` gives: this
+            // sweep's own write claim counts as a writer in flight until it lets go.
+            drop(flush_guard);
+            drop(claim);
+            store.note_flushed();
+        }
     }
 
     /// Immediate flush of all dirty buckets. Parallel across groups, sequential within a group.
@@ -1086,6 +1439,10 @@ impl LocalMutableStore {
                             let bucket = group.bucket(bucket_index).clone().read_owned().await;
                             // Re-check after lock acquire — concurrent paths may have just dirtied or undirtied this bucket.
                             if bucket.entry.is_empty() && !must_overwrite_old {
+                                // Nothing to write and no older file to overwrite, so the flag
+                                // is settled here, under the read lock every writer is
+                                // excluded by: left set, it would keep the store claimed.
+                                group.dirty[bucket_index].store(false, atomic::Ordering::Relaxed);
                                 continue;
                             }
                             let res = MutableStoreBucket::serialize_to_new(
@@ -1264,6 +1621,13 @@ impl LocalMutableStore {
 
 #[async_trait]
 impl crate::mutable_store::MutableStore for LocalMutableStore {
+    async fn hold_for_command(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError> {
+        // Read intent: this hold is for ordering, not for permission. An operation
+        // that writes takes its own write hold, which joins this one and advances
+        // the epoch then.
+        self.hold(Intent::Read).await
+    }
+
     // Assumes that payload has been validated to match the given hash prior to
     // calling this function to store the content payload - no hash validation done
     async fn store(
@@ -1273,6 +1637,7 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
         value: Hash,
         key_type: KeyType,
     ) -> Result<(), StoreError> {
+        let _hold = self.hold(Intent::Write).await?;
         let key = Key::make_typed(key, key_type);
         let group_index = key.group_index();
         let group = &self.group[group_index];
@@ -1329,8 +1694,14 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
             });
         }
 
-        self.clone()
-            .mark_dirty(&mut bucket, group_index, bucket_index);
+        // Flagged while the write lock is still held, so a flush serializing under the
+        // read lock never takes this bucket's content without also taking its flag.
+        let was_dirty =
+            self.group[group_index].dirty[bucket_index].swap(true, atomic::Ordering::Relaxed);
+        drop(bucket);
+        if !was_dirty {
+            self.clone().schedule_flush(group_index).await;
+        }
 
         Ok(())
     }
@@ -1341,6 +1712,7 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
         key: Hash,
         key_type: KeyType,
     ) -> Result<Hash, StoreError> {
+        let _hold = self.hold(Intent::Read).await?;
         let typed_key = Key::make_typed(key, key_type);
         let group_index = typed_key.group_index();
         let group = &self.group[group_index];
@@ -1410,6 +1782,7 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
         value: Hash,
         key_type: KeyType,
     ) -> Result<Hash, StoreError> {
+        let _hold = self.hold(Intent::Write).await?;
         let key = Key::make_typed(key, key_type);
         let group_index = key.group_index();
         let group = &self.group[group_index];
@@ -1449,6 +1822,12 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
                 // Value is not the expected, return stored value
                 return Ok(existing_value);
             }
+            // Already the value asked for: the swap succeeds with nothing to change, so the
+            // bucket is left unflagged — a flagged bucket is rewritten by the next flush, and
+            // keeps the store claimed until it is.
+            if value == existing_value {
+                return Ok(existing_value);
+            }
             // Value is the expected, swap to new value
             let entry_index = bucket.sorted_index[insert_slot] as usize;
             bucket.entry[entry_index].value = value;
@@ -1470,8 +1849,14 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
             });
         }
 
-        self.clone()
-            .mark_dirty(&mut bucket, group_index, bucket_index);
+        // Flagged while the write lock is still held, so a flush serializing under the
+        // read lock never takes this bucket's content without also taking its flag.
+        let was_dirty =
+            self.group[group_index].dirty[bucket_index].swap(true, atomic::Ordering::Relaxed);
+        drop(bucket);
+        if !was_dirty {
+            self.clone().schedule_flush(group_index).await;
+        }
 
         // Value was created or updated, return previously stored value (the expected) to indicate this
         Ok(existing_value)
@@ -1488,12 +1873,19 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
             return Ok(stream);
         }
 
+        // Shared with every producer below rather than dropped when this returns: the
+        // producers go on reading buckets after the stream is handed back, and the claim
+        // has to cover that work, not only the call that started it.
+        let hold = self.hold(Intent::Read).await?.map(Arc::new);
+
         for group_index in 0..self.group.len() {
             let path = self.path.clone();
             let authoritative = self.authoritative;
             let sender = sender.clone();
             let group = self.group[group_index].clone();
+            let hold = hold.clone();
             let task = async move {
+                let _hold = hold;
                 let active_buckets = group.bucket_count.load(atomic::Ordering::Relaxed);
                 for bucket_index in 0..active_buckets {
                     let bucket_ref = group.bucket(bucket_index).clone();
@@ -1622,14 +2014,37 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
     }
 
     async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
-        if let Some(path) = self.path.as_ref() {
-            self.clone()
-                .flush_all(Some(path.clone()), sync_data)
-                .await
-                .map_err(|e| StoreError::internal_with_context(e, "Failed to flush store to disk"))
-        } else {
-            Ok(())
+        let Some(path) = self.path.clone() else {
+            return Ok(());
+        };
+        // Claimed to write only when a bucket is flagged, for the reason the immutable
+        // store's `flush` gives: this runs after commands and on every handle close, and a
+        // write claim over nothing to write would invalidate every other process's state.
+        let flagged = self.group.iter().any(|group| {
+            group
+                .dirty
+                .iter()
+                .any(|flag| flag.load(atomic::Ordering::Relaxed))
+        });
+        if !flagged {
+            self.note_flushed();
+            return Ok(());
         }
+        let hold = self.hold(Intent::Write).await?;
+        let flushed = self
+            .clone()
+            .flush_all(Some(path), sync_data)
+            .await
+            .map_err(|e| StoreError::internal_with_context(e, "Failed to flush store to disk"));
+        // Dropped before declaring the store clean, for the reason the immutable
+        // store's `flush` gives: this flush's own write claim counts as a writer in
+        // flight until it lets go. A flush that failed declares nothing: what it could
+        // not write keeps the store claimed.
+        drop(hold);
+        if flushed.is_ok() {
+            self.note_flushed();
+        }
+        flushed
     }
 }
 

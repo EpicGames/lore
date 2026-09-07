@@ -902,6 +902,23 @@ impl CompositeStore {
 
 #[async_trait]
 impl ImmutableStore for CompositeStore {
+    /// Claims the local store, which is the only one of these with files to claim.
+    ///
+    /// Delegated rather than inherited. The trait's default answers `None`, which is
+    /// right for a store with nothing on disk and wrong for a wrapper around one that
+    /// has: a handle would open holding nothing, and then read and write a store no
+    /// process has claimed. The replicas and the durable upstream are remote and have
+    /// no flock of their own, so the local target's claim is the whole of it.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the local store's claim cannot be taken.
+    async fn hold_for_command(
+        self: Arc<Self>,
+    ) -> Result<Option<lore_storage::local::store_lock::StoreGuard>, lore_storage::StoreError> {
+        self.local.target.clone().hold_for_command().await
+    }
+
     /// The local store is the one a read is served from without leaving the process, so its setting
     /// is the one that decides whether bytes can cross a partition here.
     fn isolates_partitions(&self) -> bool {

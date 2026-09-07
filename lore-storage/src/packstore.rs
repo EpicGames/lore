@@ -162,6 +162,27 @@ impl PackStore {
         }
     }
 
+    /// Drop the cached packfile set so the next [`Self::resume`] re-reads the
+    /// directory.
+    ///
+    /// For a store that has discovered another process changed it underneath. The
+    /// open files go with the vector, which is the point: they may name packfiles
+    /// that have since been compacted away.
+    ///
+    /// Cannot fail and does no I/O, which is what lets a caller invalidate all 256
+    /// groups without the possibility of stopping half way. Reloading is left to
+    /// `resume()`, which every read and write path already calls, so nothing is read
+    /// back until something actually wants it.
+    ///
+    /// Note the order: `resume()` returns early when `writeable` is non-empty, so
+    /// clearing that is what re-arms it.
+    pub async fn forget(&self) {
+        let mut packfile = self.packfile.write().await;
+        let mut writeable = self.writeable.write().await;
+        packfile.clear();
+        writeable.clear();
+    }
+
     pub async fn resume(&self) -> Result<(), PackfileError> {
         let mut packfile = self.packfile.write().await;
         let mut writeable = self.writeable.write().await;

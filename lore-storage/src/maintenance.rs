@@ -228,6 +228,28 @@ impl GcCounters {
         let _ = self.store.set(Arc::downgrade(store));
     }
 
+    /// Forget everything loaded so far, so a store that is reloading from disk does
+    /// not count the same bytes twice.
+    ///
+    /// Both totals are cumulative `fetch_add`s fed by [`Self::add_loaded_size`] and
+    /// [`Self::add_loaded_fragments`], which are reached only from a packstore
+    /// `resume()` and a bucket deserialize. A store that discards its in-memory state
+    /// and re-reads the directory calls each of those a second time for the same
+    /// files, so without this the totals climb on every reload and the compaction and
+    /// eviction triggers fire against a number that describes no store.
+    ///
+    /// Zero is the right value rather than a subtraction because a reload discards
+    /// *all* of it: the caller has just invalidated every group, so the correct total
+    /// is the one a freshly constructed store has, and each group re-adds its own as
+    /// it is next touched.
+    ///
+    /// The fired-once latches are deliberately left alone. They exist to keep one
+    /// process from firing a pass per crossing, and a reload is not a new process.
+    pub fn reset_loaded(&self) {
+        self.total_size.store(0, Ordering::Relaxed);
+        self.fragment_count.store(0, Ordering::Relaxed);
+    }
+
     /// Account for `bytes` of just-loaded packstore data; fire one compaction pass if
     /// the running total crosses `max_size` (once per process).
     pub fn add_loaded_size(self: &Arc<Self>, bytes: u64) {

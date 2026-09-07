@@ -27,6 +27,7 @@ use crate::errors::NotSupported;
 use crate::errors::Oversized;
 use crate::errors::PayloadNotFound;
 use crate::errors::SlowDown;
+use crate::local::store_lock::StoreGuard;
 use crate::store_types::PayloadRead;
 use crate::store_types::StoreGetData;
 use crate::store_types::StoreMatch;
@@ -339,6 +340,28 @@ pub trait ImmutableStore: Any + Send + Sync {
     /// Check if this store is backed by local disk
     fn is_local(&self) -> bool {
         false
+    }
+
+    /// Claims this store for the span it is about to be used — a storage handle from
+    /// open to close, or one repository command.
+    ///
+    /// The claim is what tells other processes this one is using the store, so it
+    /// belongs to the span rather than to each call within it. It is also the pair a
+    /// repository lock is contained within: store locks are the outer ones, because
+    /// they are the pair the storage API can also take, and two orders over one pair
+    /// would be a cycle.
+    ///
+    /// `None` means this store has nothing on disk to claim — a remote store, or an
+    /// in-memory one. **A store that wraps one which does have files must delegate to
+    /// it rather than inherit this**, or a handle opens holding nothing and then reads
+    /// and writes a store no process has claimed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the lock cannot be taken, or if the reload a stale
+    /// acquisition demands fails.
+    async fn hold_for_command(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError> {
+        Ok(None)
     }
 
     /// Whether this store refuses to serve a payload it only found under another partition.

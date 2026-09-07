@@ -640,10 +640,10 @@ pub struct LoreRepositoryReleaseArgs {}
 
 /// Release all cached store references for the given repository path.
 ///
-/// Frees in-memory store data and releases file-backed store cache entries.
-/// Any active `RepositoryContext` instances for this path remain valid, but
-/// once they are dropped the stores will be freed. Subsequent opens will
-/// create fresh stores.
+/// Frees cached in-memory store data. Disk-backed stores are not forced closed:
+/// each is released once nothing uses it, and a later open reuses one that is still
+/// alive, which the store epoch keeps current with what other processes wrote.
+/// Any active `RepositoryContext` instances for this path remain valid.
 ///
 /// # Events
 ///

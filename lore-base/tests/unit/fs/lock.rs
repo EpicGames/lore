@@ -31,6 +31,40 @@ async fn a_second_acquirer_waits_while_the_lock_is_held() {
     drop(held);
 }
 
+/// **Trying a lock another holder has answers at once, and trying a free one takes it.**
+/// Observed from a second open file description, which contends with the first, so an
+/// attempt that waited, or one that answered without locking, is seen.
+#[tokio::test]
+async fn trying_a_held_lock_answers_at_once_and_trying_a_free_one_takes_it() {
+    let dir = TempDir::new("lore-base-lock-try");
+    let path = dir.path().join("lock");
+    let held = FSLock::acquire_exact_path(&path)
+        .await
+        .expect("first acquisition");
+
+    let refused = tokio::time::timeout(
+        Duration::from_secs(5),
+        FSLock::try_acquire_exact_path(&path),
+    )
+    .await
+    .expect("a held lock is refused without waiting")
+    .expect("contention is not an error");
+    assert!(refused.is_none(), "another holder has the lock");
+
+    drop(held);
+    let taken = FSLock::try_acquire_exact_path(&path)
+        .await
+        .expect("attempts")
+        .expect("a free lock is taken");
+    let waited =
+        tokio::time::timeout(Duration::from_millis(50), FSLock::acquire_exact_path(&path)).await;
+    assert!(
+        waited.is_err(),
+        "and what the attempt took excludes another description"
+    );
+    drop(taken);
+}
+
 /// Dropping the guard releases the OS lock, so the next acquisition completes. Bounded by a
 /// timeout because the wait is otherwise unbounded: a lock that was not released would hang
 /// the test rather than fail it.

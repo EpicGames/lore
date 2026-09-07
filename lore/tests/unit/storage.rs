@@ -279,6 +279,7 @@ async fn build_connection_store(identity: &str, connection_id: u64) -> Arc<Store
             None,
             lore::storage::store::BoundFlags::default(),
             false,
+            lore_storage::local::store_lock::StoreHold::default(),
         )
         .with_connection_id(connection_id),
     )

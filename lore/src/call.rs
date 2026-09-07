@@ -106,8 +106,8 @@ where
 /// leaf-fetch writes (mtime cache, status flush) still see it.
 ///
 /// Acquiring the token serializes writes in-process on a per-path
-/// `tokio::sync::Mutex`; reads skip this. Cross-process exclusion is the
-/// `FSLock` in `load_and_connect`.
+/// `tokio::sync::Mutex`; reads skip this. Cross-process exclusion is the store
+/// claims `load_and_connect` takes, and the repository `FSLock` it takes inside them.
 pub async fn repository_call_write<Arg, T, F, Fut, ResT, ErrT>(
     globals: LoreGlobalArgs,
     callback: LoreEventCallback,

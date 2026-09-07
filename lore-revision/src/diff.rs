@@ -93,10 +93,21 @@ pub async fn diff_revision_paths(
                 let Some(change) = walk.next().await else {
                     break;
                 };
-                let permit = task_tx
+                let permit = match task_tx
                     .reserve()
                     .await
-                    .internal("revision diff receiver dropped")?;
+                    .internal("revision diff receiver dropped")
+                {
+                    Ok(permit) => permit,
+                    Err(err) => {
+                        // Abandoned rather than dropped, so the walk is joined on every path:
+                        // closing its channel stops it at its next emit, and this task reports
+                        // once it has. The walk's complaint that its receiver went away is this
+                        // task's own doing, so the failure that caused it is the one reported.
+                        walk.abandon().await;
+                        return Err(DiffError::from(err));
+                    }
+                };
                 permit.send(Ok(change));
             }
             walk.finish()

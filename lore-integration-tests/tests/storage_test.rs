@@ -270,6 +270,150 @@ mod open_tests {
         assert_opened_before_complete(&events, 0);
     }
 
+    /// Whether this process holds the claim on one of a repository's own stores. A lock
+    /// opened on a store directory shares that directory's state with every other lock
+    /// in the process, so it reports what the command or handle under test holds.
+    fn store_held(repository: &Path, store: &str) -> bool {
+        lore_storage::local::store_lock::StoreLock::new(repository.join(".lore").join(store))
+            .expect("a repository store directory")
+            .is_held()
+    }
+
+    /// Waits for both of a repository's stores to be released, for up to five seconds.
+    async fn both_stores_released(repository: &Path) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while store_held(repository, "immutable") || store_held(repository, "mutable") {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        true
+    }
+
+    /// **A disk-backed handle claims both stores from open to close.** The handle is a
+    /// span of use: while it is open no other process may use the stores, and once it
+    /// closes, one may.
+    #[tokio::test]
+    async fn a_disk_backed_handle_claims_its_stores_until_it_closes() {
+        let repo_dir = tempdir("claims");
+        let repo_path = repo_dir.path();
+        create_repo(repo_path).await;
+        assert!(
+            both_stores_released(repo_path).await,
+            "creation let go of the stores"
+        );
+
+        let (sink, callback) = make_sink();
+        let status = open::open(
+            globals(),
+            LoreStorageOpenArgs {
+                repository_path: LoreString::from(repo_path.display().to_string().as_str()),
+                in_memory: 0,
+                ..Default::default()
+            },
+            callback,
+        )
+        .await;
+        assert_eq!(status, 0);
+        let id = take_opened(&sink.lock().unwrap()).expect("open emitted Opened");
+        assert!(
+            store_held(repo_path, "immutable") && store_held(repo_path, "mutable"),
+            "an open handle holds both stores"
+        );
+
+        let (_close_sink, close_callback) = make_sink();
+        let status = close_handle(
+            lore::storage::handle::LoreStore { handle_id: id },
+            close_callback,
+        )
+        .await;
+        assert_eq!(status, 0);
+        assert!(
+            both_stores_released(repo_path).await,
+            "closing the handle releases both stores"
+        );
+    }
+
+    /// **A repository command claims its stores before the repository lock.** Taken the
+    /// other way round, a command waiting on the repository lock would hold no store
+    /// claim, and a storage handle — which takes store claims and never a repository
+    /// lock — could wait on the command while the command waits on the handle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_repository_command_claims_its_stores_before_the_repository_lock() {
+        let repo_dir = tempdir("containment");
+        let repo_path = repo_dir.path().to_path_buf();
+        create_repo(&repo_path).await;
+        assert!(
+            both_stores_released(&repo_path).await,
+            "creation let go of the stores"
+        );
+
+        // A second open file description on the repository lock, which excludes the one
+        // the command takes.
+        let repository_lock =
+            lore_base::fs::lock::FSLock::acquire_directory_lock(repo_path.join(".lore"))
+                .await
+                .expect("takes the repository lock");
+        assert!(
+            !store_held(&repo_path, "immutable"),
+            "nothing holds the store before the command starts"
+        );
+
+        let command = {
+            let mut command_globals = globals();
+            command_globals.repository_path = repo_path.as_path().into();
+            command_globals.offline = 1;
+            command_globals.local = 1;
+            lore_spawn!(async move {
+                repository::status(
+                    command_globals,
+                    repository::LoreRepositoryStatusArgs {
+                        staged: 0,
+                        scan: 0,
+                        check_dirty: 0,
+                        reset: 0,
+                        sync_point: 0,
+                        revision_only: 1,
+                        count: 0,
+                        paths: lore_revision::interface::LoreArray::default(),
+                    },
+                    None,
+                )
+                .await
+            })
+        };
+
+        let both_held = || store_held(&repo_path, "immutable") && store_held(&repo_path, "mutable");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !both_held() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the command must claim both stores while it waits for the repository lock"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Long enough for a command that was not waiting on the repository lock to have
+        // finished, and for one that let its claims go while waiting to have done so.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(both_held(), "the command keeps both claims while it waits");
+        assert!(
+            !command.is_finished(),
+            "and it is still waiting on the repository lock"
+        );
+
+        drop(repository_lock);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), command)
+            .await
+            .expect("the command finishes once the repository lock is free")
+            .expect("the command task completes");
+        assert_eq!(status, 0);
+        assert!(
+            both_stores_released(&repo_path).await,
+            "and releases both stores once it is done"
+        );
+    }
+
     async fn open_in_memory(callback: LoreEventCallback) -> i32 {
         open::open(
             globals(),

@@ -15,6 +15,7 @@ use lore::storage::close::*;
 use lore::storage::handle;
 use lore::storage::handle::LoreStore;
 use lore::storage::store::OpGuard;
+use lore::storage::store::disk_backed_for_tests;
 use lore::storage::store::in_memory_for_tests;
 use lore_base::types::Hash;
 use lore_base::types::Partition;
@@ -122,4 +123,95 @@ async fn the_store_tears_down_only_once_the_last_revision_handle_closes() {
         alive.upgrade().is_none(),
         "and dropping it must be what finally tears the store down",
     );
+}
+
+/// **A closing handle's flush holds the stores until it is done.** The handle's own
+/// claims end with its state, which close does not keep for the flush, so the flush
+/// runs under claims joined while the handle's were still held.
+#[tokio::test]
+async fn the_claims_joined_for_a_flush_outlive_the_handle() {
+    let dir = lore_base::test_util::TempDir::new("close-flush-claims-");
+    let store = disk_backed_for_tests("close-flush-claims", dir.path()).await;
+    let held = |name: &str| {
+        lore_storage::local::store_lock::StoreLock::new(dir.path().join(name))
+            .expect("a store directory")
+            .is_held()
+    };
+    assert!(
+        held("immutable") && held("mutable"),
+        "an open handle claims both stores"
+    );
+
+    let claims = claims_for_flush(&store).await;
+    assert_eq!(claims.len(), 2, "the flush joins a claim on each store");
+    drop(store);
+    assert!(
+        held("immutable") && held("mutable"),
+        "and those keep both stores once the handle's state is gone"
+    );
+
+    drop(claims);
+    assert!(
+        !held("immutable") && !held("mutable"),
+        "until the flush lets them go"
+    );
+}
+
+/// **A tree closed after its storage handle flushes what it wrote.** The handle's close
+/// flushed what had been written by then; without a flush at the tree's own close, the
+/// tree's later writes would keep the store's flock for as long as the process ran.
+#[tokio::test]
+async fn closing_a_tree_after_its_storage_handle_flushes_what_it_wrote() {
+    let dir = lore_base::test_util::TempDir::new("close-tree-flush-");
+    let store = disk_backed_for_tests("close-tree-flush", dir.path()).await;
+    let mutable = store.mutable.clone();
+    let repository = Partition::from([0x2Bu8; 16]);
+    let store_handle = handle::register(store);
+    let tree = load_revision_tree(store_handle, repository).await;
+    let status = close(
+        LoreGlobalArgs::default(),
+        LoreStorageCloseArgs {
+            handle: store_handle,
+        },
+        None,
+    )
+    .await;
+    assert_eq!(status, 0, "closing the storage handle must succeed");
+
+    // Written after the storage handle closed, as a commit through the tree would be.
+    mutable
+        .clone()
+        .store(
+            repository,
+            Hash::from([0x5au8; 32]),
+            Hash::from([0xa5u8; 32]),
+            lore_base::types::KeyType::BranchMetadata,
+        )
+        .await
+        .expect("stores");
+
+    let status = lore::revision_tree::close::close(
+        LoreGlobalArgs::default(),
+        lore::revision_tree::close::LoreRevisionTreeCloseArgs {
+            id: 1,
+            handle: tree,
+        },
+        None,
+    )
+    .await;
+    assert_eq!(status, 0, "closing the tree must succeed");
+
+    let held = || {
+        lore_storage::local::store_lock::StoreLock::new(dir.path().join("mutable"))
+            .expect("a store directory")
+            .is_held()
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while held() {
+        assert!(
+            Instant::now() < deadline,
+            "the tree's close flushed what it wrote and let the store go"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
 }

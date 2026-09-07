@@ -508,6 +508,7 @@ async fn compact_bucket() {
     let group = Arc::new(ImmutableStoreGroup {
         bucket: [const { OnceLock::new() }; BUCKET_COUNT],
         dirty: std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false)),
+        soft_dirty: std::array::from_fn(|_| std::sync::atomic::AtomicBool::new(false)),
         bucket_count: std::sync::atomic::AtomicUsize::new(
             lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
         ),
@@ -521,6 +522,7 @@ async fn compact_bucket() {
         flush_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
         packstore: PackStore::new(Some(tempdir.to_path_buf()), 1, None),
         flush: tokio::sync::Mutex::new(JoinSet::new()),
+        scheduled: std::sync::atomic::AtomicBool::new(false),
     });
 
     // Buffer lengths are primes to ensure test actually verify the correct thing

@@ -8,11 +8,33 @@ use async_trait::async_trait;
 use crate::Hash;
 use crate::Partition;
 use crate::immutable_store::StoreError;
+use crate::local::store_lock::StoreGuard;
 use crate::store_types::KeyType;
 use crate::store_types::KeyValueStream;
 
 #[async_trait]
 pub trait MutableStore: Send + Sync {
+    /// Claims this store for the span it is about to be used — a storage handle from
+    /// open to close, or one repository command.
+    ///
+    /// The claim is what tells other processes this one is using the store, so it
+    /// belongs to the span rather than to each call within it. It is also the pair a
+    /// repository lock is contained within: store locks are the outer ones, because
+    /// they are the pair the storage API can also take, and two orders over one pair
+    /// would be a cycle.
+    ///
+    /// `None` means this store has nothing on disk to claim — a remote store, or an
+    /// in-memory one. **A store that wraps one which does have files must delegate to
+    /// it rather than inherit this**, or a handle opens holding nothing and then reads
+    /// and writes a store no process has claimed.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError`] if the lock cannot be taken, or if the reload a stale
+    /// acquisition demands fails.
+    async fn hold_for_command(self: Arc<Self>) -> Result<Option<StoreGuard>, StoreError> {
+        Ok(None)
+    }
     /// Returns the mutable value stored for `key` with the type `key_type` within `partition`.
     ///
     /// Returns `StoreError::AddressNotFound` if no value of the given type is stored for the given key.

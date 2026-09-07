@@ -620,6 +620,14 @@ pub struct RepositoryContext {
     is_layer: bool,
     write_token: Option<RepositoryWriteToken>,
     repo_lock: Option<Arc<RepositoryLock>>,
+    /// Store claims this context holds that [`Self::repo_lock`]'s holder does not.
+    ///
+    /// `None` when this context created that holder, or has no claims of its own. A
+    /// context that joined a cached one keeps its own here, because the holder's claims
+    /// belong to whichever command created it and may be on directories this one is not
+    /// using. Shared, as the holder is, with the contexts derived from this one and with
+    /// the flush this context spawns when its command ends.
+    own_stores: Option<Arc<lore_storage::local::store_lock::StoreHold>>,
     /// The storage session pool this repository's reads and writes pick from,
     /// resolved on first use.
     ///
@@ -718,6 +726,7 @@ impl RepositoryContext {
             is_layer: false,
             write_token: None,
             repo_lock: None,
+            own_stores: None,
             session_pool: Default::default(),
             lazy_session: Default::default(),
             file_system,
@@ -778,13 +787,23 @@ impl RepositoryContext {
         SALT_LORE
     }
 
-    /// Attach a process-local repository `FSLock` holder to this context. The
-    /// lock is held for the lifetime of the context (and any clones that
-    /// propagate the field). Used by `load_and_connect` on the disk-backed
-    /// path; other construction paths leave `repo_lock` as `None`.
+    /// Attach a process-local repository `FSLock` holder to this context, together
+    /// with any store claims this caller holds that the holder does not.
+    ///
+    /// Both live for the lifetime of the context, and of the flush it spawns when its
+    /// command ends. `stores` is empty when this context
+    /// created the holder — its claims went into it — and carries this caller's own
+    /// when it joined one another command had already created, whose claims are on
+    /// whichever store objects *that* command was using. Keeping them here is what
+    /// makes the containment hold per caller rather than per cache entry.
     #[must_use]
-    pub(crate) fn with_repository_lock(mut self, lock: Arc<RepositoryLock>) -> Self {
+    pub(crate) fn with_repository_lock(
+        mut self,
+        lock: Arc<RepositoryLock>,
+        stores: lore_storage::local::store_lock::StoreHold,
+    ) -> Self {
         self.repo_lock = Some(lock);
+        self.own_stores = (!stores.is_empty()).then(|| Arc::new(stores));
         self
     }
 
@@ -819,12 +838,17 @@ impl RepositoryContext {
     /// The mutable store is only flushed when the context holds a write
     /// token — read-only commands cannot have dirtied it.
     ///
-    /// The repository `FSLock` is kept alive for the duration of the spawned
-    /// flush by cloning the `Arc<RepositoryLock>` into the task. Without
-    /// this, the lock would drop when the caller's `RepositoryContext`
-    /// reference drops at end-of-command, allowing another process to
-    /// enter and race this flush against its own writes to the per-bucket
-    /// immutable-store index files.
+    /// The `Arc<RepositoryLock>` is cloned into the task, so the repository
+    /// flock and the store claims it contains outlive the caller's
+    /// `RepositoryContext` until the flush is done. Without it both would be
+    /// released at end-of-command, and another process could take the stores
+    /// and race this flush with its own writes to the per-bucket index files.
+    ///
+    /// So are this context's own claims, when it joined a lock another command
+    /// created. Released as the context drops, they would leave the flush holding
+    /// the repository flock while it claims a store again — the reverse of the
+    /// order every command takes them in, and a deadlock against a command in
+    /// another process holding that store and waiting for the repository.
     pub fn try_spawn_post_command_flush(&self, sync_data: bool) {
         let immutable_store = self.immutable_store.clone();
         let mutable_store = self
@@ -832,6 +856,7 @@ impl RepositoryContext {
             .is_some()
             .then(|| self.mutable_store.clone());
         let repo_lock = self.repo_lock.clone();
+        let own_stores = self.own_stores.clone();
         lore_base::runtime::LORE_CONTEXT.sync_scope(
             Arc::new(crate::interface::ExecutionContext::default())
                 as Arc<dyn std::any::Any + Send + Sync>,
@@ -841,7 +866,9 @@ impl RepositoryContext {
                     if let Some(mutable_store) = mutable_store {
                         let _ = mutable_store.flush(sync_data).await;
                     }
+                    // The repository flock first, then the store claims it was taken inside.
                     drop(repo_lock);
+                    drop(own_stores);
                 });
             },
         );
@@ -954,6 +981,7 @@ impl RepositoryContext {
             is_layer: false,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
+            own_stores: None,
             session_pool: Default::default(),
             lazy_session: Default::default(),
         }
@@ -975,6 +1003,7 @@ impl RepositoryContext {
             is_layer: false,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
+            own_stores: None,
             session_pool: Default::default(),
             lazy_session: Default::default(),
             file_system: self.file_system.clone(),
@@ -1001,6 +1030,7 @@ impl RepositoryContext {
             is_layer: false,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
+            own_stores: None,
             session_pool: Default::default(),
             lazy_session: Default::default(),
         }
@@ -1022,6 +1052,7 @@ impl RepositoryContext {
             is_layer: false,
             write_token: None,
             repo_lock: None,
+            own_stores: None,
             session_pool: Default::default(),
             lazy_session: Default::default(),
             file_system: self.file_system.clone(),
@@ -1057,6 +1088,7 @@ impl RepositoryContext {
             is_layer: self.is_layer,
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
+            own_stores: self.own_stores.clone(),
             session_pool: Default::default(),
             lazy_session: Default::default(),
             file_system: self.file_system.clone(),
@@ -1099,6 +1131,7 @@ impl RepositoryContext {
             is_layer: false,
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
+            own_stores: self.own_stores.clone(),
             session_pool: Default::default(),
             lazy_session: Default::default(),
             file_system: self.file_system.clone(),
@@ -1130,6 +1163,7 @@ impl RepositoryContext {
             is_layer: true,
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
+            own_stores: self.own_stores.clone(),
             session_pool: Default::default(),
             lazy_session: Default::default(),
             file_system: self.file_system.clone(),
@@ -1162,6 +1196,7 @@ impl RepositoryContext {
             is_layer: self.is_layer,
             write_token: self.write_token.as_ref().map(|t| t.share()),
             repo_lock: self.repo_lock.clone(),
+            own_stores: self.own_stores.clone(),
             session_pool: Default::default(),
             lazy_session: Default::default(),
             file_system: self.file_system.clone(),
@@ -1547,8 +1582,29 @@ pub fn load_repository_config(path: impl AsRef<Path>) -> Result<RepositoryConfig
 /// managed via an `Arc` + weak-ref cache so overlapping commands share one
 /// acquisition; the underlying flock drops when the last strong reference is
 /// released.
+#[lore_macro::test_pub]
 pub(crate) struct RepositoryLock {
+    /// Declared first so it drops first. Rust drops fields in declaration order,
+    /// so the repository flock is released before the store locks that contain
+    /// it — the reverse of acquisition, which is what containment means on the
+    /// way out.
     _lock: FSLock,
+    /// The store locks this repository lock lives inside.
+    ///
+    /// Owning them is what carries the containment past the acquisition: the flock
+    /// above is released before them, so a repository lock never outlives the store
+    /// claims it was taken under.
+    ///
+    /// What the constructor enforces is that a caller passes *its* claims, not that
+    /// those claims are non-empty — an in-memory store has nothing to claim and
+    /// legitimately contributes none. A caller that joins a holder another command
+    /// created keeps its own claims on its context instead, since the ones in here
+    /// belong to that other command and may be on store objects this one is not
+    /// using.
+    ///
+    /// Repository creation takes no repository lock, so it builds none of this: its
+    /// writes go through the stores, each taking its own claim.
+    _stores: lore_storage::local::store_lock::StoreHold,
 }
 
 static REPOSITORY_LOCK_CACHE: OnceLock<DashMap<PathBuf, Weak<RepositoryLock>>> = OnceLock::new();
@@ -1570,26 +1626,49 @@ static REPOSITORY_LOCK_INIT_MUTEXES: OnceLock<
 /// reference drops. Concurrent first-time initializers are serialized via a
 /// per-path `tokio::sync::Mutex` so only one thread calls into the OS flock
 /// for a given path at a time; others wait, then observe the cached entry.
+#[lore_macro::test_pub]
 pub(crate) async fn get_or_create_repository_lock(
     dot_path: PathBuf,
-) -> Result<Arc<RepositoryLock>, RepositoryError> {
+    stores: lore_storage::local::store_lock::StoreHold,
+) -> Result<
+    (
+        Arc<RepositoryLock>,
+        lore_storage::local::store_lock::StoreHold,
+    ),
+    RepositoryError,
+> {
     let cache = REPOSITORY_LOCK_CACHE.get_or_init(DashMap::new);
 
     // Fast path: upgrade an existing weak reference.
+    //
+    // **The caller's own guards come back with it.** A cached holder owns whichever
+    // guards its creator supplied, on whichever store objects that command was using;
+    // dropping this caller's would leave it holding the repository flock with no claim
+    // of its own, which is the shape the containment exists to prevent.
     if let Some(holder) = cache.get(&dot_path).and_then(|w| w.upgrade()) {
-        return Ok(holder);
+        return Ok((holder, stores));
     }
 
-    // Slow path: serialize init attempts per path so only one of them calls
+    // Filed under the directory the path names: a second holder for one directory would
+    // take a second flock on it, which excludes the first inside this very process. Bound
+    // before the insert below, so no shard guard from the lookup is still held by then.
+    let key = dot_path.canonicalize().unwrap_or_else(|_| dot_path.clone());
+    let cached = cache.get(&key).and_then(|w| w.upgrade());
+    if let Some(holder) = cached {
+        cache.insert(dot_path, Arc::downgrade(&holder));
+        return Ok((holder, stores));
+    }
+
+    // Slow path: serialize init attempts per directory so only one of them calls
     // into the OS flock.
     let mutexes =
         REPOSITORY_LOCK_INIT_MUTEXES.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
     let init_mutex = {
-        if let Some(existing) = mutexes.read().unwrap().get(&dot_path) {
+        if let Some(existing) = mutexes.read().unwrap().get(&key) {
             existing.clone()
         } else {
             let mut w = mutexes.write().unwrap();
-            w.entry(dot_path.clone())
+            w.entry(key.clone())
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         }
@@ -1599,8 +1678,10 @@ pub(crate) async fn get_or_create_repository_lock(
 
     // Re-check the cache — another task may have finished initializing while
     // we were waiting on the init mutex.
-    if let Some(holder) = cache.get(&dot_path).and_then(|w| w.upgrade()) {
-        return Ok(holder);
+    let cached = cache.get(&key).and_then(|w| w.upgrade());
+    if let Some(holder) = cached {
+        cache.insert(dot_path, Arc::downgrade(&holder));
+        return Ok((holder, stores));
     }
 
     // The OS flock is taken with non-blocking attempts and async retries,
@@ -1609,9 +1690,19 @@ pub(crate) async fn get_or_create_repository_lock(
         .await
         .internal("Failed to get exclusive access to repository")?;
 
-    let holder = Arc::new(RepositoryLock { _lock: lock });
+    let holder = Arc::new(RepositoryLock {
+        _lock: lock,
+        _stores: stores,
+    });
+    if key != dot_path {
+        cache.insert(key, Arc::downgrade(&holder));
+    }
     cache.insert(dot_path, Arc::downgrade(&holder));
-    Ok(holder)
+    // Moved into the holder, so the caller keeps nothing of its own here.
+    Ok((
+        holder,
+        lore_storage::local::store_lock::StoreHold::default(),
+    ))
 }
 
 static IMMUTABLE_STORE_CACHE: OnceLock<DashMap<PathBuf, Weak<dyn ImmutableStore>>> =
@@ -1624,6 +1715,24 @@ static IN_MEMORY_IMMUTABLE_CACHE: OnceLock<DashMap<PathBuf, Arc<dyn ImmutableSto
     OnceLock::new();
 
 static IN_MEMORY_MUTABLE_CACHE: OnceLock<DashMap<PathBuf, Arc<dyn MutableStore>>> = OnceLock::new();
+
+/// The key a store cache files a store under: the directory `path` names, resolved.
+///
+/// Two spellings of one directory — through a symlink, `/tmp` and `/private/tmp`, a letter
+/// case the filesystem folds — must reach one store object. Each object keeps its own
+/// in-memory state over a flock shared per directory, so a second object would miss writes
+/// the first makes while that flock stays held, and could flush stale buckets over them.
+/// Resolving needs the directory, which is created here as the store's constructor would
+/// create it; the given path is the key if either step fails, and the constructor then
+/// reports why.
+///
+/// Consulted only once the spelling itself has missed, so a caller that always spells a
+/// store the same way pays nothing for it.
+fn canonical_store_key(path: &Path) -> PathBuf {
+    std::fs::create_dir_all(path)
+        .and_then(|()| path.canonicalize())
+        .unwrap_or_else(|_| path.to_path_buf())
+}
 
 fn get_cached_immutable_store(path: &PathBuf) -> Option<Arc<dyn ImmutableStore>> {
     IMMUTABLE_STORE_CACHE
@@ -1715,20 +1824,33 @@ pub async fn stop_store_gc() {
     futures::future::join_all(stores.into_iter().map(|store| store.stop_gc(true))).await;
 }
 
-/// Release all cached store references for the given repository path.
-/// Any active `RepositoryContext` instances for this path remain valid
-/// (they hold their own `Arc` to the stores), but once they are dropped
-/// the stores will be freed. Subsequent opens will create fresh stores.
+/// Release the cached in-memory stores for the given repository path.
+///
+/// Active `RepositoryContext` instances stay valid — they hold their own `Arc` to the
+/// stores — and a disk-backed store is freed when the last of them drops.
+///
+/// # Why only the in-memory caches
+///
+/// The two families are cached differently and need opposite treatment. The in-memory
+/// caches hold `Arc`s: an in-memory store has no disk to fall back to, nothing else
+/// ever frees one, and releasing them is the work only this function can do.
+///
+/// The disk-backed caches hold `Weak`s. They free nothing when removed, expire on
+/// their own once the last context drops, and that expiry is what ordinary
+/// end-of-operation cleanup already relies on — it never touches the map. Removing
+/// them early has exactly one effect: a later open cannot upgrade to a store that is
+/// still alive, so it builds a **second** store over the same files. Two stores on one
+/// directory overlap entirely, and while the epoch keeps their reads coherent, it does
+/// not keep their writes: a reload triggered by one discards whatever the other had
+/// not yet flushed.
+///
+/// Whether retained in-memory state may be reused is settled by the store epoch, at
+/// every transition back into use, which is exactly when it matters — so removing the
+/// entries early would buy nothing and cost the overlap.
 pub fn repository_release(path: impl AsRef<Path>) {
     let path = path.as_ref();
     for dot_dir in [DOT_URC, DOT_LORE] {
         let dot_path = path.join(dot_dir);
-        if let Some(cache) = IMMUTABLE_STORE_CACHE.get() {
-            cache.remove(&dot_path);
-        }
-        if let Some(cache) = MUTABLE_STORE_CACHE.get() {
-            cache.remove(&dot_path);
-        }
         if let Some(cache) = IN_MEMORY_IMMUTABLE_CACHE.get() {
             cache.remove(&dot_path);
         }
@@ -1834,18 +1956,27 @@ pub async fn create_immutable_store_at_path(
         return Ok(store);
     }
 
-    // Slow path: serialize concurrent first-time initializers per path so only
+    // Filed under the directory the path names, so another spelling of it reaches the same
+    // store rather than building a second one over the same files.
+    let key = canonical_store_key(&path);
+    if let Some(store) = get_cached_immutable_store(&key) {
+        lore_debug!("Reusing cached immutable store");
+        cache_immutable_store(path, store.clone());
+        return Ok(store);
+    }
+
+    // Slow path: serialize concurrent first-time initializers per directory so only
     // one caller reaches `LocalImmutableStore::new` (which acquires the on-disk
     // flock). Without this, two overlapping cache misses would both block on
     // the OS flock for the same path.
     let mutexes =
         IMMUTABLE_STORE_INIT_MUTEXES.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
     let init_mutex = {
-        if let Some(existing) = mutexes.read().unwrap().get(&path) {
+        if let Some(existing) = mutexes.read().unwrap().get(&key) {
             existing.clone()
         } else {
             let mut w = mutexes.write().unwrap();
-            w.entry(path.clone())
+            w.entry(key.clone())
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         }
@@ -1854,8 +1985,9 @@ pub async fn create_immutable_store_at_path(
     let _guard = init_mutex.lock().await;
 
     // Re-check the cache — another task may have finished while we waited.
-    if let Some(store) = get_cached_immutable_store(&path) {
+    if let Some(store) = get_cached_immutable_store(&key) {
         lore_debug!("Reusing cached immutable store");
+        cache_immutable_store(path, store.clone());
         return Ok(store);
     }
 
@@ -1877,6 +2009,9 @@ pub async fn create_immutable_store_at_path(
     lore_storage::gc_event::set_gc_event_sink_provider(gc_event_sink);
     lore_storage::maintenance::spawn_gc(&store, &create_options);
 
+    if key != path {
+        cache_immutable_store(key, store.clone());
+    }
     cache_immutable_store(path, store.clone());
 
     Ok(store)
@@ -1921,17 +2056,26 @@ pub async fn create_mutable_store_at_path(
         return Ok(store);
     }
 
-    // Slow path: serialize concurrent first-time initializers per path so only
+    // Filed under the directory the path names, for the reason the immutable store's
+    // construction gives.
+    let key = canonical_store_key(&path);
+    if let Some(store) = get_cached_mutable_store(&key) {
+        lore_debug!("Reusing cached mutable store");
+        cache_mutable_store(path, store.clone());
+        return Ok(store);
+    }
+
+    // Slow path: serialize concurrent first-time initializers per directory so only
     // one caller reaches `LocalMutableStore::new` (which acquires the on-disk
     // flock). Without this, two overlapping cache misses would both block on
     // the OS flock for the same path.
     let mutexes = MUTABLE_STORE_INIT_MUTEXES.get_or_init(|| std::sync::RwLock::new(HashMap::new()));
     let init_mutex = {
-        if let Some(existing) = mutexes.read().unwrap().get(&path) {
+        if let Some(existing) = mutexes.read().unwrap().get(&key) {
             existing.clone()
         } else {
             let mut w = mutexes.write().unwrap();
-            w.entry(path.clone())
+            w.entry(key.clone())
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
                 .clone()
         }
@@ -1940,8 +2084,9 @@ pub async fn create_mutable_store_at_path(
     let _guard = init_mutex.lock().await;
 
     // Re-check the cache — another task may have finished while we waited.
-    if let Some(store) = get_cached_mutable_store(&path) {
+    if let Some(store) = get_cached_mutable_store(&key) {
         lore_debug!("Reusing cached mutable store");
+        cache_mutable_store(path, store.clone());
         return Ok(store);
     }
 
@@ -1953,6 +2098,9 @@ pub async fn create_mutable_store_at_path(
     .await
     .forward::<RepositoryError>("Failed to create local store")?;
 
+    if key != path {
+        cache_mutable_store(key, store.clone());
+    }
     cache_mutable_store(path, store.clone());
 
     Ok(store)
@@ -2103,14 +2251,6 @@ pub async fn load_and_connect_with_token(
 
     let dot_path = get_dot_lore_path(path)?;
 
-    // Acquire (or reuse) the process-local repository flock. NoStore commands
-    // skip this — they don't touch repository files.
-    let repo_lock = if access != RepositoryAccess::NoStore {
-        Some(get_or_create_repository_lock(dot_path.clone()).await?)
-    } else {
-        None
-    };
-
     let id_path = dot_path.join(ID);
     let config_path = dot_path.join(CONFIG);
 
@@ -2165,12 +2305,14 @@ pub async fn load_and_connect_with_token(
         }
     }
 
-    if identity_resolved_from_auth
+    // Recorded here and written once the repository lock is held, below: the file is
+    // shared with every other process on the repository, so its write belongs under
+    // that lock.
+    let persist_identity = identity_resolved_from_auth
         && matches!(access, RepositoryAccess::ReadWrite)
-        && let Some(ref auth_identity) = identity
-    {
+        && identity.is_some();
+    if persist_identity && let Some(ref auth_identity) = identity {
         config.identity = Some(auth_identity.clone());
-        let _ = save_config(config_path.as_path(), &config).await;
     }
 
     let execution = execution_context();
@@ -2220,6 +2362,55 @@ pub async fn load_and_connect_with_token(
         (immutable_store, mutable_store as Arc<dyn MutableStore>)
     };
 
+    // Acquired **after** the stores and contained by their locks. There are two ways
+    // into a store — `lore_storage_open` takes store locks and has no repository lock
+    // to put first, and this path takes both — and one pair taken in two orders is a
+    // cycle that neither process returns from. The store locks are therefore the
+    // outer pair, which is the order both paths can satisfy.
+    //
+    // The cost is that `id`, `config` and `instance` are read above without the
+    // repository flock. `lore_storage_open` already reads the config that way, on
+    // the path that runs most often. The one write this function makes to it waits for
+    // the lock, below.
+    //
+    // NoStore commands skip this — they touch no repository files.
+    let repo_lock = if access == RepositoryAccess::NoStore {
+        None
+    } else {
+        let mut guards = Vec::new();
+        if let Some(guard) = immutable_store
+            .clone()
+            .hold_for_command()
+            .await
+            .forward_any::<RepositoryError>("holding the immutable store lock")?
+        {
+            guards.push(guard);
+        }
+        if let Some(guard) = mutable_store
+            .clone()
+            .hold_for_command()
+            .await
+            .forward_any::<RepositoryError>("holding the mutable store lock")?
+        {
+            guards.push(guard);
+        }
+        Some(
+            get_or_create_repository_lock(
+                dot_path.clone(),
+                lore_storage::local::store_lock::StoreHold::new(guards),
+            )
+            .await?,
+        )
+    };
+
+    // Read again under the lock, and only the identity changed: the copy above was
+    // read before the lock was held, so writing it back whole would undo whatever
+    // another process wrote to the file in between.
+    if persist_identity && let Ok(mut persisted) = load_config(config_path.as_path()) {
+        persisted.identity.clone_from(&config.identity);
+        let _ = save_config(config_path.as_path(), &persisted).await;
+    }
+
     let filter = load_filter(path)?;
 
     // Resolve the remote eagerly only when we need it for the mutable store upgrade.
@@ -2237,36 +2428,66 @@ pub async fn load_and_connect_with_token(
     // Drop all refs to the mutable store, run upgrade, then re-create to read back migrated data.
     let mutable_store = if needs_upgrade {
         lore_debug!("Upgrading local mutable store");
-        let remote_conn = resolved_remote_for_upgrade
-            .as_ref()
-            .and_then(|r| r.as_ref().ok())
-            .ok_or_else(|| {
-                RepositoryError::internal(
-                    "Unable to upgrade local store to current client, need a connection to server",
-                )
-            })?;
+
+        // **Claimed to write across the whole migration, before the live store is dropped.**
+        //
+        // The migration rewrites every bucket of every group through a store built by
+        // `for_migration`, whose `lock` is `None` — so on its own it takes no claim and
+        // advances no epoch. Any other process holding retained in-memory state for
+        // this directory would observe the same epoch before and after, read it as
+        // current, and serve pre-migration buckets — flushing them back over the
+        // migrated files if any were dirty.
+        //
+        // A write claim, so the epoch advances up front rather than at the end: a process
+        // that dies mid-migration has already told everyone its state is worthless. It
+        // marks nothing dirty, since the rewrite goes straight to disk and a command that
+        // only reads never flushes the mutable store to clear it. The claim outlives the
+        // `drop` below because the flock belongs to the directory rather than to a store
+        // object, so the store re-created afterwards joins the same one.
+        let migrating =
+            create_client_mutable_store(&config, dot_path.as_path(), immutable_store.clone())
+                .await?
+                .hold_to_rewrite()
+                .await
+                .forward_any::<RepositoryError>("claiming the mutable store for its migration")?;
 
         // Drop existing mutable store so upgrade has sole ownership of on-disk data
         drop(mutable_store);
 
-        // Create a temporary store just for the upgrade
+        // Create a temporary store just for the upgrade. Built under the claim above, so
+        // whether the store still needs it is decided again there: another process may have
+        // migrated it while this one waited for its claims, and then there is nothing to do
+        // and nothing to connect for.
         let upgrade_store =
             create_client_mutable_store(&config, dot_path.as_path(), immutable_store.clone())
                 .await?;
-        crate::store::mutable::upgrade(
-            &upgrade_store,
-            immutable_store.clone(),
-            Some(remote_conn),
-            repository,
-        )
-        .await
-        .forward::<RepositoryError>("Failed to create local store")?;
+        if upgrade_store.needs_upgrade() {
+            let remote_conn = resolved_remote_for_upgrade
+                .as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .ok_or_else(|| {
+                    RepositoryError::internal(
+                        "Unable to upgrade local store to current client, need a connection to server",
+                    )
+                })?;
+            crate::store::mutable::upgrade(
+                &upgrade_store,
+                immutable_store.clone(),
+                Some(remote_conn),
+                repository,
+            )
+            .await
+            .forward::<RepositoryError>("Failed to create local store")?;
+        }
         drop(upgrade_store);
 
         // Re-create to read back the migrated data
         let mutable_store =
             create_client_mutable_store(&config, dot_path.as_path(), immutable_store.clone())
                 .await?;
+        // Released only once the re-created store exists, so the directory is never
+        // unclaimed between the rewrite and the store that reads it back.
+        drop(migrating);
         lore_debug!("Upgraded local mutable store");
         mutable_store as Arc<dyn MutableStore>
     } else {
@@ -2295,7 +2516,16 @@ pub async fn load_and_connect_with_token(
     }
 
     // Recover or generate instance ID if the instance file was missing.
-    // A zero instance_id means recovery is needed.
+    // A zero instance_id means recovery is needed — unless another process recovered it
+    // while this one waited for the repository lock, so the file is read again under it.
+    let instance_id = if instance_id.is_zero() {
+        crate::instance::InstanceId::read_from_file(instance_path.clone())
+            .ok()
+            .filter(|id| !id.is_zero())
+            .unwrap_or(instance_id)
+    } else {
+        instance_id
+    };
     let instance_id = if instance_id.is_zero() {
         let recovered = Box::pin(crate::instance::recover_instance_id(
             repository,
@@ -2349,7 +2579,7 @@ pub async fn load_and_connect_with_token(
         filesystem,
     );
     let repository = match repo_lock {
-        Some(lock) => repository.with_repository_lock(lock),
+        Some((lock, stores)) => repository.with_repository_lock(lock, stores),
         None => repository,
     };
     let repository = match write_token {

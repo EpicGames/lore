@@ -3,3 +3,4 @@
 pub mod fan_out;
 pub mod immutable_store;
 pub mod mutable_store;
+pub mod store_lock;

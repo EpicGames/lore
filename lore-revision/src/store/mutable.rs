@@ -107,18 +107,9 @@ async fn migrate_initial_to_typed(
     // repository and branch metadata upgrade path.
     lore_info!("Upgrading mutable store from initial to typed items");
 
-    let mut old_store = MutableStore {
-        path: Some(Arc::new(path.to_path_buf())),
-        lock: None,
-        group: Vec::with_capacity(GROUP_COUNT),
-        flush_delay_seconds: 0,
-        needs_upgrade: AtomicBool::new(false),
-        // Authoritative: a corrupt bucket must fail the upgrade, not be silently dropped.
-        authoritative: true,
-    };
-
+    let mut groups = Vec::with_capacity(GROUP_COUNT);
     for _ in 0..GROUP_COUNT {
-        old_store.group.push(Arc::new(MutableStoreGroup {
+        groups.push(Arc::new(MutableStoreGroup {
             bucket: [const { OnceLock::new() }; BUCKET_COUNT],
             dirty: std::array::from_fn(|_| AtomicBool::new(false)),
             bucket_count: std::sync::atomic::AtomicUsize::new(
@@ -132,10 +123,12 @@ async fn migrate_initial_to_typed(
                 lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
             ),
             flush_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            flush: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
+            scheduled: AtomicBool::new(false),
         }));
     }
 
-    let old_store = Arc::new(old_store);
+    let old_store = Arc::new(MutableStore::for_migration(path.to_path_buf(), groups));
 
     // Deserialize all old data, since migrations will require to look up dependent data
     let mut tasks = JoinSet::new();
@@ -179,6 +172,8 @@ async fn migrate_initial_to_typed(
                 lore_storage::local::fan_out::FAN_OUT_LEVEL_MAX,
             ),
             flush_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            flush: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
+            scheduled: AtomicBool::new(false),
         }));
     }
 

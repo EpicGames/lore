@@ -2051,6 +2051,28 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         false
     };
 
+    // **Claimed for as long as the server serves them.** The claim says which process is
+    // using a store, and a server uses its stores for its whole life; without one, every
+    // request that finds no other in flight would take and release the flock and read
+    // the epoch file on its own. Taken before anything serves and released after the
+    // final flush below. A server in maintenance mode serves no store, so it claims
+    // none, and leaves the stores free for the maintenance it is running for.
+    let spans = if is_maintenance {
+        None
+    } else {
+        let immutable_span = immutable_store
+            .clone()
+            .hold_for_command()
+            .await
+            .map_err(anyhow::Error::from)?;
+        let mutable_span = mutable_store
+            .clone()
+            .hold_for_command()
+            .await
+            .map_err(anyhow::Error::from)?;
+        Some((immutable_span, mutable_span))
+    };
+
     let jwt_verifier = match settings.server.auth.as_ref() {
         Some(auth) => {
             let jwk = auth.jwk.clone().unwrap_or_default();
@@ -2463,6 +2485,10 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     info!("Flushing stores");
     let _ = immutable_store.flush(true).await;
     let _ = mutable_store.flush(true).await;
+    if let Some((immutable_span, mutable_span)) = spans {
+        drop(mutable_span);
+        drop(immutable_span);
+    }
 
     Ok(())
 }

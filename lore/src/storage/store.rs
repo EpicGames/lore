@@ -151,6 +151,21 @@ pub(crate) struct StoreInternal {
     pub in_flight: AtomicU64,
     pub invalid: AtomicBool,
     pub drained: Notify,
+    /// This process's claim on the stores, held for as long as the handle is open.
+    ///
+    /// An open store is a store this process is using, and the flock is what says so
+    /// to other processes. Taking the claim here rather than per operation is what
+    /// makes it mean that: the alternative counts operations, which says nothing
+    /// about whether anyone has the store, and pays a lock acquisition and an epoch
+    /// read on every call.
+    ///
+    /// Dropped with the last reference to the handle's state: at close, or when the
+    /// last revision tree loaded against the handle closes, if that is later. Close
+    /// joins it first for the flush it starts, so the stores stay claimed until that
+    /// flush is done. The keep-alive cache may still hold the store objects afterwards —
+    /// that is retained memory, not an open store, and the epoch is what decides whether
+    /// it is still usable when one is opened again.
+    _hold: lore_storage::local::store_lock::StoreHold,
 }
 
 impl StoreInternal {
@@ -162,6 +177,7 @@ impl StoreInternal {
         remote: Option<Arc<RemoteEndpoint>>,
         bound_flags: BoundFlags,
         skip_verify: bool,
+        hold: lore_storage::local::store_lock::StoreHold,
     ) -> Self {
         Self {
             identity: identity.into(),
@@ -174,6 +190,7 @@ impl StoreInternal {
             in_flight: AtomicU64::new(0),
             invalid: AtomicBool::new(false),
             drained: Notify::new(),
+            _hold: hold,
         }
     }
 
@@ -396,6 +413,8 @@ pub async fn in_memory_for_tests(identity: impl Into<String>) -> Arc<StoreIntern
         .await
         .expect("in-memory mutable store init"),
     );
+    // In-memory stores have no directory and so no flock to claim; an empty hold is
+    // what `hold_for_command` returns for them anyway.
     Arc::new(StoreInternal::new(
         identity,
         immutable,
@@ -403,5 +422,62 @@ pub async fn in_memory_for_tests(identity: impl Into<String>) -> Arc<StoreIntern
         None,
         BoundFlags::default(),
         false,
+        lore_storage::local::store_lock::StoreHold::default(),
+    ))
+}
+
+/// Construct a `StoreInternal` backed by disk stores under `root`, holding the claims an open
+/// handle holds. For tests of what those claims do, which in-memory stores have none of.
+#[cfg(feature = "test-util")]
+pub async fn disk_backed_for_tests(
+    identity: impl Into<String>,
+    root: &std::path::Path,
+) -> Arc<StoreInternal> {
+    use lore_storage::local::immutable_store::ImmutableStoreCreateOptions;
+    use lore_storage::local::immutable_store::ImmutableStoreSettings;
+    use lore_storage::local::immutable_store::create as create_immutable;
+    use lore_storage::local::mutable_store::LocalMutableStore;
+    use lore_storage::local::mutable_store::MutableStoreSettings;
+
+    let immutable = create_immutable(
+        Some(root),
+        ImmutableStoreCreateOptions::none(),
+        false,
+        ImmutableStoreSettings::default(),
+    )
+    .await
+    .expect("disk-backed immutable store init");
+    let mutable: Arc<dyn MutableStore> = Arc::new(
+        LocalMutableStore::new(
+            Some(root),
+            MutableStoreSettings::default(),
+            immutable.clone(),
+        )
+        .await
+        .expect("disk-backed mutable store init"),
+    );
+    let mut guards = Vec::new();
+    guards.extend(
+        immutable
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the immutable store"),
+    );
+    guards.extend(
+        mutable
+            .clone()
+            .hold_for_command()
+            .await
+            .expect("claims the mutable store"),
+    );
+    Arc::new(StoreInternal::new(
+        identity,
+        immutable,
+        mutable,
+        None,
+        BoundFlags::default(),
+        false,
+        lore_storage::local::store_lock::StoreHold::new(guards),
     ))
 }

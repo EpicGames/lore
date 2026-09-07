@@ -4,3 +4,4 @@
 mod fan_out;
 mod immutable_store;
 mod mutable_store;
+mod store_lock;

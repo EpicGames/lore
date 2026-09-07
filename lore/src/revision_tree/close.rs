@@ -90,6 +90,25 @@ fn close_impl(
 
         internal.mark_invalid_and_await().await;
 
+        // A tree closed after its storage handle has writes nothing else will flush: the
+        // handle's close flushed what had been written by then. Left flagged, they would keep
+        // the store's flock past this tree — which may be the last thing claiming it — for as
+        // long as the process runs. Flushed under claims joined while the tree still holds the
+        // handle's.
+        let store = &internal.store_internal;
+        if store.invalid.load(std::sync::atomic::Ordering::Acquire) {
+            let sync_data = lore_revision::lore::execution_context()
+                .globals()
+                .sync_data();
+            let claims = crate::storage::close::claims_for_flush(store).await;
+            crate::storage::close::spawn_flush_for_closed_tree(
+                store.immutable.clone(),
+                store.mutable.clone(),
+                claims,
+                sync_data,
+            );
+        }
+
         LoreEvent::RevisionTreeCloseComplete(LoreRevisionTreeCloseCompleteEventData {
             id: args.id,
             error_code: LoreErrorCode::None,

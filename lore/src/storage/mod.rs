@@ -138,8 +138,9 @@ pub async fn close_for_connection(connection_id: u64) {
 }
 
 /// Run the close sequence for each entry concurrently: every drain fires its own task so the
-/// total wall time is bounded by the slowest drain, not the sum. The flush spawn inside is
-/// already fire-and-forget; only the in-flight-counter await is parallelized here.
+/// total wall time is bounded by the slowest drain, not the sum. The flush spawned inside is
+/// fire-and-forget; what runs in parallel here is the in-flight-counter await and the join of
+/// the claims each flush holds.
 ///
 /// Exposed at `pub(crate)` so the unit tests can exercise the close logic on an explicit
 /// entry list rather than the process-global registry — running the test against the live
@@ -151,7 +152,13 @@ pub(crate) async fn drain_in_parallel(entries: Vec<(u64, std::sync::Arc<store::S
     for (_, store) in entries {
         lore_base::lore_spawn!(tasks, async move {
             store.mark_invalid_and_await().await;
-            close::spawn_flush_stores(store.immutable.clone(), store.mutable.clone(), false);
+            let claims = close::claims_for_flush(&store).await;
+            close::spawn_flush_stores(
+                store.immutable.clone(),
+                store.mutable.clone(),
+                claims,
+                false,
+            );
         });
     }
     while tasks.join_next().await.is_some() {}
