@@ -66,16 +66,14 @@ pub async fn info(repository_url: Option<&str>, identity: &str) -> Result<(), Re
             .internal("Invalid repository path")?;
 
         let config = crate::repository::load_repository_config(repo_path)?;
-        (
-            format!(
-                "{}/{}",
-                config
-                    .remote_url
-                    .ok_or_else(|| RepositoryError::internal("Invalid URL"))?,
-                repo_context
-            ),
-            instance_id,
-        )
+        // A repository may have no remote at all. Reading that as a malformed URL sends
+        // the reader looking for a typo in something they never configured, so name it
+        // for what it is: there is no remote here to ask about this repository.
+        let remote_url = config.remote_url.unwrap_or_default();
+        if remote_url.is_empty() {
+            return Err(RepositoryError::from(crate::errors::NoRemote));
+        }
+        (format!("{remote_url}/{repo_context}"), instance_id)
     };
 
     // Parse the URL

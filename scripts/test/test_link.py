@@ -10206,3 +10206,34 @@ def test_link_branch_archive_repository_linked_twice(new_lore_repo):
     assert sorted(link_repo.branch_list().remote_branches) == branches_before, (
         f"Expected link branches {branches_before}, got: {link_repo.branch_list()}"
     )
+
+
+@pytest.mark.smoke
+def test_link_add_accepts_a_scoped_bare_name(new_lore_repo, lore_remote_url):
+    """A scoped name such as `org/project` is a name, not a host and a path.
+
+    `is_valid_name` permits slash-separated names, so a slash cannot be what tells a URL
+    from a bare identifier — only a scheme can. `link add org/project` therefore has to
+    resolve the whole argument against this repository's configured remote. Reading the
+    first segment as a host instead sent the lookup to `lores://org`, a server that was
+    never configured and, in this test, does not exist.
+    """
+    scoped_name = f"scoped/{Lore.generate_random_name('')}"
+    link_repo: Lore = new_lore_repo(
+        remote_path=f"{lore_remote_url.rstrip('/')}/{scoped_name}"
+    )
+
+    linked_file = "linked-content.txt"
+    with link_repo.open_file(linked_file, "w+") as output_file:
+        output_file.writelines(["content behind a scoped name\n"])
+    link_repo.stage(scan=True)
+    link_repo.commit("Seed the scoped repository")
+    link_repo.push()
+
+    repo: Lore = new_lore_repo()
+    # The bare, schemeless, slash-carrying identifier is the point of the test.
+    repo.link_add("vendor", scoped_name, "/")
+
+    assert link_repo.get_id() in repo.link_list(), (
+        f"link add should have resolved {scoped_name!r} against this repository's remote"
+    )

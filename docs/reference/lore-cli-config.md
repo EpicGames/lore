@@ -26,7 +26,11 @@ All keys are snake_case. The config structs are plain serde with no case renamin
 
 #### `remote_url`
 
-Set at create or clone time from the URL you pass (for example `lore://127.0.0.1:41337/my-project`). A repository created fully offline may leave it empty. See the [Quickstart](../tutorials/quickstart.md) for how the remote URL is introduced.
+Set at create or clone time from the URL you pass (for example `lore://127.0.0.1:41337/my-project`). It may be empty: a repository created with `--offline` (or `--local`) has no remote, and the argument you pass names the repository rather than locating it — `lore --offline repository create my-project`, or no argument at all to name it after the current directory.
+
+With no `remote_url`, commands that need the network fail with `NoRemote` rather than attempting a connection. That is a distinct error from `Disconnected`, which means a remote *is* configured but could not be reached.
+
+Treat the field as fixed once the repository exists. Pointing an established repository at a different remote is not generally safe — the shared store is keyed on this value, among other things — so create or clone against the remote you intend to use rather than editing this afterwards. See the [Quickstart](../tutorials/quickstart.md) for how the remote URL is introduced.
 
 #### `identity`
 

@@ -47,10 +47,28 @@ pub async fn add(
     pin: Option<String>,
     disable_branching: bool,
 ) -> Result<(), LinkError> {
-    let (remote_url, name) = repository::parse_url(&link_identifier, false)
-        .forward_with::<LinkError, _>(|| {
+    // The identifier is a full URL or a bare name or ID, and only a scheme tells them apart:
+    // `is_valid_name` permits scoped names like `org/project`, so a slash says nothing about
+    // which form this is. A schemeless identifier names a repository on the same remote as
+    // this one, so resolve it against this repository's own configured remote rather than
+    // reading its first segment as a host. Taking the remote from the config also keeps the
+    // link and the repository pointing at the same server, which the environment variable
+    // this replaces could not guarantee.
+    let (remote_url, name) = if link_identifier.contains("://") {
+        repository::parse_url(&link_identifier, false).forward_with::<LinkError, _>(|| {
             format!("Invalid repository URL or ID: {link_identifier}")
-        })?;
+        })?
+    } else {
+        let remote_url = repository
+            .require_path()
+            .ok()
+            .and_then(|path| repository::repository_remote(path.to_string_lossy()).ok())
+            .unwrap_or_default();
+        if remote_url.is_empty() {
+            return Err(LinkError::from(crate::errors::NoRemote));
+        }
+        (remote_url, link_identifier.clone())
+    };
 
     let context = execution_context();
     let identity = context.globals().identity().unwrap_or_default();

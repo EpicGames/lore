@@ -229,8 +229,11 @@ pub fn drop_connections() {
 }
 
 pub fn parse(remote_url: &str) -> Result<(Url, Arc<dyn Protocol>), ProtocolError> {
+    // A repository created without a remote URL has nothing to reach, which is a
+    // configuration state rather than a fault: report it as `NoRemote` so callers can
+    // tell it apart from a remote that is configured but unreachable (`Disconnected`).
     if remote_url.is_empty() {
-        return Err(ProtocolError::internal("no remote URL"));
+        return Err(ProtocolError::from(lore_base::error::NoRemote));
     }
 
     let mut remote_url = remote_url.to_string();
@@ -1587,6 +1590,46 @@ mod tests {
         assert_eq!(credentials.tokens(), (String::new(), String::new()));
     }
     use crate::MatchedProtocolError;
+
+    /// Every network call funnels through `parse`, so it is the one place that decides what a
+    /// repository with no remote URL reports. A repository may legitimately have no remote, and
+    /// that is not the same answer as a remote that is configured but cannot be reached.
+    mod parse {
+        use super::*;
+
+        #[test]
+        fn no_remote_url_is_no_remote() {
+            // `Arc<dyn Protocol>` is not `Debug`, so unwrap the error side rather than
+            // reaching for `expect_err`, which would need to format the success value.
+            let err = super::super::parse("")
+                .err()
+                .expect("an empty remote URL cannot be parsed");
+            assert!(
+                matches!(err, ProtocolError::NoRemote(_)),
+                "{err:?} should be NoRemote: there is no remote configured to reach"
+            );
+        }
+
+        /// The distinction that matters to the caller: nothing configured is `NoRemote`, whereas a
+        /// remote that is configured but malformed remains an internal fault rather than silently
+        /// reading as an unconfigured repository.
+        #[test]
+        fn a_malformed_remote_url_is_not_no_remote() {
+            let err = super::super::parse("nonsense://host")
+                .err()
+                .expect("an unknown protocol cannot be parsed");
+            assert!(
+                !matches!(err, ProtocolError::NoRemote(_)),
+                "{err:?} names a remote, so it must not report as having none"
+            );
+        }
+
+        #[test]
+        fn a_bare_host_gets_the_default_protocol() {
+            let (url, _) = super::super::parse("host:41337").expect("a bare host should parse");
+            assert_eq!(url.scheme(), DEFAULT_PROTOCOL);
+        }
+    }
 
     /// A copy naming a source partition asks whether it may before it tries, and a `false` costs a
     /// `session_start`. Latching the answer bounds that at one per partition — but only for the

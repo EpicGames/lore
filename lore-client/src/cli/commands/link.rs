@@ -112,17 +112,9 @@ pub enum LinkCommands {
 }
 
 fn handle_link_add(globals: LoreGlobalArgs, args: &LinkAddArgs) -> u8 {
-    let repository_identifier = if !args.link.contains("/") {
-        let Ok(mut url) = std::env::var("LORE_REMOTE_URL") else {
-            eprintln!("Link URL must include a host name");
-            return 1;
-        };
-        url.push('/');
-        url.push_str(args.link.as_str());
-        url
-    } else {
-        args.link.clone()
-    };
+    // Passed through as given: a full URL, or a bare name or ID that the core resolves
+    // against this repository's own remote.
+    let repository_identifier = args.link.clone();
 
     let link_args = LoreLinkAddArgs {
         link: LoreString::from(&repository_identifier),

@@ -318,11 +318,11 @@ List repositories
 
 Create a repository in the given directory
 
-**Usage:** `lore repository create [OPTIONS] <url>`
+**Usage:** `lore repository create [OPTIONS] [url]`
 
 ###### **Arguments:**
 
-* `<url>` — URL of repository
+* `<url>` — URL of repository. With --offline this is the repository name instead, and may be omitted to name it after the current directory
 
 ###### **Options:**
 

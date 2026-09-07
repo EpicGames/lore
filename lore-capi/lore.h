@@ -4671,9 +4671,11 @@ typedef struct lore_repository_dump_args_t {
   uintptr_t max_depth;
 } lore_repository_dump_args_t;
 
-// Arguments for creating a new repository at the specified URL.
+// Arguments for creating a new repository.
 typedef struct lore_repository_create_args_t {
-  // URL to the repository
+  // URL to the repository. Treated as the repository name instead when the call is
+  // offline or local, where an empty value names it after the directory it is
+  // created in. A URL naming no host is an error otherwise.
   struct lore_string_t repository_url;
   // Optional repository description
   struct lore_string_t description;

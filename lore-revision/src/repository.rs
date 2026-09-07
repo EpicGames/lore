@@ -1414,12 +1414,21 @@ pub fn get_dot_lore_path(path: &std::path::Path) -> Result<PathBuf, InvalidPath>
     })
 }
 
-pub fn parse_url(url: &str, offline: bool) -> Result<(String, String), RepositoryError> {
+/// Splits a repository URL into its remote URL and repository name.
+///
+/// With `allow_no_remote`, an argument carrying no URL scheme is a repository name and
+/// yields an empty remote URL, naming a repository that has no remote at all. Callers
+/// that require a reachable remote — clone, delete, info, link — pass `false` so a
+/// missing host is an error rather than a silently local repository.
+pub fn parse_url(url: &str, allow_no_remote: bool) -> Result<(String, String), RepositoryError> {
     let url = if url.contains("://") {
         url::Url::parse(url).internal("Invalid URL")?
     } else {
-        // Offline support for just a name
-        if offline && !url.contains('/') {
+        // No scheme means no host to find, so the whole argument is the name. That
+        // includes a slash-separated one such as `org/project`, which `is_valid_name`
+        // supports: reading the first segment as a host would both truncate the name and
+        // record a remote the caller never configured. Naming a remote takes a scheme.
+        if allow_no_remote {
             return Ok((String::default(), url.to_string()));
         }
         let mut protocol_url = lore_transport::DEFAULT_PROTOCOL.to_string();

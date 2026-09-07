@@ -11,6 +11,7 @@ use lore_base::error::NotAuthorized;
 use lore_base::error::NotFound;
 use lore_base::error::NotSupported;
 use lore_base::error::Oversized;
+use lore_base::error::RepositoryNotFound;
 use lore_base::error::SlowDown;
 use lore_base::error::TokenNotFound;
 use lore_base::runtime::LORE_CONTEXT;
@@ -42,6 +43,9 @@ use crate::interface::LoreString;
 #[error_set]
 pub enum AuthStoreError {
     TokenNotFound,
+    // Raised when the command needs a repository to resolve an auth endpoint from and
+    // was not run in one, which is a different fix for the caller than any of the below.
+    RepositoryNotFound,
     // The remaining variants mirror `ProtocolError` so a connect failure can be
     // forwarded whole, preserving its kind instead of collapsing to `Internal`.
     Disconnected,
@@ -141,14 +145,59 @@ async fn resolve_user_info_impl(
     lore_revision::auth::userinfo::resolve_user_info(repository, ids).await
 }
 
-fn read_repository_config(repository_path: &str) -> Option<String> {
+/// What the repository at a given path says about its remote.
+///
+/// A repository with no remote URL is distinct from no repository at all: the former is a
+/// configured state that network commands answer with `NoRemote`, the latter leaves the
+/// auth endpoint genuinely unresolvable.
+enum RepositoryRemote {
+    /// No repository config could be read at this path.
+    NoRepository,
+    /// A repository is present, but no remote URL is configured for it.
+    NoRemote,
+    /// A repository is present with a remote URL configured.
+    Remote(String),
+}
+
+fn read_repository_remote(repository_path: &str) -> RepositoryRemote {
+    // Presence of the tracking directory is what says a repository is here. A missing
+    // config file reads as the default config, so asking the config alone would report
+    // every path in the filesystem as a repository that merely has no remote.
+    //
+    // Resolve that directory the way the config loader does rather than joining `.lore`
+    // onto the path: a repository under a VFS keeps its tracking directory outside the
+    // working copy, and looking only for a physical one would report it as no repository
+    // at all. Loading from the directory already resolved keeps the two from diverging.
+    let Ok(dot_dir) =
+        lore_revision::repository::get_dot_lore_path(std::path::Path::new(repository_path))
+    else {
+        return RepositoryRemote::NoRepository;
+    };
+    if !dot_dir.is_dir() {
+        return RepositoryRemote::NoRepository;
+    }
+
     // If this command is invoked in a repository, load the config
-    if let Ok(repository_config) =
-        lore_revision::repository::load_repository_config(repository_path)
-    {
-        repository_config.remote_url
-    } else {
-        None
+    let Ok(repository_config) =
+        lore_revision::repository::load_repository_config_from_dot_dir(&dot_dir)
+    else {
+        return RepositoryRemote::NoRepository;
+    };
+
+    match repository_config.remote_url {
+        Some(remote_url) if !remote_url.is_empty() => RepositoryRemote::Remote(remote_url),
+        _ => RepositoryRemote::NoRemote,
+    }
+}
+
+/// The remote URL configured for the repository at `repository_path`, if it has one.
+///
+/// Collapses "no repository" and "repository with no remote" into `None` for the callers
+/// that only need a URL to hand to the transport, which reports the absence itself.
+fn configured_remote_url(repository_path: &str) -> Option<String> {
+    match read_repository_remote(repository_path) {
+        RepositoryRemote::Remote(remote_url) => Some(remote_url),
+        RepositoryRemote::NoRepository | RepositoryRemote::NoRemote => None,
     }
 }
 
@@ -221,7 +270,7 @@ async fn login_with_token_local(
     let remote_url = if !args.remote_url.is_empty() {
         args.remote_url.to_string()
     } else {
-        read_repository_config(globals.repository_path.as_str()).unwrap_or_default()
+        configured_remote_url(globals.repository_path.as_str()).unwrap_or_default()
     };
 
     let execution = setup_execution(globals, callback);
@@ -308,7 +357,7 @@ async fn login_interactive_local(
     let remote_url = if !args.remote_url.is_empty() {
         args.remote_url.to_string()
     } else {
-        read_repository_config(globals.repository_path.as_str()).unwrap_or_default()
+        configured_remote_url(globals.repository_path.as_str()).unwrap_or_default()
     };
 
     let execution = setup_execution(globals, callback);
@@ -619,18 +668,31 @@ async fn resolve_auth_endpoint(
 
     // Forward the connect error instead of discarding it, so the real failure
     // reaches the caller rather than collapsing into the generic error below.
-    if let Some(remote_url) = read_repository_config(repository_path) {
-        let connection = lore_revision::protocol::connect(
-            &remote_url,
-            identity,
-            lore_revision::lore::RepositoryId::default(),
-        )
-        .await
-        .forward::<AuthStoreError>("resolving auth endpoint from remote")?;
+    match read_repository_remote(repository_path) {
+        RepositoryRemote::Remote(remote_url) => {
+            let connection = lore_revision::protocol::connect(
+                &remote_url,
+                identity,
+                lore_revision::lore::RepositoryId::default(),
+            )
+            .await
+            .forward::<AuthStoreError>("resolving auth endpoint from remote")?;
 
-        let auth_url = connection.auth_url().to_string();
-        if !auth_url.is_empty() {
-            return Ok(auth_url);
+            let auth_url = connection.auth_url().to_string();
+            if !auth_url.is_empty() {
+                return Ok(auth_url);
+            }
+        }
+        // The repository exists and simply has no remote. Nothing is unreachable and
+        // nothing is unsupported — there is just no remote to ask for an auth endpoint.
+        RepositoryRemote::NoRemote => return Err(NoRemote.into()),
+        // Without a repository there is nowhere to read a remote from, and the fix is to
+        // run this from one (or pass an endpoint) rather than to configure anything.
+        RepositoryRemote::NoRepository => {
+            return Err(RepositoryNotFound {
+                repository: repository_path.to_string(),
+            }
+            .into());
         }
     }
 
@@ -722,10 +784,31 @@ async fn local_user_info_impl(
 
 #[cfg(test)]
 mod resolve_auth_endpoint_tests {
-    use lore_base::error::NotSupported;
+    use lore_base::error::NoRemote;
+    use lore_base::error::RepositoryNotFound;
     use lore_error_set::FfiError;
 
+    use super::RepositoryRemote;
+    use super::read_repository_remote;
     use super::resolve_auth_endpoint;
+
+    /// A repository directory with the given `config.toml` body, or none at all when
+    /// `config` is `None`. Returns the repository root.
+    fn repository_with_config(label: &str, config: Option<&str>) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "lore-auth-{label}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let dot_dir = root.join(lore_revision::repository::DOT_LORE);
+        std::fs::create_dir_all(&dot_dir).expect("creating the repository directory");
+        if let Some(config) = config {
+            std::fs::write(dot_dir.join("config.toml"), config).expect("writing the config");
+        }
+        root
+    }
 
     // An explicit endpoint is returned verbatim without touching the
     // repository config or the network.
@@ -737,19 +820,89 @@ mod resolve_auth_endpoint_tests {
         assert_eq!(endpoint, "ucs-auth://auth.example.com");
     }
 
-    // With no explicit endpoint and no resolvable repository remote, the
-    // operation is `NotSupported` (code 9) — there is no URL to key a token
-    // lookup on — rather than an opaque internal error.
+    // Run outside a repository with no explicit endpoint, the answer names the actual
+    // problem — there is no repository here to read a remote from — rather than the
+    // generic "requires a configured auth endpoint", which reads as though something
+    // needs configuring when the fix is to run this from a repository or pass an endpoint.
     #[tokio::test]
-    async fn missing_endpoint_is_not_supported() {
+    async fn missing_repository_is_repository_not_found() {
         let err = resolve_auth_endpoint("", "/does/not/exist", "")
             .await
             .expect_err("a missing endpoint must be an error");
 
-        let not_supported_code = NotSupported {
-            operation: String::new(),
+        let repository_not_found_code = RepositoryNotFound {
+            repository: String::new(),
         }
         .ffi_code();
-        assert_eq!(err.ffi_code(), not_supported_code);
+        assert_eq!(err.ffi_code(), repository_not_found_code, "{err:?}");
+    }
+
+    // A repository created without a URL has a remote-less config. Asking it for an auth
+    // endpoint is `NoRemote`, not `NotSupported` and not a connection failure:
+    // there is no remote to reach, as opposed to one that could not be reached.
+    #[tokio::test]
+    async fn repository_without_a_remote_is_no_remote() {
+        let root = repository_with_config("empty-remote", Some("remote_url = \"\"\n"));
+
+        let err = resolve_auth_endpoint("", &root.display().to_string(), "")
+            .await
+            .expect_err("a repository with no remote must be an error");
+
+        assert_eq!(err.ffi_code(), NoRemote.ffi_code(), "{err:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Same answer when the config omits the key outright rather than writing it empty,
+    // which is what an older or hand-edited config looks like.
+    #[tokio::test]
+    async fn repository_with_no_remote_key_is_no_remote() {
+        let root = repository_with_config("absent-remote", Some("identity = \"me\"\n"));
+
+        let err = resolve_auth_endpoint("", &root.display().to_string(), "")
+            .await
+            .expect_err("a repository with no remote must be an error");
+
+        assert_eq!(err.ffi_code(), NoRemote.ffi_code(), "{err:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // A missing config file parses as the default config, so repository presence has to
+    // come from the tracking directory. Without that check every path in the filesystem
+    // would report as a remote-less repository and mask the `NotSupported` case above.
+    #[test]
+    fn a_path_outside_a_repository_is_not_a_remote_less_repository() {
+        assert!(matches!(
+            read_repository_remote("/does/not/exist"),
+            RepositoryRemote::NoRepository
+        ));
+
+        let root = repository_with_config("no-config", None);
+        assert!(
+            matches!(
+                read_repository_remote(&root.display().to_string()),
+                RepositoryRemote::NoRemote
+            ),
+            "a repository whose config is absent still has no remote"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_configured_remote_is_returned() {
+        let root = repository_with_config(
+            "with-remote",
+            Some("remote_url = \"lore://127.0.0.1:41337\"\n"),
+        );
+
+        let remote = read_repository_remote(&root.display().to_string());
+        assert!(
+            matches!(remote, RepositoryRemote::Remote(ref url) if url == "lore://127.0.0.1:41337"),
+            "a configured remote should be reported verbatim"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -361,7 +361,8 @@ def lore_remote_url(request, lore_main_server_ports):
     else:
         remote_url = f"lore://127.0.0.1:{lore_main_server_ports['quic']}"
     remote_url = remote_url if remote_url.endswith("/") else remote_url + "/"
-    # TODO: Seems like having this set as an env var is required for repo creation?
+    # The CLI no longer reads this; it is the harness's own record of which server the
+    # session is running against, which `Lore` reads back to build full repository URLs.
     os.environ["LORE_REMOTE_URL"] = remote_url
     return remote_url
 

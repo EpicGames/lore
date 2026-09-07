@@ -409,12 +409,14 @@ async fn dump_impl(
     lore_revision::repository::dump::dump(repository, revision, path, args.max_depth).await
 }
 
-/// Arguments for creating a new repository at the specified URL.
+/// Arguments for creating a new repository.
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, LoreArgs)]
 #[handler(create_local)]
 pub struct LoreRepositoryCreateArgs {
-    /// URL to the repository
+    /// URL to the repository. Treated as the repository name instead when the call is
+    /// offline or local, where an empty value names it after the directory it is
+    /// created in. A URL naming no host is an error otherwise.
     pub repository_url: LoreString,
     /// Optional repository description
     pub description: LoreString,
@@ -429,7 +431,7 @@ pub struct LoreRepositoryCreateArgs {
     pub shared_store_path: LoreString,
 }
 
-/// Creates a new repository at the specified URL.
+/// Creates a new repository.
 ///
 /// # Events
 ///

@@ -178,10 +178,24 @@ class Lore:
         # registers this repo against the wrong instance.
         if remote_url:
             self.environment_vars.setdefault("LORE_REMOTE_URL", remote_url)
+        # Resolved before creating, because the create now passes the full URL rather
+        # than a bare name for the CLI to expand out of LORE_REMOTE_URL.
+        self.remote = remote_url if remote_url else os.getenv("LORE_REMOTE_URL", "")
+        if remote_path:
+            self.remote_path = remote_path
+        elif self.remote:
+            # Supply the separator rather than assuming the caller's remote ends in one:
+            # the session fixture appends it, but a `remote_url=` passed straight in need
+            # not, and concatenating would yield `lore://host:1234name` -- a different
+            # host rather than the intended repository.
+            self.remote_path = f"{self.remote.rstrip('/')}/{self.name}"
+        else:
+            # No remote at all, so the bare name is the whole identifier. Joining a
+            # separator onto nothing would make `/name`, whose empty first segment is not
+            # a valid repository name.
+            self.remote_path = self.name
         if create_repo:
             self.repository_create(remote_path=remote_path, repo_id=repo_id)
-        self.remote = remote_url if remote_url else os.getenv("LORE_REMOTE_URL", "")
-        self.remote_path = remote_path if remote_path else self.remote + self.name
         self.test_commit_id = 1
 
     def dot_dir(self) -> str:
@@ -379,7 +393,7 @@ class Lore:
         **kwargs: Unpack[GlobalOptions],
     ):
         output = self.run(
-            ["repository", "create", remote_path if remote_path else self.name]
+            ["repository", "create", remote_path if remote_path else self.remote_path]
             + (["--description", description] if description else [])
             + (["--id", repo_id] if repo_id else [])
             + (["--vfs", vfs] if vfs else [])
@@ -426,7 +440,7 @@ class Lore:
         self, remote_path: str | None = None, **kwargs: Unpack[GlobalOptions]
     ):
         return self.run(
-            ["repository", "delete", remote_path if remote_path else self.name],
+            ["repository", "delete", remote_path if remote_path else self.remote_path],
             **kwargs,
         )
 
