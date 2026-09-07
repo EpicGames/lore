@@ -15,6 +15,7 @@ use lore_telemetry::tracing::fields::QUIC_OPCODE;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use lore_telemetry::tracing::fields::SAMPLING_TIER_LOW;
 use lore_telemetry::tracing::fields::TRANSPORT;
+use lore_telemetry::tracing::fields::USER_AGENT;
 use lore_telemetry::tracing::fields::USER_ID;
 use lore_transport::quic::QuicOpCode;
 use lore_transport::quic::QuicServiceError;
@@ -32,6 +33,7 @@ use crate::auth::jwt::JwtVerifier;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
+use crate::protocol::client_identify::UserAgentValue;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::messages::Message;
 use crate::protocol::storage::messages::MessageHandleError;
@@ -59,6 +61,7 @@ pub(crate) fn build_storage_protocol_request_span(
     repository_id: &str,
     correlation_id: &str,
     user_id: &str,
+    user_agent: &str,
 ) -> Span {
     let command_parse = Command::try_from(cmd);
     let opcode_label = command_parse
@@ -75,6 +78,7 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Ok(Command::Get) => info_span!(
             parent: None,
@@ -87,6 +91,7 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Ok(Command::GetMetadata) => info_span!(
             parent: None,
@@ -99,6 +104,7 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Ok(Command::Put) => info_span!(
             parent: None,
@@ -111,6 +117,7 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Ok(Command::Query) => info_span!(
             parent: None,
@@ -122,6 +129,7 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Ok(Command::Verify) => info_span!(
             parent: None,
@@ -133,6 +141,7 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Ok(Command::Copy) => info_span!(
             parent: None,
@@ -145,6 +154,7 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Ok(Command::MutableLoad) => info_span!(
             parent: None,
@@ -156,6 +166,7 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Ok(Command::MutableStore) => info_span!(
             parent: None,
@@ -167,6 +178,7 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Ok(Command::MutableCas) => info_span!(
             parent: None,
@@ -178,6 +190,7 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Ok(Command::PutResolved) => info_span!(
             parent: None,
@@ -190,6 +203,7 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Ok(Command::GetResolved) => info_span!(
             parent: None,
@@ -202,6 +216,21 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
+        ),
+        // Carries no user agent itself: the value it announces is applied to the connection
+        // context after this span is built, so it lands on subsequent requests instead.
+        Ok(Command::ClientIdentify) => info_span!(
+            parent: None,
+            "StorageClientIdentifyTask",
+            { TRANSPORT } = %Transport::Quic,
+            { PROTOCOL } = %protocol,
+            { QUIC_OPCODE } = opcode_label,
+            { CONNECTION_ID } = connection_id,
+            { REPOSITORY_ID } = repository_id,
+            { CORRELATION_ID } = correlation_id,
+            { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
         Err(_) => info_span!(
             parent: None,
@@ -213,28 +242,34 @@ pub(crate) fn build_storage_protocol_request_span(
             { REPOSITORY_ID } = repository_id,
             { CORRELATION_ID } = correlation_id,
             { USER_ID } = user_id,
+            { USER_AGENT } = user_agent,
         ),
     }
 }
 
 fn request_identifiers_from_context(
     context: &Arc<AttributeMap>,
-) -> (String, String, String, String) {
-    let connection_id = context
-        .get::<ConnectionId>()
-        .map_or_else(|| NO_CONNECTION_ID.to_string(), |id| id.0.to_string());
-    let repository_id = context
-        .get::<RepositoryId>()
-        .map_or_else(|| NO_REPOSITORY_ID.to_string(), |id| id.to_string());
-    let correlation_id = context
-        .get::<CorrelationId>()
-        .map_or_else(|| NO_CORRELATION_ID.to_string(), |id| id.to_string());
-    let user_id = context
-        .get::<AuthorizationToken>()
+) -> (String, String, String, String, Option<Arc<UserAgentValue>>) {
+    let (connection_id, repository_id, correlation_id, authorization_token, user_agent) = context
+        .get_five::<ConnectionId, RepositoryId, CorrelationId, AuthorizationToken, UserAgentValue>(
+    );
+    let connection_id =
+        connection_id.map_or_else(|| NO_CONNECTION_ID.to_string(), |id| id.0.to_string());
+    let repository_id =
+        repository_id.map_or_else(|| NO_REPOSITORY_ID.to_string(), |id| id.to_string());
+    let correlation_id =
+        correlation_id.map_or_else(|| NO_CORRELATION_ID.to_string(), |id| id.to_string());
+    let user_id = authorization_token
         .map(|token| token.user_id.clone())
         .filter(|user_id| !user_id.is_empty())
         .unwrap_or_else(|| NO_USER_ID.to_string());
-    (connection_id, repository_id, correlation_id, user_id)
+    (
+        connection_id,
+        repository_id,
+        correlation_id,
+        user_id,
+        user_agent,
+    )
 }
 
 #[derive(Debug)]
@@ -328,6 +363,8 @@ pub fn parse_message_for_opcode(
         Command::PutResolved => Ok(ParsedStorageRequest::PutResolved(
             requests::PutResolved::parse(bytes)?,
         )),
+        // ClientIdentify is handled at the connection layer, not by this service.
+        Command::ClientIdentify => Err(MessageParseError::UnknownOpcode(opcode)),
     }
 }
 
@@ -504,7 +541,7 @@ impl QuicService for StorageService {
         _message: &Self::ParsedRequestType,
         context: &Arc<AttributeMap>,
     ) -> Span {
-        let (connection_id, repository_id, correlation_id, user_id) =
+        let (connection_id, repository_id, correlation_id, user_id, user_agent) =
             request_identifiers_from_context(context);
         build_storage_protocol_request_span(
             header.cmd,
@@ -513,6 +550,9 @@ impl QuicService for StorageService {
             &repository_id,
             &correlation_id,
             &user_id,
+            user_agent
+                .as_ref()
+                .map_or(crate::quic::NO_USER_AGENT, |v| v.0.as_ref()),
         )
     }
 }

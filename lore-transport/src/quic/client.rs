@@ -475,7 +475,7 @@ where
         };
 
         let epoch = service_client.quic().epoch.load(Ordering::Relaxed);
-        match send_command::<HIGH_PRIORITY>(
+        match send_command::<HIGH_PRIORITY, true>(
             service_client.quic().clone(),
             request_type.into(),
             session_id,
@@ -1243,7 +1243,40 @@ pub async fn send_normal(
     v4: bool,
     chunks: &mut [Bytes],
 ) -> Result<Bytes, QuicClientError> {
-    send_command::<false>(connection, command, session_id, v4, chunks).await
+    send_command::<false, true>(connection, command, session_id, v4, chunks).await
+}
+
+/// Announces the client's user agent for a connection, sent once on connect and again on each
+/// reconnect. Both QUIC protocols carry this same message under their own opcode, and both handle
+/// it at the connection layer rather than in a service.
+///
+/// Request:  user agent, ASCII, at most 256 bytes
+/// Response: empty
+///
+/// Advisory only: the server discards an empty, oversized or non-ASCII value rather than rejecting
+/// it, so a client that cannot identify itself still gets a working connection.
+///
+/// Returns once the bytes are written rather than once the server has acknowledged them, so
+/// establishing a connection costs no round trip for it. Being written first on the initial stream
+/// still puts it ahead of every command later written to that stream; a command that opens a
+/// second stream can be handled first, and is then recorded with no user agent.
+pub async fn send_client_identify(
+    connection: Arc<QuicConnection>,
+    command: QuicOpCode,
+    v4: bool,
+    user_agent: &str,
+) -> Result<(), QuicClientError> {
+    send_without_response(
+        connection,
+        command,
+        0,
+        v4,
+        &mut [
+            Bytes::default(),
+            Bytes::copy_from_slice(user_agent.as_bytes()),
+        ],
+    )
+    .await
 }
 
 pub async fn send_high_priority(
@@ -1253,7 +1286,7 @@ pub async fn send_high_priority(
     v4: bool,
     chunks: &mut [Bytes],
 ) -> Result<Bytes, QuicClientError> {
-    send_command::<true>(connection, command, session_id, v4, chunks).await
+    send_command::<true, true>(connection, command, session_id, v4, chunks).await
 }
 
 pub fn send_normal_with_reconnect<'a, ServiceClientType, const LEN: usize>(
@@ -1290,7 +1323,17 @@ where
     )
 }
 
-pub async fn send_command<const HIGH_PRIORITY: bool>(
+/// Send a command, waiting for its response only when `AWAIT_RESPONSE`.
+///
+/// `AWAIT_RESPONSE` is a const parameter rather than a split into a write half and a wait half so
+/// that each instantiation is a single future: a wait half awaited by a write half would nest one
+/// future inside the other and grow the send path. A `false` instantiation compiles the response
+/// wait out entirely and resolves as soon as the bytes are written, yielding `Bytes::default()`.
+///
+/// Either way the command is registered with the stream's [`ResponseReader`] before the bytes go
+/// out. Dropping the receiver unread is expected and handled; leaving the command unregistered is
+/// not, and would make the reader treat the response as unexpected and tear the stream down.
+pub async fn send_command<const HIGH_PRIORITY: bool, const AWAIT_RESPONSE: bool>(
     connection: Arc<QuicConnection>,
     command: QuicOpCode,
     session_id: u32,
@@ -1368,10 +1411,31 @@ pub async fn send_command<const HIGH_PRIORITY: bool>(
         })?;
     }
 
+    if !AWAIT_RESPONSE {
+        return Ok(Bytes::default());
+    }
+
     rx.await.map_err(|err| {
         lore_warn!("{}: {err}", QuicClientError::Read);
         QuicClientError::Read
     })?
+}
+
+/// Send a command and return once its bytes are written, discarding the response.
+///
+/// Completes without a network round trip: the write lands in the connection's send buffer,
+/// which for a small message on a healthy connection has credit to spare. Only for commands whose
+/// response carries nothing a caller can act on - a failure after the write is invisible here.
+pub async fn send_without_response(
+    connection: Arc<QuicConnection>,
+    command: QuicOpCode,
+    session_id: u32,
+    v4: bool,
+    chunks: &mut [Bytes],
+) -> Result<(), QuicClientError> {
+    send_command::<false, false>(connection, command, session_id, v4, chunks)
+        .await
+        .map(|_| ())
 }
 
 #[cfg(test)]

@@ -24,6 +24,7 @@ use lore_telemetry::tracing::fields::ADDRESS;
 use lore_telemetry::tracing::fields::PARTITION_ID;
 use lore_transport::ProtocolError;
 use lore_transport::quic::QuicClientError;
+use lore_transport::quic::QuicOpCode;
 use lore_transport::quic::client::AuthAdapter;
 use lore_transport::quic::client::CertificateSettings;
 pub use lore_transport::quic::client::ConnectionStats;
@@ -33,6 +34,7 @@ use lore_transport::quic::client::SendWithReconnectError;
 use lore_transport::quic::client::ServiceClient;
 use lore_transport::quic::client::TransportConfig;
 use lore_transport::quic::client::connect;
+use lore_transport::quic::client::send_client_identify;
 use lore_transport::quic::client::send_normal_with_reconnect;
 use opentelemetry::KeyValue;
 use thiserror::Error;
@@ -83,6 +85,22 @@ impl From<ReplicationServiceErrorCode> for ReplicationStoreClientError {
 
 struct ReplicationStoreAuth {
     certs: CertificateSettings,
+    user_agent: String,
+}
+
+impl ReplicationStoreAuth {
+    async fn announce_user_agent(
+        &self,
+        connection: Arc<QuicConnection>,
+    ) -> Result<(), QuicClientError> {
+        send_client_identify(
+            connection,
+            Command::ClientIdentify as QuicOpCode,
+            false,
+            &self.user_agent,
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -91,16 +109,18 @@ impl AuthAdapter for ReplicationStoreAuth {
 
     async fn initial_authorize(
         &self,
-        _connection: Arc<QuicConnection>,
+        connection: Arc<QuicConnection>,
     ) -> Result<(), Self::ErrorType> {
-        Ok(())
+        self.announce_user_agent(connection)
+            .await
+            .map_err(ReplicationStoreClientError::UnexpectedClientError)
     }
 
     async fn reconnect_authorize(
         &self,
-        _connection: Arc<QuicConnection>,
+        connection: Arc<QuicConnection>,
     ) -> Result<(), QuicClientError> {
-        Ok(())
+        self.announce_user_agent(connection).await
     }
 
     fn client_certs(&self) -> CertificateSettings {
@@ -195,11 +215,13 @@ impl ReplicationStoreClient {
         transport_config: TransportConfig,
         command_behavior: CommandBehavior,
         max_reconnects: Option<u32>,
+        user_agent: Option<String>,
     ) -> Result<Self, ProtocolError> {
         trace!("ReplicationStoreClient connecting to {remote_url}");
 
         let start = Instant::now();
-        let auth = Arc::new(ReplicationStoreAuth { certs });
+        let user_agent = user_agent.unwrap_or_else(|| lore_transport::user_agent().to_string());
+        let auth = Arc::new(ReplicationStoreAuth { certs, user_agent });
 
         let quinn = connect(
             &EndpointConfig {
@@ -234,8 +256,16 @@ impl ReplicationStoreClient {
         client.quic.create_initial_stream().await.map_err(|e| {
             lore_debug!("ReplicationStoreClient connection {connection_id} to {remote_url} - error making initial stream: {e:?}");
             ProtocolError::internal(format!("connecting to {remote_url}"))
-        }
-        )?;
+        })?;
+
+        client
+            .auth
+            .initial_authorize(client.quic.clone())
+            .await
+            .map_err(|err| {
+                ProtocolError::internal(format!("authorizing connection to {remote_url}: {err}"))
+            })?;
+
         client.quic.stream_count.store(1, Ordering::Relaxed);
 
         lore_debug!(
@@ -559,6 +589,162 @@ pub fn observe_client_interaction<ResponseType>()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod integration {
+        use std::net::SocketAddr;
+        use std::net::UdpSocket;
+        use std::time::Duration;
+
+        use lore_base::lore_spawn;
+        use lore_base::runtime::LORE_CONTEXT;
+        use lore_transport::quic::client::CertificateSettings;
+        use lore_transport::quic::client::CongestionAlgorithm;
+        use lore_transport::quic::client::DEFAULT_EXPECTED_RTT_MS;
+        use lore_transport::quic::client::TransportConfig;
+
+        use crate::protocol::client_identify::UserAgentValue;
+        use crate::quic::quinn::QuinnConfigBuilder;
+        use crate::quic::quinn::QuinnServer;
+        use crate::quic::replication_store_service::client::CommandBehavior;
+        use crate::quic::replication_store_service::client::ReplicationStoreClient;
+        use crate::quic::tests::ObservedContexts;
+        use crate::quic::tests::TestHandlerFactory;
+        use crate::quic::tests::server_certs;
+        use crate::store::test_store_create;
+
+        fn start_test_server(
+            immutable_store: std::sync::Arc<dyn lore_storage::ImmutableStore>,
+            mutable_store: std::sync::Arc<dyn lore_storage::MutableStore>,
+        ) -> (SocketAddr, QuinnServer, ObservedContexts) {
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let server_addr = socket.local_addr().unwrap();
+            drop(socket);
+
+            let factory = TestHandlerFactory::new(immutable_store, mutable_store);
+            let contexts = factory.observed_contexts();
+
+            let (cert_path, key_path, _ca) = server_certs().expect("Bad server cert paths");
+            let server = QuinnServer::start(
+                QuinnConfigBuilder::new()
+                    .address(server_addr)
+                    .cert_file(cert_path)
+                    .pkey_file(key_path)
+                    .stream_handler_factory(Box::new(factory))
+                    .build()
+                    .unwrap(),
+            )
+            .expect("Failed to start test QUIC server");
+
+            (server_addr, server, contexts)
+        }
+
+        /// Polls the first connection the server accepted until it carries a user agent, and
+        /// returns it. Panics if none arrives within `ANNOUNCE_TIMEOUT`.
+        async fn await_announced_user_agent(contexts: &ObservedContexts) -> String {
+            const ANNOUNCE_TIMEOUT: Duration = Duration::from_secs(10);
+            const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+            let poll = async {
+                loop {
+                    let user_agent = contexts
+                        .lock()
+                        .first()
+                        .and_then(|context| context.get::<UserAgentValue>())
+                        .map(|value| value.0.to_string());
+
+                    if let Some(user_agent) = user_agent {
+                        return user_agent;
+                    }
+                    tokio::time::sleep(POLL_INTERVAL).await;
+                }
+            };
+
+            tokio::time::timeout(ANNOUNCE_TIMEOUT, poll)
+                .await
+                .expect("user agent must be announced")
+        }
+
+        fn no_tls_transport() -> TransportConfig {
+            TransportConfig {
+                max_bytes_bandwidth_per_second: 1_000_000,
+                expected_rtt_ms: DEFAULT_EXPECTED_RTT_MS,
+                congestion_algorithm: CongestionAlgorithm::Bbr,
+                initial_cwnd: None,
+            }
+        }
+
+        fn permissive_command_behavior() -> CommandBehavior {
+            CommandBehavior {
+                message_limit: 10,
+                should_await_command_permit: false,
+            }
+        }
+
+        /// With no user agent supplied, the lore-transport default is what reaches the server.
+        #[tokio::test]
+        async fn connect_with_no_user_agent_announces_the_default() {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create store");
+
+            lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+                let (server_addr, _server, contexts) =
+                    start_test_server(immutable_store, mutable_store);
+
+                let _client = ReplicationStoreClient::connect(
+                    &format!("quic://{server_addr}"),
+                    CertificateSettings {
+                        custom_ca: None,
+                        client: None,
+                    },
+                    None,
+                    no_tls_transport(),
+                    permissive_command_behavior(),
+                    None,
+                    None,
+                )
+                .await
+                .expect("connect with no user agent must succeed");
+
+                assert_eq!(
+                    await_announced_user_agent(&contexts).await,
+                    lore_transport::user_agent()
+                );
+            }))
+            .await
+            .expect("Test task failed");
+        }
+
+        /// A user agent supplied by the caller reaches the server's per-connection context.
+        #[tokio::test]
+        async fn connect_with_user_agent_announces_it() {
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create store");
+
+            lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+                let (server_addr, _server, contexts) =
+                    start_test_server(immutable_store, mutable_store);
+
+                let _client = ReplicationStoreClient::connect(
+                    &format!("quic://{server_addr}"),
+                    CertificateSettings {
+                        custom_ca: None,
+                        client: None,
+                    },
+                    None,
+                    no_tls_transport(),
+                    permissive_command_behavior(),
+                    None,
+                    Some("lore-test/1.0".to_string()),
+                )
+                .await
+                .expect("connect with user agent must succeed");
+
+                assert_eq!(await_announced_user_agent(&contexts).await, "lore-test/1.0");
+            }))
+            .await
+            .expect("Test task failed");
+        }
+    }
 
     #[test]
     fn throttling_errors_map_to_slow_down() {

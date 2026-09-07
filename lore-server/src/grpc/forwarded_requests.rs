@@ -14,7 +14,7 @@ use lore_error_set::prelude::*;
 use lore_revision::errors::UnhandledError;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
-use lore_transport::grpc::user_agent;
+use lore_transport::user_agent;
 use serde::Deserialize;
 use tonic::Request;
 use tonic::Response;

@@ -65,7 +65,7 @@ impl From<&StoreError> for ReplicationServiceErrorCode {
 }
 
 #[repr(u8)]
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Command {
     // 0 and 5 were `ExistsBatch` / `LocalExistsBatch`, superseded by `Query` (17) and
     // `LocalQuery` (18). Left unused rather than reassigned, so a peer that still sends one is
@@ -88,6 +88,9 @@ pub enum Command {
     ImmutableQuery = 17,
     ImmutableLocalQuery = 18,
     ImmutableCopy = 19,
+    /// Announces the client's user agent; see
+    /// [`send_client_identify`](lore_transport::quic::client::send_client_identify).
+    ClientIdentify = 20,
 }
 
 impl From<Command> for QuicOpCode {
@@ -111,6 +114,7 @@ impl TryFrom<QuicOpCode> for Command {
             v if v == Command::ImmutableQuery as u8 => Ok(Command::ImmutableQuery),
             v if v == Command::ImmutableLocalQuery as u8 => Ok(Command::ImmutableLocalQuery),
             v if v == Command::ImmutableCopy as u8 => Ok(Command::ImmutableCopy),
+            v if v == Command::ClientIdentify as u8 => Ok(Command::ClientIdentify),
             _ => Err(UnknownCommand(value)),
         }
     }

@@ -129,12 +129,15 @@ impl StorageClient {
         identity: &str,
         partition: Partition,
         credentials: &Arc<SuppliedCredentials>,
+        user_agent: Option<String>,
     ) -> Result<Self, ProtocolError> {
+        let user_agent = user_agent.unwrap_or_else(|| crate::user_agent().to_string());
         let auth_adapter = Arc::new(StorageClientAuth {
             recipient_domain: remote_domain.clone(),
             auth_url: auth_url.to_string(),
             identity: identity.to_string(),
             partition,
+            user_agent,
         });
         let transport_config = TransportConfig {
             max_bytes_bandwidth_per_second: MAX_BYTES_BANDWIDTH_PER_SEC,
@@ -187,6 +190,7 @@ impl StorageClient {
             })?;
 
         auth_adapter.initial_authorize(storage.quic.clone()).await?;
+
         storage.quic.stream_count.store(1, Ordering::Relaxed);
 
         lore_debug!(

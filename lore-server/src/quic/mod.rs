@@ -85,6 +85,14 @@ pub const NO_CONNECTION_ID: &str = "<no_connection_id>";
 pub const NO_REPOSITORY_ID: &str = "<no_repository_id>";
 pub const NO_CORRELATION_ID: &str = "<no_correlation_id>";
 pub const NO_USER_ID: &str = "<no_user_id>";
+/// Recorded when the client never sent a `ClientIdentify` message. Distinct from the `<unknown>`
+/// that `ClientIdentify::apply` records, which means the client did identify itself but its agent
+/// matched no allow-list pattern.
+///
+/// Span fields and metric labels spell absence differently: spans use this, metrics use
+/// `lore_telemetry::user_agent_filter::USER_AGENT_NONE`. The gRPC transport already splits them
+/// the same way, so the two are not interchangeable.
+pub const NO_USER_AGENT: &str = "<no_user_agent>";
 
 /// A QUIC service  implementation for use with the `StreamDataHandler` scaffolding.
 /// From a high level, the service implementation takes input bytes from the stream and either
@@ -225,8 +233,13 @@ pub mod tests {
         Ok((cert, key, ca))
     }
 
+    /// Per-connection contexts handed out by a `TestHandlerFactory`, in the order the server
+    /// accepted the connections.
+    pub type ObservedContexts = Arc<parking_lot::Mutex<Vec<Arc<AttributeMap>>>>;
+
     pub struct TestHandlerFactory {
         service_store: ServiceStore,
+        contexts: ObservedContexts,
     }
 
     pub const TEST_PROTOCOL: &str = "test/0.2";
@@ -237,13 +250,16 @@ pub mod tests {
             immutable_store: Arc<dyn ImmutableStore>,
             mutable_store: Arc<dyn MutableStore>,
         ) -> Self {
+            let contexts: ObservedContexts = Arc::default();
             let mut service_store = ServiceStore::default();
             {
                 let immutable_store = immutable_store.clone();
                 let mutable_store = mutable_store.clone();
+                let contexts = contexts.clone();
                 service_store.add_service(
                     TEST_PROTOCOL,
                     Box::new(move |context: Arc<AttributeMap>| {
+                        contexts.lock().push(context.clone());
                         let storage_protocol = StorageService::new(
                             Arc::new(None),
                             immutable_store.clone(),
@@ -266,14 +282,17 @@ pub mod tests {
             {
                 let immutable_store = immutable_store.clone();
                 let mutable_store = mutable_store.clone();
+                let contexts = contexts.clone();
                 service_store.add_service(
                     TEST_PROTOCOL_V4,
                     Box::new(move |context: Arc<AttributeMap>| {
+                        contexts.lock().push(context.clone());
                         let v4_service = StorageServiceV4::new(
                             Arc::new(None),
                             immutable_store.clone(),
                             immutable_store.clone(),
                             mutable_store.clone(),
+                            Arc::new(lore_telemetry::user_agent_filter::UserAgentFilter::default()),
                         );
                         Box::new(StreamHandler::new(
                             Arc::new(v4_service),
@@ -290,12 +309,15 @@ pub mod tests {
             }
             {
                 let immutable_store = immutable_store.clone();
+                let contexts = contexts.clone();
                 service_store.add_service(
                     ReplicationStoreClient::ALPN,
                     Box::new(move |context: Arc<AttributeMap>| {
+                        contexts.lock().push(context.clone());
                         let service = ReplicationStoreService::new(
                             immutable_store.clone(),
                             immutable_store.clone(),
+                            Arc::new(lore_telemetry::user_agent_filter::UserAgentFilter::default()),
                         );
                         Box::new(StreamHandler::new(
                             Arc::new(service),
@@ -310,7 +332,16 @@ pub mod tests {
                     }),
                 );
             }
-            Self { service_store }
+            Self {
+                service_store,
+                contexts,
+            }
+        }
+
+        /// Handle onto the contexts this factory will hand to its stream handlers. Take it before
+        /// moving the factory into a server; the handle stays valid afterwards.
+        pub fn observed_contexts(&self) -> ObservedContexts {
+            self.contexts.clone()
         }
     }
 

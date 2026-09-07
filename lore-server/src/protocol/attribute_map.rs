@@ -46,6 +46,48 @@ impl AttributeMap {
         }
     }
 
+    #[allow(clippy::type_complexity)]
+    pub fn get_five<
+        T1: Send + Sync + 'static,
+        T2: Send + Sync + 'static,
+        T3: Send + Sync + 'static,
+        T4: Send + Sync + 'static,
+        T5: Send + Sync + 'static,
+    >(
+        &self,
+    ) -> (
+        Option<Arc<T1>>,
+        Option<Arc<T2>>,
+        Option<Arc<T3>>,
+        Option<Arc<T4>>,
+        Option<Arc<T5>>,
+    ) {
+        match self.map.read() {
+            Ok(m) => {
+                let v1 = m
+                    .get(&TypeId::of::<T1>())
+                    .and_then(|boxed| boxed.clone().downcast().ok());
+                let v2 = m
+                    .get(&TypeId::of::<T2>())
+                    .and_then(|boxed| boxed.clone().downcast().ok());
+                let v3 = m
+                    .get(&TypeId::of::<T3>())
+                    .and_then(|boxed| boxed.clone().downcast().ok());
+                let v4 = m
+                    .get(&TypeId::of::<T4>())
+                    .and_then(|boxed| boxed.clone().downcast().ok());
+                let v5 = m
+                    .get(&TypeId::of::<T5>())
+                    .and_then(|boxed| boxed.clone().downcast().ok());
+                (v1, v2, v3, v4, v5)
+            }
+            Err(e) => {
+                warn!("Failed to get read lock when reading from attribute map: {e:?}");
+                (None, None, None, None, None)
+            }
+        }
+    }
+
     pub fn get_or<T: Send + Sync + 'static, E>(&self, err: E) -> Result<Arc<T>, E> {
         match self.get::<T>() {
             Some(v) => Ok(v),

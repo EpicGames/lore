@@ -1027,6 +1027,7 @@ mod tests {
                 crate::quic::NO_REPOSITORY_ID,
                 crate::quic::NO_CORRELATION_ID,
                 crate::quic::NO_USER_ID,
+                crate::quic::NO_USER_AGENT,
             )
         }
     }
@@ -1290,6 +1291,7 @@ mod tests {
                     should_await_command_permit: false,
                 },
                 None,
+                None,
             )
             .await
             .expect("Failed to establish client connection");
@@ -1374,6 +1376,7 @@ mod tests {
                     should_await_command_permit: false,
                 },
                 None,
+                None,
             )
             .await;
 
@@ -1454,6 +1457,7 @@ mod tests {
                     message_limit: 10,
                     should_await_command_permit: false,
                 },
+                None,
                 None,
             )
             .await

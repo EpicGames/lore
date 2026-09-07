@@ -6,6 +6,16 @@ use rand::random;
 use regex::RegexSet;
 use tracing::info;
 
+/// Recorded when a user agent was supplied but matched none of the configured patterns.
+///
+/// Shared by metric labels and tracing span fields so the two can be correlated; a caller that
+/// substitutes its own string breaks that join silently.
+pub const USER_AGENT_UNKNOWN: &str = "<unknown>";
+
+/// Recorded when no user agent was supplied at all, in place of calling
+/// [`normalize`](UserAgentFilter::normalize).
+pub const USER_AGENT_NONE: &str = "<none>";
+
 pub enum NormalizeOutput {
     KnownAgent(Arc<str>),
     Unknown,

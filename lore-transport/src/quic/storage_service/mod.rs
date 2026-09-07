@@ -56,6 +56,9 @@ pub enum Command {
     /// A zero `Address` hash removes the mapping instead of publishing one; the `Fragment` and
     /// payload are then ignored, since there is nothing to store.
     PutResolved = 13,
+    /// Announces the client's user agent; see
+    /// [`send_client_identify`](super::client::send_client_identify).
+    ClientIdentify = 14,
 }
 
 /// `flags` field of a [`Command::GetResolved`] request. Reserved; no bits are defined.
@@ -91,6 +94,7 @@ impl TryFrom<QuicOpCode> for Command {
             v if v == Command::GetMetadata as u8 => Ok(Command::GetMetadata),
             v if v == Command::GetResolved as u8 => Ok(Command::GetResolved),
             v if v == Command::PutResolved as u8 => Ok(Command::PutResolved),
+            v if v == Command::ClientIdentify as u8 => Ok(Command::ClientIdentify),
             _ => Err(UnknownCommand(value)),
         }
     }
@@ -116,6 +120,7 @@ pub fn command_name(command: &Command) -> &'static str {
         Command::GetMetadata => "get_metadata",
         Command::GetResolved => "get_resolved",
         Command::PutResolved => "put_resolved",
+        Command::ClientIdentify => "client_identify",
     }
 }
 

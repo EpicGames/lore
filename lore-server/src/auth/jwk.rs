@@ -21,7 +21,7 @@ use lore_telemetry::LabelArray;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
 use lore_telemetry::timed;
 use lore_telemetry::timer::TimedResult;
-use lore_transport::grpc::user_agent;
+use lore_transport::user_agent;
 use opentelemetry::KeyValue;
 use serde::Deserialize;
 use smallvec::SmallVec;

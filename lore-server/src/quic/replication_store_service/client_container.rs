@@ -85,6 +85,7 @@ impl ClientFactory for QuicClientFactory {
             transport_config,
             self.command_behavior.clone(),
             self.quic_max_reconnects,
+            None,
         )
         .await?;
         Ok(client)

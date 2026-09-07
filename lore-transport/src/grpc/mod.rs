@@ -30,7 +30,6 @@ use lore_base::lore_debug;
 use lore_base::lore_info;
 use lore_base::lore_trace;
 use lore_base::types::*;
-use lore_base::version::LORE_LIBRARY_VERSION;
 use lore_error_set::prelude::*;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
@@ -633,23 +632,6 @@ async fn lock_connection(remote_url: &Url) -> Arc<RwLock<Weak<GRPCConnection>>> 
 const HTTP2_KEEP_ALIVE_INTERVAL: u64 = 30;
 const HTTP2_KEEP_ALIVE_TIMEOUT: u64 = 20;
 
-static USER_AGENT: OnceLock<String> = OnceLock::new();
-
-/// User agent string for gRPC connections. Reads from `LORE_USER_AGENT` env var,
-/// falls back to a default value.
-pub fn user_agent() -> &'static str {
-    USER_AGENT
-        .get_or_init(|| {
-            std::env::var("LORE_USER_AGENT")
-                .unwrap_or_else(|_| format!("lore-transport/{}", LORE_LIBRARY_VERSION.as_str()))
-        })
-        .as_str()
-}
-
-pub fn set_user_agent(name: String) -> bool {
-    USER_AGENT.set(name).is_ok()
-}
-
 async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
     let mut endpoint = tonic::transport::Channel::from_shared(remote.to_string())
         .internal_with(|| format!("connect: {remote}"))?;
@@ -676,7 +658,7 @@ async fn connect_to_endpoint(remote: &str) -> Result<Channel, ProtocolError> {
             )
             .internal_with(|| format!("configuring TLS for {remote}"))?;
     }
-    let user_agent = user_agent();
+    let user_agent = crate::user_agent();
     endpoint = endpoint
         .user_agent(user_agent)
         .internal_with(|| format!("setting user agent for {remote}"))?;

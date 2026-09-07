@@ -107,6 +107,7 @@ pub async fn storage(
         identity,
         partition,
         credentials,
+        None,
     )
     .await
     .forward_with::<ProtocolError, _>(|| format!("connecting to {remote_url}"))?;
