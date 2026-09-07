@@ -1185,6 +1185,28 @@ def test_dirty_add_in_new_directory(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_stage_named_nested_path_survives_commit(new_lore_repo):
+    """staging a new file by name creates its ancestors, which the commit has to keep."""
+    repo: Lore = new_lore_repo()
+
+    with repo.open_file("existing.txt", "w+") as f:
+        f.write("base\n")
+    repo.stage(scan=True, offline=True)
+    repo.commit(offline=True)
+
+    repo.make_dirs("new_dir/sub_dir")
+    with repo.open_file("new_dir/sub_dir/new_file.txt", "w+") as f:
+        f.write("new content\n")
+
+    # Named rather than scanned, so the ancestors are created to host the target.
+    repo.stage("new_dir/sub_dir/new_file.txt", offline=True)
+    repo.commit(offline=True)
+
+    committed = repo.file_info("new_dir/sub_dir/new_file.txt", offline=True)
+    assert committed, "a staged file under a new directory must survive the commit"
+
+
+@pytest.mark.smoke
 def test_dirty_nonexistent_path_ignored(new_lore_repo):
     """file dirty on a path that doesn't exist on disk or in state is ignored."""
     repo: Lore = new_lore_repo()

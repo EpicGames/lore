@@ -243,6 +243,36 @@ pub async fn test_scan(
     state_staged: std::sync::Arc<lore_revision::state::State>,
     state_current: std::sync::Arc<lore_revision::state::State>,
 ) -> Vec<lore_revision::change::NodeChange> {
+    test_scan_with_intent(
+        repository,
+        state_staged,
+        state_current,
+        lore_revision::fs::filesystem_provider::FilesystemDiffIntent::MarkDirty,
+    )
+    .await
+}
+
+/// [`test_scan`] under the given intent, for a walk that stages rather than marks.
+#[allow(dead_code)]
+pub async fn test_scan_with_intent(
+    repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    state_staged: std::sync::Arc<lore_revision::state::State>,
+    state_current: std::sync::Arc<lore_revision::state::State>,
+    intent: lore_revision::fs::filesystem_provider::FilesystemDiffIntent,
+) -> Vec<lore_revision::change::NodeChange> {
+    test_scan_path_with_intent(repository, state_staged, state_current, None, intent).await
+}
+
+/// [`test_scan_with_intent`] scoped to `path`, which is what makes the walk resolve the
+/// ancestors of a path the tree does not hold.
+#[allow(dead_code)]
+pub async fn test_scan_path_with_intent(
+    repository: std::sync::Arc<lore_revision::repository::RepositoryContext>,
+    state_staged: std::sync::Arc<lore_revision::state::State>,
+    state_current: std::sync::Arc<lore_revision::state::State>,
+    path: Option<lore_revision::util::path::RelativePath>,
+    intent: lore_revision::fs::filesystem_provider::FilesystemDiffIntent,
+) -> Vec<lore_revision::change::NodeChange> {
     let operation = lore_revision::fs::filesystem_provider::FilesystemProvider::begin_operation(
         repository.file_system().as_ref(),
     )
@@ -259,9 +289,9 @@ pub async fn test_scan(
             repository,
             state: state_current,
         },
-        None, /* full tree */
+        path,
         lore_revision::filter::FilterMode::Full,
-        lore_revision::fs::filesystem_provider::FilesystemDiffIntent::MarkDirty,
+        intent,
         std::sync::Arc::new(Vec::new()),
         &mut changes,
     )

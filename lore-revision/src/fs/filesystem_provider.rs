@@ -22,9 +22,11 @@ use crate::change::NodeChange;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::fs::os::OsOperation;
+use crate::lore::Context;
 use crate::lore::Hash;
 use crate::merge::MergeTextMode;
 use crate::node::Node;
+use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::repository::RepositoryContext;
 use crate::state::FilesystemDiffStats;
@@ -115,6 +117,20 @@ pub struct FilesystemDiffTree {
     pub state: Arc<State>,
 }
 
+/// What a staging walk records beyond the dirty flags every marking walk sets.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StageIntent {
+    /// Set on every node the walk stages, beyond the staged action itself.
+    pub node_flags: NodeFlags,
+    /// The identity a new file node takes. A new one is minted where absent, so
+    /// metadata can be attached before a commit assigns one.
+    ///
+    /// One identity serves the whole walk, so a caller supplying it stages one file.
+    /// A move is paired to its delete by identity, and repeating one across unrelated
+    /// files pairs those instead.
+    pub file_id: Option<Context>,
+}
+
 /// What a filesystem diff does with the differences it finds.
 #[derive(Debug, Clone, Copy)]
 pub enum FilesystemDiffIntent {
@@ -122,12 +138,25 @@ pub enum FilesystemDiffIntent {
     Report,
     /// Set and clear `Dirty` on each node as the walk settles it.
     MarkDirty,
+    /// Mark as [`MarkDirty`](Self::MarkDirty) does and record the staged action too.
+    Stage(StageIntent),
 }
 
 impl FilesystemDiffIntent {
     /// Whether the walk persists what it finds as dirty flags rather than only reporting.
     pub fn marks_dirty(self) -> bool {
-        matches!(self, FilesystemDiffIntent::MarkDirty)
+        matches!(
+            self,
+            FilesystemDiffIntent::MarkDirty | FilesystemDiffIntent::Stage(_)
+        )
+    }
+
+    /// What the walk stages beyond marking, where it stages at all.
+    pub fn stage(self) -> Option<StageIntent> {
+        match self {
+            FilesystemDiffIntent::Stage(intent) => Some(intent),
+            _ => None,
+        }
     }
 }
 
