@@ -2295,6 +2295,8 @@ pub async fn load_and_connect_with_token(
         // Register instance if not already present in the mutable store.
         // This covers both newly generated IDs and pre-existing instances
         // upgrading from a version before instance registration was added.
+        // Registration also retires any registration another instance left
+        // at this path, so a re-created checkout is listed once.
         let (instance_key, instance_key_type) =
             crate::instance::instance_key(repository.salt(), instance_id);
         let needs_registration = repository

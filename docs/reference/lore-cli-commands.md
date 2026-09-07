@@ -170,6 +170,7 @@ printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-comma
 * [`lore shared-store`↴](#lore-shared-store)
 * [`lore shared-store create`↴](#lore-shared-store-create)
 * [`lore shared-store info`↴](#lore-shared-store-info)
+* [`lore shared-store list`↴](#lore-shared-store-list)
 * [`lore shared-store set-use-automatically`↴](#lore-shared-store-set-use-automatically)
 
 ## `lore`
@@ -327,6 +328,18 @@ Create a repository in the given directory
 
 * `--description <description>` — Optional description of repository
 * `--id <id>` — Optional ID of repository
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+
+  Default value: `none`
+
+  Possible values:
+  - `none`:
+    No virtual file system; files are materialized directly on disk
+  - `default`:
+    Use whichever VFS system is preferred based on the user's system
+  - `swfs`:
+    Use Epic's Split Write File System as the Virtual File System
+
 * `--use-shared-store` — Use the shared store rather than create a local immutable store
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 
@@ -349,8 +362,19 @@ Clone a remote repository into the given path
 * `--revision <revision>` — Optional revision to sync
 * `--branch <branch>` — Optional branch to sync (shorthand for a full revision specifier)
 * `--bare` — Clone without files, only fetch latest revision tree
-* `--virtual` — Clone virtually using split-write filesystem
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into place
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+
+  Default value: `none`
+
+  Possible values:
+  - `none`:
+    No virtual file system; files are materialized directly on disk
+  - `default`:
+    Use whichever VFS system is preferred based on the user's system
+  - `swfs`:
+    Use Epic's Split Write File System as the Virtual File System
+
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
 * `--prefetch <file>` — File containing list of files to prefetch
@@ -552,7 +576,7 @@ Instance management
 ###### **Subcommands:**
 
 * `list` — List all registered instances for this repository
-* `prune` — Remove stale instance entries
+* `prune` — Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a different instance
 
 
 
@@ -566,7 +590,7 @@ List all registered instances for this repository
 
 ## `lore repository instance prune`
 
-Remove stale instance entries
+Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a different instance
 
 **Usage:** `lore repository instance prune`
 
@@ -728,6 +752,7 @@ Merge two branches
 
 * `--id <branch-id>` — ID of the source branch to merge into the current branch
 * `--message <MESSAGE>` — Change the message for committing when no conflicts arise from the merge
+* `--inherit-metadata <KEY>` — Carry this metadata key from the source revision onto the merge revision. Repeatable. Pass `*` to carry every key that is not reserved to the merge itself. Carries nothing when not given
 
 
 
@@ -763,6 +788,7 @@ Merge into branch
 * `--id <branch-id>` — ID of the target branch to merge the current branch into
 * `--link <LINK>` — Merge only a specific linked repository at the given mount path
 * `--ignore-links` — Merge only the main repository, skipping all linked repositories
+* `--inherit-metadata <KEY>` — Carry this metadata key from the current branch onto the revision created on the target branch. Repeatable. Pass `*` to carry every key that is not reserved to the merge itself. Carries nothing when not given
 
 
 
@@ -784,6 +810,7 @@ Start a merge process
 * `--dry-run` — Do a dry run merge start and only report what changes would be done, do not change anything in the file system
 * `--link <LINK>` — Merge only a specific linked repository at the given mount path
 * `--ignore-links` — Merge only the main repository, skipping all linked repositories
+* `--inherit-metadata <KEY>` — Carry this metadata key from the source revision onto the merge revision. Repeatable. Pass `*` to carry every key that is not reserved to the merge itself. Carries nothing when not given
 
 
 
@@ -1256,6 +1283,7 @@ Cherry-pick a revision onto the currently synced revision
 
 * `--message <MESSAGE>` — Change the message for committing when no conflicts arise from the cherry-pick
 * `--no-commit` — Disable auto commits even if no conflicts arise from the cherry-pick
+* `--inherit-metadata <KEY>` — Carry this metadata key from the picked revision onto the revision this creates. Repeatable. Pass `*` to carry every key that is not reserved to the cherry-pick itself. Carries nothing when not given
 
 
 
@@ -2259,8 +2287,19 @@ Clone a remote repository into the given path
 * `--revision <revision>` — Optional revision to sync
 * `--branch <branch>` — Optional branch to sync (shorthand for a full revision specifier)
 * `--bare` — Clone without files, only fetch latest revision tree
-* `--virtual` — Clone virtually using split-write filesystem
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into place
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+
+  Default value: `none`
+
+  Possible values:
+  - `none`:
+    No virtual file system; files are materialized directly on disk
+  - `default`:
+    Use whichever VFS system is preferred based on the user's system
+  - `swfs`:
+    Use Epic's Split Write File System as the Virtual File System
+
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
 * `--prefetch <file>` — File containing list of files to prefetch
@@ -2708,6 +2747,7 @@ Manage the shared store
 
 * `create` — Create a shared store backed by a remote
 * `info` — Show the shared store this repository uses
+* `list` — Show information about the registry of shared stores
 * `set-use-automatically` — Set whether new clones use a shared store without being asked to
 
 
@@ -2737,6 +2777,21 @@ Create a shared store backed by a remote
 Show the shared store this repository uses
 
 **Usage:** `lore shared-store info`
+
+
+
+## `lore shared-store list`
+
+Show information about the registry of shared stores
+
+**Usage:** `lore shared-store list [OPTIONS]`
+
+###### **Options:**
+
+* `--include-instances <INCLUDE_INSTANCES>` — Look up all instances each shared store is used by
+
+  Possible values: `true`, `false`
+
 
 
 

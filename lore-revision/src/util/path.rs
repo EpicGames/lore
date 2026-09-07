@@ -249,23 +249,28 @@ fn contains_directory_step_up(path: &str) -> bool {
 /// `path` in the form the repository names paths in: forward separators, none of
 /// them repeated, and no `.` or `..` left to resolve.
 pub fn clean(mut path: String) -> String {
-    replace_present(&mut path, VERBATIM_PREFIX, "");
-    replace_present(&mut path, DEVICE_PREFIX, "");
-    replace_present(&mut path, "\\", "/");
-    collapse_separators(&mut path);
-    remove_dot_segments(&mut path);
+    clean_in_place(&mut path);
+    path
+}
+
+/// [`clean`] applied to a buffer the caller owns, for a loop that would
+/// otherwise allocate a `String` per path it normalizes.
+pub fn clean_in_place(path: &mut String) {
+    replace_present(path, VERBATIM_PREFIX, "");
+    replace_present(path, DEVICE_PREFIX, "");
+    replace_present(path, "\\", "/");
+    collapse_separators(path);
+    remove_dot_segments(path);
 
     if path.starts_with("./") {
-        trim_leading(&mut path, "./");
+        trim_leading(path, "./");
     }
 
     if path.ends_with("/.") {
         path.truncate(path.trim_end_matches("/.").len());
     }
 
-    reduce_parent_segments(&mut path);
-
-    path
+    reduce_parent_segments(path);
 }
 
 /// What is left of `path` below the components of `prefix_lower`, or `None`
