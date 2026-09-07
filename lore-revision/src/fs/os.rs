@@ -88,7 +88,7 @@ impl InstanceOperation for OsOperation {
             .metadata(path.as_absolute_path())
             .await
         {
-            Ok(metadata) => Ok(FileInfo::from_metadata(metadata)),
+            Ok(metadata) => Ok(FileInfo::from_metadata(&metadata)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileInfo::default()),
             Err(e)
                 if cfg!(target_family = "windows")
@@ -223,7 +223,7 @@ impl InstanceOperation for OsOperation {
         )
         .await
         .forward_any::<FsError>("Failed to read file")?;
-        Ok((fragment, metadata.map(FileInfo::from_metadata)))
+        Ok((fragment, metadata.as_ref().map(FileInfo::from_metadata)))
     }
 
     async fn copy_to_scratch_file(

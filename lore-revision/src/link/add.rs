@@ -9,7 +9,7 @@ use crate::branch;
 use crate::errors::InvalidPath;
 use crate::event;
 use crate::filter::FilterMode;
-use crate::fs::filesystem_provider::InstanceOperation;
+use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreFileAction;
 use crate::link;
 use crate::link::LinkFlags;
@@ -344,25 +344,29 @@ pub async fn add(
                 .join(chain.innermost_mount_path.as_str());
 
             lore_debug!("Staging link parent path in innermost repository");
-            Box::pin(stage::stage_filesystem_path(
-                inner_repository.clone(),
-                inner_state.clone(),
-                inner_base_absolute,
-                RelativePathBuf::new(),
-                chain.innermost_base_node,
-                remainder_parent.freeze(),
-                Arc::default(),
-                StageOptions {
-                    no_children: true,
-                    ..Default::default()
-                },
-                None, // No link tracking when adding links
-                None, // No layer mask
-                None, // Prefixes resolved for the outer repository do not apply
-                None, // Node ids here index the inner repository's own state
-            ))
-            .await
-            .forward::<LinkError>("Failed staging the link node")?;
+            with_operation(repository.file_system(), true, async |operation| {
+                Box::pin(stage::stage_filesystem_path(
+                    operation,
+                    inner_repository.clone(),
+                    inner_state.clone(),
+                    inner_base_absolute,
+                    RelativePathBuf::new(),
+                    chain.innermost_base_node,
+                    remainder_parent.freeze(),
+                    Arc::default(),
+                    StageOptions {
+                        no_children: true,
+                        ..Default::default()
+                    },
+                    None, // No link tracking when adding links
+                    None, // No layer mask
+                    None, // Prefixes resolved for the outer repository do not apply
+                    None, // Node ids here index the inner repository's own state
+                ))
+                .await
+                .forward::<LinkError>("Failed staging the link node")
+            })
+            .await?;
         }
     }
 
@@ -439,34 +443,27 @@ pub async fn add(
     .send();
 
     let stats = Arc::new(CloneStats::default());
-    let operation = link
-        .file_system()
-        .begin_operation()
-        .await
-        .forward::<LinkError>("Failed to start operation")?;
-    let clone_ctx = CloneContext {
-        repository: link.clone(),
-        state: link_state,
-        operation: operation.clone(),
-        options: Arc::default(),
-        stats: stats.clone(),
-        modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
-    };
-
     let clone_states = link.filter.mount_states(clone_path.relative());
-    clone::clone_node(
-        clone_ctx,
-        storage,
-        clone_path,
-        link_node_link.node,
-        clone_states,
-    )
-    .await
-    .forward::<LinkError>("Failed cloning target link")?;
-    operation
-        .finalize(true)
+    with_operation(link.file_system(), true, async |operation| {
+        let clone_ctx = CloneContext {
+            repository: link.clone(),
+            state: link_state,
+            operation,
+            options: Arc::default(),
+            stats: stats.clone(),
+            modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
+        };
+        clone::clone_node(
+            clone_ctx,
+            storage,
+            clone_path,
+            link_node_link.node,
+            clone_states,
+        )
         .await
-        .forward::<LinkError>("Failed cloning target layer")?;
+        .forward::<LinkError>("Failed cloning target link")
+    })
+    .await?;
 
     event::LoreEvent::RepositoryCloneEnd(LoreRepositoryCloneEndEventData {
         branch: branch_name.into(),

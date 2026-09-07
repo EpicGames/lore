@@ -107,6 +107,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         })
         .to_string();
 
+    // A struct-valued associated constant has no C form, so cbindgen emits the blank
+    // lines it wraps a constant in and nothing between them. One empty line separates
+    // items anywhere in the header.
+    let blank_runs =
+        Regex::new(r"\n{3,}").expect("Failed to create regex to collapse repeated empty lines");
+    let contents = blank_runs
+        .replace_all(contents.as_str(), "\n\n")
+        .to_string();
+
     // Verify no Rust-internal names leak into the public C header.
     // Check for any "urc" reference as a prefix/identifier (not as substring of other words like "resource")
     let urc_re = Regex::new(r"(?i)\burc_").expect("Failed to create leak check regex");

@@ -61,9 +61,10 @@ documentation_style = "c99"
 [export]
 # `FilterState` and `FilterStates` are public so a tree walk can thread the
 # filter verdict down as it descends, and so the filter tests can build one.
-# They are Rust-side only -- no C entry point takes or returns them -- so
-# cbindgen would otherwise emit two opaque typedefs no caller can use.
-exclude = ["FilterState", "FilterStates"]
+# `FileInfo` is public so the walk and the stage path can pass what a path
+# measured. All three are Rust-side only -- no C entry point takes or returns
+# them -- so cbindgen would otherwise emit opaque typedefs no caller can use.
+exclude = ["FileInfo", "FilterState", "FilterStates"]
 # `LoreStore` and `LoreRevisionTree` are reachable via `lore_*_args_t::handle`
 # but cbindgen misses transitive types behind a typedef field; emit them
 # explicitly. The `lore_revision_tree_*_args_t` types live here too so the

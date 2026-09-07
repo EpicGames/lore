@@ -2114,4 +2114,108 @@ mod tests {
             .await
             .expect("Test task failed");
     }
+
+    /// The mode a node records is the one its file carries on disk, which the walk reads
+    /// through `FileInfo` rather than from the metadata directly.
+    ///
+    /// Only the executable bit is tracked. An already-staged node is left alone, so the
+    /// revision is committed between the two stages for the second to reach the mode.
+    #[cfg(target_family = "unix")]
+    #[tokio::test]
+    async fn staging_a_file_records_the_executable_bit_it_carries() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+        let execution = setup_test_execution();
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let tempdir = generate_tempdir();
+                let path = tempdir.to_path_buf();
+                std::fs::create_dir_all(path.as_path()).expect("Create directory failed");
+                let write_token = repository::RepositoryWriteToken::acquire(path.as_path()).await;
+                let repository = repository::create_local(
+                    path.as_path(),
+                    &write_token,
+                    repository_id,
+                    Context::from(uuid::Uuid::now_v7()),
+                    branch::DEFAULT_DEFAULT_NAME.to_string(),
+                    repository::RepositoryConfig::default(),
+                    false,
+                )
+                .await
+                .expect("Failed to initialize repository");
+
+                let file_path = path.as_path().join("script.sh");
+                let stage_all = async |mode: u32, contents: &[u8]| {
+                    test_file_write(file_path.as_path(), contents);
+                    std::fs::set_permissions(
+                        file_path.as_path(),
+                        std::fs::Permissions::from_mode(mode),
+                    )
+                    .expect("Failed to set test file mode");
+                    let signature = file::stage::stage(
+                        repository.clone(),
+                        &write_token,
+                        LoreArray::from_vec(vec![LoreString::from(&path)]),
+                        StageOptions {
+                            case_change: stage::StageCaseChange::Error,
+                            node_flags: NodeFlags::NoFlags,
+                            file_id: None,
+                            no_children: false,
+                            scan: true,
+                        },
+                    )
+                    .await
+                    .expect("Failed to stage the test file");
+                    let staged = state::State::deserialize(repository.clone(), signature)
+                        .await
+                        .expect("Failed to deserialize the staged state");
+                    let link = staged
+                        .find_node_link(repository.clone(), "script.sh")
+                        .await
+                        .expect("The staged state must hold the file");
+                    staged
+                        .node(repository.clone(), link.node)
+                        .await
+                        .expect("The staged node must read back")
+                        .mode
+                };
+
+                let executable = node::NodeFileMode::Executable.bits();
+
+                let mode = stage_all(0o755, b"#!/bin/sh\necho one").await;
+                assert_eq!(
+                    executable,
+                    mode & executable,
+                    "an executable file must record the bit"
+                );
+
+                Box::pin(commit::commit(
+                    repository.clone(),
+                    &write_token,
+                    CommitOptions {
+                        message: String::new(),
+                        link_messages: std::collections::HashMap::new(),
+                        link: None,
+                        layer_messages: std::collections::HashMap::new(),
+                        layer: None,
+                    },
+                ))
+                .await
+                .expect("Failed to commit the executable file");
+
+                let mode = stage_all(0o644, b"#!/bin/sh\necho two and three").await;
+                assert_eq!(
+                    0,
+                    mode & executable,
+                    "a file that lost the bit must record its loss"
+                );
+
+                let _ = std::fs::remove_dir_all(path.as_path());
+            }))
+            .await
+            .expect("Test task failed");
+    }
 }

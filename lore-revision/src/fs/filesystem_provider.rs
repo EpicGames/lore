@@ -66,9 +66,20 @@ pub struct FileInfo {
 }
 
 impl FileInfo {
-    pub fn from_metadata(metadata: Metadata) -> Self {
-        let (mtime, size) = crate::util::fs::file_mtime_and_size(&metadata);
-        let executable = crate::util::fs::file_executable_observed(&metadata);
+    /// A directory, as every component a walk resolved a path through must be. Carries
+    /// no size, mtime or mode, none of which a directory node stores.
+    pub const DIRECTORY: Self = FileInfo {
+        exists: true,
+        is_file: false,
+        is_dir: true,
+        executable: None,
+        size: 0,
+        mtime: 0,
+    };
+
+    pub fn from_metadata(metadata: &Metadata) -> Self {
+        let (mtime, size) = crate::util::fs::file_mtime_and_size(metadata);
+        let executable = crate::util::fs::file_executable_observed(metadata);
         FileInfo {
             exists: true,
             is_file: metadata.is_file(),
@@ -453,7 +464,7 @@ impl InstanceOperation for InstanceOperationImpl {
     async fn file_info(&self, path: FilesystemPath<'_>) -> Result<FileInfo, FsError> {
         match &self.dispatch {
             #[cfg(test)]
-            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Test(this) => this.file_info(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.file_info(path).await,
         }
     }
@@ -619,6 +630,9 @@ impl InstanceOperation for InstanceOperationImpl {
 }
 
 #[cfg(test)]
+// A fixture builds filesystem state directly, outside any repository; what these
+// test is how the provider reads it.
+#[allow(clippy::disallowed_methods)]
 pub mod tests {
     use std::path::Path;
     use std::sync::Arc;
@@ -652,10 +666,12 @@ pub mod tests {
     use crate::state::NodeComparison;
     use crate::state::State;
     use crate::util::path::RelativePath;
+    use crate::util::path::RepositoryPath;
 
     #[derive(Default)]
     pub struct TestFilesystemProvider {
         pub begin_count: Arc<AtomicUsize>,
+        pub file_info_count: Arc<AtomicUsize>,
         pub finalize_events: Arc<Mutex<Vec<bool>>>,
         finalize_fails: bool,
     }
@@ -664,6 +680,7 @@ pub mod tests {
         pub fn new() -> TestFilesystemProvider {
             Self {
                 begin_count: Arc::new(AtomicUsize::new(0)),
+                file_info_count: Arc::new(AtomicUsize::new(0)),
                 finalize_events: Arc::new(Mutex::new(Vec::new())),
                 finalize_fails: false,
             }
@@ -679,6 +696,11 @@ pub mod tests {
 
         pub fn begins(&self) -> usize {
             self.begin_count.load(Ordering::Acquire)
+        }
+
+        /// How many paths were looked up through operations this provider began.
+        pub fn file_infos(&self) -> usize {
+            self.file_info_count.load(Ordering::Acquire)
         }
     }
 
@@ -698,6 +720,7 @@ pub mod tests {
             self.begin_count.fetch_add(1, Ordering::AcqRel);
             Ok(Arc::new(InstanceOperationImpl::new(
                 StaticDispatchInstanceOperation::Test(TestOperation {
+                    file_info_count: self.file_info_count.clone(),
                     finalize_events: self.finalize_events.clone(),
                     finalize_fails: self.finalize_fails,
                 }),
@@ -706,6 +729,7 @@ pub mod tests {
     }
 
     pub struct TestOperation {
+        file_info_count: Arc<AtomicUsize>,
         finalize_events: Arc<Mutex<Vec<bool>>>,
         finalize_fails: bool,
     }
@@ -729,8 +753,11 @@ pub mod tests {
             panic!("Test operation unimplemented except finalize")
         }
 
+        /// Counts the lookup and reports a path the filesystem does not hold, which is
+        /// what a caller acts on without needing content behind it.
         async fn file_info(&self, _path: FilesystemPath<'_>) -> Result<FileInfo, FsError> {
-            panic!("Test operation unimplemented except finalize")
+            self.file_info_count.fetch_add(1, Ordering::AcqRel);
+            Ok(FileInfo::default())
         }
 
         async fn file_hash(
@@ -959,6 +986,82 @@ pub mod tests {
                 assert_eq!(0, stats.file_add.load(std::sync::atomic::Ordering::Relaxed));
             })
             .await;
+    }
+
+    /// The walk hands this to every component above a staged path, so it has to report
+    /// a directory that holds nothing a directory node would store.
+    #[test]
+    fn a_directory_info_is_an_existing_directory_with_no_content() {
+        let info = FileInfo::DIRECTORY;
+        assert!(info.exists);
+        assert!(info.is_dir);
+        assert!(!info.is_file);
+        assert_eq!(0, info.size);
+        assert_eq!(0, info.mtime);
+    }
+
+    /// A node staged from a `FileInfo` has to land the size, time and mode a node
+    /// staged from the metadata itself would, since the two are the same walk before
+    /// and after the file information became the currency between them.
+    #[test]
+    fn file_information_answers_what_the_metadata_helpers_answer() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("file");
+        std::fs::write(&path, b"content").expect("write");
+
+        let check = |path: &Path| {
+            let metadata = std::fs::metadata(path).expect("metadata");
+            let info = FileInfo::from_metadata(&metadata);
+            assert_eq!(crate::util::fs::file_size(&metadata), info.size);
+            assert_eq!(crate::util::fs::file_mtime(&metadata), info.mtime);
+            assert_eq!(metadata.is_dir(), info.is_dir);
+            assert_eq!(metadata.is_file(), info.is_file);
+            for previous in [0, crate::node::NodeFileMode::Executable.bits()] {
+                assert_eq!(
+                    crate::util::fs::metadata_to_mode(&metadata, previous),
+                    info.mode(previous),
+                    "mode for {} from previous {previous}",
+                    path.display()
+                );
+            }
+        };
+
+        check(&path);
+        check(dir.path());
+
+        #[cfg(target_family = "unix")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("set executable");
+            check(&path);
+            let info = FileInfo::from_metadata(&std::fs::metadata(&path).expect("metadata"));
+            assert_eq!(
+                crate::node::NodeFileMode::Executable.bits(),
+                info.mode(0),
+                "an executable file reports the bit whatever the node held"
+            );
+        }
+    }
+
+    /// The forwarder routes a lookup to the operation rather than refusing one, which
+    /// is what lets a test observe the paths an operation was asked about.
+    #[tokio::test]
+    async fn a_lookup_through_an_operation_is_counted() {
+        let filesystem = Arc::new(TestFilesystemProvider::new());
+        let operation = filesystem.begin_operation().await.expect("an operation");
+        let path = RepositoryPath::from_relative_and_root(
+            Path::new("/repository"),
+            RelativePath::new_from_initial_path("a/b").expect("path"),
+        );
+
+        let info = operation
+            .file_info(FilesystemPath::Repository(&path))
+            .await
+            .expect("a lookup is answered");
+
+        assert!(!info.exists);
+        assert_eq!(1, filesystem.file_infos());
     }
 
     #[tokio::test]

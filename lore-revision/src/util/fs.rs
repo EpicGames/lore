@@ -465,19 +465,6 @@ pub async fn filesystem_path(
         .map(|(path, _)| path)
 }
 
-/// The metadata of `path`, stat'ed unless [`filesystem_path_and_metadata`]
-/// already read it while resolving the path. A path the file system does not
-/// hold has none, which is what the callers act on.
-pub async fn metadata_or_stat(
-    resolved: Option<Metadata>,
-    path: impl Into<PathBuf>,
-) -> Option<Metadata> {
-    match resolved {
-        Some(metadata) => Some(metadata),
-        None => lore_io::IoDriver::global().metadata(path).await.ok(),
-    }
-}
-
 /// [`filesystem_path`], and the metadata of the resolved path where establishing
 /// it read that metadata, so a caller needing both reads it once.
 ///
