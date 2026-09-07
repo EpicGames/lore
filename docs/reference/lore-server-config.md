@@ -299,6 +299,43 @@ directory. The server does not load the example in place.
 > a restricted deployment without an edit. Check the `Registered public gRPC
 > services` line after an upgrade.
 
+#### Forwarded requests
+
+`[server.grpc_public_services.forwarded_requests]` lets this server answer selected
+public RPCs by forwarding them to another Lore server's internal endpoint. It is
+absent by default, and no RPC is forwarded until it is named under `enabled_rpcs`.
+
+`[server.grpc_public_services.forwarded_requests.enabled_rpcs]` takes one boolean
+per forwardable RPC, all `false` by default. Releases add to the set; an unknown
+key here is ignored, so a name that is not yet forwardable forwards nothing.
+
+`[server.grpc_public_services.forwarded_requests.client]` configures the channel to
+the peer. The defaults suit a long-lived connection that sits idle between
+forwards; tune them to the path the peer is actually reached over:
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `url` | none (required) | The peer's internal gRPC endpoint, for example `https://peer.example.com:41340`. |
+| `certs` | none | Optional certificate block for mutual TLS to the peer — same fields as the [Certificate block](#certificate-block). The peer's `[server.grpc_internal]` requires client certificates unless it sets `verify_client_certs = false`. |
+| `connect_timeout_seconds` | `5` | Ceiling on the TCP connect, divided across the addresses the URL resolves to. It covers neither DNS resolution nor the TLS handshake, so it is not a bound on the whole of establishing a connection. |
+| `request_timeout_seconds` | `40` | Deadline for each forwarded request. Keep below the `request_handler_timeout_seconds` of the endpoint doing the forwarding, so that handler outlives the call it forwards. |
+| `tcp_keepalive_seconds` | `30` | TCP keep-alive probe interval. Holds open any NAT or proxy flow state on the path while the channel is idle between requests. |
+| `http2_keepalive_interval_seconds` | `20` | HTTP/2 keep-alive PING interval. Keep below the idle timeout of anything on the path that reaps idle connections. Pings are sent while the channel is idle, not only while requests are in flight. |
+| `http2_keepalive_timeout_seconds` | `10` | How long a keep-alive PING may go unanswered before the connection is dropped and redialled. |
+
+```toml
+[server.grpc_public_services.forwarded_requests.client]
+url = "https://peer.example.com:41340"
+
+[server.grpc_public_services.forwarded_requests.client.certs]
+cert_file = "/etc/lore/tls/client.crt"
+pkey_file = "/etc/lore/tls/client.key"
+cert_chain = "/etc/lore/tls/ca.crt"
+
+[server.grpc_public_services.forwarded_requests.enabled_rpcs]
+repository_get = true
+```
+
 ### Authentication
 
 `[server.auth]` configures JWT verification for the gRPC API. When `[server.auth]` (or its `[server.auth.jwk]` sub-table) is absent — as in every shipped config — JWT verification is disabled and the gRPC services accept unauthenticated requests.

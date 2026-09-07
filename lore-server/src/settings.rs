@@ -371,6 +371,45 @@ pub struct ServerSettings {
 pub struct GrpcInternalClientSettings {
     pub url: String,
     pub certs: Option<CertificateSettings>,
+    /// Ceiling on the TCP connect. Covers neither DNS nor the TLS handshake.
+    #[serde(default = "GrpcInternalClientSettings::default_connect_timeout_seconds")]
+    pub connect_timeout_seconds: u64,
+    /// Deadline for each request on the channel. Keep below the
+    /// `request_handler_timeout_seconds` of the endpoint whose handler issues it.
+    #[serde(default = "GrpcInternalClientSettings::default_request_timeout_seconds")]
+    pub request_timeout_seconds: u64,
+    #[serde(default = "GrpcInternalClientSettings::default_tcp_keepalive_seconds")]
+    pub tcp_keepalive_seconds: u64,
+    /// HTTP/2 keep-alive PING interval, sent while the channel is idle. Keep below
+    /// the idle timeout of anything on the path that reaps idle connections.
+    #[serde(default = "GrpcInternalClientSettings::default_http2_keepalive_interval_seconds")]
+    pub http2_keepalive_interval_seconds: u64,
+    /// How long a keep-alive PING may go unanswered before the connection is
+    /// dropped.
+    #[serde(default = "GrpcInternalClientSettings::default_http2_keepalive_timeout_seconds")]
+    pub http2_keepalive_timeout_seconds: u64,
+}
+
+impl GrpcInternalClientSettings {
+    fn default_connect_timeout_seconds() -> u64 {
+        5
+    }
+
+    fn default_request_timeout_seconds() -> u64 {
+        40
+    }
+
+    fn default_tcp_keepalive_seconds() -> u64 {
+        30
+    }
+
+    fn default_http2_keepalive_interval_seconds() -> u64 {
+        20
+    }
+
+    fn default_http2_keepalive_timeout_seconds() -> u64 {
+        10
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

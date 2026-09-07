@@ -5,6 +5,7 @@ pub mod repository_service;
 pub mod revision_service;
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use http::Uri;
 use lore_base::lore_spawn_net;
@@ -196,7 +197,17 @@ async fn make_channel(settings: &GrpcInternalClientSettings) -> Result<Channel, 
 
     let endpoint = endpoint
         .user_agent(user_agent())
-        .internal("error setting user agent")?;
+        .internal("error setting user agent")?
+        .connect_timeout(Duration::from_secs(settings.connect_timeout_seconds))
+        .timeout(Duration::from_secs(settings.request_timeout_seconds))
+        .tcp_keepalive(Some(Duration::from_secs(settings.tcp_keepalive_seconds)))
+        .http2_keep_alive_interval(Duration::from_secs(
+            settings.http2_keepalive_interval_seconds,
+        ))
+        .keep_alive_timeout(Duration::from_secs(
+            settings.http2_keepalive_timeout_seconds,
+        ))
+        .keep_alive_while_idle(true);
     // Connect from net so the hyper/h2 driver tasks this spawns bind there rather
     // than to the core runtime the caller runs on.
     let channel = lore_spawn_net!(async move { endpoint.connect().await })
