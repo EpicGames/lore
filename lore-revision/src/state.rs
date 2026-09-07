@@ -45,6 +45,7 @@ use crate::errors::InvalidArguments;
 use crate::errors::LinkNotFound;
 use crate::errors::NodeNotFound;
 use crate::errors::NotFound;
+use crate::errors::NotSupported;
 use crate::errors::Oversized;
 use crate::errors::StateErrors;
 use crate::filter::FilterMode;
@@ -6323,12 +6324,16 @@ pub(crate) async fn diff_os_filesystem(
 /// marking newly created segments as dirty-add. A path-filtered scan can enter
 /// a directory (or a file's parent) present on disk but absent from `state_from`;
 /// creating the chain lets adds discovered inside resolve their parent node.
-/// Returns the node for the final path segment.
+///
+/// A segment that is a link mount is crossed, and the chain continues in the
+/// state that owns it — a `NodeID` encodes a block index, so the same
+/// coordinates address a different node, or none, in another state. Returns
+/// that repository and state with the chain's final node.
 async fn ensure_scan_dir_chain(
-    repository: Arc<RepositoryContext>,
-    state: Arc<State>,
+    mut repository: Arc<RepositoryContext>,
+    mut state: Arc<State>,
     path: &str,
-) -> Result<NodeID, StateError> {
+) -> Result<(Arc<RepositoryContext>, Arc<State>, NodeID), StateError> {
     let mut current_node = ROOT_NODE;
     for segment in path.split('/').filter(|s| !s.is_empty()) {
         let name_hash = crate::hash::hash_string(segment);
@@ -6336,7 +6341,17 @@ async fn ensure_scan_dir_chain(
             .find_subnode(repository.clone(), current_node, name_hash)
             .await
         {
-            current_node = child_id;
+            let child = state.node(repository.clone(), child_id).await?;
+            if child.is_link() {
+                let link = child.linked_node();
+                let (linked_repository, linked_state) =
+                    link.resolve(repository.clone(), state.clone()).await?;
+                repository = linked_repository;
+                state = linked_state;
+                current_node = link.node;
+            } else {
+                current_node = child_id;
+            }
         } else {
             let dir_node = Node {
                 flags: NodeFlags::DirtyAdd.bits(),
@@ -6349,7 +6364,7 @@ async fn ensure_scan_dir_chain(
                 .forward::<StateError>("scan add: failed to create entry directory node")?;
         }
     }
-    Ok(current_node)
+    Ok((repository, state, current_node))
 }
 
 async fn diff_filesystem_subtree_impl(
@@ -6368,28 +6383,40 @@ async fn diff_filesystem_subtree_impl(
                 && !ctx.from.root_node.is_valid_or_root_node_id()
                 && !ctx.filesystem_path.is_empty()
             {
-                let entry_node = ensure_scan_dir_chain(
+                let (entry_repository, entry_state, entry_node) = ensure_scan_dir_chain(
                     ctx.from.repository.clone(),
                     ctx.from.state.clone(),
                     ctx.filesystem_path.as_str(),
                 )
                 .await?;
+                ctx.from.repository = entry_repository;
+                ctx.from.state = entry_state;
                 ctx.from.root_node = entry_node;
             }
             diff_filesystem_directory(ctx, listing).await
         }
         util::fs::PathListingResult::File { item } => {
             // A path-filtered scan of a new file: ensure its parent directory
-            // chain exists so the add resolves its parent node.
+            // chain exists so the add resolves its parent node. The chain
+            // returns that node — below a crossed link mount the path no longer
+            // resolves in the state that holds it.
+            let mut scan_parent_node = None;
             if ctx.intent.marks_dirty()
                 && !ctx.from.root_node.is_valid_node_id()
                 && let Some(parent) = ctx.filesystem_path.parent()
                 && !parent.is_empty()
             {
-                ensure_scan_dir_chain(ctx.from.repository.clone(), ctx.from.state.clone(), parent)
-                    .await?;
+                let (parent_repository, parent_state, parent_node) = ensure_scan_dir_chain(
+                    ctx.from.repository.clone(),
+                    ctx.from.state.clone(),
+                    parent,
+                )
+                .await?;
+                ctx.from.repository = parent_repository;
+                ctx.from.state = parent_state;
+                scan_parent_node = Some(parent_node);
             }
-            diff_filesystem_single_file(ctx, item).await
+            diff_filesystem_single_file(ctx, item, scan_parent_node).await
         }
         util::fs::PathListingResult::NotFound => {
             // Path doesn't exist on filesystem - everything in state is deleted
@@ -6878,22 +6905,36 @@ async fn handle_single_file_compare_result(
             let to_state = if !is_filesystem_directory && ctx.intent.marks_dirty() {
                 let parent_path = file_path.parent();
                 let file_name = file_path.name();
-                // The directory walk supplies the parent node directly (correct
-                // even across link/layer boundaries). For a single-file path the
-                // parent was created during discovery, so resolving by path must
-                // succeed.
+                // The directory walk and the single-file scan both supply the
+                // parent node, correct across link and layer boundaries.
+                // Resolving by path is the fallback when neither did.
                 let parent_node_id = if let Some(parent) = ctx.parent_node_id {
                     parent
                 } else {
                     match parent_path {
                         Some(p) if !p.is_empty() => {
-                            ctx.state_from
+                            let link = ctx
+                                .state_from
                                 .find_node_link(ctx.repository_from.clone(), p)
                                 .await
                                 .forward::<StateError>(
                                     "scan add: parent directory node missing for nested add",
-                                )?
-                                .node
+                                )?;
+                            // find_node_link follows link mounts, so the node
+                            // it returns can belong to another state. Adding
+                            // under it here would address a colliding node, or
+                            // a block this state does not have.
+                            if link.repository != ctx.repository_from.id {
+                                return Err(NotSupported {
+                                    operation: format!(
+                                        "scanning {file_path} into link mount {p}, \
+                                         owned by repository {}",
+                                        link.repository
+                                    ),
+                                }
+                                .into());
+                            }
+                            link.node
                         }
                         _ => ROOT_NODE,
                     }
@@ -6912,11 +6953,14 @@ async fn handle_single_file_compare_result(
                         stage.file_id.unwrap_or_else(|| uuid::Uuid::now_v7().into());
                 }
 
+                // A failed add cannot continue: `add_change` has no correct
+                // result from `INVALID_NODE`, and the state is already mutated
+                // by the time it would use one.
                 let new_node_id = ctx
                     .state_from
                     .node_add(ctx.repository_from.clone(), parent_node_id, node, file_name)
                     .await
-                    .unwrap_or(INVALID_NODE);
+                    .forward::<StateError>("scan add: failed to add node")?;
                 if staging.is_some() {
                     mark_settled(
                         &ctx.state_from,
@@ -6929,15 +6973,15 @@ async fn handle_single_file_compare_result(
                 }
 
                 // Propagate dirty to parent
-                let _ = ctx
-                    .state_from
+                ctx.state_from
                     .node_mark_dirty(
                         ctx.repository_from.clone(),
                         parent_node_id,
                         NodeFlags::Dirty,
                         false,
                     )
-                    .await;
+                    .await
+                    .forward::<StateError>("scan add: failed to mark parent dirty")?;
 
                 NodeChangeState {
                     repository: ctx.repository_from.clone(),
@@ -8105,6 +8149,7 @@ fn diff_filesystem_subtree_merge(
 async fn diff_filesystem_single_file(
     ctx: FilesystemDiffContext,
     file_item: util::fs::FileListItem,
+    scan_parent_node: Option<NodeID>,
 ) -> Result<(Vec<NodeChange>, FilesystemDiffStats), StateError> {
     let mut changes = vec![];
     let stats = FilesystemDiffStats::default();
@@ -8176,7 +8221,7 @@ async fn diff_filesystem_single_file(
         state_from: ctx.from.state.clone(),
         from_node_id: ctx.from.root_node,
         from_node,
-        parent_node_id: None,
+        parent_node_id: scan_parent_node,
         intent: ctx.intent,
         states: ctx.states,
         observed,
