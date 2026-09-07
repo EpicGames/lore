@@ -21,8 +21,11 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use tracing::debug;
 use tracing::error;
 
-pub(crate) static USER_AGENT_NONE: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("<none>"));
-pub(crate) static USER_AGENT_UNKNOWN: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("<unknown>"));
+/// Recorded in place of a `User-Agent` the request did not carry.
+pub static USER_AGENT_NONE: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("<none>"));
+/// Recorded in place of a `User-Agent` no configured pattern recognises, so a
+/// caller cannot choose the value.
+pub static USER_AGENT_UNKNOWN: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from("<unknown>"));
 
 static METER_PROVIDER: OnceLock<RwLock<Arc<SdkMeterProvider>>> = OnceLock::new();
 

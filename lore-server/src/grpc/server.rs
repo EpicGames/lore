@@ -61,6 +61,7 @@ use crate::grpc::revision_service::LoreRevisionService;
 use crate::grpc::storage_service::LoreStorageService;
 use crate::grpc::thinclient::LoreThinClientV1Service;
 use crate::grpc::tower::grpc_response_trace::GrpcResponseTraceLayer;
+use crate::grpc::tower::malformed_request::MalformedRequestLayer;
 use crate::grpc::tower::tracing::LoreTracingLayer;
 use crate::hooks::HookDispatcher;
 use crate::legacy::rpc::environment_service_server::EnvironmentServiceServer;
@@ -74,17 +75,23 @@ use crate::util::core_hop::CoreHopLayer;
 // Copy and paste from the rust compiler for sanity
 type GrpcRouter = tonic::transport::server::Router<
     Stack<
-        GrpcResponseTraceLayer,
+        MalformedRequestLayer,
         Stack<
-            ServiceBuilder<Stack<GrpcMetricsLayer, tower::layer::util::Identity>>,
+            GrpcResponseTraceLayer,
             Stack<
-                LoreTracingLayer,
+                ServiceBuilder<Stack<GrpcMetricsLayer, tower::layer::util::Identity>>,
                 Stack<
+                    LoreTracingLayer,
                     Stack<
-                        TraceLayer<SharedClassifier<GrpcErrorsAsFailures>, MakeCorrelationIdSpan>,
-                        CorrelationIdLayer,
+                        Stack<
+                            TraceLayer<
+                                SharedClassifier<GrpcErrorsAsFailures>,
+                                MakeCorrelationIdSpan,
+                            >,
+                            CorrelationIdLayer,
+                        >,
+                        Stack<CoreHopLayer, tower::layer::util::Identity>,
                     >,
-                    Stack<CoreHopLayer, tower::layer::util::Identity>,
                 >,
             >,
         >,
@@ -608,8 +615,8 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             enabled
         };
 
-        let metrics_layer =
-            tower::ServiceBuilder::new().layer(GrpcMetricsLayer::new(self.0.user_agent_filter));
+        let metrics_layer = tower::ServiceBuilder::new()
+            .layer(GrpcMetricsLayer::new(self.0.user_agent_filter.clone()));
         let mut server = Server::builder()
             .http2_keepalive_interval(self.0.http2_keep_alive_interval)
             .http2_keepalive_timeout(self.0.http2_keep_alive_timeout);
@@ -633,6 +640,8 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             .layer(LoreTracingLayer {})
             .layer(metrics_layer)
             .layer(GrpcResponseTraceLayer {})
+            // Innermost: the layers above must observe the reclassified status.
+            .layer(MalformedRequestLayer::new(self.0.user_agent_filter))
             // Empty routes turn the `Server` into a `Router` without mounting
             // anything; unmatched paths answer UNIMPLEMENTED.
             .add_routes(Routes::default());
