@@ -96,7 +96,7 @@ def test_push_missing_fragments(new_lore_repo, missing_fragments_remote_url):
     # Push main branch
     output = repo.push(check=False).strip()
 
-    assert "Missing fragment" in output, "Push failed for unrelated reason"
+    assert "peer is missing a fragment" in output, "Push failed for unrelated reason"
 
     # Create source repository
     repo = new_lore_repo(remote_url=missing_fragments_remote_url)
