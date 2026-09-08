@@ -96,7 +96,13 @@ def test_push_missing_fragments(new_lore_repo, missing_fragments_remote_url):
     # Push main branch
     output = repo.push(check=False).strip()
 
-    assert "Missing fragment" in output, "Push failed for unrelated reason"
+    # The client reports the server's AddressNotFound by its own wording and the
+    # missing address; the server's status text is not echoed. Assert on both so
+    # the test pins the error class and that it names a dropped fragment.
+    assert "peer is missing a fragment" in output, "Push failed for unrelated reason"
+    assert any(h in output for h in DROPPED_FRAGMENT_HASHES.split(",")), (
+        "Push failure did not name a dropped fragment"
+    )
 
     # Create source repository
     repo = new_lore_repo(remote_url=missing_fragments_remote_url)
