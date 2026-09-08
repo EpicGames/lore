@@ -4074,8 +4074,7 @@ mod write_token_tests {
     /// and shares siblings to every constructed context.
     #[tokio::test]
     async fn no_store_context_with_client_token_grants_write_capability() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("lore-write-token-test-{}", std::process::id()));
+        let temp_dir = lore_base::test_util::TempDir::new("lore-write-token-test-");
         let token = RepositoryWriteToken::acquire(&temp_dir).await;
         let ctx = in_memory_context().await;
         let with_token = Arc::new(

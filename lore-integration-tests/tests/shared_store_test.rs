@@ -40,11 +40,8 @@ mod shared_store_tests {
         LoreGlobalArgs::default()
     }
 
-    fn tempdir(tag: &str) -> tempfile::TempDir {
-        tempfile::Builder::new()
-            .prefix(&format!("lore-shared-store-{tag}-"))
-            .tempdir()
-            .expect("create tempdir")
+    fn tempdir(tag: &str) -> lore_base::test_util::TempDir {
+        lore_base::test_util::TempDir::new(&format!("lore-shared-store-{tag}-"))
     }
 
     fn capture_sink() -> (Arc<Mutex<Vec<LoreEvent>>>, LoreEventCallback) {

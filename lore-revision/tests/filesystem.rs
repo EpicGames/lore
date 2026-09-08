@@ -27,17 +27,6 @@ mod tests {
 
     include!("helper.rs");
 
-    struct Cleanup {
-        path: PathBuf,
-    }
-
-    impl Drop for Cleanup {
-        fn drop(&mut self) {
-            #[allow(clippy::disallowed_methods)]
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
-
     /// Runs a filesystem operation test with standard setup and teardown.
     ///
     /// Creates a temporary repository, begins a filesystem operation, runs the test,
@@ -59,7 +48,6 @@ mod tests {
         let tempdir = generate_tempdir();
         let temp_path = tempdir.to_path_buf();
         let path = temp_path.clone();
-        let _cleanup = Cleanup { path: path.clone() };
 
         #[allow(clippy::disallowed_methods)]
         runtime()
@@ -91,8 +79,6 @@ mod tests {
                     .finalize(changes_made)
                     .await
                     .expect("finalize should succeed");
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -144,14 +130,9 @@ mod tests {
                 // Test finalize with changes_made=false
                 let result = operation2.finalize(false).await;
                 assert!(result.is_ok(), "finalize(false) should succeed");
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
-
-        #[allow(clippy::disallowed_methods)]
-        let _ = std::fs::remove_dir_all(temp_path.as_path());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -371,8 +352,8 @@ mod tests {
                 file.write_all(content).expect("Write failed");
             }
 
-            let scratch_dir = std::env::temp_dir();
-            let scratch_file = scratch_dir.join("lore_test_scratch_copy.txt");
+            let scratch_dir = TempDir::new("lore-test-scratch-copy-");
+            let scratch_file = scratch_dir.child("lore_test_scratch_copy.txt");
 
             let source_rel_path = RelativePath::new_from_initial_path("source.txt").unwrap();
             operation
@@ -392,8 +373,6 @@ mod tests {
                 "Copied content should match source"
             );
 
-            #[allow(clippy::disallowed_methods)]
-            let _ = std::fs::remove_file(&scratch_file);
             false
         })
         .await;
@@ -446,8 +425,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn instance_operation_scratch_path() {
         run_fs_test(|_repository, operation, _path| async move {
-            let scratch_dir = std::env::temp_dir().join("lore_test_scratch_dir");
-            std::fs::create_dir_all(&scratch_dir).expect("Create scratch dir failed");
+            let scratch_dir = TempDir::new("lore-test-scratch-dir-");
 
             let scratch_file = scratch_dir.join("scratch_file.txt");
             {
@@ -463,8 +441,6 @@ mod tests {
             assert!(info.exists, "Scratch file should exist");
             assert!(info.is_file, "Scratch path should be a file");
 
-            #[allow(clippy::disallowed_methods)]
-            let _ = std::fs::remove_dir_all(&scratch_dir);
             false
         })
         .await;

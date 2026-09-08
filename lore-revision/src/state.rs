@@ -10152,7 +10152,7 @@ mod tests {
     /// recovering from.
     #[tokio::test]
     async fn a_comparison_that_settles_nothing_reads_as_modified() {
-        let dir = tempfile::TempDir::new().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-state-test-");
         let repository = working_tree_repository(dir.path()).await;
         let content = pseudo_random_bytes(150 * 1024);
         let path = write_working_file(&repository, "settles-nothing.bin", &content).await;
@@ -10178,7 +10178,7 @@ mod tests {
     /// either way.
     #[tokio::test]
     async fn an_unfragmented_file_is_decided_by_its_own_hash() {
-        let dir = tempfile::TempDir::new().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-state-test-");
         let repository = working_tree_repository(dir.path()).await;
         let content = pseudo_random_bytes(20 * 1024);
         let path = write_working_file(&repository, "unfragmented.bin", &content).await;
@@ -10213,7 +10213,7 @@ mod tests {
     /// A file of another size is modified without the file being read at all.
     #[tokio::test]
     async fn a_file_of_another_size_is_modified_unread() {
-        let dir = tempfile::TempDir::new().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-state-test-");
         let repository = working_tree_repository(dir.path()).await;
         let content = pseudo_random_bytes(20 * 1024);
         let path = write_working_file(&repository, "resized.bin", &content).await;

@@ -9,6 +9,10 @@ name = "lore_base"
 
 [features]
 trace_log = []
+# The shared test temp-directory helper in src/test_util.rs. Crates whose tests
+# need scratch space on disk enable it from their dev-dependencies, so it stays
+# out of every normal build.
+test-util = ["dep:tempfile"]
 
 [dependencies]
 # allocator
@@ -30,6 +34,11 @@ bitflags = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
 rand = { workspace = true }
+# Built only when `test-util` is on, so it stays out of normal builds. It is a
+# normal optional dependency rather than a dev-dependency because a dependent
+# enabling the feature compiles lore-base normally, and a normal build cannot see
+# dev-dependencies.
+tempfile = { workspace = true, optional = true }
 serde = { workspace = true }
 uuid = { workspace = true, features = ["zerocopy"] }
 
@@ -48,6 +57,10 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage
 [dev-dependencies]
 # The non-self-describing format the identifier types must round-trip through.
 bitcode = { workspace = true }
+# This crate's own tests reach test_util through the `test` arm of its cfg, which
+# bypasses the `test-util` feature and so does not pull in the optional
+# dependency above.
+tempfile = { workspace = true }
 serde_json = { workspace = true, features = ["std"] }
 
 [build-dependencies]

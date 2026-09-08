@@ -1025,10 +1025,10 @@ fn saved_rules_reload_to_the_same_filter() {
         }
     }
 
-    let file = std::env::temp_dir().join("lore-filter-save-roundtrip");
+    let dir = lore_base::test_util::TempDir::new("lore-filter-save-roundtrip-");
+    let file = dir.child("filter");
     lore_revision::filter::save(&original, &file).expect("save");
     let reloaded = lore_revision::filter::load_filter(&file).expect("load");
-    let _ = std::fs::remove_file(&file);
 
     assert_eq!(reloaded.lines.len(), original.lines.len());
     for case in CASES.iter().take(200) {

@@ -2135,13 +2135,11 @@ mod storage_remote_tests {
                     let handle_id = open_remote_handle(&server).await;
 
                     let payload = b"put_file remote upload payload".to_vec();
-                    let mut tempfile_handle = tempfile::Builder::new()
-                        .prefix("lore-put-file-remote-")
-                        .tempfile()
-                        .expect("create tempfile");
-                    std::io::Write::write_all(&mut tempfile_handle, &payload)
-                        .expect("write tempfile");
-                    let path = tempfile_handle.path().to_string_lossy().into_owned();
+                    let temp_file = lore_base::test_util::TempFile::with_contents(
+                        "lore-put-file-remote-",
+                        &payload,
+                    );
+                    let path = temp_file.path().to_string_lossy().into_owned();
                     let partition = Partition::from([0xb1u8; 16]);
 
                     let captured: Arc<Mutex<Vec<(u64, Address, LoreErrorCode)>>> =
@@ -2250,10 +2248,7 @@ mod storage_remote_tests {
                         .await
                         .expect("backend seed put");
 
-                    let target_dir = tempfile::Builder::new()
-                        .prefix("lore-get-file-remote-")
-                        .tempdir()
-                        .expect("create tempdir");
+                    let target_dir = lore_base::test_util::TempDir::new("lore-get-file-remote-");
                     let target_path_buf = target_dir.path().join("target");
                     let target_path = target_path_buf.to_string_lossy().into_owned();
 
@@ -4787,11 +4782,11 @@ mod storage_remote_tests {
     /// A path inside a fresh `TempDir`, holding `payload` when one is given and not created at all
     /// when none is — a read target must not exist before the op writes it. The directory cleans
     /// its whole tree on Drop, so the caller holds the guard for the scope it needs the path in.
-    fn temp_file(tag: &str, payload: Option<&[u8]>) -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::Builder::new()
-            .prefix(&format!("lore-file-resolved-{tag}-"))
-            .tempdir()
-            .expect("create tempdir");
+    fn temp_file(
+        tag: &str,
+        payload: Option<&[u8]>,
+    ) -> (lore_base::test_util::TempDir, std::path::PathBuf) {
+        let dir = lore_base::test_util::TempDir::new(&format!("lore-file-resolved-{tag}-"));
         let path = dir.path().join("content");
         if let Some(payload) = payload {
             std::fs::write(&path, payload).expect("write source file");

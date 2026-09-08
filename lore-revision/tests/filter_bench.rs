@@ -61,6 +61,7 @@ fn time(label: &str, calls: usize, run: impl Fn() -> usize) {
 /// `Filter::excludes`, the call every production site reaches through
 /// `emit_excludes`, over paths spanning every rule kind.
 #[test]
+#[ignore = "benchmark: run on demand with --ignored"]
 fn excludes_throughput() {
     let filter = build();
     let probes = paths(probe_paths());
@@ -86,6 +87,7 @@ fn excludes_throughput() {
 /// `Filter::excludes` over a targets file, the shape `lore stage --targets` is
 /// handed: many paths, far fewer directories.
 #[test]
+#[ignore = "benchmark: run on demand with --ignored"]
 fn targets_file_throughput() {
     let filter = build();
     let targets = paths(
@@ -111,6 +113,7 @@ fn targets_file_throughput() {
 /// `Filter::excludes_subtree`, which `state::diff` asks of every directory it
 /// meets to decide whether the subtree can be skipped whole.
 #[test]
+#[ignore = "benchmark: run on demand with --ignored"]
 fn excludes_subtree_throughput() {
     let filter = build();
     let dirs: Vec<RelativePath> = probe_paths()

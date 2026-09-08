@@ -245,27 +245,7 @@ impl Drop for FSLock {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A directory to lock, removed when the test ends.
-    struct TempDir(std::path::PathBuf);
-
-    impl TempDir {
-        fn new(name: &str) -> Self {
-            let path = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
-            std::fs::create_dir_all(&path).expect("failed to create temp dir");
-            TempDir(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::test_util::TempDir;
 
     /// The lock excludes a second acquirer, which waits rather than failing. Both `flock` and
     /// `LockFileEx` contend between separate handles on one file, so one process is enough to

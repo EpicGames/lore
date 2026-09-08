@@ -12,6 +12,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
+    use lore_base::test_util::TempDir;
     use lore_storage::ImmutableStoreSettings;
     use lore_storage::MutableStoreSettings;
     use lore_storage::local::fan_out::FAN_OUT_THRESHOLD_DEFAULT;
@@ -19,15 +20,8 @@ mod tests {
     use rand::SeedableRng;
     use rand::rngs::StdRng;
 
-    fn temp_dir() -> PathBuf {
-        let name = format!("store_fan_out_test_{}", rand::random::<u64>());
-        let path = std::env::temp_dir().join(name);
-        std::fs::create_dir_all(&path).expect("Failed to create temp dir");
-        path
-    }
-
-    fn cleanup(path: &Path) {
-        let _ = std::fs::remove_dir_all(path);
+    fn temp_dir() -> TempDir {
+        TempDir::new("store-fan-out-test-")
     }
 
     /// Generate a deterministic 32-byte hash from a seeded RNG, evenly distributed across the hash
@@ -130,8 +124,6 @@ mod tests {
             total_files <= 512,
             "expected ≤512 on-disk files for level-1 mutable store, got {total_files} (every group at level 1 should write at most 1 bucket file + 1 marker file)"
         );
-
-        cleanup(&store_path);
     }
 
     /// REQ-F-1 acceptance: a fresh client `LocalImmutableStore` at level 1, after writing 100,000
@@ -141,7 +133,7 @@ mod tests {
     async fn immutable_store_at_level_one_writes_at_most_768_files_for_100k_entries() {
         let store_path = temp_dir();
         let store = lore_storage::LocalImmutableStore::new(
-            Some(store_path.clone()),
+            Some(store_path.path().to_path_buf()),
             ImmutableStoreSettings {
                 initial_fan_out_level: 1,
                 fan_out_threshold: FAN_OUT_THRESHOLD_DEFAULT,
@@ -211,8 +203,6 @@ mod tests {
             total_files <= 768,
             "expected ≤768 on-disk files for level-1 immutable store, got {total_files} (every group at level 1 should write at most 1 bucket + 1 marker + 1 packfile)"
         );
-
-        cleanup(&store_path);
     }
 
     /// Open a `LocalMutableStore` at `store_path` over a throwaway in-memory immutable store.
@@ -307,8 +297,6 @@ mod tests {
                 .expect("Lookup failed for written key");
             assert_eq!(loaded, value, "Loaded value did not match stored value");
         }
-
-        cleanup(&store_path);
     }
 
     /// The immutable store makes the same decision the same way; see
@@ -339,9 +327,12 @@ mod tests {
             context: lore_storage::Context::default(),
         };
 
-        let store = lore_storage::LocalImmutableStore::new(Some(store_path.clone()), settings())
-            .await
-            .expect("Failed to create immutable store");
+        let store = lore_storage::LocalImmutableStore::new(
+            Some(store_path.path().to_path_buf()),
+            settings(),
+        )
+        .await
+        .expect("Failed to create immutable store");
         store
             .clone()
             .store(partition, written, fragment, Some(payload.clone()), false)
@@ -350,9 +341,12 @@ mod tests {
         let store: Arc<dyn lore_storage::ImmutableStore> = store;
         store.flush(true).await.expect("Failed to flush");
 
-        let store = lore_storage::LocalImmutableStore::new(Some(store_path.clone()), settings())
-            .await
-            .expect("Failed to reopen immutable store");
+        let store = lore_storage::LocalImmutableStore::new(
+            Some(store_path.path().to_path_buf()),
+            settings(),
+        )
+        .await
+        .expect("Failed to reopen immutable store");
         for (idx, group) in store.group.iter().enumerate() {
             let count = group.bucket_count.load(Ordering::Relaxed);
             assert_eq!(count, 1, "Group {idx} must reopen at the initial level 1");
@@ -365,9 +359,12 @@ mod tests {
         let store: Arc<dyn lore_storage::ImmutableStore> = store;
         store.flush(true).await.expect("Failed to flush");
 
-        let store = lore_storage::LocalImmutableStore::new(Some(store_path.clone()), settings())
-            .await
-            .expect("Failed to reopen immutable store");
+        let store = lore_storage::LocalImmutableStore::new(
+            Some(store_path.path().to_path_buf()),
+            settings(),
+        )
+        .await
+        .expect("Failed to reopen immutable store");
         assert_eq!(
             store.group[0x42].bucket_count.load(Ordering::Relaxed),
             1,
@@ -385,8 +382,6 @@ mod tests {
                 result.matching
             );
         }
-
-        cleanup(&store_path);
     }
 
     /// Per-group `bucket_count` must remain at the configured initial level when the workload
@@ -448,8 +443,6 @@ mod tests {
             }
         }
         assert!(found_marker, "Expected at least one group marker file");
-
-        cleanup(&store_path);
     }
 
     /// Server-mode default (`initial_fan_out_level` = 256) on a FRESH disk goes to fan-out-aware
@@ -514,8 +507,6 @@ mod tests {
             found_marker_at_256,
             "Expected marker file recording level 256 in at least one group"
         );
-
-        cleanup(&store_path);
     }
 
     /// REQ-F-5 acceptance: every maintenance function iterates per-group bucket arrays at the
@@ -528,7 +519,7 @@ mod tests {
     async fn mixed_level_maintenance_is_consistent() {
         let store_path = temp_dir();
         let store = lore_storage::LocalImmutableStore::new(
-            Some(store_path.clone()),
+            Some(store_path.path().to_path_buf()),
             ImmutableStoreSettings {
                 initial_fan_out_level: 1,
                 ..Default::default()
@@ -592,8 +583,6 @@ mod tests {
         assert_eq!(store.group[0].bucket_count.load(Ordering::Relaxed), 1);
         assert_eq!(store.group[1].bucket_count.load(Ordering::Relaxed), 32);
         assert_eq!(store.group[100].bucket_count.load(Ordering::Relaxed), 256);
-
-        cleanup(&store_path);
     }
 
     /// REQ-F-3 / REQ-NF-3 acceptance: a v2-format mutable store synthesised inline (mimicking what
@@ -666,8 +655,6 @@ mod tests {
             snapshot_before, snapshot_after,
             "On-disk DATA state must be byte-identical after a read-only session (lock files excluded)"
         );
-
-        cleanup(&store_path);
     }
 
     /// REQ-F-3 / REQ-NF-3 acceptance under Decision 8: a v2-format mutable store opened for
@@ -794,8 +781,6 @@ mod tests {
             .await
             .expect("Lookup failed for written key");
         assert_eq!(loaded, value);
-
-        cleanup(&store_path);
     }
 
     /// Walks `dir` recursively, returning a map of every file `PATH→CONTENT`. Skips infrastructure
@@ -893,7 +878,6 @@ mod tests {
             }
         }
         assert!(found_v3, "No bucket files found to inspect");
-        cleanup(&store_path);
     }
 
     /// REQ-F-6 / T9(a) acceptance for `LocalMutableStore`: 5,000 entries to a single group at level
@@ -981,8 +965,6 @@ mod tests {
                 .expect("Lookup failed after fan-out");
             assert_eq!(loaded, *value);
         }
-
-        cleanup(&store_path);
     }
 
     /// REQ-F-6 / T9(a) acceptance for `LocalImmutableStore`: same direct-jump fan-out semantics as
@@ -992,7 +974,7 @@ mod tests {
     async fn immutable_5000_entries_in_one_group_fans_out_to_level_32() {
         let store_path = temp_dir();
         let store = lore_storage::LocalImmutableStore::new(
-            Some(store_path.clone()),
+            Some(store_path.path().to_path_buf()),
             ImmutableStoreSettings {
                 initial_fan_out_level: 1,
                 fan_out_threshold: FAN_OUT_THRESHOLD_DEFAULT,
@@ -1056,8 +1038,6 @@ mod tests {
                 "Address not findable after fan-out"
             );
         }
-
-        cleanup(&store_path);
     }
 
     /// T9(b) acceptance: load an existing on-disk store with entries spread across all level-32
@@ -1205,8 +1185,6 @@ mod tests {
                 );
             }
         }
-
-        cleanup(&store_path);
     }
 
     /// T9(c)+(d) acceptance: 100 concurrent writer tasks against a single group while flushes run
@@ -1319,8 +1297,6 @@ mod tests {
                 "Value mismatch for concurrently-written key (CAS-retry regression)"
             );
         }
-
-        cleanup(&store_path);
     }
 
     /// REQ-F-2 / REQ-NF-2: smoke-grade latency check at level 256. Pre-populates a server-mode
@@ -1395,7 +1371,6 @@ mod tests {
             median < 1_000_000,
             "median lookup latency {median}ns is implausibly slow (>1ms)"
         );
-        cleanup(&store_path);
     }
 
     /// Reload a fan-out-aware store written by an earlier session and confirm `bucket_count` is
@@ -1475,8 +1450,6 @@ mod tests {
                 "Expected at least one group restored to bucket_count = 1 from marker"
             );
         }
-
-        cleanup(&store_path);
     }
 
     /// Helper: create a mutable store at `initial_fan_out_level=1`, write enough entries pinned
@@ -1491,7 +1464,9 @@ mod tests {
         seed: u64,
         threshold: usize,
     ) -> (
-        PathBuf,
+        // The guard, not just its path: the directory lives as long as this
+        // value, and the caller reads it after this returns.
+        TempDir,
         PathBuf,
         Vec<(lore_storage::Hash, lore_storage::Hash)>,
     ) {
@@ -1618,8 +1593,6 @@ mod tests {
         );
 
         verify_all_keys_findable_and_drop(&store_path, &keys).await;
-
-        cleanup(&store_path);
     }
 
     /// T10 crash point 2: `level.pending` written, all `.new` files in place, no renames done
@@ -1664,8 +1637,6 @@ mod tests {
                 .unwrap(),
             Some(32)
         );
-
-        cleanup(&store_path);
     }
 
     /// T10 crash point 3a: mid-renames. Some `.new` already renamed to final, some still as
@@ -1716,8 +1687,6 @@ mod tests {
                 .unwrap(),
             Some(32)
         );
-
-        cleanup(&store_path);
     }
 
     /// T10 crash points 4 and 5: all renames done, marker may or may not be written, pending
@@ -1747,8 +1716,6 @@ mod tests {
                 .unwrap(),
             Some(32)
         );
-
-        cleanup(&store_path);
     }
 
     /// REQ-NF-5 / Decision 8: an existing immutable store at the current pre-fan-out version
@@ -1768,7 +1735,7 @@ mod tests {
         std::fs::write(group_dir.join("index_00"), &bucket_bytes).unwrap();
 
         let store = lore_storage::LocalImmutableStore::new(
-            Some(store_path.clone()),
+            Some(store_path.path().to_path_buf()),
             ImmutableStoreSettings::default(),
         )
         .await
@@ -1780,8 +1747,6 @@ mod tests {
             lore_storage::local::immutable_store::ImmutableStoreVersion::LastAccessInEntry as u32,
             "Current v4 store should stay at LastAccessInEntry, got {v}"
         );
-
-        cleanup(&store_path);
     }
 
     /// REQ-NF-5 / Decision 8: an existing immutable store at an older version (v1-v3) gets
@@ -1802,7 +1767,7 @@ mod tests {
         std::fs::write(group_dir.join("index_00"), &bucket_bytes).unwrap();
 
         let store = lore_storage::LocalImmutableStore::new(
-            Some(store_path.clone()),
+            Some(store_path.path().to_path_buf()),
             ImmutableStoreSettings::default(),
         )
         .await
@@ -1814,8 +1779,6 @@ mod tests {
             lore_storage::local::immutable_store::ImmutableStoreVersion::LazyFanOut as u32,
             "Older v3 store should upgrade to LazyFanOut (v5), got {v}"
         );
-
-        cleanup(&store_path);
     }
 
     /// T10 idempotency: running recovery twice (open → drop → open) leaves the store in the
@@ -1842,8 +1805,6 @@ mod tests {
         verify_all_keys_findable_and_drop(&store_path, &keys).await;
         // Second open: recovery is a no-op (no pending), keys still findable.
         verify_all_keys_findable_and_drop(&store_path, &keys).await;
-
-        cleanup(&store_path);
     }
 
     /// A fan-out redistributes entries in memory while the layout on disk is still the
@@ -1912,7 +1873,6 @@ mod tests {
                 _ => missing += 1,
             }
         }
-        cleanup(&store_path);
         assert_eq!(
             missing,
             0,
@@ -1927,7 +1887,7 @@ mod tests {
     async fn immutable_reads_during_a_fan_out_flush_lose_no_fragments() {
         let store_path = temp_dir();
         let store = lore_storage::LocalImmutableStore::new(
-            Some(store_path.clone()),
+            Some(store_path.path().to_path_buf()),
             ImmutableStoreSettings {
                 initial_fan_out_level: 1,
                 fan_out_threshold: FAN_OUT_THRESHOLD_DEFAULT,
@@ -1995,7 +1955,6 @@ mod tests {
                 missing += 1;
             }
         }
-        cleanup(&store_path);
         assert_eq!(
             missing,
             0,
@@ -2033,7 +1992,7 @@ mod tests {
         };
 
         let store = lore_storage::LocalImmutableStore::new(
-            Some(store_path.clone()),
+            Some(store_path.path().to_path_buf()),
             ImmutableStoreSettings::default(),
         )
         .await
@@ -2062,7 +2021,7 @@ mod tests {
         );
 
         let store = lore_storage::LocalImmutableStore::new(
-            Some(store_path.clone()),
+            Some(store_path.path().to_path_buf()),
             ImmutableStoreSettings::default(),
         )
         .await
@@ -2076,8 +2035,6 @@ mod tests {
             lore_storage::StoreMatch::MatchFull,
             "Fragment written to an untouched group of a legacy store must survive a reopen"
         );
-
-        cleanup(&store_path);
     }
 
     /// The mutable store makes the same decision the same way; see
@@ -2127,7 +2084,5 @@ mod tests {
             loaded, value,
             "Entry written to an untouched group of a legacy store must survive a reopen"
         );
-
-        cleanup(&store_path);
     }
 }

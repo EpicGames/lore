@@ -1099,7 +1099,7 @@ mod tests {
         String,
         std::path::PathBuf,
         std::path::PathBuf,
-        tempfile::TempDir,
+        lore_base::test_util::TempDir,
     ) {
         use rcgen::BasicConstraints;
         use rcgen::CertificateParams;
@@ -1120,10 +1120,7 @@ mod tests {
         let server_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
         let server_cert = server_params.signed_by(&server_key, &issuer).unwrap();
 
-        let dir = tempfile::Builder::new()
-            .prefix("lore-server-tls-test-")
-            .tempdir()
-            .unwrap();
+        let dir = lore_base::test_util::TempDir::new("lore-server-tls-test-");
         let cert_path = dir.path().join("server.crt");
         let key_path = dir.path().join("server.key");
         std::fs::write(&cert_path, server_cert.pem()).unwrap();

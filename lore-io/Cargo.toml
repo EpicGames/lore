@@ -45,7 +45,7 @@ windows-sys = { workspace = true, features = [
 # one that ships. Dev-only, so the library's own dependency graph is unchanged.
 [dev-dependencies]
 futures = { workspace = true }
-lore-base = { workspace = true }
+lore-base = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true }
 
 # A named pipe is the only thing a unit test can make defer on demand, and deferring is the whole

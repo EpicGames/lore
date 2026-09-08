@@ -70,10 +70,10 @@ windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage
 [dev-dependencies]
 # The non-self-describing format an event crosses the service boundary in.
 bitcode = { workspace = true }
+lore-base = { workspace = true, features = ["test-util"] }
 lore-storage = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
-tempfile = "3"
 trybuild = { workspace = true }
 
 [features]

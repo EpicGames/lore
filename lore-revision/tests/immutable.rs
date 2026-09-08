@@ -67,7 +67,6 @@ mod tests {
     async fn write_and_read_chunked() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let mut rng = rand::rng();
         let (immutable_store, mutable_store, execution) =
@@ -159,7 +158,6 @@ mod tests {
     async fn test_verify_fragment() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let mut rng = rand::rng();
         let execution = setup_test_execution();
@@ -253,7 +251,6 @@ mod tests {
     async fn test_verify_fragment_multiple_contexts() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let mut rng = rand::rng();
         let execution = setup_test_execution();
@@ -342,7 +339,6 @@ mod tests {
     async fn test_verify_fragment_not_found() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let mut rng = rand::rng();
         let execution = setup_test_execution();
@@ -421,7 +417,6 @@ mod tests {
     async fn test_verify_fragment_not_first_in_index() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let mut rng = rand::rng();
         let execution = setup_test_execution();
@@ -528,7 +523,6 @@ mod tests {
     async fn test_verify_fragment_match_repository() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let mut rng = rand::rng();
         let execution = setup_test_execution();
@@ -635,7 +629,6 @@ mod tests {
     async fn test_verify_fragment_match_full() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let mut rng = rand::rng();
         let execution = setup_test_execution();
@@ -724,7 +717,6 @@ mod tests {
     async fn test_verify_fragment_corrupted_no_heal() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let mut rng = rand::rng();
         let execution = setup_test_execution();
@@ -828,7 +820,6 @@ mod tests {
     async fn test_verify_fragment_corrupted_heal() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let mut rng = rand::rng();
         let execution = setup_test_execution();
@@ -932,7 +923,6 @@ mod tests {
     async fn test_verify_fragment_match_full_wrong_context() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let mut rng = rand::rng();
         let execution = setup_test_execution();
@@ -1007,7 +997,6 @@ mod tests {
     async fn test_read_zero_hash_returns_zero_initialized() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");

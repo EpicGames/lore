@@ -2154,14 +2154,14 @@ urc_repository_clone_module_in_path(urc_repository_t* repository, urc_state_t* s
 // reached.
 #[allow(clippy::disallowed_methods)]
 mod tests {
-    use tempfile::TempDir;
+    use lore_base::test_util::TempDir;
 
     use super::*;
     use crate::fs::filesystem_provider::FilesystemProvider;
     use crate::fs::os::OsFilesystem;
 
     async fn create_operation() -> (TempDir, Arc<InstanceOperationImpl>) {
-        let temp = TempDir::with_prefix("temp_path").expect("temp path");
+        let temp = TempDir::new("lore-clone-temp-path-");
         let os_filesystem = OsFilesystem::new(temp.path());
         let operation = os_filesystem
             .begin_operation()

@@ -168,8 +168,6 @@ mod tests {
                     .flatten()
                     .expect("Real stage should persist staged anchor");
                 assert_eq!(staged_revision, signature);
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -240,8 +238,6 @@ mod tests {
                 )
                 .await
                 .expect("Stage of nonexisting file failed");
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -385,8 +381,6 @@ mod tests {
 
                 let node = block.node(block.node(0).child().unwrap() as usize);
                 assert!(node.is_staged_delete());
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -491,8 +485,6 @@ mod tests {
                 )
                 .await
                 .expect_err("Case difference not detected as expected");
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -637,8 +629,6 @@ mod tests {
                 assert_eq!(updated_name.len(), 1);
                 let updated_name = updated_name[0].clone();
                 assert_eq!(updated_name, "test.file");
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -799,8 +789,6 @@ mod tests {
                 assert_eq!(updated_file_name.len(), 1);
                 let updated_file_name = updated_file_name[0].clone();
                 assert_eq!(updated_file_name, "teST.file");
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -978,8 +966,6 @@ mod tests {
                 let node_name = block.node_name_ref(node_index).expect("Invalid node name");
 
                 assert_eq!(&*node_name, updated_name.as_str());
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -1156,8 +1142,6 @@ mod tests {
                     child = block.node(index).sibling();
                 }
                 assert_eq!(children, vec!["Assets".to_string()]);
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -1385,13 +1369,11 @@ mod tests {
                     tree.sort();
                 }
 
-                let outcome = CaseOutcome {
+                CaseOutcome {
                     staged: staged.is_ok(),
                     filesystem,
                     tree,
-                };
-                let _ = std::fs::remove_dir_all(path.as_path());
-                outcome
+                }
             }))
             .await
             .expect("Test task failed")
@@ -1864,8 +1846,6 @@ mod tests {
                     .expect("Failed to get child node");
 
                 assert_eq!(node.address.context, file_id);
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -2068,9 +2048,7 @@ mod tests {
         let staged = state::State::deserialize(repository.clone(), signature)
             .await
             .expect("Failed to deserialize the staged state");
-        let listed = staged_file_listing(repository.clone(), staged).await;
-        let _ = std::fs::remove_dir_all(path.as_path());
-        listed
+        staged_file_listing(repository.clone(), staged).await
     }
 
     /// Resolution collects targets in completion order, and only the antichain
@@ -2212,8 +2190,6 @@ mod tests {
                     mode & executable,
                     "a file that lost the bit must record its loss"
                 );
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");

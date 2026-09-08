@@ -842,8 +842,8 @@ mod tests {
 
     #[tokio::test]
     async fn loads_keys_from_file_url() {
-        let temp_dir = std::env::temp_dir();
-        let jwks_path = temp_dir.join("jwk_test_loads_keys_from_file_url.json");
+        let temp_dir = lore_base::test_util::TempDir::new("jwk-test-file-url-");
+        let jwks_path = temp_dir.child("jwks.json");
 
         std::fs::write(
             &jwks_path,
@@ -867,8 +867,6 @@ mod tests {
             .await
             .expect("key should be cached after loading from file");
         assert_eq!(algorithm, jsonwebtoken::Algorithm::ES256);
-
-        std::fs::remove_file(&jwks_path).ok();
     }
 
     #[tokio::test]
@@ -1251,8 +1249,18 @@ mod tests {
 
     /// A service whose endpoint is a `file://` URL, which exercises the whole
     /// parse-and-publish path without standing up a server.
-    fn service_over_jwks(name: &str, jwks: &str) -> (JwkServiceImpl, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!("jwk_test_{name}.json"));
+    /// Returns the temp directory alongside the service: it owns the jwks file,
+    /// so the caller has to hold it for as long as the service is used.
+    fn service_over_jwks(
+        name: &str,
+        jwks: &str,
+    ) -> (
+        JwkServiceImpl,
+        std::path::PathBuf,
+        lore_base::test_util::TempDir,
+    ) {
+        let dir = lore_base::test_util::TempDir::new(&format!("jwk-test-{name}-"));
+        let path = dir.child("jwks.json");
         std::fs::write(&path, jwks).expect("write test jwks");
         let endpoint = reqwest::Url::from_file_path(&path)
             .expect("jwks path as a file url")
@@ -1263,6 +1271,7 @@ mod tests {
                 endpoint: Some(endpoint),
             }),
             path,
+            dir,
         )
     }
 
@@ -1271,7 +1280,7 @@ mod tests {
     /// down every key the server has.
     #[tokio::test]
     async fn unusable_key_does_not_discard_the_rest() {
-        let (service, path) = service_over_jwks(
+        let (service, path, _dir) = service_over_jwks(
             "unusable_key_does_not_discard_the_rest",
             &format!(
                 r#"{{"keys":[
@@ -1303,7 +1312,7 @@ mod tests {
     /// key is misconfigured.
     #[tokio::test]
     async fn a_key_whose_algorithm_does_not_match_its_type_is_skipped() {
-        let (service, path) = service_over_jwks(
+        let (service, path, _dir) = service_over_jwks(
             "a_key_whose_algorithm_does_not_match_its_type_is_skipped",
             &format!(
                 r#"{{"keys":[
@@ -1331,7 +1340,7 @@ mod tests {
     /// than failing the document that carried it.
     #[tokio::test]
     async fn key_without_kid_is_skipped() {
-        let (service, path) = service_over_jwks(
+        let (service, path, _dir) = service_over_jwks(
             "key_without_kid_is_skipped",
             &format!(
                 r#"{{"keys":[
@@ -1355,7 +1364,7 @@ mod tests {
     /// throttled — so it would cost the bound on outbound requests along with the keys.
     #[tokio::test]
     async fn no_usable_keys_errors_and_keeps_the_cache() {
-        let (service, path) = service_over_jwks(
+        let (service, path, _dir) = service_over_jwks(
             "no_usable_keys_errors_and_keeps_the_cache",
             &format!(
                 r#"{{"keys":[{{"kty":"RSA","use":"enc","alg":"RSA-OAEP","kid":"enc","n":"{RSA_N}","e":"{RSA_E}"}}]}}"#
@@ -1398,7 +1407,7 @@ mod tests {
     /// verifying tokens, or withdrawing a compromised key would not withdraw anything.
     #[tokio::test]
     async fn a_key_the_endpoint_stopped_serving_is_dropped() {
-        let (service, path) = service_over_jwks(
+        let (service, path, _dir) = service_over_jwks(
             "a_key_the_endpoint_stopped_serving_is_dropped",
             &jwks_with(&["old", "keep"]),
         );
@@ -1426,7 +1435,7 @@ mod tests {
     /// than looking like a key that did not change.
     #[tokio::test]
     async fn refreshing_a_revoked_key_reports_no_key() {
-        let (service, path) = service_over_jwks(
+        let (service, path, _dir) = service_over_jwks(
             "refreshing_a_revoked_key_reports_no_key",
             &jwks_with(&["going", "staying"]),
         );
@@ -1446,7 +1455,7 @@ mod tests {
     /// no rotation would ever be picked up.
     #[tokio::test]
     async fn the_throttle_lapses_after_the_interval() {
-        let (service, path) = service_over_jwks(
+        let (service, path, _dir) = service_over_jwks(
             "the_throttle_lapses_after_the_interval",
             &jwks_with(&["sig"]),
         );
@@ -1465,7 +1474,7 @@ mod tests {
     /// document order in a way nobody had decided.
     #[tokio::test]
     async fn a_duplicate_kid_keeps_the_last_key_listed() {
-        let (service, path) = service_over_jwks(
+        let (service, path, _dir) = service_over_jwks(
             "a_duplicate_kid_keeps_the_last_key_listed",
             &format!(
                 r#"{{"keys":[
@@ -1488,7 +1497,7 @@ mod tests {
     /// A JWKS file larger than the cap is refused without being read into memory.
     #[tokio::test]
     async fn an_oversized_jwks_file_is_refused() {
-        let (service, path) = service_over_jwks(
+        let (service, path, _dir) = service_over_jwks(
             "an_oversized_jwks_file_is_refused",
             &format!(
                 r#"{{"keys":[],"padding":"{}"}}"#,

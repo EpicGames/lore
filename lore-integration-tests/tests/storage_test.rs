@@ -92,14 +92,11 @@ mod open_tests {
         assert_eq!(events[complete_ix], Captured::Complete(status));
     }
 
-    /// Create a `tempfile::TempDir` that auto-cleans on Drop. The `tag` becomes part of the
+    /// Create a `lore_base::test_util::TempDir` that auto-cleans on Drop. The `tag` becomes part of the
     /// directory's filename prefix so call sites retain a contextual hint visible in the
     /// working directory.
-    fn tempdir(tag: &str) -> tempfile::TempDir {
-        tempfile::Builder::new()
-            .prefix(&format!("lore-storage-open-{tag}-"))
-            .tempdir()
-            .expect("create tempdir")
+    fn tempdir(tag: &str) -> lore_base::test_util::TempDir {
+        lore_base::test_util::TempDir::new(&format!("lore-storage-open-{tag}-"))
     }
 
     /// Create a repository backed by its own store.
@@ -3667,27 +3664,19 @@ mod open_tests {
         );
     }
 
-    /// Create a `tempfile::NamedTempFile` populated with `contents`. The returned guard
+    /// Create a temp file populated with `contents`. The returned guard
     /// auto-cleans the file on Drop (success or panic). Callers hold the guard for the test
     /// scope and pass `guard.path()` to the API.
-    fn write_temp_file(contents: &[u8], tag: &str) -> tempfile::NamedTempFile {
-        let mut file = tempfile::Builder::new()
-            .prefix(&format!("lore-put-file-{tag}-"))
-            .tempfile()
-            .expect("create tempfile");
-        std::io::Write::write_all(&mut file, contents).expect("write tempfile");
-        file
+    fn write_temp_file(contents: &[u8], tag: &str) -> lore_base::test_util::TempFile {
+        lore_base::test_util::TempFile::with_contents(&format!("lore-put-file-{tag}-"), contents)
     }
 
     /// Create a path inside a fresh `TempDir` for tests that need a destination file location
     /// (e.g. `get_file` target). The directory cleans up its entire tree on Drop, so the
     /// resulting file — whether the test creates it, the API creates it, or it never exists —
     /// is removed on both success and panic paths.
-    fn temp_file_path(tag: &str) -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::Builder::new()
-            .prefix(&format!("lore-storage-{tag}-"))
-            .tempdir()
-            .expect("create tempdir");
+    fn temp_file_path(tag: &str) -> (lore_base::test_util::TempDir, PathBuf) {
+        let dir = lore_base::test_util::TempDir::new(&format!("lore-storage-{tag}-"));
         let path = dir.path().join("target");
         (dir, path)
     }

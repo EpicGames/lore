@@ -2693,7 +2693,7 @@ mod tests {
     #[tokio::test]
     async fn a_clean_file_is_overwritten() {
         Box::pin(with_execution(async {
-            let dir = tempfile::TempDir::new().expect("temp dir");
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
             let repository = working_tree_repository(dir.path()).await;
             let path = RelativePathBuf::new().push_and_freeze("clean.bin");
             let base_content = pseudo_random_bytes(20 * 1024, 0);
@@ -2720,7 +2720,7 @@ mod tests {
     #[tokio::test]
     async fn a_file_holding_the_replaced_content_is_realized() {
         Box::pin(with_execution(async {
-            let dir = tempfile::TempDir::new().expect("temp dir");
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
             let repository = working_tree_repository(dir.path()).await;
             let path = RelativePathBuf::new().push_and_freeze("reset.bin");
             let base_content = pseudo_random_bytes(20 * 1024, 0);
@@ -2748,7 +2748,7 @@ mod tests {
     #[tokio::test]
     async fn a_locally_edited_file_is_refused() {
         Box::pin(with_execution(async {
-            let dir = tempfile::TempDir::new().expect("temp dir");
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
             let repository = working_tree_repository(dir.path()).await;
             let path = RelativePathBuf::new().push_and_freeze("edited.bin");
             let base_content = pseudo_random_bytes(20 * 1024, 0);
@@ -2773,7 +2773,7 @@ mod tests {
     #[tokio::test]
     async fn a_file_already_holding_the_incoming_content_is_dropped() {
         Box::pin(with_execution(async {
-            let dir = tempfile::TempDir::new().expect("temp dir");
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
             let repository = working_tree_repository(dir.path()).await;
             let path = RelativePathBuf::new().push_and_freeze("incoming.bin");
             let base_content = pseudo_random_bytes(20 * 1024, 0);
@@ -2799,7 +2799,7 @@ mod tests {
     #[tokio::test]
     async fn a_target_side_change_the_tree_already_holds_is_dropped() {
         Box::pin(with_execution(async {
-            let dir = tempfile::TempDir::new().expect("temp dir");
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
             let repository = working_tree_repository(dir.path()).await;
             let path = RelativePathBuf::new().push_and_freeze("target-side.bin");
             let base_content = pseudo_random_bytes(20 * 1024, 0);
@@ -2864,7 +2864,7 @@ mod tests {
     #[tokio::test]
     async fn a_clean_file_addressed_as_a_list_is_overwritten() {
         Box::pin(with_execution(async {
-            let dir = tempfile::TempDir::new().expect("temp dir");
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
             let repository = working_tree_repository(dir.path()).await;
             let path = RelativePathBuf::new().push_and_freeze("listed.bin");
             let content = pseudo_random_bytes(150 * 1024, 0);
@@ -2898,7 +2898,7 @@ mod tests {
     #[tokio::test]
     async fn a_change_starting_at_the_current_revision_is_measured_by_its_own_node() {
         Box::pin(with_execution(async {
-            let dir = tempfile::TempDir::new().expect("temp dir");
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
             let repository = working_tree_repository(dir.path()).await;
             let path = RelativePathBuf::new().push_and_freeze("from-current.bin");
             let content = pseudo_random_bytes(20 * 1024, 0);
@@ -2924,7 +2924,7 @@ mod tests {
     #[tokio::test]
     async fn a_path_the_current_revision_does_not_hold_is_realized() {
         Box::pin(with_execution(async {
-            let dir = tempfile::TempDir::new().expect("temp dir");
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
             let repository = working_tree_repository(dir.path()).await;
             let path = RelativePathBuf::new().push_and_freeze("untracked.bin");
             let elsewhere = RelativePathBuf::new().push_and_freeze("elsewhere.bin");
@@ -2951,7 +2951,7 @@ mod tests {
     #[tokio::test]
     async fn a_move_of_unchanged_content_is_realized() {
         Box::pin(with_execution(async {
-            let dir = tempfile::TempDir::new().expect("temp dir");
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
             let repository = working_tree_repository(dir.path()).await;
             let path = RelativePathBuf::new().push_and_freeze("moved.bin");
             let content = pseudo_random_bytes(20 * 1024, 0);
@@ -2989,7 +2989,7 @@ mod tests {
     #[tokio::test]
     async fn an_unresolvable_chunking_is_refused_until_a_recorded_time_answers() {
         Box::pin(with_execution(async {
-            let dir = tempfile::TempDir::new().expect("temp dir");
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
             let repository = working_tree_repository(dir.path()).await;
             let path = RelativePathBuf::new().push_and_freeze("unresolvable.bin");
             let base_content = pseudo_random_bytes(150 * 1024, 0);

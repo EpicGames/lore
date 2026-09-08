@@ -10,18 +10,17 @@ mod store_keep_alive_tests {
     use lore::file;
     use lore::repository;
     use lore::revision;
+    use lore_base::test_util::TempDir;
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreGlobalArgs;
     use lore_revision::interface::LoreString;
     use lore_revision::repository::LoreSharedStoreMode;
 
-    fn test_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("lore-keep-alive-{}", uuid::Uuid::new_v4()));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+    fn test_dir() -> TempDir {
+        TempDir::new("lore-keep-alive-")
     }
 
-    fn globals(repo_path: &PathBuf) -> LoreGlobalArgs {
+    fn globals(repo_path: &Path) -> LoreGlobalArgs {
         LoreGlobalArgs {
             repository_path: repo_path.into(),
             offline: 1,
@@ -32,7 +31,7 @@ mod store_keep_alive_tests {
         }
     }
 
-    fn stage_all(repo_path: &PathBuf) -> (LoreGlobalArgs, file::LoreFileStageArgs) {
+    fn stage_all(repo_path: &Path) -> (LoreGlobalArgs, file::LoreFileStageArgs) {
         (
             globals(repo_path),
             file::LoreFileStageArgs {
@@ -242,8 +241,5 @@ mod store_keep_alive_tests {
             repo_path.join("second.txt").exists(),
             "second.txt missing after merge"
         );
-
-        // Cleanup
-        let _ = fs::remove_dir_all(&repo_path);
     }
 }

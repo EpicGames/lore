@@ -3,6 +3,7 @@
 mod tests {
     #![allow(clippy::disallowed_methods)] // Test fixture writes; not subject to repository write-token discipline.
 
+    use lore_base::test_util::TempDir;
     use lore_revision::repository::DOT_URC;
     use lore_revision::repository::DOT_URCIGNORE;
 
@@ -21,8 +22,8 @@ mod tests {
     #[test]
     fn discovery_finds_lore_directory() {
         // Simulate directory walk: a parent with .lore/ should be found
-        let base = std::env::temp_dir().join("lore-test-discovery-lore");
-        let _ = std::fs::remove_dir_all(&base);
+        let temp = TempDir::new("lore-test-discovery-lore-");
+        let base = temp.path().to_path_buf();
         let nested = base.join("a").join("b");
         std::fs::create_dir_all(&nested).expect("create nested dirs");
         std::fs::create_dir_all(base.join(".lore")).expect("create .lore dir");
@@ -39,14 +40,12 @@ mod tests {
             }
         };
         assert_eq!(found, Some(base.clone()));
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn discovery_finds_urc_directory() {
-        let base = std::env::temp_dir().join("lore-test-discovery-urc");
-        let _ = std::fs::remove_dir_all(&base);
+        let temp = TempDir::new("lore-test-discovery-urc-");
+        let base = temp.path().to_path_buf();
         let nested = base.join("a").join("b");
         std::fs::create_dir_all(&nested).expect("create nested dirs");
         std::fs::create_dir_all(base.join(".urc")).expect("create .urc dir");
@@ -62,16 +61,14 @@ mod tests {
             }
         };
         assert_eq!(found, Some(base.clone()));
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn load_filter_lore_format_falls_back_to_urcignore() {
         use lore_revision::repository::load_filter;
 
-        let dir = std::env::temp_dir().join("lore-test-ignore-fallback");
-        let _ = std::fs::remove_dir_all(&dir);
+        let temp = TempDir::new("lore-test-ignore-fallback-");
+        let dir = temp.path().to_path_buf();
         std::fs::create_dir_all(dir.join(".lore")).expect("create .lore dir");
 
         // Write a .urcignore with a pattern (no .loreignore present)
@@ -82,16 +79,14 @@ mod tests {
         // plus auto-generated exclusions (.urc, .lore, conflict suffixes).
         // With one user rule ("secret.txt") and 6 auto-generated rules, we expect 7 lines.
         assert_eq!(filter.ignore.lines.len(), 7);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_filter_lore_format_prefers_loreignore() {
         use lore_revision::repository::load_filter;
 
-        let dir = std::env::temp_dir().join("lore-test-ignore-prefer");
-        let _ = std::fs::remove_dir_all(&dir);
+        let temp = TempDir::new("lore-test-ignore-prefer-");
+        let dir = temp.path().to_path_buf();
         std::fs::create_dir_all(dir.join(".lore")).expect("create .lore dir");
 
         // Both files present — .loreignore should win
@@ -101,8 +96,6 @@ mod tests {
         let filter = load_filter(&dir).expect("filter should load");
         // 2 user rules from .loreignore + 6 auto-generated = 8
         assert_eq!(filter.ignore.lines.len(), 8);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -112,8 +105,8 @@ mod tests {
         // The .urcignore fallback is universal: even a legacy .urc-format
         // repository (whose primary ignore file is now also .loreignore) loads
         // a lone .urcignore when no .loreignore is present.
-        let dir = std::env::temp_dir().join("lore-test-ignore-fallback-urc");
-        let _ = std::fs::remove_dir_all(&dir);
+        let temp = TempDir::new("lore-test-ignore-fallback-urc-");
+        let dir = temp.path().to_path_buf();
         std::fs::create_dir_all(dir.join(DOT_URC)).expect("create .urc dir");
 
         std::fs::write(dir.join(DOT_URCIGNORE), "secret.txt\n").expect("write .urcignore");
@@ -121,7 +114,5 @@ mod tests {
         let filter = load_filter(&dir).expect("filter should load");
         // One user rule ("secret.txt") + 6 auto-generated rules = 7 lines.
         assert_eq!(filter.ignore.lines.len(), 7);
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

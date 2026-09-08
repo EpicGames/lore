@@ -669,7 +669,6 @@ mod tests {
     async fn store_serialize_deserialize() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let execution = setup_test_execution();
         LORE_CONTEXT
@@ -768,8 +767,6 @@ mod tests {
                         );
                     }
                 }
-
-                let _ = std::fs::remove_dir_all(dir.as_path());
             })
             .await;
     }
@@ -778,7 +775,6 @@ mod tests {
     async fn store_and_update() {
         let tempdir = generate_tempdir();
         let dir = tempdir.to_path_buf();
-        let _ = std::fs::remove_dir_all(dir.as_path());
 
         let execution = setup_test_execution();
         LORE_CONTEXT
@@ -917,8 +913,6 @@ mod tests {
                         );
                     }
                 }
-
-                let _ = std::fs::remove_dir_all(dir.as_path());
             })
             .await;
     }

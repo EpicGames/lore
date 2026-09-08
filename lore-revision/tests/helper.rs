@@ -112,48 +112,8 @@ impl RepositoryContextCreationArgsExt for lore_revision::repository::RepositoryC
     }
 }
 
-pub struct TempDir(std::path::PathBuf);
-
-impl TempDir {
-    #[allow(dead_code)]
-    pub fn new(prefix: &str) -> Self {
-        use rand::distr::SampleString;
-        let name = format!(
-            "{prefix}{}",
-            rand::distr::Alphanumeric.sample_string(&mut rand::rng(), 8)
-        );
-        let path = std::env::temp_dir().join(name);
-        std::fs::create_dir_all(&path).expect("Failed to create temp directory");
-        let path = std::fs::canonicalize(path).expect("Canonicalize temporary test dir");
-        Self(path)
-    }
-
-    #[allow(dead_code)]
-    pub fn path(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl std::ops::Deref for TempDir {
-    type Target = std::path::Path;
-    fn deref(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl AsRef<std::path::Path> for TempDir {
-    fn as_ref(&self) -> &std::path::Path {
-        &self.0
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        // Test fixture cleanup; not subject to repository write-token discipline.
-        #[allow(clippy::disallowed_methods)]
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+#[allow(unused_imports)]
+pub use lore_base::test_util::TempDir;
 
 #[allow(dead_code)]
 pub fn generate_tempdir() -> TempDir {

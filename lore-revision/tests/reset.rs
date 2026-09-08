@@ -371,8 +371,6 @@ mod tests {
                         .expect("Could not check the existence of root_file_ignored.txt"),
                     "root_file_ignored.txt was not force purged."
                 );
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -513,8 +511,6 @@ mod tests {
 
                 // We expect no changes
                 assert_eq!(changes.len(), 0);
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
@@ -662,8 +658,6 @@ mod tests {
 
                 // We expect one change
                 assert_eq!(changes.len(), 1);
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");

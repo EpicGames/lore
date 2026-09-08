@@ -183,12 +183,8 @@ mod tests {
                         .expect("Failed to find first file as expected")
                         .is_file()
                 );
-
-                let _ = std::fs::remove_dir_all(path.as_path());
             }))
             .await
             .expect("Test task failed");
-
-        let _ = std::fs::remove_dir_all(temp_path.as_path());
     }
 }

@@ -794,14 +794,8 @@ mod resolve_auth_endpoint_tests {
 
     /// A repository directory with the given `config.toml` body, or none at all when
     /// `config` is `None`. Returns the repository root.
-    fn repository_with_config(label: &str, config: Option<&str>) -> std::path::PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "lore-auth-{label}-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+    fn repository_with_config(label: &str, config: Option<&str>) -> lore_base::test_util::TempDir {
+        let root = lore_base::test_util::TempDir::new(&format!("lore-auth-{label}-"));
         let dot_dir = root.join(lore_revision::repository::DOT_LORE);
         std::fs::create_dir_all(&dot_dir).expect("creating the repository directory");
         if let Some(config) = config {
@@ -849,8 +843,6 @@ mod resolve_auth_endpoint_tests {
             .expect_err("a repository with no remote must be an error");
 
         assert_eq!(err.ffi_code(), NoRemote.ffi_code(), "{err:?}");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     // Same answer when the config omits the key outright rather than writing it empty,
@@ -864,8 +856,6 @@ mod resolve_auth_endpoint_tests {
             .expect_err("a repository with no remote must be an error");
 
         assert_eq!(err.ffi_code(), NoRemote.ffi_code(), "{err:?}");
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     // A missing config file parses as the default config, so repository presence has to
@@ -886,8 +876,6 @@ mod resolve_auth_endpoint_tests {
             ),
             "a repository whose config is absent still has no remote"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -902,7 +890,5 @@ mod resolve_auth_endpoint_tests {
             matches!(remote, RepositoryRemote::Remote(ref url) if url == "lore://127.0.0.1:41337"),
             "a configured remote should be reported verbatim"
         );
-
-        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -41,7 +41,7 @@ mod replication_service_tests {
 
     /// An mTLS chain: one CA, a server certificate for `localhost`, and a client certificate.
     struct TestCerts {
-        _dir: tempfile::TempDir,
+        _dir: lore_base::test_util::TempDir,
         ca_pem: String,
         server_cert_path: PathBuf,
         server_key_path: PathBuf,
@@ -79,9 +79,7 @@ mod replication_service_tests {
         let client_params = CertificateParams::new(vec!["client".to_string()])?;
         let client_cert = client_params.signed_by(&client_key, &issuer)?;
 
-        let dir = tempfile::Builder::new()
-            .prefix("lore-replication-certs-")
-            .tempdir()?;
+        let dir = lore_base::test_util::TempDir::new("lore-replication-certs-");
         let ca_path = dir.path().join("ca.crt");
         let server_cert_path = dir.path().join("server.crt");
         let server_key_path = dir.path().join("server.key");

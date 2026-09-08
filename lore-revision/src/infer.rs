@@ -237,8 +237,8 @@ mod tests {
 
     /// A file holding `contents`, alive for as long as the returned directory is.
     #[allow(clippy::disallowed_methods)] // A test fixture in its own temporary directory.
-    fn file_holding(contents: &[u8]) -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::tempdir().expect("temp dir");
+    fn file_holding(contents: &[u8]) -> (lore_base::test_util::TempDir, PathBuf) {
+        let dir = lore_base::test_util::TempDir::new("lore-infer-test-");
         let path = dir.path().join("scanned");
         std::fs::write(&path, contents).expect("write scanned file");
         (dir, path)
@@ -404,7 +404,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_file_is_clean() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-infer-test-");
         let path = dir.path().join("absent");
         assert!(!infer_is_conflicted_by_path(&path).await.unwrap());
     }

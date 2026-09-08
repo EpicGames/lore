@@ -9,8 +9,7 @@ fn assert_send<T: Send>(value: T) -> T {
 
 #[tokio::test]
 async fn vectored_futures_are_send() {
-    let dir = std::env::temp_dir().join(format!("lore-io-sendprobe-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = lore_base::test_util::TempDir::new("lore-io-sendprobe-");
     let driver = lore_io::IoDriver::new(lore_io::BackendKind::Auto).unwrap();
     let file = driver
         .open(
@@ -28,5 +27,4 @@ async fn vectored_futures_are_send() {
     let _read = assert_send(file.read_exact_vectored_at(written, 0))
         .await
         .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }

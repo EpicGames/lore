@@ -238,7 +238,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_absent_config_is_the_default() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-config-test-");
         let config: Settings = load(dir.path().join("absent.toml"))
             .await
             .expect("an absent config defaults");
@@ -247,7 +247,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_config_round_trips() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-config-test-");
         let path = dir.path().join("settings.toml");
         std::fs::write(&path, b"name = \"configured\"\n").expect("write config");
 
@@ -259,7 +259,7 @@ mod tests {
     /// as empty TOML, so defaulting here would be indistinguishable from a deliberate default.
     #[tokio::test]
     async fn a_config_that_is_not_text_is_an_error() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-config-test-");
         let path = dir.path().join("settings.toml");
         std::fs::write(&path, [0xFF, 0xFE, 0x00, 0x80]).expect("write config");
 
@@ -268,7 +268,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_config_that_is_not_toml_is_an_error() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-config-test-");
         let path = dir.path().join("settings.toml");
         std::fs::write(&path, b"this is not toml = = =").expect("write config");
 
@@ -279,7 +279,7 @@ mod tests {
     /// that default back over a configuration that was merely inaccessible.
     #[tokio::test]
     async fn a_config_that_cannot_be_read_is_an_error() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-config-test-");
         let path = dir.path().join("settings.toml");
         std::fs::create_dir(&path).expect("occupy the config path");
 
@@ -288,7 +288,7 @@ mod tests {
 
     #[test]
     fn a_blocking_load_of_an_absent_config_is_the_default() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-config-test-");
         let config: Settings =
             load_blocking(dir.path().join("absent.toml")).expect("an absent config defaults");
         assert_eq!(config, Settings::default());
@@ -299,7 +299,7 @@ mod tests {
     /// which presented as a repository with no remote.
     #[test]
     fn a_blocking_load_of_a_config_that_cannot_be_read_is_an_error() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-config-test-");
         let path = dir.path().join("settings.toml");
         std::fs::create_dir(&path).expect("occupy the config path");
 
@@ -308,7 +308,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_save_replaces_the_config_and_leaves_no_temporary_file() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-config-test-");
         let path = dir.path().join("settings.toml");
         std::fs::write(&path, b"name = \"original\"\n").expect("write config");
 
@@ -330,7 +330,7 @@ mod tests {
     /// standing in for a crash or a full disk at the same point.
     #[tokio::test]
     async fn a_save_that_fails_before_the_rename_keeps_the_previous_config() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-config-test-");
         let path = dir.path().join("settings.toml");
         std::fs::write(&path, b"name = \"original\"\n").expect("write config");
         std::fs::create_dir(temp_path(&path)).expect("occupy the temporary path");
@@ -354,7 +354,7 @@ mod tests {
     /// which file it was writing and which one still holds a good copy.
     #[tokio::test]
     async fn a_failed_save_names_the_target_and_the_temporary() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-config-test-");
         let path = dir.path().join("settings.toml");
         std::fs::write(&path, b"name = \"original\"\n").expect("write config");
         std::fs::create_dir(temp_path(&path)).expect("occupy the temporary path");

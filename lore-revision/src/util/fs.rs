@@ -1068,8 +1068,8 @@ pub fn generate_temppath(prefix: &str) -> std::path::PathBuf {
 mod tests {
     use super::*;
 
-    fn temp_dir() -> tempfile::TempDir {
-        tempfile::tempdir().expect("temp dir")
+    fn temp_dir() -> lore_base::test_util::TempDir {
+        lore_base::test_util::TempDir::new("lore-fs-test-")
     }
 
     #[tokio::test]

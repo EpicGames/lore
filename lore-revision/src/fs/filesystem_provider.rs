@@ -1034,7 +1034,7 @@ pub mod tests {
     /// and after the file information became the currency between them.
     #[test]
     fn file_information_answers_what_the_metadata_helpers_answer() {
-        let dir = tempfile::tempdir().expect("temp dir");
+        let dir = lore_base::test_util::TempDir::new("lore-fs-provider-test-");
         let path = dir.path().join("file");
         std::fs::write(&path, b"content").expect("write");
 

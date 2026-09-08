@@ -110,7 +110,7 @@ async fn seed_store(path: &std::path::Path, partition: Partition) {
 /// [`REPORT_DEADLINE`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn loading_a_store_over_its_size_cap_fires_compaction() {
-    let dir = tempfile::tempdir().expect("temp dir");
+    let dir = lore_base::test_util::TempDir::new("lore-store-gc-test-");
     let partition = Partition::from([0x21u8; 16]);
     seed_store(dir.path(), partition).await;
 

@@ -1165,7 +1165,8 @@ mod tests {
     /// share over a real workload.
     #[test]
     fn every_file_operation_is_completed_by_exactly_one_path() {
-        let path = std::env::temp_dir().join(format!("lore-io-iocp-count-{}", std::process::id()));
+        let dir = lore_base::test_util::TempDir::new("lore-io-iocp-count-");
+        let path = dir.child("counted");
         std::fs::write(&path, vec![7u8; 64 * 1024]).expect("seeding the file");
 
         let driver = IocpDriver::new().expect("a completion port");

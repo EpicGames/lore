@@ -38,7 +38,6 @@ serde_json = { workspace = true }
 rs-consul = "0.13.0"
 rustls = { workspace = true, optional = true }
 serde_dynamo = { version = "4.2.14", features = ["aws-sdk-dynamodb+1"] }
-tempfile = "3.21"
 tokio = { workspace = true }
 tokio-stream = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
@@ -55,6 +54,7 @@ lore-proto = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+lore-base = { workspace = true, features = ["test-util"] }
 lore-server = { workspace = true }
 lore-transport = { workspace = true }
 rcgen = { workspace = true }

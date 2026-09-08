@@ -180,14 +180,13 @@ eFIZ7GeXtWFz+ftM1FrUvXA5XESE0H9iNZklf0dnJXwheUXRpn06bXysEyk4
 
     #[test]
     fn test_parse_valid_certificate() {
-        let temp_dir = std::env::temp_dir();
-        let cert_path = temp_dir.join("test_cert_metrics.pem");
+        let temp_dir = lore_base::test_util::TempDir::new("cert-metrics-test-");
+        let cert_path = temp_dir.child("cert.pem");
 
         let mut file = std::fs::File::create(&cert_path).unwrap();
         file.write_all(TEST_CERT_PEM.as_bytes()).unwrap();
 
         let result = parse_certificate_info(&cert_path);
-        std::fs::remove_file(&cert_path).ok();
 
         let info = result.expect("should parse valid certificate");
         assert_eq!(info.cert_path, cert_path);

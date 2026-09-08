@@ -81,6 +81,53 @@ async fn test_with_isolated_state() {
 - `lore-revision/tests/` — Cross-module integration tests.
 - `lore-integration-tests/` — Tests against real infrastructure, without mocking
 
+### Scratch space on disk
+
+`lore_base::test_util::TempDir`, and `TempFile` for a single file, are the only
+way a test asks for scratch space on disk. Both are behind lore-base's
+`test-util` feature, which the crates that need it enable from their
+dev-dependencies:
+
+```toml
+[dev-dependencies]
+lore-base = { workspace = true, features = ["test-util"] }
+```
+
+```rust
+let dir = TempDir::new("my-test-");       // <temp>/my-test-A1b2C3d4
+std::fs::write(dir.child("data.bin"), b"...").expect("write");
+
+let file = TempFile::with_contents("my-test-", b"payload");
+some_api(file.path());
+```
+
+The name carries a random suffix, so two tests — or two runs on one machine —
+never share a directory, and removal happens in `Drop`, so it happens whether
+the test passes or fails an assertion.
+
+**Do not** build a path under `std::env::temp_dir()` by hand, and **do not**
+remove a directory on the last line of a test body: a failing assertion panics
+before reaching that line, so the run that most needs its output is the one that
+leaks it.
+
+**Return the guard, never a path derived from it.** A helper that ends
+`temp.path().to_path_buf()` drops the guard on return and deletes the directory
+its caller is about to read. Hand back the `TempDir` and let the caller hold it:
+
+```rust
+fn fixture() -> (TempDir, PathBuf) { ... }   // correct
+fn fixture() -> PathBuf { ... }              // deletes the directory on return
+```
+
+Set `LORE_KEEP_TEST_DATA=1` to keep the directories rather than remove them —
+the Rust equivalent of the smoke tests' `--keep-test-data`. The prefix is all
+there is to identify one afterwards, so give it the test's name wherever several
+tests in a module would otherwise share it.
+
+`tempfile` is the implementation and a dependency of `lore-base` only. Do not add
+it to another crate: a second guard type is a second set of rules, and it does not
+honour `LORE_KEEP_TEST_DATA`.
+
 ---
 
 ## 3. Smoke tests (`scripts/test/`)
