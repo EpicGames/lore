@@ -914,6 +914,20 @@ mod tests {
         );
     }
 
+    /// A dispatcher whose handler timeouts are far longer than any handler here
+    /// needs.
+    ///
+    /// `dispatch_pre` measures a handler after it returns and reports
+    /// `HookError::Timeout` if it took longer than the limit, discarding what
+    /// the handler actually produced. With the 200 ms default that turns a
+    /// loaded machine into a test failure: the handler's real result -- a
+    /// panic, a rejection, a success -- is replaced by a timeout that says
+    /// nothing about the behaviour under test. Tests that are about the timeout
+    /// set a short one deliberately.
+    fn test_dispatcher(hooks: Vec<(String, Box<dyn Hook>)>) -> HookDispatcher {
+        HookDispatcher::new(hooks, Duration::from_secs(60), Duration::from_secs(60))
+    }
+
     #[test]
     fn test_dispatcher_from_hooks_default() {
         let hooks: Vec<(String, Box<dyn Hook>)> = vec![(
@@ -957,7 +971,7 @@ mod tests {
             ),
         )];
 
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
+        let dispatcher = test_dispatcher(hooks);
         let ctx = create_test_context();
 
         let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
@@ -990,7 +1004,7 @@ mod tests {
             ),
         ];
 
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
+        let dispatcher = test_dispatcher(hooks);
         let ctx = create_test_context();
 
         let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
@@ -1013,7 +1027,7 @@ mod tests {
             ),
         )];
 
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
+        let dispatcher = test_dispatcher(hooks);
         let ctx = create_test_context();
 
         let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
@@ -1030,7 +1044,7 @@ mod tests {
             Box::new(RejectingHook::new("rejecting", &[HookPoint::BranchPush])),
         )];
 
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
+        let dispatcher = test_dispatcher(hooks);
         let ctx = create_test_context();
 
         let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
@@ -1071,7 +1085,7 @@ mod tests {
             ),
         ];
 
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
+        let dispatcher = test_dispatcher(hooks);
         let ctx = create_test_context();
 
         let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
@@ -1106,7 +1120,7 @@ mod tests {
             ),
         ];
 
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
+        let dispatcher = test_dispatcher(hooks);
         let ctx = create_test_context();
 
         let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
@@ -1169,7 +1183,7 @@ mod tests {
             Box::new(PanicPreHook::new("panic", &[HookPoint::BranchPush])),
         )];
 
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
+        let dispatcher = test_dispatcher(hooks);
         let ctx = create_test_context();
 
         let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
@@ -1210,7 +1224,7 @@ mod tests {
             ),
         ];
 
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
+        let dispatcher = test_dispatcher(hooks);
         let ctx = create_test_context();
 
         let result = LORE_CONTEXT.sync_scope(test_execution_context(), || {
@@ -1233,7 +1247,7 @@ mod tests {
 
         let hooks: Vec<(String, Box<dyn Hook>)> = vec![("reader".to_string(), Box::new(reader))];
 
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
+        let dispatcher = test_dispatcher(hooks);
         let ctx = HookContext::builder()
             .correlation_id("test")
             .hook_point(HookPoint::BranchPush)
@@ -1276,7 +1290,7 @@ mod tests {
                     ),
                 )];
 
-                let dispatcher = HookDispatcher::from_hooks_default(hooks);
+                let dispatcher = test_dispatcher(hooks);
                 let ctx = create_test_context();
 
                 dispatcher.spawn_post(HookPoint::BranchPush, ctx);
@@ -1306,7 +1320,7 @@ mod tests {
                     ),
                 )];
 
-                let dispatcher = HookDispatcher::from_hooks_default(hooks);
+                let dispatcher = test_dispatcher(hooks);
                 let ctx = create_test_context();
 
                 let start = Instant::now();
@@ -1347,7 +1361,7 @@ mod tests {
                     ),
                 ];
 
-                let dispatcher = HookDispatcher::from_hooks_default(hooks);
+                let dispatcher = test_dispatcher(hooks);
                 let ctx = create_test_context();
 
                 dispatcher.spawn_post(HookPoint::BranchPush, ctx);
@@ -1374,7 +1388,7 @@ mod tests {
                     ),
                 )];
 
-                let dispatcher = HookDispatcher::from_hooks_default(hooks);
+                let dispatcher = test_dispatcher(hooks);
                 let ctx = create_test_context();
 
                 dispatcher.spawn_post(HookPoint::BranchDelete, ctx);
@@ -1410,7 +1424,7 @@ mod tests {
                     ),
                 ];
 
-                let dispatcher = HookDispatcher::from_hooks_default(hooks);
+                let dispatcher = test_dispatcher(hooks);
                 let ctx = create_test_context();
 
                 dispatcher.spawn_post(HookPoint::BranchPush, ctx);
@@ -1485,7 +1499,7 @@ mod tests {
             ));
         }
 
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
+        let dispatcher = test_dispatcher(hooks);
         let ctx = create_test_context();
 
         let start = std::time::Instant::now();
@@ -1519,7 +1533,7 @@ mod tests {
                     ));
                 }
 
-                let dispatcher = HookDispatcher::from_hooks_default(hooks);
+                let dispatcher = test_dispatcher(hooks);
                 let ctx = create_test_context();
 
                 let start = std::time::Instant::now();
@@ -1567,7 +1581,7 @@ mod tests {
 
         let hooks: Vec<(String, Box<dyn Hook>)> =
             vec![("message_hook".to_string(), Box::new(MessageHook))];
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
+        let dispatcher = test_dispatcher(hooks);
         let ctx = create_test_context();
 
         let response = dispatcher.dispatch_response(HookPoint::BranchPush, &ctx);
@@ -1593,7 +1607,7 @@ mod tests {
 
         let hooks: Vec<(String, Box<dyn Hook>)> =
             vec![("no_msg".to_string(), Box::new(NoMessageHook))];
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
+        let dispatcher = test_dispatcher(hooks);
         let ctx = create_test_context();
 
         let response = dispatcher.dispatch_response(HookPoint::BranchPush, &ctx);
@@ -1635,7 +1649,7 @@ mod tests {
             ("hook_a".to_string(), Box::new(HookA)),
             ("hook_b".to_string(), Box::new(HookB)),
         ];
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
+        let dispatcher = test_dispatcher(hooks);
         let ctx = create_test_context();
 
         let response = dispatcher.dispatch_response(HookPoint::BranchPush, &ctx);
@@ -1677,7 +1691,7 @@ mod tests {
             ("failing".to_string(), Box::new(FailingHook)),
             ("good".to_string(), Box::new(GoodHook)),
         ];
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
+        let dispatcher = test_dispatcher(hooks);
         let ctx = create_test_context();
 
         let response = dispatcher.dispatch_response(HookPoint::BranchPush, &ctx);
@@ -1719,7 +1733,7 @@ mod tests {
             ("panic".to_string(), Box::new(PanicHook)),
             ("safe".to_string(), Box::new(SafeHook)),
         ];
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
+        let dispatcher = test_dispatcher(hooks);
         let ctx = create_test_context();
 
         let response = dispatcher.dispatch_response(HookPoint::BranchPush, &ctx);
@@ -1744,7 +1758,7 @@ mod tests {
         }
 
         let hooks: Vec<(String, Box<dyn Hook>)> = vec![("msg".to_string(), Box::new(MessageHook))];
-        let dispatcher = HookDispatcher::from_hooks_default(hooks);
+        let dispatcher = test_dispatcher(hooks);
         let ctx = create_test_context();
 
         let response = dispatcher.dispatch_response(HookPoint::BranchPush, &ctx);
