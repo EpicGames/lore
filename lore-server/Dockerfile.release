@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+
+# Packages a loreserver binary that was already built and published as a
+# release asset. The publish workflow fetches those assets and unpacks them
+# into dist/<arch>/, so this file only assembles the runtime image — nothing is
+# compiled here. To build the server from source, use lore-server/Dockerfile.
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set by buildx for each platform in the build: amd64 or arm64, which is also
+# the directory the workflow unpacked that platform's release asset into.
+ARG TARGETARCH
+
+COPY dist/${TARGETARCH}/loreserver /usr/local/bin/loreserver
+
+# Shipped alongside the binary in the release archive, so they travel with it.
+COPY dist/${TARGETARCH}/LICENSE.txt /usr/share/doc/loreserver/LICENSE.txt
+COPY dist/${TARGETARCH}/THIRD-PARTY-NOTICES.txt /usr/share/doc/loreserver/THIRD-PARTY-NOTICES.txt
+
+# From the checkout rather than the release archive, which does not carry it.
+# On a release-triggered run the checkout is the release's own tag, so the two
+# agree; see the note on backfilling in the publish workflow.
+COPY lore-server/config/default.toml /etc/lore/config/default.toml
+
+# Docker environment config: local stores at /data. No QUIC certificate is
+# configured, so the server generates an ephemeral self-signed cert for the
+# public endpoint at startup (zero-config). For a durable deployment, mount a
+# real cert into the container and add a [server.quic.certificate] override.
+RUN cat <<'EOF' > /etc/lore/config/docker.toml
+[immutable_store.local]
+path = "/data"
+
+[mutable_store.local]
+path = "/data"
+EOF
+
+ENV LORE_CONFIG_PATH=/etc/lore/config
+ENV LORE_ENV=docker
+ENV RUST_LOG=info
+
+RUN mkdir -p /data
+VOLUME /data
+
+# QUIC + gRPC: 41337, HTTP: 41339
+EXPOSE 41337 41339
+
+ENTRYPOINT ["loreserver"]
