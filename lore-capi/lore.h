@@ -634,8 +634,20 @@ typedef struct lore_branch_info_event_data_t {
 
 // Event data reported at the start of a branch diff.
 typedef struct lore_branch_diff_begin_event_data_t {
-  // Unused placeholder field.
-  uint32_t _unused;
+  // Identifier of the source branch of the diff.
+  lore_branch_id_t source_branch;
+  // Name of the source branch.
+  struct lore_string_t source_branch_name;
+  // Revision of the source branch used in the diff.
+  struct lore_hash_t source_revision;
+  // Identifier of the target branch of the diff.
+  lore_branch_id_t target_branch;
+  // Name of the target branch.
+  struct lore_string_t target_branch_name;
+  // Revision of the target branch used in the diff.
+  struct lore_hash_t target_revision;
+  // Base revision the 3-way diff was resolved against.
+  struct lore_hash_t base_revision;
 } lore_branch_diff_begin_event_data_t;
 
 // Event data reported at the start of the change section of a branch diff.
@@ -6360,7 +6372,7 @@ void lore_branch_info_async(const struct lore_global_args_t *globals,
 //
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
-// | `LORE_EVENT_BRANCH_DIFF_BEGIN` | `lore_branch_diff_begin_event_data_t` | Emitted before diff results begin streaming |
+// | `LORE_EVENT_BRANCH_DIFF_BEGIN` | `lore_branch_diff_begin_event_data_t` | Emitted before diff results begin streaming. Includes the resolved branch names and revisions being compared |
 // | `LORE_EVENT_BRANCH_DIFF_CHANGE_BEGIN` | `lore_branch_diff_change_begin_event_data_t` | Emitted before the list of changed files begins |
 // | `LORE_EVENT_BRANCH_DIFF_CHANGE` | `lore_branch_diff_change_event_data_t` | Emitted for each changed file between the two branches |
 // | `LORE_EVENT_BRANCH_DIFF_CHANGE_END` | `lore_branch_diff_change_end_event_data_t` | Emitted after all changed files have been reported |
@@ -6393,7 +6405,7 @@ int32_t lore_branch_diff(const struct lore_global_args_t *globals,
 //
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
-// | `LORE_EVENT_BRANCH_DIFF_BEGIN` | `lore_branch_diff_begin_event_data_t` | Emitted before diff results begin streaming |
+// | `LORE_EVENT_BRANCH_DIFF_BEGIN` | `lore_branch_diff_begin_event_data_t` | Emitted before diff results begin streaming; carries the resolved branch names and revisions being compared |
 // | `LORE_EVENT_BRANCH_DIFF_CHANGE_BEGIN` | `lore_branch_diff_change_begin_event_data_t` | Emitted before the list of changed files begins |
 // | `LORE_EVENT_BRANCH_DIFF_CHANGE` | `lore_branch_diff_change_event_data_t` | Emitted for each changed file between the two branches |
 // | `LORE_EVENT_BRANCH_DIFF_CHANGE_END` | `lore_branch_diff_change_end_event_data_t` | Emitted after all changed files have been reported |

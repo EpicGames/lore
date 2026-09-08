@@ -38,7 +38,6 @@ use crate::history::find_branch_point;
 use crate::interface::LoreString;
 use crate::lore::*;
 use crate::lore_debug;
-use crate::lore_info;
 use crate::lore_warn;
 use crate::metadata;
 use crate::metadata::Metadata;
@@ -324,7 +323,7 @@ pub async fn diff3_with_source_cap(
         .await?
         .branch;
 
-    lore_info!(
+    lore_debug!(
         "Calculating 3-way diff between\n  base {} -> {}\n  source {} -> {}\n  target {} -> {}",
         state_base.revision_number(),
         state_base.revision(),
@@ -340,7 +339,7 @@ pub async fn diff3_with_source_cap(
     // `StateError::Oversized` so callers can map to
     // `Status::resource_exhausted` via `is_oversized()` without
     // string-matching across crates.
-    lore_info!("Diff source branch revisions (streaming)");
+    lore_debug!("Diff source branch revisions (streaming)");
     let (source_tx, mut source_rx) = mpsc::channel::<Result<NodeChange, StateError>>(256);
     let source_walker_repo = repository.clone();
     let source_walker_state_base = state_base.clone();
@@ -421,7 +420,7 @@ pub async fn diff3_with_source_cap(
     }
     state::detect_and_coalesce_moves(&mut source_changes);
 
-    lore_info!("Sorting {} source changes", source_changes.len());
+    lore_debug!("Sorting {} source changes", source_changes.len());
     change::sort_by_path(&mut source_changes);
 
     let target_filter = if source_changes.len() < SOURCE_FILTER_THRESHOLD
@@ -433,7 +432,7 @@ pub async fn diff3_with_source_cap(
     };
     let target_repository = Arc::new(repository.to_filter_context(target_filter));
 
-    lore_info!("Diff target branch revisions (streaming)");
+    lore_debug!("Diff target branch revisions (streaming)");
     let (target_tx, mut target_rx) = mpsc::channel::<Result<NodeChange, StateError>>(256);
     let walker_repo = target_repository.clone();
     let walker_state_base = state_base.clone();

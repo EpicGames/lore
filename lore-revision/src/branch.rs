@@ -164,11 +164,23 @@ pub struct LoreBranchListEndEventData {
 
 /// Event data reported at the start of a branch diff.
 #[repr(C)]
-#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreBranchDiffBeginEventData {
-    /// Unused placeholder field.
-    pub _unused: u32,
+    /// Identifier of the source branch of the diff.
+    pub source_branch: BranchId,
+    /// Name of the source branch.
+    pub source_branch_name: LoreString,
+    /// Revision of the source branch used in the diff.
+    pub source_revision: Hash,
+    /// Identifier of the target branch of the diff.
+    pub target_branch: BranchId,
+    /// Name of the target branch.
+    pub target_branch_name: LoreString,
+    /// Revision of the target branch used in the diff.
+    pub target_revision: Hash,
+    /// Base revision the 3-way diff was resolved against.
+    pub base_revision: Hash,
 }
 
 /// Event data describing a single changed node in a branch diff.
@@ -2606,7 +2618,7 @@ pub async fn diff3_with_source_cap(
     graft_view: Option<Arc<crate::filter::Filter>>,
     tx: mpsc::Sender<Result<DiffItem, BranchError>>,
 ) -> Result<Diff3Summary, BranchError> {
-    lore_info!(
+    lore_debug!(
         "Branch diff branch {source_branch} revision {source_revision} -> branch {target_branch} revision {target_revision}"
     );
 
@@ -2629,7 +2641,7 @@ pub async fn diff3_with_source_cap(
         return Err(BranchError::from(Divergent));
     }
 
-    lore_info!(
+    lore_debug!(
         "Revision diff base {base_revision} source {source_revision} target {target_revision}"
     );
 
@@ -3866,8 +3878,26 @@ async fn find_common_ancestor_from_merges(
     }
 }
 
-pub fn dispatch_diff_events(diff: &DiffResult) {
-    event::LoreEvent::BranchDiffBegin(LoreBranchDiffBeginEventData::default()).send();
+/// Send the event that begins a branch diff, reporting the resolved branches
+/// and revisions being compared. Sent before the diff runs, so it precedes
+/// the diff's own diagnostics in the event stream.
+pub fn dispatch_diff_events(
+    diff: &DiffResult,
+    source_branch: BranchId,
+    source_branch_name: &str,
+    target_branch: BranchId,
+    target_branch_name: &str,
+) {
+    event::LoreEvent::BranchDiffBegin(LoreBranchDiffBeginEventData {
+        source_branch,
+        source_branch_name: source_branch_name.into(),
+        source_revision: diff.source,
+        target_branch,
+        target_branch_name: target_branch_name.into(),
+        target_revision: diff.target,
+        base_revision: diff.base,
+    })
+    .send();
 
     event::LoreEvent::BranchDiffChangeBegin(LoreBranchDiffChangeBeginEventData {
         changes_count: diff.changes.len(),

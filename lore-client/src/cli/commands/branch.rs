@@ -1469,7 +1469,19 @@ pub fn handle_branch_diff(globals: LoreGlobalArgs, args: &BranchDiffArgs) -> u8 
 
     let callback = output_formatter().unwrap_or(Some(
         (Box::new(move |event: &LoreEvent| match event {
-            LoreEvent::BranchDiffBegin(_data) => {}
+            LoreEvent::BranchDiffBegin(data) => {
+                println!(
+                    "Branch diff branch {} revision {} -> branch {} revision {}",
+                    data.source_branch,
+                    data.source_revision,
+                    data.target_branch,
+                    data.target_revision
+                );
+                println!(
+                    "Revision diff base {} source {} target {}",
+                    data.base_revision, data.source_revision, data.target_revision
+                );
+            }
             LoreEvent::BranchDiffChangeBegin(data) => {
                 println!(
                     "{}Found {} changes{}",

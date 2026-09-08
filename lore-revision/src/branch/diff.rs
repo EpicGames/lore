@@ -128,6 +128,17 @@ pub async fn diff(
         ));
     }
 
+    let (source_metadata, target_metadata) = tokio::join!(
+        branch::metadata(repository.clone(), source_branch.id),
+        branch::metadata(repository.clone(), target_branch.id),
+    );
+    let source_name = source_metadata
+        .map(|metadata| branch::name(&metadata).unwrap_or_default().to_string())
+        .unwrap_or_default();
+    let target_name = target_metadata
+        .map(|metadata| branch::name(&metadata).unwrap_or_default().to_string())
+        .unwrap_or_default();
+
     let diff = Box::pin(branch::diff3_collect(
         repository,
         source_branch.id,
@@ -140,7 +151,13 @@ pub async fn diff(
     ))
     .await?;
 
-    branch::dispatch_diff_events(&diff);
+    branch::dispatch_diff_events(
+        &diff,
+        source_branch.id,
+        source_name.as_str(),
+        target_branch.id,
+        target_name.as_str(),
+    );
 
     Ok(())
 }

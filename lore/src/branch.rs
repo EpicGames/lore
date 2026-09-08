@@ -212,7 +212,7 @@ pub struct LoreBranchDiffArgs {
 ///
 /// | Event | Description |
 /// |-------|-------------|
-/// | [`LoreEvent::BranchDiffBegin`](crate::interface::LoreEvent::BranchDiffBegin) | Emitted before diff results begin streaming |
+/// | [`LoreEvent::BranchDiffBegin`](crate::interface::LoreEvent::BranchDiffBegin) | Emitted before diff results begin streaming. Includes the resolved branch names and revisions being compared |
 /// | [`LoreEvent::BranchDiffChangeBegin`](crate::interface::LoreEvent::BranchDiffChangeBegin) | Emitted before the list of changed files begins |
 /// | [`LoreEvent::BranchDiffChange`](crate::interface::LoreEvent::BranchDiffChange) | Emitted for each changed file between the two branches |
 /// | [`LoreEvent::BranchDiffChangeEnd`](crate::interface::LoreEvent::BranchDiffChangeEnd) | Emitted after all changed files have been reported |
