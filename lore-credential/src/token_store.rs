@@ -1026,6 +1026,46 @@ fn secret_absent(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn dbus_error_means_secret_service_is_unavailable(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some(
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+                | "org.freedesktop.DBus.Error.NameHasNoOwner"
+                | "org.freedesktop.DBus.Error.NoServer"
+        )
+    )
+}
+
+/// Whether Linux has no Secret Service provider to read from.
+///
+/// An unavailable provider is different from a provider that is locked or
+/// denied access. Only the former may fall back without risking replacement of
+/// an encryption key that still exists but is temporarily inaccessible.
+#[cfg(target_os = "linux")]
+fn secure_store_is_unavailable(err: &keyring::Error) -> bool {
+    let keyring::Error::PlatformFailure(platform_err) = err else {
+        return false;
+    };
+    let Some(secret_service_err) = platform_err.downcast_ref::<dbus_secret_service::Error>() else {
+        return false;
+    };
+
+    match secret_service_err {
+        dbus_secret_service::Error::Unavailable => true,
+        dbus_secret_service::Error::Dbus(err) => {
+            dbus_error_means_secret_service_is_unavailable(err.name())
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn secure_store_is_unavailable(_err: &keyring::Error) -> bool {
+    false
+}
+
 /// Reads a secret from the OS secure store, if there is a usable one.
 ///
 /// `Ok(None)` means the store holds no such secret, or that no secure store is
@@ -1051,6 +1091,10 @@ async fn secret_from_secure_store(target: &str) -> Result<Option<Vec<u8>>, Token
         }
         Err(keyring::Error::NoEntry) => {
             lore_debug!("No secret in secure store {target}");
+            Ok(None)
+        }
+        Err(err) if secure_store_is_unavailable(&err) => {
+            lore_debug!("No secure store is available for {target}, using fallback storage");
             Ok(None)
         }
         Err(err) => {
@@ -1290,6 +1334,32 @@ token = "tok-b"
         assert!(encryption_key_from_stored(&[0u8; 16]).is_none());
         // The layout earlier versions wrote: a nonce counter ahead of the key.
         assert!(encryption_key_from_stored(&[0u8; 4 + 32]).is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn absent_linux_secret_service_uses_fallback_without_hiding_other_failures() {
+        let unavailable =
+            keyring::Error::PlatformFailure(Box::new(dbus_secret_service::Error::Unavailable));
+        assert!(secure_store_is_unavailable(&unavailable));
+
+        let locked = keyring::Error::NoStorageAccess(Box::new(dbus_secret_service::Error::Locked));
+        assert!(!secure_store_is_unavailable(&locked));
+
+        let unrelated = keyring::Error::PlatformFailure(Box::new(std::io::Error::other(
+            "unrelated platform failure",
+        )));
+        assert!(!secure_store_is_unavailable(&unrelated));
+
+        assert!(dbus_error_means_secret_service_is_unavailable(Some(
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+        )));
+        assert!(dbus_error_means_secret_service_is_unavailable(Some(
+            "org.freedesktop.DBus.Error.NameHasNoOwner"
+        )));
+        assert!(!dbus_error_means_secret_service_is_unavailable(Some(
+            "org.freedesktop.DBus.Error.AccessDenied"
+        )));
     }
 
     #[test]
