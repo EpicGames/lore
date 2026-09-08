@@ -6160,6 +6160,7 @@ mod tests {
                         no_commit: true,
                         scope: lore_revision::branch::merge::MergeScope::MainOnly,
                         inherit_metadata: Default::default(),
+                        metadata: Default::default(),
                     },
                 )),
             )
@@ -7567,6 +7568,7 @@ mod tests {
                                 no_commit: false,
                                 scope: lore_revision::branch::merge::MergeScope::MainOnly,
                                 inherit_metadata: Default::default(),
+                                metadata: Default::default(),
                             },
                         )),
                     )

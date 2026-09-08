@@ -481,6 +481,10 @@ pub struct MergeStartOptions {
     pub scope: MergeScope,
     /// Metadata keys carried from the source revision onto the merge revision.
     pub inherit_metadata: MetadataInherit,
+    /// The caller's own metadata for the auto commit, applied as
+    /// `commit_with_metadata` applies its keys. Empty leaves the commit as
+    /// `commit` would make it.
+    pub metadata: crate::commit::CommitMetadata,
 }
 
 /// The revisions a merge's three-way diff ran between, other than the target.
@@ -3360,7 +3364,7 @@ async fn validate_link_messages(
     Ok(())
 }
 
-/// Auto-commit a merge with no conflicts.
+/// Auto-commit a merge with no conflicts, recording the caller's metadata.
 async fn auto_commit_merge(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -3373,9 +3377,16 @@ async fn auto_commit_merge(
         layer_messages: std::collections::HashMap::new(),
         layer: None,
     };
-    commit::commit_boxed(repository, token, commit_options)
-        .await
-        .forward::<MergeError>("auto-committing merge")
+    commit::commit_with_metadata_boxed(
+        repository,
+        token,
+        commit_options,
+        options.metadata.keys,
+        options.metadata.values,
+        options.metadata.formats,
+    )
+    .await
+    .forward::<MergeError>("auto-committing merge")
 }
 
 pub struct ApplyDiffResults {

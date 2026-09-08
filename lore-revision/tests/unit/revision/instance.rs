@@ -330,6 +330,7 @@ pub(super) async fn start_merge(
             no_commit,
             scope: branch::merge::MergeScope::MainOnly,
             inherit_metadata: MetadataInherit::default(),
+            metadata: Default::default(),
         },
     ))
     .await

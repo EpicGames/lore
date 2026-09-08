@@ -218,6 +218,7 @@ mod tests {
                         no_commit: true,
                         scope: branch::merge::MergeScope::MainOnly,
                         inherit_metadata: MetadataInherit::default(),
+                        metadata: Default::default(),
                     },
                 ))
                 .await

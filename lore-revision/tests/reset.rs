@@ -1843,6 +1843,7 @@ mod tests {
                             no_commit: false,
                             scope: branch::merge::MergeScope::MainOnly,
                             inherit_metadata: Default::default(),
+                            metadata: Default::default(),
                         },
                     )),
                 )
@@ -2306,6 +2307,7 @@ mod tests {
                                 no_commit: false,
                                 scope: branch::merge::MergeScope::MainOnly,
                                 inherit_metadata: Default::default(),
+                                metadata: Default::default(),
                             },
                         )),
                     )
