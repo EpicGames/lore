@@ -162,6 +162,7 @@ impl Settings {
         let settings: Settings = settings.try_deserialize()?;
         validate_trace_config(&settings)?;
         validate_feature_config(&settings)?;
+        validate_auth_config(&settings)?;
         let settings_string = format!("{settings:?}");
         let settings_hash = hash::hash_string(&settings_string);
 
@@ -170,6 +171,26 @@ impl Settings {
 
         Ok((settings, settings_hash))
     }
+}
+
+/// Missing `jwt_issuer` / `jwt_audience` under `[server.auth]` already fails
+/// deserialization. This catches the empty list, which would parse but reject
+/// every token, and is never what was configured on purpose.
+fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> {
+    let Some(auth) = settings.server.auth.as_ref() else {
+        return Ok(());
+    };
+    if auth.jwt_issuer.is_empty() {
+        return Err(config::ConfigError::Message(
+            "server.auth.jwt_issuer must not be empty".to_string(),
+        ));
+    }
+    if auth.jwt_audience.is_empty() {
+        return Err(config::ConfigError::Message(
+            "server.auth.jwt_audience must not be empty".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_trace_config(settings: &Settings) -> Result<(), config::ConfigError> {
@@ -224,16 +245,65 @@ pub struct AuthSettings {
     /// If this or its `endpoint` is absent, the JWKS endpoint is
     /// resolved through OIDC discovery against `jwt_issuer`.
     pub jwk: Option<JWKServiceSettings>,
-    pub jwt_audience: Option<Vec<String>>,
-    /// The `iss` values verification accepts. A bare string still parses, so
-    /// existing configs need no edit. Two entries is for the length of an
-    /// issuer's cutover — accepting tokens minted under both the old and the
-    /// new `iss` while they are both in flight — and one entry otherwise. The
-    /// list is not for discovering several providers: discovery resolves
-    /// against the first entry, and two entries with different discovery
-    /// documents is a configuration error.
-    #[serde_as(as = "Option<serde_with::OneOrMany<_, serde_with::formats::PreferMany>>")]
-    pub jwt_issuer: Option<Vec<String>>,
+    /// The accepted `aud` values.
+    pub jwt_audience: Vec<String>,
+    /// The accepted `iss` values. A bare string still parses, so existing
+    /// configs need no edit. Two entries is for the length of an issuer's
+    /// cutover — accepting tokens minted under both the old and the new `iss`
+    /// while they are both in flight — and one entry otherwise. The list is not
+    /// for discovering several providers: discovery resolves against the first
+    /// entry, and two entries with different discovery documents is a
+    /// configuration error.
+    #[serde_as(as = "serde_with::OneOrMany<_, serde_with::formats::PreferMany>")]
+    pub jwt_issuer: Vec<String>,
+    /// Dotted path of the JWT claim carrying the caller's allowed actions.
+    pub permission_claim: Option<String>,
+    /// Dotted path of the claim carrying per-repository resource grants.
+    /// If this is set, enables the granular `ResourceGrantsAuthorizer`.
+    pub resource_claim: Option<String>,
+    /// Template that renders a repository id into the corresponding resource
+    /// name.
+    #[serde(default = "AuthSettings::default_resource_id_template")]
+    pub resource_id_template: String,
+    /// The resource name that matches every repository.
+    #[serde(default = "AuthSettings::default_resource_wildcard")]
+    pub resource_wildcard: String,
+    /// The claim recorded and compared as the caller's identity.
+    #[serde(default = "AuthSettings::default_identity_claim")]
+    pub identity_claim: String,
+    /// What the repository listing answers for an authenticated caller with
+    /// no explicit grant. Gates listing of the IDs only, never grants
+    /// access to the contents.
+    #[serde(default)]
+    pub baseline_access: BaselineAccess,
+}
+
+impl AuthSettings {
+    fn default_resource_id_template() -> String {
+        "urc-{id}".to_string()
+    }
+
+    fn default_resource_wildcard() -> String {
+        "urc-*".to_string()
+    }
+
+    fn default_identity_claim() -> String {
+        "sub".to_string()
+    }
+}
+
+/// What `list_repositories` answers for an authenticated caller holding no
+/// explicit grant.
+#[derive(Copy, Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BaselineAccess {
+    /// Every partition the server holds is listed. Opt-in: it discloses
+    /// partition identifiers to every authenticated caller.
+    Reachable,
+    /// Nothing is listed without a grant. The default, so the disclosing
+    /// option is an explicit choice.
+    #[default]
+    Denied,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -607,39 +677,191 @@ mod tests {
     /// configuration, so existing config files need no edit.
     #[test]
     fn jwt_issuer_accepts_a_bare_string_and_a_list() {
-        let bare: AuthSettings = toml::from_str(r#"jwt_issuer = "LEGACY_AUTH_KEYWORD""#)
-            .expect("[server.auth] with a bare string should deserialize");
-        let list: AuthSettings = toml::from_str(r#"jwt_issuer = ["LEGACY_AUTH_KEYWORD"]"#)
-            .expect("[server.auth] with a list should deserialize");
+        let bare: AuthSettings = toml::from_str(
+            r#"
+            jwt_issuer = "LEGACY_AUTH_KEYWORD"
+            jwt_audience = ["lore-service"]
+        "#,
+        )
+        .expect("[server.auth] with a bare string should deserialize");
+        let list: AuthSettings = toml::from_str(
+            r#"
+            jwt_issuer = ["LEGACY_AUTH_KEYWORD"]
+            jwt_audience = ["lore-service"]
+        "#,
+        )
+        .expect("[server.auth] with a list should deserialize");
 
         assert_eq!(bare.jwt_issuer, list.jwt_issuer);
-        assert_eq!(
-            bare.jwt_issuer,
-            Some(vec!["LEGACY_AUTH_KEYWORD".to_string()])
-        );
+        assert_eq!(bare.jwt_issuer, vec!["LEGACY_AUTH_KEYWORD".to_string()]);
     }
 
     #[test]
     fn jwt_issuer_accepts_two_entries_for_a_cutover() {
         let auth: AuthSettings = toml::from_str(
-            r#"jwt_issuer = ["LEGACY_AUTH_KEYWORD", "https://auth.example.com/realms/lore"]"#,
+            r#"
+            jwt_issuer = ["LEGACY_AUTH_KEYWORD", "https://auth.example.com/realms/lore"]
+            jwt_audience = ["lore-service"]
+        "#,
         )
         .expect("[server.auth] with two issuers should deserialize");
 
         assert_eq!(
             auth.jwt_issuer,
-            Some(vec![
+            vec![
                 "LEGACY_AUTH_KEYWORD".to_string(),
                 "https://auth.example.com/realms/lore".to_string(),
-            ])
+            ]
+        );
+    }
+
+    /// Every authorization field round-trips from TOML, including the
+    /// literal `urc-*` wildcard.
+    #[test]
+    fn auth_settings_authorization_fields_round_trip() {
+        let auth: AuthSettings = toml::from_str(
+            r#"
+            jwt_issuer = "https://auth.example.com"
+            jwt_audience = ["lore"]
+            permission_claim = "realm_access.roles"
+            resource_claim = "resources"
+            resource_id_template = "repo:{id}"
+            resource_wildcard = "urc-*"
+            identity_claim = "preferred_username"
+            baseline_access = "reachable"
+        "#,
+        )
+        .expect("[server.auth] with every authorization field should deserialize");
+
+        assert_eq!(auth.permission_claim.as_deref(), Some("realm_access.roles"));
+        assert_eq!(auth.resource_claim.as_deref(), Some("resources"));
+        assert_eq!(auth.resource_id_template, "repo:{id}");
+        assert_eq!(auth.resource_wildcard, "urc-*");
+        assert_eq!(auth.identity_claim, "preferred_username");
+        assert_eq!(auth.baseline_access, BaselineAccess::Reachable);
+    }
+
+    /// A config setting none of the authorization fields gets the documented
+    /// defaults: the `urc-` template and wildcard literals, `sub` as the
+    /// identity claim, and no permission or resource claim selected.
+    #[test]
+    fn auth_settings_authorization_fields_have_backward_compatible_defaults() {
+        let auth: AuthSettings = toml::from_str(
+            r#"
+            jwt_issuer = "LEGACY_AUTH_KEYWORD"
+            jwt_audience = ["lore-service"]
+        "#,
+        )
+        .expect("[server.auth] without the authorization fields should deserialize");
+
+        assert_eq!(auth.resource_id_template, "urc-{id}");
+        assert_eq!(auth.resource_wildcard, "urc-*");
+        assert_eq!(auth.baseline_access, BaselineAccess::Denied);
+        assert_eq!(auth.permission_claim, None);
+        assert_eq!(auth.resource_claim, None);
+        assert_eq!(auth.identity_claim, "sub");
+    }
+
+    /// Minimal loadable settings with the given `[server.auth]` keys, for the
+    /// startup-validation tests. `Settings` deserializes with a `'static`
+    /// bound, so the assembled TOML is leaked; each test builds one.
+    fn settings_with_auth_keys(auth_keys: &str) -> Result<Settings, toml::de::Error> {
+        let config = format!(
+            r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+
+            [server.auth]
+            {auth_keys}
+        "#
+        );
+        toml::from_str(Box::leak(config.into_boxed_str()))
+    }
+
+    #[test]
+    fn auth_without_jwt_audience_fails_to_parse_naming_the_setting() {
+        let error = settings_with_auth_keys(r#"jwt_issuer = "LEGACY_AUTH_KEYWORD""#)
+            .expect_err("[server.auth] without jwt_audience must fail to parse");
+        assert!(
+            error.to_string().contains("jwt_audience"),
+            "the error must name the missing setting: {error}"
         );
     }
 
     #[test]
-    fn jwt_issuer_absent_stays_none() {
-        let auth: AuthSettings =
-            toml::from_str("").expect("an empty [server.auth] should deserialize");
-        assert_eq!(auth.jwt_issuer, None);
+    fn auth_without_jwt_issuer_fails_to_parse_naming_the_setting() {
+        let error = settings_with_auth_keys(r#"jwt_audience = ["lore-service"]"#)
+            .expect_err("[server.auth] without jwt_issuer must fail to parse");
+        assert!(
+            error.to_string().contains("jwt_issuer"),
+            "the error must name the missing setting: {error}"
+        );
+    }
+
+    /// An empty list parses but would reject every token, which is never what
+    /// was configured on purpose, so validation refuses it.
+    #[test]
+    fn auth_with_empty_jwt_audience_fails_validation() {
+        let settings = settings_with_auth_keys(
+            r#"
+            jwt_issuer = "LEGACY_AUTH_KEYWORD"
+            jwt_audience = []
+        "#,
+        )
+        .expect("an empty jwt_audience list still parses");
+        validate_auth_config(&settings)
+            .expect_err("[server.auth] with an empty jwt_audience must fail validation");
+    }
+
+    #[test]
+    fn auth_with_empty_jwt_issuer_fails_validation() {
+        let settings = settings_with_auth_keys(
+            r#"
+            jwt_issuer = []
+            jwt_audience = ["lore-service"]
+        "#,
+        )
+        .expect("an empty jwt_issuer list still parses");
+        validate_auth_config(&settings)
+            .expect_err("[server.auth] with an empty jwt_issuer must fail validation");
+    }
+
+    #[test]
+    fn auth_with_issuer_and_audience_passes_validation() {
+        let settings = settings_with_auth_keys(
+            r#"
+            jwt_issuer = "LEGACY_AUTH_KEYWORD"
+            jwt_audience = ["lore-service", ".example.net"]
+        "#,
+        )
+        .expect("a complete [server.auth] must parse");
+        validate_auth_config(&settings).expect("a complete [server.auth] must validate");
+    }
+
+    /// No `[server.auth]` at all keeps starting: verification stays off and
+    /// nothing is mandatory.
+    #[test]
+    fn no_auth_table_passes_validation() {
+        let settings: Settings = toml::from_str(
+            r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+        "#,
+        )
+        .expect("settings deserialize");
+        validate_auth_config(&settings).expect("no [server.auth] must stay valid");
     }
 
     /// Both keys absent means an empty policy, which resolves to the built-in set.

@@ -5,7 +5,7 @@ authors:
   - Hannes Muurinen
 status: Approved
 created: 2026-08-20
-updated: 2026-09-01
+updated: 2026-09-08
 discussion: https://crowd.urc.internal.epicgames.net/epic/Lore/change-request/412
 ---
 
@@ -669,8 +669,8 @@ a token without it keeps verifying (D6).
 The resource claim is Tier 2's mechanism, and Tier 1 reads no resource claim at all (D1). Both
 tiers answer the same *question*: `check_repository_access(token, repository, action)` is asked
 identically at every enforcement point, and the tier decides who answers it. Under Tier 2
-`TokenClaimsRepositoryAuthorizer` answers from this claim. Under Tier 1
-`TokenRolesRepositoryAuthorizer` answers the same question from a global action set read out of a
+`ResourceGrantsAuthorizer` answers from this claim. Under Tier 1
+`GlobalGrantsAuthorizer` answers the same question from a global action set read out of a
 role or group claim, ignoring which partition was asked about (D8). The action vocabulary is
 common to both tiers. What differs is whether an action is scoped to a partition or held
 everywhere.
@@ -853,8 +853,10 @@ requests exactly one resource per exchange (D1), and `lore repo list` has no par
 to exchange for in the first place, since discovering them is the point of the
 call. Enumeration therefore requires its own optional trait, `RepositoryDirectory`.
 
-The default implementation answers from `baseline_access` (D8): `reachable`, the default, lists
-every partition the server holds, and `denied` lists none. That setting exists for this trait
+The default implementation answers from `baseline_access` (D8): `denied`, the default, lists
+none, and `reachable` lists every partition the server holds. The secure option is the default
+so the disclosing one is an explicit choice. A server with no `[server.auth]` at all keeps
+listing everything it holds, as a local server does today. That setting exists for this trait
 alone and gates no access decision. A `UrcAuthApi` deployment gets an implementation that calls
 `LookupUserPermissions` and behaves exactly as today.
 
@@ -954,9 +956,9 @@ Two changes from today's `check_repository_access(authorization: Option<String>,
 
 The two implementations:
 
-- `TokenClaimsRepositoryAuthorizer` answers from the token's resource claim with no network call.
+- `ResourceGrantsAuthorizer` answers from the token's resource claim with no network call.
   **Tier 2 only.** It consumes the per-partition scoping that tier exists to produce.
-- `TokenRolesRepositoryAuthorizer` answers from a *global* action set read out of a role or group
+- `GlobalGrantsAuthorizer` answers from a *global* action set read out of a role or group
   claim, ignoring the repository parameter entirely. **This is Tier 1's authorizer.** Without it
   Tier 1 would fall through to `AllowAllRepositoryAuthorizer`, which is not an acceptable default
   for a tier meant for real deployments.
@@ -969,8 +971,8 @@ flowchart TD
     A -- yes --> B{"legacy UrcAuthApi deployment?"}
     B -- yes --> AC["AuthClientAuthorizer<br/>online CheckUserPermission call per check"]
     B -- no --> C{"resource_claim set?"}
-    C -- "yes (Tier 2)" --> TC["TokenClaimsRepositoryAuthorizer<br/>per-partition grants read from the resource claim"]
-    C -- "no (Tier 1)" --> TR["TokenRolesRepositoryAuthorizer<br/>global actions read from permission_claim"]
+    C -- "yes (Tier 2)" --> TC["ResourceGrantsAuthorizer<br/>per-partition grants read from the resource claim"]
+    C -- "no (Tier 1)" --> TR["GlobalGrantsAuthorizer<br/>global actions read from permission_claim"]
 ```
 
 #### Tier 2 authorizes from the resource claim
@@ -1009,7 +1011,7 @@ in `[server.auth]` but touches listing only:
 | --- | --- |
 | `permission_claim` | Dotted path to the actions claim, for example `realm_access.roles` on Keycloak or `groups` on Dex. Claim values are action names. |
 | `resource_claim` | Present means Tier 2, and actions are scoped by the resource beside them. Absent means the `permission_claim` actions are global, which is Tier 1. |
-| `baseline_access` | What the default `RepositoryDirectory` (D7) lists when no custom implementation is configured. `reachable`, the default, lists every repository the server holds, which is today's behavior. `denied` lists none. It gates no access decision. |
+| `baseline_access` | What the default `RepositoryDirectory` (D7) lists when no custom implementation is configured. `denied`, the default, lists none. `reachable` lists every repository the server holds. It gates no access decision. |
 
 A deployment that configures `[server.auth]` but no `permission_claim` leaves every authenticated
 principal with ordinary access and no admin actions at all. That fails closed on every privileged
@@ -1060,7 +1062,7 @@ Two of these cannot simply await an authorizer.
 `Arc<dyn Fn(RepositoryId) -> bool + Send + Sync>`
 ([`lore-revision/src/state.rs`](../../lore-revision/src/state.rs)), called during revision-graph
 traversal, potentially many times per request. Whatever answers it has to do so without awaiting
-anything. Both tiers can: `TokenRolesRepositoryAuthorizer` and `TokenClaimsRepositoryAuthorizer`
+anything. Both tiers can: `GlobalGrantsAuthorizer` and `ResourceGrantsAuthorizer`
 read a token the interceptor has already verified, so the answer is in memory and the closure needs
 no cache, no preload and no staleness bound.
 
@@ -1070,7 +1072,7 @@ land somewhere that can answer it without blocking. Two placements do, and picki
 be decided at the time of implementation:
 
 - **Keep the check in the interceptor**, against an authorizer that answers from the verified token
-  with no await. `TokenRolesRepositoryAuthorizer` and `TokenClaimsRepositoryAuthorizer` both do,
+  with no await. `GlobalGrantsAuthorizer` and `ResourceGrantsAuthorizer` both do,
   so the check is genuinely synchronous rather than an async block standing in place, and the
   `block_in_place` shape stays confined to the JWKS miss it already covers. The cost is that an
   online authorizer, `AuthClientAuthorizer` included, cannot be reached from here, so a legacy
@@ -1289,13 +1291,14 @@ The action parameter added to the interface also allows a hybrid approach, where
 are answered from the token with no network call, while writes, or only destructive actions such
 as `obliterate`, do online checks for every call.
 
-**The default partition listing discloses names to every authenticated caller.** Without a
-`RepositoryDirectory` implementation, `lore repo list` returns what the server holds rather than
-what the caller was granted (D7). That is correct under Tier 1, where reachability is global
-anyway, and an over-disclosure under Tier 2. It leaks partition identifiers and names, not
-contents: every operation on a listed partition still goes through `check_repository_access`. A
-deployment that treats the partition inventory as sensitive can implement the
-trait or set `baseline_access = "denied"`.
+**`baseline_access = "reachable"` discloses partition names to every authenticated caller.**
+With it set, `lore repo list` returns what the server holds rather than what the caller was
+granted (D7). That is correct under Tier 1, where reachability is global anyway, and an
+over-disclosure under Tier 2. It leaks partition identifiers and names, not contents: every
+operation on a listed partition still goes through `check_repository_access`. The default is
+`denied`, which lists nothing, so the disclosure is something a deployment opts into rather
+than something it has to notice and turn off. A deployment that wants per-caller listings
+implements the trait.
 
 ## Privacy Considerations
 
