@@ -34,7 +34,9 @@ def test_store_compaction(new_lore_repo, lore_executable_path):
 
     # Also one big file for re-fragmentation
     repo.make_dirs(os.path.join("large", "file"))
-    with repo.open_file(os.path.join("large", "file", "test.png"), "w+b") as output_file:
+    with repo.open_file(
+        os.path.join("large", "file", "test.png"), "w+b"
+    ) as output_file:
         output_file.write(os.urandom(160 * 1024 * 1024))
 
     # Add a copy for deduplication

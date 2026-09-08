@@ -441,7 +441,9 @@ def test_merge_conflict_binary_files_written(new_lore_repo):
 
     # ~base and ~theirs should be written for binary conflicts
     assert repo.file_exists(binary_file + "~base"), "~base missing for binary conflict"
-    assert repo.file_exists(binary_file + "~theirs"), "~theirs missing for binary conflict"
+    assert repo.file_exists(binary_file + "~theirs"), (
+        "~theirs missing for binary conflict"
+    )
 
     # ~mine should NOT be written for binary — the working copy is already the mine version
     assert not repo.file_exists(binary_file + "~mine"), (

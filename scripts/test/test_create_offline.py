@@ -22,9 +22,7 @@ class TestCreateOfflineLocal:
         """--offline with a bare name succeeds even when no remote URL is set."""
         monkeypatch.delenv("LORE_REMOTE_URL", raising=False)
         repo: Lore = new_lore_repo(create_repo=False)
-        assert not os.path.isdir(repo.dot_path()), (
-            "Lore repo is already initialized"
-        )
+        assert not os.path.isdir(repo.dot_path()), "Lore repo is already initialized"
 
         repo.repository_create(offline=True)
 
@@ -36,9 +34,7 @@ class TestCreateOfflineLocal:
         """--local mirrors --offline: a bare name succeeds with no remote URL."""
         monkeypatch.delenv("LORE_REMOTE_URL", raising=False)
         repo: Lore = new_lore_repo(create_repo=False)
-        assert not os.path.isdir(repo.dot_path()), (
-            "Lore repo is already initialized"
-        )
+        assert not os.path.isdir(repo.dot_path()), "Lore repo is already initialized"
 
         repo.repository_create(local=True)
 
@@ -48,12 +44,8 @@ class TestCreateOfflineLocal:
 
     def test_create_local_remote_unreachable(self, new_lore_repo):
         """--local must not attempt to connect even when the remote is unreachable."""
-        repo: Lore = new_lore_repo(
-            create_repo=False, remote_url=UNREACHABLE_REMOTE_URL
-        )
-        assert not os.path.isdir(repo.dot_path()), (
-            "Lore repo is already initialized"
-        )
+        repo: Lore = new_lore_repo(create_repo=False, remote_url=UNREACHABLE_REMOTE_URL)
+        assert not os.path.isdir(repo.dot_path()), "Lore repo is already initialized"
 
         repo.repository_create(local=True)
 
@@ -63,12 +55,8 @@ class TestCreateOfflineLocal:
 
     def test_create_offline_remote_unreachable(self, new_lore_repo):
         """--offline must not attempt to connect even when the remote is unreachable."""
-        repo: Lore = new_lore_repo(
-            create_repo=False, remote_url=UNREACHABLE_REMOTE_URL
-        )
-        assert not os.path.isdir(repo.dot_path()), (
-            "Lore repo is already initialized"
-        )
+        repo: Lore = new_lore_repo(create_repo=False, remote_url=UNREACHABLE_REMOTE_URL)
+        assert not os.path.isdir(repo.dot_path()), "Lore repo is already initialized"
 
         repo.repository_create(offline=True)
 

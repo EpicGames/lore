@@ -23,6 +23,16 @@ extend-exclude = [".urc", ".lore"]
 
 [tool.pytest.ini_options]
 addopts = "--dist loadgroup --tb=short -rsxX"
+# tmp_path_retention_policy is deliberately left at its default. "none" looks
+# right for a suite that cleans up after itself, but it sets keep=0 on the
+# numbered basetemp rotation, which makes pytest delete the *current* session's
+# basetemp from its own pytest_sessionfinish. That takes lore_server_info.json
+# with it before scripts/test/lore_server.py can read the shared server's pid,
+# leaking a loreserver on every run, and it deletes the very data that
+# --keep-test-data promises to keep. Neither shows up when --basetemp is passed,
+# which is why CI would not have caught it. The default keeps the last three
+# basetemps, which now costs nothing because each run empties its own. Per-test
+# tmp_path directories are handled by a fixture in scripts/test/conftest.py.
 markers = [
     "smoke: marks as smoke test",
     "slow: marks as a slow running test",

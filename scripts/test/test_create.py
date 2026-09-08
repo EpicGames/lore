@@ -22,9 +22,7 @@ class TestCreate:
         """
         repo: Lore = new_lore_repo(create_repo=False)
         # verify the repo is not yet initialized
-        assert not os.path.isdir(repo.dot_path()), (
-            "Lore repo is already initialized"
-        )
+        assert not os.path.isdir(repo.dot_path()), "Lore repo is already initialized"
 
         with pytest.raises(UninitializedRepositoryError):
             repo.status()
@@ -35,17 +33,13 @@ class TestCreate:
         """
         repo: Lore = new_lore_repo(create_repo=False)
         # verify the repo is not yet initialized
-        assert not os.path.isdir(repo.dot_path()), (
-            "Lore repo is already initialized"
-        )
+        assert not os.path.isdir(repo.dot_path()), "Lore repo is already initialized"
 
         # initialize Lore repo and verify success
         repo.repository_create()
 
         # verify repo was initialized
-        assert os.path.isdir(repo.dot_path()), (
-            "Lore repo was not initialized"
-        )
+        assert os.path.isdir(repo.dot_path()), "Lore repo was not initialized"
 
     def test_initialize_twice_fails(self, new_lore_repo):
         """
@@ -93,9 +87,7 @@ class TestCreate:
         generated_id = Lore.generate_id()
         repo = new_lore_repo(repo_id=generated_id, create_repo=False)
         # verify the repo is not yet initialized
-        assert not os.path.isdir(repo.dot_path()), (
-            "Lore repo is already initialized"
-        )
+        assert not os.path.isdir(repo.dot_path()), "Lore repo is already initialized"
         repo.repository_create(repo_id=generated_id)
         created_repo_id = repo.get_id()
 

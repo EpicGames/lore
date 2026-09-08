@@ -50,7 +50,10 @@ def test_killed_sync_leaves_blocking_orphan(new_lore_repo):
     env.setdefault("LORE_AUTH_PATH", clone.global_dir)
     proc = subprocess.Popen(
         [clone.lore_executable_path, "--repository", clone.path, "sync"],
-        cwd=clone.path, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
+        cwd=clone.path,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
     )
     deadline = time.time() + 60
     while time.time() < deadline:

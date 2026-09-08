@@ -13,9 +13,9 @@ logger = logging.getLogger(__name__)
 
 
 @pytest.mark.smoke
-def test_merge_restart(new_lore_repo, tmp_path_factory):
+def test_merge_restart(new_lore_repo, scratch_dir):
     repo: Lore = new_lore_repo()
-    merge_backup_path = tmp_path_factory.mktemp("backup_path")
+    merge_backup_path = scratch_dir("backup_path", create=True)
     example_file = "example.txt"
     with repo.open_file(example_file, "w+") as output_file:
         output_file.writelines(["This is the first file.\n"])

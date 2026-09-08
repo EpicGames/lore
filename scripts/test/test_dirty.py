@@ -290,7 +290,9 @@ def test_dirty_move_of_uncommitted_source_stays_add(new_lore_repo):
         "--scan must not invent move provenance, "
         f"got fromPath={scanned_entry.get('fromPath')!r}"
     )
-    assert scanned_entry["flagDirty"] is True, "new.txt should stay flagDirty after scan"
+    assert scanned_entry["flagDirty"] is True, (
+        "new.txt should stay flagDirty after scan"
+    )
     assert find_status_entry(scanned, "old.txt") is None, (
         "the vacated source path must not reappear after scan"
     )

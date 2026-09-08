@@ -80,7 +80,9 @@ def test_commit_with_identity_stamps_creator_and_committer(new_lore_repo):
 
     rev = repo.revision_info(metadata=True)
     assert rev.creator == "alice", f"Expected creator='alice', got {rev.creator!r}"
-    assert rev.committer == "alice", f"Expected committer='alice', got {rev.committer!r}"
+    assert rev.committer == "alice", (
+        f"Expected committer='alice', got {rev.committer!r}"
+    )
 
 
 @pytest.mark.smoke

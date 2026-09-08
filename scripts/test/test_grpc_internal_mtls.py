@@ -22,6 +22,7 @@ import os
 import grpc
 import pytest
 
+from cleanup_util import remove_tree
 from lore_server import (
     _kill_server_by_pid,
     _wait_for_grpc_port,
@@ -64,7 +65,9 @@ def _generate_pki(pki_dir):
         .public_key(ca_key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
-        .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1))
+        .not_valid_after(
+            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1)
+        )
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
         .add_extension(
             x509.KeyUsage(
@@ -94,7 +97,10 @@ def _generate_pki(pki_dir):
             .public_key(key.public_key())
             .serial_number(x509.random_serial_number())
             .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
-            .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=1))
+            .not_valid_after(
+                datetime.datetime.now(datetime.timezone.utc)
+                + datetime.timedelta(days=1)
+            )
         )
         if san:
             builder = builder.add_extension(
@@ -182,8 +188,14 @@ class TestGrpcInternalMtls:
     """
 
     @pytest.fixture(scope="class")
-    def pki(self, tmp_path_factory):
-        return _generate_pki(tmp_path_factory.mktemp("pki"))
+    def pki(self, request, tmp_path_factory):
+        # Class-scoped, so it cannot use the function-scoped scratch_dir; the
+        # certificates are removed with the class instead, once the servers
+        # using them have been torn down.
+        pki_dir = tmp_path_factory.mktemp("pki")
+        if not request.config.getoption("--keep-test-data"):
+            request.addfinalizer(lambda: remove_tree(pki_dir, label="test PKI"))
+        return _generate_pki(pki_dir)
 
     @pytest.fixture(scope="class")
     def mtls_server_config(self, request, tmp_path_factory, pki):

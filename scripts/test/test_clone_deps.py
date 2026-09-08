@@ -81,7 +81,9 @@ def test_clone_deps_root_file_only(new_lore_repo):
     files = cloned_files(clone)
     assert "src/main.rs" in files, f"Root file not cloned: {files}"
     assert "src/lib.rs" not in files, f"Unrelated file should not be cloned: {files}"
-    assert "assets/texture.png" not in files, f"Unrelated file should not be cloned: {files}"
+    assert "assets/texture.png" not in files, (
+        f"Unrelated file should not be cloned: {files}"
+    )
 
 
 @pytest.mark.smoke
@@ -114,7 +116,9 @@ def test_clone_deps_direct_dependencies(new_lore_repo):
     assert "src/deep.rs" not in files, (
         f"Transitive dep should not be cloned without recursive: {files}"
     )
-    assert "assets/texture.png" not in files, f"Unrelated file should not be cloned: {files}"
+    assert "assets/texture.png" not in files, (
+        f"Unrelated file should not be cloned: {files}"
+    )
 
 
 @pytest.mark.smoke
@@ -143,8 +147,12 @@ def test_clone_deps_recursive(new_lore_repo):
     assert "src/main.rs" in files
     assert "src/lib.rs" in files
     assert "src/util.rs" in files
-    assert "src/deep.rs" in files, f"Transitive dep should be cloned with recursive: {files}"
-    assert "assets/texture.png" not in files, f"Unrelated file should not be cloned: {files}"
+    assert "src/deep.rs" in files, (
+        f"Transitive dep should be cloned with recursive: {files}"
+    )
+    assert "assets/texture.png" not in files, (
+        f"Unrelated file should not be cloned: {files}"
+    )
 
 
 @pytest.mark.smoke
@@ -175,14 +183,20 @@ def test_clone_deps_tag_filter(new_lore_repo):
     files = cloned_files(clone_build)
     assert "src/main.rs" in files
     assert "src/lib.rs" in files, f"Build dep not cloned: {files}"
-    assert "assets/texture.png" not in files, f"Art dep should not be cloned with build tag: {files}"
-    assert "assets/sound.wav" not in files, f"Art dep should not be cloned with build tag: {files}"
+    assert "assets/texture.png" not in files, (
+        f"Art dep should not be cloned with build tag: {files}"
+    )
+    assert "assets/sound.wav" not in files, (
+        f"Art dep should not be cloned with build tag: {files}"
+    )
 
     # Clone with only "art" tag
     clone_art = repo.clone(root_files=["src/main.rs"], dependency_tags=["art"])
     files = cloned_files(clone_art)
     assert "src/main.rs" in files
-    assert "src/lib.rs" not in files, f"Build dep should not be cloned with art tag: {files}"
+    assert "src/lib.rs" not in files, (
+        f"Build dep should not be cloned with art tag: {files}"
+    )
     assert "assets/texture.png" in files, f"Art dep not cloned: {files}"
     assert "assets/sound.wav" in files, f"Art dep not cloned: {files}"
 
@@ -214,7 +228,9 @@ def test_clone_deps_multiple_roots(new_lore_repo):
     assert "src/lib.rs" in files, f"Dep of first root not cloned: {files}"
     assert "src/test.rs" in files
     assert "src/helper.rs" in files, f"Dep of second root not cloned: {files}"
-    assert "assets/texture.png" not in files, f"Unrelated file should not be cloned: {files}"
+    assert "assets/texture.png" not in files, (
+        f"Unrelated file should not be cloned: {files}"
+    )
 
 
 @pytest.mark.smoke
@@ -291,8 +307,12 @@ def test_clone_deps_depth_limit(new_lore_repo):
     files = cloned_files(clone_d1)
     assert "src/main.rs" in files
     assert "src/lib.rs" in files, f"Depth-1 dep not cloned: {files}"
-    assert "src/util.rs" not in files, f"Depth-2 dep should not be cloned with limit=1: {files}"
-    assert "src/deep.rs" not in files, f"Depth-3 dep should not be cloned with limit=1: {files}"
+    assert "src/util.rs" not in files, (
+        f"Depth-2 dep should not be cloned with limit=1: {files}"
+    )
+    assert "src/deep.rs" not in files, (
+        f"Depth-3 dep should not be cloned with limit=1: {files}"
+    )
 
     # depth_limit=2: follow deps of root and depth 1
     clone_d2 = repo.clone(
@@ -304,7 +324,9 @@ def test_clone_deps_depth_limit(new_lore_repo):
     assert "src/main.rs" in files
     assert "src/lib.rs" in files
     assert "src/util.rs" in files, f"Depth-2 dep not cloned with limit=2: {files}"
-    assert "src/deep.rs" not in files, f"Depth-3 dep should not be cloned with limit=2: {files}"
+    assert "src/deep.rs" not in files, (
+        f"Depth-3 dep should not be cloned with limit=2: {files}"
+    )
 
 
 @pytest.mark.smoke
@@ -326,11 +348,13 @@ def test_clone_deps_no_root_files_clones_all(new_lore_repo):
     assert "assets/texture.png" in files
 
 
-def clone_with_json(repo, root_files, **extra_args):
-    """Run clone with JSON output and return the raw output string."""
-    clone_name = repo.generate_random_name()
-    clone_path = os.path.join(os.path.dirname(repo.path), clone_name)
-    os.makedirs(clone_path, exist_ok=True)
+def clone_with_json(repo, scratch_dir, root_files, **extra_args):
+    """Run clone with JSON output and return the raw output string.
+
+    The clone lands beside the repository rather than inside it, so it needs
+    `scratch_dir` to have it removed when the test ends.
+    """
+    clone_path = str(scratch_dir("clone", create=True))
     args = ["repository", "clone", repo.remote + repo.name, clone_path]
     for rf in root_files:
         args += ["--root-file", rf]
@@ -342,7 +366,7 @@ def clone_with_json(repo, root_files, **extra_args):
 
 
 @pytest.mark.smoke
-def test_clone_deps_events(new_lore_repo):
+def test_clone_deps_events(new_lore_repo, scratch_dir):
     """
     Clone with root files emits dependency resolve begin/end/item events.
     """
@@ -353,7 +377,7 @@ def test_clone_deps_events(new_lore_repo):
         deps={"src/main.rs": ["src/lib.rs", "src/util.rs"]},
     )
 
-    output = clone_with_json(repo, ["src/main.rs"])
+    output = clone_with_json(repo, scratch_dir, ["src/main.rs"])
 
     begin_events = parse_jsonl(output, "dependencyResolveBegin")
     end_events = parse_jsonl(output, "dependencyResolveEnd")
@@ -374,7 +398,7 @@ def test_clone_deps_events(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_clone_deps_events_with_tags(new_lore_repo):
+def test_clone_deps_events_with_tags(new_lore_repo, scratch_dir):
     """
     Item events include the tags from the dependency edges.
     Only edges matching the tag filter produce item events.
@@ -394,26 +418,32 @@ def test_clone_deps_events_with_tags(new_lore_repo):
 
     # Clone with build tag — only build dep item events
     output = clone_with_json(
-        repo, ["src/main.rs"], dependency_tags=["build"]
+        repo, scratch_dir, ["src/main.rs"], dependency_tags=["build"]
     )
     item_events = parse_jsonl(output, "dependencyResolveItem")
-    assert len(item_events) == 1, f"Expected 1 item event with build tag, got: {item_events}"
+    assert len(item_events) == 1, (
+        f"Expected 1 item event with build tag, got: {item_events}"
+    )
     assert item_events[0]["target"] == "src/lib.rs"
     assert item_events[0]["source"] == "src/main.rs"
     assert "build" in item_events[0]["tags"]
 
     # Clone with art tag — only art dep item events
     output = clone_with_json(
-        repo, ["src/main.rs"], dependency_tags=["art"]
+        repo, scratch_dir, ["src/main.rs"], dependency_tags=["art"]
     )
     item_events = parse_jsonl(output, "dependencyResolveItem")
-    assert len(item_events) == 1, f"Expected 1 item event with art tag, got: {item_events}"
+    assert len(item_events) == 1, (
+        f"Expected 1 item event with art tag, got: {item_events}"
+    )
     assert item_events[0]["target"] == "assets/texture.png"
     assert "art" in item_events[0]["tags"]
 
     # Clone with no tag filter — all dep item events
-    output = clone_with_json(repo, ["src/main.rs"])
+    output = clone_with_json(repo, scratch_dir, ["src/main.rs"])
     item_events = parse_jsonl(output, "dependencyResolveItem")
-    assert len(item_events) == 2, f"Expected 2 item events without tag filter, got: {item_events}"
+    assert len(item_events) == 2, (
+        f"Expected 2 item events without tag filter, got: {item_events}"
+    )
     targets = {e["target"] for e in item_events}
     assert targets == {"src/lib.rs", "assets/texture.png"}

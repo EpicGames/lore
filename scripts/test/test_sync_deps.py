@@ -87,9 +87,9 @@ def test_sync_deps_filters_changes(new_lore_repo):
     assert read_file(clone, "src/util.rs") == "content of src/util.rs\n", (
         "util.rs should not be updated by filtered sync"
     )
-    assert read_file(clone, "assets/texture.png") == "content of assets/texture.png\n", (
-        "texture.png should not be updated by filtered sync"
-    )
+    assert (
+        read_file(clone, "assets/texture.png") == "content of assets/texture.png\n"
+    ), "texture.png should not be updated by filtered sync"
 
 
 @pytest.mark.smoke
@@ -164,9 +164,9 @@ def test_sync_deps_tag_filter(new_lore_repo):
     clone.sync(root_files=["src/main.rs"], dependency_tags=["build"])
     assert read_file(clone, "src/main.rs") == "main v2\n"
     assert read_file(clone, "src/lib.rs") == "lib v2\n"
-    assert read_file(clone, "assets/texture.png") == "content of assets/texture.png\n", (
-        "Art dep should not be synced with build tag"
-    )
+    assert (
+        read_file(clone, "assets/texture.png") == "content of assets/texture.png\n"
+    ), "Art dep should not be synced with build tag"
 
 
 @pytest.mark.smoke

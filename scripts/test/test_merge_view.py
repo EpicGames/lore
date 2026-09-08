@@ -10,9 +10,9 @@ from lore import Lore
 logger = logging.getLogger(__name__)
 
 
-def _write_view_filter(tmp_path_factory, *lines: str) -> str:
+def _write_view_filter(scratch_dir, *lines: str) -> str:
     """Write a view filter file holding `lines` and return its path."""
-    temp_path = tmp_path_factory.mktemp("viewfilter")
+    temp_path = scratch_dir("viewfilter", create=True)
     view_filter = os.path.join(temp_path, "view_filter.txt")
     with open(view_filter, "w+") as output_file:
         output_file.writelines(lines)
@@ -20,7 +20,7 @@ def _write_view_filter(tmp_path_factory, *lines: str) -> str:
 
 
 @pytest.mark.smoke
-def test_merge_restart(new_lore_repo, tmp_path_factory):
+def test_merge_restart(new_lore_repo, scratch_dir):
     repo: Lore = new_lore_repo()
     source_bin_file1 = "file1.bin"
     source_bin_file2 = "file2.bin"
@@ -46,7 +46,7 @@ def test_merge_restart(new_lore_repo, tmp_path_factory):
     # (source) Push the repository
     repo.branch_push()
 
-    temp_path = tmp_path_factory.mktemp("viewfilter")
+    temp_path = scratch_dir("viewfilter", create=True)
     view_filter = os.path.join(temp_path, "view_filter.txt")
 
     with open(view_filter, "w+") as output_file:
@@ -115,7 +115,7 @@ def test_merge_restart(new_lore_repo, tmp_path_factory):
 
 
 @pytest.mark.smoke
-def test_merge_out_of_view_directory_not_materialized(new_lore_repo, tmp_path_factory):
+def test_merge_out_of_view_directory_not_materialized(new_lore_repo, scratch_dir):
     """A merge that adds a brand-new directory outside the local view filter
     must not create that directory on a sparse working tree.
 
@@ -137,7 +137,7 @@ def test_merge_out_of_view_directory_not_materialized(new_lore_repo, tmp_path_fa
     # Clone with a view filter that excludes the `hidden/` directory itself and
     # everything under it. `/hidden` (no trailing `/*`) excludes the directory
     # node too; `/hidden/*` would exclude only the contents, leaving the folder.
-    temp_path = tmp_path_factory.mktemp("viewfilter")
+    temp_path = scratch_dir("viewfilter", create=True)
     view_filter = os.path.join(temp_path, "view_filter.txt")
     with open(view_filter, "w+") as output_file:
         output_file.writelines(["/hidden\n"])
@@ -169,7 +169,7 @@ def test_merge_out_of_view_directory_not_materialized(new_lore_repo, tmp_path_fa
 
 
 @pytest.mark.smoke
-def test_merge_out_of_view_link_not_materialized(new_lore_repo, tmp_path_factory):
+def test_merge_out_of_view_link_not_materialized(new_lore_repo, scratch_dir):
     """A merge that adds a link outside the local view filter must not clone the
     linked contents onto a sparse working tree.
 
@@ -197,7 +197,7 @@ def test_merge_out_of_view_link_not_materialized(new_lore_repo, tmp_path_factory
     # Clone the main repo with a view filter that excludes the link mount point
     # itself. `/linkdir` (no trailing `/*`) excludes the link node too; `/linkdir/*`
     # would exclude only its contents, leaving the mount point in view.
-    temp_path = tmp_path_factory.mktemp("viewfilter")
+    temp_path = scratch_dir("viewfilter", create=True)
     view_filter = os.path.join(temp_path, "view_filter.txt")
     with open(view_filter, "w+") as output_file:
         output_file.writelines(["/linkdir\n"])
@@ -223,7 +223,7 @@ def test_merge_out_of_view_link_not_materialized(new_lore_repo, tmp_path_factory
 
 
 @pytest.mark.smoke
-def test_merge_grafts_untouched_out_of_view_subtree(new_lore_repo, tmp_path_factory):
+def test_merge_grafts_untouched_out_of_view_subtree(new_lore_repo, scratch_dir):
     """A merge adopts a whole out-of-view subtree the merging branch never
     touched, and the adopted content is correct at every depth.
 
@@ -253,7 +253,7 @@ def test_merge_grafts_untouched_out_of_view_subtree(new_lore_repo, tmp_path_fact
     # Exclude the hidden/ subtree at every depth. `/hidden` also generates the
     # `hidden/**` rule that excludes the contents, which is what allows the
     # subtree to be adopted.
-    view_filter = _write_view_filter(tmp_path_factory, "/hidden\n")
+    view_filter = _write_view_filter(scratch_dir, "/hidden\n")
 
     clone = repo.clone(view=view_filter)
     clone.branch_create("feature-branch")
@@ -304,9 +304,7 @@ def test_merge_grafts_untouched_out_of_view_subtree(new_lore_repo, tmp_path_fact
 
 
 @pytest.mark.smoke
-def test_merge_does_not_graft_when_view_reincludes_subpath(
-    new_lore_repo, tmp_path_factory
-):
+def test_merge_does_not_graft_when_view_reincludes_subpath(new_lore_repo, scratch_dir):
     """A view that re-includes part of an excluded subtree must still write the
     re-included paths to disk during a merge.
 
@@ -329,7 +327,7 @@ def test_merge_does_not_graft_when_view_reincludes_subpath(
     repo.branch_push()
 
     # Exclude hidden/, then re-include hidden/keep/.
-    view_filter = _write_view_filter(tmp_path_factory, "/hidden\n", "!/hidden/keep\n")
+    view_filter = _write_view_filter(scratch_dir, "/hidden\n", "!/hidden/keep\n")
 
     clone = repo.clone(view=view_filter)
     assert clone.file_exists(reincluded_file), (
@@ -382,7 +380,7 @@ def test_merge_does_not_graft_when_view_reincludes_subpath(
 
 
 @pytest.mark.smoke
-def test_merge_out_of_view_delete_reaches_tree(new_lore_repo, tmp_path_factory):
+def test_merge_out_of_view_delete_reaches_tree(new_lore_repo, scratch_dir):
     """A merge that deletes an out-of-view file records the delete in the tree.
 
     The file is absent from a sparse working tree, so the on-disk removal has
@@ -397,7 +395,7 @@ def test_merge_out_of_view_delete_reaches_tree(new_lore_repo, tmp_path_factory):
     repo.commit()
     repo.branch_push()
 
-    view_filter = _write_view_filter(tmp_path_factory, "/hidden\n")
+    view_filter = _write_view_filter(scratch_dir, "/hidden\n")
     clone = repo.clone(view=view_filter)
     clone.branch_create("feature-branch")
     clone.write_files({"keep.txt": "v2 on feature\n"})
@@ -426,7 +424,7 @@ def test_merge_out_of_view_delete_reaches_tree(new_lore_repo, tmp_path_factory):
 
 
 @pytest.mark.smoke
-def test_merge_out_of_view_conflict_takes_theirs(new_lore_repo, tmp_path_factory):
+def test_merge_out_of_view_conflict_takes_theirs(new_lore_repo, scratch_dir):
     """A conflict at an out-of-view path adopts the incoming side, and writes
     nothing to a sparse working tree.
 
@@ -454,7 +452,7 @@ def test_merge_out_of_view_conflict_takes_theirs(new_lore_repo, tmp_path_factory
     repo.branch_push()
     repo.branch_switch("main")
 
-    view_filter = _write_view_filter(tmp_path_factory, "/hidden\n")
+    view_filter = _write_view_filter(scratch_dir, "/hidden\n")
     clone = repo.clone(view=view_filter)
     clone.branch_create("feature-branch")
     clone.revision_sync()

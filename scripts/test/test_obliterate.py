@@ -12,9 +12,9 @@ logger = logging.getLogger(__name__)
 
 
 @pytest.mark.smoke
-def test_obliterate(new_lore_repo, tmp_path_factory):
+def test_obliterate(new_lore_repo, scratch_dir):
     repo: Lore = new_lore_repo()
-    temp = tmp_path_factory.mktemp("obliterate")
+    temp = scratch_dir("obliterate", create=True)
 
     # Generate some files
     multi_reference_file_one = "multi-ref-file-one.txt"
@@ -35,7 +35,9 @@ def test_obliterate(new_lore_repo, tmp_path_factory):
         output_file.write(os.urandom(3456789))
 
     # Store a backup of a file so we can try and re-add it later
-    shutil.copy(os.path.join(repo.path, multi_fragment_file), multi_fragment_file_backup)
+    shutil.copy(
+        os.path.join(repo.path, multi_fragment_file), multi_fragment_file_backup
+    )
 
     # Stage the files
     repo.stage(scan=True, offline=True)
@@ -103,7 +105,9 @@ def test_obliterate(new_lore_repo, tmp_path_factory):
     assert "staged for commit" in output, "No files staged after obliterate"
 
     # Restore the multi-fragment file and then try and re-add it
-    shutil.copy(multi_fragment_file_backup, os.path.join(repo.path, multi_fragment_file))
+    shutil.copy(
+        multi_fragment_file_backup, os.path.join(repo.path, multi_fragment_file)
+    )
 
     # Stage the files
     repo.stage(scan=True, offline=True)

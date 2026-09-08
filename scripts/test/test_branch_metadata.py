@@ -83,7 +83,9 @@ def test_branch_metadata_clear_defaults_to_current_branch(new_lore_repo):
 
     output = repo.branch_metadata_get(branch="main", json=True)
     metadata = get_metadata_dict(output)
-    assert "temp" not in metadata, "Clear without --branch must affect the current branch"
+    assert "temp" not in metadata, (
+        "Clear without --branch must affect the current branch"
+    )
 
 
 @pytest.mark.smoke

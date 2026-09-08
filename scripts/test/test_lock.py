@@ -47,7 +47,8 @@ def test_lock(new_lore_repo):
     # Lock status
     assert repo.lock_status("file_a.txt")[0].invalid_path
     assert (
-        len(repo.lock_status(["subdir_a/file_a.txt", "subdir_c/subdir/file_c.txt"])) == 2
+        len(repo.lock_status(["subdir_a/file_a.txt", "subdir_c/subdir/file_c.txt"]))
+        == 2
     )
     assert len(repo.lock_status("ignore.txt")) == 0
     assert len(repo.lock_status(["duplicate.txt", "duplicate.txt"])) == 1

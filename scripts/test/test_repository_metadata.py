@@ -31,7 +31,9 @@ def test_repository_metadata_get_builtin(new_lore_repo):
     output = repo.repository_metadata_get(json=True)
     metadata = get_metadata_dict(output)
 
-    assert "name" in metadata, f"Expected 'name' key in metadata.\nGot keys: {list(metadata.keys())}"
+    assert "name" in metadata, (
+        f"Expected 'name' key in metadata.\nGot keys: {list(metadata.keys())}"
+    )
     assert "description" in metadata
     assert "default-branch" in metadata
     assert "default-branch-name" in metadata

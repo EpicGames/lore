@@ -85,9 +85,7 @@ def assert_discovery_complete_consistency(
                 "discoveryComplete reverted to False in end event after being True in progress"
             )
 
-    assert any_complete, (
-        "discoveryComplete was never True in any progress or end event"
-    )
+    assert any_complete, "discoveryComplete was never True in any progress or end event"
 
 
 def assert_end_gte_last_progress(last_progress, end_event, fields):
@@ -116,7 +114,9 @@ def assert_work_lte_total(events, field_pairs):
             )
 
 
-def assert_post_discovery_totals(events, expected_totals, discovery_field="discoveryComplete"):
+def assert_post_discovery_totals(
+    events, expected_totals, discovery_field="discoveryComplete"
+):
     """
     Verify that every progress event where discoveryComplete is True reports the
     expected total values. Once discovery finishes the totals are known and must
@@ -139,15 +139,13 @@ def assert_post_discovery_totals(events, expected_totals, discovery_field="disco
 
 
 @pytest.mark.smoke
-def test_clone_progress_events(new_lore_repo):
+def test_clone_progress_events(new_lore_repo, scratch_dir):
     """Clone progress events report correct file/byte counts and monotonic progress."""
     source: Lore = new_lore_repo()
     create_test_repo(source)
 
     # Clone with JSON to capture progress events
-    new_repo_name = Lore.generate_random_name("clone_progress_")
-    new_repo_path = os.path.join(os.path.dirname(source.path), new_repo_name)
-    os.makedirs(new_repo_path, exist_ok=True)
+    new_repo_path = str(scratch_dir("clone_progress_", create=True))
     output = source.run(
         ["repository", "clone", source.remote + source.name, new_repo_path],
         json=True,
@@ -170,20 +168,26 @@ def test_clone_progress_events(new_lore_repo):
     assert_discovery_complete_consistency(progress_counts)
 
     # Work done must never exceed totals
-    assert_work_lte_total(progress_counts, [
-        ("fileComplete", "fileCount"),
-        ("bytesTransferred", "bytesTotal"),
-    ])
+    assert_work_lte_total(
+        progress_counts,
+        [
+            ("fileComplete", "fileCount"),
+            ("bytesTransferred", "bytesTotal"),
+        ],
+    )
 
     # Progress should be monotonically increasing
     assert_progress_is_increasing(progress_counts, "fileComplete")
     assert_progress_is_increasing(progress_counts, "bytesTransferred")
 
     # After discovery, totals must match expected values
-    assert_post_discovery_totals(progress_counts, {
-        "fileCount": TOTAL_FILE_COUNT,
-        "bytesTotal": TOTAL_BYTE_COUNT,
-    })
+    assert_post_discovery_totals(
+        progress_counts,
+        {
+            "fileCount": TOTAL_FILE_COUNT,
+            "bytesTotal": TOTAL_BYTE_COUNT,
+        },
+    )
 
     # End event should reflect the correct totals
     assert end_count["fileCount"] == TOTAL_FILE_COUNT, (
@@ -239,11 +243,14 @@ def test_commit_progress_events(new_lore_repo):
     assert_discovery_complete_consistency(progress_counts)
 
     # Work done must never exceed totals
-    assert_work_lte_total(progress_counts, [
-        ("fileCount", "fileTotal"),
-        ("bytesTransferred", "bytesTotal"),
-        ("directoryCount", "directoryTotal"),
-    ])
+    assert_work_lte_total(
+        progress_counts,
+        [
+            ("fileCount", "fileTotal"),
+            ("bytesTransferred", "bytesTotal"),
+            ("directoryCount", "directoryTotal"),
+        ],
+    )
 
     # Progress should be monotonically increasing
     assert_progress_is_increasing(progress_counts, "fileCount")
@@ -251,10 +258,13 @@ def test_commit_progress_events(new_lore_repo):
     assert_progress_is_increasing(progress_counts, "directoryCount")
 
     # After discovery, totals must match expected values
-    assert_post_discovery_totals(progress_counts, {
-        "fileTotal": TOTAL_FILE_COUNT,
-        "bytesTotal": TOTAL_BYTE_COUNT,
-    })
+    assert_post_discovery_totals(
+        progress_counts,
+        {
+            "fileTotal": TOTAL_FILE_COUNT,
+            "bytesTotal": TOTAL_BYTE_COUNT,
+        },
+    )
 
     # End event should reflect correct totals
     assert end_count["fileTotal"] == TOTAL_FILE_COUNT, (
@@ -321,11 +331,14 @@ def test_sync_progress_events(new_lore_repo):
     print_events("SYNC revision", revision_events)
 
     # Work done must never exceed totals
-    assert_work_lte_total(progress_events, [
-        ("fileUpdate", "fileUpdateTotal"),
-        ("bytesUpdate", "bytesUpdateTotal"),
-        ("fileDelete", "fileDeleteTotal"),
-    ])
+    assert_work_lte_total(
+        progress_events,
+        [
+            ("fileUpdate", "fileUpdateTotal"),
+            ("bytesUpdate", "bytesUpdateTotal"),
+            ("fileDelete", "fileDeleteTotal"),
+        ],
+    )
 
     # Progress should be monotonically increasing
     assert_progress_is_increasing(progress_events, "fileUpdate")
@@ -335,10 +348,13 @@ def test_sync_progress_events(new_lore_repo):
     assert_discovery_complete_consistency(progress_events)
 
     # After discovery, totals must match expected values
-    assert_post_discovery_totals(progress_events, {
-        "fileUpdateTotal": extra_file_count,
-        "bytesUpdateTotal": extra_byte_count,
-    })
+    assert_post_discovery_totals(
+        progress_events,
+        {
+            "fileUpdateTotal": extra_file_count,
+            "bytesUpdateTotal": extra_byte_count,
+        },
+    )
 
     # Final progress event should reflect the synced files
     # (sync always emits a final progress event after processing)
@@ -414,10 +430,13 @@ def test_push_progress_events(new_lore_repo):
     )
 
     # Work done must never exceed totals
-    assert_work_lte_total(fragment_progress_events, [
-        ("complete", "count"),
-        ("bytesTransferred", "bytesTotal"),
-    ])
+    assert_work_lte_total(
+        fragment_progress_events,
+        [
+            ("complete", "count"),
+            ("bytesTransferred", "bytesTotal"),
+        ],
+    )
 
     # Fragment transfer happened - verify progress is monotonic
     assert_progress_is_increasing(fragment_progress_events, "complete")
@@ -498,11 +517,14 @@ def test_large_commit_progress_events(new_lore_repo):
     print_events("LARGE COMMIT end (count)", [end_count])
 
     # Work done must never exceed totals
-    assert_work_lte_total(progress_counts, [
-        ("fileCount", "fileTotal"),
-        ("bytesTransferred", "bytesTotal"),
-        ("directoryCount", "directoryTotal"),
-    ])
+    assert_work_lte_total(
+        progress_counts,
+        [
+            ("fileCount", "fileTotal"),
+            ("bytesTransferred", "bytesTotal"),
+            ("directoryCount", "directoryTotal"),
+        ],
+    )
 
     # Monotonic progress
     assert_progress_is_increasing(progress_counts, "fileCount")
@@ -513,10 +535,13 @@ def test_large_commit_progress_events(new_lore_repo):
     assert_discovery_complete_consistency(progress_counts)
 
     # After discovery, totals must match expected values
-    assert_post_discovery_totals(progress_counts, {
-        "fileTotal": LARGE_FILE_COUNT,
-        "bytesTotal": LARGE_TOTAL_BYTES,
-    })
+    assert_post_discovery_totals(
+        progress_counts,
+        {
+            "fileTotal": LARGE_FILE_COUNT,
+            "bytesTotal": LARGE_TOTAL_BYTES,
+        },
+    )
 
     # With 10k files we expect multiple progress ticks
     assert len(progress_counts) > 1, (
@@ -575,10 +600,13 @@ def test_large_push_progress_events(new_lore_repo):
     assert push_events[0]["flagAlreadyPushed"] is False
 
     # Work done must never exceed totals
-    assert_work_lte_total(fragment_progress_events, [
-        ("complete", "count"),
-        ("bytesTransferred", "bytesTotal"),
-    ])
+    assert_work_lte_total(
+        fragment_progress_events,
+        [
+            ("complete", "count"),
+            ("bytesTransferred", "bytesTotal"),
+        ],
+    )
 
     if len(fragment_begin_events) > 0:
         assert_progress_is_increasing(fragment_progress_events, "complete")
@@ -613,14 +641,12 @@ def test_large_push_progress_events(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_large_clone_progress_events(new_lore_repo):
+def test_large_clone_progress_events(new_lore_repo, scratch_dir):
     """Clone progress for 10k x 10 000 byte files reports correct counts and monotonic progress."""
     source: Lore = new_lore_repo()
     create_large_test_repo(source)
 
-    new_repo_name = Lore.generate_random_name("large_clone_progress_")
-    new_repo_path = os.path.join(os.path.dirname(source.path), new_repo_name)
-    os.makedirs(new_repo_path, exist_ok=True)
+    new_repo_path = str(scratch_dir("large_clone_progress_", create=True))
     output = source.run(
         ["repository", "clone", source.remote + source.name, new_repo_path],
         json=True,
@@ -639,10 +665,13 @@ def test_large_clone_progress_events(new_lore_repo):
     print_events("LARGE CLONE end (count)", [end_count])
 
     # Work done must never exceed totals
-    assert_work_lte_total(progress_counts, [
-        ("fileComplete", "fileCount"),
-        ("bytesTransferred", "bytesTotal"),
-    ])
+    assert_work_lte_total(
+        progress_counts,
+        [
+            ("fileComplete", "fileCount"),
+            ("bytesTransferred", "bytesTotal"),
+        ],
+    )
 
     # Monotonic progress
     assert_progress_is_increasing(progress_counts, "fileComplete")
@@ -652,10 +681,13 @@ def test_large_clone_progress_events(new_lore_repo):
     assert_discovery_complete_consistency(progress_counts)
 
     # After discovery, totals must match expected values
-    assert_post_discovery_totals(progress_counts, {
-        "fileCount": LARGE_FILE_COUNT,
-        "bytesTotal": LARGE_TOTAL_BYTES,
-    })
+    assert_post_discovery_totals(
+        progress_counts,
+        {
+            "fileCount": LARGE_FILE_COUNT,
+            "bytesTotal": LARGE_TOTAL_BYTES,
+        },
+    )
 
     # With 10k files there must be multiple progress events
     assert len(progress_counts) > 1, (
@@ -724,11 +756,14 @@ def test_large_sync_progress_events(new_lore_repo):
     print_events("LARGE SYNC revision", revision_events)
 
     # Work done must never exceed totals
-    assert_work_lte_total(progress_events, [
-        ("fileUpdate", "fileUpdateTotal"),
-        ("bytesUpdate", "bytesUpdateTotal"),
-        ("fileDelete", "fileDeleteTotal"),
-    ])
+    assert_work_lte_total(
+        progress_events,
+        [
+            ("fileUpdate", "fileUpdateTotal"),
+            ("bytesUpdate", "bytesUpdateTotal"),
+            ("fileDelete", "fileDeleteTotal"),
+        ],
+    )
 
     # Monotonic progress
     assert_progress_is_increasing(progress_events, "fileUpdate")
@@ -738,10 +773,13 @@ def test_large_sync_progress_events(new_lore_repo):
     assert_discovery_complete_consistency(progress_events)
 
     # After discovery, totals must match expected values
-    assert_post_discovery_totals(progress_events, {
-        "fileUpdateTotal": extra_count,
-        "bytesUpdateTotal": extra_total_bytes,
-    })
+    assert_post_discovery_totals(
+        progress_events,
+        {
+            "fileUpdateTotal": extra_count,
+            "bytesUpdateTotal": extra_total_bytes,
+        },
+    )
 
     # With 500 large files there should be multiple progress events
     assert len(progress_events) > 1, (

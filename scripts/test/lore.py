@@ -166,12 +166,19 @@ class Lore:
         remote_path: str | None = None,
         repo_id: str | None = None,
         create_repo: bool = True,
+        created_paths: list[str] | None = None,
     ):
         self.lore_executable_path = lore_executable_path
         self.path = path
         self.name = name
         self.global_dir = global_dir
         self.environment_vars = environment_vars or {}
+        # The `new_lore_repo` fixture's record of what to remove when the test
+        # ends. Handed down to every repository this one clones, so a clone --
+        # which lands beside its source rather than inside it -- is removed with
+        # the rest. Defaults to a list of its own so a directly constructed Lore
+        # outside a fixture still works, just without the cleanup.
+        self.created_paths = [] if created_paths is None else created_paths
         # If the caller picked a specific remote_url, mirror it into the env
         # subprocess overrides — otherwise repository_create inherits the
         # session-level LORE_REMOTE_URL pointing at the autouse server and
@@ -1895,6 +1902,9 @@ class Lore:
             new_repo_path = parent / new_repo_name
         else:
             new_repo_path = Path(path)
+        # Recorded before the directory exists, so a clone that fails partway
+        # through still has its half-written tree removed with the test.
+        self.created_paths.append(str(new_repo_path))
         if not kwargs.get("dry_run"):
             new_repo_path.mkdir(exist_ok=True)
         root_file_args = []
@@ -1937,6 +1947,7 @@ class Lore:
             path=str(new_repo_path),
             name=new_repo_name,
             create_repo=False,
+            created_paths=self.created_paths,
         )
         new_repo._ensure_test_identity_in_config()
         return new_repo

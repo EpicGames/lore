@@ -183,14 +183,18 @@ def test_filescan_modify_detected_and_persists(new_lore_repo):
         f.write("modified content longer\n")
 
     scanned = get_status_files_twice(repo, scan=True)
-    assert_file_set(scanned, ["file.txt"], msg="scan should detect only the modified file")
+    assert_file_set(
+        scanned, ["file.txt"], msg="scan should detect only the modified file"
+    )
     assert_entry(
         scanned, "file.txt", action="keep", dirty=True, staged=False, node_type="file"
     )
 
     persisted = get_status_files(repo)
     assert_file_set(
-        persisted, ["file.txt"], msg="scanned modification must persist to no-scan status"
+        persisted,
+        ["file.txt"],
+        msg="scanned modification must persist to no-scan status",
     )
     assert_entry(persisted, "file.txt", action="keep", dirty=True, staged=False)
 
@@ -255,16 +259,27 @@ def test_filescan_delete_detected_dirty_and_persists(new_lore_repo):
     scanned = get_status_files_twice(repo, scan=True)
     assert_file_set(scanned, ["victim.txt"], msg="scan should detect the deletion")
     assert_entry(
-        scanned, "victim.txt", action="delete", dirty=True, staged=False, node_type="file",
+        scanned,
+        "victim.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="a scan-detected delete should be flagged dirty like modify/add",
     )
 
     persisted = get_status_files(repo)
     assert_file_set(
-        persisted, ["victim.txt"], msg="a scan-detected delete must persist to no-scan status"
+        persisted,
+        ["victim.txt"],
+        msg="a scan-detected delete must persist to no-scan status",
     )
     assert_entry(
-        persisted, "victim.txt", action="delete", dirty=True, staged=False,
+        persisted,
+        "victim.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
         msg="a scan-detected delete must persist as a dirty delete",
     )
 
@@ -301,7 +316,12 @@ def test_filescan_nested_modify_no_ancestors(new_lore_repo):
         scanned, ["a/b/c/deep.txt"], msg="only the modified leaf is a changed file"
     )
     assert_entry(
-        scanned, "a/b/c/deep.txt", action="keep", dirty=True, staged=False, node_type="file"
+        scanned,
+        "a/b/c/deep.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
     )
     assert_absent(scanned, "a", msg="unchanged ancestor dir must not be reported")
     assert_absent(scanned, "a/b", msg="unchanged ancestor dir must not be reported")
@@ -338,7 +358,9 @@ def test_filescan_scan_clears_stale_dirty_on_revert(new_lore_repo):
     )
 
     persisted = get_status_files(repo)
-    assert_file_set(persisted, [], msg="cleared dirty must stay cleared in no-scan status")
+    assert_file_set(
+        persisted, [], msg="cleared dirty must stay cleared in no-scan status"
+    )
 
 
 @pytest.mark.smoke
@@ -390,8 +412,12 @@ def test_dirs_add_tree_scan(new_lore_repo):
 
     scanned = get_status_files_twice(repo, scan=True)
     assert_entry(
-        scanned, "dir1/dir2/dir3/leaf.txt",
-        action="add", dirty=True, staged=False, node_type="file",
+        scanned,
+        "dir1/dir2/dir3/leaf.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
     )
     assert_file_set(scanned, ["dir1/dir2/dir3/leaf.txt"])
     assert_entry(scanned, "dir1", action="add", node_type="directory")
@@ -461,11 +487,32 @@ def test_dirs_dirty_parent_collects_mixed_children(new_lore_repo):
     assert_file_set(
         entries, ["src/a.txt", "src/sub/b.txt", "src/sub/c.txt", "src/sub/d.txt"]
     )
-    assert_entry(entries, "src/a.txt", action="keep", dirty=True, staged=False, node_type="file")
-    assert_entry(entries, "src/sub/b.txt", action="delete", dirty=True, staged=False, node_type="file")
-    assert_entry(entries, "src/sub/d.txt", action="add", dirty=True, staged=False, node_type="file")
     assert_entry(
-        entries, "src/sub/c.txt", action="keep", dirty=True, staged=False, node_type="file",
+        entries, "src/a.txt", action="keep", dirty=True, staged=False, node_type="file"
+    )
+    assert_entry(
+        entries,
+        "src/sub/b.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
+    )
+    assert_entry(
+        entries,
+        "src/sub/d.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
+    )
+    assert_entry(
+        entries,
+        "src/sub/c.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="dirty <dir> force-marks unchanged tracked children too",
     )
 
@@ -501,15 +548,28 @@ def test_dirs_dirty_changes_two_levels_below_marked_parent(new_lore_repo):
         entries, ["top/keep.txt", "top/mid/deep.txt", "top/mid/inner/added.txt"]
     )
     assert_entry(
-        entries, "top/mid/deep.txt",
-        action="keep", dirty=True, staged=False, node_type="file",
+        entries,
+        "top/mid/deep.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
     )
     assert_entry(
-        entries, "top/mid/inner/added.txt",
-        action="add", dirty=True, staged=False, node_type="file",
+        entries,
+        "top/mid/inner/added.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
     )
     assert_entry(
-        entries, "top/keep.txt", action="keep", dirty=True, staged=False, node_type="file",
+        entries,
+        "top/keep.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="dirty <dir> force-marks the unchanged shallow sibling too",
     )
 
@@ -535,8 +595,12 @@ def test_dirs_delete_one_keep_sibling(new_lore_repo):
     entries = get_status_files(repo)
     assert_file_set(entries, ["pkg/gone.txt"])
     assert_entry(
-        entries, "pkg/gone.txt",
-        action="delete", dirty=True, staged=False, node_type="file",
+        entries,
+        "pkg/gone.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
     )
     assert_absent(entries, "pkg/stay.txt", msg="surviving sibling stays clean")
 
@@ -557,7 +621,9 @@ def test_dirs_emptied_dir_retained_after_last_file_delete_commit(new_lore_repo):
     repo.commit("drop only.txt", offline=True)
 
     entries = get_status_files(repo)
-    assert entries == [], f"status should be clean after commit, got {summarize(entries)}"
+    assert entries == [], (
+        f"status should be clean after commit, got {summarize(entries)}"
+    )
     scanned = get_status_files_twice(repo, scan=True)
     assert scanned == [], f"--scan status should be clean, got {summarize(scanned)}"
 
@@ -592,7 +658,9 @@ def test_dirs_add_tree_stage_commit_dump(new_lore_repo):
     )
 
     entries = get_status_files(repo)
-    assert entries == [], f"status should be clean after commit, got {summarize(entries)}"
+    assert entries == [], (
+        f"status should be clean after commit, got {summarize(entries)}"
+    )
     scanned = get_status_files_twice(repo, scan=True)
     assert scanned == [], f"--scan status should be clean, got {summarize(scanned)}"
 
@@ -617,19 +685,30 @@ def test_dirs_modify_under_existing_dir_keeps_dir_unreported(new_lore_repo):
     scanned = get_status_files_twice(repo, scan=True)
     assert_file_set(scanned, ["lib/mod.txt"])
     assert_entry(
-        scanned, "lib/mod.txt",
-        action="keep", dirty=True, staged=False, node_type="file",
+        scanned,
+        "lib/mod.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
     )
-    assert_absent(scanned, "lib", msg="unchanged ancestor directory must not be reported")
+    assert_absent(
+        scanned, "lib", msg="unchanged ancestor directory must not be reported"
+    )
     assert_absent(scanned, "lib/other.txt", msg="untouched sibling stays clean")
 
     persisted = get_status_files(repo)
     assert_entry(
-        persisted, "lib/mod.txt",
-        action="keep", dirty=True, staged=False,
+        persisted,
+        "lib/mod.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
         msg="scanned modification persists to no-scan status",
     )
-    assert_absent(persisted, "lib", msg="ancestor dir still unreported in no-scan status")
+    assert_absent(
+        persisted, "lib", msg="ancestor dir still unreported in no-scan status"
+    )
 
 
 # ===========================================================================
@@ -687,13 +766,20 @@ def test_dirtyapi_delete_marks_dirty(new_lore_repo):
     entries = get_status_files(repo)
     assert_file_set(entries, ["victim.txt"])
     assert_entry(
-        entries, "victim.txt", action="delete", dirty=True, staged=False, node_type="file"
+        entries,
+        "victim.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
     )
     assert_absent(entries, "keep.txt", msg="untouched committed file stays clean")
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands")
+@pytest.mark.skip(
+    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
+)
 def test_dirtyapi_copy_reports_copy_action(new_lore_repo):
     """A `file dirty copy` surfaces the destination as action=copy with
     fromPath pointing at the source; the source itself stays clean."""
@@ -746,7 +832,9 @@ def test_dirtyapi_move_action_no_scan(new_lore_repo):
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands")
+@pytest.mark.skip(
+    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
+)
 def test_dirtyapi_move_survives_scan(new_lore_repo):
     """A `file dirty move` remains action=move/fromPath=source after a
     --scan, since the rename is still present on disk."""
@@ -771,7 +859,9 @@ def test_dirtyapi_move_survives_scan(new_lore_repo):
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands")
+@pytest.mark.skip(
+    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
+)
 def test_dirtyapi_move_into_new_directory(new_lore_repo):
     """Renaming a committed file into a brand-new directory and dirty-moving it
     reports the destination as action=move/fromPath=source and surfaces the new
@@ -798,13 +888,19 @@ def test_dirtyapi_move_into_new_directory(new_lore_repo):
         msg="move into a new dir keeps move provenance",
     )
     assert_entry(
-        entries, "dest2", action="add", node_type="directory", msg="new dest dir node present"
+        entries,
+        "dest2",
+        action="add",
+        node_type="directory",
+        msg="new dest dir node present",
     )
     assert_absent(entries, "src.txt", msg="move source must not appear")
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands")
+@pytest.mark.skip(
+    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
+)
 def test_dirtyapi_copy_into_nested_new_directory(new_lore_repo):
     """A dirty copy of a committed file into a nested brand-new directory
     reports the destination as action=copy/fromPath=source and surfaces every
@@ -831,10 +927,18 @@ def test_dirtyapi_copy_into_nested_new_directory(new_lore_repo):
         msg="a nested dirty copy must report action=copy with fromPath=source",
     )
     assert_entry(
-        entries, "newdir", action="add", node_type="directory", msg="new parent dir node present"
+        entries,
+        "newdir",
+        action="add",
+        node_type="directory",
+        msg="new parent dir node present",
     )
     assert_entry(
-        entries, "newdir/sub", action="add", node_type="directory", msg="new sub dir node present"
+        entries,
+        "newdir/sub",
+        action="add",
+        node_type="directory",
+        msg="new sub dir node present",
     )
     assert_absent(entries, "orig.txt", msg="copy source is unchanged")
 
@@ -1057,7 +1161,9 @@ def test_stage_explicit_dir_default_only_dirty_leaves(new_lore_repo):
     repo.stage("src", scan=False, offline=True)
 
     entries = get_status_files(repo)
-    assert_file_set(entries, ["src/a.txt"], msg="only the dirty leaf under src is staged")
+    assert_file_set(
+        entries, ["src/a.txt"], msg="only the dirty leaf under src is staged"
+    )
     assert_entry(
         entries, "src/a.txt", action="keep", dirty=True, staged=True, node_type="file"
     )
@@ -1126,7 +1232,12 @@ def test_stage_add_and_delete_default_from_dirty(new_lore_repo):
         entries, "added.txt", action="add", dirty=True, staged=True, node_type="file"
     )
     assert_entry(
-        entries, "victim.txt", action="delete", dirty=True, staged=True, node_type="file"
+        entries,
+        "victim.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
     )
     assert_absent(entries, "keep.txt", msg="untouched file is not tracked")
 
@@ -1195,7 +1306,8 @@ def test_reset_add_untracks(new_lore_repo):
     # no-scan status (symmetric with the modify/delete reset cases).
     no_scan = get_status_files(repo)
     assert_absent(
-        no_scan, "new.txt",
+        no_scan,
+        "new.txt",
         msg="reset must clear the dirty-add; no-scan status must be clean",
     )
     assert_file_set(no_scan, [], msg="no files should remain tracked after reset")
@@ -1204,7 +1316,12 @@ def test_reset_add_untracks(new_lore_repo):
     # add (this is --scan's job; it is not resurrecting a tracked node).
     scanned = get_status_files_twice(repo, scan=True)
     assert_entry(
-        scanned, "new.txt", action="add", dirty=True, staged=False, node_type="file",
+        scanned,
+        "new.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="--scan rediscovers the surviving untracked file as an add",
     )
 
@@ -1276,7 +1393,9 @@ def test_reset_directory_mixed_children(new_lore_repo):
     # Tracked children are restored to their committed state.
     with repo.open_file("src/mod.txt", "r") as f:
         assert f.read() == "modify original\n", "modified child must be restored"
-    assert os.path.exists(repo._fix_path("src/del.txt")), "deleted child must be restored"
+    assert os.path.exists(repo._fix_path("src/del.txt")), (
+        "deleted child must be restored"
+    )
     with repo.open_file("src/del.txt", "r") as f:
         assert f.read() == "delete original\n", "restored delete content must match"
 
@@ -1297,7 +1416,9 @@ def test_reset_directory_mixed_children(new_lore_repo):
     # it as an unstaged add (idempotently).
     scanned = get_status_files_twice(repo, scan=True)
     assert_file_set(
-        scanned, ["src/add.txt"], msg="--scan must rediscover the surviving untracked add"
+        scanned,
+        ["src/add.txt"],
+        msg="--scan must rediscover the surviving untracked add",
     )
     assert_entry(scanned, "src/add.txt", action="add", dirty=True, staged=False)
 
@@ -1328,7 +1449,9 @@ def test_reset_nested_path(new_lore_repo):
         assert_absent(no_scan, ancestor, msg="intermediate parent must not stay dirty")
     scanned = get_status_files_twice(repo, scan=True)
     assert_file_set(scanned, [], msg="--scan agrees the subtree is clean")
-    assert not has_staged_anchor(repo), "anchor released after the only dirty leaf reset"
+    assert not has_staged_anchor(repo), (
+        "anchor released after the only dirty leaf reset"
+    )
 
 
 @pytest.mark.smoke
@@ -1349,7 +1472,9 @@ def test_reset_purge_removes_untracked(new_lore_repo):
     assert not os.path.exists(repo._fix_path("junk.txt")), (
         "purge must remove the untracked file from disk"
     )
-    assert os.path.exists(repo._fix_path("tracked.txt")), "tracked file must survive purge"
+    assert os.path.exists(repo._fix_path("tracked.txt")), (
+        "tracked file must survive purge"
+    )
     with repo.open_file("tracked.txt", "r") as f:
         assert f.read() == "tracked\n", "tracked content must be intact after purge"
 
@@ -1403,7 +1528,9 @@ def test_reset_refuses_on_staged(new_lore_repo):
     # The stage must survive the refused reset.
     after = get_status_files(repo)
     assert_entry(
-        after, "file.txt", staged=True,
+        after,
+        "file.txt",
+        staged=True,
         msg="staged node must remain staged after a refused reset",
     )
     with repo.open_file("file.txt", "r") as f:
@@ -1437,7 +1564,9 @@ def test_commit_dirty_only_modify_survives(new_lore_repo):
     """Committing a staged modify clears it; a dirty-only modify on another
     file survives as action=keep/flagDirty, and the staged anchor persists."""
     repo: Lore = new_lore_repo()
-    commit_base(repo, {"staged.txt": "staged original\n", "dirty.txt": "dirty original\n"})
+    commit_base(
+        repo, {"staged.txt": "staged original\n", "dirty.txt": "dirty original\n"}
+    )
 
     with repo.open_file("staged.txt", "w+") as f:
         f.write("staged modified longer\n")
@@ -1449,13 +1578,22 @@ def test_commit_dirty_only_modify_survives(new_lore_repo):
     repo.commit("commit staged", offline=True)
 
     entries = get_status_files(repo)
-    assert_file_set(entries, ["dirty.txt"], msg="only the dirty-only file remains pending")
+    assert_file_set(
+        entries, ["dirty.txt"], msg="only the dirty-only file remains pending"
+    )
     assert_absent(entries, "staged.txt", msg="staged modify is committed and clean")
     assert_entry(
-        entries, "dirty.txt", action="keep", dirty=True, staged=False, node_type="file",
+        entries,
+        "dirty.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="dirty-only modify survives commit as a kept dirty file",
     )
-    assert has_staged_anchor(repo), "anchor must persist while a dirty-only node remains"
+    assert has_staged_anchor(repo), (
+        "anchor must persist while a dirty-only node remains"
+    )
 
 
 @pytest.mark.smoke
@@ -1478,18 +1616,31 @@ def test_commit_dirty_only_add_excluded_from_tree(new_lore_repo):
     repo.commit("commit staged add", offline=True)
 
     entries = get_status_files(repo)
-    assert_file_set(entries, ["dirty_dir/dirty.txt"], msg="only the dirty-only add remains")
-    assert_absent(entries, "staged_dir/staged.txt", msg="staged add is committed and clean")
+    assert_file_set(
+        entries, ["dirty_dir/dirty.txt"], msg="only the dirty-only add remains"
+    )
+    assert_absent(
+        entries, "staged_dir/staged.txt", msg="staged add is committed and clean"
+    )
     assert_entry(
-        entries, "dirty_dir/dirty.txt", action="add", dirty=True, staged=False,
-        node_type="file", msg="dirty-only add stays pending after commit",
+        entries,
+        "dirty_dir/dirty.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        msg="dirty-only add stays pending after commit",
     )
 
     repo.status(reset=True, offline=True)
     dump = repo.repository_dump()
     assert "staged.txt" in dump, f"staged add should be in the sealed tree:\n{dump}"
-    assert "dirty.txt" not in dump, f"dirty-only add must not be in the sealed tree:\n{dump}"
-    assert "dirty_dir" not in dump, f"dirty-only added dir must not be in the sealed tree:\n{dump}"
+    assert "dirty.txt" not in dump, (
+        f"dirty-only add must not be in the sealed tree:\n{dump}"
+    )
+    assert "dirty_dir" not in dump, (
+        f"dirty-only added dir must not be in the sealed tree:\n{dump}"
+    )
 
 
 @pytest.mark.smoke
@@ -1498,7 +1649,9 @@ def test_commit_dirty_only_delete_reverted_in_tree(new_lore_repo):
     stays in the dump) while remaining pending in status (delete/dirty); an
     unrelated staged change is what actually gets committed."""
     repo: Lore = new_lore_repo()
-    commit_base(repo, {"victim.txt": "will be deleted\n", "other.txt": "other original\n"})
+    commit_base(
+        repo, {"victim.txt": "will be deleted\n", "other.txt": "other original\n"}
+    )
 
     os.remove(repo._fix_path("victim.txt"))
     repo.dirty("victim.txt", offline=True)
@@ -1510,10 +1663,17 @@ def test_commit_dirty_only_delete_reverted_in_tree(new_lore_repo):
     repo.commit("commit unrelated", offline=True)
 
     entries = get_status_files(repo)
-    assert_file_set(entries, ["victim.txt"], msg="only the dirty-only delete remains pending")
+    assert_file_set(
+        entries, ["victim.txt"], msg="only the dirty-only delete remains pending"
+    )
     assert_absent(entries, "other.txt", msg="staged modify is committed and clean")
     assert_entry(
-        entries, "victim.txt", action="delete", dirty=True, staged=False, node_type="file",
+        entries,
+        "victim.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="dirty-only delete stays pending after commit",
     )
 
@@ -1537,9 +1697,13 @@ def test_commit_anchor_deleted_when_clean(new_lore_repo):
     repo.stage("file.txt", offline=True)
     repo.commit("commit all", offline=True)
 
-    assert not has_staged_anchor(repo), "anchor must be deleted when nothing remains pending"
+    assert not has_staged_anchor(repo), (
+        "anchor must be deleted when nothing remains pending"
+    )
     entries = get_status_files(repo)
-    assert entries == [], f"no-scan status must be empty when clean, got {summarize(entries)}"
+    assert entries == [], (
+        f"no-scan status must be empty when clean, got {summarize(entries)}"
+    )
 
 
 @pytest.mark.smoke
@@ -1547,7 +1711,9 @@ def test_commit_anchor_preserved_when_dirty_remains(new_lore_repo):
     """When a dirty-only node survives a commit, the staged anchor is kept and
     the survivor is the only pending entry."""
     repo: Lore = new_lore_repo()
-    commit_base(repo, {"staged.txt": "staged original\n", "dirty.txt": "dirty original\n"})
+    commit_base(
+        repo, {"staged.txt": "staged original\n", "dirty.txt": "dirty original\n"}
+    )
 
     with repo.open_file("staged.txt", "w+") as f:
         f.write("staged modified longer\n")
@@ -1557,7 +1723,9 @@ def test_commit_anchor_preserved_when_dirty_remains(new_lore_repo):
     repo.stage("staged.txt", offline=True)
     repo.commit("commit staged", offline=True)
 
-    assert has_staged_anchor(repo), "anchor must persist while a dirty-only node remains"
+    assert has_staged_anchor(repo), (
+        "anchor must persist while a dirty-only node remains"
+    )
     entries = get_status_files(repo)
     assert_file_set(entries, ["dirty.txt"], msg="only the dirty-only survivor remains")
     assert_entry(entries, "dirty.txt", action="keep", dirty=True, staged=False)
@@ -1582,19 +1750,30 @@ def test_commit_emptied_dir_retained_in_tree(new_lore_repo):
 
     staged = get_status_files(repo)
     assert_entry(
-        staged, "sub/only.txt", action="delete", dirty=True, staged=True, node_type="file",
+        staged,
+        "sub/only.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="the file is staged for deletion before commit",
     )
 
     repo.commit("delete only file", offline=True)
 
     entries = get_status_files(repo)
-    assert entries == [], f"status must be clean after committing the delete, got {summarize(entries)}"
+    assert entries == [], (
+        f"status must be clean after committing the delete, got {summarize(entries)}"
+    )
 
     repo.status(reset=True, offline=True)
     dump = repo.repository_dump()
-    assert "sub/only.txt" not in dump, f"deleted file must be gone from the sealed tree:\n{dump}"
-    assert "sub/" in dump, f"emptied directory node should be retained in the sealed tree:\n{dump}"
+    assert "sub/only.txt" not in dump, (
+        f"deleted file must be gone from the sealed tree:\n{dump}"
+    )
+    assert "sub/" in dump, (
+        f"emptied directory node should be retained in the sealed tree:\n{dump}"
+    )
     assert "keep.txt" in dump, f"unrelated file must remain in the sealed tree:\n{dump}"
 
 
@@ -1611,13 +1790,24 @@ def test_commit_staged_add_dir_in_tree(new_lore_repo):
     repo.stage("a/b/c/leaf.txt", scan=True, offline=True)
 
     staged = get_status_files(repo)
-    assert_entry(staged, "a/b/c/leaf.txt", action="add", dirty=True, staged=True, node_type="file")
-    assert_entry(staged, "a/b/c", action="add", dirty=True, staged=True, node_type="directory")
+    assert_entry(
+        staged,
+        "a/b/c/leaf.txt",
+        action="add",
+        dirty=True,
+        staged=True,
+        node_type="file",
+    )
+    assert_entry(
+        staged, "a/b/c", action="add", dirty=True, staged=True, node_type="directory"
+    )
 
     repo.commit("add nested tree", offline=True)
 
     entries = get_status_files(repo)
-    assert entries == [], f"status must be clean after committing the add, got {summarize(entries)}"
+    assert entries == [], (
+        f"status must be clean after committing the add, got {summarize(entries)}"
+    )
 
     repo.status(reset=True, offline=True)
     dump = repo.repository_dump()
@@ -1668,7 +1858,9 @@ def test_commit_mixed_each_class_commit(new_lore_repo):
     assert_absent(entries, "mod.txt", msg="staged modify is committed and clean")
     assert_absent(entries, "added.txt", msg="staged add is committed and clean")
     assert_entry(entries, "dirty.txt", action="keep", dirty=True, staged=False)
-    assert has_staged_anchor(repo), "anchor persists while the dirty-only modify remains"
+    assert has_staged_anchor(repo), (
+        "anchor persists while the dirty-only modify remains"
+    )
 
     repo.status(reset=True, offline=True)
     dump = repo.repository_dump()
@@ -1693,7 +1885,14 @@ def test_switch_carries_dirty_modify_add_delete(new_lore_repo):
     (action=delete) all remain flagDirty after the switch; a committed file
     untouched on disk stays clean and absent."""
     repo: Lore = new_lore_repo()
-    commit_base(repo, {"mod.txt": "mod original\n", "del.txt": "del original\n", "stay.txt": "stay\n"})
+    commit_base(
+        repo,
+        {
+            "mod.txt": "mod original\n",
+            "del.txt": "del original\n",
+            "stay.txt": "stay\n",
+        },
+    )
 
     repo.branch_create("other", offline=True)
     repo.branch_switch("main", offline=True)
@@ -1706,22 +1905,36 @@ def test_switch_carries_dirty_modify_add_delete(new_lore_repo):
     repo.dirty(["mod.txt", "added.txt", "del.txt"], offline=True)
 
     pre = get_status_files(repo)
-    assert_file_set(pre, ["mod.txt", "added.txt", "del.txt"], msg="dirty set before switch")
+    assert_file_set(
+        pre, ["mod.txt", "added.txt", "del.txt"], msg="dirty set before switch"
+    )
 
     repo.branch_switch("other", offline=True)
 
     entries = get_status_files(repo)
-    assert_entry(entries, "mod.txt", action="keep", dirty=True, staged=False, node_type="file")
-    assert_entry(entries, "added.txt", action="add", dirty=True, staged=False, node_type="file")
-    assert_entry(entries, "del.txt", action="delete", dirty=True, staged=False, node_type="file")
+    assert_entry(
+        entries, "mod.txt", action="keep", dirty=True, staged=False, node_type="file"
+    )
+    assert_entry(
+        entries, "added.txt", action="add", dirty=True, staged=False, node_type="file"
+    )
+    assert_entry(
+        entries, "del.txt", action="delete", dirty=True, staged=False, node_type="file"
+    )
     assert_absent(entries, "stay.txt", msg="untouched committed file stays clean")
-    assert_file_set(entries, ["mod.txt", "added.txt", "del.txt"], msg="dirty set carried across same-revision switch")
+    assert_file_set(
+        entries,
+        ["mod.txt", "added.txt", "del.txt"],
+        msg="dirty set carried across same-revision switch",
+    )
 
     with repo.open_file("mod.txt", "r") as f:
         assert f.read() == "mod locally edited\n"
     with repo.open_file("added.txt", "r") as f:
         assert f.read() == "added content\n"
-    assert not os.path.exists(repo._fix_path("del.txt")), "dirty-deleted file stays deleted after switch"
+    assert not os.path.exists(repo._fix_path("del.txt")), (
+        "dirty-deleted file stays deleted after switch"
+    )
 
 
 @pytest.mark.smoke
@@ -1742,24 +1955,39 @@ def test_switch_only_dirty_paths_after_feature_commit(new_lore_repo):
     )
 
     repo.branch_create("feature", offline=True)
-    repo.write_files({"app/main.py": "modified on feature\n", "app/new.py": "new feature code\n"})
+    repo.write_files(
+        {"app/main.py": "modified on feature\n", "app/new.py": "new feature code\n"}
+    )
     repo.remove_file("docs/readme.md")
     repo.stage(scan=True, offline=True)
     repo.commit("feature commit", offline=True)
 
-    repo.write_files({"data/sample.txt": "dirty modified sample\n", "data/extra.txt": "dirty new file\n"})
+    repo.write_files(
+        {
+            "data/sample.txt": "dirty modified sample\n",
+            "data/extra.txt": "dirty new file\n",
+        }
+    )
     repo.remove_file("app/utils/helper.py")
-    repo.dirty(["data/sample.txt", "data/extra.txt", "app/utils/helper.py"], offline=True)
+    repo.dirty(
+        ["data/sample.txt", "data/extra.txt", "app/utils/helper.py"], offline=True
+    )
 
     pre = get_status_files(repo)
-    assert_file_set(pre, ["data/sample.txt", "data/extra.txt", "app/utils/helper.py"], msg="dirty set before switch")
+    assert_file_set(
+        pre,
+        ["data/sample.txt", "data/extra.txt", "app/utils/helper.py"],
+        msg="dirty set before switch",
+    )
 
     repo.branch_switch("main", offline=True)
 
     entries = get_status_files(repo)
     assert_entry(entries, "data/sample.txt", action="keep", dirty=True, staged=False)
     assert_entry(entries, "data/extra.txt", action="add", dirty=True, staged=False)
-    assert_entry(entries, "app/utils/helper.py", action="delete", dirty=True, staged=False)
+    assert_entry(
+        entries, "app/utils/helper.py", action="delete", dirty=True, staged=False
+    )
     assert_file_set(
         entries,
         ["data/sample.txt", "data/extra.txt", "app/utils/helper.py"],
@@ -1768,7 +1996,9 @@ def test_switch_only_dirty_paths_after_feature_commit(new_lore_repo):
 
     with repo.open_file("app/main.py", "r") as f:
         assert f.read() == "main entrypoint\n", "feature modify reverted on disk"
-    assert not os.path.exists(repo._fix_path("app/new.py")), "feature add absent on main"
+    assert not os.path.exists(repo._fix_path("app/new.py")), (
+        "feature add absent on main"
+    )
     with repo.open_file("docs/readme.md", "r") as f:
         assert f.read() == "readme original\n", "feature delete restored on main"
     with repo.open_file("data/config.json", "r") as f:
@@ -1778,7 +2008,9 @@ def test_switch_only_dirty_paths_after_feature_commit(new_lore_repo):
         assert f.read() == "dirty modified sample\n", "dirty modify keeps local content"
     with repo.open_file("data/extra.txt", "r") as f:
         assert f.read() == "dirty new file\n", "dirty add keeps local content"
-    assert not os.path.exists(repo._fix_path("app/utils/helper.py")), "dirty delete stays deleted"
+    assert not os.path.exists(repo._fix_path("app/utils/helper.py")), (
+        "dirty delete stays deleted"
+    )
 
 
 @pytest.mark.smoke
@@ -1796,7 +2028,9 @@ def test_switch_clears_anchor_when_no_dirty(new_lore_repo):
 
     repo.branch_switch("main", offline=True)
 
-    assert not has_staged_anchor(repo), "anchor should be cleared after a no-dirty switch"
+    assert not has_staged_anchor(repo), (
+        "anchor should be cleared after a no-dirty switch"
+    )
     entries = get_status_files_twice(repo, scan=True)
     assert_absent(entries, "file.txt", msg="file.txt clean after switch")
     with repo.open_file("file.txt", "r") as f:
@@ -1822,7 +2056,9 @@ def test_switch_anchor_rebase_parity_add(new_lore_repo):
     entries = get_status_files_twice(repo, scan=True)
     assert_absent(entries, "added.txt", msg="no false add after switching back")
     assert_file_set(entries, [], msg="status clean after parity add switch")
-    assert not os.path.exists(repo._fix_path("added.txt")), "added file removed by switch to main"
+    assert not os.path.exists(repo._fix_path("added.txt")), (
+        "added file removed by switch to main"
+    )
     with repo.open_file("base.txt", "r") as f:
         assert f.read() == "base\n"
 
@@ -1850,7 +2086,9 @@ def test_switch_anchor_rebase_parity_delete(new_lore_repo):
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands")
+@pytest.mark.skip(
+    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
+)
 def test_switch_carries_dirty_move(new_lore_repo):
     """A dirty move on main is still reported (action=move, fromPath=source)
     after switching to a same-revision branch, and the on-disk rename is
@@ -1865,7 +2103,9 @@ def test_switch_carries_dirty_move(new_lore_repo):
     repo.dirty_move("old.txt", "new.txt", offline=True)
 
     pre = get_status_files(repo)
-    assert_entry(pre, "new.txt", action="move", dirty=True, staged=False, from_path="old.txt")
+    assert_entry(
+        pre, "new.txt", action="move", dirty=True, staged=False, from_path="old.txt"
+    )
 
     repo.branch_switch("other", offline=True)
 
@@ -1876,7 +2116,12 @@ def test_switch_carries_dirty_move(new_lore_repo):
 
     entries = get_status_files(repo)
     assert_entry(
-        entries, "new.txt", action="move", dirty=True, staged=False, from_path="old.txt",
+        entries,
+        "new.txt",
+        action="move",
+        dirty=True,
+        staged=False,
+        from_path="old.txt",
         msg="dirty move provenance (action=move, fromPath) is carried across a same-revision switch",
     )
 
@@ -1906,7 +2151,14 @@ def test_switch_with_staged_node_present(new_lore_repo):
     repo.stage("staged.txt", offline=True)
 
     pre = get_status_files(repo)
-    assert_entry(pre, "staged.txt", action="add", dirty=True, staged=True, msg="staged before switch")
+    assert_entry(
+        pre,
+        "staged.txt",
+        action="add",
+        dirty=True,
+        staged=True,
+        msg="staged before switch",
+    )
 
     # The switch must not silently discard the staged commit-intent. Accept
     # either intended remedy: refuse (LoreException) or carry the stage.
@@ -1924,17 +2176,27 @@ def test_switch_with_staged_node_present(new_lore_repo):
         )
         after = get_status_files(repo)
         assert_entry(
-            after, "staged.txt", action="add", dirty=True, staged=True,
+            after,
+            "staged.txt",
+            action="add",
+            dirty=True,
+            staged=True,
             msg="staged node must survive a refused switch",
         )
     else:
         # Carry path: the switch succeeded, so the staged node is carried onto
         # the target branch.
         assert "On branch other" in repo.status(offline=True)
-        assert os.path.exists(repo._fix_path("staged.txt")), "staged file remains on disk"
+        assert os.path.exists(repo._fix_path("staged.txt")), (
+            "staged file remains on disk"
+        )
         after = get_status_files(repo)
         assert_entry(
-            after, "staged.txt", action="add", dirty=True, staged=True,
+            after,
+            "staged.txt",
+            action="add",
+            dirty=True,
+            staged=True,
             msg="staged node is carried across a same-revision switch",
         )
 
@@ -2008,7 +2270,9 @@ def test_sync_anchor_rebase_no_false_mods(new_lore_repo):
     repo.sync(rev_v1, offline=True)
 
     entries = get_status_files_twice(repo, scan=True)
-    assert_absent(entries, "file.txt", msg="synced file must not be a false modification")
+    assert_absent(
+        entries, "file.txt", msg="synced file must not be a false modification"
+    )
     assert_file_set(entries, [], msg="no false mods after sync back + rescan")
     with repo.open_file("file.txt", "r") as f:
         assert f.read() == "v1 content\n"
@@ -2182,7 +2446,11 @@ def test_sync_pending_genuine_dirty_carries_modification(new_lore_repo):
 
     entries = get_status_files_twice(repo)
     assert_entry(
-        entries, "file.txt", action="keep", dirty=True, staged=False,
+        entries,
+        "file.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
         msg="carried dirty modify is still reported after sync",
     )
     assert_file_set(entries, ["file.txt"], msg="only the carried dirty path is pending")
@@ -2261,7 +2529,12 @@ def test_mergeclean_featadd_mainadd_carry_modify(new_lore_repo):
         entries, ["base.txt"], msg="only the dirty carry should remain pending"
     )
     assert_entry(
-        entries, "base.txt", action="keep", dirty=True, staged=False, node_type="file",
+        entries,
+        "base.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="dirty modify carry survives the clean merge",
     )
     assert_absent(entries, "fa.txt", msg="feature add is committed and clean")
@@ -2298,7 +2571,9 @@ def test_mergeclean_featmodify_mainmodify_carry_add(new_lore_repo):
     repo.branch_merge("feature", offline=True)
 
     with repo.open_file("f.txt", "r") as f:
-        assert f.read() == "f modified on feature\n", "f.txt must reflect feature change"
+        assert f.read() == "f modified on feature\n", (
+            "f.txt must reflect feature change"
+        )
     with repo.open_file("m.txt", "r") as f:
         assert f.read() == "m modified on main\n", "m.txt must reflect main change"
 
@@ -2307,11 +2582,21 @@ def test_mergeclean_featmodify_mainmodify_carry_add(new_lore_repo):
         entries, ["carrydir/newcarry.txt"], msg="only the dirty-add carry remains"
     )
     assert_entry(
-        entries, "carrydir/newcarry.txt", action="add", dirty=True, staged=False,
-        node_type="file", msg="dirty-add carry survives the clean merge",
+        entries,
+        "carrydir/newcarry.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        msg="dirty-add carry survives the clean merge",
     )
     assert_entry(
-        entries, "carrydir", action="add", dirty=True, staged=False, node_type="directory",
+        entries,
+        "carrydir",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="directory",
         msg="the carried new directory node is recreated by the carry replay",
     )
     assert_absent(entries, "f.txt", msg="feature modify is committed and clean")
@@ -2357,8 +2642,13 @@ def test_mergeclean_featdelete_maindelete_carry_delete(new_lore_repo):
         entries, ["carrydel.txt"], msg="only the dirty-delete carry remains"
     )
     assert_entry(
-        entries, "carrydel.txt", action="delete", dirty=True, staged=False,
-        node_type="file", msg="explicitly dirty-marked delete carry survives merge",
+        entries,
+        "carrydel.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        msg="explicitly dirty-marked delete carry survives merge",
     )
     assert_absent(entries, "fd.txt", msg="feature delete committed and clean")
     assert_absent(entries, "md.txt", msg="main delete committed and clean")
@@ -2397,7 +2687,12 @@ def test_mergeclean_featadd_maindelete_carry_modify(new_lore_repo):
     entries = get_status_files(repo)
     assert_file_set(entries, ["base.txt"], msg="only the dirty carry remains")
     assert_entry(
-        entries, "base.txt", action="keep", dirty=True, staged=False, node_type="file",
+        entries,
+        "base.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="dirty modify carry survives the clean add/delete merge",
     )
     assert_absent(entries, "fa.txt", msg="feature add committed and clean")
@@ -2432,14 +2727,21 @@ def test_mergeclean_featmodify_mainadd_carry_modify(new_lore_repo):
     repo.branch_merge("feature", offline=True)
 
     with repo.open_file("f.txt", "r") as f:
-        assert f.read() == "f modified on feature\n", "f.txt must reflect feature change"
+        assert f.read() == "f modified on feature\n", (
+            "f.txt must reflect feature change"
+        )
     with repo.open_file("ma.txt", "r") as f:
         assert f.read() == "main add\n", "ma.txt must reflect main's add"
 
     entries = get_status_files(repo)
     assert_file_set(entries, ["base.txt"], msg="only the dirty carry remains")
     assert_entry(
-        entries, "base.txt", action="keep", dirty=True, staged=False, node_type="file",
+        entries,
+        "base.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="dirty modify carry survives the clean modify/add merge",
     )
     assert_absent(entries, "f.txt", msg="feature modify committed and clean")
@@ -2482,11 +2784,21 @@ def test_mergeclean_featdelete_mainmodify_carry_add(new_lore_repo):
         entries, ["carrydir/newcarry.txt"], msg="only the dirty-add carry remains"
     )
     assert_entry(
-        entries, "carrydir/newcarry.txt", action="add", dirty=True, staged=False,
-        node_type="file", msg="dirty-add carry survives the clean delete/modify merge",
+        entries,
+        "carrydir/newcarry.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        msg="dirty-add carry survives the clean delete/modify merge",
     )
     assert_entry(
-        entries, "carrydir", action="add", dirty=True, staged=False, node_type="directory",
+        entries,
+        "carrydir",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="directory",
         msg="the carried new directory node is recreated by the carry replay",
     )
     assert_absent(entries, "fd.txt", msg="feature delete committed and clean")
@@ -2521,8 +2833,12 @@ def test_mergeclean_clean_merge_no_carry_baseline(new_lore_repo):
         assert f.read() == "main add\n", "ma.txt must reflect main's add"
 
     entries = get_status_files(repo)
-    assert entries == [], f"status should be empty after a clean no-carry merge, got {summarize(entries)}"
-    assert not has_staged_anchor(repo), "anchor should be cleared after a clean no-carry merge"
+    assert entries == [], (
+        f"status should be empty after a clean no-carry merge, got {summarize(entries)}"
+    )
+    assert not has_staged_anchor(repo), (
+        "anchor should be cleared after a clean no-carry merge"
+    )
 
 
 @pytest.mark.smoke
@@ -2554,10 +2870,17 @@ def test_mergeclean_refuses_on_staged(new_lore_repo):
 
     entries = get_status_files(repo)
     assert_entry(
-        entries, "staged.txt", action="add", dirty=True, staged=True, node_type="file",
+        entries,
+        "staged.txt",
+        action="add",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged.txt must remain staged after the rejected merge",
     )
-    assert_absent(entries, "fa.txt", msg="feature add must not land after a refused merge")
+    assert_absent(
+        entries, "fa.txt", msg="feature add must not land after a refused merge"
+    )
 
 
 # ===========================================================================
@@ -2618,7 +2941,11 @@ def test_mergeconflict_modify_modify_resolve_mine(new_lore_repo):
     entries = get_status_files(repo)
     assert_file_set(entries, ["carry.txt"], msg="only the dirty carry should remain")
     assert_entry(
-        entries, "carry.txt", action="keep", dirty=True, staged=False,
+        entries,
+        "carry.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
         msg="dirty carry must survive the conflicted merge",
     )
     assert_absent(entries, "conflict.txt", msg="resolved conflict is clean post-commit")
@@ -2662,7 +2989,11 @@ def test_mergeconflict_modify_modify_resolve_theirs(new_lore_repo):
     entries = get_status_files(repo)
     assert_file_set(entries, ["carry.txt"], msg="only the dirty carry should remain")
     assert_entry(
-        entries, "carry.txt", action="keep", dirty=True, staged=False,
+        entries,
+        "carry.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
         msg="dirty carry must survive the conflicted merge",
     )
     assert_absent(entries, "conflict.txt", msg="resolved conflict is clean post-commit")
@@ -2748,7 +3079,9 @@ def test_mergeconflict_delete_modify_resolve_theirs(new_lore_repo):
     # 'theirs' = feature's delete — the file goes away.
     repo.branch_merge_resolve_theirs("conflict.txt", offline=True)
     resolved = assert_entry(
-        get_status_files(repo), "conflict.txt", action="delete",
+        get_status_files(repo),
+        "conflict.txt",
+        action="delete",
         msg="resolving to theirs (delete) marks the path as a resolved delete",
     )
     assert resolved.get("flagConflict") is True
@@ -2895,20 +3228,30 @@ def test_merge_dir_delete_vs_file_add_clean(new_lore_repo):
     assert " 0 conflicted" in merge_output, (
         f"disjoint dir-delete vs file-add should merge cleanly, got:\n{merge_output}"
     )
-    assert not _mergeconflict_unresolved(repo), "no conflict expected — merge auto-commits"
+    assert not _mergeconflict_unresolved(repo), (
+        "no conflict expected — merge auto-commits"
+    )
 
     # The clean merge auto-committed: feature's deletes landed, main's new file
     # under the otherwise-emptied dir survives.
     assert os.path.exists(repo._fix_path("d/new.txt")), "main's d/new.txt must survive"
     with repo.open_file("d/new.txt", "r") as f:
         assert f.read() == "main new file\n"
-    assert not os.path.exists(repo._fix_path("d/keep.txt")), "feature's delete must land"
-    assert not os.path.exists(repo._fix_path("d/other.txt")), "feature's delete must land"
+    assert not os.path.exists(repo._fix_path("d/keep.txt")), (
+        "feature's delete must land"
+    )
+    assert not os.path.exists(repo._fix_path("d/other.txt")), (
+        "feature's delete must land"
+    )
 
     entries = get_status_files(repo)
     assert_file_set(entries, ["carry.txt"], msg="only the dirty carry should remain")
     assert_entry(
-        entries, "carry.txt", action="keep", dirty=True, staged=False,
+        entries,
+        "carry.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
         msg="dirty carry must survive the dir-delete vs file-add merge",
     )
     assert_absent(entries, "d/new.txt", msg="d/new.txt is committed and clean")
@@ -2952,12 +3295,18 @@ def test_mergeconflict_carry_add_new_dir_through_conflict(new_lore_repo):
 
     entries = get_status_files(repo)
     assert_file_set(
-        entries, ["new_dir/sub/added.txt"],
+        entries,
+        ["new_dir/sub/added.txt"],
         msg="only the dirty-add carry should remain after the merge",
     )
     assert_entry(
-        entries, "new_dir/sub/added.txt", action="add", dirty=True, staged=False,
-        node_type="file", msg="dirty-add carry must survive + keep action=add",
+        entries,
+        "new_dir/sub/added.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        msg="dirty-add carry must survive + keep action=add",
     )
     # The recreated directory nodes for the carried add must be present.
     assert_entry(entries, "new_dir", node_type="directory", action="add")
@@ -3000,12 +3349,21 @@ def test_mergeconflict_abort_keeps_carry(new_lore_repo):
     # Abort cancels the merge but keeps the unrelated dirty-only carry.
     after_abort = get_status_files(repo)
     assert_entry(
-        after_abort, "carry.txt", action="keep", dirty=True, staged=False, node_type="file",
+        after_abort,
+        "carry.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="merge abort preserves the pre-existing dirty-only carry",
     )
-    assert_file_set(after_abort, ["carry.txt"], msg="only the carry remains after abort")
+    assert_file_set(
+        after_abort, ["carry.txt"], msg="only the carry remains after abort"
+    )
     with repo.open_file("carry.txt", "r") as f:
-        assert f.read() == "carry locally edited\n", "carry on-disk edit is intact after abort"
+        assert f.read() == "carry locally edited\n", (
+            "carry on-disk edit is intact after abort"
+        )
 
     # An unrelated staged commit afterwards commits only post.txt; the dirty-only
     # carry survives that commit.
@@ -3017,7 +3375,12 @@ def test_mergeconflict_abort_keeps_carry(new_lore_repo):
     entries = get_status_files(repo)
     assert_absent(entries, "post.txt", msg="staged commit should be clean after commit")
     assert_entry(
-        entries, "carry.txt", action="keep", dirty=True, staged=False, node_type="file",
+        entries,
+        "carry.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="the dirty-only carry survives an unrelated commit",
     )
     assert_file_set(entries, ["carry.txt"], msg="only the surviving carry remains")
@@ -3057,7 +3420,11 @@ def test_revert_clean_carry_modify(new_lore_repo):
     entries = get_status_files(repo)
     assert_absent(entries, "revertable.txt", msg="reverted add is gone from status")
     assert_entry(
-        entries, "base.txt", action="keep", dirty=True, staged=False,
+        entries,
+        "base.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
         msg="dirty modify carry must survive a clean revert",
     )
     assert_file_set(entries, ["base.txt"], msg="only the carried modify remains")
@@ -3087,7 +3454,9 @@ def test_revert_clean_carry_add_new_dir(new_lore_repo):
     repo.dirty("dirty_dir/nested/dirty_file.txt", offline=True)
 
     pre = get_status_files(repo)
-    assert_entry(pre, "dirty_dir/nested/dirty_file.txt", action="add", dirty=True, staged=False)
+    assert_entry(
+        pre, "dirty_dir/nested/dirty_file.txt", action="add", dirty=True, staged=False
+    )
 
     repo.revision_revert(rev_v2, offline=True)
 
@@ -3095,19 +3464,31 @@ def test_revert_clean_carry_add_new_dir(new_lore_repo):
     entries = get_status_files(repo)
     assert_absent(entries, "revertable.txt", msg="reverted add gone from status")
     assert_entry(
-        entries, "dirty_dir/nested/dirty_file.txt", action="add", dirty=True, staged=False,
-        node_type="file", msg="dirty add carry must survive a clean revert",
+        entries,
+        "dirty_dir/nested/dirty_file.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        msg="dirty add carry must survive a clean revert",
     )
     assert_entry(
-        entries, "dirty_dir", action="add", node_type="directory",
+        entries,
+        "dirty_dir",
+        action="add",
+        node_type="directory",
         msg="carry replay must recreate the new directory node",
     )
     assert_entry(
-        entries, "dirty_dir/nested", action="add", node_type="directory",
+        entries,
+        "dirty_dir/nested",
+        action="add",
+        node_type="directory",
         msg="carry replay must recreate the nested directory node",
     )
     assert_file_set(
-        entries, ["dirty_dir/nested/dirty_file.txt"],
+        entries,
+        ["dirty_dir/nested/dirty_file.txt"],
         msg="only the carried add leaf remains as a file entry",
     )
 
@@ -3138,7 +3519,11 @@ def test_revert_clean_carry_delete(new_lore_repo):
     entries = get_status_files(repo)
     assert_absent(entries, "revertable.txt", msg="reverted add gone from status")
     assert_entry(
-        entries, "victim.txt", action="delete", dirty=True, staged=False,
+        entries,
+        "victim.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
         msg="dirty delete carry must survive a clean revert",
     )
     assert_file_set(entries, ["victim.txt"], msg="only the carried delete remains")
@@ -3180,7 +3565,11 @@ def test_revert_conflict_resolve_mine(new_lore_repo):
 
     entries = get_status_files(repo)
     assert_entry(
-        entries, "untouched.txt", action="keep", dirty=True, staged=False,
+        entries,
+        "untouched.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
         msg="dirty carry must survive a conflicted revert resolved mine",
     )
     assert_absent(entries, "target.txt", msg="target.txt clean after resolve + commit")
@@ -3222,7 +3611,11 @@ def test_revert_conflict_resolve_theirs(new_lore_repo):
 
     entries = get_status_files(repo)
     assert_entry(
-        entries, "untouched.txt", action="keep", dirty=True, staged=False,
+        entries,
+        "untouched.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
         msg="dirty carry must survive a conflicted revert resolved theirs",
     )
     assert_absent(entries, "target.txt", msg="target.txt clean after resolve + commit")
@@ -3261,7 +3654,11 @@ def test_revert_refuses_on_staged(new_lore_repo):
 
     entries = get_status_files(repo)
     assert_entry(
-        entries, "staged.txt", action="add", dirty=True, staged=True,
+        entries,
+        "staged.txt",
+        action="add",
+        dirty=True,
+        staged=True,
         msg="the staged node must survive the rejected revert",
     )
     assert os.path.exists(repo._fix_path("revertable.txt")), (
@@ -3301,12 +3698,19 @@ def test_revert_abort_keeps_carry(new_lore_repo):
     # Abort cancels the revert but keeps the unrelated dirty-only carry.
     after_abort = get_status_files(repo)
     assert_entry(
-        after_abort, "base.txt", action="keep", dirty=True, staged=False, node_type="file",
+        after_abort,
+        "base.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="revert abort preserves the pre-existing dirty-only carry",
     )
     assert_file_set(after_abort, ["base.txt"], msg="only the carry remains after abort")
     with repo.open_file("base.txt", "r") as f:
-        assert f.read() == "base locally edited longer\n", "carry on-disk edit is intact after abort"
+        assert f.read() == "base locally edited longer\n", (
+            "carry on-disk edit is intact after abort"
+        )
 
     with repo.open_file("staged_post.txt", "w+") as f:
         f.write("post-abort\n")
@@ -3316,7 +3720,12 @@ def test_revert_abort_keeps_carry(new_lore_repo):
     entries = get_status_files(repo)
     assert_absent(entries, "staged_post.txt", msg="committed staged file is clean")
     assert_entry(
-        entries, "base.txt", action="keep", dirty=True, staged=False, node_type="file",
+        entries,
+        "base.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="the dirty-only carry survives an unrelated commit",
     )
     assert_file_set(entries, ["base.txt"], msg="only the surviving carry remains")
@@ -3357,7 +3766,9 @@ def test_cherrypick_clean_carry_modify(new_lore_repo):
     repo.dirty("base.txt", offline=True)
 
     pre = get_status_files(repo)
-    assert_entry(pre, "base.txt", action="keep", dirty=True, staged=False, node_type="file")
+    assert_entry(
+        pre, "base.txt", action="keep", dirty=True, staged=False, node_type="file"
+    )
     assert_file_set(pre, ["base.txt"], msg="only the dirty carry is pending pre-pick")
 
     repo.revision_cherry_pick(source_rev, offline=True)
@@ -3369,10 +3780,17 @@ def test_cherrypick_clean_carry_modify(new_lore_repo):
     entries = get_status_files(repo)
     assert_absent(entries, "from_source.txt", msg="picked file is committed and clean")
     assert_entry(
-        entries, "base.txt", action="keep", dirty=True, staged=False, node_type="file",
+        entries,
+        "base.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="dirty modify carry must survive the clean pick",
     )
-    assert_file_set(entries, ["base.txt"], msg="only the carry remains pending after pick")
+    assert_file_set(
+        entries, ["base.txt"], msg="only the carry remains pending after pick"
+    )
     with repo.open_file("base.txt", "r") as f:
         assert f.read() == "base locally edited\n"
 
@@ -3396,10 +3814,16 @@ def test_cherrypick_clean_carry_add_new_dir(new_lore_repo):
 
     pre = get_status_files(repo)
     assert_entry(
-        pre, "carry_dir/nested/added.txt", action="add", dirty=True, staged=False,
+        pre,
+        "carry_dir/nested/added.txt",
+        action="add",
+        dirty=True,
+        staged=False,
         node_type="file",
     )
-    assert_file_set(pre, ["carry_dir/nested/added.txt"], msg="only the dirty add is pending")
+    assert_file_set(
+        pre, ["carry_dir/nested/added.txt"], msg="only the dirty add is pending"
+    )
 
     repo.revision_cherry_pick(source_rev, offline=True)
 
@@ -3407,8 +3831,13 @@ def test_cherrypick_clean_carry_add_new_dir(new_lore_repo):
     entries = get_status_files(repo)
     assert_absent(entries, "from_source.txt", msg="picked file is committed and clean")
     assert_entry(
-        entries, "carry_dir/nested/added.txt", action="add", dirty=True, staged=False,
-        node_type="file", msg="dirty add carry must survive the clean pick",
+        entries,
+        "carry_dir/nested/added.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        msg="dirty add carry must survive the clean pick",
     )
     assert_file_set(
         entries, ["carry_dir/nested/added.txt"], msg="only the carry remains pending"
@@ -3436,8 +3865,12 @@ def test_cherrypick_clean_carry_delete(new_lore_repo):
     repo.dirty("victim.txt", offline=True)
 
     pre = get_status_files(repo)
-    assert_entry(pre, "victim.txt", action="delete", dirty=True, staged=False, node_type="file")
-    assert_file_set(pre, ["victim.txt"], msg="only the dirty delete is pending pre-pick")
+    assert_entry(
+        pre, "victim.txt", action="delete", dirty=True, staged=False, node_type="file"
+    )
+    assert_file_set(
+        pre, ["victim.txt"], msg="only the dirty delete is pending pre-pick"
+    )
 
     repo.revision_cherry_pick(source_rev, offline=True)
 
@@ -3445,10 +3878,17 @@ def test_cherrypick_clean_carry_delete(new_lore_repo):
     entries = get_status_files(repo)
     assert_absent(entries, "from_source.txt", msg="picked file is committed and clean")
     assert_entry(
-        entries, "victim.txt", action="delete", dirty=True, staged=False, node_type="file",
+        entries,
+        "victim.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="dirty delete carry must survive the clean pick",
     )
-    assert_file_set(entries, ["victim.txt"], msg="only the carry remains pending after pick")
+    assert_file_set(
+        entries, ["victim.txt"], msg="only the carry remains pending after pick"
+    )
     assert not os.path.exists(repo._fix_path("victim.txt")), (
         "the dirty-deleted file must stay absent from disk after the pick"
     )
@@ -3485,10 +3925,17 @@ def test_cherrypick_conflict_resolve_mine(new_lore_repo):
 
     entries = get_status_files(repo)
     assert_entry(
-        entries, "untouched.txt", action="keep", dirty=True, staged=False, node_type="file",
+        entries,
+        "untouched.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="unrelated dirty carry must survive the conflicted pick",
     )
-    assert_absent(entries, "conflict.txt", msg="conflict.txt clean after resolve + commit")
+    assert_absent(
+        entries, "conflict.txt", msg="conflict.txt clean after resolve + commit"
+    )
     assert_file_set(entries, ["untouched.txt"], msg="only the carry remains pending")
     with repo.open_file("conflict.txt", "r") as f:
         assert f.read() == "main side\n", "resolve mine keeps the current-branch side"
@@ -3525,13 +3972,22 @@ def test_cherrypick_conflict_resolve_theirs(new_lore_repo):
 
     entries = get_status_files(repo)
     assert_entry(
-        entries, "untouched.txt", action="keep", dirty=True, staged=False, node_type="file",
+        entries,
+        "untouched.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="unrelated dirty carry must survive the conflicted pick",
     )
-    assert_absent(entries, "conflict.txt", msg="conflict.txt clean after resolve + commit")
+    assert_absent(
+        entries, "conflict.txt", msg="conflict.txt clean after resolve + commit"
+    )
     assert_file_set(entries, ["untouched.txt"], msg="only the carry remains pending")
     with repo.open_file("conflict.txt", "r") as f:
-        assert f.read() == "source side\n", "resolve theirs takes the picked-revision side"
+        assert f.read() == "source side\n", (
+            "resolve theirs takes the picked-revision side"
+        )
 
 
 @pytest.mark.smoke
@@ -3562,15 +4018,24 @@ def test_cherrypick_pick_rev_that_adds_directory_with_carry(new_lore_repo):
         assert f.read() == "helper module\n"
 
     entries = get_status_files(repo)
-    assert_absent(entries, "feature/src/main.txt", msg="picked tree is committed and clean")
+    assert_absent(
+        entries, "feature/src/main.txt", msg="picked tree is committed and clean"
+    )
     assert_absent(
         entries, "feature/src/util/helper.txt", msg="picked tree is committed and clean"
     )
     assert_entry(
-        entries, "base.txt", action="keep", dirty=True, staged=False, node_type="file",
+        entries,
+        "base.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="dirty carry must survive the directory-adding pick",
     )
-    assert_file_set(entries, ["base.txt"], msg="only the carry remains pending after pick")
+    assert_file_set(
+        entries, ["base.txt"], msg="only the carry remains pending after pick"
+    )
 
 
 @pytest.mark.smoke
@@ -3598,7 +4063,11 @@ def test_cherrypick_refuses_on_staged(new_lore_repo):
 
     entries = get_status_files(repo)
     assert_entry(
-        entries, "staged.txt", dirty=True, staged=True, node_type="file",
+        entries,
+        "staged.txt",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged.txt should remain staged after the rejected pick",
     )
     assert_absent(entries, "from_source.txt", msg="nothing from the source was applied")
@@ -3636,12 +4105,19 @@ def test_cherrypick_abort_keeps_carry(new_lore_repo):
     # Abort cancels the pick but keeps the unrelated dirty-only carry.
     after_abort = get_status_files(repo)
     assert_entry(
-        after_abort, "base.txt", action="keep", dirty=True, staged=False, node_type="file",
+        after_abort,
+        "base.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="cherry-pick abort preserves the pre-existing dirty-only carry",
     )
     assert_file_set(after_abort, ["base.txt"], msg="only the carry remains after abort")
     with repo.open_file("base.txt", "r") as f:
-        assert f.read() == "base locally edited\n", "carry on-disk edit is intact after abort"
+        assert f.read() == "base locally edited\n", (
+            "carry on-disk edit is intact after abort"
+        )
 
     with repo.open_file("staged_post.txt", "w+") as f:
         f.write("post-abort\n")
@@ -3651,7 +4127,12 @@ def test_cherrypick_abort_keeps_carry(new_lore_repo):
     entries = get_status_files(repo)
     assert_absent(entries, "staged_post.txt", msg="staged_post.txt clean after commit")
     assert_entry(
-        entries, "base.txt", action="keep", dirty=True, staged=False, node_type="file",
+        entries,
+        "base.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="the dirty-only carry survives an unrelated commit",
     )
     assert_file_set(entries, ["base.txt"], msg="only the surviving carry remains")
@@ -3723,13 +4204,36 @@ def test_stress_all_classes_then_commit(new_lore_repo):
         ],
         msg="all five change classes should be reported pre-commit",
     )
-    assert_entry(pre, "staged_add.txt", action="add", dirty=True, staged=True, node_type="file")
-    assert_entry(pre, "staged_del.txt", action="delete", dirty=True, staged=True, node_type="file")
-    assert_entry(pre, "dirty_mod.txt", action="keep", dirty=True, staged=False, node_type="file")
     assert_entry(
-        pre, "newdir/dirty_add.txt", action="add", dirty=True, staged=False, node_type="file"
+        pre, "staged_add.txt", action="add", dirty=True, staged=True, node_type="file"
     )
-    assert_entry(pre, "dirty_del.txt", action="delete", dirty=True, staged=False, node_type="file")
+    assert_entry(
+        pre,
+        "staged_del.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
+    )
+    assert_entry(
+        pre, "dirty_mod.txt", action="keep", dirty=True, staged=False, node_type="file"
+    )
+    assert_entry(
+        pre,
+        "newdir/dirty_add.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
+    )
+    assert_entry(
+        pre,
+        "dirty_del.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
+    )
     # The new dirty-add directory is surfaced as an add directory node.
     assert_entry(pre, "newdir", action="add", node_type="directory")
 
@@ -3745,17 +4249,27 @@ def test_stress_all_classes_then_commit(new_lore_repo):
     assert_entry(post, "dirty_mod.txt", action="keep", dirty=True, staged=False)
     assert_entry(post, "newdir/dirty_add.txt", action="add", dirty=True, staged=False)
     assert_entry(post, "dirty_del.txt", action="delete", dirty=True, staged=False)
-    assert_absent(post, "staged_add.txt", msg="staged add should be committed and clean")
-    assert_absent(post, "staged_del.txt", msg="staged delete should be committed and clean")
+    assert_absent(
+        post, "staged_add.txt", msg="staged add should be committed and clean"
+    )
+    assert_absent(
+        post, "staged_del.txt", msg="staged delete should be committed and clean"
+    )
 
     # Confirm the committed tree by dropping the tracked state and dumping.
     repo.status(reset=True, offline=True)
     dump = repo.repository_dump()
     assert "staged_add.txt" in dump, f"staged add must be in committed tree:\n{dump}"
-    assert "staged_del.txt" not in dump, f"staged delete must be gone from tree:\n{dump}"
+    assert "staged_del.txt" not in dump, (
+        f"staged delete must be gone from tree:\n{dump}"
+    )
     # Dirty-only changes never touch the committed tree.
-    assert "dirty_del.txt" in dump, f"dirty-only delete must NOT alter committed tree:\n{dump}"
-    assert "dirty_add.txt" not in dump, f"dirty-only add must NOT enter committed tree:\n{dump}"
+    assert "dirty_del.txt" in dump, (
+        f"dirty-only delete must NOT alter committed tree:\n{dump}"
+    )
+    assert "dirty_add.txt" not in dump, (
+        f"dirty-only add must NOT enter committed tree:\n{dump}"
+    )
     # The dirty-only modify keeps its original committed content.
     assert "dirty modified content longer" not in dump, (
         f"dirty-only modify must NOT alter committed content:\n{dump}"
@@ -3796,11 +4310,17 @@ def test_stress_all_classes_then_reset_all(new_lore_repo):
     repo.remove_file("dirty_del.txt")
     repo.dirty("dirty_del.txt", offline=True)
 
-    assert has_staged_anchor(repo), "anchor should exist before reset (staged nodes present)"
+    assert has_staged_anchor(repo), (
+        "anchor should exist before reset (staged nodes present)"
+    )
 
     entries = get_status_files(repo, reset=True)
-    assert entries == [], f"status(reset=True) should yield empty status, got {summarize(entries)}"
-    assert not has_staged_anchor(repo), "anchor should be cleared after status(reset=True)"
+    assert entries == [], (
+        f"status(reset=True) should yield empty status, got {summarize(entries)}"
+    )
+    assert not has_staged_anchor(repo), (
+        "anchor should be cleared after status(reset=True)"
+    )
 
 
 @pytest.mark.smoke
@@ -3816,24 +4336,39 @@ def test_stress_reset_scan_redetects_delete(new_lore_repo):
     repo.dirty("victim.txt", offline=True)
     _stage_one(repo, "victim.txt")
     assert_entry(
-        get_status_files(repo), "victim.txt", action="delete", dirty=True, staged=True,
+        get_status_files(repo),
+        "victim.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
         msg="staged delete before reset",
     )
 
     entries = get_status_files_twice(repo, reset=True, scan=True)
-    assert_file_set(entries, ["victim.txt"], msg="reset+scan should re-detect only the deletion")
+    assert_file_set(
+        entries, ["victim.txt"], msg="reset+scan should re-detect only the deletion"
+    )
     assert_entry(
-        entries, "victim.txt", action="delete", staged=False,
+        entries,
+        "victim.txt",
+        action="delete",
+        staged=False,
         msg="reset+scan must re-detect the deletion as an unstaged delete",
     )
     assert_entry(
-        entries, "victim.txt", dirty=True,
+        entries,
+        "victim.txt",
+        dirty=True,
         msg="scan-detected delete is flagDirty=true (symmetric with modify/add)",
     )
 
     persisted = get_status_files(repo)
     assert_entry(
-        persisted, "victim.txt", action="delete", dirty=True, staged=False,
+        persisted,
+        "victim.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
         msg="scan-detected delete persists to no-scan status like modify/add",
     )
 
@@ -3856,7 +4391,9 @@ def test_stress_reset_scan_redetects_dir_mixed(new_lore_repo):
 
     staged = get_status_files(repo)
     assert_file_set(
-        staged, ["src/a.txt", "src/b.txt", "src/c.txt"], msg="all three staged before reset"
+        staged,
+        ["src/a.txt", "src/b.txt", "src/c.txt"],
+        msg="all three staged before reset",
     )
     assert_entry(staged, "src/a.txt", staged=True)
     assert_entry(staged, "src/c.txt", staged=True)
@@ -3868,19 +4405,32 @@ def test_stress_reset_scan_redetects_dir_mixed(new_lore_repo):
         msg="reset+scan re-detects the unstaged filesystem state of the directory",
     )
     assert_entry(
-        entries, "src/a.txt", action="keep", dirty=True, staged=False,
+        entries,
+        "src/a.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
         msg="scan re-detects the modify as an unstaged dirty modify",
     )
     assert_entry(
-        entries, "src/c.txt", action="add", dirty=True, staged=False,
+        entries,
+        "src/c.txt",
+        action="add",
+        dirty=True,
+        staged=False,
         msg="scan re-detects the add as an unstaged dirty add",
     )
     assert_entry(
-        entries, "src/b.txt", action="delete", staged=False,
+        entries,
+        "src/b.txt",
+        action="delete",
+        staged=False,
         msg="scan re-detects the deletion as an unstaged delete",
     )
     assert_entry(
-        entries, "src/b.txt", dirty=True,
+        entries,
+        "src/b.txt",
+        dirty=True,
         msg="scan-detected delete is flagDirty=true like the sibling modify/add",
     )
 
@@ -3913,7 +4463,9 @@ def test_stress_pathscoped_status_mixed(new_lore_repo):
     repo.remove_file("subC/del.txt")
     repo.dirty("subC/del.txt", offline=True)
 
-    entries = get_status_files_twice(repo, path=["subA", "subB", "subC", "."], scan=True)
+    entries = get_status_files_twice(
+        repo, path=["subA", "subB", "subC", "."], scan=True
+    )
     assert_file_set(
         entries,
         ["subA/mod.txt", "subB/add.txt", "subC/del.txt"],
@@ -3974,7 +4526,11 @@ def test_stress_long_chain(new_lore_repo):
     assert_entry(scanned, "side.txt", action="keep", dirty=True, staged=False)
     persisted = get_status_files(repo)
     assert_entry(
-        persisted, "side.txt", action="keep", dirty=True, staged=False,
+        persisted,
+        "side.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
         msg="a scanned modification persists to no-scan status",
     )
 
@@ -4029,21 +4585,32 @@ def test_chain_modify_scan_switch_reset_status(new_lore_repo):
     # Step 2: status --scan detects file.txt as keep/dirty (idempotent).
     scanned = get_status_files_twice(repo, scan=True)
     assert_file_set(scanned, ["file.txt"], msg="scan detects only the modified file")
-    assert_entry(scanned, "file.txt", action="keep", dirty=True, staged=False, node_type="file")
+    assert_entry(
+        scanned, "file.txt", action="keep", dirty=True, staged=False, node_type="file"
+    )
     assert_absent(scanned, "anchor.txt", msg="untouched committed file stays clean")
 
     # Step 3: the scanned modify PERSISTS into a later no-scan status.
     persisted = get_status_files(repo)
-    assert_file_set(persisted, ["file.txt"], msg="scanned modify persists to no-scan status")
+    assert_file_set(
+        persisted, ["file.txt"], msg="scanned modify persists to no-scan status"
+    )
     assert_entry(persisted, "file.txt", action="keep", dirty=True, staged=False)
     assert _chain_read(repo, "file.txt") == "v0 content modified longer"
 
     # Step 4: switch to other (same revision) — the dirty modify CARRIES.
     repo.branch_switch("other", offline=True)
     carried = get_status_files(repo)
-    assert_file_set(carried, ["file.txt"], msg="dirty modify carries across same-revision switch")
+    assert_file_set(
+        carried, ["file.txt"], msg="dirty modify carries across same-revision switch"
+    )
     assert_entry(
-        carried, "file.txt", action="keep", dirty=True, staged=False, node_type="file",
+        carried,
+        "file.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="carried modify keeps keep/dirty after the switch",
     )
     assert_absent(carried, "anchor.txt", msg="untouched file stays clean on other")
@@ -4098,7 +4665,9 @@ def test_chain_modify_scan_switch_roundtrip_reset(new_lore_repo):
     # Hop back to main: still identical.
     repo.branch_switch("main", offline=True)
     back_entries = get_status_files(repo)
-    assert_file_set(back_entries, ["file.txt"], msg="dirty modify carries back to main unchanged")
+    assert_file_set(
+        back_entries, ["file.txt"], msg="dirty modify carries back to main unchanged"
+    )
     assert_entry(back_entries, "file.txt", action="keep", dirty=True, staged=False)
     assert _chain_read(repo, "file.txt") == "round modified longer", (
         "on-disk content is stable across the full round trip"
@@ -4109,9 +4678,13 @@ def test_chain_modify_scan_switch_roundtrip_reset(new_lore_repo):
 
     # Reset closes the chain to a clean tree.
     repo.reset("file.txt", offline=True)
-    assert _chain_read(repo, "file.txt") == "round v0", "reset restores committed content"
+    assert _chain_read(repo, "file.txt") == "round v0", (
+        "reset restores committed content"
+    )
     assert_file_set(get_status_files(repo), [], msg="no-scan clean after reset")
-    assert_file_set(get_status_files_twice(repo, scan=True), [], msg="--scan clean after reset")
+    assert_file_set(
+        get_status_files_twice(repo, scan=True), [], msg="--scan clean after reset"
+    )
     assert not has_staged_anchor(repo), "anchor released once clean"
 
 
@@ -4136,29 +4709,47 @@ def test_chain_add_scan_switch_stage_commit_dump(new_lore_repo):
         f.write("fresh content")
     scanned = get_status_files_twice(repo, scan=True)
     assert_file_set(scanned, ["fresh.txt"], msg="scan detects the new file")
-    assert_entry(scanned, "fresh.txt", action="add", dirty=True, staged=False, node_type="file")
+    assert_entry(
+        scanned, "fresh.txt", action="add", dirty=True, staged=False, node_type="file"
+    )
     persisted = get_status_files(repo)
-    assert_entry(persisted, "fresh.txt", action="add", dirty=True, staged=False,
-                 msg="scanned add persists to no-scan status")
+    assert_entry(
+        persisted,
+        "fresh.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        msg="scanned add persists to no-scan status",
+    )
 
     # Carry the add across a same-revision switch to other.
     repo.branch_switch("other", offline=True)
     carried = get_status_files(repo)
     assert_file_set(carried, ["fresh.txt"], msg="dirty add carries onto other")
     assert_entry(carried, "fresh.txt", action="add", dirty=True, staged=False)
-    assert _chain_read(repo, "fresh.txt") == "fresh content", "added content carries on disk"
+    assert _chain_read(repo, "fresh.txt") == "fresh content", (
+        "added content carries on disk"
+    )
 
     # Stage + commit on other.
     repo.stage("fresh.txt", offline=True)
     staged = get_status_files(repo)
-    assert_entry(staged, "fresh.txt", action="add", dirty=True, staged=True,
-                 msg="add is staged on other before commit")
+    assert_entry(
+        staged,
+        "fresh.txt",
+        action="add",
+        dirty=True,
+        staged=True,
+        msg="add is staged on other before commit",
+    )
     repo.commit("commit fresh on other", offline=True)
 
     # Status fully clean, anchor gone, and the dump carries the committed file.
     after = get_status_files(repo)
     assert_file_set(after, [], msg="no-scan status clean after committing the add")
-    assert_file_set(get_status_files_twice(repo, scan=True), [], msg="--scan clean after commit")
+    assert_file_set(
+        get_status_files_twice(repo, scan=True), [], msg="--scan clean after commit"
+    )
     assert not has_staged_anchor(repo), "anchor cleared after a clean commit"
 
     repo.status(reset=True, offline=True)
@@ -4185,12 +4776,20 @@ def test_chain_full_lifecycle_modify_commit_modify_switch_reset(new_lore_repo):
     s1 = get_status_files_twice(repo, scan=True)
     assert_entry(s1, "file.txt", action="keep", dirty=True, staged=False)
     repo.stage("file.txt", offline=True)
-    assert_entry(get_status_files(repo), "file.txt", action="keep", dirty=True, staged=True,
-                 msg="staged before the first commit")
+    assert_entry(
+        get_status_files(repo),
+        "file.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        msg="staged before the first commit",
+    )
     repo.commit("commit v1", offline=True)
     assert_file_set(get_status_files(repo), [], msg="clean after committing v1")
     assert not has_staged_anchor(repo), "anchor gone after the clean commit"
-    assert _chain_read(repo, "file.txt") == "v1 lifecycle longer", "v1 committed on disk"
+    assert _chain_read(repo, "file.txt") == "v1 lifecycle longer", (
+        "v1 committed on disk"
+    )
 
     # Second edit detected by scan and persisted.
     with repo.open_file("file.txt", "w+") as f:
@@ -4205,7 +4804,9 @@ def test_chain_full_lifecycle_modify_commit_modify_switch_reset(new_lore_repo):
     carried = get_status_files(repo)
     assert_file_set(carried, ["file.txt"], msg="second edit carries onto other")
     assert_entry(carried, "file.txt", action="keep", dirty=True, staged=False)
-    assert _chain_read(repo, "file.txt") == "v2 lifecycle even longer", "v2 carries on disk"
+    assert _chain_read(repo, "file.txt") == "v2 lifecycle even longer", (
+        "v2 carries on disk"
+    )
 
     # Reset restores the committed (v1) content and clears tracking.
     repo.reset("file.txt", offline=True)
@@ -4213,7 +4814,9 @@ def test_chain_full_lifecycle_modify_commit_modify_switch_reset(new_lore_repo):
         "reset restores committed v1, not the original base v0"
     )
     assert_file_set(get_status_files(repo), [], msg="no-scan clean after reset")
-    assert_file_set(get_status_files_twice(repo, scan=True), [], msg="--scan clean after reset")
+    assert_file_set(
+        get_status_files_twice(repo, scan=True), [], msg="--scan clean after reset"
+    )
     assert not has_staged_anchor(repo), "anchor released once clean"
 
 
@@ -4244,26 +4847,48 @@ def test_chain_two_modifies_scan_switch_reset_one_then_other(new_lore_repo):
     # Carry both across the switch.
     repo.branch_switch("other", offline=True)
     carried = get_status_files(repo)
-    assert_file_set(carried, ["a.txt", "b.txt"], msg="both dirty modifies carry onto other")
+    assert_file_set(
+        carried, ["a.txt", "b.txt"], msg="both dirty modifies carry onto other"
+    )
     assert_entry(carried, "a.txt", action="keep", dirty=True, staged=False)
     assert_entry(carried, "b.txt", action="keep", dirty=True, staged=False)
 
     # Reset a.txt only: b.txt must remain dirty with its content intact.
     repo.reset("a.txt", offline=True)
-    assert _chain_read(repo, "a.txt") == "a v0", "reset a.txt restores its committed content"
-    assert _chain_read(repo, "b.txt") == "b modified longer", "b.txt keeps its dirty content"
+    assert _chain_read(repo, "a.txt") == "a v0", (
+        "reset a.txt restores its committed content"
+    )
+    assert _chain_read(repo, "b.txt") == "b modified longer", (
+        "b.txt keeps its dirty content"
+    )
     mid = get_status_files(repo)
-    assert_file_set(mid, ["b.txt"], msg="only b.txt remains dirty after resetting a.txt")
-    assert_entry(mid, "b.txt", action="keep", dirty=True, staged=False,
-                 msg="the un-reset sibling is still a dirty modify")
+    assert_file_set(
+        mid, ["b.txt"], msg="only b.txt remains dirty after resetting a.txt"
+    )
+    assert_entry(
+        mid,
+        "b.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        msg="the un-reset sibling is still a dirty modify",
+    )
     assert_absent(mid, "a.txt", msg="the reset file is cleared from status")
     assert has_staged_anchor(repo), "anchor persists while one dirty path remains"
 
     # Reset b.txt: the tree is now clean.
     repo.reset("b.txt", offline=True)
-    assert _chain_read(repo, "b.txt") == "b v0", "reset b.txt restores its committed content"
-    assert_file_set(get_status_files(repo), [], msg="no-scan clean after resetting both")
-    assert_file_set(get_status_files_twice(repo, scan=True), [], msg="--scan clean after both resets")
+    assert _chain_read(repo, "b.txt") == "b v0", (
+        "reset b.txt restores its committed content"
+    )
+    assert_file_set(
+        get_status_files(repo), [], msg="no-scan clean after resetting both"
+    )
+    assert_file_set(
+        get_status_files_twice(repo, scan=True),
+        [],
+        msg="--scan clean after both resets",
+    )
     assert not has_staged_anchor(repo), "anchor released once both are reset"
 
 
@@ -4300,24 +4925,41 @@ def test_chain_dirty_base_switch_merge_feature_reset(new_lore_repo):
     # Merge feature into main: clean, auto-commits, carry survives.
     repo.branch_merge("feature", offline=True)
     assert _chain_exists(repo, "feat.txt"), "feature add lands on disk after the merge"
-    assert _chain_read(repo, "feat.txt") == "feature added", "merged feat.txt content on disk"
+    assert _chain_read(repo, "feat.txt") == "feature added", (
+        "merged feat.txt content on disk"
+    )
     assert _chain_read(repo, "base.txt") == "base locally edited longer", (
         "the dirty carry keeps its local content through the merge"
     )
 
     post = get_status_files(repo)
-    assert_file_set(post, ["base.txt"], msg="base still dirty, feat.txt committed-clean")
+    assert_file_set(
+        post, ["base.txt"], msg="base still dirty, feat.txt committed-clean"
+    )
     assert_entry(
-        post, "base.txt", action="keep", dirty=True, staged=False, node_type="file",
+        post,
+        "base.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="dirty modify carry survives the clean merge",
     )
-    assert_absent(post, "feat.txt", msg="feature add is committed and clean after merge")
+    assert_absent(
+        post, "feat.txt", msg="feature add is committed and clean after merge"
+    )
 
     # Reset the carry -> clean.
     repo.reset("base.txt", offline=True)
-    assert _chain_read(repo, "base.txt") == "base v0", "reset restores committed base content"
-    assert_file_set(get_status_files(repo), [], msg="no-scan clean after resetting the carry")
-    assert_file_set(get_status_files_twice(repo, scan=True), [], msg="--scan clean after reset")
+    assert _chain_read(repo, "base.txt") == "base v0", (
+        "reset restores committed base content"
+    )
+    assert_file_set(
+        get_status_files(repo), [], msg="no-scan clean after resetting the carry"
+    )
+    assert_file_set(
+        get_status_files_twice(repo, scan=True), [], msg="--scan clean after reset"
+    )
     assert not has_staged_anchor(repo), "anchor released once the carry is reset"
 
 
@@ -4343,7 +4985,9 @@ def test_chain_modify_scan_sync_back_forward_reset(new_lore_repo):
         f.write("v2 side longer")
     repo.stage(scan=True, offline=True)
     repo.commit("v2 edits side.txt", offline=True)
-    assert _chain_read(repo, "file.txt") == "v1 file content", "file.txt unchanged by v2"
+    assert _chain_read(repo, "file.txt") == "v1 file content", (
+        "file.txt unchanged by v2"
+    )
     assert _chain_read(repo, "side.txt") == "v2 side longer", "side.txt at v2"
 
     # Genuine pending dirty modify of file.txt (outside the v1<->v2 delta),
@@ -4360,9 +5004,13 @@ def test_chain_modify_scan_sync_back_forward_reset(new_lore_repo):
     assert _chain_read(repo, "file.txt") == "local pending edit longer", (
         "dirty modify outside the delta is carried across sync back, not lost"
     )
-    assert _chain_read(repo, "side.txt") == "v1 side", "non-dirty file follows the synced revision"
+    assert _chain_read(repo, "side.txt") == "v1 side", (
+        "non-dirty file follows the synced revision"
+    )
     at_v1 = get_status_files_twice(repo)
-    assert_file_set(at_v1, ["file.txt"], msg="only the carried dirty path is pending at v1")
+    assert_file_set(
+        at_v1, ["file.txt"], msg="only the carried dirty path is pending at v1"
+    )
     assert_entry(at_v1, "file.txt", action="keep", dirty=True, staged=False)
 
     # Sync FORWARD to v2: the carry still survives; side.txt returns to v2.
@@ -4370,7 +5018,9 @@ def test_chain_modify_scan_sync_back_forward_reset(new_lore_repo):
     assert _chain_read(repo, "file.txt") == "local pending edit longer", (
         "dirty modify is carried across sync forward too"
     )
-    assert _chain_read(repo, "side.txt") == "v2 side longer", "side.txt back at v2 after forward sync"
+    assert _chain_read(repo, "side.txt") == "v2 side longer", (
+        "side.txt back at v2 after forward sync"
+    )
     at_v2 = get_status_files_twice(repo)
     assert_file_set(at_v2, ["file.txt"], msg="carry still pending after sync forward")
     assert_entry(at_v2, "file.txt", action="keep", dirty=True, staged=False)
@@ -4382,7 +5032,9 @@ def test_chain_modify_scan_sync_back_forward_reset(new_lore_repo):
         "reset restores file.txt's committed content"
     )
     assert_file_set(get_status_files(repo), [], msg="no-scan clean after reset")
-    assert_file_set(get_status_files_twice(repo, scan=True), [], msg="--scan clean after reset")
+    assert_file_set(
+        get_status_files_twice(repo, scan=True), [], msg="--scan clean after reset"
+    )
     assert not has_staged_anchor(repo), "anchor released once clean"
 
 
@@ -4411,29 +5063,51 @@ def test_chain_two_adds_scan_switch_commit_one_then_other(new_lore_repo):
         f.write("second add")
     scanned = get_status_files_twice(repo, scan=True)
     assert_file_set(scanned, ["first.txt", "second.txt"], msg="scan detects both adds")
-    assert_entry(scanned, "first.txt", action="add", dirty=True, staged=False, node_type="file")
-    assert_entry(scanned, "second.txt", action="add", dirty=True, staged=False, node_type="file")
+    assert_entry(
+        scanned, "first.txt", action="add", dirty=True, staged=False, node_type="file"
+    )
+    assert_entry(
+        scanned, "second.txt", action="add", dirty=True, staged=False, node_type="file"
+    )
     persisted = get_status_files(repo)
-    assert_file_set(persisted, ["first.txt", "second.txt"], msg="both adds persist to no-scan")
+    assert_file_set(
+        persisted, ["first.txt", "second.txt"], msg="both adds persist to no-scan"
+    )
 
     # Carry both adds across the switch.
     repo.branch_switch("other", offline=True)
     carried = get_status_files(repo)
-    assert_file_set(carried, ["first.txt", "second.txt"], msg="both adds carry onto other")
+    assert_file_set(
+        carried, ["first.txt", "second.txt"], msg="both adds carry onto other"
+    )
     assert_entry(carried, "first.txt", action="add", dirty=True, staged=False)
     assert_entry(carried, "second.txt", action="add", dirty=True, staged=False)
-    assert _chain_read(repo, "first.txt") == "first add", "first add content carries on disk"
-    assert _chain_read(repo, "second.txt") == "second add", "second add content carries on disk"
+    assert _chain_read(repo, "first.txt") == "first add", (
+        "first add content carries on disk"
+    )
+    assert _chain_read(repo, "second.txt") == "second add", (
+        "second add content carries on disk"
+    )
 
     # Commit only first.txt; second.txt stays pending as a dirty add.
     repo.stage("first.txt", offline=True)
     repo.commit("commit first add on other", offline=True)
     mid = get_status_files(repo)
-    assert_file_set(mid, ["second.txt"], msg="only the un-committed add remains pending")
-    assert_entry(mid, "second.txt", action="add", dirty=True, staged=False,
-                 msg="the un-committed add keeps add/dirty status")
+    assert_file_set(
+        mid, ["second.txt"], msg="only the un-committed add remains pending"
+    )
+    assert_entry(
+        mid,
+        "second.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        msg="the un-committed add keeps add/dirty status",
+    )
     assert_absent(mid, "first.txt", msg="committed add is clean")
-    assert _chain_read(repo, "second.txt") == "second add", "second add content still on disk"
+    assert _chain_read(repo, "second.txt") == "second add", (
+        "second add content still on disk"
+    )
     assert has_staged_anchor(repo), "anchor persists while the second dirty add remains"
 
     # Commit second.txt too; the tree is now fully clean.
@@ -4441,13 +5115,21 @@ def test_chain_two_adds_scan_switch_commit_one_then_other(new_lore_repo):
     repo.commit("commit second add on other", offline=True)
     after = get_status_files(repo)
     assert_file_set(after, [], msg="no-scan status clean after committing both adds")
-    assert_file_set(get_status_files_twice(repo, scan=True), [], msg="--scan clean after both commits")
+    assert_file_set(
+        get_status_files_twice(repo, scan=True),
+        [],
+        msg="--scan clean after both commits",
+    )
     assert not has_staged_anchor(repo), "anchor cleared once both adds are committed"
 
     repo.status(reset=True, offline=True)
     dump = repo.repository_dump()
-    assert "first.txt" in dump, f"first committed add must be in the sealed tree:\n{dump}"
-    assert "second.txt" in dump, f"second committed add must be in the sealed tree:\n{dump}"
+    assert "first.txt" in dump, (
+        f"first committed add must be in the sealed tree:\n{dump}"
+    )
+    assert "second.txt" in dump, (
+        f"second committed add must be in the sealed tree:\n{dump}"
+    )
 
 
 @pytest.mark.smoke
@@ -4469,20 +5151,38 @@ def test_chain_modify_stage_unstage_scan_switch_reset(new_lore_repo):
     with repo.open_file("file.txt", "w+") as f:
         f.write("edited stagechain longer")
     repo.dirty("file.txt", offline=True)
-    assert_entry(get_status_files(repo), "file.txt", action="keep", dirty=True, staged=False,
-                 msg="dirty-only modify before staging")
+    assert_entry(
+        get_status_files(repo),
+        "file.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        msg="dirty-only modify before staging",
+    )
 
     # Stage: dirty preserved, staged set (orthogonal flags).
     repo.stage("file.txt", offline=True)
-    assert_entry(get_status_files(repo), "file.txt", action="keep", dirty=True, staged=True,
-                 msg="default stage keeps dirty and sets staged")
+    assert_entry(
+        get_status_files(repo),
+        "file.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        msg="default stage keeps dirty and sets staged",
+    )
 
     # Unstage: staged cleared, dirty survives.
     repo.unstage(offline=True)
     unstaged = get_status_files(repo)
     assert_file_set(unstaged, ["file.txt"], msg="file.txt still pending after unstage")
-    assert_entry(unstaged, "file.txt", action="keep", dirty=True, staged=False,
-                 msg="unstage clears staged but keeps the dirty modify")
+    assert_entry(
+        unstaged,
+        "file.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        msg="unstage clears staged but keeps the dirty modify",
+    )
 
     # A scan over the still-dirty modify is idempotent and keeps keep/dirty.
     scanned = get_status_files_twice(repo, scan=True)
@@ -4492,14 +5192,22 @@ def test_chain_modify_stage_unstage_scan_switch_reset(new_lore_repo):
     # Carry across the switch, then reset.
     repo.branch_switch("other", offline=True)
     carried = get_status_files(repo)
-    assert_file_set(carried, ["file.txt"], msg="dirty modify carries onto other after unstage")
+    assert_file_set(
+        carried, ["file.txt"], msg="dirty modify carries onto other after unstage"
+    )
     assert_entry(carried, "file.txt", action="keep", dirty=True, staged=False)
-    assert _chain_read(repo, "file.txt") == "edited stagechain longer", "edited content carries"
+    assert _chain_read(repo, "file.txt") == "edited stagechain longer", (
+        "edited content carries"
+    )
 
     repo.reset("file.txt", offline=True)
-    assert _chain_read(repo, "file.txt") == "v0 stagechain", "reset restores committed content"
+    assert _chain_read(repo, "file.txt") == "v0 stagechain", (
+        "reset restores committed content"
+    )
     assert_file_set(get_status_files(repo), [], msg="no-scan clean after reset")
-    assert_file_set(get_status_files_twice(repo, scan=True), [], msg="--scan clean after reset")
+    assert_file_set(
+        get_status_files_twice(repo, scan=True), [], msg="--scan clean after reset"
+    )
     assert not has_staged_anchor(repo), "anchor released once clean"
 
 
@@ -4524,16 +5232,26 @@ def test_chain_add_scan_switch_reset_keeps_untracked(new_lore_repo):
         f.write("brand new content")
     scanned = get_status_files_twice(repo, scan=True)
     assert_file_set(scanned, ["new.txt"], msg="scan detects the add")
-    assert_entry(scanned, "new.txt", action="add", dirty=True, staged=False, node_type="file")
-    assert_entry(get_status_files(repo), "new.txt", action="add", dirty=True, staged=False,
-                 msg="scanned add persists to no-scan status")
+    assert_entry(
+        scanned, "new.txt", action="add", dirty=True, staged=False, node_type="file"
+    )
+    assert_entry(
+        get_status_files(repo),
+        "new.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        msg="scanned add persists to no-scan status",
+    )
 
     # Carry the add across the switch.
     repo.branch_switch("other", offline=True)
     carried = get_status_files(repo)
     assert_file_set(carried, ["new.txt"], msg="dirty add carries onto other")
     assert_entry(carried, "new.txt", action="add", dirty=True, staged=False)
-    assert _chain_read(repo, "new.txt") == "brand new content", "added content carries on disk"
+    assert _chain_read(repo, "new.txt") == "brand new content", (
+        "added content carries on disk"
+    )
 
     # Plain reset on other.
     repo.reset("new.txt", offline=True)
@@ -4545,17 +5263,28 @@ def test_chain_add_scan_switch_reset_keeps_untracked(new_lore_repo):
         "untracked content must be intact after the plain reset"
     )
     no_scan = get_status_files(repo)
-    assert_absent(no_scan, "new.txt", msg="reset must clear the dirty-add; no-scan status clean")
+    assert_absent(
+        no_scan, "new.txt", msg="reset must clear the dirty-add; no-scan status clean"
+    )
     assert_file_set(no_scan, [], msg="no files should remain tracked after the reset")
 
     # The surviving untracked file is rediscovered by --scan (scan's job).
     redetect = get_status_files_twice(repo, scan=True)
-    assert_entry(redetect, "new.txt", action="add", dirty=True, staged=False, node_type="file",
-                 msg="--scan rediscovers the surviving untracked add")
+    assert_entry(
+        redetect,
+        "new.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        msg="--scan rediscovers the surviving untracked add",
+    )
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands")
+@pytest.mark.skip(
+    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
+)
 def test_chain_move_scan_switch_status(new_lore_repo):
     """Chain (move -> scan -> switch -> reset): dirty_move old.txt -> new.txt
     -> status (move/fromPath) -> status --scan -> switch(other) -> status ->
@@ -4580,8 +5309,16 @@ def test_chain_move_scan_switch_status(new_lore_repo):
     # no-scan status reports the move with its provenance.
     pre = get_status_files(repo)
     assert_file_set(pre, ["new.txt"], msg="no-scan reports only the move destination")
-    assert_entry(pre, "new.txt", action="move", dirty=True, staged=False, node_type="file",
-                 from_path="old.txt", msg="no-scan reports the dirty move with provenance")
+    assert_entry(
+        pre,
+        "new.txt",
+        action="move",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        from_path="old.txt",
+        msg="no-scan reports the dirty move with provenance",
+    )
     assert_absent(pre, "old.txt", msg="move source must not appear")
     assert not _chain_exists(repo, "old.txt"), "move source gone on disk"
     assert _chain_read(repo, "new.txt") == "movable content", "moved content on disk"
@@ -4589,19 +5326,37 @@ def test_chain_move_scan_switch_status(new_lore_repo):
     # --scan must preserve the move provenance.
     scanned = get_status_files_twice(repo, scan=True)
     assert_file_set(scanned, ["new.txt"], msg="scan reports only the move destination")
-    assert_entry(scanned, "new.txt", action="move", dirty=True, node_type="file",
-                 from_path="old.txt", msg="--scan must preserve the dirty-move provenance")
+    assert_entry(
+        scanned,
+        "new.txt",
+        action="move",
+        dirty=True,
+        node_type="file",
+        from_path="old.txt",
+        msg="--scan must preserve the dirty-move provenance",
+    )
     assert_absent(scanned, "old.txt", msg="move source must not reappear after scan")
 
     # Switch must carry the move provenance.
     repo.branch_switch("other", offline=True)
     assert not _chain_exists(repo, "old.txt"), "move source still gone after switch"
-    assert _chain_read(repo, "new.txt") == "movable content", "moved content intact after switch"
+    assert _chain_read(repo, "new.txt") == "movable content", (
+        "moved content intact after switch"
+    )
     carried = get_status_files(repo)
-    assert_file_set(carried, ["new.txt"], msg="switch carries only the move destination")
-    assert_entry(carried, "new.txt", action="move", dirty=True, staged=False, node_type="file",
-                 from_path="old.txt",
-                 msg="dirty move provenance must survive a same-revision switch, not downgrade to add")
+    assert_file_set(
+        carried, ["new.txt"], msg="switch carries only the move destination"
+    )
+    assert_entry(
+        carried,
+        "new.txt",
+        action="move",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        from_path="old.txt",
+        msg="dirty move provenance must survive a same-revision switch, not downgrade to add",
+    )
 
     # Reset closes the chain: the destination's tracking is cleared.
     repo.reset("new.txt", offline=True)
@@ -4620,7 +5375,9 @@ def test_chain_modify_delete_scan_switch_stage_commit_dump(new_lore_repo):
     A dirty MODIFY and a dirty DELETE carried across a same-revision switch can
     be staged and committed on the target branch, leaving status fully clean."""
     repo: Lore = new_lore_repo()
-    commit_base(repo, {"mod.txt": "mod v0\n", "del.txt": "del v0\n", "stay.txt": "stay\n"})
+    commit_base(
+        repo, {"mod.txt": "mod v0\n", "del.txt": "del v0\n", "stay.txt": "stay\n"}
+    )
 
     repo.branch_create("other", offline=True)
     repo.branch_switch("main", offline=True)
@@ -4629,37 +5386,69 @@ def test_chain_modify_delete_scan_switch_stage_commit_dump(new_lore_repo):
         f.write("mod locally edited longer\n")
     repo.remove_file("del.txt")
     scanned = get_status_files_twice(repo, scan=True)
-    assert_file_set(scanned, ["mod.txt", "del.txt"], msg="scan detects the modify and the delete")
-    assert_entry(scanned, "mod.txt", action="keep", dirty=True, staged=False, node_type="file")
-    assert_entry(scanned, "del.txt", action="delete", dirty=True, staged=False, node_type="file")
+    assert_file_set(
+        scanned, ["mod.txt", "del.txt"], msg="scan detects the modify and the delete"
+    )
+    assert_entry(
+        scanned, "mod.txt", action="keep", dirty=True, staged=False, node_type="file"
+    )
+    assert_entry(
+        scanned, "del.txt", action="delete", dirty=True, staged=False, node_type="file"
+    )
 
     # Carry the dirty modify + delete across a same-revision switch to other.
     repo.branch_switch("other", offline=True)
     carried = get_status_files(repo)
-    assert_file_set(carried, ["mod.txt", "del.txt"], msg="dirty modify+delete carry onto other")
+    assert_file_set(
+        carried, ["mod.txt", "del.txt"], msg="dirty modify+delete carry onto other"
+    )
     assert_entry(carried, "mod.txt", action="keep", dirty=True, staged=False)
     assert_entry(carried, "del.txt", action="delete", dirty=True, staged=False)
-    assert _chain_read(repo, "mod.txt") == "mod locally edited longer\n", "modify carries on disk"
+    assert _chain_read(repo, "mod.txt") == "mod locally edited longer\n", (
+        "modify carries on disk"
+    )
     assert not _chain_exists(repo, "del.txt"), "delete carries on disk"
 
     # Default stage picks up the carried dirty marks; commit on other.
     repo.stage(offline=True)
     staged = get_status_files(repo)
-    assert_entry(staged, "mod.txt", action="keep", dirty=True, staged=True, msg="carried modify staged on other")
-    assert_entry(staged, "del.txt", action="delete", dirty=True, staged=True, msg="carried delete staged on other")
+    assert_entry(
+        staged,
+        "mod.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        msg="carried modify staged on other",
+    )
+    assert_entry(
+        staged,
+        "del.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        msg="carried delete staged on other",
+    )
     repo.commit("commit carried modify+delete on other", offline=True)
 
     # Status fully clean, anchor gone, and the dump reflects the committed change.
     after = get_status_files(repo)
     assert_file_set(after, [], msg="no-scan status clean after committing the carry")
-    assert_file_set(get_status_files_twice(repo, scan=True), [], msg="--scan clean after commit")
+    assert_file_set(
+        get_status_files_twice(repo, scan=True), [], msg="--scan clean after commit"
+    )
     assert not has_staged_anchor(repo), "anchor cleared after a clean commit"
 
     repo.status(reset=True, offline=True)
     dump = repo.repository_dump()
-    assert "mod.txt" in dump, f"committed modify must appear in the sealed tree:\n{dump}"
-    assert "del.txt" not in dump, f"committed delete must drop the file from the tree:\n{dump}"
-    assert _chain_read(repo, "mod.txt") == "mod locally edited longer\n", "committed content on disk"
+    assert "mod.txt" in dump, (
+        f"committed modify must appear in the sealed tree:\n{dump}"
+    )
+    assert "del.txt" not in dump, (
+        f"committed delete must drop the file from the tree:\n{dump}"
+    )
+    assert _chain_read(repo, "mod.txt") == "mod locally edited longer\n", (
+        "committed content on disk"
+    )
 
 
 @pytest.mark.smoke
@@ -4686,17 +5475,30 @@ def test_chain_branchreset_dirty_modify_stage_commit_dump(new_lore_repo):
     with repo.open_file("base.txt", "r") as f:
         assert f.read() == "base v1\n", "branch reset realizes v1 of the tip file"
     carried = get_status_files(repo)
-    assert_file_set(carried, ["mod.txt"], msg="only the carried dirty modify is pending after reset")
+    assert_file_set(
+        carried, ["mod.txt"], msg="only the carried dirty modify is pending after reset"
+    )
     assert_entry(
-        carried, "mod.txt", action="keep", dirty=True, staged=False, node_type="file",
+        carried,
+        "mod.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="dirty modify must survive branch reset",
     )
-    assert _chain_read(repo, "mod.txt") == "mod locally edited longer\n", "modify carries on disk"
+    assert _chain_read(repo, "mod.txt") == "mod locally edited longer\n", (
+        "modify carries on disk"
+    )
 
     # Default stage + commit the carried modify on the reset tip.
     repo.stage(offline=True)
     assert_entry(
-        get_status_files(repo), "mod.txt", action="keep", dirty=True, staged=True,
+        get_status_files(repo),
+        "mod.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
         msg="carried modify staged on the reset tip",
     )
     repo.commit("commit carried modify after branch reset", offline=True)
@@ -4707,8 +5509,12 @@ def test_chain_branchreset_dirty_modify_stage_commit_dump(new_lore_repo):
 
     repo.status(reset=True, offline=True)
     dump = repo.repository_dump()
-    assert "mod.txt" in dump, f"committed modify must appear in the sealed tree:\n{dump}"
-    assert _chain_read(repo, "mod.txt") == "mod locally edited longer\n", "committed content on disk"
+    assert "mod.txt" in dump, (
+        f"committed modify must appear in the sealed tree:\n{dump}"
+    )
+    assert _chain_read(repo, "mod.txt") == "mod locally edited longer\n", (
+        "committed content on disk"
+    )
 
 
 @pytest.mark.smoke
@@ -4751,9 +5557,13 @@ def test_chain_mergeconflict_resolve_theirs_commit_switch(new_lore_repo):
     # Switch away and back: the merged content and clean status survive.
     repo.branch_switch("feature", offline=True)
     repo.branch_switch("main", offline=True)
-    assert "On branch main" in repo.status(offline=True), "switch should land back on main"
+    assert "On branch main" in repo.status(offline=True), (
+        "switch should land back on main"
+    )
     roundtrip = get_status_files(repo)
-    assert_file_set(roundtrip, [], msg="status stays clean after switching away and back")
+    assert_file_set(
+        roundtrip, [], msg="status stays clean after switching away and back"
+    )
     with repo.open_file("conflict.txt", "r") as f:
         assert f.read() == "feature\n", "merged content survives the switch round-trip"
 
@@ -4783,24 +5593,41 @@ def test_switch_scan_nested_add_carries(new_lore_repo):
 
     scanned = get_status_files_twice(repo, scan=True)
     assert_entry(
-        scanned, "nested/sub/leaf.txt", action="add", dirty=True, staged=False, node_type="file"
+        scanned,
+        "nested/sub/leaf.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
     )
-    assert_entry(scanned, "flat.txt", action="add", dirty=True, staged=False, node_type="file")
+    assert_entry(
+        scanned, "flat.txt", action="add", dirty=True, staged=False, node_type="file"
+    )
 
     repo.branch_switch("other", offline=True)
     carried = get_status_files(repo)
     # The flat scan-detected add carries across the switch.
     assert_entry(
-        carried, "flat.txt", action="add", dirty=True, staged=False,
+        carried,
+        "flat.txt",
+        action="add",
+        dirty=True,
+        staged=False,
         msg="a flat scan-detected add carries across a same-revision switch",
     )
     # The scan-detected nested-dir add carries across the switch.
     assert_entry(
-        carried, "nested/sub/leaf.txt", action="add", dirty=True, staged=False, node_type="file",
+        carried,
+        "nested/sub/leaf.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="a scan-detected nested-dir add carries across a same-revision switch",
     )
     assert_file_set(
-        carried, ["flat.txt", "nested/sub/leaf.txt"],
+        carried,
+        ["flat.txt", "nested/sub/leaf.txt"],
         msg="both scan-detected adds carry across the switch",
     )
     assert os.path.exists(repo._fix_path("nested/sub/leaf.txt")), (
@@ -4829,10 +5656,16 @@ def test_dirty_nested_add_reports_new_dirs(new_lore_repo):
     repo.dirty("a/b/c/leaf.txt", offline=True)
 
     entries = get_status_files(repo)
-    assert_file_set(entries, ["a/b/c/leaf.txt"], msg="only the nested leaf is a changed file")
+    assert_file_set(
+        entries, ["a/b/c/leaf.txt"], msg="only the nested leaf is a changed file"
+    )
     assert_entry(
-        entries, "a/b/c/leaf.txt",
-        action="add", dirty=True, staged=False, node_type="file",
+        entries,
+        "a/b/c/leaf.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
     )
     assert_entry(entries, "a", action="add", node_type="directory")
     assert_entry(entries, "a/b", action="add", node_type="directory")
@@ -4858,12 +5691,20 @@ def test_dirty_nested_delete_leaf(new_lore_repo):
     repo.dirty("a/b/c/leaf.txt", offline=True)
 
     entries = get_status_files(repo)
-    assert_file_set(entries, ["a/b/c/leaf.txt"], msg="only the deleted nested leaf is reported")
-    assert_entry(
-        entries, "a/b/c/leaf.txt",
-        action="delete", dirty=True, staged=False, node_type="file",
+    assert_file_set(
+        entries, ["a/b/c/leaf.txt"], msg="only the deleted nested leaf is reported"
     )
-    assert_absent(entries, "a/b/c", msg="surviving ancestor directory must not be reported")
+    assert_entry(
+        entries,
+        "a/b/c/leaf.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
+    )
+    assert_absent(
+        entries, "a/b/c", msg="surviving ancestor directory must not be reported"
+    )
     assert_absent(entries, "a/b/c/sibling.txt", msg="surviving sibling stays clean")
 
 
@@ -4882,10 +5723,16 @@ def test_dirty_nested_modify_leaf(new_lore_repo):
     entries = get_status_files(repo)
     assert_file_set(entries, ["a/b/c/leaf.txt"], msg="only the nested leaf is dirty")
     assert_entry(
-        entries, "a/b/c/leaf.txt",
-        action="keep", dirty=True, staged=False, node_type="file",
+        entries,
+        "a/b/c/leaf.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
     )
-    assert_absent(entries, "a/b/c", msg="unchanged ancestor directory must not be reported")
+    assert_absent(
+        entries, "a/b/c", msg="unchanged ancestor directory must not be reported"
+    )
 
 
 @pytest.mark.smoke
@@ -4921,16 +5768,36 @@ def test_scan_wide_deep_tree_mixed(new_lore_repo):
 
     scanned = get_status_files_twice(repo, scan=True)
     assert_file_set(scanned, changed, msg="scan must report exactly the changed leaves")
-    assert_entry(scanned, "x/y/b.txt", action="keep", dirty=True, staged=False, node_type="file")
-    assert_entry(scanned, "x/y/z/c.txt", action="keep", dirty=True, staged=False, node_type="file")
-    assert_entry(scanned, "p/q/d.txt", action="delete", dirty=True, staged=False, node_type="file")
-    assert_entry(scanned, "p/added.txt", action="add", dirty=True, staged=False, node_type="file")
+    assert_entry(
+        scanned, "x/y/b.txt", action="keep", dirty=True, staged=False, node_type="file"
+    )
+    assert_entry(
+        scanned,
+        "x/y/z/c.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
+    )
+    assert_entry(
+        scanned,
+        "p/q/d.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
+    )
+    assert_entry(
+        scanned, "p/added.txt", action="add", dirty=True, staged=False, node_type="file"
+    )
     assert_absent(scanned, "x/a.txt", msg="unchanged deep sibling stays clean")
     assert_absent(scanned, "p/keep.txt", msg="unchanged sibling stays clean")
     assert_absent(scanned, "root.txt", msg="unchanged root file stays clean")
 
     persisted = get_status_files(repo)
-    assert_file_set(persisted, changed, msg="the whole wide/deep change set must persist to no-scan")
+    assert_file_set(
+        persisted, changed, msg="the whole wide/deep change set must persist to no-scan"
+    )
     assert_entry(persisted, "x/y/b.txt", action="keep", dirty=True, staged=False)
     assert_entry(persisted, "x/y/z/c.txt", action="keep", dirty=True, staged=False)
     assert_entry(persisted, "p/q/d.txt", action="delete", dirty=True, staged=False)
@@ -4959,21 +5826,36 @@ def test_status_staged_modify_flat_representation(new_lore_repo):
     no_scan = get_status_files(repo)
     assert_file_set(no_scan, ["file.txt"])
     assert_entry(
-        no_scan, "file.txt", action="keep", dirty=True, staged=True, node_type="file",
+        no_scan,
+        "file.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged modify reported as keep/dirty/staged in no-scan status",
     )
 
     scanned = get_status_files(repo, scan=True)
     assert_file_set(scanned, ["file.txt"])
     assert_entry(
-        scanned, "file.txt", action="keep", dirty=True, staged=True, node_type="file",
+        scanned,
+        "file.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="--scan reports the staged modify identically",
     )
 
     persisted = get_status_files(repo)
     assert_file_set(persisted, ["file.txt"])
     assert_entry(
-        persisted, "file.txt", action="keep", dirty=True, staged=True, node_type="file",
+        persisted,
+        "file.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="the staged dirty modify persists in a later no-scan status",
     )
 
@@ -4995,7 +5877,12 @@ def test_status_staged_add_flat_representation(new_lore_repo):
     no_scan = get_status_files(repo)
     assert_file_set(no_scan, ["added.txt"])
     assert_entry(
-        no_scan, "added.txt", action="add", dirty=True, staged=True, node_type="file",
+        no_scan,
+        "added.txt",
+        action="add",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged add reported as add/dirty/staged in no-scan status",
     )
     assert_absent(no_scan, "base.txt", msg="untouched committed file stays clean")
@@ -5003,14 +5890,24 @@ def test_status_staged_add_flat_representation(new_lore_repo):
     scanned = get_status_files(repo, scan=True)
     assert_file_set(scanned, ["added.txt"])
     assert_entry(
-        scanned, "added.txt", action="add", dirty=True, staged=True, node_type="file",
+        scanned,
+        "added.txt",
+        action="add",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="--scan reports the staged add identically",
     )
 
     persisted = get_status_files(repo)
     assert_file_set(persisted, ["added.txt"])
     assert_entry(
-        persisted, "added.txt", action="add", dirty=True, staged=True, node_type="file",
+        persisted,
+        "added.txt",
+        action="add",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="the staged dirty add persists in a later no-scan status",
     )
 
@@ -5030,7 +5927,12 @@ def test_status_staged_delete_flat_representation(new_lore_repo):
     no_scan = get_status_files(repo)
     assert_file_set(no_scan, ["victim.txt"])
     assert_entry(
-        no_scan, "victim.txt", action="delete", dirty=True, staged=True, node_type="file",
+        no_scan,
+        "victim.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged delete reported as delete/dirty/staged in no-scan status",
     )
     assert_absent(no_scan, "keep.txt", msg="untouched committed file stays clean")
@@ -5038,7 +5940,12 @@ def test_status_staged_delete_flat_representation(new_lore_repo):
     scanned = get_status_files_twice(repo, scan=True)
     assert_file_set(scanned, ["victim.txt"])
     assert_entry(
-        scanned, "victim.txt", action="delete", dirty=True, staged=True, node_type="file",
+        scanned,
+        "victim.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="--scan reports the staged delete identically",
     )
 
@@ -5060,22 +5967,39 @@ def test_status_staged_modify_nested_representation(new_lore_repo):
     no_scan = get_status_files(repo)
     assert_file_set(no_scan, ["a/b/c/leaf.txt"])
     assert_entry(
-        no_scan, "a/b/c/leaf.txt", action="keep", dirty=True, staged=True, node_type="file",
+        no_scan,
+        "a/b/c/leaf.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged nested modify reported as keep/dirty/staged",
     )
-    assert_absent(no_scan, "a/b/c", msg="unchanged ancestor directory must not be reported")
+    assert_absent(
+        no_scan, "a/b/c", msg="unchanged ancestor directory must not be reported"
+    )
 
     scanned = get_status_files(repo, scan=True)
     assert_file_set(scanned, ["a/b/c/leaf.txt"])
     assert_entry(
-        scanned, "a/b/c/leaf.txt", action="keep", dirty=True, staged=True, node_type="file",
+        scanned,
+        "a/b/c/leaf.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="--scan reports the staged nested modify identically",
     )
     assert_absent(scanned, "a/b/c", msg="ancestor dir still unreported under --scan")
 
     persisted = get_status_files(repo)
     assert_entry(
-        persisted, "a/b/c/leaf.txt", action="keep", dirty=True, staged=True, node_type="file",
+        persisted,
+        "a/b/c/leaf.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="the staged dirty nested modify persists in a later no-scan status",
     )
 
@@ -5096,25 +6020,52 @@ def test_status_staged_add_nested_representation(new_lore_repo):
     repo.stage("a/b/c/leaf.txt", offline=True)
 
     no_scan = get_status_files(repo)
-    assert_file_set(no_scan, ["a/b/c/leaf.txt"], msg="only the leaf is a staged add file")
+    assert_file_set(
+        no_scan, ["a/b/c/leaf.txt"], msg="only the leaf is a staged add file"
+    )
     assert_entry(
-        no_scan, "a/b/c/leaf.txt", action="add", dirty=True, staged=True, node_type="file",
+        no_scan,
+        "a/b/c/leaf.txt",
+        action="add",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged nested add leaf reported as add/dirty/staged",
     )
-    assert_entry(no_scan, "a", action="add", dirty=True, staged=True, node_type="directory")
-    assert_entry(no_scan, "a/b", action="add", dirty=True, staged=True, node_type="directory")
-    assert_entry(no_scan, "a/b/c", action="add", dirty=True, staged=True, node_type="directory")
+    assert_entry(
+        no_scan, "a", action="add", dirty=True, staged=True, node_type="directory"
+    )
+    assert_entry(
+        no_scan, "a/b", action="add", dirty=True, staged=True, node_type="directory"
+    )
+    assert_entry(
+        no_scan, "a/b/c", action="add", dirty=True, staged=True, node_type="directory"
+    )
 
     scanned = get_status_files(repo, scan=True)
-    assert_file_set(scanned, ["a/b/c/leaf.txt"], msg="--scan keeps only the leaf as a staged add file")
+    assert_file_set(
+        scanned,
+        ["a/b/c/leaf.txt"],
+        msg="--scan keeps only the leaf as a staged add file",
+    )
     assert_entry(
-        scanned, "a/b/c/leaf.txt", action="add", dirty=True, staged=True, node_type="file",
+        scanned,
+        "a/b/c/leaf.txt",
+        action="add",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="--scan reports the staged nested add identically",
     )
 
     persisted = get_status_files(repo)
     assert_entry(
-        persisted, "a/b/c/leaf.txt", action="add", dirty=True, staged=True, node_type="file",
+        persisted,
+        "a/b/c/leaf.txt",
+        action="add",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="the staged dirty nested add persists in a later no-scan status",
     )
 
@@ -5134,15 +6085,27 @@ def test_status_staged_delete_nested_representation(new_lore_repo):
     no_scan = get_status_files(repo)
     assert_file_set(no_scan, ["a/b/c/leaf.txt"])
     assert_entry(
-        no_scan, "a/b/c/leaf.txt", action="delete", dirty=True, staged=True, node_type="file",
+        no_scan,
+        "a/b/c/leaf.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged nested delete reported as delete/dirty/staged",
     )
-    assert_absent(no_scan, "a/b/c", msg="surviving ancestor directory must not be reported")
+    assert_absent(
+        no_scan, "a/b/c", msg="surviving ancestor directory must not be reported"
+    )
 
     scanned = get_status_files_twice(repo, scan=True)
     assert_file_set(scanned, ["a/b/c/leaf.txt"])
     assert_entry(
-        scanned, "a/b/c/leaf.txt", action="delete", dirty=True, staged=True, node_type="file",
+        scanned,
+        "a/b/c/leaf.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="--scan reports the staged nested delete identically",
     )
 
@@ -5158,7 +6121,9 @@ def test_stage_default_nested_modify_add_delete(new_lore_repo):
     modify (keep), an add (add) and a delete (delete) several directories deep,
     each flagStaged=True with its dirty flag preserved (flagDirty=True)."""
     repo: Lore = new_lore_repo()
-    commit_base(repo, {"a/b/mod.txt": "mod original\n", "a/b/del.txt": "del original\n"})
+    commit_base(
+        repo, {"a/b/mod.txt": "mod original\n", "a/b/del.txt": "del original\n"}
+    )
 
     with repo.open_file("a/b/mod.txt", "w+") as f:
         f.write("mod changed longer\n")
@@ -5171,9 +6136,20 @@ def test_stage_default_nested_modify_add_delete(new_lore_repo):
 
     entries = get_status_files(repo)
     assert_file_set(entries, ["a/b/mod.txt", "a/b/del.txt", "a/b/add.txt"])
-    assert_entry(entries, "a/b/mod.txt", action="keep", dirty=True, staged=True, node_type="file")
-    assert_entry(entries, "a/b/add.txt", action="add", dirty=True, staged=True, node_type="file")
-    assert_entry(entries, "a/b/del.txt", action="delete", dirty=True, staged=True, node_type="file")
+    assert_entry(
+        entries, "a/b/mod.txt", action="keep", dirty=True, staged=True, node_type="file"
+    )
+    assert_entry(
+        entries, "a/b/add.txt", action="add", dirty=True, staged=True, node_type="file"
+    )
+    assert_entry(
+        entries,
+        "a/b/del.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
+    )
 
 
 @pytest.mark.smoke
@@ -5192,7 +6168,12 @@ def test_stage_default_stages_scan_detected_nested_leaf(new_lore_repo):
     scanned = get_status_files_twice(repo, scan=True)
     assert_file_set(scanned, ["a/b/c/deep.txt"], msg="scan detects only the deep leaf")
     assert_entry(
-        scanned, "a/b/c/deep.txt", action="keep", dirty=True, staged=False, node_type="file"
+        scanned,
+        "a/b/c/deep.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
     )
 
     # Default stage (no --scan, no path) must traverse to the scan-recorded leaf.
@@ -5201,7 +6182,12 @@ def test_stage_default_stages_scan_detected_nested_leaf(new_lore_repo):
     entries = get_status_files(repo)
     assert_file_set(entries, ["a/b/c/deep.txt"], msg="only the scanned leaf is staged")
     assert_entry(
-        entries, "a/b/c/deep.txt", action="keep", dirty=True, staged=True, node_type="file",
+        entries,
+        "a/b/c/deep.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="default stage picks up the scan-recorded nested leaf via traversal",
     )
     assert_absent(entries, "a", msg="unchanged ancestor dir must not be reported")
@@ -5217,7 +6203,9 @@ def test_stage_scan_nested_modify_add_delete(new_lore_repo):
     change dirty), and the brand-new directory is staged as an
     action=add/type=directory node."""
     repo: Lore = new_lore_repo()
-    commit_base(repo, {"a/b/mod.txt": "mod original\n", "a/b/del.txt": "del original\n"})
+    commit_base(
+        repo, {"a/b/mod.txt": "mod original\n", "a/b/del.txt": "del original\n"}
+    )
 
     with repo.open_file("a/b/mod.txt", "w+") as f:
         f.write("mod changed longer\n")
@@ -5230,10 +6218,28 @@ def test_stage_scan_nested_modify_add_delete(new_lore_repo):
 
     entries = get_status_files(repo)
     assert_file_set(entries, ["a/b/mod.txt", "a/b/del.txt", "a/b/c/add.txt"])
-    assert_entry(entries, "a/b/mod.txt", action="keep", dirty=True, staged=True, node_type="file")
-    assert_entry(entries, "a/b/del.txt", action="delete", dirty=True, staged=True, node_type="file")
-    assert_entry(entries, "a/b/c/add.txt", action="add", dirty=True, staged=True, node_type="file")
-    assert_entry(entries, "a/b/c", action="add", dirty=True, staged=True, node_type="directory")
+    assert_entry(
+        entries, "a/b/mod.txt", action="keep", dirty=True, staged=True, node_type="file"
+    )
+    assert_entry(
+        entries,
+        "a/b/del.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
+    )
+    assert_entry(
+        entries,
+        "a/b/c/add.txt",
+        action="add",
+        dirty=True,
+        staged=True,
+        node_type="file",
+    )
+    assert_entry(
+        entries, "a/b/c", action="add", dirty=True, staged=True, node_type="directory"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5253,7 +6259,11 @@ def test_unstage_staged_add_flat(new_lore_repo):
         f.write("brand new content\n")
     repo.stage("added.txt", offline=True)
     assert_entry(
-        get_status_files(repo), "added.txt", action="add", dirty=True, staged=True,
+        get_status_files(repo),
+        "added.txt",
+        action="add",
+        dirty=True,
+        staged=True,
         msg="staged+dirty before unstage",
     )
 
@@ -5262,7 +6272,12 @@ def test_unstage_staged_add_flat(new_lore_repo):
     no_scan = get_status_files(repo)
     assert_file_set(no_scan, ["added.txt"], msg="the dirty add survives unstage")
     assert_entry(
-        no_scan, "added.txt", action="add", dirty=True, staged=False, node_type="file",
+        no_scan,
+        "added.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="unstage clears staged but keeps the dirty add",
     )
     assert os.path.exists(repo._fix_path("added.txt")), "the added file stays on disk"
@@ -5283,20 +6298,36 @@ def test_unstage_staged_delete_dirty_flat(new_lore_repo):
     repo.remove_file("victim.txt")
     repo.dirty("victim.txt", offline=True)
     repo.stage("victim.txt", offline=True)
-    assert_entry(get_status_files(repo), "victim.txt", action="delete", dirty=True, staged=True, msg="staged before unstage")
+    assert_entry(
+        get_status_files(repo),
+        "victim.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        msg="staged before unstage",
+    )
 
     repo.unstage(offline=True)
 
     no_scan = get_status_files(repo)
     assert_file_set(no_scan, ["victim.txt"], msg="the dirty delete survives unstage")
     assert_entry(
-        no_scan, "victim.txt", action="delete", dirty=True, staged=False, node_type="file",
+        no_scan,
+        "victim.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="unstage clears staged but keeps the dirty delete",
     )
-    assert not os.path.exists(repo._fix_path("victim.txt")), "the deleted file stays gone on disk"
+    assert not os.path.exists(repo._fix_path("victim.txt")), (
+        "the deleted file stays gone on disk"
+    )
 
     scanned = get_status_files_twice(repo, scan=True)
-    assert_file_set(scanned, ["victim.txt"], msg="--scan agrees the dirty delete remains")
+    assert_file_set(
+        scanned, ["victim.txt"], msg="--scan agrees the dirty delete remains"
+    )
     assert_entry(scanned, "victim.txt", action="delete", dirty=True, staged=False)
 
 
@@ -5312,18 +6343,32 @@ def test_unstage_staged_modify_survives_when_differs(new_lore_repo):
         f.write("modified content longer\n")
     repo.dirty("file.txt", offline=True)
     repo.stage("file.txt", offline=True)
-    assert_entry(get_status_files(repo), "file.txt", action="keep", dirty=True, staged=True, msg="staged before unstage")
+    assert_entry(
+        get_status_files(repo),
+        "file.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        msg="staged before unstage",
+    )
 
     repo.unstage(offline=True)
 
     no_scan = get_status_files(repo)
     assert_file_set(no_scan, ["file.txt"], msg="the dirty modify survives unstage")
     assert_entry(
-        no_scan, "file.txt", action="keep", dirty=True, staged=False, node_type="file",
+        no_scan,
+        "file.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="unstage clears staged but keeps the dirty modify",
     )
     with repo.open_file("file.txt", "r") as f:
-        assert f.read() == "modified content longer\n", "unstage must not touch on-disk content"
+        assert f.read() == "modified content longer\n", (
+            "unstage must not touch on-disk content"
+        )
 
 
 @pytest.mark.smoke
@@ -5346,7 +6391,9 @@ def test_unstage_staged_modify_clears_when_reverted(new_lore_repo):
     repo.unstage(offline=True)
 
     no_scan = get_status_files(repo)
-    assert_file_set(no_scan, [], msg="a reverted staged modify clears entirely on unstage")
+    assert_file_set(
+        no_scan, [], msg="a reverted staged modify clears entirely on unstage"
+    )
     scanned = get_status_files_twice(repo, scan=True)
     assert_file_set(scanned, [], msg="--scan agrees the reverted file is clean")
 
@@ -5365,25 +6412,46 @@ def test_unstage_staged_add_nested(new_lore_repo):
         f.write("nested add content\n")
     repo.stage("a/b/c/leaf.txt", scan=True, offline=True)
     assert_entry(
-        get_status_files(repo), "a/b/c/leaf.txt", action="add", dirty=True, staged=True,
+        get_status_files(repo),
+        "a/b/c/leaf.txt",
+        action="add",
+        dirty=True,
+        staged=True,
         msg="staged+dirty before unstage",
     )
 
     repo.unstage(offline=True)
 
     no_scan = get_status_files(repo)
-    assert_file_set(no_scan, ["a/b/c/leaf.txt"], msg="the nested dirty add survives unstage")
+    assert_file_set(
+        no_scan, ["a/b/c/leaf.txt"], msg="the nested dirty add survives unstage"
+    )
     assert_entry(
-        no_scan, "a/b/c/leaf.txt", action="add", dirty=True, staged=False, node_type="file",
+        no_scan,
+        "a/b/c/leaf.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="unstage clears staged but keeps the nested dirty add",
     )
-    assert_entry(no_scan, "a", action="add", dirty=True, staged=False, node_type="directory")
-    assert_entry(no_scan, "a/b", action="add", dirty=True, staged=False, node_type="directory")
-    assert_entry(no_scan, "a/b/c", action="add", dirty=True, staged=False, node_type="directory")
-    assert os.path.exists(repo._fix_path("a/b/c/leaf.txt")), "the nested added file stays on disk"
+    assert_entry(
+        no_scan, "a", action="add", dirty=True, staged=False, node_type="directory"
+    )
+    assert_entry(
+        no_scan, "a/b", action="add", dirty=True, staged=False, node_type="directory"
+    )
+    assert_entry(
+        no_scan, "a/b/c", action="add", dirty=True, staged=False, node_type="directory"
+    )
+    assert os.path.exists(repo._fix_path("a/b/c/leaf.txt")), (
+        "the nested added file stays on disk"
+    )
 
     scanned = get_status_files_twice(repo, scan=True)
-    assert_file_set(scanned, ["a/b/c/leaf.txt"], msg="--scan agrees the nested dirty add remains")
+    assert_file_set(
+        scanned, ["a/b/c/leaf.txt"], msg="--scan agrees the nested dirty add remains"
+    )
     assert_entry(scanned, "a/b/c/leaf.txt", action="add", dirty=True, staged=False)
 
 
@@ -5398,20 +6466,38 @@ def test_unstage_staged_delete_nested(new_lore_repo):
     repo.remove_file("a/b/c/leaf.txt")
     repo.dirty("a/b/c/leaf.txt", offline=True)
     repo.stage("a/b/c/leaf.txt", offline=True)
-    assert_entry(get_status_files(repo), "a/b/c/leaf.txt", action="delete", dirty=True, staged=True, msg="staged before unstage")
+    assert_entry(
+        get_status_files(repo),
+        "a/b/c/leaf.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        msg="staged before unstage",
+    )
 
     repo.unstage(offline=True)
 
     no_scan = get_status_files(repo)
-    assert_file_set(no_scan, ["a/b/c/leaf.txt"], msg="the nested dirty delete survives unstage")
+    assert_file_set(
+        no_scan, ["a/b/c/leaf.txt"], msg="the nested dirty delete survives unstage"
+    )
     assert_entry(
-        no_scan, "a/b/c/leaf.txt", action="delete", dirty=True, staged=False, node_type="file",
+        no_scan,
+        "a/b/c/leaf.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="unstage clears staged but keeps the nested dirty delete",
     )
-    assert_absent(no_scan, "a/b/c", msg="surviving ancestor directory must not be reported")
+    assert_absent(
+        no_scan, "a/b/c", msg="surviving ancestor directory must not be reported"
+    )
 
     scanned = get_status_files_twice(repo, scan=True)
-    assert_file_set(scanned, ["a/b/c/leaf.txt"], msg="--scan agrees the nested dirty delete remains")
+    assert_file_set(
+        scanned, ["a/b/c/leaf.txt"], msg="--scan agrees the nested dirty delete remains"
+    )
     assert_entry(scanned, "a/b/c/leaf.txt", action="delete", dirty=True, staged=False)
 
 
@@ -5421,7 +6507,9 @@ def test_unstage_staged_delete_nested(new_lore_repo):
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands")
+@pytest.mark.skip(
+    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
+)
 def test_scan_dirty_move_into_nested_dir(new_lore_repo):
     """`status --scan` of a dirty move into a brand-new nested directory keeps
     the destination as action=move/fromPath=source (the rename is still on
@@ -5437,15 +6525,22 @@ def test_scan_dirty_move_into_nested_dir(new_lore_repo):
     scanned = get_status_files_twice(repo, scan=True)
     assert_file_set(scanned, ["dest/sub/src.txt"])
     assert_entry(
-        scanned, "dest/sub/src.txt",
-        action="move", dirty=True, staged=False, node_type="file", from_path="src.txt",
+        scanned,
+        "dest/sub/src.txt",
+        action="move",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        from_path="src.txt",
         msg="--scan must preserve the nested dirty-move provenance",
     )
     assert_absent(scanned, "src.txt", msg="move source must not reappear after scan")
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands")
+@pytest.mark.skip(
+    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
+)
 def test_stage_dirty_move_into_nested_dir(new_lore_repo):
     """Default `stage` of a dirty move into a brand-new nested directory stages
     the destination as action=move/fromPath=source (flagDirty preserved) and
@@ -5462,15 +6557,22 @@ def test_stage_dirty_move_into_nested_dir(new_lore_repo):
     entries = get_status_files(repo)
     assert_file_set(entries, ["dest/sub/src.txt"])
     assert_entry(
-        entries, "dest/sub/src.txt",
-        action="move", dirty=True, staged=True, node_type="file", from_path="src.txt",
+        entries,
+        "dest/sub/src.txt",
+        action="move",
+        dirty=True,
+        staged=True,
+        node_type="file",
+        from_path="src.txt",
         msg="default stage of a dirty move keeps move provenance and sets staged",
     )
     assert_absent(entries, "src.txt", msg="move source must not appear")
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands")
+@pytest.mark.skip(
+    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
+)
 def test_scan_dirty_copy_into_nested_dir(new_lore_repo):
     """`status --scan` of a dirty copy into a brand-new nested directory keeps
     the destination as action=copy/fromPath=source and leaves the source
@@ -5486,8 +6588,13 @@ def test_scan_dirty_copy_into_nested_dir(new_lore_repo):
     scanned = get_status_files_twice(repo, scan=True)
     assert_file_set(scanned, ["newdir/sub/copy.txt"])
     assert_entry(
-        scanned, "newdir/sub/copy.txt",
-        action="copy", dirty=True, staged=False, node_type="file", from_path="orig.txt",
+        scanned,
+        "newdir/sub/copy.txt",
+        action="copy",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        from_path="orig.txt",
         msg="--scan must preserve the nested dirty-copy provenance",
     )
     assert_absent(scanned, "orig.txt", msg="copy source is unchanged")
@@ -5517,7 +6624,9 @@ def test_reset_refuses_staged_add_flat(new_lore_repo):
     repo.stage("added.txt", offline=True)
 
     before = get_status_files(repo)
-    assert_entry(before, "added.txt", action="add", dirty=True, staged=True, node_type="file")
+    assert_entry(
+        before, "added.txt", action="add", dirty=True, staged=True, node_type="file"
+    )
 
     with pytest.raises(LoreException) as excinfo:
         repo.reset("added.txt", offline=True)
@@ -5527,7 +6636,12 @@ def test_reset_refuses_staged_add_flat(new_lore_repo):
 
     after = get_status_files(repo)
     assert_entry(
-        after, "added.txt", action="add", dirty=True, staged=True, node_type="file",
+        after,
+        "added.txt",
+        action="add",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged add must remain staged after a refused reset",
     )
     assert_file_set(after, ["added.txt"], msg="only the staged add is tracked")
@@ -5550,7 +6664,14 @@ def test_reset_refuses_staged_add_nested(new_lore_repo):
     repo.stage("a/b/c/added.txt", scan=True, offline=True)
 
     before = get_status_files(repo)
-    assert_entry(before, "a/b/c/added.txt", action="add", dirty=True, staged=True, node_type="file")
+    assert_entry(
+        before,
+        "a/b/c/added.txt",
+        action="add",
+        dirty=True,
+        staged=True,
+        node_type="file",
+    )
 
     with pytest.raises(LoreException) as excinfo:
         repo.reset("a/b/c/added.txt", offline=True)
@@ -5560,7 +6681,12 @@ def test_reset_refuses_staged_add_nested(new_lore_repo):
 
     after = get_status_files(repo)
     assert_entry(
-        after, "a/b/c/added.txt", action="add", dirty=True, staged=True, node_type="file",
+        after,
+        "a/b/c/added.txt",
+        action="add",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="nested staged add must remain staged after a refused reset",
     )
     assert_file_set(after, ["a/b/c/added.txt"], msg="only the staged add is tracked")
@@ -5580,7 +6706,14 @@ def test_reset_refuses_staged_modify_nested(new_lore_repo):
     repo.stage("a/b/c/deep.txt", offline=True)
 
     before = get_status_files(repo)
-    assert_entry(before, "a/b/c/deep.txt", action="keep", dirty=True, staged=True, node_type="file")
+    assert_entry(
+        before,
+        "a/b/c/deep.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        node_type="file",
+    )
 
     with pytest.raises(LoreException) as excinfo:
         repo.reset("a/b/c/deep.txt", offline=True)
@@ -5590,12 +6723,19 @@ def test_reset_refuses_staged_modify_nested(new_lore_repo):
 
     after = get_status_files(repo)
     assert_entry(
-        after, "a/b/c/deep.txt", action="keep", dirty=True, staged=True, node_type="file",
+        after,
+        "a/b/c/deep.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="nested staged modify must remain staged after a refused reset",
     )
     assert_file_set(after, ["a/b/c/deep.txt"], msg="only the staged modify is tracked")
     with repo.open_file("a/b/c/deep.txt", "r") as f:
-        assert f.read() == "deep modified longer\n", "refused reset must not touch content"
+        assert f.read() == "deep modified longer\n", (
+            "refused reset must not touch content"
+        )
 
 
 @pytest.mark.smoke
@@ -5612,7 +6752,9 @@ def test_reset_refuses_staged_delete_flat(new_lore_repo):
     repo.stage("victim.txt", offline=True)
 
     before = get_status_files(repo)
-    assert_entry(before, "victim.txt", action="delete", dirty=True, staged=True, node_type="file")
+    assert_entry(
+        before, "victim.txt", action="delete", dirty=True, staged=True, node_type="file"
+    )
 
     with pytest.raises(LoreException) as excinfo:
         repo.reset("victim.txt", offline=True)
@@ -5622,7 +6764,12 @@ def test_reset_refuses_staged_delete_flat(new_lore_repo):
 
     after = get_status_files(repo)
     assert_entry(
-        after, "victim.txt", action="delete", dirty=True, staged=True, node_type="file",
+        after,
+        "victim.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged delete must remain staged after a refused reset",
     )
     assert_file_set(after, ["victim.txt"], msg="only the staged delete is tracked")
@@ -5645,7 +6792,14 @@ def test_reset_refuses_staged_delete_nested(new_lore_repo):
     repo.stage("a/b/c/deep.txt", offline=True)
 
     before = get_status_files(repo)
-    assert_entry(before, "a/b/c/deep.txt", action="delete", dirty=True, staged=True, node_type="file")
+    assert_entry(
+        before,
+        "a/b/c/deep.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
+    )
 
     with pytest.raises(LoreException) as excinfo:
         repo.reset("a/b/c/deep.txt", offline=True)
@@ -5655,7 +6809,12 @@ def test_reset_refuses_staged_delete_nested(new_lore_repo):
 
     after = get_status_files(repo)
     assert_entry(
-        after, "a/b/c/deep.txt", action="delete", dirty=True, staged=True, node_type="file",
+        after,
+        "a/b/c/deep.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="nested staged delete must remain staged after a refused reset",
     )
     assert_file_set(after, ["a/b/c/deep.txt"], msg="only the staged delete is tracked")
@@ -5691,16 +6850,25 @@ def test_reset_dirty_add_nested_keeps_file(new_lore_repo):
         "plain reset must keep the untracked nested add on disk; only --purge removes it"
     )
     with repo.open_file("a/b/c/new.txt", "r") as f:
-        assert f.read() == "nested brand new\n", "untracked content must be intact after reset"
+        assert f.read() == "nested brand new\n", (
+            "untracked content must be intact after reset"
+        )
 
     no_scan = get_status_files(repo)
-    assert_file_set(no_scan, [], msg="reset must clear the dirty-add; no-scan status clean")
+    assert_file_set(
+        no_scan, [], msg="reset must clear the dirty-add; no-scan status clean"
+    )
     for ancestor in ("a", "a/b", "a/b/c"):
         assert_absent(no_scan, ancestor, msg="ancestor dir must not stay dirty")
 
     scanned = get_status_files_twice(repo, scan=True)
     assert_entry(
-        scanned, "a/b/c/new.txt", action="add", dirty=True, staged=False, node_type="file",
+        scanned,
+        "a/b/c/new.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="--scan rediscovers the surviving untracked nested file as an add",
     )
 
@@ -5721,7 +6889,9 @@ def test_reset_dirty_delete_nested_restores(new_lore_repo):
 
     repo.reset("a/b/c/deep.txt", offline=True)
 
-    assert os.path.exists(repo._fix_path("a/b/c/deep.txt")), "deleted nested file must be restored"
+    assert os.path.exists(repo._fix_path("a/b/c/deep.txt")), (
+        "deleted nested file must be restored"
+    )
     with repo.open_file("a/b/c/deep.txt", "r") as f:
         assert f.read() == "deep precious\n", "restored content must match committed"
 
@@ -5731,7 +6901,9 @@ def test_reset_dirty_delete_nested_restores(new_lore_repo):
         assert_absent(no_scan, ancestor, msg="intermediate parent must not stay dirty")
     scanned = get_status_files_twice(repo, scan=True)
     assert_file_set(scanned, [], msg="--scan agrees the subtree is clean")
-    assert not has_staged_anchor(repo), "anchor released after the only dirty leaf reset"
+    assert not has_staged_anchor(repo), (
+        "anchor released after the only dirty leaf reset"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -5751,18 +6923,24 @@ def test_commit_staged_add_flat_dump(new_lore_repo):
     repo.stage("added.txt", offline=True)
 
     staged = get_status_files(repo)
-    assert_entry(staged, "added.txt", action="add", dirty=True, staged=True, node_type="file")
+    assert_entry(
+        staged, "added.txt", action="add", dirty=True, staged=True, node_type="file"
+    )
 
     repo.commit("commit staged add", offline=True)
 
     entries = get_status_files(repo)
-    assert entries == [], f"status must be clean after committing the add, got {summarize(entries)}"
+    assert entries == [], (
+        f"status must be clean after committing the add, got {summarize(entries)}"
+    )
     scanned = get_status_files_twice(repo, scan=True)
     assert scanned == [], f"--scan status must be clean, got {summarize(scanned)}"
 
     repo.status(reset=True, offline=True)
     dump = repo.repository_dump()
-    assert "added.txt" in dump, f"staged add should be present in the sealed tree:\n{dump}"
+    assert "added.txt" in dump, (
+        f"staged add should be present in the sealed tree:\n{dump}"
+    )
 
 
 @pytest.mark.smoke
@@ -5780,12 +6958,16 @@ def test_commit_staged_modify_flat_dump(new_lore_repo):
     repo.stage("mod.txt", offline=True)
 
     staged = get_status_files(repo)
-    assert_entry(staged, "mod.txt", action="keep", dirty=True, staged=True, node_type="file")
+    assert_entry(
+        staged, "mod.txt", action="keep", dirty=True, staged=True, node_type="file"
+    )
 
     repo.commit("commit staged modify", offline=True)
 
     entries = get_status_files(repo)
-    assert entries == [], f"status must be clean after committing the modify, got {summarize(entries)}"
+    assert entries == [], (
+        f"status must be clean after committing the modify, got {summarize(entries)}"
+    )
 
     repo.status(reset=True, offline=True)
     dump = repo.repository_dump()
@@ -5806,16 +6988,22 @@ def test_commit_staged_delete_flat_dump(new_lore_repo):
     repo.stage("victim.txt", scan=True, offline=True)
 
     staged = get_status_files(repo)
-    assert_entry(staged, "victim.txt", action="delete", dirty=True, staged=True, node_type="file")
+    assert_entry(
+        staged, "victim.txt", action="delete", dirty=True, staged=True, node_type="file"
+    )
 
     repo.commit("commit staged delete", offline=True)
 
     entries = get_status_files(repo)
-    assert entries == [], f"status must be clean after committing the delete, got {summarize(entries)}"
+    assert entries == [], (
+        f"status must be clean after committing the delete, got {summarize(entries)}"
+    )
 
     repo.status(reset=True, offline=True)
     dump = repo.repository_dump()
-    assert "victim.txt" not in dump, f"deleted file must be gone from the sealed tree:\n{dump}"
+    assert "victim.txt" not in dump, (
+        f"deleted file must be gone from the sealed tree:\n{dump}"
+    )
     assert "keep.txt" in dump, f"unrelated file must remain in the sealed tree:\n{dump}"
 
 
@@ -5834,16 +7022,27 @@ def test_commit_staged_modify_nested_dump(new_lore_repo):
     repo.stage("a/b/c/deep.txt", offline=True)
 
     staged = get_status_files(repo)
-    assert_entry(staged, "a/b/c/deep.txt", action="keep", dirty=True, staged=True, node_type="file")
+    assert_entry(
+        staged,
+        "a/b/c/deep.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        node_type="file",
+    )
 
     repo.commit("commit nested staged modify", offline=True)
 
     entries = get_status_files(repo)
-    assert entries == [], f"status must be clean after the commit, got {summarize(entries)}"
+    assert entries == [], (
+        f"status must be clean after the commit, got {summarize(entries)}"
+    )
 
     repo.status(reset=True, offline=True)
     dump = repo.repository_dump()
-    assert "a/b/c/deep.txt" in dump, f"nested modified file must remain in the sealed tree:\n{dump}"
+    assert "a/b/c/deep.txt" in dump, (
+        f"nested modified file must remain in the sealed tree:\n{dump}"
+    )
     assert _node_addr_in_dump(dump, "a/b/c/deep.txt") != base_addr, (
         f"nested staged modify's content hash should change in the sealed tree:\n{dump}"
     )
@@ -5860,7 +7059,9 @@ def test_commit_dirty_only_modify_nested_survives(new_lore_repo):
     file pending (action=keep/flagDirty); the staged anchor persists and the
     dirty-only file's content does not reach the sealed tree."""
     repo: Lore = new_lore_repo()
-    commit_base(repo, {"a/b/c/deep.txt": "deep original\n", "staged.txt": "staged original\n"})
+    commit_base(
+        repo, {"a/b/c/deep.txt": "deep original\n", "staged.txt": "staged original\n"}
+    )
     repo.status(reset=True, offline=True)
     base_addr = _node_addr_in_dump(repo.repository_dump(), "a/b/c/deep.txt")
     assert base_addr, "base addr should parse"
@@ -5876,13 +7077,22 @@ def test_commit_dirty_only_modify_nested_survives(new_lore_repo):
     repo.commit("commit staged", offline=True)
 
     entries = get_status_files(repo)
-    assert_file_set(entries, ["a/b/c/deep.txt"], msg="only the dirty-only nested modify remains")
+    assert_file_set(
+        entries, ["a/b/c/deep.txt"], msg="only the dirty-only nested modify remains"
+    )
     assert_absent(entries, "staged.txt", msg="staged modify is committed and clean")
     assert_entry(
-        entries, "a/b/c/deep.txt", action="keep", dirty=True, staged=False, node_type="file",
+        entries,
+        "a/b/c/deep.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="dirty-only nested modify survives commit as a kept dirty file",
     )
-    assert has_staged_anchor(repo), "anchor must persist while a dirty-only node remains"
+    assert has_staged_anchor(repo), (
+        "anchor must persist while a dirty-only node remains"
+    )
 
     repo.status(reset=True, offline=True)
     dump = repo.repository_dump()
@@ -5911,18 +7121,31 @@ def test_commit_dirty_only_add_nested_survives(new_lore_repo):
     repo.commit("commit staged", offline=True)
 
     entries = get_status_files(repo)
-    assert_file_set(entries, ["a/b/c/new.txt"], msg="only the dirty-only nested add remains")
+    assert_file_set(
+        entries, ["a/b/c/new.txt"], msg="only the dirty-only nested add remains"
+    )
     assert_absent(entries, "staged.txt", msg="staged modify is committed and clean")
     assert_entry(
-        entries, "a/b/c/new.txt", action="add", dirty=True, staged=False, node_type="file",
+        entries,
+        "a/b/c/new.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="dirty-only nested add stays pending after commit",
     )
-    assert has_staged_anchor(repo), "anchor must persist while a dirty-only node remains"
+    assert has_staged_anchor(repo), (
+        "anchor must persist while a dirty-only node remains"
+    )
 
     repo.status(reset=True, offline=True)
     dump = repo.repository_dump()
-    assert "new.txt" not in dump, f"dirty-only add must not be in the sealed tree:\n{dump}"
-    assert "a/b/c/" not in dump, f"dirty-only added dirs must not be in the sealed tree:\n{dump}"
+    assert "new.txt" not in dump, (
+        f"dirty-only add must not be in the sealed tree:\n{dump}"
+    )
+    assert "a/b/c/" not in dump, (
+        f"dirty-only added dirs must not be in the sealed tree:\n{dump}"
+    )
 
 
 @pytest.mark.smoke
@@ -5931,7 +7154,9 @@ def test_commit_dirty_only_delete_nested_survives(new_lore_repo):
     deeply nested file pending (action=delete/flagDirty); the deleted file is
     reverted in the sealed tree (still present in the dump)."""
     repo: Lore = new_lore_repo()
-    commit_base(repo, {"a/b/c/deep.txt": "deep precious\n", "other.txt": "other original\n"})
+    commit_base(
+        repo, {"a/b/c/deep.txt": "deep precious\n", "other.txt": "other original\n"}
+    )
 
     repo.remove_file("a/b/c/deep.txt")
     repo.dirty("a/b/c/deep.txt", offline=True)
@@ -5943,13 +7168,22 @@ def test_commit_dirty_only_delete_nested_survives(new_lore_repo):
     repo.commit("commit unrelated", offline=True)
 
     entries = get_status_files(repo)
-    assert_file_set(entries, ["a/b/c/deep.txt"], msg="only the dirty-only nested delete remains")
+    assert_file_set(
+        entries, ["a/b/c/deep.txt"], msg="only the dirty-only nested delete remains"
+    )
     assert_absent(entries, "other.txt", msg="staged modify is committed and clean")
     assert_entry(
-        entries, "a/b/c/deep.txt", action="delete", dirty=True, staged=False, node_type="file",
+        entries,
+        "a/b/c/deep.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="dirty-only nested delete stays pending after commit",
     )
-    assert has_staged_anchor(repo), "anchor must persist while a dirty-only node remains"
+    assert has_staged_anchor(repo), (
+        "anchor must persist while a dirty-only node remains"
+    )
 
     repo.status(reset=True, offline=True)
     dump = repo.repository_dump()
@@ -5998,11 +7232,18 @@ def test_branchreset_carries_dirty_add_flat(new_lore_repo):
     entries = get_status_files(repo)
     assert_file_set(entries, ["added.txt"], msg="only the carried dirty add is pending")
     assert_entry(
-        entries, "added.txt", action="add", dirty=True, staged=False, node_type="file",
+        entries,
+        "added.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="dirty add must survive branch reset",
     )
     with repo.open_file("added.txt", "r") as f:
-        assert f.read() == "dirty add content\n", "carried add keeps its on-disk content"
+        assert f.read() == "dirty add content\n", (
+            "carried add keeps its on-disk content"
+        )
 
 
 @pytest.mark.smoke
@@ -6026,13 +7267,22 @@ def test_branchreset_carries_dirty_add_nested(new_lore_repo):
         assert f.read() == "base v1\n", "branch reset must realize v1 of the tip file"
 
     entries = get_status_files(repo)
-    assert_file_set(entries, ["a/b/c/added.txt"], msg="only the carried nested dirty add is pending")
+    assert_file_set(
+        entries, ["a/b/c/added.txt"], msg="only the carried nested dirty add is pending"
+    )
     assert_entry(
-        entries, "a/b/c/added.txt", action="add", dirty=True, staged=False, node_type="file",
+        entries,
+        "a/b/c/added.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="nested dirty add must survive branch reset",
     )
     with repo.open_file("a/b/c/added.txt", "r") as f:
-        assert f.read() == "nested dirty add\n", "carried nested add keeps its on-disk content"
+        assert f.read() == "nested dirty add\n", (
+            "carried nested add keeps its on-disk content"
+        )
 
 
 @pytest.mark.smoke
@@ -6041,7 +7291,9 @@ def test_branchreset_carries_dirty_delete_flat(new_lore_repo):
     pending delete after `branch reset` moves the tip to an earlier revision;
     the file stays removed from disk."""
     repo: Lore = new_lore_repo()
-    rev_v1 = _commit_two_revs(repo, {"base.txt": "base v1\n", "victim.txt": "precious\n"})
+    rev_v1 = _commit_two_revs(
+        repo, {"base.txt": "base v1\n", "victim.txt": "precious\n"}
+    )
 
     repo.remove_file("victim.txt")
     repo.dirty("victim.txt", offline=True)
@@ -6055,12 +7307,21 @@ def test_branchreset_carries_dirty_delete_flat(new_lore_repo):
         assert f.read() == "base v1\n", "branch reset must realize v1 of the tip file"
 
     entries = get_status_files(repo)
-    assert_file_set(entries, ["victim.txt"], msg="only the carried dirty delete is pending")
+    assert_file_set(
+        entries, ["victim.txt"], msg="only the carried dirty delete is pending"
+    )
     assert_entry(
-        entries, "victim.txt", action="delete", dirty=True, staged=False, node_type="file",
+        entries,
+        "victim.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="dirty delete must survive branch reset",
     )
-    assert not os.path.exists(repo._fix_path("victim.txt")), "carried delete stays removed on disk"
+    assert not os.path.exists(repo._fix_path("victim.txt")), (
+        "carried delete stays removed on disk"
+    )
 
 
 @pytest.mark.smoke
@@ -6085,12 +7346,23 @@ def test_branchreset_carries_dirty_delete_nested(new_lore_repo):
         assert f.read() == "base v1\n", "branch reset must realize v1 of the tip file"
 
     entries = get_status_files(repo)
-    assert_file_set(entries, ["a/b/c/deep.txt"], msg="only the carried nested dirty delete is pending")
+    assert_file_set(
+        entries,
+        ["a/b/c/deep.txt"],
+        msg="only the carried nested dirty delete is pending",
+    )
     assert_entry(
-        entries, "a/b/c/deep.txt", action="delete", dirty=True, staged=False, node_type="file",
+        entries,
+        "a/b/c/deep.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="nested dirty delete must survive branch reset",
     )
-    assert not os.path.exists(repo._fix_path("a/b/c/deep.txt")), "carried nested delete stays removed"
+    assert not os.path.exists(repo._fix_path("a/b/c/deep.txt")), (
+        "carried nested delete stays removed"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -6105,7 +7377,9 @@ def test_branchreset_refuses_staged_modify_flat(new_lore_repo):
     from error_types import LoreException
 
     repo: Lore = new_lore_repo()
-    rev_v1 = _commit_two_revs(repo, {"base.txt": "base v1\n", "mod.txt": "mod original\n"})
+    rev_v1 = _commit_two_revs(
+        repo, {"base.txt": "base v1\n", "mod.txt": "mod original\n"}
+    )
 
     with repo.open_file("mod.txt", "w+") as f:
         f.write("mod modified longer\n")
@@ -6113,13 +7387,18 @@ def test_branchreset_refuses_staged_modify_flat(new_lore_repo):
 
     with pytest.raises(LoreException) as excinfo:
         repo.branch_reset(rev_v1, offline=True)
-    assert "Unable to reset branch when there is a staged state" in str(excinfo.value), (
-        f"reset should refuse on a staged modify, got: {excinfo.value}"
-    )
+    assert "Unable to reset branch when there is a staged state" in str(
+        excinfo.value
+    ), f"reset should refuse on a staged modify, got: {excinfo.value}"
 
     after = get_status_files(repo)
     assert_entry(
-        after, "mod.txt", action="keep", dirty=True, staged=True, node_type="file",
+        after,
+        "mod.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged modify must survive the rejected branch reset",
     )
 
@@ -6141,13 +7420,18 @@ def test_branchreset_refuses_staged_modify_nested(new_lore_repo):
 
     with pytest.raises(LoreException) as excinfo:
         repo.branch_reset(rev_v1, offline=True)
-    assert "Unable to reset branch when there is a staged state" in str(excinfo.value), (
-        f"reset should refuse on a nested staged modify, got: {excinfo.value}"
-    )
+    assert "Unable to reset branch when there is a staged state" in str(
+        excinfo.value
+    ), f"reset should refuse on a nested staged modify, got: {excinfo.value}"
 
     after = get_status_files(repo)
     assert_entry(
-        after, "a/b/c/deep.txt", action="keep", dirty=True, staged=True, node_type="file",
+        after,
+        "a/b/c/deep.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="nested staged modify must survive the rejected branch reset",
     )
 
@@ -6168,13 +7452,18 @@ def test_branchreset_refuses_staged_delete_flat(new_lore_repo):
 
     with pytest.raises(LoreException) as excinfo:
         repo.branch_reset(rev_v1, offline=True)
-    assert "Unable to reset branch when there is a staged state" in str(excinfo.value), (
-        f"reset should refuse on a staged delete, got: {excinfo.value}"
-    )
+    assert "Unable to reset branch when there is a staged state" in str(
+        excinfo.value
+    ), f"reset should refuse on a staged delete, got: {excinfo.value}"
 
     after = get_status_files(repo)
     assert_entry(
-        after, "victim.txt", action="delete", dirty=True, staged=True, node_type="file",
+        after,
+        "victim.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged delete must survive the rejected branch reset",
     )
 
@@ -6195,13 +7484,18 @@ def test_branchreset_refuses_staged_delete_nested(new_lore_repo):
 
     with pytest.raises(LoreException) as excinfo:
         repo.branch_reset(rev_v1, offline=True)
-    assert "Unable to reset branch when there is a staged state" in str(excinfo.value), (
-        f"reset should refuse on a nested staged delete, got: {excinfo.value}"
-    )
+    assert "Unable to reset branch when there is a staged state" in str(
+        excinfo.value
+    ), f"reset should refuse on a nested staged delete, got: {excinfo.value}"
 
     after = get_status_files(repo)
     assert_entry(
-        after, "a/b/c/deep.txt", action="delete", dirty=True, staged=True, node_type="file",
+        after,
+        "a/b/c/deep.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="nested staged delete must survive the rejected branch reset",
     )
 
@@ -6212,7 +7506,9 @@ def test_branchreset_refuses_staged_delete_nested(new_lore_repo):
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands")
+@pytest.mark.skip(
+    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
+)
 def test_commit_staged_move(new_lore_repo):
     """Committing a staged move (rename on disk + dirty_move + stage) records
     the rename in the sealed tree: the destination is present, the source is
@@ -6226,22 +7522,34 @@ def test_commit_staged_move(new_lore_repo):
 
     staged = get_status_files(repo)
     assert_entry(
-        staged, "new.txt", action="move", dirty=True, staged=True, node_type="file", from_path="old.txt"
+        staged,
+        "new.txt",
+        action="move",
+        dirty=True,
+        staged=True,
+        node_type="file",
+        from_path="old.txt",
     )
 
     repo.commit("commit staged move", offline=True)
 
     entries = get_status_files(repo)
-    assert entries == [], f"status must be clean after committing the move, got {summarize(entries)}"
+    assert entries == [], (
+        f"status must be clean after committing the move, got {summarize(entries)}"
+    )
 
     repo.status(reset=True, offline=True)
     dump = repo.repository_dump()
     assert "new.txt" in dump, f"move destination should be in the sealed tree:\n{dump}"
-    assert "old.txt" not in dump, f"move source should be gone from the sealed tree:\n{dump}"
+    assert "old.txt" not in dump, (
+        f"move source should be gone from the sealed tree:\n{dump}"
+    )
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands")
+@pytest.mark.skip(
+    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
+)
 def test_commit_staged_copy(new_lore_repo):
     """Committing a staged copy (duplicate on disk + dirty_copy + stage) records
     both the source and the destination in the sealed tree, and status is
@@ -6256,13 +7564,21 @@ def test_commit_staged_copy(new_lore_repo):
 
     staged = get_status_files(repo)
     assert_entry(
-        staged, "copy.txt", action="copy", dirty=True, staged=True, node_type="file", from_path="orig.txt"
+        staged,
+        "copy.txt",
+        action="copy",
+        dirty=True,
+        staged=True,
+        node_type="file",
+        from_path="orig.txt",
     )
 
     repo.commit("commit staged copy", offline=True)
 
     entries = get_status_files(repo)
-    assert entries == [], f"status must be clean after committing the copy, got {summarize(entries)}"
+    assert entries == [], (
+        f"status must be clean after committing the copy, got {summarize(entries)}"
+    )
 
     repo.status(reset=True, offline=True)
     dump = repo.repository_dump()
@@ -6271,7 +7587,9 @@ def test_commit_staged_copy(new_lore_repo):
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands")
+@pytest.mark.skip(
+    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
+)
 def test_reset_dirty_move(new_lore_repo):
     """Resetting a dirty move (action=move/fromPath=source) restores the source
     on disk, removes the destination, and leaves a clean status."""
@@ -6282,13 +7600,19 @@ def test_reset_dirty_move(new_lore_repo):
     repo.dirty_move("old.txt", "new.txt", offline=True)
 
     before = get_status_files(repo)
-    assert_entry(before, "new.txt", action="move", dirty=True, staged=False, from_path="old.txt")
+    assert_entry(
+        before, "new.txt", action="move", dirty=True, staged=False, from_path="old.txt"
+    )
 
     repo.reset("new.txt", offline=True)
 
-    assert os.path.exists(repo._fix_path("old.txt")), "reset must restore the move source"
+    assert os.path.exists(repo._fix_path("old.txt")), (
+        "reset must restore the move source"
+    )
     with repo.open_file("old.txt", "r") as f:
-        assert f.read() == "movable content\n", "restored source content must match committed"
+        assert f.read() == "movable content\n", (
+            "restored source content must match committed"
+        )
 
     no_scan = get_status_files(repo)
     assert_file_set(no_scan, [], msg="status clean after resetting the dirty move")
@@ -6297,7 +7621,9 @@ def test_reset_dirty_move(new_lore_repo):
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands")
+@pytest.mark.skip(
+    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
+)
 def test_reset_dirty_copy(new_lore_repo):
     """Resetting a dirty copy (action=copy/fromPath=source) clears the copy's
     tracking and leaves the source unchanged with a clean status."""
@@ -6309,12 +7635,21 @@ def test_reset_dirty_copy(new_lore_repo):
     repo.dirty_copy("orig.txt", "copy.txt", offline=True)
 
     before = get_status_files(repo)
-    assert_entry(before, "copy.txt", action="copy", dirty=True, staged=False, from_path="orig.txt")
+    assert_entry(
+        before,
+        "copy.txt",
+        action="copy",
+        dirty=True,
+        staged=False,
+        from_path="orig.txt",
+    )
 
     repo.reset("copy.txt", offline=True)
 
     with repo.open_file("orig.txt", "r") as f:
-        assert f.read() == "source content\n", "copy source must be unchanged after reset"
+        assert f.read() == "source content\n", (
+            "copy source must be unchanged after reset"
+        )
 
     no_scan = get_status_files(repo)
     assert_absent(no_scan, "copy.txt", msg="reset must clear the dirty copy's tracking")
@@ -6359,17 +7694,28 @@ def test_sync_refuses_staged_add_flat(new_lore_repo):
         f.write("staged add\n")
     repo.stage("staged.txt", offline=True)
 
-    with pytest.raises(LoreException, match="Unable to sync when there is a staged state"):
+    with pytest.raises(
+        LoreException, match="Unable to sync when there is a staged state"
+    ):
         repo.sync(rev_v1, offline=True)
 
     after = get_status_files(repo)
     assert_entry(
-        after, "staged.txt", action="add", dirty=True, staged=True, node_type="file",
+        after,
+        "staged.txt",
+        action="add",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged add must survive a refused sync",
     )
-    assert_file_set(after, ["staged.txt"], msg="only the staged add is pending after refusal")
+    assert_file_set(
+        after, ["staged.txt"], msg="only the staged add is pending after refusal"
+    )
     with repo.open_file("file.txt", "r") as f:
-        assert f.read() == "v2 longer content\n", "refused sync must not move the working tree"
+        assert f.read() == "v2 longer content\n", (
+            "refused sync must not move the working tree"
+        )
 
 
 @pytest.mark.smoke
@@ -6392,17 +7738,28 @@ def test_sync_refuses_staged_modify_flat(new_lore_repo):
         f.write("staged edit longer\n")
     repo.stage("mod.txt", offline=True)
 
-    with pytest.raises(LoreException, match="Unable to sync when there is a staged state"):
+    with pytest.raises(
+        LoreException, match="Unable to sync when there is a staged state"
+    ):
         repo.sync(rev_v1, offline=True)
 
     after = get_status_files(repo)
     assert_entry(
-        after, "mod.txt", action="keep", dirty=True, staged=True, node_type="file",
+        after,
+        "mod.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged modify must survive a refused sync",
     )
-    assert_file_set(after, ["mod.txt"], msg="only the staged modify is pending after refusal")
+    assert_file_set(
+        after, ["mod.txt"], msg="only the staged modify is pending after refusal"
+    )
     with repo.open_file("mod.txt", "r") as f:
-        assert f.read() == "staged edit longer\n", "staged content stays on disk after refusal"
+        assert f.read() == "staged edit longer\n", (
+            "staged content stays on disk after refusal"
+        )
 
 
 @pytest.mark.smoke
@@ -6425,16 +7782,27 @@ def test_sync_refuses_staged_delete_flat(new_lore_repo):
     repo.dirty("gone.txt", offline=True)
     repo.stage("gone.txt", offline=True)
 
-    with pytest.raises(LoreException, match="Unable to sync when there is a staged state"):
+    with pytest.raises(
+        LoreException, match="Unable to sync when there is a staged state"
+    ):
         repo.sync(rev_v1, offline=True)
 
     after = get_status_files(repo)
     assert_entry(
-        after, "gone.txt", action="delete", dirty=True, staged=True, node_type="file",
+        after,
+        "gone.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged delete must survive a refused sync",
     )
-    assert_file_set(after, ["gone.txt"], msg="only the staged delete is pending after refusal")
-    assert not os.path.exists(repo._fix_path("gone.txt")), "staged-deleted file stays removed"
+    assert_file_set(
+        after, ["gone.txt"], msg="only the staged delete is pending after refusal"
+    )
+    assert not os.path.exists(repo._fix_path("gone.txt")), (
+        "staged-deleted file stays removed"
+    )
 
 
 @pytest.mark.smoke
@@ -6458,17 +7826,28 @@ def test_sync_refuses_staged_add_nested(new_lore_repo):
         f.write("nested staged add\n")
     repo.stage("nested/sub/leaf.txt", offline=True)
 
-    with pytest.raises(LoreException, match="Unable to sync when there is a staged state"):
+    with pytest.raises(
+        LoreException, match="Unable to sync when there is a staged state"
+    ):
         repo.sync(rev_v1, offline=True)
 
     after = get_status_files(repo)
     assert_entry(
-        after, "nested/sub/leaf.txt", action="add", dirty=True, staged=True, node_type="file",
+        after,
+        "nested/sub/leaf.txt",
+        action="add",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="nested staged add must survive a refused sync",
     )
-    assert_file_set(after, ["nested/sub/leaf.txt"], msg="only the nested staged add is pending")
+    assert_file_set(
+        after, ["nested/sub/leaf.txt"], msg="only the nested staged add is pending"
+    )
     with repo.open_file("file.txt", "r") as f:
-        assert f.read() == "v2 longer content\n", "refused sync must not move the working tree"
+        assert f.read() == "v2 longer content\n", (
+            "refused sync must not move the working tree"
+        )
 
 
 @pytest.mark.smoke
@@ -6491,17 +7870,28 @@ def test_sync_refuses_staged_modify_nested(new_lore_repo):
         f.write("deep staged edit longer\n")
     repo.stage("a/b/deep.txt", offline=True)
 
-    with pytest.raises(LoreException, match="Unable to sync when there is a staged state"):
+    with pytest.raises(
+        LoreException, match="Unable to sync when there is a staged state"
+    ):
         repo.sync(rev_v1, offline=True)
 
     after = get_status_files(repo)
     assert_entry(
-        after, "a/b/deep.txt", action="keep", dirty=True, staged=True, node_type="file",
+        after,
+        "a/b/deep.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="nested staged modify must survive a refused sync",
     )
-    assert_file_set(after, ["a/b/deep.txt"], msg="only the nested staged modify is pending")
+    assert_file_set(
+        after, ["a/b/deep.txt"], msg="only the nested staged modify is pending"
+    )
     with repo.open_file("a/b/deep.txt", "r") as f:
-        assert f.read() == "deep staged edit longer\n", "staged content stays on disk after refusal"
+        assert f.read() == "deep staged edit longer\n", (
+            "staged content stays on disk after refusal"
+        )
 
 
 @pytest.mark.smoke
@@ -6524,16 +7914,27 @@ def test_sync_refuses_staged_delete_nested(new_lore_repo):
     repo.dirty("a/b/gone.txt", offline=True)
     repo.stage("a/b/gone.txt", offline=True)
 
-    with pytest.raises(LoreException, match="Unable to sync when there is a staged state"):
+    with pytest.raises(
+        LoreException, match="Unable to sync when there is a staged state"
+    ):
         repo.sync(rev_v1, offline=True)
 
     after = get_status_files(repo)
     assert_entry(
-        after, "a/b/gone.txt", action="delete", dirty=True, staged=True, node_type="file",
+        after,
+        "a/b/gone.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="nested staged delete must survive a refused sync",
     )
-    assert_file_set(after, ["a/b/gone.txt"], msg="only the nested staged delete is pending")
-    assert not os.path.exists(repo._fix_path("a/b/gone.txt")), "staged-deleted leaf stays removed"
+    assert_file_set(
+        after, ["a/b/gone.txt"], msg="only the nested staged delete is pending"
+    )
+    assert not os.path.exists(repo._fix_path("a/b/gone.txt")), (
+        "staged-deleted leaf stays removed"
+    )
 
 
 # ===========================================================================
@@ -6568,12 +7969,21 @@ def test_switch_refuses_staged_modify_flat(new_lore_repo):
     )
     after = get_status_files(repo)
     assert_entry(
-        after, "mod.txt", action="keep", dirty=True, staged=True, node_type="file",
+        after,
+        "mod.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged modify must survive a refused switch",
     )
-    assert_file_set(after, ["mod.txt"], msg="only the staged modify is pending after refusal")
+    assert_file_set(
+        after, ["mod.txt"], msg="only the staged modify is pending after refusal"
+    )
     with repo.open_file("mod.txt", "r") as f:
-        assert f.read() == "staged edit longer\n", "staged content stays on disk after refusal"
+        assert f.read() == "staged edit longer\n", (
+            "staged content stays on disk after refusal"
+        )
 
 
 @pytest.mark.smoke
@@ -6603,11 +8013,20 @@ def test_switch_refuses_staged_delete_flat(new_lore_repo):
     )
     after = get_status_files(repo)
     assert_entry(
-        after, "gone.txt", action="delete", dirty=True, staged=True, node_type="file",
+        after,
+        "gone.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged delete must survive a refused switch",
     )
-    assert_file_set(after, ["gone.txt"], msg="only the staged delete is pending after refusal")
-    assert not os.path.exists(repo._fix_path("gone.txt")), "staged-deleted file stays removed"
+    assert_file_set(
+        after, ["gone.txt"], msg="only the staged delete is pending after refusal"
+    )
+    assert not os.path.exists(repo._fix_path("gone.txt")), (
+        "staged-deleted file stays removed"
+    )
 
 
 @pytest.mark.smoke
@@ -6637,12 +8056,21 @@ def test_switch_refuses_staged_modify_nested(new_lore_repo):
     )
     after = get_status_files(repo)
     assert_entry(
-        after, "a/b/deep.txt", action="keep", dirty=True, staged=True, node_type="file",
+        after,
+        "a/b/deep.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="nested staged modify must survive a refused switch",
     )
-    assert_file_set(after, ["a/b/deep.txt"], msg="only the nested staged modify is pending")
+    assert_file_set(
+        after, ["a/b/deep.txt"], msg="only the nested staged modify is pending"
+    )
     with repo.open_file("a/b/deep.txt", "r") as f:
-        assert f.read() == "deep staged edit longer\n", "staged content stays on disk after refusal"
+        assert f.read() == "deep staged edit longer\n", (
+            "staged content stays on disk after refusal"
+        )
 
 
 @pytest.mark.smoke
@@ -6672,11 +8100,20 @@ def test_switch_refuses_staged_delete_nested(new_lore_repo):
     )
     after = get_status_files(repo)
     assert_entry(
-        after, "a/b/gone.txt", action="delete", dirty=True, staged=True, node_type="file",
+        after,
+        "a/b/gone.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="nested staged delete must survive a refused switch",
     )
-    assert_file_set(after, ["a/b/gone.txt"], msg="only the nested staged delete is pending")
-    assert not os.path.exists(repo._fix_path("a/b/gone.txt")), "staged-deleted leaf stays removed"
+    assert_file_set(
+        after, ["a/b/gone.txt"], msg="only the nested staged delete is pending"
+    )
+    assert not os.path.exists(repo._fix_path("a/b/gone.txt")), (
+        "staged-deleted leaf stays removed"
+    )
 
 
 # ===========================================================================
@@ -6704,23 +8141,39 @@ def test_sync_carries_dirty_add_flat(new_lore_repo):
     repo.dirty("added.txt", offline=True)
 
     repo.sync(rev_v1, offline=True)
-    assert os.path.exists(repo._fix_path("added.txt")), "dirty add carried onto the v1 base"
+    assert os.path.exists(repo._fix_path("added.txt")), (
+        "dirty add carried onto the v1 base"
+    )
     with repo.open_file("added.txt", "r") as f:
-        assert f.read() == "dirty add content\n", "carried add keeps its content over v1"
+        assert f.read() == "dirty add content\n", (
+            "carried add keeps its content over v1"
+        )
     with repo.open_file("file.txt", "r") as f:
-        assert f.read() == "v1\n", "non-dirty committed file follows the synced revision"
+        assert f.read() == "v1\n", (
+            "non-dirty committed file follows the synced revision"
+        )
     back = get_status_files_twice(repo)
-    assert_entry(back, "added.txt", action="add", dirty=True, staged=False, node_type="file")
+    assert_entry(
+        back, "added.txt", action="add", dirty=True, staged=False, node_type="file"
+    )
     assert_file_set(back, ["added.txt"], msg="only the carried add is pending at v1")
 
     repo.sync(offline=True)
-    assert os.path.exists(repo._fix_path("added.txt")), "dirty add still present after sync forward"
+    assert os.path.exists(repo._fix_path("added.txt")), (
+        "dirty add still present after sync forward"
+    )
     with repo.open_file("added.txt", "r") as f:
-        assert f.read() == "dirty add content\n", "carried add survives the forward sync"
+        assert f.read() == "dirty add content\n", (
+            "carried add survives the forward sync"
+        )
     with repo.open_file("file.txt", "r") as f:
-        assert f.read() == "v2 longer content\n", "committed file restored to v2 forward"
+        assert f.read() == "v2 longer content\n", (
+            "committed file restored to v2 forward"
+        )
     fwd = get_status_files_twice(repo)
-    assert_entry(fwd, "added.txt", action="add", dirty=True, staged=False, node_type="file")
+    assert_entry(
+        fwd, "added.txt", action="add", dirty=True, staged=False, node_type="file"
+    )
     assert_file_set(fwd, ["added.txt"], msg="only the carried add is pending at v2")
 
 
@@ -6743,19 +8196,29 @@ def test_sync_carries_dirty_delete_flat(new_lore_repo):
     repo.dirty("victim.txt", offline=True)
 
     repo.sync(rev_v1, offline=True)
-    assert not os.path.exists(repo._fix_path("victim.txt")), "dirty delete carried onto v1"
+    assert not os.path.exists(repo._fix_path("victim.txt")), (
+        "dirty delete carried onto v1"
+    )
     with repo.open_file("other.txt", "r") as f:
         assert f.read() == "other v1\n", "non-dirty file follows the synced revision"
     back = get_status_files_twice(repo)
-    assert_entry(back, "victim.txt", action="delete", dirty=True, staged=False, node_type="file")
-    assert_file_set(back, ["victim.txt"], msg="only the carried delete is pending at v1")
+    assert_entry(
+        back, "victim.txt", action="delete", dirty=True, staged=False, node_type="file"
+    )
+    assert_file_set(
+        back, ["victim.txt"], msg="only the carried delete is pending at v1"
+    )
 
     repo.sync(offline=True)
-    assert not os.path.exists(repo._fix_path("victim.txt")), "dirty delete still applied at v2"
+    assert not os.path.exists(repo._fix_path("victim.txt")), (
+        "dirty delete still applied at v2"
+    )
     with repo.open_file("other.txt", "r") as f:
         assert f.read() == "other v2 longer\n", "committed file restored to v2 forward"
     fwd = get_status_files_twice(repo)
-    assert_entry(fwd, "victim.txt", action="delete", dirty=True, staged=False, node_type="file")
+    assert_entry(
+        fwd, "victim.txt", action="delete", dirty=True, staged=False, node_type="file"
+    )
     assert_file_set(fwd, ["victim.txt"], msg="only the carried delete is pending at v2")
 
 
@@ -6778,18 +8241,30 @@ def test_sync_carries_dirty_add_nested(new_lore_repo):
     repo.dirty("a/b/added.txt", offline=True)
 
     repo.sync(rev_v1, offline=True)
-    assert os.path.exists(repo._fix_path("a/b/added.txt")), "nested dirty add carried onto v1"
+    assert os.path.exists(repo._fix_path("a/b/added.txt")), (
+        "nested dirty add carried onto v1"
+    )
     with repo.open_file("a/b/added.txt", "r") as f:
         assert f.read() == "nested dirty add\n", "carried nested add keeps its content"
     back = get_status_files_twice(repo)
-    assert_entry(back, "a/b/added.txt", action="add", dirty=True, staged=False, node_type="file")
-    assert_file_set(back, ["a/b/added.txt"], msg="only the nested carried add is pending at v1")
+    assert_entry(
+        back, "a/b/added.txt", action="add", dirty=True, staged=False, node_type="file"
+    )
+    assert_file_set(
+        back, ["a/b/added.txt"], msg="only the nested carried add is pending at v1"
+    )
 
     repo.sync(offline=True)
-    assert os.path.exists(repo._fix_path("a/b/added.txt")), "nested dirty add survives forward sync"
+    assert os.path.exists(repo._fix_path("a/b/added.txt")), (
+        "nested dirty add survives forward sync"
+    )
     fwd = get_status_files_twice(repo)
-    assert_entry(fwd, "a/b/added.txt", action="add", dirty=True, staged=False, node_type="file")
-    assert_file_set(fwd, ["a/b/added.txt"], msg="only the nested carried add is pending at v2")
+    assert_entry(
+        fwd, "a/b/added.txt", action="add", dirty=True, staged=False, node_type="file"
+    )
+    assert_file_set(
+        fwd, ["a/b/added.txt"], msg="only the nested carried add is pending at v2"
+    )
 
 
 @pytest.mark.smoke
@@ -6810,16 +8285,33 @@ def test_sync_carries_dirty_delete_nested(new_lore_repo):
     repo.dirty("a/b/gone.txt", offline=True)
 
     repo.sync(rev_v1, offline=True)
-    assert not os.path.exists(repo._fix_path("a/b/gone.txt")), "nested dirty delete carried onto v1"
+    assert not os.path.exists(repo._fix_path("a/b/gone.txt")), (
+        "nested dirty delete carried onto v1"
+    )
     back = get_status_files_twice(repo)
-    assert_entry(back, "a/b/gone.txt", action="delete", dirty=True, staged=False, node_type="file")
-    assert_file_set(back, ["a/b/gone.txt"], msg="only the nested carried delete is pending at v1")
+    assert_entry(
+        back,
+        "a/b/gone.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
+    )
+    assert_file_set(
+        back, ["a/b/gone.txt"], msg="only the nested carried delete is pending at v1"
+    )
 
     repo.sync(offline=True)
-    assert not os.path.exists(repo._fix_path("a/b/gone.txt")), "nested dirty delete still applied at v2"
+    assert not os.path.exists(repo._fix_path("a/b/gone.txt")), (
+        "nested dirty delete still applied at v2"
+    )
     fwd = get_status_files_twice(repo)
-    assert_entry(fwd, "a/b/gone.txt", action="delete", dirty=True, staged=False, node_type="file")
-    assert_file_set(fwd, ["a/b/gone.txt"], msg="only the nested carried delete is pending at v2")
+    assert_entry(
+        fwd, "a/b/gone.txt", action="delete", dirty=True, staged=False, node_type="file"
+    )
+    assert_file_set(
+        fwd, ["a/b/gone.txt"], msg="only the nested carried delete is pending at v2"
+    )
 
 
 @pytest.mark.smoke
@@ -6831,7 +8323,12 @@ def test_sync_carries_all_dirty_classes(new_lore_repo):
     repo: Lore = new_lore_repo()
     commit_base(
         repo,
-        {"mod.txt": "mod v1\n", "del.txt": "del v1\n", "stay.txt": "stay v1\n", "drv.txt": "drv v1\n"},
+        {
+            "mod.txt": "mod v1\n",
+            "del.txt": "del v1\n",
+            "stay.txt": "stay v1\n",
+            "drv.txt": "drv v1\n",
+        },
     )
     rev_v1 = repo.revision_history(offline=True)[0].signature
 
@@ -6850,22 +8347,35 @@ def test_sync_carries_all_dirty_classes(new_lore_repo):
     repo.sync(rev_v1, offline=True)
 
     entries = get_status_files_twice(repo)
-    assert_entry(entries, "mod.txt", action="keep", dirty=True, staged=False, node_type="file")
-    assert_entry(entries, "added.txt", action="add", dirty=True, staged=False, node_type="file")
-    assert_entry(entries, "del.txt", action="delete", dirty=True, staged=False, node_type="file")
+    assert_entry(
+        entries, "mod.txt", action="keep", dirty=True, staged=False, node_type="file"
+    )
+    assert_entry(
+        entries, "added.txt", action="add", dirty=True, staged=False, node_type="file"
+    )
+    assert_entry(
+        entries, "del.txt", action="delete", dirty=True, staged=False, node_type="file"
+    )
     assert_absent(entries, "stay.txt", msg="untouched committed file stays clean")
     assert_file_set(
-        entries, ["mod.txt", "added.txt", "del.txt"],
+        entries,
+        ["mod.txt", "added.txt", "del.txt"],
         msg="the whole dirty set carries together across sync",
     )
 
     with repo.open_file("mod.txt", "r") as f:
-        assert f.read() == "mod locally edited\n", "dirty modify keeps local content over v1"
+        assert f.read() == "mod locally edited\n", (
+            "dirty modify keeps local content over v1"
+        )
     with repo.open_file("added.txt", "r") as f:
         assert f.read() == "added content\n", "dirty add keeps local content over v1"
-    assert not os.path.exists(repo._fix_path("del.txt")), "dirty delete stays deleted over v1"
+    assert not os.path.exists(repo._fix_path("del.txt")), (
+        "dirty delete stays deleted over v1"
+    )
     with repo.open_file("drv.txt", "r") as f:
-        assert f.read() == "drv v1\n", "non-dirty committed file follows the synced revision"
+        assert f.read() == "drv v1\n", (
+            "non-dirty committed file follows the synced revision"
+        )
 
 
 # ===========================================================================
@@ -6895,29 +8405,46 @@ def test_switch_carries_nested_dirty_add_and_modify(new_lore_repo):
     repo.dirty(["a/b/mod.txt", "a/b/added.txt"], offline=True)
 
     pre = get_status_files(repo)
-    assert_file_set(pre, ["a/b/mod.txt", "a/b/added.txt"], msg="nested dirty set before switch")
+    assert_file_set(
+        pre, ["a/b/mod.txt", "a/b/added.txt"], msg="nested dirty set before switch"
+    )
 
     repo.branch_switch("other", offline=True)
 
     entries = get_status_files(repo)
     assert_entry(
-        entries, "a/b/mod.txt", action="keep", dirty=True, staged=False, node_type="file",
+        entries,
+        "a/b/mod.txt",
+        action="keep",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="nested dirty modify carried across the switch",
     )
     assert_entry(
-        entries, "a/b/added.txt", action="add", dirty=True, staged=False, node_type="file",
+        entries,
+        "a/b/added.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="nested dirty add carried across the switch",
     )
     assert_absent(entries, "a/b/keep.txt", msg="untouched nested sibling stays clean")
     assert_file_set(
-        entries, ["a/b/mod.txt", "a/b/added.txt"],
+        entries,
+        ["a/b/mod.txt", "a/b/added.txt"],
         msg="the nested dirty add+modify carry across the switch",
     )
 
     with repo.open_file("a/b/mod.txt", "r") as f:
-        assert f.read() == "mod locally edited\n", "nested dirty modify keeps local content"
+        assert f.read() == "mod locally edited\n", (
+            "nested dirty modify keeps local content"
+        )
     with repo.open_file("a/b/added.txt", "r") as f:
-        assert f.read() == "nested added content\n", "nested dirty add keeps local content"
+        assert f.read() == "nested added content\n", (
+            "nested dirty add keeps local content"
+        )
 
 
 # ===========================================================================
@@ -6926,7 +8453,9 @@ def test_switch_carries_nested_dirty_add_and_modify(new_lore_repo):
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands")
+@pytest.mark.skip(
+    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
+)
 def test_sync_carries_dirty_move(new_lore_repo):
     """A dirty MOVE is carried across a sync back to an earlier revision: the
     destination is still reported action=move/fromPath=source, the on-disk
@@ -6945,20 +8474,31 @@ def test_sync_carries_dirty_move(new_lore_repo):
 
     repo.sync(rev_v1, offline=True)
 
-    assert not os.path.exists(repo._fix_path("old.txt")), "move source gone on disk after sync"
+    assert not os.path.exists(repo._fix_path("old.txt")), (
+        "move source gone on disk after sync"
+    )
     with repo.open_file("new.txt", "r") as f:
-        assert f.read() == "movable content\n", "move destination intact on disk after sync"
+        assert f.read() == "movable content\n", (
+            "move destination intact on disk after sync"
+        )
 
     entries = get_status_files_twice(repo)
     assert_entry(
-        entries, "new.txt", action="move", dirty=True, staged=False, from_path="old.txt",
+        entries,
+        "new.txt",
+        action="move",
+        dirty=True,
+        staged=False,
+        from_path="old.txt",
         msg="dirty move provenance is carried across sync",
     )
     assert_absent(entries, "old.txt", msg="move source must not appear after sync")
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands")
+@pytest.mark.skip(
+    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
+)
 def test_sync_carries_dirty_copy(new_lore_repo):
     """A dirty COPY is carried across a sync back to an earlier revision: the
     destination is still reported action=copy/fromPath=source, the source stays
@@ -6979,18 +8519,27 @@ def test_sync_carries_dirty_copy(new_lore_repo):
     repo.sync(rev_v1, offline=True)
 
     with repo.open_file("copy.txt", "r") as f:
-        assert f.read() == "source content\n", "copy destination intact on disk after sync"
+        assert f.read() == "source content\n", (
+            "copy destination intact on disk after sync"
+        )
 
     entries = get_status_files_twice(repo)
     assert_entry(
-        entries, "copy.txt", action="copy", dirty=True, staged=False, from_path="orig.txt",
+        entries,
+        "copy.txt",
+        action="copy",
+        dirty=True,
+        staged=False,
+        from_path="orig.txt",
         msg="dirty copy provenance is carried across sync",
     )
     assert_absent(entries, "orig.txt", msg="copy source stays clean after sync")
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands")
+@pytest.mark.skip(
+    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
+)
 def test_switch_carries_dirty_copy(new_lore_repo):
     """A dirty COPY is carried across a same-revision branch switch: the
     destination is still reported action=copy/fromPath=source and the source
@@ -7006,18 +8555,27 @@ def test_switch_carries_dirty_copy(new_lore_repo):
     repo.dirty_copy("orig.txt", "copy.txt", offline=True)
 
     pre = get_status_files(repo)
-    assert_entry(pre, "copy.txt", action="copy", dirty=True, staged=False, from_path="orig.txt")
+    assert_entry(
+        pre, "copy.txt", action="copy", dirty=True, staged=False, from_path="orig.txt"
+    )
 
     repo.branch_switch("other", offline=True)
 
     with repo.open_file("orig.txt", "r") as f:
         assert f.read() == "source content\n", "copy source intact on disk after switch"
     with repo.open_file("copy.txt", "r") as f:
-        assert f.read() == "source content\n", "copy destination intact on disk after switch"
+        assert f.read() == "source content\n", (
+            "copy destination intact on disk after switch"
+        )
 
     entries = get_status_files(repo)
     assert_entry(
-        entries, "copy.txt", action="copy", dirty=True, staged=False, from_path="orig.txt",
+        entries,
+        "copy.txt",
+        action="copy",
+        dirty=True,
+        staged=False,
+        from_path="orig.txt",
         msg="dirty copy provenance is carried across a same-revision switch",
     )
     assert_absent(entries, "orig.txt", msg="copy source stays clean after switch")
@@ -7090,10 +8648,17 @@ def test_merge_refuses_staged_modify_flat(new_lore_repo):
     entries = get_status_files(repo)
     assert_file_set(entries, ["tracked.txt"], msg="only the staged modify remains")
     assert_entry(
-        entries, "tracked.txt", action="keep", dirty=True, staged=True, node_type="file",
+        entries,
+        "tracked.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged modify must survive the refused merge",
     )
-    assert_absent(entries, "feat.txt", msg="feature add must not land after a refused merge")
+    assert_absent(
+        entries, "feat.txt", msg="feature add must not land after a refused merge"
+    )
 
 
 @pytest.mark.smoke
@@ -7121,10 +8686,17 @@ def test_merge_refuses_staged_delete_nested(new_lore_repo):
     entries = get_status_files(repo)
     assert_file_set(entries, ["pkg/sub/gone.txt"], msg="only the staged delete remains")
     assert_entry(
-        entries, "pkg/sub/gone.txt", action="delete", dirty=True, staged=True, node_type="file",
+        entries,
+        "pkg/sub/gone.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged nested delete must survive the refused merge",
     )
-    assert_absent(entries, "feat.txt", msg="feature add must not land after a refused merge")
+    assert_absent(
+        entries, "feat.txt", msg="feature add must not land after a refused merge"
+    )
 
 
 @pytest.mark.smoke
@@ -7135,7 +8707,9 @@ def test_cherrypick_refuses_staged_modify_nested(new_lore_repo):
     from error_types import LoreException
 
     repo: Lore = new_lore_repo()
-    commit_base(repo, {"base.txt": "base original\n", "pkg/sub/tracked.txt": "tracked v1\n"})
+    commit_base(
+        repo, {"base.txt": "base original\n", "pkg/sub/tracked.txt": "tracked v1\n"}
+    )
     source_rev = _feature_branch_with_add(repo)
 
     with repo.open_file("pkg/sub/tracked.txt", "w+") as f:
@@ -7149,9 +8723,16 @@ def test_cherrypick_refuses_staged_modify_nested(new_lore_repo):
     )
 
     entries = get_status_files(repo)
-    assert_file_set(entries, ["pkg/sub/tracked.txt"], msg="only the staged modify remains")
+    assert_file_set(
+        entries, ["pkg/sub/tracked.txt"], msg="only the staged modify remains"
+    )
     assert_entry(
-        entries, "pkg/sub/tracked.txt", action="keep", dirty=True, staged=True, node_type="file",
+        entries,
+        "pkg/sub/tracked.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged nested modify must survive the refused cherry-pick",
     )
     assert_absent(entries, "feat.txt", msg="nothing from the source was applied")
@@ -7181,7 +8762,12 @@ def test_cherrypick_refuses_staged_delete_flat(new_lore_repo):
     entries = get_status_files(repo)
     assert_file_set(entries, ["gone.txt"], msg="only the staged delete remains")
     assert_entry(
-        entries, "gone.txt", action="delete", dirty=True, staged=True, node_type="file",
+        entries,
+        "gone.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged delete must survive the refused cherry-pick",
     )
     assert_absent(entries, "feat.txt", msg="nothing from the source was applied")
@@ -7210,7 +8796,12 @@ def test_revert_refuses_staged_modify_flat(new_lore_repo):
     entries = get_status_files(repo)
     assert_file_set(entries, ["base.txt"], msg="only the staged modify remains")
     assert_entry(
-        entries, "base.txt", action="keep", dirty=True, staged=True, node_type="file",
+        entries,
+        "base.txt",
+        action="keep",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged modify must survive the refused revert",
     )
     assert os.path.exists(repo._fix_path("revertable.txt")), (
@@ -7246,7 +8837,12 @@ def test_revert_refuses_staged_delete_nested(new_lore_repo):
     entries = get_status_files(repo)
     assert_file_set(entries, ["pkg/sub/gone.txt"], msg="only the staged delete remains")
     assert_entry(
-        entries, "pkg/sub/gone.txt", action="delete", dirty=True, staged=True, node_type="file",
+        entries,
+        "pkg/sub/gone.txt",
+        action="delete",
+        dirty=True,
+        staged=True,
+        node_type="file",
         msg="staged nested delete must survive the refused revert",
     )
     assert os.path.exists(repo._fix_path("revertable.txt")), (
@@ -7266,7 +8862,9 @@ def test_merge_carry_nested_delete_clean(new_lore_repo):
     branch merge: the feature add lands clean and the nested delete carry is
     still reported as a pending action=delete/flagDirty after the auto-commit."""
     repo: Lore = new_lore_repo()
-    commit_base(repo, {"base.txt": "base original\n", "pkg/sub/victim.txt": "delete me\n"})
+    commit_base(
+        repo, {"base.txt": "base original\n", "pkg/sub/victim.txt": "delete me\n"}
+    )
     feat_rev = _feature_branch_with_add(repo)
     assert len(feat_rev) == 64
 
@@ -7282,10 +8880,17 @@ def test_merge_carry_nested_delete_clean(new_lore_repo):
         assert f.read() == "feature add\n", "feature add must land on disk"
 
     entries = get_status_files(repo)
-    assert_file_set(entries, ["pkg/sub/victim.txt"], msg="only the nested delete carry remains")
+    assert_file_set(
+        entries, ["pkg/sub/victim.txt"], msg="only the nested delete carry remains"
+    )
     assert_entry(
-        entries, "pkg/sub/victim.txt", action="delete", dirty=True, staged=False,
-        node_type="file", msg="nested dirty delete carry survives the clean merge",
+        entries,
+        "pkg/sub/victim.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        msg="nested dirty delete carry survives the clean merge",
     )
     assert_absent(entries, "feat.txt", msg="feature add is committed and clean")
     assert not os.path.exists(repo._fix_path("pkg/sub/victim.txt")), (
@@ -7312,10 +8917,17 @@ def test_cherrypick_carry_nested_delete_clean(new_lore_repo):
 
     assert os.path.exists(repo._fix_path("feat.txt"))
     entries = get_status_files(repo)
-    assert_file_set(entries, ["pkg/sub/victim.txt"], msg="only the nested delete carry remains")
+    assert_file_set(
+        entries, ["pkg/sub/victim.txt"], msg="only the nested delete carry remains"
+    )
     assert_entry(
-        entries, "pkg/sub/victim.txt", action="delete", dirty=True, staged=False,
-        node_type="file", msg="nested dirty delete carry survives the clean pick",
+        entries,
+        "pkg/sub/victim.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        msg="nested dirty delete carry survives the clean pick",
     )
     assert_absent(entries, "feat.txt", msg="picked file is committed and clean")
     assert not os.path.exists(repo._fix_path("pkg/sub/victim.txt")), (
@@ -7330,7 +8942,9 @@ def test_revert_carry_nested_delete_clean(new_lore_repo):
     carry is still reported as a pending action=delete/flagDirty after the revert
     auto-commit."""
     repo: Lore = new_lore_repo()
-    commit_base(repo, {"base.txt": "base original\n", "pkg/sub/victim.txt": "delete me\n"})
+    commit_base(
+        repo, {"base.txt": "base original\n", "pkg/sub/victim.txt": "delete me\n"}
+    )
 
     with repo.open_file("revertable.txt", "w+") as f:
         f.write("added in v2\n")
@@ -7346,13 +8960,22 @@ def test_revert_carry_nested_delete_clean(new_lore_repo):
 
     repo.revision_revert(rev_v2, offline=True)
 
-    assert not os.path.exists(repo._fix_path("revertable.txt")), "reverted add removed from disk"
+    assert not os.path.exists(repo._fix_path("revertable.txt")), (
+        "reverted add removed from disk"
+    )
     entries = get_status_files(repo)
     assert_absent(entries, "revertable.txt", msg="reverted add gone from status")
-    assert_file_set(entries, ["pkg/sub/victim.txt"], msg="only the nested delete carry remains")
+    assert_file_set(
+        entries, ["pkg/sub/victim.txt"], msg="only the nested delete carry remains"
+    )
     assert_entry(
-        entries, "pkg/sub/victim.txt", action="delete", dirty=True, staged=False,
-        node_type="file", msg="nested dirty delete carry survives the clean revert",
+        entries,
+        "pkg/sub/victim.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        msg="nested dirty delete carry survives the clean revert",
     )
     assert not os.path.exists(repo._fix_path("pkg/sub/victim.txt")), (
         "the carried dirty delete must keep the file absent on disk"
@@ -7406,8 +9029,13 @@ def test_merge_conflict_theirs_carry_nested_add(new_lore_repo):
         entries, ["new_dir/sub/added.txt"], msg="only the dirty-add carry should remain"
     )
     assert_entry(
-        entries, "new_dir/sub/added.txt", action="add", dirty=True, staged=False,
-        node_type="file", msg="nested dirty-add carry must survive a theirs resolve",
+        entries,
+        "new_dir/sub/added.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        msg="nested dirty-add carry must survive a theirs resolve",
     )
     assert_entry(entries, "new_dir", node_type="directory", action="add")
     assert_entry(entries, "new_dir/sub", node_type="directory", action="add")
@@ -7449,9 +9077,16 @@ def test_merge_conflict_theirs_carry_delete(new_lore_repo):
         assert f.read() == "feature\n", "resolve theirs must take feature's content"
 
     entries = get_status_files(repo)
-    assert_file_set(entries, ["victim.txt"], msg="only the dirty-delete carry should remain")
+    assert_file_set(
+        entries, ["victim.txt"], msg="only the dirty-delete carry should remain"
+    )
     assert_entry(
-        entries, "victim.txt", action="delete", dirty=True, staged=False, node_type="file",
+        entries,
+        "victim.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="dirty-delete carry must survive a theirs resolve",
     )
     assert_absent(entries, "conflict.txt", msg="resolved conflict is clean post-commit")
@@ -7493,12 +9128,21 @@ def test_cherrypick_conflict_theirs_carry_delete(new_lore_repo):
     repo.commit("cherry-pick resolved theirs", offline=True)
 
     with repo.open_file("conflict.txt", "r") as f:
-        assert f.read() == "source side\n", "resolve theirs takes the picked-revision side"
+        assert f.read() == "source side\n", (
+            "resolve theirs takes the picked-revision side"
+        )
 
     entries = get_status_files(repo)
-    assert_file_set(entries, ["victim.txt"], msg="only the dirty-delete carry should remain")
+    assert_file_set(
+        entries, ["victim.txt"], msg="only the dirty-delete carry should remain"
+    )
     assert_entry(
-        entries, "victim.txt", action="delete", dirty=True, staged=False, node_type="file",
+        entries,
+        "victim.txt",
+        action="delete",
+        dirty=True,
+        staged=False,
+        node_type="file",
         msg="dirty-delete carry must survive a theirs resolve",
     )
     assert_absent(entries, "conflict.txt", msg="resolved conflict is clean post-commit")
@@ -7547,8 +9191,13 @@ def test_revert_conflict_theirs_carry_nested_add(new_lore_repo):
         entries, ["new_dir/sub/added.txt"], msg="only the dirty-add carry should remain"
     )
     assert_entry(
-        entries, "new_dir/sub/added.txt", action="add", dirty=True, staged=False,
-        node_type="file", msg="nested dirty-add carry must survive a theirs resolve",
+        entries,
+        "new_dir/sub/added.txt",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        msg="nested dirty-add carry must survive a theirs resolve",
     )
     assert_entry(entries, "new_dir", node_type="directory", action="add")
     assert_entry(entries, "new_dir/sub", node_type="directory", action="add")
@@ -7562,7 +9211,9 @@ def test_revert_conflict_theirs_carry_nested_add(new_lore_repo):
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands")
+@pytest.mark.skip(
+    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
+)
 def test_merge_carry_dirty_move(new_lore_repo):
     """A dirty MOVE (rename on disk + dirty_move) survives a clean branch merge
     with its provenance intact: after the auto-commit the destination is still
@@ -7578,17 +9229,27 @@ def test_merge_carry_dirty_move(new_lore_repo):
     repo.branch_merge("feature", offline=True)
 
     entries = get_status_files(repo)
-    assert_file_set(entries, ["new.txt"], msg="only the carried move destination remains")
+    assert_file_set(
+        entries, ["new.txt"], msg="only the carried move destination remains"
+    )
     assert_entry(
-        entries, "new.txt", action="move", dirty=True, staged=False, node_type="file",
-        from_path="old.txt", msg="dirty move carry must keep move provenance through merge",
+        entries,
+        "new.txt",
+        action="move",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        from_path="old.txt",
+        msg="dirty move carry must keep move provenance through merge",
     )
     assert_absent(entries, "old.txt", msg="move source must not reappear after merge")
     assert_absent(entries, "feat.txt", msg="feature add is committed and clean")
 
 
 @pytest.mark.smoke
-@pytest.mark.skip(reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands")
+@pytest.mark.skip(
+    reason="move/copy not fully implemented yet; asserts the intended behavior, re-enable when full move/copy support lands"
+)
 def test_cherrypick_carry_dirty_copy(new_lore_repo):
     """A dirty COPY survives a clean cherry-pick with its provenance intact:
     after the pick commit the destination is still reported action=copy/
@@ -7604,10 +9265,18 @@ def test_cherrypick_carry_dirty_copy(new_lore_repo):
     repo.revision_cherry_pick(source_rev, offline=True)
 
     entries = get_status_files(repo)
-    assert_file_set(entries, ["copy.txt"], msg="only the carried copy destination remains")
+    assert_file_set(
+        entries, ["copy.txt"], msg="only the carried copy destination remains"
+    )
     assert_entry(
-        entries, "copy.txt", action="copy", dirty=True, staged=False, node_type="file",
-        from_path="orig.txt", msg="dirty copy carry must keep copy provenance through pick",
+        entries,
+        "copy.txt",
+        action="copy",
+        dirty=True,
+        staged=False,
+        node_type="file",
+        from_path="orig.txt",
+        msg="dirty copy carry must keep copy provenance through pick",
     )
     assert_absent(entries, "feat.txt", msg="picked file is committed and clean")
     assert_absent(entries, "orig.txt", msg="copy source is unchanged")
@@ -7637,7 +9306,12 @@ def test_emptydir_scan_add_detected_and_persists(new_lore_repo):
 
     persisted = get_status_files(repo)
     assert_entry(
-        persisted, "empty", action="add", dirty=True, staged=False, node_type="directory",
+        persisted,
+        "empty",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="directory",
         msg="scanned empty-directory add must persist into a no-scan status",
     )
 
@@ -7671,10 +9345,14 @@ def test_emptydir_stage_scan_commit_retained(new_lore_repo):
     repo.commit("add empty directory", offline=True)
 
     dump = repo.repository_dump()
-    assert "empty/" in dump, f"committed empty directory should appear in the tree:\n{dump}"
+    assert "empty/" in dump, (
+        f"committed empty directory should appear in the tree:\n{dump}"
+    )
 
     entries = get_status_files(repo)
-    assert entries == [], f"status should be clean after commit, got {summarize(entries)}"
+    assert entries == [], (
+        f"status should be clean after commit, got {summarize(entries)}"
+    )
     scanned = get_status_files_twice(repo, scan=True)
     assert scanned == [], f"--scan status should be clean, got {summarize(scanned)}"
 
@@ -7692,14 +9370,24 @@ def test_emptydir_dirty_mark_then_stage(new_lore_repo):
 
     marked = get_status_files(repo)
     assert_entry(
-        marked, "empty", action="add", dirty=True, staged=False, node_type="directory",
+        marked,
+        "empty",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="directory",
         msg="file dirty must mark a new empty directory as a dirty add",
     )
 
     repo.stage(offline=True)
     staged = get_status_files(repo)
     assert_entry(
-        staged, "empty", action="add", dirty=True, staged=True, node_type="directory",
+        staged,
+        "empty",
+        action="add",
+        dirty=True,
+        staged=True,
+        node_type="directory",
         msg="default stage promotes the dirty-marked empty directory",
     )
 
@@ -7717,8 +9405,12 @@ def test_emptydir_reset_dirty_add_keeps_dir(new_lore_repo):
     repo.reset(["empty"], offline=True)
 
     entries = get_status_files(repo)
-    assert_absent(entries, "empty", msg="reset discards the empty-directory add tracking")
-    assert repo.path_exists("empty"), "reset without --purge keeps the empty directory on disk"
+    assert_absent(
+        entries, "empty", msg="reset discards the empty-directory add tracking"
+    )
+    assert repo.path_exists("empty"), (
+        "reset without --purge keeps the empty directory on disk"
+    )
 
 
 @pytest.mark.smoke
@@ -7734,8 +9426,12 @@ def test_emptydir_reset_purge_removes_dir(new_lore_repo):
     repo.reset(["empty"], purge=True, offline=True)
 
     entries = get_status_files(repo)
-    assert_absent(entries, "empty", msg="purged empty-directory add is gone from status")
-    assert not repo.path_exists("empty"), "reset --purge removes the empty directory from disk"
+    assert_absent(
+        entries, "empty", msg="purged empty-directory add is gone from status"
+    )
+    assert not repo.path_exists("empty"), (
+        "reset --purge removes the empty directory from disk"
+    )
 
 
 @pytest.mark.smoke
@@ -7753,10 +9449,15 @@ def test_emptydir_delete_committed_scan_detected(new_lore_repo):
 
     scanned = get_status_files_twice(repo, scan=True)
     assert_entry(
-        scanned, "gone", action="delete", node_type="directory",
+        scanned,
+        "gone",
+        action="delete",
+        node_type="directory",
         msg="removing a committed empty directory is a scan-detected delete",
     )
-    assert_file_set(scanned, [], msg="empty-directory delete contributes no file entries")
+    assert_file_set(
+        scanned, [], msg="empty-directory delete contributes no file entries"
+    )
 
 
 @pytest.mark.smoke
@@ -7790,16 +9491,29 @@ def test_emptydir_switch_carries_dirty_add(new_lore_repo):
     get_status_files_twice(repo, scan=True)
 
     pre = get_status_files(repo)
-    assert_entry(pre, "carried", action="add", node_type="directory", msg="dirty add before switch")
+    assert_entry(
+        pre,
+        "carried",
+        action="add",
+        node_type="directory",
+        msg="dirty add before switch",
+    )
 
     repo.branch_switch("other", offline=True)
 
     entries = get_status_files(repo)
     assert_entry(
-        entries, "carried", action="add", dirty=True, staged=False, node_type="directory",
+        entries,
+        "carried",
+        action="add",
+        dirty=True,
+        staged=False,
+        node_type="directory",
         msg="empty-directory dirty add carried across same-revision switch",
     )
-    assert repo.path_exists("carried"), "carried empty directory remains on disk after switch"
+    assert repo.path_exists("carried"), (
+        "carried empty directory remains on disk after switch"
+    )
 
 
 @pytest.mark.smoke
@@ -7816,7 +9530,11 @@ def test_emptydir_commit_on_branch_then_switch_reverts(new_lore_repo):
     assert "feat_dir/" in repo.repository_dump(), "empty dir committed on feature"
 
     repo.branch_switch("main", offline=True)
-    assert not repo.path_exists("feat_dir"), "empty dir absent on main after switch away"
+    assert not repo.path_exists("feat_dir"), (
+        "empty dir absent on main after switch away"
+    )
 
     repo.branch_switch("feature", offline=True)
-    assert repo.path_exists("feat_dir"), "empty dir restored when switching back to feature"
+    assert repo.path_exists("feat_dir"), (
+        "empty dir restored when switching back to feature"
+    )

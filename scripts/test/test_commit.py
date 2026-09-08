@@ -428,9 +428,7 @@ def test_failed_commit_records_no_modified_times(new_lore_repo):
         f"was {revision_before}, now {revision_after}"
     )
 
-    summary = parse_status_summary_json(
-        repo.status(scan=True, json=True, offline=True)
-    )
+    summary = parse_status_summary_json(repo.status(scan=True, json=True, offline=True))
     assert summary is not None, "scan must emit a repositoryStatusSummary event"
     assert summary["mtimeMatches"] == 0, (
         "no file may be answered by a modified time the failed commit took, as the working "

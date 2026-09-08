@@ -216,7 +216,7 @@ def test_file(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_file_reset_view(new_lore_repo, tmp_path_factory):
+def test_file_reset_view(new_lore_repo, scratch_dir):
     repo: Lore = new_lore_repo("FileResetView")
 
     # Mix of file-level and whole-subdir view filtering. Every directory that
@@ -245,7 +245,7 @@ def test_file_reset_view(new_lore_repo, tmp_path_factory):
         files[path] = [f"{path}\n"]
     repo.write_commit_push("Initial commit", files)
 
-    view_dir = tmp_path_factory.mktemp("file-reset-view")
+    view_dir = scratch_dir("file-reset-view", create=True)
     view_path = os.path.join(view_dir, "view.txt")
     with open(view_path, "w+") as view_file:
         view_file.write("/" + drop_top + "\n")

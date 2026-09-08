@@ -20,17 +20,16 @@ def parse_resolve_events(output: str) -> list[str]:
             continue
         try:
             parsed = json.loads(line)
-            if (
-                parsed.get("tagName") == "branchMergeResolveFile"
-                and "data" in parsed
-            ):
+            if parsed.get("tagName") == "branchMergeResolveFile" and "data" in parsed:
                 resolved.append(parsed["data"]["path"])
         except (json.JSONDecodeError, KeyError):
             continue
     return resolved
 
 
-def setup_merge_conflict(repo: Lore, files: dict[str, tuple[list[str], list[str], list[str]]]):
+def setup_merge_conflict(
+    repo: Lore, files: dict[str, tuple[list[str], list[str], list[str]]]
+):
     """Set up a merge conflict scenario with multiple files.
 
     Args:
@@ -55,20 +54,14 @@ def setup_merge_conflict(repo: Lore, files: dict[str, tuple[list[str], list[str]
     repo.write_commit_push("Current changes", current_contents, offline=True)
 
     # Merge incoming into current to trigger conflicts
-    repo.branch_merge_start(
-        "incoming", no_commit=True, check=False, offline=True
-    )
+    repo.branch_merge_start("incoming", no_commit=True, check=False, offline=True)
 
 
 def get_conflicted_paths(repo: Lore) -> set[str]:
     """Return the set of file paths that are unresolved conflicts via JSON status."""
     raw = repo.status(offline=True, json=True)
     entries = parse_status_json(raw)
-    return {
-        e["path"]
-        for e in entries
-        if e.get("flagConflictUnresolved") is True
-    }
+    return {e["path"] for e in entries if e.get("flagConflictUnresolved") is True}
 
 
 def get_resolved_paths(repo: Lore) -> set[str]:
@@ -86,11 +79,7 @@ def get_merged_paths(repo: Lore) -> set[str]:
     """Return the set of file paths that are merged via JSON status."""
     raw = repo.status(offline=True, json=True)
     entries = parse_status_json(raw)
-    return {
-        e["path"]
-        for e in entries
-        if e.get("flagMerged") is True
-    }
+    return {e["path"] for e in entries if e.get("flagMerged") is True}
 
 
 # ---------------------------------------------------------------------------
@@ -116,9 +105,15 @@ def test_merge_resolve_directory(new_lore_repo):
 
     # All three files should be conflicted
     conflicted = get_conflicted_paths(repo)
-    assert "src/a.txt" in conflicted, f"src/a.txt should be conflicted, got {conflicted}"
-    assert "src/b.txt" in conflicted, f"src/b.txt should be conflicted, got {conflicted}"
-    assert "other/c.txt" in conflicted, f"other/c.txt should be conflicted, got {conflicted}"
+    assert "src/a.txt" in conflicted, (
+        f"src/a.txt should be conflicted, got {conflicted}"
+    )
+    assert "src/b.txt" in conflicted, (
+        f"src/b.txt should be conflicted, got {conflicted}"
+    )
+    assert "other/c.txt" in conflicted, (
+        f"other/c.txt should be conflicted, got {conflicted}"
+    )
 
     # Manually resolve the files under src/ by writing clean content
     for path in ["src/a.txt", "src/b.txt"]:
@@ -229,13 +224,15 @@ def test_merge_resolve_multiple_paths(new_lore_repo):
             f.writelines(["line1\n", "line2 merged\n", "line3\n"])
 
     # Resolve a.txt and c.txt explicitly
-    output = repo.branch_merge_resolve(
-        ["a.txt", "c.txt"], offline=True, json=True
-    )
+    output = repo.branch_merge_resolve(["a.txt", "c.txt"], offline=True, json=True)
     resolved_events = parse_resolve_events(output)
 
-    assert "a.txt" in resolved_events, f"a.txt should be resolved, got {resolved_events}"
-    assert "c.txt" in resolved_events, f"c.txt should be resolved, got {resolved_events}"
+    assert "a.txt" in resolved_events, (
+        f"a.txt should be resolved, got {resolved_events}"
+    )
+    assert "c.txt" in resolved_events, (
+        f"c.txt should be resolved, got {resolved_events}"
+    )
     assert "b.txt" not in resolved_events, (
         f"b.txt should NOT be resolved, got {resolved_events}"
     )
@@ -531,7 +528,9 @@ def test_merge_resolve_nested_directories(new_lore_repo):
     assert "src/core/util/b.txt" not in still_conflicted, (
         "src/core/util/b.txt should be resolved"
     )
-    assert "src/other/c.txt" in still_conflicted, "src/other/c.txt should still be conflicted"
+    assert "src/other/c.txt" in still_conflicted, (
+        "src/other/c.txt should still be conflicted"
+    )
     assert "docs/d.txt" in still_conflicted, "docs/d.txt should still be conflicted"
 
     # Verify content of resolved files
@@ -584,6 +583,8 @@ def test_merge_resolve_mine_no_paths(new_lore_repo):
         )
 
     repo.commit("Resolved all with mine (no paths)", offline=True)
+
+
 # ---------------------------------------------------------------------------
 # Test: a final line without a newline survives resolve unchanged
 # ---------------------------------------------------------------------------
@@ -602,9 +603,7 @@ THEIRS_NO_EOL = b"line 1\nline 2 theirs"
 def test_merge_conflict_markers_own_line_without_trailing_newline(new_lore_repo):
     """Every marker starts a line even when the conflicting hunk has no EOL."""
     repo: Lore = new_lore_repo()
-    setup_merge_conflict(
-        repo, {"a.txt": (BASE_NO_EOL, MINE_NO_EOL, THEIRS_NO_EOL)}
-    )
+    setup_merge_conflict(repo, {"a.txt": (BASE_NO_EOL, MINE_NO_EOL, THEIRS_NO_EOL)})
 
     with repo.open_file("a.txt", "rb") as f:
         conflicted = f.read().decode()
@@ -621,9 +620,7 @@ def test_merge_conflict_markers_own_line_without_trailing_newline(new_lore_repo)
 def test_merge_resolve_mine_restores_missing_trailing_newline(new_lore_repo):
     """resolve mine gives back the committed bytes, without the marker newline."""
     repo: Lore = new_lore_repo()
-    setup_merge_conflict(
-        repo, {"a.txt": (BASE_NO_EOL, MINE_NO_EOL, THEIRS_NO_EOL)}
-    )
+    setup_merge_conflict(repo, {"a.txt": (BASE_NO_EOL, MINE_NO_EOL, THEIRS_NO_EOL)})
 
     repo.branch_merge_resolve_mine(["a.txt"], offline=True, json=True)
 
@@ -640,9 +637,7 @@ def test_merge_resolve_mine_restores_missing_trailing_newline(new_lore_repo):
 def test_merge_resolve_theirs_restores_missing_trailing_newline(new_lore_repo):
     """resolve theirs gives back the committed bytes, without the marker newline."""
     repo: Lore = new_lore_repo()
-    setup_merge_conflict(
-        repo, {"a.txt": (BASE_NO_EOL, MINE_NO_EOL, THEIRS_NO_EOL)}
-    )
+    setup_merge_conflict(repo, {"a.txt": (BASE_NO_EOL, MINE_NO_EOL, THEIRS_NO_EOL)})
 
     repo.branch_merge_resolve_theirs(["a.txt"], offline=True, json=True)
 

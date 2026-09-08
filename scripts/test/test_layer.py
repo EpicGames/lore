@@ -108,9 +108,7 @@ def test_layer_add_list_remove(new_lore_repo):
     # Remove the second layer and verify only the third remains.
     remove_output = repo.layer_remove("sec", second_repo, json=True)
     remove_event = parse_layer_remove_json(remove_output)
-    assert remove_event is not None, (
-        f"Expected layerRemove event, got: {remove_output}"
-    )
+    assert remove_event is not None, f"Expected layerRemove event, got: {remove_output}"
     assert remove_event.get("targetPath") == "sec"
     assert remove_event.get("forced") == 0
     assert remove_event.get("purged") == 0
@@ -695,9 +693,7 @@ def test_layer_branch_switch_sync_latest(new_lore_repo):
 
     # Make another commit on the main branch to diverge layer states
     repo.branch_switch("main")
-    repo.write_commit_push(
-        None, {os.path.join("lay", "layer_file.txt"): b"main v2"}
-    )
+    repo.write_commit_push(None, {os.path.join("lay", "layer_file.txt"): b"main v2"})
 
     # Switch back to evolving - should be at the feature revision
     repo.branch_switch("evolving")
@@ -746,9 +742,7 @@ def test_layer_branch_switch_name_collision(new_lore_repo):
     # Commit unique content on it so we can verify independence later.
     layer_repo.branch_create("colliding-name")
     layer_repo.push()
-    layer_repo.write_commit_push(
-        None, {"lay/layer.txt": b"layer original branch"}
-    )
+    layer_repo.write_commit_push(None, {"lay/layer.txt": b"layer original branch"})
     layer_repo.branch_switch("main")
 
     # Add the layer while on main branch (layer_add checks by branch ID,
@@ -848,11 +842,13 @@ def test_layer_stage_root_dot(new_lore_repo):
     status_output = repo.status(json=True)
     status_entries = parse_status_json(status_output)
     paths = sorted(e.get("path") for e in status_entries)
-    expected = sorted([
-        "root_repo.txt",
-        "sec/second/second_repo.txt",
-        "thr/third_repo.txt",
-    ])
+    expected = sorted(
+        [
+            "root_repo.txt",
+            "sec/second/second_repo.txt",
+            "thr/third_repo.txt",
+        ]
+    )
     assert paths == expected, (
         f"Expected staged entries {expected}, got {paths}: {status_entries}"
     )
@@ -889,11 +885,13 @@ def test_layer_stage_ancestor(new_lore_repo):
     status_output = repo.status(json=True)
     status_entries = parse_status_json(status_output)
     paths = sorted(e.get("path") for e in status_entries)
-    expected = sorted([
-        "root_repo.txt",
-        "sec/second/second_repo.txt",
-        "thr/third_repo.txt",
-    ])
+    expected = sorted(
+        [
+            "root_repo.txt",
+            "sec/second/second_repo.txt",
+            "thr/third_repo.txt",
+        ]
+    )
     assert paths == expected, (
         f"Expected staged entries {expected}, got {paths}: {status_entries}"
     )
@@ -1344,8 +1342,7 @@ def test_status_unstaged_layer_file_deleted(new_lore_repo):
         e for e in status_entries if e.get("path") == "lay/layer_file.txt"
     )
     assert deleted_entry.get("action") == "delete", (
-        f"Expected deleted layer file to be reported as 'delete', got: "
-        f"{deleted_entry}"
+        f"Expected deleted layer file to be reported as 'delete', got: {deleted_entry}"
     )
 
 
@@ -1399,8 +1396,7 @@ def test_status_unstaged_mixed_parent_and_layer(new_lore_repo):
     # Each entry should be a modification, not an add.
     for entry in status_entries:
         assert entry.get("action") != "add", (
-            f"Expected entry to be reported as modified (not 'add'), got: "
-            f"{entry}"
+            f"Expected entry to be reported as modified (not 'add'), got: {entry}"
         )
 
 
@@ -1639,9 +1635,7 @@ def test_layer_remove_two_layers_non_overlapping(new_lore_repo):
     # The thr layer's mount is gone
     assert not os.path.exists(os.path.join(repo.path, "thr"))
     # The sec layer is untouched
-    assert os.path.isfile(
-        os.path.join(repo.path, "sec", "second", "second_repo.txt")
-    )
+    assert os.path.isfile(os.path.join(repo.path, "sec", "second", "second_repo.txt"))
 
 
 def _setup_layer_behind(new_lore_repo, advance_layer: bool):
@@ -2365,9 +2359,10 @@ def test_layer_config_save_leaves_no_temporary_file(new_lore_repo):
     config_path = _layer_config_path(repo)
     with open(config_path, "rb") as config_file:
         config = tomllib.load(config_file)
-    assert sorted(layer["target_path"] for layer in config["layers"]) == ["lay", "sec"], (
-        f"Expected both layers in the saved config, got {config}"
-    )
+    assert sorted(layer["target_path"] for layer in config["layers"]) == [
+        "lay",
+        "sec",
+    ], f"Expected both layers in the saved config, got {config}"
 
     assert not os.path.exists(config_path + ".tmp"), (
         "A successful save left its temporary file behind"
@@ -2394,9 +2389,10 @@ def test_layer_config_save_replaces_stale_temporary_file(new_lore_repo):
 
     with open(config_path, "rb") as config_file:
         config = tomllib.load(config_file)
-    assert sorted(layer["target_path"] for layer in config["layers"]) == ["lay", "sec"], (
-        f"Expected both layers in the saved config, got {config}"
-    )
+    assert sorted(layer["target_path"] for layer in config["layers"]) == [
+        "lay",
+        "sec",
+    ], f"Expected both layers in the saved config, got {config}"
 
     assert not os.path.exists(temp_path), (
         "The stale temporary file survived the save that should have consumed it"

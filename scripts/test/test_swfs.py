@@ -24,7 +24,9 @@ def test_no_swfs_clone_outside_service(new_lore_repo):
         lore.clone(vfs="swfs", use_shared_store=True)
 
 
-@pytest.mark.skip(reason="swfs is generally not available; test fails randomly under parallel execution")
+@pytest.mark.skip(
+    reason="swfs is generally not available; test fails randomly under parallel execution"
+)
 @pytest.mark.smoke
 def test_swfs_creates_external_dot_lore(new_lore_repo, background_lore_service):
     repo: Lore = new_lore_repo(
@@ -50,7 +52,9 @@ def test_swfs_creates_external_dot_lore(new_lore_repo, background_lore_service):
     assert os.path.exists(external_dot_lore)
 
 
-@pytest.mark.skip(reason="swfs is generally not available; test fails randomly under parallel execution")
+@pytest.mark.skip(
+    reason="swfs is generally not available; test fails randomly under parallel execution"
+)
 @pytest.mark.smoke
 def test_swfs_repo_prevents_creating_non_swfs_repo(
     new_lore_repo, background_lore_service
@@ -73,7 +77,9 @@ def test_swfs_repo_prevents_creating_non_swfs_repo(
         lore.clone(repo.path)
 
 
-@pytest.mark.skip(reason="swfs is generally not available; test fails randomly under parallel execution")
+@pytest.mark.skip(
+    reason="swfs is generally not available; test fails randomly under parallel execution"
+)
 @pytest.mark.smoke
 def test_swfs_repo_prevents_creating_non_swfs_repo_after_restart(
     new_lore_repo, lore_service_runner
@@ -99,7 +105,9 @@ def test_swfs_repo_prevents_creating_non_swfs_repo_after_restart(
         lore.clone(repo.path)
 
 
-@pytest.mark.skip(reason="swfs is generally not available; test fails randomly under parallel execution")
+@pytest.mark.skip(
+    reason="swfs is generally not available; test fails randomly under parallel execution"
+)
 @pytest.mark.smoke
 def test_swfs_repo_can_be_force_created_over(new_lore_repo, background_lore_service):
     repo: Lore = new_lore_repo(

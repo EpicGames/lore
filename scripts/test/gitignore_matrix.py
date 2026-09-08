@@ -20,6 +20,7 @@ Usage:
     python3 scripts/test/gitignore_matrix.py > \\
         lore-revision/tests/data/gitignore_ground_truth.rs
 """
+
 import itertools
 import os
 import shutil
@@ -33,13 +34,27 @@ from concurrent.futures import ThreadPoolExecutor
 # (`*.tmp`) wildcards all bite, and so that `d` has two subdirectories, `e`
 # exists at two different depths, and the tree reaches four levels.
 FILES = [
-    "a", "ab", "xa", "a.tmp", "b.log",
-    "d/a", "d/ab", "d/xa", "d/a.tmp", "d/b.log",
-    "d/e/a", "d/e/ab", "d/e/a.tmp",
-    "d/e/f/a", "d/e/f/a.tmp",
-    "d/g/a", "d/g/a.tmp",
-    "dd/a", "dd/e/a",
-    "e/a", "e/a.tmp",
+    "a",
+    "ab",
+    "xa",
+    "a.tmp",
+    "b.log",
+    "d/a",
+    "d/ab",
+    "d/xa",
+    "d/a.tmp",
+    "d/b.log",
+    "d/e/a",
+    "d/e/ab",
+    "d/e/a.tmp",
+    "d/e/f/a",
+    "d/e/f/a.tmp",
+    "d/g/a",
+    "d/g/a.tmp",
+    "dd/a",
+    "dd/e/a",
+    "e/a",
+    "e/a.tmp",
 ]
 DIRS = ["d", "d/e", "d/e/f", "d/g", "dd", "dd/e", "e"]
 
@@ -79,12 +94,39 @@ def single_patterns():
 # Representative set for the exclusion x inclusion product: every wildcard kind
 # in every position, at each depth.
 MATRIX = [
-    "**", "*", "/*",
-    "d", "/d", "d/", "/d/",
-    "*a", "a*", "*a*", "*.tmp", "?a", "[ad]",
-    "d/*", "d/**", "d/*/", "*/d", "**/d", "*/*",
-    "d/e", "/d/e", "d/e/", "d/*/a", "d/**/a", "**/a", "**/e/a", "*/e/a",
-    "d/e/*", "d/e/**", "d/e/f", "*/*/a", "**/*.tmp", "d/**/*.tmp",
+    "**",
+    "*",
+    "/*",
+    "d",
+    "/d",
+    "d/",
+    "/d/",
+    "*a",
+    "a*",
+    "*a*",
+    "*.tmp",
+    "?a",
+    "[ad]",
+    "d/*",
+    "d/**",
+    "d/*/",
+    "*/d",
+    "**/d",
+    "*/*",
+    "d/e",
+    "/d/e",
+    "d/e/",
+    "d/*/a",
+    "d/**/a",
+    "**/a",
+    "**/e/a",
+    "*/e/a",
+    "d/e/*",
+    "d/e/**",
+    "d/e/f",
+    "*/*/a",
+    "**/*.tmp",
+    "d/**/*.tmp",
 ]
 
 # Smaller set for three-rule alternation, so the product stays bounded.
@@ -150,16 +192,20 @@ def run(case):
     kind, patterns = case
     root = tempfile.mkdtemp(prefix="gimatrix-")
     try:
-        subprocess.run(["git", "init", "-q"], cwd=root, check=True,
-                       capture_output=True)
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True, capture_output=True)
         with open(os.path.join(root, ".gitignore"), "w") as f:
             f.write("\n".join(patterns) + "\n")
         for rel in FILES:
             full = os.path.join(root, rel)
             os.makedirs(os.path.dirname(full), exist_ok=True)
             open(full, "a").close()
-        st = subprocess.run(["git", "status", "--porcelain", "-uall"],
-                            cwd=root, capture_output=True, text=True, check=True)
+        st = subprocess.run(
+            ["git", "status", "--porcelain", "-uall"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
         untracked = set()
         for line in st.stdout.splitlines():
             if line.startswith("?? "):
@@ -222,8 +268,10 @@ def emit(results):
     w(f"pub const DIRS: &[&str] = {rs_list(DIRS)};\n\n")
     w("pub const CASES: &[Case] = &[\n")
     for kind, patterns, mask in results:
-        w(f"    Case {{ kind: {rs_str(kind)}, patterns: {rs_list(patterns)}, "
-          f"included: {mask:#x} }},\n")
+        w(
+            f"    Case {{ kind: {rs_str(kind)}, patterns: {rs_list(patterns)}, "
+            f"included: {mask:#x} }},\n"
+        )
     w("];\n")
 
 

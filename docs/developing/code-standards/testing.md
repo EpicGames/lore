@@ -100,8 +100,39 @@ async fn test_with_isolated_state() {
 ### Fixtures
 
 - `new_lore_repo` — Creates a new test repository.
+- `scratch_dir` — Hands out a path beside the repositories for the test to create
+  something at: a shared store, a clone target, a moved instance.
 - `lore_executable_path` — Path to the Lore client binary.
 - `auto_lore_local_server` — Auto starts the server for the session.
+
+### Test data is removed as the run goes
+
+A full run writes about ten gigabytes, so nothing is kept once it is no longer
+needed. Cleanup is in two layers:
+
+1. **Per test.** `new_lore_repo` removes every repository it handed out and
+   every repository those went on to clone; `scratch_dir` removes every path it
+   handed out; `global_dir_name` removes the isolated global config and the
+   shared stores under it. All of this runs whether the test passed or failed.
+   A server built inside a test or a class fixture through
+   `generate_server_config` is removed at that same scope, after the fixture
+   that launched it has stopped it. An autouse fixture removes the per-test
+   `tmp_path`, which pytest itself only removes under the `failed` policy and
+   then only for tests that passed.
+2. **Per session.** `_SessionCleanup` in `lore_server.py` empties basetemp once
+   every worker has finished, taking the session server's root and anything a
+   per-test cleanup could not.
+
+**A test that creates files outside its repository must take `scratch_dir` and
+create them at a path it hands out.** Anything written straight to
+`tmp_path_factory.getbasetemp()` survives the test that made it and is only
+caught by the session sweep, which is a backstop, not the guard.
+
+Removal is best effort and never fails a test: a locked file is logged and left
+to the sweep.
+
+Pass `--keep-test-data` to keep everything on disk — repositories, stores,
+server roots and the server log — when investigating a failure.
 
 ### Usage
 
@@ -144,6 +175,7 @@ uv run pytest scripts/test/ --disable-local-server --lore-remote-url=lore://host
 | `--lore-remote-url` | `lore://127.0.0.1:41338` | Server address |
 | `--disable-local-server` | `false` | Use external server |
 | `--disable-auto-server` | `false` | Don't auto start the server |
+| `--keep-test-data` | `false` | Leave repositories, stores and server roots on disk |
 
 ### Per-test timeout
 
@@ -183,7 +215,8 @@ Lore has a load-testing suite that exercises concurrent clone, commit, sync, loc
 1. **All Lore commands must have smoke tests** in `scripts/test/`.
 2. **Use `LORE_CONTEXT.scope()`** for all async Rust tests.
 3. **Keep tests independent** — Avoid `#[serial]` and test dependencies; use isolated fixtures.
-4. **Use the `new_lore_repo` fixture** for smoke tests (handles cleanup).
+4. **Use the `new_lore_repo` fixture** for smoke tests, and `scratch_dir` for anything
+   a test creates outside its repository — both remove what they hand out.
 5. **Mark tests** with `@pytest.mark.smoke` for smoke test runs.
 6. **Use `offline=True`** for operations that don't need the server.
 7. **Feature-gate integration tests** that require external dependencies.

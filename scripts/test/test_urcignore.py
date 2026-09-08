@@ -257,9 +257,7 @@ def test_urcignore_branch_switch_preserves_ignored_file(new_lore_repo):
 
     # Verify the ignored file is not tracked
     output = repo.repository_status(unstaged=True)
-    assert "code-workspace" not in output, (
-        "ignored file should not appear in status"
-    )
+    assert "code-workspace" not in output, "ignored file should not appear in status"
 
     # -- Create feature branch and add a tracked file --
     repo.branch_create("feature")

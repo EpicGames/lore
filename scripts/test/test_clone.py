@@ -54,9 +54,7 @@ def test_clone_status_behind_remote_not_divergent(new_lore_repo):
     assert entry["revisionRemoteNumber"] > entry["revisionLocalNumber"], (
         f"Remote should be strictly ahead by revision number: {entry}"
     )
-    assert entry["isRemoteAhead"] == 1, (
-        f"Status should report remote ahead: {entry}"
-    )
+    assert entry["isRemoteAhead"] == 1, f"Status should report remote ahead: {entry}"
     assert entry["isLocalAhead"] == 0, (
         f"Status must NOT report local ahead — clone_a has no local commits "
         f"beyond what the remote has: {entry}"
@@ -106,16 +104,12 @@ def test_clone_by_branch_id(new_lore_repo):
 
     feature_branch = "feature-branch"
     repo.branch_create(feature_branch)
-    repo.write_commit_push(
-        "Feature commit", {"file.txt": ["main content\nfeature\n"]}
-    )
+    repo.write_commit_push("Feature commit", {"file.txt": ["main content\nfeature\n"]})
 
     # Read the branch ID for the feature branch
     info_output = repo.branch_info(feature_branch, json=True)
     info_entries = parse_jsonl(info_output, "branchInfo")
-    assert len(info_entries) == 1, (
-        f"Expected one branchInfo entry, got {info_entries}"
-    )
+    assert len(info_entries) == 1, f"Expected one branchInfo entry, got {info_entries}"
     branch_id = info_entries[0]["id"]
 
     # Clone by branch ID — must succeed and end up on the requested branch
@@ -149,11 +143,14 @@ def test_clone_direct_file_write(new_lore_repo):
     """
     repo: Lore = new_lore_repo()
 
-    repo.write_commit_push("Initial commit", {
-        "text.txt": "hello world\n",
-        "subdir/nested.txt": "nested content\n",
-        "binary.bin": b"\x00\x01\x02\xff" * 256,
-    })
+    repo.write_commit_push(
+        "Initial commit",
+        {
+            "text.txt": "hello world\n",
+            "subdir/nested.txt": "nested content\n",
+            "binary.bin": b"\x00\x01\x02\xff" * 256,
+        },
+    )
 
     clone = repo.clone(direct_file_write=True)
 

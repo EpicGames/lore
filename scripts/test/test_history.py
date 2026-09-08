@@ -85,8 +85,12 @@ def test_file_history_oneline(new_lore_repo):
         parts = line.split(maxsplit=1)
         assert len(parts) == 2, f"Expected 'revision message' format, got: {line}"
         revision_number, message = parts
-        assert revision_number.isdigit(), f"Revision should be numeric, got: {revision_number}"
-        assert len(message) > 0, f"Message should not be empty for revision {revision_number}"
+        assert revision_number.isdigit(), (
+            f"Revision should be numeric, got: {revision_number}"
+        )
+        assert len(message) > 0, (
+            f"Message should not be empty for revision {revision_number}"
+        )
 
     # Verify the messages match what we committed (newest first)
     parts = [line.split(maxsplit=1) for line in lines]

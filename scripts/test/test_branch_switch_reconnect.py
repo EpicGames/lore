@@ -40,7 +40,6 @@ import socket
 import subprocess
 import sys
 import time
-from pathlib import Path
 
 import pytest
 
@@ -144,6 +143,7 @@ def _wait_for_port_free(host: str, port: int, deadline_s: float = 10.0) -> None:
 def test_sync_survives_mid_flight_disconnect(
     request,
     tmp_path_factory,
+    scratch_dir,
     global_dir_name,
     lore_executable_path,
     lore_server_executable_path,
@@ -204,8 +204,7 @@ def test_sync_survives_mid_flight_disconnect(
         # Spawn a fresh clone in a subprocess. This drives the multi-file
         # sync we want to interrupt, exercising the same realize_state ->
         # read_into_file -> remote_get_retry path as branch switch.
-        target_path = Path(tmp_path_factory.getbasetemp()) / f"target-{source.name}"
-        target_path.mkdir(exist_ok=True)
+        target_path = scratch_dir(f"target-{source.name}", unique=False, create=True)
 
         client_env = os.environ.copy()
         client_env["LORE_REMOTE_URL"] = test_remote_url

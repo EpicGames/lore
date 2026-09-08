@@ -54,15 +54,15 @@ def test_search_nearest_layer_metadata(new_lore_repo):
     with repo.open_file(os.path.join("lay", "data.txt"), "wb") as f:
         f.write(b"updated")
     repo.stage(scan=True)
-    repo.commit("no_match", layer_messages={"lay": "layer_diverged"}, non_interactive=True)
+    repo.commit(
+        "no_match", layer_messages={"lay": "layer_diverged"}, non_interactive=True
+    )
     repo.push()
 
     repo.branch_create("sn-pass")
     repo.push()
     output = repo.branch_switch("main", search_nearest=True, level="debug")
-    assert "search nearest: true" in output, (
-        "Expected debug log 'search nearest: true'"
-    )
+    assert "search nearest: true" in output, "Expected debug log 'search nearest: true'"
     assert "Found matching metadata" in output, (
         "Expected debug log confirming metadata match"
     )

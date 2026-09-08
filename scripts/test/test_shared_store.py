@@ -133,11 +133,11 @@ def verify_shared_store_repo(
 
 
 @pytest.mark.smoke
-def test_create(new_lore_repo, tmp_path_factory):
+def test_create(new_lore_repo, scratch_dir):
     repo: Lore = new_lore_repo(create_repo=False)
 
     # Create a shared store which will implicitly get set as the default
-    store1_containing_path = tmp_path_factory.getbasetemp() / "store1"
+    store1_containing_path = scratch_dir("store1")
     repo.shared_store_create(repo.remote, str(store1_containing_path))
     store1_path = _per_url_store_path(str(store1_containing_path), repo.remote)
 
@@ -148,7 +148,7 @@ def test_create(new_lore_repo, tmp_path_factory):
     )
 
     # Create a second shared store without making it the default
-    store2_containing_path = tmp_path_factory.getbasetemp() / "store2"
+    store2_containing_path = scratch_dir("store2")
     repo.shared_store_create(
         repo.remote, str(store2_containing_path), make_default=False
     )
@@ -187,7 +187,7 @@ def test_create(new_lore_repo, tmp_path_factory):
 
 
 @pytest.mark.smoke
-def test_create_bad_remote(new_lore_repo, tmp_path_factory):
+def test_create_bad_remote(new_lore_repo):
     repo: Lore = new_lore_repo(create_repo=False)
 
     random_remote_name = repo.generate_random_name()
@@ -197,7 +197,7 @@ def test_create_bad_remote(new_lore_repo, tmp_path_factory):
 
 
 @pytest.mark.smoke
-def test_double_create(new_lore_repo, tmp_path_factory):
+def test_double_create(new_lore_repo, scratch_dir):
     repo: Lore = new_lore_repo(create_repo=False)
 
     # Create a shared store at the default path twice, ensuring the second one fails
@@ -207,7 +207,7 @@ def test_double_create(new_lore_repo, tmp_path_factory):
         repo.shared_store_create(repo.remote)
 
     # Create a shared store at a custom path twice, ensuring the second one fails
-    store_path = tmp_path_factory.getbasetemp() / "double_created_store"
+    store_path = scratch_dir("double_created_store")
     repo.shared_store_create(repo.remote, str(store_path))
 
     with pytest.raises(ExistingSharedStore):
@@ -245,12 +245,10 @@ def test_create_repo(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_create_repo_custom_default(new_lore_repo, tmp_path_factory):
+def test_create_repo_custom_default(new_lore_repo, scratch_dir):
     # Create a different default shared store
     repo: Lore = new_lore_repo(create_repo=False)
-    default_store_base = str(
-        tmp_path_factory.getbasetemp() / Lore.generate_random_name("default_store")
-    )
+    default_store_base = str(scratch_dir("default_store"))
     repo.shared_store_create(repo.remote, default_store_base)
     default_store_path = _per_url_store_path(default_store_base, repo.remote)
 
@@ -273,12 +271,10 @@ def test_create_repo_custom_default(new_lore_repo, tmp_path_factory):
 
 
 @pytest.mark.smoke
-def test_create_repo_custom_non_default(new_lore_repo, tmp_path_factory, create_repo):
+def test_create_repo_custom_non_default(new_lore_repo, scratch_dir, create_repo):
     # Create a non-default shared store
     repo: Lore = new_lore_repo(create_repo=False)
-    non_default_store_base = str(
-        tmp_path_factory.getbasetemp() / Lore.generate_random_name("non_default_store")
-    )
+    non_default_store_base = str(scratch_dir("non_default_store"))
     repo.shared_store_create(repo.remote, non_default_store_base, make_default=False)
 
     # Create a repo using the non-default shared store and verify it used the correct immutable store
@@ -304,13 +300,11 @@ def test_create_repo_custom_non_default(new_lore_repo, tmp_path_factory, create_
 
 @pytest.mark.smoke
 def test_create_repo_relative_path(
-    new_lore_repo, tmp_path_factory, create_repo, monkeypatch
+    new_lore_repo, scratch_dir, create_repo, monkeypatch
 ):
     # Create a non-default shared store
     repo: Lore = new_lore_repo(create_repo=False)
-    non_default_store_path = str(
-        tmp_path_factory.getbasetemp() / Lore.generate_random_name("non_default_store")
-    )
+    non_default_store_path = str(scratch_dir("non_default_store"))
     try:
         non_default_store_relative_path = os.path.relpath(
             non_default_store_path, os.getcwd()
@@ -348,7 +342,7 @@ def test_create_repo_relative_path(
 
 
 @pytest.mark.smoke
-def test_create_two_repos(new_lore_repo, tmp_path_factory, create_repo):
+def test_create_two_repos(new_lore_repo, create_repo):
     # Set up a shared store to be shared between two repos
     repo: Lore = new_lore_repo(create_repo=False)
     repo.shared_store_create(repo.remote)
@@ -412,11 +406,11 @@ def test_create_two_repos(new_lore_repo, tmp_path_factory, create_repo):
 
 
 @pytest.mark.smoke
-def test_shared_store_remote_mismatch_rejected(new_lore_repo, tmp_path_factory):
+def test_shared_store_remote_mismatch_rejected(new_lore_repo, scratch_dir):
     """If a store's recorded remote URL does not match the repo's (e.g. a
     hand-edited or corrupted shared_store.toml), loading it is rejected rather than
     serving another endpoint's data."""
-    base = str(tmp_path_factory.getbasetemp() / Lore.generate_random_name("mismatch"))
+    base = str(scratch_dir("mismatch"))
     repo: Lore = new_lore_repo(create_repo=False)
     repo.repository_create(use_shared_store=True, shared_store_path=base)
 
@@ -447,7 +441,7 @@ def test_create_repo_remote_different_but_correct(new_lore_repo, create_repo):
 
 
 @pytest.mark.smoke
-def test_registry(new_lore_repo, tmp_path_factory):
+def test_registry(new_lore_repo, scratch_dir):
     repo: Lore = new_lore_repo(create_repo=False)
 
     # Create a shared store by creating a repository with --use-shared-store=true and ensure it's in the registry.
@@ -465,8 +459,8 @@ def test_registry(new_lore_repo, tmp_path_factory):
     assert expected_list == repo.shared_store_list()
 
     # Create a shared store manually and ensure it's in the registry.
-    additional_shared_store_path = tmp_path_factory.mktemp(
-        "additional_shared_store_path"
+    additional_shared_store_path = scratch_dir(
+        "additional_shared_store_path", create=True
     )
     repo.shared_store_create(repo.remote, str(additional_shared_store_path))
 
@@ -494,14 +488,11 @@ def test_registry(new_lore_repo, tmp_path_factory):
 
 
 @pytest.mark.smoke
-def test_deleted_shared_store(new_lore_repo, tmp_path_factory):
+def test_deleted_shared_store(new_lore_repo, scratch_dir):
     """Deleting a repo's shared store out from under it surfaces as a missing
     store on the next command that loads the repo — the load path does not
     recreate it, only clone/create do."""
-    store_base = str(
-        tmp_path_factory.getbasetemp()
-        / Lore.generate_random_name("deleted_shared_store")
-    )
+    store_base = str(scratch_dir("deleted_shared_store"))
     repo: Lore = new_lore_repo(create_repo=False)
     repo.repository_create(use_shared_store=True, shared_store_path=store_base)
 
@@ -537,7 +528,7 @@ def test_set_and_get_automatic_shared_store(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_automatic_shared_store(new_lore_repo, tmp_path_factory, create_repo):
+def test_automatic_shared_store(new_lore_repo, create_repo):
     """With automatic usage enabled and no shared store yet, creating or cloning
     a repo creates the default-location shared store on demand instead of
     failing."""
@@ -597,12 +588,12 @@ def test_create_repo_creates_store_for_new_endpoint(new_lore_repo, create_repo):
 
 @pytest.mark.smoke
 def test_explicit_base_hosts_multiple_endpoints(
-    new_lore_repo, tmp_path_factory, create_repo
+    new_lore_repo, scratch_dir, create_repo
 ):
     """An explicit --shared-store-path is a base directory holding a per-URL
     store, so a second endpoint pointed at the same base gets its own store
     rather than colliding with the first."""
-    base = str(tmp_path_factory.getbasetemp() / Lore.generate_random_name("multi_base"))
+    base = str(scratch_dir("multi_base"))
 
     other_endpoint = "other.endpoint.example"
     other: Lore = new_lore_repo(create_repo=False)
@@ -623,14 +614,12 @@ def test_explicit_base_hosts_multiple_endpoints(
 @pytest.mark.smoke
 @pytest.mark.parametrize("legacy_config_file", [True, False])
 def test_legacy_store_migrated_to_per_url_dir(
-    new_lore_repo, tmp_path_factory, create_repo, legacy_config_file
+    new_lore_repo, scratch_dir, create_repo, legacy_config_file
 ):
     """A pre-per-URL store at <base>/shared_store whose recorded remote matches is
     moved into <base>/<remote>/shared_store on the next clone/create and loaded
     from there, rather than a new empty store being created alongside it."""
-    base = str(
-        tmp_path_factory.getbasetemp() / Lore.generate_random_name("legacy_base")
-    )
+    base = str(scratch_dir("legacy_base"))
 
     seed: Lore = new_lore_repo(create_repo=False)
     seed.shared_store_create(seed.remote, path=base, make_default=False)
@@ -655,13 +644,11 @@ def test_legacy_store_migrated_to_per_url_dir(
 
 @pytest.mark.smoke
 def test_legacy_store_not_migrated_for_different_remote(
-    new_lore_repo, tmp_path_factory, create_repo
+    new_lore_repo, scratch_dir, create_repo
 ):
     """A legacy <base>/shared_store recording a different remote is left in place;
     a fresh per-URL store is created for the repo's own remote alongside it."""
-    base = str(
-        tmp_path_factory.getbasetemp() / Lore.generate_random_name("legacy_other_base")
-    )
+    base = str(scratch_dir("legacy_other_base"))
 
     other_remote = "other.remote.example"
     seed: Lore = new_lore_repo(create_repo=False)
@@ -786,13 +773,11 @@ def test_shared_store_shared_mutable_cross_repo(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_shared_store_local_mutable_store_rejected(new_lore_repo, tmp_path_factory):
+def test_shared_store_local_mutable_store_rejected(new_lore_repo, scratch_dir):
     """If a repository has a local mutable/ directory but is configured to use
     a shared store, loading it should fail with an error instructing the user to
     reclone."""
-    store_containing_path = str(
-        tmp_path_factory.getbasetemp() / Lore.generate_random_name("gs_reject")
-    )
+    store_containing_path = str(scratch_dir("gs_reject"))
     repo: Lore = new_lore_repo(create_repo=False)
     repo.shared_store_create(repo.remote, store_containing_path)
 
@@ -813,13 +798,11 @@ def test_shared_store_local_mutable_store_rejected(new_lore_repo, tmp_path_facto
 
 
 @pytest.mark.smoke
-def test_shared_store_auto_upgrade_mutable_dir(new_lore_repo, tmp_path_factory):
+def test_shared_store_auto_upgrade_mutable_dir(new_lore_repo, scratch_dir):
     """If an existing shared store has no mutable/ directory (pre-upgrade),
     creating a new repository that uses it should auto-create the mutable/
     directory."""
-    store_containing_path = str(
-        tmp_path_factory.getbasetemp() / Lore.generate_random_name("gs_upgrade")
-    )
+    store_containing_path = str(scratch_dir("gs_upgrade"))
     repo: Lore = new_lore_repo(create_repo=False)
     repo.shared_store_create(repo.remote, store_containing_path)
     shared_store_path = _per_url_store_path(store_containing_path, repo.remote)
@@ -1270,15 +1253,13 @@ def test_config_get_invalid_key(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_update_path_after_move(new_lore_repo, tmp_path_factory):
+def test_update_path_after_move(new_lore_repo, scratch_dir):
     """After moving an instance directory, update-path should update the stored
     path so instance list reflects the new location."""
     repo_a, repo_b = create_shared_instances(new_lore_repo)
 
     # Move instance B to a new location
-    new_path = str(
-        tmp_path_factory.getbasetemp() / Lore.generate_random_name("moved_instance")
-    )
+    new_path = str(scratch_dir("moved_instance"))
     shutil.move(repo_b.path, new_path)
 
     # Create a new Lore wrapper pointing to the moved location
@@ -1347,13 +1328,10 @@ def test_background_prune_during_clone(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_backwards_compatible_with_old_location(new_lore_repo, tmp_path_factory):
+def test_backwards_compatible_with_old_location(new_lore_repo, scratch_dir):
     # Create a shared store at a non-default location
     repo: Lore = new_lore_repo(create_repo=False)
-    non_default_store_path = str(
-        tmp_path_factory.getbasetemp()
-        / Lore.generate_random_name("legacy_store_old_location")
-    )
+    non_default_store_path = str(scratch_dir("legacy_store_old_location"))
     repo.shared_store_create(repo.remote, non_default_store_path)
     shared_store_path = get_shared_store_info(repo).path
 
@@ -1395,12 +1373,10 @@ def test_backwards_compatible_with_old_location(new_lore_repo, tmp_path_factory)
 
 
 @pytest.mark.smoke
-def test_backwards_compatible_with_global_store(new_lore_repo, tmp_path_factory):
+def test_backwards_compatible_with_global_store(new_lore_repo, scratch_dir):
     # Create a shared store at a non-default location
     repo: Lore = new_lore_repo(create_repo=False)
-    non_default_store_path = str(
-        tmp_path_factory.getbasetemp() / Lore.generate_random_name("legacy_store")
-    )
+    non_default_store_path = str(scratch_dir("legacy_store"))
     repo.shared_store_create(repo.remote, non_default_store_path)
     shared_store_path = get_shared_store_info(repo).path
 
@@ -1444,7 +1420,7 @@ def test_backwards_compatible_with_global_store(new_lore_repo, tmp_path_factory)
 
 
 @pytest.mark.smoke
-def test_backwards_compatible_config_file(new_lore_repo, tmp_path_factory):
+def test_backwards_compatible_config_file(new_lore_repo):
     """A shared store with a config with the old file name will have it moved to the new file name when used"""
     repo: Lore = new_lore_repo(create_repo=False)
     repo.shared_store_create(repo.remote)
@@ -1472,7 +1448,7 @@ def test_backwards_compatible_config_file(new_lore_repo, tmp_path_factory):
 
 
 @pytest.mark.smoke
-def test_backwards_compatible_config_file_broken(new_lore_repo, tmp_path_factory):
+def test_backwards_compatible_config_file_broken(new_lore_repo):
     """A shared store with a config with the old file name that fails to migrate due to not parsing will still have the
     old file left alone"""
     repo: Lore = new_lore_repo(create_repo=False)

@@ -4,6 +4,7 @@ import pytest
 
 from lore import Lore
 
+
 @pytest.mark.regression
 @pytest.mark.bug_reproduction
 def test_metadata_only_change_is_stageable(new_lore_repo):
@@ -18,4 +19,6 @@ def test_metadata_only_change_is_stageable(new_lore_repo):
     repo.write_commit_push("base", {"f.txt": b"hello\n"})
     repo.file_metadata_set("f.txt", ["Temperature", "99"])
     output = repo.stage("f.txt")
-    assert "No changes staged" not in output, "metadata-only change was not detected by stage"
+    assert "No changes staged" not in output, (
+        "metadata-only change was not detected by stage"
+    )

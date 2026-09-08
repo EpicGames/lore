@@ -13,8 +13,8 @@ logger = logging.getLogger(__name__)
 
 
 @pytest.mark.smoke
-def test_view(new_lore_repo, tmp_path_factory):
-    view_dir = tmp_path_factory.mktemp("view")
+def test_view(new_lore_repo, scratch_dir):
+    view_dir = scratch_dir("view", create=True)
     repo: Lore = new_lore_repo()
     # Generate some files
     text_file = "text-File.txt"
@@ -149,7 +149,7 @@ def test_view(new_lore_repo, tmp_path_factory):
 
 @pytest.mark.smoke
 def test_view_clone_materializes_directory_emptied_by_filter(
-    new_lore_repo, tmp_path_factory
+    new_lore_repo, scratch_dir
 ):
     """Cloning with a view filter that excludes every child of a directory --
     but not the directory node itself -- still materializes the (now empty)
@@ -194,7 +194,7 @@ def test_view_clone_materializes_directory_emptied_by_filter(
 
     # Pure-exclusion view: `data/**` drops every descendant of `data` while the
     # `data` directory node itself stays in view.
-    view_dir = tmp_path_factory.mktemp("view")
+    view_dir = scratch_dir("view", create=True)
     view_path = os.path.join(view_dir, "view.txt")
     with open(view_path, "w+") as view_file:
         view_file.write("data/**\n")

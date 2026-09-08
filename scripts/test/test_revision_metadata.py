@@ -335,9 +335,7 @@ def test_revision_metadata_set_binary(new_lore_repo):
     with repo.open_file("metadata_payload.bin", "wb") as f:
         f.write(payload)
 
-    repo.revision_metadata_set(
-        ["build-artifact", "metadata_payload.bin"], binary=True
-    )
+    repo.revision_metadata_set(["build-artifact", "metadata_payload.bin"], binary=True)
 
     # Delete source file — data is already in immutable store
     repo.remove_file("metadata_payload.bin")

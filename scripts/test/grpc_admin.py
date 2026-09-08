@@ -41,5 +41,7 @@ def fetch_server_features(grpc_target: str, timeout: float = 10.0) -> set[str]:
             response_deserializer=_parse_features,
         )
         features = set(call(None, timeout=timeout))
-    logger.info("Server %s reports compiled features: %s", grpc_target, sorted(features))
+    logger.info(
+        "Server %s reports compiled features: %s", grpc_target, sorted(features)
+    )
     return features

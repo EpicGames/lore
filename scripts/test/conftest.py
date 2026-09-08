@@ -13,11 +13,12 @@ from time import sleep
 
 import pytest
 
+from cleanup_util import remove_tree
 from lore import Lore
 from lore_server import (
     _get_shared_tmp_dir,
     _get_worker_id,
-    _XdistControllerCleanup,
+    _SessionCleanup,
     allocate_free_port,
     generate_server_config,
     launch_lore_server,
@@ -111,15 +112,40 @@ def pytest_addoption(parser):
         default="info",
         help="RUST_LOG level for the Lore server (e.g. debug, info, warn)",
     )
+    parser.addoption(
+        "--keep-test-data",
+        action="store_true",
+        default=False,
+        help=(
+            "Leave repositories, stores and server roots on disk after the run. "
+            "Off by default: the suite writes about ten gigabytes per session, "
+            "so it is removed as it goes. Turn this on to inspect the state a "
+            "failing test left behind, including the server log."
+        ),
+    )
+
+
+@pytest.fixture(scope="session")
+def keep_test_data(request):
+    """Whether the run leaves its repositories and stores on disk."""
+    return request.config.getoption("--keep-test-data")
 
 
 @pytest.fixture(scope="function")
 def new_lore_repo(
-    lore_executable_path, lore_remote_url, tmp_path_factory, global_dir_name
+    lore_executable_path,
+    lore_remote_url,
+    tmp_path_factory,
+    global_dir_name,
+    keep_test_data,
 ):
     """
-    Returns a function that can be used to create a new lore repo
+    Returns a function that can be used to create a new lore repo.
+
+    Every repository handed out is removed when the test ends, whether it passed
+    or failed.
     """
+    created_paths: list[str] = []
 
     def _new_lore_repo(
         name=None,
@@ -133,6 +159,9 @@ def new_lore_repo(
             name = ""
         name = Lore.generate_random_name(name)
         path = str(tmp_path_factory.getbasetemp() / name)
+        # Recorded before the client is asked to create anything, so a
+        # repository that fails halfway through creation is still cleaned up.
+        created_paths.append(path)
         return Lore(
             lore_executable_path=lore_executable_path,
             path=path,
@@ -143,13 +172,75 @@ def new_lore_repo(
             remote_url=remote_url,
             repo_id=repo_id,
             create_repo=create_repo,
+            # Shared with the repository so anything it clones -- which lands
+            # beside it, not inside it -- is removed with the test as well.
+            created_paths=created_paths,
         )
 
-    return _new_lore_repo
+    yield _new_lore_repo
+
+    if keep_test_data:
+        return
+    # Newest first, so an instance created over another one's shared store goes
+    # before the store it points at.
+    for path in reversed(created_paths):
+        remove_tree(path, label="test repository")
+
+
+@pytest.fixture(autouse=True)
+def _remove_tmp_path(request, keep_test_data):
+    """Remove the per-test `tmp_path` when the test ends, pass or fail.
+
+    pytest has no retention policy that does this. "failed" removes the
+    directory only for tests that *passed*, and "none" governs how many previous
+    sessions' basetemps survive rather than anything per test, so a test taking
+    `tmp_path` would otherwise hold its directory until the end of the session.
+    Autouse, so this holds for tests added later without them having to know.
+
+    Read from `funcargs` rather than requested as a fixture: requesting it would
+    create a `tmp_path` for every test in the suite, and asking for it here only
+    to find out whether it exists would defeat the point.
+    """
+    yield
+    if keep_test_data:
+        return
+    tmp_path = request.node.funcargs.get("tmp_path")
+    if tmp_path is not None:
+        remove_tree(tmp_path, label="tmp_path")
 
 
 @pytest.fixture(scope="function")
-def global_dir_name(tmp_path_factory):
+def scratch_dir(tmp_path_factory, keep_test_data):
+    """Returns a function handing out paths beside the test's repositories for
+    the test to create things at -- shared stores, clone targets, instances --
+    each removed when the test ends, pass or fail.
+
+    Paths are handed out rather than created, because the Lore commands under
+    test expect to create the directory themselves; pass `create=True` for the
+    cases that need it to exist first. Names are suffixed to keep them unique
+    unless `unique=False` asks for the name verbatim.
+    """
+    created: list[Path] = []
+
+    def _scratch_dir(name: str, *, unique: bool = True, create: bool = False) -> Path:
+        if unique:
+            name = Lore.generate_random_name(name)
+        path = tmp_path_factory.getbasetemp() / name
+        created.append(path)
+        if create:
+            path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    yield _scratch_dir
+
+    if keep_test_data:
+        return
+    for path in reversed(created):
+        remove_tree(path, label="scratch directory")
+
+
+@pytest.fixture(scope="function")
+def global_dir_name(tmp_path_factory, keep_test_data):
     path = str(
         tmp_path_factory.getbasetemp() / Lore.generate_random_name("lore_global")
     )
@@ -157,6 +248,11 @@ def global_dir_name(tmp_path_factory):
     os.makedirs(path)
 
     yield path
+
+    if not keep_test_data:
+        # Torn down after new_lore_repo, which depends on this fixture, so the
+        # repositories are gone before the shared stores they were using.
+        remove_tree(path, label="global directory")
 
 
 def _service_unreachable(output):
@@ -220,13 +316,28 @@ class TrackedServices(object):
 
     def terminate(self, directory: str | None = None):
         process = self.service_processes.get(directory)
-        if process is not None:
+        if process is None:
+            return
+        # Ask before waiting. Without this the wait below had nothing to wait
+        # for -- the service was never told to stop -- so it burned its whole
+        # timeout and reached the kill every time, and each service test paid
+        # ten seconds to end. Already-exited processes are handled by
+        # send_signal, which polls first and does nothing if the process is
+        # gone.
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            logger.warning("Lore service did not exit on terminate, killing it")
+            process.kill()
             try:
+                # Reap it rather than leave a zombie for the rest of the
+                # session. Bounded, because on Windows kill() is the same
+                # TerminateProcess that has just failed to take effect.
                 process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                logger.warning("Lore service did not exit on terminate, killing it")
-                process.kill()
-            self.service_processes[directory] = None
+                logger.error("Lore service survived being killed, leaving it")
+        self.service_processes[directory] = None
 
     def terminate_all(self):
         for key in list(self.service_processes.keys()):
@@ -468,7 +579,12 @@ def lore_main_server_ports(request, tmp_path_factory):
 
 @pytest.fixture(scope="session")
 def lore_local_server_config(request, tmp_path_factory, lore_main_server_ports):
-    return generate_server_config(request, tmp_path_factory, lore_main_server_ports)
+    # remove_when_done=False: under xdist this server belongs to gw0 but serves
+    # every worker, so it is still in use when gw0's session ends. The
+    # controller's sweep takes its root once all of them have stopped.
+    return generate_server_config(
+        request, tmp_path_factory, lore_main_server_ports, remove_when_done=False
+    )
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -556,9 +672,9 @@ def auto_lore_local_server(
 
 
 def pytest_configure(config):
-    """Register the xdist controller cleanup plugin early so its
-    pytest_sessionfinish hook fires on the controller process."""
-    config.pluginmanager.register(_XdistControllerCleanup(), "lore_xdist_cleanup")
+    """Register the session cleanup plugin early so its pytest_sessionfinish
+    hook fires on the controller process."""
+    config.pluginmanager.register(_SessionCleanup(), "lore_session_cleanup")
     config.addinivalue_line(
         "markers", "regression: mark tests that don't run on every CI"
     )

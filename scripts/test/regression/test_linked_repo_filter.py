@@ -4,9 +4,9 @@ import os
 from lore import Lore
 
 
-def _write_view_filter(tmp_path_factory, *lines: str) -> str:
+def _write_view_filter(scratch_dir, *lines: str) -> str:
     """Write a view filter file holding `lines` and return its path."""
-    temp_path = tmp_path_factory.mktemp("viewfilter")
+    temp_path = scratch_dir("viewfilter", create=True)
     view_filter = os.path.join(temp_path, "view_filter.txt")
     with open(view_filter, "w+") as output_file:
         output_file.writelines(lines)
@@ -14,12 +14,12 @@ def _write_view_filter(tmp_path_factory, *lines: str) -> str:
 
 
 @pytest.mark.regression
-def test_view_filter_when_adding_linked_repo(new_lore_repo, tmp_path_factory):
+def test_view_filter_when_adding_linked_repo(new_lore_repo, scratch_dir):
     repo: Lore = new_lore_repo()
 
     repo.write_commit_push(None, {"a.txt": os.urandom(1024)})
 
-    cloned = repo.clone(view=_write_view_filter(tmp_path_factory, "/target_dir/c.txt"))
+    cloned = repo.clone(view=_write_view_filter(scratch_dir, "/target_dir/c.txt"))
 
     linked_repo: Lore = new_lore_repo()
     linked_repo.write_commit_push(

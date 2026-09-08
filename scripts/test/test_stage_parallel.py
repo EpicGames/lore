@@ -77,7 +77,9 @@ def _assert_staged_exactly(repo: Lore, expected: dict[str, tuple[str, str]]):
     got = _staged_map(repo)
     missing = {k: expected[k] for k in expected if k not in got}
     extra = {k: got[k] for k in got if k not in expected}
-    wrong = {k: (got[k], expected[k]) for k in expected if k in got and got[k] != expected[k]}
+    wrong = {
+        k: (got[k], expected[k]) for k in expected if k in got and got[k] != expected[k]
+    }
     assert not (missing or extra or wrong), (
         f"staged set mismatch (got {len(got)}, want {len(expected)}):\n"
         f"  missing={sorted(missing.items())[:12]}\n"
@@ -242,7 +244,9 @@ def _apply_mixed_changes(repo: Lore, files):
     deleted = set(files_sorted[3::13]) - modified
 
     new_subdirs = [f"d{t:03d}/nsub" for t in range(0, TOP_DIRS, 4)]
-    new_files = {f"{d}/nf{i:02d}.txt": "new file\n" for d in new_subdirs for i in range(3)}
+    new_files = {
+        f"{d}/nf{i:02d}.txt": "new file\n" for d in new_subdirs for i in range(3)
+    }
 
     repo.write_files({p: "modified content\n" for p in modified})
     for p in deleted:
@@ -297,16 +301,12 @@ def test_stage_noscan_mixed_dirty_overlapping(new_lore_repo):
 
     covered_tops = tops[: len(tops) // 2]
     overlap_subs = [s for s in subs if _covered(s, covered_tops)][::13]
-    overlap_files = [
-        p for p in changed if _covered(to_posix(p), covered_tops)
-    ][::17]
+    overlap_files = [p for p in changed if _covered(to_posix(p), covered_tops)][::17]
     repo.stage(
         covered_tops + overlap_subs + overlap_files,
         offline=True,
         relative_paths=True,
     )
 
-    expected = {
-        p: v for p, v in whole_expected.items() if _covered(p, covered_tops)
-    }
+    expected = {p: v for p, v in whole_expected.items() if _covered(p, covered_tops)}
     _assert_staged_exactly(repo, expected)

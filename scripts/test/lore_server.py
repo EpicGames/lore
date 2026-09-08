@@ -14,6 +14,9 @@ import sys
 from pathlib import Path
 from time import sleep
 
+import pytest
+
+from cleanup_util import remove_tree, remove_tree_contents
 from error_types import ServerException
 
 logger = logging.getLogger(__name__)
@@ -36,31 +39,62 @@ def lore_local_server(server_root, server_env, executable_path):
     server_log_fd.close()
 
 
-class _XdistControllerCleanup:
-    """Pytest plugin registered on the xdist controller to kill the shared
-    Lore server after all workers complete.  Registered via pytest_configure
-    so it is guaranteed to run on the controller process."""
+def _kill_shared_xdist_server(basetemp: Path) -> None:
+    """Kill the server gw0 launched for every worker to share, if it is running."""
+    info_path = basetemp / "lore_server_info.json"
+    if not info_path.exists():
+        return
+
+    info = json.loads(info_path.read_text())
+    if info.get("status") != "running":
+        return
+
+    pid = info["pid"]
+    log_path = Path(info["log_path"])
+    _kill_server_by_pid(pid, log_path, label="xdist controller")
+
+
+class _SessionCleanup:
+    """Pytest plugin that stops the shared Lore server and removes the session's
+    test data once every test has finished.  Registered via pytest_configure so
+    the hook is guaranteed to run on the xdist controller.
+
+    The sweep lives here rather than in a session fixture because the controller
+    is the only process that runs after all workers are done. A worker finishing
+    its own tests says nothing about the others, and gw0's basetemp holds the
+    store of the server every worker is still talking to.
+    """
 
     @staticmethod
+    @pytest.hookimpl(trylast=True)
     def pytest_sessionfinish(session, exitstatus):
-        # Only run on the xdist controller, not on workers or non-xdist runs
+        # trylast, so this runs after _pytest.runner's own pytest_sessionfinish.
+        # On a normal run the session fixtures are already finalized by then --
+        # the last item's teardown does it -- but on an interrupted or
+        # collection-error run that hook is what finalizes them, and it is
+        # registered earlier than this plugin, so without trylast the sweep
+        # would delete the session server's root while the server was still up.
+        #
+        # An xdist worker owns none of this: the controller sweeps every
+        # worker's basetemp below, once they have all stopped.
         if hasattr(session.config, "workerinput"):
-            return
-        if not session.config.pluginmanager.has_plugin("dsession"):
             return
 
         basetemp = session.config._tmp_path_factory.getbasetemp()
-        info_path = basetemp / "lore_server_info.json"
-        if not info_path.exists():
+
+        if session.config.pluginmanager.has_plugin("dsession"):
+            _kill_shared_xdist_server(basetemp)
+
+        if session.config.getoption("--keep-test-data"):
+            logger.info("Leaving test data in %s (--keep-test-data)", basetemp)
             return
 
-        info = json.loads(info_path.read_text())
-        if info.get("status") != "running":
-            return
-
-        pid = info["pid"]
-        log_path = Path(info["log_path"])
-        _kill_server_by_pid(pid, log_path, label="xdist controller")
+        # Backstop for everything the per-test fixtures could not take: the
+        # server roots and logs that had to outlive the tests using them, any
+        # path a test made for itself, and anything a locked file left behind.
+        # A run without xdist arrives here with its server already stopped,
+        # since session fixtures finalize before this hook.
+        remove_tree_contents(basetemp, label="session test data")
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +364,9 @@ def release_reserved_ports(server_env, label: str = "") -> None:
             sock.close()
 
 
-def generate_server_config(request, tmp_path_factory, ports: dict):
+def generate_server_config(
+    request, tmp_path_factory, ports: dict, *, remove_when_done: bool = True
+):
     def copy_server_configs(base_dir: Path, dest_dir: Path) -> None:
         cfg_src = base_dir / "lore-server" / "config"
         cfg_dst = dest_dir / "lore-server" / "config"
@@ -346,6 +382,19 @@ def generate_server_config(request, tmp_path_factory, ports: dict):
 
     server_root = tmp_path_factory.mktemp("lore-server")
     server_root.mkdir(parents=True, exist_ok=True)
+
+    if remove_when_done and not request.config.getoption("--keep-test-data"):
+        # A server store is the largest thing a test writes, so it is removed at
+        # the scope of whoever asked for the config: a class-scoped server goes
+        # when its class ends, one built inside a test body when that test ends,
+        # pass or fail. The server is always stopped first -- the fixture that
+        # launched it depends on this one, so it finalizes first, and a
+        # generator fixture's own teardown is registered after this finalizer
+        # and therefore runs before it.
+        #
+        # The session-wide server opts out: under xdist it outlives every
+        # worker, so the controller's sweep is the only safe place to take it.
+        request.addfinalizer(lambda: remove_tree(server_root, label="server root"))
 
     copy_server_configs(test_base_directory, server_root)
 
