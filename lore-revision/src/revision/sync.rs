@@ -232,6 +232,9 @@ pub struct SyncOptions {
     pub dependency_recursive: bool,
     /// Maximum dependency traversal depth. 0 means unlimited.
     pub dependency_depth_limit: u32,
+    /// The caller's own metadata for the merge revision a diverged sync
+    /// commits, applied as `commit_with_metadata` applies its keys.
+    pub metadata: crate::commit::CommitMetadata,
 }
 
 impl Default for SyncOptions {
@@ -246,6 +249,7 @@ impl Default for SyncOptions {
             dependency_tags: Vec::new(),
             dependency_recursive: false,
             dependency_depth_limit: 0,
+            metadata: crate::commit::CommitMetadata::default(),
         }
     }
 }
@@ -562,6 +566,7 @@ pub async fn sync(
                 no_commit: false,
                 scope: merge::MergeScope::MainOnly,
                 inherit_metadata: crate::metadata::MetadataInherit::default(),
+                metadata: options.metadata.clone(),
             };
             let revision_staged = Box::pin(merge::merge_start(
                 repository.clone(),

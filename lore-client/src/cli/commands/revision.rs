@@ -1505,6 +1505,9 @@ pub fn handle_revision_sync(globals: LoreGlobalArgs, args: &RevisionSyncArgs) ->
         ),
         dependency_recursive: args.dependency_recursive.into(),
         dependency_depth_limit: args.dependency_depth_limit,
+        metadata_keys: Default::default(),
+        metadata_values: Default::default(),
+        metadata_formats: Default::default(),
     };
 
     let progress_bar = ProgressBar::new(0);

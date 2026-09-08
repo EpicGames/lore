@@ -398,6 +398,10 @@ pub struct MergeStartOptions {
     pub scope: MergeScope,
     /// Metadata keys carried from the source revision onto the merge revision.
     pub inherit_metadata: MetadataInherit,
+    /// The caller's own metadata for the auto commit, applied as
+    /// `commit_with_metadata` applies its keys. Empty leaves the commit as
+    /// `commit` would make it.
+    pub metadata: crate::commit::CommitMetadata,
 }
 
 /// The revisions a merge's three-way diff ran between, other than the target.
@@ -752,7 +756,8 @@ pub async fn merge_start(
             .forward::<MergeError>("comparing link pins")?;
 
             if !has_conflicts && !dry_run && !options.no_commit {
-                signature = auto_commit_merge(repository, token, options.message).await?;
+                signature =
+                    auto_commit_merge(repository, token, options.message, options.metadata).await?;
             }
 
             Ok(signature)
@@ -970,16 +975,8 @@ async fn merge_start_link(
 
     // Auto-commit if no conflicts
     if !result.has_conflicts && !options.no_commit {
-        let commit_options = CommitOptions {
-            message: options.message,
-            link_messages: std::collections::HashMap::new(),
-            link: None,
-            layer_messages: std::collections::HashMap::new(),
-            layer: None,
-        };
-        let signature = Box::pin(commit::commit(repository, token, commit_options))
-            .await
-            .forward::<MergeError>("auto-committing merge")?;
+        let signature =
+            auto_commit_merge(repository, token, options.message, options.metadata).await?;
         return Ok(signature);
     }
 
@@ -1578,17 +1575,18 @@ async fn finalize_main_merge(
     }
 
     if !has_conflicts && !dry_run && !options.no_commit {
-        return auto_commit_merge(repository, token, options.message).await;
+        return auto_commit_merge(repository, token, options.message, options.metadata).await;
     }
 
     Ok(state_staged.revision())
 }
 
-/// Auto-commit a merge with no conflicts.
+/// Auto-commit a merge with no conflicts, recording the caller's metadata.
 async fn auto_commit_merge(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
     message: String,
+    metadata: crate::commit::CommitMetadata,
 ) -> Result<Hash, MergeError> {
     let commit_options = CommitOptions {
         message,
@@ -1597,9 +1595,16 @@ async fn auto_commit_merge(
         layer_messages: std::collections::HashMap::new(),
         layer: None,
     };
-    Box::pin(commit::commit(repository, token, commit_options))
-        .await
-        .forward::<MergeError>("auto-committing merge")
+    Box::pin(commit::commit_with_metadata(
+        repository,
+        token,
+        commit_options,
+        metadata.keys,
+        metadata.values,
+        metadata.formats,
+    ))
+    .await
+    .forward::<MergeError>("auto-committing merge")
 }
 
 pub struct ApplyDiffResults {
