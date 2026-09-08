@@ -139,7 +139,7 @@ impl QuicService for StorageServiceV4 {
 
         if opcode == Command::ClientIdentify as u8 {
             return Ok(ParsedStorageRequestV4::ClientIdentify(
-                ClientIdentify::parse(bytes)?,
+                ClientIdentify::parse(bytes, false)?,
             ));
         }
 
@@ -572,6 +572,7 @@ mod tests {
 
         let ci = crate::protocol::client_identify::ClientIdentify {
             user_agent: Some("my-client/1.0".to_string()),
+            is_trusted: false,
         };
 
         let response = service

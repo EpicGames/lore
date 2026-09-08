@@ -186,7 +186,7 @@ impl QuicService for ReplicationStoreService {
             Command::ClientIdentify => {
                 return Ok(ParsedReplicationStoreRequest::ClientIdentify(
                     ClientIdentifyHandler {
-                        message: ClientIdentify::parse(bytes)?,
+                        message: ClientIdentify::parse(bytes, true)?,
                     },
                 ));
             }
@@ -493,6 +493,7 @@ mod tests {
             let request = ParsedReplicationStoreRequest::ClientIdentify(ClientIdentifyHandler {
                 message: ClientIdentify {
                     user_agent: Some("my-client/1.0".to_string()),
+                    is_trusted: true,
                 },
             });
 
@@ -515,6 +516,7 @@ mod tests {
             let request = ParsedReplicationStoreRequest::ClientIdentify(ClientIdentifyHandler {
                 message: ClientIdentify {
                     user_agent: Some("my-client/1.0".to_string()),
+                    is_trusted: true,
                 },
             });
 

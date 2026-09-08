@@ -20,6 +20,9 @@ pub struct UserAgentValue(pub Arc<str>);
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClientIdentify {
     pub user_agent: Option<String>,
+    /// Whether this `ClientIdentity` can be trusted, or whether it should be
+    /// put through the user agent filter
+    pub is_trusted: bool,
 }
 
 const USER_AGENT_MAX_BYTES: usize = 256;
@@ -36,7 +39,7 @@ impl ClientIdentify {
     ///
     /// Validation mirrors `Correlate::parse`: invalid input is silently
     /// discarded rather than surfaced as a protocol error.
-    pub fn parse(bytes: Bytes) -> Result<Self, MessageParseError> {
+    pub fn parse(bytes: Bytes, is_trusted: bool) -> Result<Self, MessageParseError> {
         let user_agent = if bytes.is_empty()
             || bytes.len() > USER_AGENT_MAX_BYTES
             || !is_printable_ascii(&bytes)
@@ -48,20 +51,29 @@ impl ClientIdentify {
             Some(unsafe { String::from_utf8_unchecked(bytes.to_vec()) })
         };
 
-        Ok(Self { user_agent })
+        Ok(Self {
+            user_agent,
+            is_trusted,
+        })
     }
 
     pub fn apply(&self, context: &Arc<AttributeMap>, filter: &UserAgentFilter) {
-        let user_agent = match self.user_agent.as_ref() {
+        let raw_agent = match self.user_agent.as_ref() {
             Some(v) => v,
             None => return,
         };
 
-        let normalized: Arc<str> = match filter.normalize(user_agent) {
-            NormalizeOutput::KnownAgent(label) => label,
-            NormalizeOutput::Unknown => {
-                filter.sample_unknown_agent(user_agent);
-                Arc::from(USER_AGENT_UNKNOWN)
+        let normalized: Arc<str> = {
+            if !self.is_trusted {
+                match filter.normalize(raw_agent) {
+                    NormalizeOutput::KnownAgent(label) => label,
+                    NormalizeOutput::Unknown => {
+                        filter.sample_unknown_agent(raw_agent);
+                        Arc::from(USER_AGENT_UNKNOWN)
+                    }
+                }
+            } else {
+                Arc::from(raw_agent.as_str())
             }
         };
 
@@ -85,29 +97,37 @@ mod tests {
         #[test]
         fn valid_ascii_returns_some() {
             let ua = "my-client/1.0";
-            let result = ClientIdentify::parse(Bytes::from(ua)).unwrap();
+            let result = ClientIdentify::parse(Bytes::from(ua), true).unwrap();
             assert_eq!(
                 result,
                 ClientIdentify {
-                    user_agent: Some(ua.to_string())
+                    user_agent: Some(ua.to_string()),
+                    is_trusted: true,
                 }
             );
         }
 
         #[test]
         fn empty_bytes_returns_none() {
-            let result = ClientIdentify::parse(Bytes::new()).unwrap();
-            assert_eq!(result, ClientIdentify { user_agent: None });
+            let result = ClientIdentify::parse(Bytes::new(), true).unwrap();
+            assert_eq!(
+                result,
+                ClientIdentify {
+                    user_agent: None,
+                    is_trusted: true,
+                }
+            );
         }
 
         #[test]
         fn exactly_256_bytes_returns_some() {
             let ua = "a".repeat(USER_AGENT_MAX_BYTES);
-            let result = ClientIdentify::parse(Bytes::from(ua.clone())).unwrap();
+            let result = ClientIdentify::parse(Bytes::from(ua.clone()), true).unwrap();
             assert_eq!(
                 result,
                 ClientIdentify {
-                    user_agent: Some(ua)
+                    user_agent: Some(ua),
+                    is_trusted: true,
                 }
             );
         }
@@ -115,25 +135,38 @@ mod tests {
         #[test]
         fn over_256_bytes_returns_none() {
             let ua = "a".repeat(USER_AGENT_MAX_BYTES + 1);
-            let result = ClientIdentify::parse(Bytes::from(ua)).unwrap();
-            assert_eq!(result, ClientIdentify { user_agent: None });
+            let result = ClientIdentify::parse(Bytes::from(ua), true).unwrap();
+            assert_eq!(
+                result,
+                ClientIdentify {
+                    user_agent: None,
+                    is_trusted: true,
+                }
+            );
         }
 
         #[test]
         fn non_ascii_returns_none() {
             // Multi-byte UTF-8; not ASCII.
-            let result = ClientIdentify::parse(Bytes::from("lore/1.0-\u{1F4E6}")).unwrap();
-            assert_eq!(result, ClientIdentify { user_agent: None });
+            let result = ClientIdentify::parse(Bytes::from("lore/1.0-\u{1F4E6}"), true).unwrap();
+            assert_eq!(
+                result,
+                ClientIdentify {
+                    user_agent: None,
+                    is_trusted: true,
+                }
+            );
         }
 
         #[test]
         fn every_printable_ascii_byte_returns_some() {
             let ua: String = (0x20u8..=0x7E).map(char::from).collect();
-            let result = ClientIdentify::parse(Bytes::from(ua.clone())).unwrap();
+            let result = ClientIdentify::parse(Bytes::from(ua.clone()), true).unwrap();
             assert_eq!(
                 result,
                 ClientIdentify {
-                    user_agent: Some(ua)
+                    user_agent: Some(ua),
+                    is_trusted: true,
                 }
             );
         }
@@ -142,10 +175,13 @@ mod tests {
         fn control_characters_return_none() {
             for byte in (0x00u8..=0x1F).chain(std::iter::once(0x7F)) {
                 let raw = Bytes::from(vec![b'a', byte, b'b']);
-                let result = ClientIdentify::parse(raw).unwrap();
+                let result = ClientIdentify::parse(raw, true).unwrap();
                 assert_eq!(
                     result,
-                    ClientIdentify { user_agent: None },
+                    ClientIdentify {
+                        user_agent: None,
+                        is_trusted: true,
+                    },
                     "byte {byte:#04x} must be rejected"
                 );
             }
@@ -153,8 +189,14 @@ mod tests {
 
         #[test]
         fn high_bit_bytes_return_none() {
-            let result = ClientIdentify::parse(Bytes::from(vec![b'a', 0x80, b'b'])).unwrap();
-            assert_eq!(result, ClientIdentify { user_agent: None });
+            let result = ClientIdentify::parse(Bytes::from(vec![b'a', 0x80, b'b']), true).unwrap();
+            assert_eq!(
+                result,
+                ClientIdentify {
+                    user_agent: None,
+                    is_trusted: true,
+                }
+            );
         }
     }
 
@@ -163,7 +205,10 @@ mod tests {
 
         #[test]
         fn none_is_noop() {
-            let ci = ClientIdentify { user_agent: None };
+            let ci = ClientIdentify {
+                user_agent: None,
+                is_trusted: true,
+            };
             let context = Arc::new(AttributeMap::default());
             let filter = UserAgentFilter::default();
 
@@ -176,6 +221,7 @@ mod tests {
         fn known_agent_stores_value_in_context() {
             let ci = ClientIdentify {
                 user_agent: Some("my-client/1.0".to_string()),
+                is_trusted: false,
             };
             let context = Arc::new(AttributeMap::default());
             // Default filter (no patterns) treats everything as known.
@@ -191,19 +237,30 @@ mod tests {
 
         #[test]
         fn unknown_agent_stores_unknown_sentinel() {
-            let ci = ClientIdentify {
-                user_agent: Some("rogue-client/9.9".to_string()),
+            let user_agent = "rogue-client/9.9".to_string();
+            let untrusting = ClientIdentify {
+                user_agent: Some(user_agent.clone()),
+                is_trusted: false,
+            };
+            let trusting = ClientIdentify {
+                user_agent: Some(user_agent.clone()),
+                is_trusted: true,
             };
             let context = Arc::new(AttributeMap::default());
             // Allow-list that will not match "rogue-client".
             let filter = UserAgentFilter::new(&["my-client/.*"]).unwrap();
 
-            ci.apply(&context, &filter);
-
+            untrusting.apply(&context, &filter);
             let stored = context
                 .get::<UserAgentValue>()
                 .expect("UserAgentValue should be stored");
             assert_eq!(&*stored.0, USER_AGENT_UNKNOWN);
+
+            trusting.apply(&context, &filter);
+            let stored = context
+                .get::<UserAgentValue>()
+                .expect("UserAgentValue should be stored");
+            assert_eq!(&*stored.0, user_agent);
         }
     }
 }
