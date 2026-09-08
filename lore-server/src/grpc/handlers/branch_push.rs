@@ -909,8 +909,37 @@ mod tests {
         state
     }
 
+    /// A revision whose metadata names `payload`, so the walk collects an address
+    /// it never reads.
+    async fn serialize_revision_naming_a_payload(
+        repository: &Arc<RepositoryContext>,
+        branch: BranchId,
+        payload: Address,
+    ) -> Arc<State> {
+        let write_token = get_write_token();
+        let mut metadata = lore_revision::metadata::Metadata::new();
+        metadata.set_branch(branch).expect("set branch");
+        metadata
+            .set_address("build-artifact", payload)
+            .expect("set the payload address");
+        let metadata_hash = metadata
+            .serialize(repository.clone())
+            .await
+            .expect("serialize metadata");
+
+        let state = Arc::new(State::new());
+        state.set_parent_self(Hash::default());
+        state.set_revision_number(1);
+        state.set_metadata_hash(metadata_hash);
+        state
+            .serialize(repository.clone(), &write_token)
+            .await
+            .expect("serialize state");
+        state
+    }
+
     /// A revision holding one file, so its state references node and name
-    /// fragments the walk has to read rather than a bare metadata hash.
+    /// fragments the walk has to read.
     async fn serialize_revision_with_a_file(
         repository: &Arc<RepositoryContext>,
         branch: BranchId,
@@ -947,25 +976,25 @@ mod tests {
         state
     }
 
-    /// Copy the revision fragment alone, leaving everything it references absent
+    /// Copy the fragment at `hash` alone, leaving everything it references absent
     /// in `target`.
-    async fn hand_over_revision(
+    async fn hand_over_fragment(
         source: &Arc<dyn lore_storage::ImmutableStore>,
         target: &Arc<dyn lore_storage::ImmutableStore>,
         repository: RepositoryId,
-        revision: Hash,
+        hash: Hash,
     ) {
-        let address = Address::zero_context_hash(revision);
+        let address = Address::zero_context_hash(hash);
         let data = source
             .clone()
             .get(repository, address)
             .await
-            .expect("read the serialized revision");
+            .expect("read the fragment to hand over");
         target
             .clone()
             .put(repository, address, data.fragment, data.payload, false)
             .await
-            .expect("hand over the revision");
+            .expect("hand over the fragment");
     }
 
     /// Push revisions `numbers`, chained from `parent`. Returns the pushed
@@ -1230,7 +1259,7 @@ mod tests {
                 let branch = create_test_branch(&repository).await;
                 let state = serialize_revision_with_a_file(&peer, branch).await;
 
-                hand_over_revision(&peer_store, &store, repository_id, state.revision()).await;
+                hand_over_fragment(&peer_store, &store, repository_id, state.revision()).await;
 
                 let Err(status) = push(
                     repository,
@@ -1263,6 +1292,11 @@ mod tests {
 
         /// A fragment the store answers as absent is named the same way, so the
         /// two paths that detect it report one condition.
+        ///
+        /// The revision and the blob holding its metadata are both handed over,
+        /// since the walk reads both. What stays absent is the payload that
+        /// metadata names, which the walk collects without reading, so the store
+        /// query is what detects it.
         #[tokio::test]
         async fn a_fragment_the_store_reports_absent_names_its_address() {
             let repository_id = random::<RepositoryId>();
@@ -1285,9 +1319,10 @@ mod tests {
                 ));
 
                 let branch = create_test_branch(&repository).await;
-                let state =
-                    serialize_revision(&peer, branch, Hash::default(), Hash::default(), 1).await;
-                hand_over_revision(&peer_store, &store, repository_id, state.revision()).await;
+                let payload = Address::zero_context_hash(Hash::from([0xabu8; 32]));
+                let state = serialize_revision_naming_a_payload(&peer, branch, payload).await;
+                hand_over_fragment(&peer_store, &store, repository_id, state.revision()).await;
+                hand_over_fragment(&peer_store, &store, repository_id, state.metadata_hash()).await;
 
                 let Err(status) = push(
                     repository,
@@ -1301,14 +1336,14 @@ mod tests {
                 )
                 .await
                 else {
-                    panic!("a revision missing its metadata cannot be pushed");
+                    panic!("a revision missing a payload its metadata names cannot be pushed");
                 };
 
                 assert_eq!(status.code(), Code::FailedPrecondition);
-                assert!(
-                    status.message().starts_with("Missing fragment"),
-                    "{}",
-                    status.message()
+                assert_eq!(
+                    status.message(),
+                    format!("Missing fragment '{payload}'"),
+                    "the absent payload has to be the fragment named"
                 );
                 let error = lore_transport::ProtocolError::from(status);
                 assert!(error.is_address_not_found(), "{error:?}");

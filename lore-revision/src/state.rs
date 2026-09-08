@@ -9215,6 +9215,19 @@ pub async fn collect_new_fragments(
         }
     });
 
+    let new_revision_metadata_address = lore_spawn!({
+        let repository = repository.clone();
+        let metadata_hash = state_to.metadata_hash();
+        async move {
+            collect_new_revision_metadata_fragments(
+                repository,
+                metadata_hash,
+                ignore_durably_stored,
+            )
+            .await
+        }
+    });
+
     let mut failure = None;
 
     // Get the diff of the node blocks addresses
@@ -9491,11 +9504,31 @@ pub async fn collect_new_fragments(
         new_file_address.len()
     );
 
+    // Collect the fragments the revision metadata names
+    let mut new_revision_metadata_address = match new_revision_metadata_address
+        .await
+        .internal("Task failure")
+        .map_err(StateError::from)
+        .flatten()
+    {
+        Ok(address) => address,
+        Err(err) => {
+            failure = failure.or(Some(err));
+            vec![]
+        }
+    };
+    lore_debug!(
+        "Collected {} new addresses from revision metadata",
+        new_revision_metadata_address.len()
+    );
+
     if let Some(err) = failure {
         return Err(err);
     }
 
+    fragments.reserve(new_file_address.len() + new_revision_metadata_address.len());
     fragments.append(&mut new_file_address);
+    fragments.append(&mut new_revision_metadata_address);
 
     fragments.sort_unstable();
     fragments.dedup();
@@ -9620,6 +9653,38 @@ fn collect_new_file_fragments_recurse(
     ))
 }
 
+/// Appends the addresses the [`MetadataType::Address`] values in `metadata` name.
+///
+/// A value of that type holds its payload in a fragment of its own, so the
+/// payload is part of what carries the metadata and has to travel with it. A
+/// value naming the zero address names no payload and is skipped. A value the
+/// address decoder rejects fails the walk, since a payload that cannot be named
+/// cannot be sent.
+fn collect_metadata_address_refs(
+    metadata: &Metadata,
+    refs: &mut Vec<Address>,
+) -> Result<(), StateError> {
+    let mut invalid = 0;
+    metadata.walk(
+        |_key_slice: &[u8], value_slice: &[u8], value_type: MetadataType| {
+            if value_type != MetadataType::Address {
+                return;
+            }
+            match Metadata::to_address(value_slice) {
+                Ok(address) if !address.hash.is_zero() => refs.push(address),
+                Ok(_) => (),
+                Err(_) => invalid += 1,
+            }
+        },
+    );
+
+    if invalid != 0 {
+        return Err(StateError::internal("Invalid metadata address"));
+    }
+
+    Ok(())
+}
+
 async fn collect_new_node_metadata_fragments(
     repository: Arc<RepositoryContext>,
     state_to: Arc<State>,
@@ -9665,30 +9730,12 @@ async fn collect_new_node_metadata_fragments(
     }
 
     let mut metadata_refs = vec![];
-    let mut addresses_expected = 0;
     for metadata_blob in metadata_blobs.iter() {
         let metadata = Metadata::deserialize(repository.clone(), metadata_blob.hash)
             .await
             .forward::<StateError>("Failed to deserialize metadata")?;
 
-        metadata.walk(
-            |_key_slice: &[u8], value_slice: &[u8], value_type: MetadataType| {
-                if value_type == MetadataType::Address {
-                    if let Ok(address) = Metadata::to_address(value_slice) {
-                        if address.hash.is_zero() {
-                            return;
-                        }
-                        metadata_refs.push(address);
-                    }
-                    addresses_expected += 1;
-                }
-            },
-        );
-    }
-
-    // Ensure metadata contained only valid addresses
-    if addresses_expected != metadata_refs.len() {
-        return Err(StateError::internal("Invalid metadata address"));
+        collect_metadata_address_refs(&metadata, &mut metadata_refs)?;
     }
 
     let mut addresses =
@@ -9696,6 +9743,35 @@ async fn collect_new_node_metadata_fragments(
     let mut more_addresses =
         collect_new_addresses(repository, &metadata_refs, ignore_durably_stored).await?;
     addresses.append(&mut more_addresses);
+
+    addresses.sort_unstable();
+    addresses.dedup();
+
+    Ok(addresses)
+}
+
+/// The fragments a revision's own metadata names.
+///
+/// The blob holding the metadata travels with the rest of the state. This is
+/// what that blob points at, which the state does not cover.
+async fn collect_new_revision_metadata_fragments(
+    repository: Arc<RepositoryContext>,
+    metadata_hash: Hash,
+    ignore_durably_stored: bool,
+) -> Result<Vec<Address>, StateError> {
+    if metadata_hash.is_zero() {
+        return Ok(vec![]);
+    }
+
+    let metadata = Metadata::deserialize(repository.clone(), metadata_hash)
+        .await
+        .forward::<StateError>("Failed to deserialize revision metadata")?;
+
+    let mut metadata_refs = vec![];
+    collect_metadata_address_refs(&metadata, &mut metadata_refs)?;
+
+    let mut addresses =
+        collect_new_addresses(repository, &metadata_refs, ignore_durably_stored).await?;
 
     addresses.sort_unstable();
     addresses.dedup();

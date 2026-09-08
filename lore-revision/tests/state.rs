@@ -6,11 +6,15 @@ mod tests {
 
     use std::sync::Arc;
 
+    use bytes::Bytes;
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::runtime::runtime;
     use lore_base::types::Address;
     use lore_base::types::CloneHeapAlloc;
+    use lore_base::types::Context;
     use lore_base::types::ZeroHeapAlloc;
+    use lore_revision::lore::RepositoryId;
+    use lore_revision::metadata::Metadata;
     use lore_revision::node::*;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::state::State;
@@ -379,6 +383,100 @@ mod tests {
                 assert!(
                     fragments.contains(&name_address),
                     "Name table not collected as new fragment after marked as not durably stored"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A revision metadata value of type Address names a payload held in a
+    /// fragment of its own, which the walk collects so the payload reaches the
+    /// peer with the revision it belongs to.
+    ///
+    /// The payload is written before the value names it, so the first collection
+    /// pins that a blob the metadata does not name stays out: without it the
+    /// assertion that follows would hold for a walk that collected everything in
+    /// the store.
+    #[tokio::test]
+    async fn collect_new_revision_metadata_fragments() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        #[allow(clippy::disallowed_methods)]
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let write_token = &fixture.write_token;
+
+                let payload = lore_revision::immutable::write(
+                    repository.clone(),
+                    Context::default(),
+                    Bytes::from_static(b"revision metadata payload"),
+                    lore_revision::immutable::write_options_from_repository(repository.clone()),
+                )
+                .await
+                .expect("Failed to write the metadata payload");
+
+                let state_from = Arc::new(State::new());
+                state_from
+                    .serialize(repository.clone(), write_token)
+                    .await
+                    .expect("Failed to serialize from state");
+
+                let state_to = Arc::new(State::new());
+                state_to
+                    .serialize(repository.clone(), write_token)
+                    .await
+                    .expect("Failed to serialize to state");
+
+                let fragments = collect_new_fragments(
+                    repository.clone(),
+                    state_from.clone(),
+                    state_to.clone(),
+                    true,
+                )
+                .await
+                .expect("Failed to collect fragments");
+
+                assert!(
+                    !fragments.contains(&payload),
+                    "A payload no metadata names was collected"
+                );
+
+                let mut metadata = Metadata::new();
+                metadata
+                    .set_address("build-artifact", payload)
+                    .expect("Failed to set the metadata address");
+                let metadata_hash = metadata
+                    .serialize(repository.clone())
+                    .await
+                    .expect("Failed to serialize the metadata");
+
+                state_to.set_metadata_hash(metadata_hash);
+                state_to
+                    .serialize(repository.clone(), write_token)
+                    .await
+                    .expect("Failed to serialize to state");
+
+                let fragments = collect_new_fragments(
+                    repository.clone(),
+                    state_from.clone(),
+                    state_to.clone(),
+                    true,
+                )
+                .await
+                .expect("Failed to collect fragments");
+
+                assert!(
+                    fragments.contains(&Address::zero_context_hash(metadata_hash)),
+                    "The blob holding the revision metadata was not collected"
+                );
+                assert!(
+                    fragments.contains(&payload),
+                    "The payload the revision metadata names was not collected"
                 );
             }))
             .await

@@ -1,13 +1,23 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
 import logging
+import random
 
 import pytest
-
 from error_types import ImproperArgumentsError
+from lore_parsers import parse_jsonl
+
 from lore import Lore
 
 logger = logging.getLogger(__name__)
+
+# Content size above which the store splits a payload into several fragments,
+# mirroring lore_base::types::FRAGMENT_SIZE_THRESHOLD
+FRAGMENT_SIZE_THRESHOLD = 256 * 1024
+
+# The store query status for an address the store does not hold, mirroring
+# LoreRepositoryStoreImmutableQueryEventData
+STORE_QUERY_NOT_FOUND = 3
 
 
 @pytest.mark.smoke
@@ -355,4 +365,78 @@ def test_revision_metadata_set_binary(new_lore_repo):
     value = repo.revision_metadata_get("build-artifact")
     assert value.strip(), (
         "Expected non-empty value for binary metadata key 'build-artifact'"
+    )
+
+
+def _metadata_address(output: str) -> str:
+    """The address an Address-typed value records, from one `metadata` event."""
+    events = parse_jsonl(output, "metadata")
+    assert len(events) == 1, f"Expected one metadata event.\nGot: {events}"
+    value = events[0]["value"]
+    assert value["tagName"] == "address", (
+        f"Binary metadata must record the address its payload was stored at.\n"
+        f"Got: {value}"
+    )
+    return value["data"]
+
+
+def _store_query(repo: Lore, address: str, *, remote: bool) -> dict:
+    """The store query result for `address`, which reports the local store and
+    the peer as an event each."""
+    events = parse_jsonl(
+        repo.repository_store_immutable_query(address, json=True),
+        "repositoryStoreImmutableQuery",
+    )
+    half = [event for event in events if event["remote"] == remote]
+    assert len(half) == 1, (
+        f"Expected one {'remote' if remote else 'local'} result for {address}.\n"
+        f"Got: {events}"
+    )
+    return half[0]
+
+
+@pytest.mark.smoke
+def test_revision_metadata_binary_payload_is_pushed(new_lore_repo, scratch_dir):
+    """A binary metadata value keeps its payload in a fragment of its own, so
+    push has to carry that fragment along with the revision.
+
+    The payload is larger than FRAGMENT_SIZE_THRESHOLD, so the store splits it
+    and push has to carry the fragments it is split into as well as the one
+    naming them. Verified from a clone, whose store starts empty: whatever it
+    resolves came off the server.
+    """
+    repo: Lore = new_lore_repo()
+
+    payload = random.Random(0).randbytes(2 * FRAGMENT_SIZE_THRESHOLD)
+    with repo.open_file("content.txt", "w") as f:
+        f.write("content\n")
+    repo.stage("content.txt")
+
+    with repo.open_file("payload.bin", "wb") as f:
+        f.write(payload)
+    repo.revision_metadata_set(["build-artifact", "payload.bin"], binary=True)
+    # The payload lives in the store now, so the clone cannot be reading the file
+    repo.remove_file("payload.bin")
+
+    repo.commit("Commit with binary metadata")
+    repo.push()
+
+    address = _metadata_address(repo.revision_metadata_get("build-artifact", json=True))
+
+    clone = repo.clone()
+
+    local = _store_query(clone, address, remote=False)
+    assert local["status"] == STORE_QUERY_NOT_FOUND, (
+        f"The clone must not already hold {address} locally, or the read below "
+        f"would not prove the push carried it.\nGot: {local}"
+    )
+    remote = _store_query(clone, address, remote=True)
+    assert remote["status"] != STORE_QUERY_NOT_FOUND, (
+        f"Push must have uploaded the binary metadata payload {address}.\nGot: {remote}"
+    )
+
+    restored = scratch_dir("restored-payload", create=True) / "restored.bin"
+    clone.file_write(address=address, output=str(restored))
+    assert restored.read_bytes() == payload, (
+        "The payload read back from the server must match what was stored"
     )
