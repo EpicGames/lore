@@ -6,6 +6,10 @@ telemetry integration, or replication is configured.
 ## Prerequisites
 
 - Docker with BuildKit support
+- Around 16 GB of memory available to Docker, for building from source. The image builds the
+  `release-lto` profile, whose fat LTO link holds the whole dependency graph at once; the same link
+  was OOM-killed on a 16 GB runner until the Dockerfile dropped debug info from it. Docker Desktop
+  caps its VM well below host memory by default, so this is worth checking rather than assuming.
 
 Both `linux/amd64` and `linux/arm64` build. `.cargo/config.toml` pins `aarch64-unknown-linux-gnu`
 to Graviton3+ via `-C target-cpu=neoverse-512tvb`, which faults on older arm64 parts, so the
@@ -48,6 +52,10 @@ nothing — and pushes two variants to `ghcr.io/epicgames/lore/loreserver`:
 **On Graviton3 or newer**, pull `-graviton` for a native arm64 image. **Anywhere else**, pull the
 unsuffixed tag.
 
+`latest` and `latest-graviton` move only when the release being packaged is the newest stable one,
+so backfilling an old release or hotfixing an older line does not drag them backwards. A prerelease
+never takes them.
+
 Releases ship no baseline `armv8-a` Linux binary. The only `aarch64-unknown-linux-gnu` build is
 tuned for Graviton3+, and the `aarch64-apple-darwin` build is a macOS Mach-O executable, which
 cannot go into a Linux image at all. So arm64 is offered only under the suffixed tag, where the
@@ -65,6 +73,10 @@ Both variants are signed regardless.
 For a native arm64 image on Apple Silicon, build from source as above, or skip Docker and run the
 release's `aarch64-apple-darwin` binary directly. When releases start shipping a baseline
 `armv8-a` Linux binary, the unsuffixed variant can carry `linux/arm64` too.
+
+The `default.toml` baked in comes from the release tag rather than from the branch the workflow ran
+from, since config keys move between releases and an older binary can fail to start on a newer
+file. Only the packaging — the Dockerfile — comes from the workflow's own ref.
 
 Every tag is signed keylessly with cosign, and the run summary prints the `cosign verify`
 invocation for the digest it published, along with the release assets packaged and their SHA-256 —

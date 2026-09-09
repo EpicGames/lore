@@ -76,7 +76,7 @@ ENV RUST_LOG=info
 RUN mkdir -p /data
 VOLUME /data
 
-# QUIC + gRPC: 41337, HTTP: 41339
-EXPOSE 41337 41339
+# 41337 carries gRPC over TCP and QUIC over UDP; both are needed.
+EXPOSE 41337/tcp 41337/udp 41339/tcp
 
 ENTRYPOINT ["loreserver"]

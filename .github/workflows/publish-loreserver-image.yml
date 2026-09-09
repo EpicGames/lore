@@ -82,6 +82,33 @@ jobs:
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
+      # `latest=auto` hands `latest` to any non-prerelease without consulting
+      # what is already published, so a backfill or a hotfix of an older line
+      # would move it backwards. Hence latest=false below and this gate.
+      - id: latest
+        name: Decide whether this is the newest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          latest=false
+          # Anything carrying a prerelease or build suffix never takes `latest`.
+          if printf '%s' "${VERSION}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            newest=$(gh release list --exclude-drafts --exclude-pre-releases --limit 100 \
+              --json tagName --jq '.[].tagName' \
+              | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } \
+              | sort -V | tail -1)
+            # Ties count: the release being published is itself in that list.
+            if [ "$(printf '%s\n%s\n' "${VERSION}" "${newest}" | sort -V | tail -1)" = "${VERSION}" ]; then
+              latest=true
+            fi
+            echo "newest released is '${newest}'"
+          fi
+          echo "latest=${latest}" >> "$GITHUB_OUTPUT"
+          echo "latest=${latest}"
+
       # The input lands verbatim in the `tags` lists below, where a newline
       # would smuggle in a further directive.
       - name: Validate the tag input
@@ -107,14 +134,15 @@ jobs:
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.IMAGE }}
-          flavor: latest=auto
+          flavor: latest=false
           tags: |
             type=semver,pattern={{version}},value=${{ steps.version.outputs.version }},enable=${{ env.RELEASE_TAGS }}
             type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }},enable=${{ env.RELEASE_TAGS }}
+            type=raw,value=latest,enable=${{ env.RELEASE_TAGS == 'true' && steps.latest.outputs.latest == 'true' }}
             type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
 
-      # `onlatest` suffixes `latest` too, so the tuned stream has its own
-      # moving tag instead of taking that one.
+      # The suffix reaches every tag including the raw `latest`, so the tuned
+      # stream gets its own moving tag rather than taking that one.
       - id: meta-graviton
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         env:
@@ -122,11 +150,12 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           flavor: |
-            latest=auto
-            suffix=-graviton,onlatest=true
+            latest=false
+            suffix=-graviton
           tags: |
             type=semver,pattern={{version}},value=${{ steps.version.outputs.version }},enable=${{ env.RELEASE_TAGS }}
             type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }},enable=${{ env.RELEASE_TAGS }}
+            type=raw,value=latest,enable=${{ env.RELEASE_TAGS == 'true' && steps.latest.outputs.latest == 'true' }}
             type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
 
       # Here, not as an invalid reference once the images are already pushed.
@@ -159,11 +188,30 @@ jobs:
     env:
       VERSION: ${{ needs.meta.outputs.version }}
     steps:
-      # No `ref`: a release run already checks out the release's own tag, so
-      # the config baked into the image matches the binary beside it.
+      # No `ref`: the packaging must come from the ref this workflow ran from.
+      # A release predating this workflow has no Dockerfile.release at its tag,
+      # and backfilling one is a supported dispatch.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # The config does come from the release tag, since keys move between
+      # releases — main has renamed and added some since v0.9.0 — and a
+      # dispatch checks out whatever ref it was dispatched from. On a release
+      # run this rewrites the file with itself.
+      - name: Take default.toml from the release tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          path=lore-server/config/default.toml
+          if ! gh api "repos/{owner}/{repo}/contents/${path}?ref=${VERSION}" \
+              -H 'Accept: application/vnd.github.raw' > default.toml.tag; then
+            echo "::error::release ${VERSION} has no ${path}"
+            exit 1
+          fi
+          mv default.toml.tag "${path}"
 
       # One directory per platform, which the Dockerfile selects on TARGETARCH.
       - id: fetch
@@ -268,6 +316,8 @@ jobs:
           DIGEST: ${{ needs.build.outputs.graviton-digest }}
         run: docker run --rm --platform linux/arm64 "${IMAGE}@${DIGEST}" --version
 
+  # smoke-arm64 gates both variants, the amd64-only one included: a release
+  # whose arm64 binary does not run is one to fix, not to publish half of.
   publish:
     name: sign and tag (${{ matrix.variant }})
     needs: [meta, build, smoke-arm64]
@@ -276,7 +326,8 @@ jobs:
       packages: write # Push the cosign signature and the release tags
       id-token: write # Federate to Fulcio for keyless signing
     strategy:
-      fail-fast: false # One variant failing should not withhold the other
+      # Signing or tagging failing for one variant should not cancel the other.
+      fail-fast: false
       matrix:
         include:
           - variant: default
