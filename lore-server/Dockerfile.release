@@ -1,35 +1,28 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
 
-# Packages a loreserver binary that was already built and published as a
-# release asset. The publish workflow fetches those assets and unpacks them
-# into dist/<arch>/, so this file only assembles the runtime image — nothing is
-# compiled here. To build the server from source, use lore-server/Dockerfile.
+# Packages a loreserver binary already published as a release asset, which the
+# publish workflow unpacks into dist/<arch>/. Nothing is compiled here; use
+# lore-server/Dockerfile to build from source.
 FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Set by buildx for each platform in the build: amd64 or arm64, which is also
-# the directory the workflow unpacked that platform's release asset into.
+# amd64 or arm64, matching the directory the workflow unpacked that platform's
+# asset into.
 ARG TARGETARCH
 
 COPY dist/${TARGETARCH}/loreserver /usr/local/bin/loreserver
-
-# Shipped alongside the binary in the release archive, so they travel with it.
 COPY dist/${TARGETARCH}/LICENSE.txt /usr/share/doc/loreserver/LICENSE.txt
 COPY dist/${TARGETARCH}/THIRD-PARTY-NOTICES.txt /usr/share/doc/loreserver/THIRD-PARTY-NOTICES.txt
 
-# From the checkout rather than the release archive, which does not carry it.
-# On a release-triggered run the checkout is the release's own tag, so the two
-# agree; see the note on backfilling in the publish workflow.
+# From the checkout; the release archive does not carry it.
 COPY lore-server/config/default.toml /etc/lore/config/default.toml
 
-# Docker environment config: local stores at /data. No QUIC certificate is
-# configured, so the server generates an ephemeral self-signed cert for the
-# public endpoint at startup (zero-config). For a durable deployment, mount a
-# real cert into the container and add a [server.quic.certificate] override.
+# Local stores at /data, and no QUIC certificate, which is what leaves the
+# server generating an ephemeral self-signed one at startup.
 RUN cat <<'EOF' > /etc/lore/config/docker.toml
 [immutable_store.local]
 path = "/data"
