@@ -73,10 +73,8 @@ fn longest_ancestor<'a>(
 /// and the path it covers below that point.
 struct WalkBase {
     absolute: std::path::PathBuf,
-    /// `absolute` named from the root the operation names paths from, which for a walk
-    /// starting in this repository is the same path `relative` holds.
-    on_disk: RelativePath,
-    relative: RelativePathBuf,
+    /// `absolute` named from the working-tree root.
+    relative: RelativePath,
     node: crate::node::NodeID,
     path: RelativePath,
     /// The prefix map, which is keyed by repository-relative paths and so only
@@ -94,8 +92,7 @@ impl WalkBase {
     ) -> Self {
         Self {
             absolute: repository_root.to_path_buf(),
-            on_disk: RelativePath::new(),
-            relative: RelativePathBuf::new(),
+            relative: RelativePath::new(),
             node: ROOT_NODE,
             path,
             prefixes,
@@ -120,7 +117,7 @@ fn walk_base(
     ancestor_nodes: &AncestorNodes<'_>,
     prefixes: Option<&Arc<crate::util::fs::ResolvedPrefixes>>,
 ) -> Result<WalkBase, RelativePath> {
-    let (absolute, on_disk, relative, node, prefix_depth) = {
+    let (absolute, relative, node, prefix_depth) = {
         let Some((prefix, node)) = longest_ancestor(target.as_str(), ancestor_nodes) else {
             return Err(target);
         };
@@ -133,11 +130,9 @@ fn walk_base(
             .map_or(prefix, |(_, variation)| variation);
         // Already clean: a map value built from cleaned parts, so it needs no
         // validating or rewriting.
-        let relative = RelativePathBuf::new_from_clean_parts(variation, "");
         (
             repository_root.join(variation),
             RelativePath::new_from_clean_parts(variation, ""),
-            relative,
             node,
             prefix_depth,
         )
@@ -145,7 +140,6 @@ fn walk_base(
     target.pop_root_repeat(prefix_depth);
     Ok(WalkBase {
         absolute,
-        on_disk,
         relative,
         node,
         path: target,
@@ -233,19 +227,16 @@ async fn stage_into_single_layer(
 ) -> Result<(), StageError> {
     let absolute_path = parent_repository.require_path()?.join(&layer.target_path);
 
-    let layer_relative_path = RelativePathBuf::new_from_initial_path(&layer.source_path)
-        .forward::<StageError>("Failed to construct layer relative path")?;
-    let layer_on_disk = RelativePath::new_from_initial_path(&layer.target_path)
+    let layer_source_path = RelativePath::new_from_initial_path(&layer.source_path)
+        .forward::<StageError>("Failed to construct layer source path")?;
+    let layer_mount_path = RelativePath::new_from_initial_path(&layer.target_path)
         .forward::<StageError>("Failed to construct layer target path")?;
 
     // TODO(mjansson): If this has gone past a link into a subrepository, we
-    // need to stage the link node and upwards in the layer repository. The base
-    // below also stays relative to this repository while the walk runs against
-    // the linked one, so the filter and the delete lookup are handed a path the
-    // linked repository does not hold.
+    // need to stage the link node and upwards in the layer repository.
     let layer_staged_node = layer_state
         .state_staged
-        .find_node_link(layer_state.repository.clone(), layer_relative_path.as_str())
+        .find_node_link(layer_state.repository.clone(), layer_source_path.as_str())
         .await
         .forward::<StageError>("Failed to locate layer source base node")?;
 
@@ -271,8 +262,7 @@ async fn stage_into_single_layer(
             layer_repository,
             layer_state_staged,
             absolute_path,
-            layer_on_disk,
-            layer_relative_path,
+            layer_mount_path,
             layer_staged_node.node,
             remain,
             stats,
@@ -390,7 +380,6 @@ async fn precreate_shared_ancestors<'a>(
                     repository,
                     state,
                     base.absolute,
-                    base.on_disk,
                     base.relative,
                     base.node,
                     base.path,
@@ -448,7 +437,6 @@ async fn spawn_target_walks(
                 walk.repository.clone(),
                 walk.state.clone(),
                 base.absolute,
-                base.on_disk,
                 base.relative,
                 base.node,
                 base.path,
@@ -1290,7 +1278,6 @@ pub async fn stage_move(
             state.clone(),
             repository.require_path()?.to_path_buf(),
             RelativePath::new(),
-            RelativePathBuf::new(),
             ROOT_NODE,
             parent_path,
             stats.clone(),

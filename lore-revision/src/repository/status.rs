@@ -142,7 +142,7 @@ impl LoreRepositoryStatusRevisionEventData {
 #[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRepositoryStatusFileEventData {
-    /// Path of the file relative to the repository root.
+    /// Path of the file, relative to the root of the working tree.
     pub path: LoreString,
     /// Size of the file in bytes.
     pub size: u64,
@@ -595,6 +595,53 @@ struct CountShared {
     files: AtomicU64,
     error: OnceLock<StatusError>,
     notify: Notify,
+}
+
+/// Whether the diff against the staged state is what reports `change`.
+///
+/// A change that is neither staged nor dirty is not a working-tree change. One a scan will
+/// re-detect from the filesystem, settling its flags inline, is left to the scan rather than
+/// reported twice — except a move, which only this diff pairs by file identity to recover the
+/// path it came from.
+fn reported_by_state_diff(change: &NodeChange, show_scan: bool) -> bool {
+    if !(change.flags.is_stage() || change.flags.is_dirty()) {
+        return false;
+    }
+    !(show_scan
+        && change.flags.is_dirty()
+        && !change.flags.is_stage()
+        && change.action != FileAction::Move)
+}
+
+/// What a request for a path selects of a layer: where the selection sits in the working tree,
+/// and the path the layer draws it from.
+struct LayerSelection {
+    /// Where the selection is materialized, which every path reported for it is spelled from.
+    mount_path: RelativePath,
+    /// The path the drawn-from repository spells the selection at, read only to name its node.
+    source_path: RelativePath,
+}
+
+/// What `path` selects of `layer`, or `None` where it names nothing the mount holds.
+///
+/// A request naming nothing, or naming an ancestor of the mount, selects the whole of what the
+/// layer draws. One naming a path below the mount selects what lies at the same offset below the
+/// layer's source.
+fn layer_selection(layer: &layer::Layer, path: Option<&RelativePath>) -> Option<LayerSelection> {
+    let target_path = RelativePath::new_from_initial_path(&layer.target_path).unwrap_or_default();
+    let selected = path.cloned().unwrap_or_else(|| target_path.clone());
+    if !selected.is_empty() && !selected.overlaps(&layer.target_path) {
+        return None;
+    }
+
+    let sub_path = selected
+        .as_str()
+        .get(target_path.len()..)
+        .unwrap_or_default();
+    Some(LayerSelection {
+        mount_path: RelativePath::new_from_clean_parts(&layer.target_path, sub_path),
+        source_path: RelativePath::new_from_clean_parts(&layer.source_path, sub_path),
+    })
 }
 
 /// Resolve `source_path` to the work needed to count its subtree, labelling
@@ -1314,26 +1361,14 @@ pub async fn status(
             };
 
             for (layer, layer_state) in layers.iter() {
-                let target_path =
-                    RelativePath::new_from_initial_path(&layer.target_path).unwrap_or_default();
-                let selected = path.clone().unwrap_or_else(|| target_path.clone());
-                if !selected.is_empty() && !selected.overlaps(&layer.target_path) {
+                let Some(selection) = layer_selection(layer, path.as_ref()) else {
                     continue;
-                }
-                let sub_path = if selected.as_str().len() > target_path.len() {
-                    &selected.as_str()[target_path.len()..]
-                } else {
-                    ""
                 };
-                let source_subpath =
-                    RelativePath::new_from_clean_parts(&layer.source_path, sub_path);
-                let target_subpath =
-                    RelativePath::new_from_clean_parts(&layer.target_path, sub_path);
                 let (layer_directories, layer_files, work) = count_at_path_root(
                     layer_state.state_staged.clone(),
                     layer_state.repository.clone(),
-                    &source_subpath,
-                    &target_subpath,
+                    &selection.source_path,
+                    &selection.mount_path,
                 )
                 .await?;
                 directories += layer_directories;
@@ -1384,18 +1419,7 @@ pub async fn status(
                     lore_debug!("Found {} changes in staged revision", changes.len());
 
                     for change in changes.iter() {
-                        // When scanning, skip dirty-only changes from the
-                        // state diff — the scan section re-detects them from
-                        // the filesystem and handles set/clear inline. Moves
-                        // are exempt: only this diff pairs the add and delete
-                        // by file context to recover the source path.
-                        let dominated_by_scan = show_scan
-                            && change.flags.is_dirty()
-                            && !change.flags.is_stage()
-                            && change.action != FileAction::Move;
-                        if dominated_by_scan
-                            || !(change.flags.is_stage() || change.flags.is_dirty())
-                        {
+                        if !reported_by_state_diff(change, show_scan) {
                             continue;
                         }
 
@@ -1432,61 +1456,52 @@ pub async fn status(
             });
 
             for (layer, layer_state) in layers.iter() {
-                let target_path =
-                    RelativePath::new_from_initial_path(&layer.target_path).unwrap_or_default();
-                let path = path.clone().unwrap_or_else(|| target_path.clone());
-                if path.is_empty() || path.overlaps(&layer.target_path) {
-                    lore_spawn!(tasks, {
-                        let repository = layer_state.repository.clone();
-                        let state_current = layer_state.state_current.clone();
-                        let state_staged = layer_state.state_staged.clone();
-                        let source_path = layer.source_path.clone();
-                        let sub_path = if path.as_str().len() > target_path.len() {
-                            &path.as_str()[target_path.len()..]
-                        } else {
-                            ""
-                        };
-                        let path = RelativePath::new_from_clean_parts(&source_path, sub_path);
-                        let path = if !path.is_empty() { Some(path) } else { None };
-                        async move {
-                            let mut changes = state::diff_collect(
-                                repository.clone(),
-                                state_current,
-                                repository.clone(),
-                                state_staged.clone(),
-                                path,
-                                FilterMode::Full,
+                let Some(selection) = layer_selection(layer, path.as_ref()) else {
+                    continue;
+                };
+                lore_spawn!(tasks, {
+                    let repository = layer_state.repository.clone();
+                    let state_current = layer_state.state_current.clone();
+                    let state_staged = layer_state.state_staged.clone();
+                    async move {
+                        let changes = state::diff_collect_subtree(
+                            layer::drawn_subtree_state(
+                                &repository,
+                                &state_current,
+                                &selection.source_path,
                             )
-                            .await
-                            .forward::<StatusError>("computing diff against staged state")?;
-                            lore_debug!(
-                                "Found {} changes in layer \"{}\" staged revision",
-                                target_path,
-                                changes.len()
-                            );
+                            .await,
+                            layer::drawn_subtree_state(
+                                &repository,
+                                &state_staged,
+                                &selection.source_path,
+                            )
+                            .await,
+                            selection.mount_path.clone(),
+                            FilterMode::Full,
+                        )
+                        .await
+                        .forward::<StatusError>("computing diff against staged state")?;
+                        lore_debug!(
+                            "Found {} changes in layer at \"{}\" staged revision",
+                            changes.len(),
+                            selection.mount_path,
+                        );
 
-                            for change in changes.iter_mut() {
-                                // TODO(mjansson): Translate paths for file size
-                                let size = 0;
-                                /*
-                                let size = file_size_from_node_change_id(change).await?;
-                                */
-
-                                change
-                                    .translate_from_layer_path(&source_path, target_path.as_str());
-
-                                event::LoreEvent::RepositoryStatusFile(
-                                    LoreRepositoryStatusFileEventData::from_node_change(
-                                        change, size,
-                                    ),
-                                )
-                                .send();
+                        for change in changes.iter() {
+                            if !reported_by_state_diff(change, show_scan) {
+                                continue;
                             }
-
-                            Ok(())
+                            let size = file_size_from_node_change_id(change).await?;
+                            event::LoreEvent::RepositoryStatusFile(
+                                LoreRepositoryStatusFileEventData::from_node_change(change, size),
+                            )
+                            .send();
                         }
-                    });
-                }
+
+                        Ok(())
+                    }
+                });
             }
         }
 

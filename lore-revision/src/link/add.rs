@@ -35,7 +35,6 @@ use crate::stage::StageOptions;
 use crate::state::State;
 use crate::state::StateNodeChildrenIterator;
 use crate::util::path::RelativePath;
-use crate::util::path::RelativePathBuf;
 
 pub async fn add(
     repository: Arc<RepositoryContext>,
@@ -365,7 +364,6 @@ pub async fn add(
                 inner_state.clone(),
                 inner_base_absolute,
                 chain.innermost_mount_path.clone().freeze(),
-                RelativePathBuf::new(),
                 chain.innermost_base_node,
                 remainder_parent.freeze(),
                 Arc::default(),

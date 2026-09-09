@@ -3813,12 +3813,15 @@ def test_link_merge_file_conflict_resolve(new_lore_repo):
     )
 
 
-def _setup_link_merge_conflict(new_lore_repo, link_path="linked/repo", files=None):
+def _setup_link_merge_conflict(
+    new_lore_repo, link_path="linked/repo", files=None, source_path="/"
+):
     """Helper: create main repo + linked repo with conflicting changes on feature branch.
 
-    `files` is a list of dicts with keys: path, base, mine, theirs.
-    Each file will be created with base content, then modified on both branches.
-    Returns (urc, link_repo, link_path).
+    `files` is a list of dicts with keys: path, base, mine, theirs. Each path is relative to
+    what the link exposes, so it is the path below the mount as well; `source_path` is where
+    the linked repository itself holds that subtree. Each file will be created with base
+    content, then modified on both branches. Returns (urc, link_repo, link_path).
     """
     if files is None:
         files = [
@@ -3840,18 +3843,20 @@ def _setup_link_merge_conflict(new_lore_repo, link_path="linked/repo", files=Non
 
     link_repo = new_lore_repo()
 
-    # Create base files in linked repo
+    # Create base files in linked repo, below the path the link exposes
+    source_prefix = source_path.strip("/")
     for file_info in files:
-        dirs = "/".join(file_info["path"].split("/")[:-1])
+        source_file = "/".join(filter(None, [source_prefix, file_info["path"]]))
+        dirs = "/".join(source_file.split("/")[:-1])
         if dirs:
             link_repo.make_dirs(dirs)
-        with link_repo.open_file(file_info["path"], "w+") as f:
+        with link_repo.open_file(source_file, "w+") as f:
             f.writelines([file_info["base"]])
     link_repo.stage(scan=True)
     link_repo.commit("Initial link repo commit")
     link_repo.push()
 
-    urc.link_add(link_path, link_repo.get_id(), "/", debug=True)
+    urc.link_add(link_path, link_repo.get_id(), source_path, debug=True)
     urc.commit("Add link")
     urc.push()
 
@@ -3876,6 +3881,54 @@ def _setup_link_merge_conflict(new_lore_repo, link_path="linked/repo", files=Non
     urc.push()
 
     return urc, link_repo, link_path
+
+
+@pytest.mark.smoke
+def test_link_merge_all_conflict_in_a_link_exposing_a_subtree(new_lore_repo):
+    """A default merge marks a conflict in a link exposing a subtree at the mount.
+
+    The link draws `content/assets` and materializes it at `linked/repo`, so the linked
+    repository's own path for the conflicted file is not the one on disk. The conflict is named
+    by its node below the subtree the link exposes, and the markers are written from the mount.
+    """
+    urc, _link_repo, link_path = _setup_link_merge_conflict(
+        new_lore_repo,
+        files=[
+            {
+                "path": "shader.hlsl",
+                "base": "base\n",
+                "mine": "mine content\n",
+                "theirs": "theirs content\n",
+            }
+        ],
+        source_path="content/assets",
+    )
+
+    urc.branch_merge_start("feature-branch", message="Merge with a subtree link conflict")
+
+    conflict_file = f"{link_path}/shader.hlsl"
+    assert urc.file_exists(conflict_file), (
+        "Expected the conflicted file to be marked at the mount"
+    )
+    assert not urc.file_exists(f"{link_path}/content/assets/shader.hlsl"), (
+        "The linked repository's own spelling was realized below the mount"
+    )
+
+    with urc.open_file(conflict_file, "r") as f:
+        content = f.read()
+    assert "<<<<<<<" in content or ">>>>>>>" in content, (
+        f"Expected conflict markers at the mount path, got:\n{content}"
+    )
+
+    with urc.open_file(conflict_file, "w+") as f:
+        f.writelines(["resolved through the mount\n"])
+
+    urc.branch_merge_resolve(conflict_file)
+    urc.commit("Merge with a conflict resolved in a subtree link")
+    urc.push()
+
+    with urc.open_file(conflict_file, "r") as f:
+        assert "resolved through the mount" in f.read()
 
 
 def test_link_merge_file_conflict_in_subdirectory(new_lore_repo):

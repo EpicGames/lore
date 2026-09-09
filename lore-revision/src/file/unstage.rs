@@ -616,9 +616,7 @@ async fn resolve_unstage_target(
     .forward::<UnstageError>("Failed to resolve link chain")?;
 
     let innermost_state = chain.innermost_state.clone();
-    chain
-        .record_tracker_contexts(link_tracker, &innermost_state, node_path.as_str())
-        .await;
+    chain.record_tracker_contexts(link_tracker, &innermost_state);
 
     let repository = chain.innermost_repository.clone();
     let state_staged = chain.innermost_state.clone();
@@ -1089,7 +1087,6 @@ async fn unstage_node(
             link_repository_id: link_metadata.repository,
             link_node_id: node_id,
             parent_repository_id: repository.id,
-            link_path: node_path.clone().into_buf(),
             link_state: linked_state.clone(),
         };
 

@@ -19,6 +19,7 @@ use crate::branch::push::push_query;
 use crate::change;
 use crate::change::FileAction;
 use crate::change::NodeChange;
+use crate::change::NodeChangeState;
 use crate::commit;
 use crate::commit::CommitOptions;
 use crate::errors::*;
@@ -54,6 +55,7 @@ use crate::node::NodeFileMetadata;
 use crate::node::NodeFileMetadataBlock;
 use crate::node::NodeFlags;
 use crate::node::NodeID;
+use crate::node::NodeIDExt;
 use crate::node::NodeLink;
 use crate::node::ROOT_NODE;
 use crate::path::emit_path_ignore;
@@ -418,8 +420,8 @@ pub struct MergeRepositoryResult {
     /// Endpoints for reconciling state the diff does not carry, such as link pins.
     pub endpoints: MergeDiffEndpoints,
     /// Conflict-realization context: the 3-way merge inputs and the conflict
-    /// pairs from the diff. Surfaced so `merge_start_all` can remap paths
-    /// onto the link's mount and call `realize_conflicts` without re-running
+    /// pairs from the diff. Surfaced so `merge_start_all` can spell them from
+    /// the link's mount and call `realize_conflicts` without re-running
     /// diff3. `None` when no conflicts (`!has_conflicts`).
     pub conflict_context: Option<ConflictRealizeContext>,
 }
@@ -433,8 +435,8 @@ pub struct ConflictRealizeContext {
     pub state_base: Arc<State>,
     pub state_from: Arc<State>,
     pub state_to: Arc<State>,
-    /// Paths are relative to the merged repository's root — for a linked
-    /// repo merge, the caller must remap to the parent's mount path.
+    /// Paths are relative to the merged repository's root, which for a linked repo merge is not
+    /// the working tree: [`mount_conflicts`] names each by its node to spell it from the mount.
     pub conflicts: Arc<Vec<(NodeChange, NodeChange)>>,
 }
 
@@ -1018,7 +1020,106 @@ struct MergedLink {
 struct PendingConflictRealize {
     link_context: Arc<RepositoryContext>,
     link_path: String,
+    link_node: Node,
     context: ConflictRealizeContext,
+}
+
+/// Where `side`'s node is materialized under `mount_path`, or `None` where the link exposes no
+/// subtree holding it.
+///
+/// `source_path` is resolved against `side`'s own revision: each revision of the linked
+/// repository numbers its nodes as it pleases, so the subtree the link exposes is a different
+/// node in each.
+async fn mounted_node_path(
+    side: &NodeChangeState,
+    mount_path: &RelativePath,
+    source_path: &RelativePath,
+) -> Option<RelativePath> {
+    let subtree_node = if source_path.is_empty() {
+        ROOT_NODE
+    } else {
+        side.state
+            .find_node_link(side.repository.clone(), source_path.as_str())
+            .await
+            .ok()
+            .filter(NodeLink::is_valid)?
+            .node
+    };
+
+    let below = side
+        .state
+        .node_path_below(side.repository.clone(), side.node, subtree_node)
+        .await
+        .ok()??;
+    Some(mount_path.join(below.as_str()))
+}
+
+/// Where a change is materialized under `mount_path`: the merged side where it holds a node, and
+/// the pre-merge side otherwise, which is what a delete leaves.
+async fn conflict_mount_path(
+    change: &NodeChange,
+    mount_path: &RelativePath,
+    source_path: &RelativePath,
+) -> Option<RelativePath> {
+    let side = if change.to.node.is_valid_or_root_node_id() {
+        &change.to
+    } else {
+        &change.from
+    };
+    mounted_node_path(side, mount_path, source_path).await
+}
+
+/// Where the source of a change's move is materialized under `mount_path`, for a change that
+/// records one.
+///
+/// A move's source is where its node was, which is the node the pre-merge side holds.
+async fn conflict_mount_from_path(
+    change: &NodeChange,
+    mount_path: &RelativePath,
+    source_path: &RelativePath,
+) -> Option<RelativePath> {
+    change.from_path.as_ref()?;
+    mounted_node_path(&change.from, mount_path, source_path).await
+}
+
+/// The conflicts a link's merge produced, spelled from the mount they are materialized at.
+///
+/// A merge covers the whole of the linked repository while the working tree materializes only the
+/// subtree the link exposes, so each conflict is named by its node below that subtree's root. One
+/// the link does not expose is dropped: nothing on disk holds it, so there is nothing to mark.
+///
+/// The two sides are spelled apart: a move conflicting with a change at the path it moved from
+/// pairs two changes at different paths.
+async fn mount_conflicts(
+    pending: &PendingConflictRealize,
+    mount_path: &RelativePath,
+) -> Result<Vec<(NodeChange, NodeChange)>, MergeError> {
+    let source_path = link::pinned_source_path(pending.link_context.clone(), &pending.link_node)
+        .await
+        .forward::<MergeError>("resolving the path a conflicted link exposes")?;
+
+    let mut mounted = Vec::with_capacity(pending.context.conflicts.len());
+    for (from, to) in pending.context.conflicts.iter() {
+        let (Some(from_mounted), Some(to_mounted)) = (
+            conflict_mount_path(from, mount_path, &source_path).await,
+            conflict_mount_path(to, mount_path, &source_path).await,
+        ) else {
+            lore_debug!(
+                "Conflict at {} is outside what the link at {mount_path} exposes, not realized",
+                to.path
+            );
+            continue;
+        };
+
+        let mut from = from.clone();
+        let mut to = to.clone();
+        from.from_path = conflict_mount_from_path(&from, mount_path, &source_path).await;
+        to.from_path = conflict_mount_from_path(&to, mount_path, &source_path).await;
+        from.path = from_mounted;
+        to.path = to_mounted;
+        mounted.push((from, to));
+    }
+    Ok(mounted)
 }
 
 /// Run upfront eligibility checks for every link in `state_current`, returning
@@ -1276,6 +1377,7 @@ async fn merge_start_all(
                 pending_conflict_realizes.push(PendingConflictRealize {
                     link_context: eligible.link_context.clone(),
                     link_path: eligible.link_path.clone(),
+                    link_node: eligible.link_node,
                     context: ctx,
                 });
             }
@@ -1404,32 +1506,14 @@ async fn finalize_link_conflict_state(
 
     // Now that each conflicted link's new state has been realized at the
     // mount path by `stage_link_pin`, write conflict markers (and
-    // `.mine`/`.theirs`/`.base` sidecars) on top. Remap each conflict's
-    // `change.path` to the link's mount prefix; pass the link's
+    // `.mine`/`.theirs`/`.base` sidecars) on top. Pass the link's
     // `RepositoryContext` — its `path` is shared with the parent (set by
     // `to_link_context`), so absolute paths resolve to
     // `<parent>/<mount>/<file>` while state block lookups stay in the link.
     for pending in pending_conflict_realizes {
         let mount_path = RelativePath::from_str(&pending.link_path)
             .internal_with(|| format!("link not found: {}", pending.link_path))?;
-        let remapped_conflicts: Vec<(NodeChange, NodeChange)> = pending
-            .context
-            .conflicts
-            .iter()
-            .map(|(from, to)| {
-                let mut from_remapped = from.clone();
-                let mut to_remapped = to.clone();
-                from_remapped.path = mount_path.join(from.path.as_str());
-                to_remapped.path = mount_path.join(to.path.as_str());
-                if let Some(ref fp) = from.from_path {
-                    from_remapped.from_path = Some(mount_path.join(fp.as_str()));
-                }
-                if let Some(ref fp) = to.from_path {
-                    to_remapped.from_path = Some(mount_path.join(fp.as_str()));
-                }
-                (from_remapped, to_remapped)
-            })
-            .collect();
+        let conflicts = Arc::new(mount_conflicts(pending, &mount_path).await?);
         let conflict_stats = Arc::new(sync::SyncRealizeStats::default());
         sync::realize_conflicts(
             pending.link_context.clone(),
@@ -1437,7 +1521,7 @@ async fn finalize_link_conflict_state(
             pending.context.state_from.clone(),
             pending.context.state_to.clone(),
             None, // staging already happened inside apply_diff for the link state
-            Arc::new(remapped_conflicts),
+            conflicts.clone(),
             false,
             conflict_stats,
             MergeType::BranchMerge,
@@ -1445,12 +1529,11 @@ async fn finalize_link_conflict_state(
         .await
         .forward::<MergeError>("realizing link conflicts")?;
 
-        // Emit per-file conflict events with the mount-prefixed path so
-        // consumers see the same shape as for parent-level conflicts.
-        for (from, _to) in pending.context.conflicts.iter() {
-            let mount_relative = mount_path.join(from.path.as_str());
+        // Emit per-file conflict events at the same paths, so consumers see the
+        // same shape as for parent-level conflicts.
+        for (from, _to) in conflicts.iter() {
             event::LoreEvent::BranchMergeConflictFile(LoreBranchMergeConflictFileEventData {
-                path: LoreString::from(mount_relative.as_str()),
+                path: LoreString::from(from.path.as_str()),
             })
             .send();
         }

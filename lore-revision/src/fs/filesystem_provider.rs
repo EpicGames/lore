@@ -98,9 +98,9 @@ impl FileInfo {
     }
 }
 
-/// One side of a filesystem diff: which tree, rooted where. `node_path` is where
-/// `root_node` sits in its own tree, which differs from the path being walked once a
-/// link or layer mount has been crossed.
+/// One side of a filesystem diff: which tree, rooted where. `node_path` is the working-tree path
+/// of `root_node`, as the tree spells it — which differs from `filesystem_path` only where the two
+/// spell a name with different case.
 pub struct FilesystemTraversal {
     pub repository: Arc<RepositoryContext>,
     pub state: Arc<State>,

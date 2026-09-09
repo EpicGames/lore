@@ -875,9 +875,9 @@ pub async fn commit_impl(
 /// Commits staged changes in a single layer without committing the parent.
 ///
 /// Resolves the layer by `target_path` against the parent's layer config,
-/// runs the existing commit pipeline against the layer with proper path
-/// remapping, advances the local layer config to point at the new layer
-/// revision, and emits a `RevisionCommitRevision` event for the layer.
+/// runs the existing commit pipeline against the layer from the node its
+/// source path names, advances the local layer config to point at the new
+/// layer revision, and emits a `RevisionCommitRevision` event for the layer.
 ///
 /// The parent's staged anchor and tree state are NOT modified — layer pins
 /// live in `.urc/layer.toml`, not in the parent's revision tree.

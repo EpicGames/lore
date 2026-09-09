@@ -132,6 +132,10 @@ impl EventError for LinkError {
 }
 
 /// Context information for discovered links during tree traversal
+///
+/// A link is named by the repository holding it, the node it sits at there, and the
+/// repository it mounts. That triple is its identity, so a walk reaching the same link twice
+/// registers it once whatever path it arrived by.
 #[derive(Debug, Clone)]
 pub struct LinkContext {
     /// The repository ID that the link points to
@@ -140,8 +144,6 @@ pub struct LinkContext {
     pub link_node_id: NodeID,
     /// The repository ID where the link resides
     pub parent_repository_id: RepositoryId,
-    /// Path to the link from the parent repository root
-    pub link_path: RelativePathBuf,
     /// The state of the linked repository
     pub link_state: Arc<State>,
 }
@@ -151,7 +153,6 @@ impl PartialEq for LinkContext {
         self.link_repository_id == other.link_repository_id
             && self.link_node_id == other.link_node_id
             && self.parent_repository_id == other.parent_repository_id
-            && self.link_path == other.link_path
     }
 }
 
@@ -162,7 +163,6 @@ impl std::hash::Hash for LinkContext {
         self.link_repository_id.hash(state);
         self.link_node_id.hash(state);
         self.parent_repository_id.hash(state);
-        self.link_path.hash(state);
     }
 }
 
@@ -887,36 +887,22 @@ impl ResolvedLinkChain {
     /// Register a `LinkContext` in `tracker` for every link crossed by this
     /// chain, so a filesystem-walk operation (stage / unstage) folds a nested
     /// change up through all intermediate links. Each level's child state is
-    /// the next level's parent state, or `innermost_state` for the last level;
-    /// `link_path` is the link node's path within its own parent repository
-    /// (its `node_path` there, falling back to `fallback_path`).
+    /// the next level's parent state, or `innermost_state` for the last level.
     ///
     /// `innermost_state` must be the exact state instance the caller mutates
     /// (the one the deep change is staged into), so the tracker reserializes
     /// the changes rather than a fresh deserialization of the same revision.
-    pub async fn record_tracker_contexts(
-        &self,
-        tracker: &LinkTracker,
-        innermost_state: &Arc<State>,
-        fallback_path: &str,
-    ) {
+    pub fn record_tracker_contexts(&self, tracker: &LinkTracker, innermost_state: &Arc<State>) {
         for (index, level) in self.levels.iter().enumerate() {
             let child_state = if index + 1 < self.levels.len() {
                 self.levels[index + 1].state.clone()
             } else {
                 innermost_state.clone()
             };
-            let level_path = level
-                .state
-                .node_path(level.repository.clone(), level.link_node_id)
-                .await
-                .unwrap_or_else(|_| fallback_path.to_string());
             tracker.add_link(LinkContext {
                 link_repository_id: level.child_repository_id,
                 link_node_id: level.link_node_id,
                 parent_repository_id: level.repository.id,
-                link_path: RelativePathBuf::new_from_initial_path(level_path.as_str())
-                    .unwrap_or_default(),
                 link_state: child_state,
             });
         }
@@ -1009,10 +995,8 @@ pub async fn drain_link_tracker(
     let mut contexts = selected;
 
     // Order deepest-nested first so each child is reserialized before the
-    // parent whose pin folds it in. Depth is the length of the ancestor chain
-    // (following `parent_repository_id` up to the top-level repo), NOT a
-    // proxy like the mount path's slash count — the two tracker-population
-    // sites store different path semantics, so the path length is unreliable.
+    // parent whose pin folds it in. Depth is the length of the ancestor chain,
+    // following `parent_repository_id` up to the top-level repo.
     let depth_of = |ctx: &LinkContext| -> usize {
         let mut depth = 0usize;
         let mut parent_id = ctx.parent_repository_id;
@@ -1334,8 +1318,8 @@ pub async fn is_staged_pin_change(
 /// Realizes on-disk content changes when a link pin changes.
 ///
 /// Deserializes the old and new link states, computes a 2-way diff scoped to
-/// the linked node, remaps change paths to the mount point, verifies filesystem
-/// consistency, and realizes the changes on disk.
+/// the linked node and spelled from the mount, verifies filesystem consistency,
+/// and realizes the changes on disk.
 pub async fn realize_link_pin_change(
     repository: Arc<RepositoryContext>,
     link_context: Arc<RepositoryContext>,

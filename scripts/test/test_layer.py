@@ -1400,6 +1400,182 @@ def test_status_unstaged_mixed_parent_and_layer(new_lore_repo):
         )
 
 
+# The `thr` layer of `_setup_repo_with_two_layers` draws `third/` and materializes it at `thr/`,
+# so the two spellings never match. Every path below is one or the other, and a report carrying
+# the drawn-from spelling is a report of a path the working tree does not hold.
+THR_MOUNT_FILE = os.path.join("thr", "third_repo.txt")
+THR_MOUNT_PATH = "thr/third_repo.txt"
+THR_SOURCE_PATH = "third/third_repo.txt"
+
+
+@pytest.mark.smoke
+def test_layer_stage_reports_paths_at_the_mount(new_lore_repo):
+    """Staging into a layer mounted away from its source reports the mount path.
+
+    The stage walk runs against the layer's own tree while the file it reads is the parent's, so
+    this is what tells the two spellings apart.
+    """
+    repo, _second_repo, _third_repo = _setup_repo_with_two_layers(new_lore_repo)
+
+    with repo.open_file(THR_MOUNT_FILE, mode="wb") as out:
+        out.write(b"staged through the mount")
+
+    staged = parse_jsonl(repo.stage(THR_MOUNT_FILE, json=True), "fileStageFile")
+    paths = [entry.get("path") for entry in staged]
+    assert THR_MOUNT_PATH in paths, (
+        f"Expected the staged file at the mount path {THR_MOUNT_PATH}, got: {staged}"
+    )
+    assert THR_SOURCE_PATH not in paths, (
+        f"The layer's own spelling leaked into the stage report: {paths}"
+    )
+
+    status_entries = parse_status_json(repo.status(json=True))
+    staged_entries = [e for e in status_entries if e.get("flagStaged")]
+    assert [e.get("path") for e in staged_entries] == [THR_MOUNT_PATH], (
+        f"Expected one staged entry at {THR_MOUNT_PATH}, got: {status_entries}"
+    )
+    assert staged_entries[0].get("size") == len(b"staged through the mount"), (
+        f"Expected the staged file's size to be reported, got: {staged_entries[0]}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_dirty_reports_paths_at_the_mount(new_lore_repo):
+    """`lore dirty` on a path inside a layer mounted away from its source marks the layer's node
+    and reports the mount path."""
+    repo, _second_repo, _third_repo = _setup_repo_with_two_layers(new_lore_repo)
+
+    with repo.open_file(THR_MOUNT_FILE, mode="wb") as out:
+        out.write(b"dirtied through the mount")
+
+    repo.dirty(THR_MOUNT_FILE)
+
+    status_entries = parse_status_json(repo.status(json=True))
+    paths = [e.get("path") for e in status_entries]
+    assert paths == [THR_MOUNT_PATH], (
+        f"Expected one dirty entry at {THR_MOUNT_PATH}, got: {status_entries}"
+    )
+    assert status_entries[0].get("flagDirty") is True, (
+        f"Expected the marked file to be reported dirty, got: {status_entries[0]}"
+    )
+
+    # A scan re-detects the marked file, which the state diff then leaves to it.
+    scanned = parse_status_json(repo.status(json=True, scan=True))
+    assert [e.get("path") for e in scanned] == [THR_MOUNT_PATH], (
+        f"Expected the scan to report the file once, got: {scanned}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_stage_is_filtered_by_the_mount_path(new_lore_repo):
+    """A rule naming the mount excludes what is below it from staging.
+
+    Ignore rules are written against the working tree, so `thr/**` — which matches nothing the
+    layer repository spells — must still exclude the file the layer draws.
+    """
+    repo, _second_repo, _third_repo = _setup_repo_with_two_layers(new_lore_repo)
+
+    with repo.open_file(repo.ignore_file(), "w+") as out:
+        out.write("thr/**\n")
+    with repo.open_file(THR_MOUNT_FILE, mode="wb") as out:
+        out.write(b"excluded by the mount rule")
+
+    staged = parse_jsonl(repo.stage(THR_MOUNT_FILE, json=True), "fileStageFile")
+    assert staged == [], (
+        f"Expected the rule on the mount path to exclude the file from `stage`, got: {staged}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_dirty_is_not_filtered_by_the_layers_own_spelling(new_lore_repo):
+    """A rule matching only the path the layer draws from excludes nothing.
+
+    `third/**` is what the layer repository spells the file as, and matches nothing in the
+    working tree, so the file below the mount is marked and reported as usual.
+    """
+    repo, _second_repo, _third_repo = _setup_repo_with_two_layers(new_lore_repo)
+
+    with repo.open_file(repo.ignore_file(), "w+") as out:
+        out.write("third/**\n")
+    with repo.open_file(THR_MOUNT_FILE, mode="wb") as out:
+        out.write(b"not excluded by a rule on the source path")
+
+    repo.dirty(THR_MOUNT_FILE)
+
+    status_entries = parse_status_json(repo.status(json=True))
+    assert [e.get("path") for e in status_entries] == [THR_MOUNT_PATH], (
+        "Expected a rule matching only the layer's own spelling to exclude nothing, got: "
+        f"{status_entries}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_dirty_add_and_delete_report_paths_at_the_mount(new_lore_repo):
+    """A file added and one deleted inside a layer mounted away from its source are both marked
+    against the layer's tree and reported at the mount."""
+    repo, _second_repo, _third_repo = _setup_repo_with_two_layers(new_lore_repo)
+
+    added = os.path.join("thr", "added_through_mount.txt")
+    with repo.open_file(added, mode="wb") as out:
+        out.write(b"added through the mount")
+    os.remove(os.path.join(repo.path, THR_MOUNT_FILE))
+
+    repo.dirty("thr")
+
+    status_entries = parse_status_json(repo.status(json=True))
+    by_path = {e.get("path"): e for e in status_entries}
+    assert by_path.keys() == {"thr/added_through_mount.txt", THR_MOUNT_PATH}, (
+        f"Expected the add and the delete at the mount, got: {status_entries}"
+    )
+    assert by_path["thr/added_through_mount.txt"].get("action") == "add"
+    assert by_path[THR_MOUNT_PATH].get("action") == "delete"
+
+
+@pytest.mark.smoke
+def test_layer_sync_advances_a_layer_mounted_away_from_its_source(new_lore_repo):
+    """Syncing a layer mounted away from its source realizes the new content at the mount.
+
+    The state diff is taken between the two revisions of the drawn subtree and reported from the
+    mount, which is what lets a layer whose source and target differ be synced at all.
+    """
+    repo, _second_repo, third_repo = _setup_repo_with_two_layers(new_lore_repo)
+
+    with third_repo.open_file(THR_SOURCE_PATH, mode="wb") as out:
+        out.write(b"layer revision two")
+    third_repo.stage(scan=True)
+    third_repo.commit()
+    third_repo.push()
+
+    repo.sync(force=True)
+
+    with repo.open_file(THR_MOUNT_FILE, mode="rb") as out:
+        assert out.read() == b"layer revision two", (
+            "Expected the layer's new content to be realized at the mount"
+        )
+    assert not os.path.exists(os.path.join(repo.path, "thr", "third")), (
+        "The layer's own spelling was realized below the mount"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_sync_reset_restores_a_layer_mounted_away_from_its_source(new_lore_repo):
+    """`lore sync --reset` restores locally modified content of a layer mounted away from its
+    source, diffing the filesystem at the mount against the subtree the layer draws."""
+    repo, _second_repo, _third_repo = _setup_repo_with_two_layers(new_lore_repo)
+
+    with repo.open_file(THR_MOUNT_FILE, mode="rb") as out:
+        original = out.read()
+    with repo.open_file(THR_MOUNT_FILE, mode="wb") as out:
+        out.write(b"local modification")
+
+    repo.sync(reset=True)
+
+    with repo.open_file(THR_MOUNT_FILE, mode="rb") as out:
+        assert out.read() == original, (
+            "Expected --reset to restore the layer's pinned content at the mount"
+        )
+
+
 @pytest.mark.smoke
 def test_layer_remove_without_repository(new_lore_repo):
     """`lore layer remove <path>` without a source repository argument finds

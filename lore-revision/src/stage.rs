@@ -346,17 +346,18 @@ async fn is_uncommitted_child(
 /// Stage changes from filesystem into the given state
 /// The base directory is the point where the relative path starts
 /// Only the relative path will be checked for case consistency
+///
+/// `base_relative_path` is the working-tree path of `base_node`, and `relative_path` names the
+/// target below it. A mounted state starts at its own root and spells its nodes from there, so
+/// the base is named by its node rather than by a path, and the walk carries the working-tree
+/// path the filesystem, the filter and the reported changes all answer for.
 #[allow(clippy::too_many_arguments)]
-/// `base_on_disk` is where the base sits under the root the operation names paths from, which
-/// a link or layer mount makes different from `base_relative_path`: that one is the offset into
-/// the state being staged, and a mount's state starts at its own root.
 pub(crate) async fn stage_filesystem_path(
     operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     base_absolute_path: PathBuf,
-    base_on_disk: RelativePath,
-    base_relative_path: RelativePathBuf,
+    base_relative_path: RelativePath,
     base_node: NodeID,
     relative_path: RelativePath,
     stats: Arc<StageStats>,
@@ -377,7 +378,7 @@ pub(crate) async fn stage_filesystem_path(
     } else {
         let resolved = util::fs::filesystem_path_and_info(
             &operation,
-            base_on_disk.as_str(),
+            base_relative_path.as_str(),
             &relative_path,
             prefixes.as_deref(),
         )
@@ -388,8 +389,6 @@ pub(crate) async fn stage_filesystem_path(
         }
     };
 
-    // The filter and the delete lookup below are repository-relative, while
-    // `relative_path` is relative to the base the walk starts from.
     let full_relative_path = if base_relative_path.is_empty() {
         relative_path.clone()
     } else {
@@ -409,10 +408,8 @@ pub(crate) async fn stage_filesystem_path(
     let staged_info = if let Some(info) = resolved_info {
         Some(info)
     } else {
-        let staged_path =
-            RelativePath::new_from_clean_parts(base_on_disk.as_str(), relative_path.as_str());
         operation
-            .file_info(&staged_path)
+            .file_info(&full_relative_path)
             .await
             .ok()
             .filter(|info| info.exists)
@@ -441,7 +438,8 @@ pub(crate) async fn stage_filesystem_path(
         // in the file system for the current existing name case variation but just use what was
         // passed to the function as the stage_directory will enumerate the file system.
         let mut current_repository = repository.clone();
-        let mut current_relative_path = base_relative_path;
+        let mut current_relative_path =
+            base_relative_path.to_buf_with_capacity(RelativePath::COMPONENT_ROOM);
         let mut current_absolute_path = base_absolute_path;
         let mut current_node = base_node;
         let mut current_state = state.clone();
@@ -562,7 +560,6 @@ pub(crate) async fn stage_filesystem_path(
                         link_repository_id,
                         link_node_id: node_link.node,
                         parent_repository_id: current_repository.id,
-                        link_path: current_relative_path.clone(),
                         link_state: linked_state.clone(),
                     };
 
@@ -614,7 +611,7 @@ pub(crate) async fn stage_filesystem_path(
         full_relative_path.as_str(),
     );
     if let Ok(node_link) = state
-        .find_node_link(repository.clone(), full_relative_path.as_str())
+        .find_relative_node_link(repository.clone(), base_node, relative_path.as_str())
         .await
     {
         let mut current_repository = repository.clone();
@@ -643,9 +640,7 @@ pub(crate) async fn stage_filesystem_path(
             .await
             .forward::<StageError>("Failed to resolve link chain")?;
 
-            chain
-                .record_tracker_contexts(tracker, &node_state, full_relative_path.as_str())
-                .await;
+            chain.record_tracker_contexts(tracker, &node_state);
         }
 
         lore_debug!(
@@ -1741,7 +1736,6 @@ async fn stage_child_directory(
                 link_repository_id: link.repository,
                 link_node_id: node_link.node,
                 parent_repository_id: repository.id,
-                link_path: relative_path.clone(),
                 link_state: linked_state.clone(),
             };
 
@@ -2856,7 +2850,6 @@ async fn stage_from_parent_revision_in_operation(
                     state.clone(),
                     repository.require_path()?.to_path_buf(),
                     RelativePath::new(),
-                    RelativePathBuf::new(),
                     ROOT_NODE,
                     relative_path.clone(),
                     stats.clone(),
@@ -3023,7 +3016,6 @@ async fn stage_from_parent_revision_in_operation(
                     state.clone(),
                     repository.require_path()?.to_path_buf(),
                     RelativePath::new(),
-                    RelativePathBuf::new(),
                     ROOT_NODE,
                     relative_path.clone(),
                     stats.clone(),
@@ -3367,9 +3359,8 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
 
             // Mirror `stage_from_parent_revision`: realize the chosen
             // target's content on disk, then read it back into state via
-            // `stage_filesystem_path`. Anchor at the link's mount so the
-            // disk side is mount-prefixed while the state side stays
-            // link-relative.
+            // `stage_filesystem_path`, anchored at the mount, whose node is
+            // the root of the link's own state.
             if !target_node_link.is_valid() {
                 // No file at the path → `stage_filesystem_path` stages a
                 // delete; we just clear the on-disk file first.
@@ -3381,7 +3372,6 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
                     group.link_state_staged.clone(),
                     mount_base_absolute.clone(),
                     group.link_path_rel.clone(),
-                    RelativePathBuf::new(),
                     ROOT_NODE,
                     link_relative.clone(),
                     stats.clone(),
@@ -3427,7 +3417,6 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
                     group.link_state_staged.clone(),
                     mount_base_absolute.clone(),
                     group.link_path_rel.clone(),
-                    RelativePathBuf::new(),
                     ROOT_NODE,
                     link_relative.clone(),
                     stats.clone(),

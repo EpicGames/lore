@@ -3673,17 +3673,19 @@ impl State {
         }
     }
 
-    pub async fn node_path(
+    /// The path from `ancestor` down to `node`, or `None` where the parent chain leaves the tree
+    /// without reaching `ancestor`. `ancestor` itself is the empty path.
+    async fn path_from_ancestor(
         &self,
         repository: Arc<RepositoryContext>,
         mut node: NodeID,
-    ) -> Result<String, StateError> {
-        if node == ROOT_NODE {
-            return Ok(String::new());
-        }
-
+        ancestor: NodeID,
+    ) -> Result<Option<RelativePathBuf>, StateError> {
         let mut nodes = vec![];
-        while node.is_valid_node_id() {
+        while node != ancestor {
+            if !node.is_valid_node_id() {
+                return Ok(None);
+            }
             nodes.push(node);
 
             let block_index = NodeBlock::index(node);
@@ -3701,7 +3703,40 @@ impl State {
             path.push(name);
         }
 
-        Ok(path.to_string())
+        Ok(Some(path))
+    }
+
+    /// The path `node` sits at in this state's own tree.
+    ///
+    /// This is the tree's spelling, which is the working-tree path only for a state the working
+    /// tree materializes from its root. A walk carries the working-tree path instead; this is for
+    /// the few places that need what a repository itself calls a node, such as resolving
+    /// configuration that names one.
+    pub async fn node_path(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: NodeID,
+    ) -> Result<String, StateError> {
+        Ok(self
+            .path_from_ancestor(repository, node, ROOT_NODE)
+            .await?
+            .map_or_else(String::new, |path| path.to_string()))
+    }
+
+    /// The path of `node` below `ancestor`, or `None` where `ancestor` does not hold it.
+    ///
+    /// A working tree materializes the subtree an ancestor roots, so this is what to spell from
+    /// the path that subtree is materialized at. `ancestor` itself is the empty path.
+    pub async fn node_path_below(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: NodeID,
+        ancestor: NodeID,
+    ) -> Result<Option<RelativePath>, StateError> {
+        Ok(self
+            .path_from_ancestor(repository, node, ancestor)
+            .await?
+            .map(RelativePathBuf::freeze))
     }
 
     pub async fn collect_children_unsorted(

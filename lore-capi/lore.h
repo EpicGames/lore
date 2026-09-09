@@ -2079,7 +2079,7 @@ typedef struct lore_repository_status_revision_event_data_t {
 
 // Status of a single file or node reported by a repository status operation.
 typedef struct lore_repository_status_file_event_data_t {
-  // Path of the file relative to the repository root.
+  // Path of the file, relative to the root of the working tree.
   struct lore_string_t path;
   // Size of the file in bytes.
   uint64_t size;

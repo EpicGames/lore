@@ -280,24 +280,6 @@ impl NodeChange {
             Ok(noderef.is_directory())
         }
     }
-
-    /// Translate paths from inner path inside the layer to the outer path in the main repository
-    pub fn translate_from_layer_path(&mut self, inner_path: &str, outer_path: &str) {
-        if self.path.as_str().starts_with(inner_path) {
-            self.path = RelativePath::new_from_clean_parts(
-                outer_path,
-                &self.path.as_str()[inner_path.len()..],
-            );
-        }
-        if let Some(from_path) = self.from_path.as_mut()
-            && from_path.as_str().starts_with(inner_path)
-        {
-            *from_path = RelativePath::new_from_clean_parts(
-                outer_path,
-                &from_path.as_str()[inner_path.len()..],
-            );
-        }
-    }
 }
 
 pub async fn is_conflict(
