@@ -3,9 +3,9 @@
 
 name: Publish loreserver image
 
-# Packages the loreserver binaries from a published GitHub release into a
-# multi-arch image at ghcr.io/epicgames/lore/loreserver, and signs it with
-# keyless cosign so the community Helm chart can reference a verifiable tag.
+# Packages the loreserver binaries from a published GitHub release into images
+# at ghcr.io/epicgames/lore/loreserver, and signs them with keyless cosign so
+# the community Helm chart can reference a verifiable tag.
 #
 # Nothing is compiled here. The release assets are the artifacts; this workflow
 # unpacks and packages them:
@@ -13,13 +13,25 @@ name: Publish loreserver image
 #   loreserver-<version>-x86_64-unknown-linux-gnu.tar.gz                  linux/amd64
 #   loreserver-<version>-aarch64-unknown-linux-gnu-neoverse-512tvb.tar.gz linux/arm64
 #
-# Only one arm64 Linux binary is released and it is tuned for Graviton3+, so
-# every tag carries the -graviton suffix — `latest-graviton` included — and no
-# unsuffixed tag is published at all. An unsuffixed tag would hand that arm64
-# binary to Apple Silicon and Ampere hosts, which SIGILL on it, and claiming
-# the portable name for a non-portable image is worse than leaving it unclaimed.
-# When a baseline armv8-a binary starts shipping, the portable stream can take
-# the unsuffixed tags.
+# Two variants ship, differing in which of those they carry:
+#
+#   :X.Y.Z            linux/amd64 alone
+#   :X.Y.Z-graviton   linux/amd64 plus linux/arm64 tuned for Graviton3+
+#
+# The release ships no baseline armv8-a Linux binary — its only aarch64 Linux
+# build is tuned for Graviton3+, and its aarch64-apple-darwin build is Mach-O
+# and so cannot go in a Linux image at all. So arm64 is offered only under the
+# suffixed tag, where the name warns what it is. Nothing in the pull path
+# consults CPU features, so an unsuffixed tag carrying that arm64 build would
+# hand it to Apple Silicon and Ampere hosts, which SIGILL on it.
+#
+# The default variant is therefore amd64 alone, and deliberately a plain
+# manifest rather than a single-entry index: an index listing only linux/amd64
+# makes an arm64 host fail the pull outright ("no matching manifest for
+# linux/arm64/v8"), whereas a plain manifest runs under emulation with a
+# warning. That is the whole point of the unsuffixed tag, so it is asserted
+# below and it is why this variant sets provenance=false — buildx attaches
+# provenance as a second manifest, which forces an index.
 #
 # Triggered by `release: published` rather than the tag push, because releases
 # here are drafted, have their assets uploaded, and are published by hand hours
@@ -30,11 +42,10 @@ name: Publish loreserver image
 # publishes only its `tag` input, so proving the workflow cannot move a
 # release tag onto an image built from unreviewed code.
 #
-# `meta` resolves tags and labels once, so the later jobs cannot disagree.
-# `build` packages both platforms in a single pass and pushes the index by
-# digest, carrying no tag at all, which is what lets `publish` sign and verify
-# the image before it is named: no tag is ever left pointing at an unsigned
-# image.
+# `meta` resolves each variant's tags and labels once, so the later jobs cannot
+# disagree. `build` packages both variants and pushes each by digest, carrying
+# no tag at all, which is what lets `publish` sign and verify an image before
+# it is named: no tag is ever left pointing at an unsigned image.
 #
 # No secrets: GITHUB_TOKEN reads the release and authenticates to GHCR, and
 # cosign signs keylessly against Fulcio via the job's OIDC token.
@@ -52,7 +63,7 @@ on:
       tag:
         description: >-
           Extra tag to publish, for proving the workflow (for example "edge").
-          The -graviton suffix applies to it like any other tag. Required when
+          Both variants publish it, the tuned one suffixed. Required when
           dispatching from a branch other than the default one, which
           publishes this tag alone and no release tags.
         type: string
@@ -81,6 +92,9 @@ jobs:
       json: ${{ steps.meta.outputs.json }}
       labels: ${{ steps.meta.outputs.labels }}
       annotations: ${{ steps.meta.outputs.annotations }}
+      graviton-json: ${{ steps.meta-graviton.outputs.json }}
+      graviton-labels: ${{ steps.meta-graviton.outputs.labels }}
+      graviton-annotations: ${{ steps.meta-graviton.outputs.annotations }}
     env:
       # Whether this run is allowed to attach the release tags, as opposed to
       # only the `tag` input. True for a release, and for a dispatch from the
@@ -107,7 +121,7 @@ jobs:
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
-      # The input lands verbatim in the `tags` list below, where a newline
+      # The input lands verbatim in the `tags` lists below, where a newline
       # would smuggle in a further directive. Hold it to Docker's grammar.
       - name: Validate the tag input
         env:
@@ -131,16 +145,13 @@ jobs:
         env:
           # The index is what gets signed and what a puller resolves, so it
           # needs the annotations too, not just the per-platform manifests.
+          # Harmless on the default variant, which has no index.
           DOCKER_METADATA_ANNOTATIONS_LEVELS: index,manifest
         with:
           images: ${{ env.IMAGE }}
-          # Every tag carries the suffix, `latest` included: the tuned stream
-          # is the only one that ships and it must not occupy the portable
-          # name. Only a stable semver moves latest-graviton; a prerelease
-          # publishes its own tag and nothing else.
-          flavor: |
-            latest=auto
-            suffix=-graviton,onlatest=true
+          # Only a stable semver moves `latest`; a prerelease publishes its own
+          # tag and nothing else.
+          flavor: latest=auto
           # The version comes from `value=` rather than the ref, because a
           # dispatch run starts from a branch whose ref carries no version.
           #
@@ -156,18 +167,37 @@ jobs:
             type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }},enable=${{ env.RELEASE_TAGS }}
             type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
 
+      # The same tags, suffixed. `onlatest` carries the suffix onto `latest`,
+      # so the tuned stream has its own moving tag instead of taking that one.
+      - id: meta-graviton
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index,manifest
+        with:
+          images: ${{ env.IMAGE }}
+          flavor: |
+            latest=auto
+            suffix=-graviton,onlatest=true
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.version.outputs.version }},enable=${{ env.RELEASE_TAGS }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }},enable=${{ env.RELEASE_TAGS }}
+            type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
+
       # An empty list has to fail here, not as an invalid reference in
-      # `publish` once the image has already been built and pushed.
+      # `publish` once the images have already been built and pushed.
       - name: Require at least one tag
         env:
           JSON: ${{ steps.meta.outputs.json }}
+          GRAVITON_JSON: ${{ steps.meta-graviton.outputs.json }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          if [ -z "$(jq -r '.tags[0] // empty' <<< "${JSON}")" ]; then
-            echo "::error::no image tags resolved for ${VERSION}; a dispatch from a branch publishes only the 'tag' input, so pass one"
-            exit 1
-          fi
+          for tags_json in "$JSON" "$GRAVITON_JSON"; do
+            if [ -z "$(jq -r '.tags[0] // empty' <<< "${tags_json}")" ]; then
+              echo "::error::no image tags resolved for ${VERSION}; a dispatch from a branch publishes only the 'tag' input, so pass one"
+              exit 1
+            fi
+          done
 
   build:
     name: package and push
@@ -175,9 +205,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read # Check out the Dockerfile and config, and read the release
-      packages: write # Push the index, addressed by digest
+      packages: write # Push each variant, addressed by digest
     outputs:
       digest: ${{ steps.build.outputs.digest }}
+      graviton-digest: ${{ steps.build-graviton.outputs.digest }}
       amd64-sha256: ${{ steps.fetch.outputs.amd64-sha256 }}
       arm64-sha256: ${{ steps.fetch.outputs.arm64-sha256 }}
     env:
@@ -241,23 +272,41 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # Both platforms in one pass. Copying a prebuilt binary needs no
-      # emulation, so the per-arch native runners the Rust compile required are
-      # gone, and with them the per-leg digest artifacts and the separate merge
-      # step: buildx pushes the finished index itself.
+      # emulation, so the per-arch native runners a Rust compile would require
+      # are not needed, and buildx pushes the finished index itself.
       #
-      # push-by-digest pushes that index under no tag, which is what leaves it
-      # unnamed until the signature exists. Annotations must land here, not on
+      # push-by-digest pushes it under no tag, which is what leaves it unnamed
+      # until the signature exists. Annotations must land here, not on
       # promotion: they are part of the digest, and promotion must not alter it.
-      - id: build
+      - id: build-graviton
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: lore-server/Dockerfile.release
           platforms: linux/amd64,linux/arm64
           labels: |
-            ${{ needs.meta.outputs.labels }}
+            ${{ needs.meta.outputs.graviton-labels }}
             com.epicgames.lore.asset.amd64.sha256=${{ steps.fetch.outputs.amd64-sha256 }}
             com.epicgames.lore.asset.arm64.sha256=${{ steps.fetch.outputs.arm64-sha256 }}
+          annotations: ${{ needs.meta.outputs.graviton-annotations }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      # The default variant: amd64 alone, and a plain manifest rather than an
+      # index. provenance=false is what keeps it one — buildx attaches
+      # provenance as a second manifest, and anything with two manifests is an
+      # index, which an arm64 host refuses to pull rather than emulating. The
+      # cost is that this variant carries no build provenance attestation; the
+      # cosign signature below covers it either way.
+      - id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: lore-server/Dockerfile.release
+          platforms: linux/amd64
+          provenance: false
+          labels: |
+            ${{ needs.meta.outputs.labels }}
+            com.epicgames.lore.asset.amd64.sha256=${{ steps.fetch.outputs.amd64-sha256 }}
           annotations: ${{ needs.meta.outputs.annotations }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
 
@@ -290,24 +339,37 @@ jobs:
 
       - name: Smoke test the arm64 image
         env:
-          DIGEST: ${{ needs.build.outputs.digest }}
+          DIGEST: ${{ needs.build.outputs.graviton-digest }}
         run: docker run --rm --platform linux/arm64 "${IMAGE}@${DIGEST}" --version
 
   publish:
-    name: sign and tag
+    name: sign and tag (${{ matrix.variant }})
     needs: [meta, build, smoke-arm64]
     runs-on: ubuntu-latest
     permissions:
       packages: write # Push the cosign signature and the release tags
       id-token: write # Federate to Fulcio for keyless signing
+    strategy:
+      # One variant failing should not withhold the other.
+      fail-fast: false
+      matrix:
+        include:
+          - variant: default
+            media: application/vnd.oci.image.manifest.v1+json
+            platforms: linux/amd64
+          - variant: graviton
+            media: application/vnd.oci.image.index.v1+json
+            platforms: linux/amd64,linux/arm64
     env:
-      JSON: ${{ needs.meta.outputs.json }}
+      JSON: ${{ matrix.variant == 'graviton' && needs.meta.outputs.graviton-json || needs.meta.outputs.json }}
+      DIGEST: ${{ matrix.variant == 'graviton' && needs.build.outputs.graviton-digest || needs.build.outputs.digest }}
       VERSION: ${{ needs.meta.outputs.version }}
-      DIGEST: ${{ needs.build.outputs.digest }}
-      # Where the index is named before the release tags are attached.
+      EXPECT_MEDIA: ${{ matrix.media }}
+      EXPECT_PLATFORMS: ${{ matrix.platforms }}
+      # Where the image is named before the release tags are attached.
       # Commit-addressed, so it never moves; kept afterwards as a record of
-      # which commit produced which digest.
-      STAGING_TAG: sha-${{ github.sha }}-graviton
+      # which commit published which digest.
+      STAGING_TAG: sha-${{ github.sha }}${{ matrix.variant == 'graviton' && '-graviton' || '' }}
       # Anchored on this workflow's path: a bare repository prefix would
       # accept a certificate minted by any workflow here.
       IDENTITY_REGEXP: '^https://github\.com/${{ github.repository }}/\.github/workflows/publish-loreserver-image\.yml@'
@@ -320,8 +382,34 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Inspect the index
+      - name: Inspect what was pushed
         run: docker buildx imagetools inspect "${IMAGE}@${DIGEST}"
+
+      # The shape is the variant's whole contract, and every step after this
+      # one would pass just as happily with the wrong one. The default variant
+      # silently becoming an index, or gaining an arm64 manifest, is exactly
+      # the regression that makes an arm64 host fail the pull.
+      - name: Check the variant is the shape it claims
+        run: |
+          set -euo pipefail
+          manifest=$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{json .Manifest}}')
+          media=$(jq -r .mediaType <<< "${manifest}")
+          if [ "${media}" != "${EXPECT_MEDIA}" ]; then
+            echo "::error::${DIGEST} is ${media}, expected ${EXPECT_MEDIA} for the ${EXPECT_PLATFORMS} variant"
+            exit 1
+          fi
+          if [ "${media}" = "application/vnd.oci.image.index.v1+json" ]; then
+            # Attestations ride along as unknown/unknown, and are not platforms.
+            platforms=$(jq -r '[.manifests[] | select(.platform.os != "unknown") | "\(.platform.os)/\(.platform.architecture)"] | sort | join(",")' <<< "${manifest}")
+          else
+            platforms=$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{json .Image}}' \
+              | jq -r '"\(.os)/\(.architecture)"')
+          fi
+          if [ "${platforms}" != "${EXPECT_PLATFORMS}" ]; then
+            echo "::error::${DIGEST} carries ${platforms}, expected ${EXPECT_PLATFORMS}"
+            exit 1
+          fi
+          echo "${media} carrying ${platforms}"
 
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
@@ -339,19 +427,26 @@ jobs:
             > /dev/null
           echo "signature verified"
 
-      # Tagging rests on `imagetools create` copying a lone index source
-      # through unchanged. Prove that on the staging tag first, which nothing
-      # consumes: if some later buildx stops preserving the digest, the tag
-      # that moves off the signature is this one. Checking only afterwards
-      # would mean learning it from `latest-graviton`.
+      # Tagging rests on `imagetools create` copying a lone source through
+      # unchanged. It does not do that by default for a plain manifest: it
+      # rewraps it in an index and the digest changes with it, which would take
+      # the default variant off both its signature and its arm64 fallback.
+      # --prefer-index=false is what holds it. Prove that on the staging tag
+      # first, which nothing consumes: if a later buildx stops preserving the
+      # digest, the tag that moves off the signature is this one. Checking only
+      # afterwards would mean learning it from `latest`.
       - name: Prove the copy preserves the digest
         run: |
           set -euo pipefail
-          docker buildx imagetools create --tag "${IMAGE}:${STAGING_TAG}" "${IMAGE}@${DIGEST}"
+          create=(docker buildx imagetools create)
+          if [ "${EXPECT_MEDIA}" != "application/vnd.oci.image.index.v1+json" ]; then
+            create+=(--prefer-index=false)
+          fi
+          "${create[@]}" --tag "${IMAGE}:${STAGING_TAG}" "${IMAGE}@${DIGEST}"
           resolved=$(docker buildx imagetools inspect "${IMAGE}:${STAGING_TAG}" \
             --format '{{json .Manifest}}' | jq -r .digest)
           if [ "${resolved}" != "${DIGEST}" ]; then
-            echo "::error::copying the index changed its digest (${DIGEST} -> ${resolved}); refusing to move the release tags off the signed digest"
+            echo "::error::copying changed the digest (${DIGEST} -> ${resolved}); refusing to move the release tags off the signed digest"
             exit 1
           fi
           echo "copy is digest-preserving"
@@ -361,11 +456,14 @@ jobs:
       - name: Promote the signed digest to the release tags
         run: |
           set -euo pipefail
-          args=()
+          create=(docker buildx imagetools create)
+          if [ "${EXPECT_MEDIA}" != "application/vnd.oci.image.index.v1+json" ]; then
+            create+=(--prefer-index=false)
+          fi
           while IFS= read -r tag; do
-            args+=(--tag "${tag}")
+            create+=(--tag "${tag}")
           done < <(jq -r '.tags[]' <<< "$JSON")
-          docker buildx imagetools create "${args[@]}" "${IMAGE}@${DIGEST}"
+          "${create[@]}" "${IMAGE}@${DIGEST}"
           while IFS= read -r tag; do
             resolved=$(docker buildx imagetools inspect "${tag}" \
               --format '{{json .Manifest}}' | jq -r .digest)
@@ -378,26 +476,32 @@ jobs:
 
       - name: Summarise what was published
         env:
+          VARIANT: ${{ matrix.variant }}
           AMD64_SHA256: ${{ needs.build.outputs.amd64-sha256 }}
           ARM64_SHA256: ${{ needs.build.outputs.arm64-sha256 }}
         run: |
           set -euo pipefail
           {
-            echo "## Published \`${IMAGE}\` from release \`${VERSION}\`"
+            echo "## Published \`${IMAGE}\` (${VARIANT}) from release \`${VERSION}\`"
             echo ""
             echo "Digest: \`${DIGEST}\`"
             echo ""
-            echo "Platforms: linux/amd64 (baseline), linux/arm64 (tuned for Graviton3+ — will not run on older arm64)"
-            echo ""
-            echo "Release assets packaged:"
-            echo "- \`loreserver-${VERSION}-x86_64-unknown-linux-gnu.tar.gz\` (sha256 \`${AMD64_SHA256}\`)"
-            echo "- \`loreserver-${VERSION}-aarch64-unknown-linux-gnu-${ARM64_TUNING}.tar.gz\` (sha256 \`${ARM64_SHA256}\`)"
+            if [ "${VARIANT}" = "graviton" ]; then
+              echo "Platforms: linux/amd64 (baseline), linux/arm64 (tuned for Graviton3+ — will not run on older arm64)"
+              echo ""
+              echo "Release assets packaged:"
+              echo "- \`loreserver-${VERSION}-x86_64-unknown-linux-gnu.tar.gz\` (sha256 \`${AMD64_SHA256}\`)"
+              echo "- \`loreserver-${VERSION}-aarch64-unknown-linux-gnu-${ARM64_TUNING}.tar.gz\` (sha256 \`${ARM64_SHA256}\`)"
+            else
+              echo "Platforms: linux/amd64 only, as a plain manifest so an arm64 host emulates it rather than failing the pull"
+              echo ""
+              echo "Release assets packaged:"
+              echo "- \`loreserver-${VERSION}-x86_64-unknown-linux-gnu.tar.gz\` (sha256 \`${AMD64_SHA256}\`)"
+            fi
             echo ""
             echo "Tags:"
             jq -r '.tags[] | "- `" + . + "`"' <<< "$JSON"
             echo "- \`${IMAGE}:${STAGING_TAG}\` (staging tag the signature was made against)"
-            echo ""
-            echo "No unsuffixed tag is published: the only released arm64 binary is tuned for Graviton3+."
             echo ""
             echo "Verify the signature with:"
             echo ""

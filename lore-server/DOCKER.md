@@ -38,26 +38,41 @@ docker build -f lore-server/Dockerfile --build-arg ARM64_TARGET_CPU=neoverse-512
 ## Published images
 
 The publish workflow packages the `loreserver` binaries from a published release — it compiles
-nothing — and pushes them to `ghcr.io/epicgames/lore/loreserver`:
+nothing — and pushes two variants to `ghcr.io/epicgames/lore/loreserver`:
 
-| Tag | arm64 build |
+| Tag | Platforms |
 | --- | --- |
-| `X.Y.Z-graviton`, `X.Y-graviton`, `latest-graviton` | tuned for Graviton3+ — faults on older arm64 |
+| `X.Y.Z`, `X.Y`, `latest` | `linux/amd64` only |
+| `X.Y.Z-graviton`, `X.Y-graviton`, `latest-graviton` | `linux/amd64`, and `linux/arm64` tuned for Graviton3+ |
 
-`linux/amd64` is baseline.
+**On Graviton3 or newer**, pull `-graviton` for a native arm64 image. **Anywhere else**, pull the
+unsuffixed tag.
 
-There is currently no unsuffixed tag and no plain `latest`. Releases ship exactly one arm64 Linux
-binary and it is tuned for Graviton3+, so an unsuffixed tag would hand that binary to Apple
-Silicon and Ampere hosts, which fault on it. For a portable arm64 image, build from source as
-above; otherwise run the amd64 image. When releases start shipping a baseline `armv8-a` binary,
-the portable stream will take the unsuffixed tags.
+Releases ship no baseline `armv8-a` Linux binary. The only `aarch64-unknown-linux-gnu` build is
+tuned for Graviton3+, and the `aarch64-apple-darwin` build is a macOS Mach-O executable, which
+cannot go into a Linux image at all. So arm64 is offered only under the suffixed tag, where the
+name says what it is: nothing in the pull path consults CPU features, so an unsuffixed tag
+carrying that binary would hand it to Apple Silicon and Ampere hosts, which fault on it with
+`SIGILL`.
+
+The unsuffixed variant is `linux/amd64` alone, published as a plain manifest rather than a
+single-entry index. That distinction matters: an index listing only `linux/amd64` makes an arm64
+host fail the pull with `no matching manifest for linux/arm64/v8`, whereas a plain manifest runs
+under emulation with a warning. It is the reason that variant carries no build provenance
+attestation — buildx attaches provenance as a second manifest, and two manifests make an index.
+Both variants are signed regardless.
+
+For a native arm64 image on Apple Silicon, build from source as above, or skip Docker and run the
+release's `aarch64-apple-darwin` binary directly. When releases start shipping a baseline
+`armv8-a` Linux binary, the unsuffixed variant can carry `linux/arm64` too.
 
 Every tag is signed keylessly with cosign, and the run summary prints the `cosign verify`
 invocation for the digest it published, along with the release assets packaged and their SHA-256 —
 the releases carry no checksums of their own, so that is what ties an image back to exact bytes. A
-`sha-<commit>-graviton` tag appears alongside each release, on the same digest: the signature is
-made against that digest before any release tag is pointed at it, so no release tag is ever briefly
-unsigned. It stays afterwards as a record of which commit published which image.
+`sha-<commit>` tag (and `sha-<commit>-graviton`) appears alongside each release, on the same
+digest: the signature is made against that digest before any release tag is pointed at it, so no
+release tag is ever briefly unsigned. It stays afterwards as a record of which commit published
+which image.
 
 ## Running
 
