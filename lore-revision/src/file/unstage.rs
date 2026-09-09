@@ -17,6 +17,8 @@ use crate::event;
 use crate::event::EventError;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
@@ -229,85 +231,26 @@ pub async fn unstage(
     let stats = Arc::new(UnstageStats::default());
     let discard = Arc::new(DashMap::<RepositoryId, Vec<u32>>::new());
     let link_tracker = LinkTracker::new();
-    let mut clear = false;
     let is_merge_or_cherry_pick_or_revert = state_staged.is_merge_or_cherry_pick_or_revert();
 
-    for path in paths.as_slice().iter() {
-        let Ok(relative_path) =
-            RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
-        else {
-            emit_path_ignore(path.as_str()).await;
-            lore_debug!("Ignoring invalid path: {path}");
-            continue;
-        };
-
-        // If we unstage everything, mark for potential clearing, unless we're in a merge/cherry-pick.
-        // The actual deletion check also considers dirty nodes (checked later).
-        if !is_merge_or_cherry_pick_or_revert && relative_path.is_empty() {
-            clear = true;
-        }
-
-        lore_debug!(
-            "User path [{}] transformed to relative path [{}] in repository {}",
-            path.as_str(),
-            relative_path.as_str(),
-            repository.path_for_display()
-        );
-
-        lore_debug!("Unstage options: {:?}", options);
-
-        let mut task = {
-            let repository = repository.clone();
-            let state_current = state_current.clone();
-            let state_staged = state_staged.clone();
-            let discard = discard.clone();
-            let stats = stats.clone();
-            let link_tracker = link_tracker.clone();
-            lore_spawn!(async move {
-                Box::pin(unstage_path(
-                    repository,
-                    state_current,
-                    state_staged,
-                    relative_path,
-                    discard,
-                    options,
-                    stats,
-                    link_tracker,
-                ))
-                .await
-            })
-        };
-
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
-        let result = loop {
-            tokio::select! {
-                _ = ticker.tick() => {
-                    let directory_unstaged_count = stats.directory_unstaged_count.load(Ordering::Relaxed);
-                    let directory_discarded_count = stats.directory_discarded_count.load(Ordering::Relaxed);
-                    let file_unstaged_count = stats.file_unstaged_count.load(Ordering::Relaxed);
-                    let file_discarded_count = stats.file_discarded_count.load(Ordering::Relaxed);
-
-                    event::LoreEvent::FileUnstageProgress(LoreFileUnstageProgressEventData {
-                        count: LoreFileUnstageCountData {
-                            directory_unstaged_count,
-                            directory_discarded_count,
-                            file_unstaged_count,
-                            file_discarded_count,
-                            total_count: directory_unstaged_count
-                                + directory_discarded_count
-                                + file_unstaged_count
-                                + file_discarded_count,
-                        },
-                    }).send();
-                },
-                result = &mut task => {
-                    break result.internal("Recursion task failed").map_err(UnstageError::from)?;
-                }
-            }
-        };
-
-        result?;
-    }
+    // One operation covers every path: unstaging reads the working copy to resolve the case
+    // each path is held in, and one per path would freeze a filesystem per path.
+    let mut clear = with_operation(repository.file_system(), false, async |operation| {
+        unstage_each_path(UnstagePaths {
+            operation: &operation,
+            repository: &repository,
+            state_current: &state_current,
+            state_staged: &state_staged,
+            paths: &paths,
+            discard: &discard,
+            options,
+            stats: &stats,
+            link_tracker: &link_tracker,
+            is_merge_or_cherry_pick_or_revert,
+        })
+        .await
+    })
+    .await?;
 
     if !clear && !is_merge_or_cherry_pick_or_revert {
         let has_staged = state_staged
@@ -451,8 +394,124 @@ impl FilterCursor {
     }
 }
 
+/// What unstaging each path needs: the trees it rewrites and the filesystem operation it
+/// resolves path cases through.
+struct UnstagePaths<'a> {
+    operation: &'a Arc<InstanceOperationImpl>,
+    repository: &'a Arc<RepositoryContext>,
+    state_current: &'a Arc<State>,
+    state_staged: &'a Arc<State>,
+    paths: &'a LoreArray<LoreString>,
+    discard: &'a Arc<DashMap<RepositoryId, Vec<u32>>>,
+    options: UnstageOptions,
+    stats: &'a Arc<UnstageStats>,
+    link_tracker: &'a Arc<LinkTracker>,
+    is_merge_or_cherry_pick_or_revert: bool,
+}
+
+/// Unstage each path in turn, reporting progress while one runs.
+///
+/// Reports whether the whole tree was named, which is what makes removing the staged anchor
+/// the outcome rather than rewriting it.
+async fn unstage_each_path(args: UnstagePaths<'_>) -> Result<bool, UnstageError> {
+    let UnstagePaths {
+        operation,
+        repository,
+        state_current,
+        state_staged,
+        paths,
+        discard,
+        options,
+        stats,
+        link_tracker,
+        is_merge_or_cherry_pick_or_revert,
+    } = args;
+    let mut clear = false;
+    for path in paths.as_slice().iter() {
+        let Ok(relative_path) =
+            RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
+        else {
+            emit_path_ignore(path.as_str()).await;
+            lore_debug!("Ignoring invalid path: {path}");
+            continue;
+        };
+
+        // If we unstage everything, mark for potential clearing, unless we're in a merge/cherry-pick.
+        // The actual deletion check also considers dirty nodes (checked later).
+        if !is_merge_or_cherry_pick_or_revert && relative_path.is_empty() {
+            clear = true;
+        }
+
+        lore_debug!(
+            "User path [{}] transformed to relative path [{}] in repository {}",
+            path.as_str(),
+            relative_path.as_str(),
+            repository.path_for_display()
+        );
+
+        lore_debug!("Unstage options: {:?}", options);
+
+        let mut task = {
+            let repository = repository.clone();
+            let state_current = state_current.clone();
+            let state_staged = state_staged.clone();
+            let discard = discard.clone();
+            let stats = stats.clone();
+            let link_tracker = link_tracker.clone();
+            let operation = operation.clone();
+            lore_spawn!(async move {
+                Box::pin(unstage_path(
+                    operation,
+                    repository,
+                    state_current,
+                    state_staged,
+                    relative_path,
+                    discard,
+                    options,
+                    stats,
+                    link_tracker,
+                ))
+                .await
+            })
+        };
+
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
+        let result = loop {
+            tokio::select! {
+                _ = ticker.tick() => {
+                    let directory_unstaged_count = stats.directory_unstaged_count.load(Ordering::Relaxed);
+                    let directory_discarded_count = stats.directory_discarded_count.load(Ordering::Relaxed);
+                    let file_unstaged_count = stats.file_unstaged_count.load(Ordering::Relaxed);
+                    let file_discarded_count = stats.file_discarded_count.load(Ordering::Relaxed);
+
+                    event::LoreEvent::FileUnstageProgress(LoreFileUnstageProgressEventData {
+                        count: LoreFileUnstageCountData {
+                            directory_unstaged_count,
+                            directory_discarded_count,
+                            file_unstaged_count,
+                            file_discarded_count,
+                            total_count: directory_unstaged_count
+                                + directory_discarded_count
+                                + file_unstaged_count
+                                + file_discarded_count,
+                        },
+                    }).send();
+                },
+                result = &mut task => {
+                    break result.internal("Recursion task failed").map_err(UnstageError::from)?;
+                }
+            }
+        };
+
+        result?;
+    }
+
+    Ok(clear)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn unstage_path(
+    operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     state_current: Arc<State>,
     state_staged: Arc<State>,
@@ -472,7 +531,8 @@ async fn unstage_path(
         relative_path
     } else {
         let repository_root = repository.require_path()?;
-        let resolved = util::fs::filesystem_path(repository_root, &relative_path, None).await;
+        let resolved =
+            util::fs::filesystem_path(&operation, repository_root, &relative_path, None).await;
         resolved.unwrap_or(relative_path)
     };
 

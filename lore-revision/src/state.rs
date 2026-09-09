@@ -57,6 +57,7 @@ use crate::fs::filesystem_provider::FilesystemDiffTree;
 use crate::fs::filesystem_provider::FilesystemTraversal;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::StageIntent;
 use crate::hash;
 use crate::immutable;
 use crate::immutable::ImmutableError;
@@ -79,10 +80,13 @@ use crate::metadata::MetadataType;
 use crate::nametable::NameTable;
 use crate::node;
 use crate::node::*;
+use crate::repository::BASE_SUFFIX;
 use crate::repository::DOT_LORE;
 use crate::repository::DOT_URC;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
+use crate::repository::TEMP_FILE_EXTENSION;
+use crate::repository::THEIRS_SUFFIX;
 use crate::revision::RevisionMetadata;
 use crate::stage::stage_delete;
 use crate::state::diff::NodeSearchResult;
@@ -3290,6 +3294,34 @@ impl State {
     /// This is the inverse of [`node_mark_dirty`](Self::node_mark_dirty) and is
     /// used both by the filesystem scan when a tracked file is found unmodified
     /// and by `status --check-dirty` when a dirty flag turns out to be stale.
+    /// Clear `node_id`'s staged flags, leaving the dirty ones as they are.
+    ///
+    /// The node alone: an ancestor's staged bits stand for a sibling's action as much as for
+    /// this one's, so clearing them is not this node's to do.
+    pub async fn node_clear_staged(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node_id: NodeID,
+    ) -> Result<(), StateError> {
+        if !node_id.is_valid_node_id() {
+            return Ok(());
+        }
+
+        let block_index = NodeBlock::index(node_id);
+        let node_index = Node::index(node_id);
+        let block = self.block(repository, block_index).await?;
+        let block_dirtied = {
+            let mut locked_block = block.write();
+            locked_block.node(node_index).clear_staged_flags();
+            locked_block.mark_dirty()
+        };
+        if block_dirtied {
+            self.block_modified(block, block_index);
+            self.mark_dirty();
+        }
+        Ok(())
+    }
+
     pub async fn node_clear_dirty(
         &self,
         repository: Arc<RepositoryContext>,
@@ -6043,6 +6075,19 @@ async fn collect_link_mounts(
     Ok(mounts)
 }
 
+/// The filter slots a walk consults. A forced walk consults none: it drops nothing, so it
+/// reports nothing as excluded and descends everywhere, which is what an empty mode is. The
+/// verdicts it threads are then folded but never read, so no site below needs to know.
+///
+/// Only a staging walk is forced. `status --scan` answers for the view whether or not the
+/// command that asked was forced.
+fn walk_filter_mode(filter_mode: FilterMode, intent: FilesystemDiffIntent) -> FilterMode {
+    if intent.stage().is_some() && execution_context().globals().force() {
+        return FilterMode::empty();
+    }
+    filter_mode
+}
+
 /// Resolves `path` on both sides and diffs the filesystem under it through
 /// `operation`, appending a change per difference to `changes`.
 ///
@@ -6072,6 +6117,7 @@ pub async fn diff_filesystem(
         repository: repository_current,
         state: state_current,
     } = current;
+    let filter_mode = walk_filter_mode(filter_mode, intent);
 
     let states = match path.as_ref() {
         Some(path) => {
@@ -6268,6 +6314,7 @@ pub async fn diff_filesystem_subtree(
     layer_mounts: Arc<Vec<LayerMountInfo>>,
     changes: &mut Vec<NodeChange>,
 ) -> Result<FilesystemDiffStats, StateError> {
+    let filter_mode = walk_filter_mode(filter_mode, intent);
     let link_mounts = Arc::new(collect_link_mounts(&current.state, &current.repository).await?);
     let states = from.repository.filter.exclusion_states(&filesystem_path);
     diff_with(
@@ -6511,6 +6558,9 @@ struct FileDiffContext {
     /// What the walk measured at the path, which a node it creates records rather than
     /// reading the path a second time.
     observed: FileInfo,
+    /// Settle the node whatever the comparison says. Force asks for it, and a merge needs
+    /// it to carry its own flags onto a node the working copy already holds.
+    insists: bool,
 }
 
 impl FileDiffContext {
@@ -6558,6 +6608,101 @@ impl FileDiffContext {
             flags: NodeFlags::NoFlags,
             address: Address::default(),
         }
+    }
+
+    /// The `to` side of a change for a node this context added, carrying the flags it
+    /// settled with rather than the ones it was created with.
+    async fn settled_change_state(&self, node_id: NodeID) -> Result<NodeChangeState, StateError> {
+        let node = self
+            .state_from
+            .node(self.repository_from.clone(), node_id)
+            .await?;
+        Ok(NodeChangeState {
+            repository: self.repository_from.clone(),
+            state: self.state_from.clone(),
+            node: node_id,
+            flags: NodeFlags::from_bits_retain(node.flags),
+            address: node.address,
+        })
+    }
+
+    /// The node a child is added under: the directory the walk supplied, which is right
+    /// across a link or layer boundary too, and the path's own parent otherwise, which
+    /// discovery created before reaching here.
+    async fn parent_node(&self, file_path: &RelativePath) -> Result<NodeID, StateError> {
+        if let Some(parent) = self.parent_node_id {
+            return Ok(parent);
+        }
+        match file_path.parent() {
+            Some(parent) if !parent.is_empty() => Ok(self
+                .state_from
+                .find_node_link(self.repository_from.clone(), parent)
+                .await
+                .forward::<StateError>("scan add: parent directory node missing for nested add")?
+                .node),
+            _ => Ok(ROOT_NODE),
+        }
+    }
+
+    /// Add the node a path new to the tree takes and settle it as an add, carrying what the
+    /// walk measured where the path is a file.
+    ///
+    /// The parent takes the base dirty bit alone: the add belongs to the child.
+    async fn add_new_node(
+        &self,
+        file_path: &RelativePath,
+        is_directory: bool,
+    ) -> Result<NodeID, StateError> {
+        let parent_node_id = self.parent_node(file_path).await?;
+        let mut flags = NodeFlags::DirtyAdd;
+        if !is_directory {
+            flags |= NodeFlags::File;
+        }
+        let mut node = Node {
+            flags: flags.bits(),
+            name_hash: crate::hash::hash_string(file_path.name()),
+            ..Default::default()
+        };
+        let staging = self.intent.stage();
+        if let Some(stage) = staging
+            && !is_directory
+        {
+            node.mode = self.observed.mode(0);
+            node.size = self.observed.size;
+            node.address.context = stage.file_id.unwrap_or_else(|| uuid::Uuid::now_v7().into());
+        }
+
+        let node_id = self
+            .state_from
+            .node_add(
+                self.repository_from.clone(),
+                parent_node_id,
+                node,
+                file_path.name(),
+            )
+            .await
+            .unwrap_or(INVALID_NODE);
+        if staging.is_some() {
+            mark_settled(
+                &self.state_from,
+                &self.repository_from,
+                node_id,
+                SettledAction::Add,
+                self.intent,
+            )
+            .await?;
+        }
+
+        let _ = self
+            .state_from
+            .node_mark_dirty(
+                self.repository_from.clone(),
+                parent_node_id,
+                NodeFlags::Dirty,
+                false,
+            )
+            .await;
+        Ok(node_id)
     }
 }
 
@@ -6631,6 +6776,166 @@ async fn mark_settled(
         .await
 }
 
+/// Settle a delete for `node_id` and every node below it, which is what a commit needs to
+/// drop a subtree the file system no longer holds.
+///
+/// A node already settled is left alone along with its subtree, so a second pass over the
+/// same replacement costs one node read. A link's subtree lives in the linked state and is
+/// not walked here, as staging a delete does not.
+async fn settle_subtree_delete(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    node_id: NodeID,
+    intent: FilesystemDiffIntent,
+) -> Result<(), StateError> {
+    let mut stack = vec![node_id];
+    while let Some(node_id) = stack.pop() {
+        let node = state.node(repository.clone(), node_id).await?;
+        if node.is_staged_delete() {
+            continue;
+        }
+        mark_settled(state, repository, node_id, SettledAction::Delete, intent).await?;
+        if !node.is_directory() {
+            continue;
+        }
+        let mut child = node.child();
+        let mut cycle = SiblingCycleGuard::new(node_id);
+        while let Some(child_id) = child {
+            stack.push(child_id);
+            let child_node = state.node(repository.clone(), child_id).await?;
+            child_node.walk_step(child_id, node_id, &mut cycle)?;
+            child = child_node.sibling();
+        }
+    }
+    Ok(())
+}
+
+/// Settle a modification for a node whose content the file system already matches, which is
+/// what force stages and what carries a merge's flags onto a node needing no other change.
+async fn settle_insisted_modification(
+    ctx: &FileDiffContext,
+    file_path: &RelativePath,
+    sink: &mut ChangeSink<'_>,
+    filter_mode: FilterMode,
+) -> Result<(), StateError> {
+    mark_settled(
+        &ctx.state_from,
+        &ctx.repository_from,
+        ctx.from_node_id,
+        SettledAction::Modify,
+        ctx.intent,
+    )
+    .await?;
+    emit_change(
+        ctx.create_from_change_state(),
+        ctx.new_file_change_state(),
+        FileAction::Keep,
+        file_path,
+        None,
+        sink,
+        filter_mode,
+    )
+    .await
+}
+
+/// Settle a modification for a directory node force or a merge asked for.
+///
+/// A directory holds no content to compare, so it is settled on being asked rather than on
+/// anything the walk found. The descent below it runs either way.
+#[allow(clippy::too_many_arguments)]
+async fn settle_insisted_directory(
+    node_list: &StateChildrenNodes,
+    node_id: NodeID,
+    node: &Node,
+    path: &RelativePath,
+    sink: &mut ChangeSink<'_>,
+    intent: FilesystemDiffIntent,
+    filter_mode: FilterMode,
+) -> Result<(), StateError> {
+    mark_settled(
+        &node_list.state,
+        &node_list.repository,
+        node_id,
+        SettledAction::Modify,
+        intent,
+    )
+    .await?;
+    let from = NodeChangeState {
+        repository: node_list.repository.clone(),
+        state: node_list.state.clone(),
+        node: node_id,
+        flags: NodeFlags::from_bits_retain(node.flags),
+        address: node.address,
+    };
+    let to = from.invalid();
+    emit_change(from, to, FileAction::Keep, path, None, sink, filter_mode).await
+}
+
+/// Report the delete of the node a type change displaced and the add of what replaced it,
+/// settling both where the intent stages.
+///
+/// The displaced node keeps its place beside the replacement and carries the staged delete,
+/// which is how a commit drops the old content and records the new.
+///
+/// Returns the replacement node, [`INVALID_NODE`] where the intent minted none, so a walk
+/// descends into a directory it created.
+async fn emit_type_replacement(
+    ctx: &FileDiffContext,
+    file_path: &RelativePath,
+    is_directory: bool,
+    sink: &mut ChangeSink<'_>,
+    filter_mode: FilterMode,
+) -> Result<NodeID, StateError> {
+    let staging = ctx.intent.stage().is_some();
+    if staging {
+        settle_subtree_delete(
+            &ctx.state_from,
+            &ctx.repository_from,
+            ctx.from_node_id,
+            ctx.intent,
+        )
+        .await?;
+    }
+
+    add_change(
+        ctx.create_from_change_state(),
+        ctx.invalid_change_state(),
+        FileAction::Delete,
+        file_path,
+        None,
+        sink,
+        filter_mode,
+        ctx.states,
+    )
+    .await?;
+
+    let replacement = if staging {
+        ctx.add_new_node(file_path, is_directory).await?
+    } else {
+        INVALID_NODE
+    };
+    let to_state = if replacement.is_valid_node_id() {
+        ctx.settled_change_state(replacement).await?
+    } else if is_directory {
+        ctx.new_directory_change_state()
+    } else {
+        ctx.new_file_change_state()
+    };
+
+    add_change(
+        ctx.invalid_change_state(),
+        to_state,
+        FileAction::Add,
+        file_path,
+        None,
+        sink,
+        filter_mode,
+        ctx.states,
+    )
+    .await?;
+    Ok(replacement)
+}
+
 /// Emit an Add+Dirty reconciliation change for a file whose node exists in
 /// `state_from` (staged) but not in the current state. The file's presence
 /// on disk is the add, and the node carries the `DirtyAdd` flag (re-marked
@@ -6650,6 +6955,7 @@ async fn emit_unstaged_add(
     from_node_id: NodeID,
     from_node: Node,
     file_path: &RelativePath,
+    observed: &FileInfo,
     sink: &mut ChangeSink<'_>,
     stats: &FilesystemDiffStats,
     filter_mode: FilterMode,
@@ -6660,7 +6966,11 @@ async fn emit_unstaged_add(
         lore_trace!("File {file_path} is a dirty move destination, not an unstaged add");
         return Ok(());
     }
-    if intent.stage().is_some() || !from_node.is_dirty_add() {
+    let staging = intent.stage().is_some();
+    if staging {
+        record_observed_file(&state, &repository, from_node_id, observed).await?;
+    }
+    if staging || !from_node.is_dirty_add() {
         mark_settled(
             &state,
             &repository,
@@ -6701,6 +7011,34 @@ async fn emit_unstaged_add(
     Ok(())
 }
 
+/// Record on `node_id` what the walk measured at its path, which is what a commit reads to
+/// realize the file being staged.
+///
+/// The node is a file already: a path whose type the tree disagrees with is replaced rather
+/// than recorded, which is [`emit_type_replacement`]'s.
+async fn record_observed_file(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    node_id: NodeID,
+    observed: &FileInfo,
+) -> Result<(), StateError> {
+    let block_index = NodeBlock::index(node_id);
+    let node_index = Node::index(node_id);
+    let block = state.block(repository.clone(), block_index).await?;
+    let dirtied = {
+        let mut locked_block = block.write();
+        let node = locked_block.node(node_index);
+        node.mode = observed.mode(node.mode);
+        node.size = observed.size;
+        locked_block.mark_dirty()
+    };
+    if dirtied {
+        state.block_modified(block, block_index);
+        state.mark_dirty();
+    }
+    Ok(())
+}
+
 /// Emit a single Add change for `node_id` without recursing into its subtree —
 /// the caller's walk recursion surfaces the children. Used to report a dirty-add
 /// directory exactly once per scan (unlike `add_change`, which recurses the whole
@@ -6721,6 +7059,19 @@ async fn emit_dirty_add_node_single(
     if intent.stage().is_some() || !node.is_dirty_add() {
         mark_settled(&state, &repository, node_id, SettledAction::Add, intent).await?;
     }
+    emit_add_node_single(repository, state, node_id, path, sink, stats).await
+}
+
+/// Emit a single Add change for `node_id` as it stands, without marking it and without
+/// recursing into its subtree.
+async fn emit_add_node_single(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    node_id: NodeID,
+    path: &RelativePath,
+    sink: &mut ChangeSink<'_>,
+    stats: &FilesystemDiffStats,
+) -> Result<(), StateError> {
     let block = state
         .block(repository.clone(), NodeBlock::index(node_id))
         .await?;
@@ -6770,6 +7121,10 @@ async fn emit_dirty_add_node_single(
 /// renames for both modified and unmodified content:
 /// - Unmodified + Rename: Generates a Move action (file content matches but name changed)
 /// - Modified + Rename: Generates a Move action with modified content
+///
+/// # Returns
+/// The node a staged type replacement minted, [`INVALID_NODE`] otherwise, so a walk
+/// descends into a directory that replaced a file.
 #[allow(clippy::too_many_arguments)]
 async fn handle_single_file_compare_result(
     ctx: &FileDiffContext,
@@ -6780,7 +7135,7 @@ async fn handle_single_file_compare_result(
     sink: &mut ChangeSink<'_>,
     stats: &FilesystemDiffStats,
     filter_mode: FilterMode,
-) -> Result<(), StateError> {
+) -> Result<NodeID, StateError> {
     match compare_result {
         SingleFileCompareResult::Unmodified => {
             // Handle rename case: content is unchanged but filename differs
@@ -6814,6 +7169,10 @@ async fn handle_single_file_compare_result(
                 )
                 .await?;
                 stats.file_replace.fetch_add(1, Ordering::Relaxed);
+            } else if ctx.insists {
+                lore_trace!("File {} unmodified, staged anyway", file_path);
+                settle_insisted_modification(ctx, file_path, sink, filter_mode).await?;
+                stats.file_replace.fetch_add(1, Ordering::Relaxed);
             } else {
                 lore_trace!("File {} unmodified, retain", file_path);
                 stats.file_retain.fetch_add(1, Ordering::Relaxed);
@@ -6841,6 +7200,15 @@ async fn handle_single_file_compare_result(
             // Scan: persist Dirty on the modified node before recording the change so
             // compute_change_flags loads the dirty node and includes Dirty in the event.
             if ctx.intent.marks_dirty() && ctx.from_node_id.is_valid_node_id() {
+                if ctx.intent.stage().is_some() {
+                    record_observed_file(
+                        &ctx.state_from,
+                        &ctx.repository_from,
+                        ctx.from_node_id,
+                        &ctx.observed,
+                    )
+                    .await?;
+                }
                 let settled = if action == change::FileAction::Move {
                     SettledAction::Move
                 } else {
@@ -6876,73 +7244,10 @@ async fn handle_single_file_compare_result(
             // Scan: create the Dirty+Add node in state first, then route add_change
             // through its NodeID so compute_change_flags loads it and sets Dirty.
             let to_state = if !is_filesystem_directory && ctx.intent.marks_dirty() {
-                let parent_path = file_path.parent();
-                let file_name = file_path.name();
-                // The directory walk supplies the parent node directly (correct
-                // even across link/layer boundaries). For a single-file path the
-                // parent was created during discovery, so resolving by path must
-                // succeed.
-                let parent_node_id = if let Some(parent) = ctx.parent_node_id {
-                    parent
-                } else {
-                    match parent_path {
-                        Some(p) if !p.is_empty() => {
-                            ctx.state_from
-                                .find_node_link(ctx.repository_from.clone(), p)
-                                .await
-                                .forward::<StateError>(
-                                    "scan add: parent directory node missing for nested add",
-                                )?
-                                .node
-                        }
-                        _ => ROOT_NODE,
-                    }
-                };
-
-                let mut node = Node {
-                    flags: (NodeFlags::File | NodeFlags::DirtyAdd).bits(),
-                    name_hash: crate::hash::hash_string(file_name),
-                    ..Default::default()
-                };
-                let staging = ctx.intent.stage();
-                if let Some(stage) = staging {
-                    node.mode = ctx.observed.mode(0);
-                    node.size = ctx.observed.size;
-                    node.address.context =
-                        stage.file_id.unwrap_or_else(|| uuid::Uuid::now_v7().into());
-                }
-
-                let new_node_id = ctx
-                    .state_from
-                    .node_add(ctx.repository_from.clone(), parent_node_id, node, file_name)
-                    .await
-                    .unwrap_or(INVALID_NODE);
-                if staging.is_some() {
-                    mark_settled(
-                        &ctx.state_from,
-                        &ctx.repository_from,
-                        new_node_id,
-                        SettledAction::Add,
-                        ctx.intent,
-                    )
-                    .await?;
-                }
-
-                // Propagate dirty to parent
-                let _ = ctx
-                    .state_from
-                    .node_mark_dirty(
-                        ctx.repository_from.clone(),
-                        parent_node_id,
-                        NodeFlags::Dirty,
-                        false,
-                    )
-                    .await;
-
                 NodeChangeState {
                     repository: ctx.repository_from.clone(),
                     state: ctx.state_from.clone(),
-                    node: new_node_id,
+                    node: ctx.add_new_node(file_path, false).await?,
                     flags: NodeFlags::File | NodeFlags::DirtyAdd,
                     address: Address::default(),
                 }
@@ -6971,67 +7276,17 @@ async fn handle_single_file_compare_result(
                 "Type changed at {} - state has directory/link, filesystem has file, delete + add",
                 file_path
             );
-
-            // Delete the old directory/link
-            add_change(
-                ctx.create_from_change_state(),
-                ctx.invalid_change_state(),
-                FileAction::Delete,
-                file_path,
-                None,
-                sink,
-                filter_mode,
-                ctx.states,
-            )
-            .await?;
-
-            // Add the new file
-            add_change(
-                ctx.invalid_change_state(),
-                ctx.new_file_change_state(),
-                FileAction::Add,
-                file_path,
-                None,
-                sink,
-                filter_mode,
-                ctx.states,
-            )
-            .await?;
+            return emit_type_replacement(ctx, file_path, false, sink, filter_mode).await;
         }
         SingleFileCompareResult::TypeChangedToDirectory => {
             lore_trace!(
                 "Type changed at {} - state has file, filesystem has directory, delete + add",
                 file_path
             );
-
-            // Delete the old file
-            add_change(
-                ctx.create_from_change_state(),
-                ctx.invalid_change_state(),
-                FileAction::Delete,
-                file_path,
-                None,
-                sink,
-                filter_mode,
-                ctx.states,
-            )
-            .await?;
-
-            // Add the new directory
-            add_change(
-                ctx.invalid_change_state(),
-                ctx.new_directory_change_state(),
-                FileAction::Add,
-                file_path,
-                None,
-                sink,
-                filter_mode,
-                ctx.states,
-            )
-            .await?;
+            return emit_type_replacement(ctx, file_path, true, sink, filter_mode).await;
         }
     }
-    Ok(())
+    Ok(INVALID_NODE)
 }
 
 /// Handle diff for a directory path.
@@ -7041,8 +7296,11 @@ async fn diff_filesystem_directory(
     ctx: FilesystemDiffContext,
     file_listing: lore_io::DirStream,
 ) -> Result<(Vec<NodeChange>, FilesystemDiffStats), StateError> {
+    /// A staging walk includes the children staged for delete, so a path the file system
+    /// still holds takes its delete back rather than being added a second time beside it.
     async fn collect_node_list(
         traversal: &FilesystemTraversal,
+        include_deleted: bool,
     ) -> Result<StateChildrenNodes, StateError> {
         let FilesystemTraversal {
             repository,
@@ -7057,8 +7315,8 @@ async fn diff_filesystem_directory(
                     .collect_children_unsorted(
                         repository.clone(),
                         *node_id,
-                        false, /* ignore deleted */
-                        true,  /* Traverse links */
+                        include_deleted,
+                        true, /* Traverse links */
                     )
                     .await?
             } else {
@@ -7082,9 +7340,10 @@ async fn diff_filesystem_directory(
         })
     }
     // Collect state node lists (always directory mode here)
-    let mut node_list = collect_node_list(&ctx.from).await?;
+    let staging = ctx.intent.stage().is_some();
+    let mut node_list = collect_node_list(&ctx.from, staging).await?;
 
-    let mut current_node_list = collect_node_list(&ctx.current).await?;
+    let mut current_node_list = collect_node_list(&ctx.current, false).await?;
 
     let mut changes: Vec<NodeChange> = vec![];
     let mut tasks = JoinSet::new();
@@ -7310,6 +7569,132 @@ pub(crate) async fn is_nested_repository_root(parent: &mut std::path::PathBuf, n
     nested
 }
 
+/// Whether staging leaves the name alone: a scratch file of the client's own making, or the
+/// base and theirs sides a merge resolution has not consumed yet. A marking walk reports
+/// them, since the working tree does hold them.
+///
+/// The mine side is not among them, as `stage` does not skip it either: a resolution that
+/// keeps the working copy leaves it beside the resolved file.
+fn staging_ignores_name(name: &str) -> bool {
+    name.ends_with(TEMP_FILE_EXTENSION)
+        || name.ends_with(BASE_SUFFIX)
+        || name.ends_with(THEIRS_SUFFIX)
+}
+
+/// The index in `node_list` of the child an entry named `name_hash` claims, `None` where the
+/// directory holds none.
+///
+/// Two children can share a folded name: a staged replacement sits beside the node it
+/// displaced, and two spellings of one name can both be committed. A staging walk claims one
+/// child per entry and prefers one not staged for delete, so a replacement is not replaced
+/// again; only a run of more than one child is read to decide. Every other intent reports
+/// against whichever the search reached, as it has.
+async fn claim_named_child(
+    node_list: &StateChildrenNodes,
+    claimed: &[bool],
+    name_hash: u64,
+    staging: bool,
+) -> Result<Option<usize>, StateError> {
+    let children = node_list.children.as_slice();
+    let Ok(found) = children.binary_search_by(|child| child.name.cmp(&name_hash)) else {
+        return Ok(None);
+    };
+    if !staging {
+        return Ok(Some(found));
+    }
+
+    let mut start = found;
+    while start > 0 && children[start - 1].name == name_hash {
+        start -= 1;
+    }
+    let mut end = found + 1;
+    while end < children.len() && children[end].name == name_hash {
+        end += 1;
+    }
+    if end - start == 1 {
+        return Ok((!claimed[start]).then_some(start));
+    }
+
+    let mut displaced = None;
+    for index in start..end {
+        if claimed[index] {
+            continue;
+        }
+        let node = node_list
+            .state
+            .node(node_list.repository.clone(), children[index].node)
+            .await?;
+        if !node.is_staged_delete() {
+            return Ok(Some(index));
+        }
+        displaced = displaced.or(Some(index));
+    }
+    Ok(displaced)
+}
+
+/// What a staging walk does with a node the tree holds and the file system still has at its
+/// path, decided before the content is compared.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum StagedEntry {
+    /// Compare the content and settle what that says, as a marking walk does. `insisted`
+    /// settles a modification even where the content matches, which is what force asks for
+    /// and what carries a merge's own flags onto a node the working copy already holds.
+    Compare { insisted: bool },
+    /// Nothing to settle: the node already carries a staged action and neither force nor a
+    /// merge asks for it again.
+    Settled,
+    /// The node was staged for delete and the file system still holds the path, so the
+    /// delete is taken back and the node settled as a modification, reported as the add it
+    /// is from the tree's side.
+    Undeleted,
+}
+
+/// Whether the tree and the file system agree on the type at a path. A type change replaces
+/// the node rather than settling it, so staging decides only where they agree.
+fn types_agree(from_node: &Node, is_file: bool, is_directory: bool) -> bool {
+    (from_node.is_file() && is_file)
+        || ((from_node.is_directory() || from_node.is_link()) && is_directory)
+}
+
+/// How a staging walk treats a node the tree holds, taking back a staged delete before
+/// anything is compared.
+///
+/// A node already carrying a staged action is left as it is, so staging the same tree twice
+/// reports the second pass as staging nothing. Force and a merge both ask for the action
+/// again regardless, a merge because its own flags have to reach the node.
+///
+/// Taking back a delete clears the staged flags before marking, which is what drops a merge's
+/// own flags: [`State::node_mark`] preserves those, and a node whose delete was taken back
+/// carries no merge.
+async fn staged_entry(
+    state: &Arc<State>,
+    repository: &Arc<RepositoryContext>,
+    node_id: NodeID,
+    node: &Node,
+    stage: StageIntent,
+    forced: bool,
+) -> Result<StagedEntry, StateError> {
+    let insists = forced
+        || stage.node_flags.contains(NodeFlags::StagedMerge)
+        || node.is_staged_merge_unresolved();
+    if node.is_staged_delete() {
+        state.node_clear_staged(repository.clone(), node_id).await?;
+        mark_settled(
+            state,
+            repository,
+            node_id,
+            SettledAction::Modify,
+            FilesystemDiffIntent::Stage(stage),
+        )
+        .await?;
+        return Ok(StagedEntry::Undeleted);
+    }
+    if node.is_staged() && !insists {
+        return Ok(StagedEntry::Settled);
+    }
+    Ok(StagedEntry::Compare { insisted: insists })
+}
+
 /// Match each filesystem item from `file_receiver` against `node_list` (the
 /// `from` state's children) and `current_node_list` (the `current` state's
 /// children), emitting changes into `changes`, marking matched entries in
@@ -7338,6 +7723,8 @@ async fn diff_filesystem_directory_walk(
     pending_discards: &mut Vec<NodeID>,
 ) -> Result<(), StateError> {
     let repository_root = ctx.from.repository.require_path()?;
+    let staging = ctx.intent.stage().is_some();
+    let forced = staging && execution_context().globals().force();
     let mut nested_probe: Option<std::path::PathBuf> = None;
     let mut new_file_list = vec![];
     while let Some(entry) = file_listing.next().await {
@@ -7345,6 +7732,9 @@ async fn diff_filesystem_directory_walk(
             continue;
         };
         if item.name == DOT_URC || item.name == DOT_LORE {
+            continue;
+        }
+        if staging && staging_ignores_name(item.name.as_str()) {
             continue;
         }
 
@@ -7364,13 +7754,9 @@ async fn diff_filesystem_directory_walk(
             continue;
         }
 
-        let current_index = if let Ok(index) = node_list
-            .children
-            .as_slice()
-            .binary_search_by(|child| child.name.cmp(&item.name_hash))
-        {
-            index
-        } else {
+        let Some(current_index) =
+            claim_named_child(node_list, node_list_found, item.name_hash, staging).await?
+        else {
             new_file_list.push(item);
             continue;
         };
@@ -7416,7 +7802,39 @@ async fn diff_filesystem_directory_walk(
         let from_node_name = from_path.name();
         let is_rename = *item.name != *from_node_name;
 
+        let staged = match ctx.intent.stage() {
+            Some(stage) if types_agree(&from_node, is_file, is_directory) => {
+                staged_entry(
+                    &node_list.state,
+                    &node_list.repository,
+                    from_named_node.node,
+                    &from_node,
+                    stage,
+                    forced,
+                )
+                .await?
+            }
+            _ => StagedEntry::Compare { insisted: false },
+        };
+
         if was_file && is_file {
+            match staged {
+                StagedEntry::Settled => continue,
+                StagedEntry::Undeleted => {
+                    emit_add_node_single(
+                        node_list.repository.clone(),
+                        node_list.state.clone(),
+                        from_named_node.node,
+                        &item_path,
+                        &mut ChangeSink::Vec(&mut *changes),
+                        stats,
+                    )
+                    .await?;
+                    continue;
+                }
+                StagedEntry::Compare { .. } => {}
+            }
+
             // A node in state_from but not in state_current is an unstaged
             // add — the file's presence on disk is the add. Comparing the
             // filesystem hash against the staged node's zero address would
@@ -7428,6 +7846,7 @@ async fn diff_filesystem_directory_walk(
                     from_named_node.node,
                     from_node,
                     &item_path,
+                    &FileInfo::from_metadata(&item.metadata),
                     &mut ChangeSink::Vec(&mut *changes),
                     stats,
                     ctx.filter_mode,
@@ -7465,6 +7884,7 @@ async fn diff_filesystem_directory_walk(
                 intent: ctx.intent,
                 states: item_states,
                 observed,
+                insists: matches!(staged, StagedEntry::Compare { insisted: true }),
             };
 
             // This handles renames (via from_path_for_rename), modifications, and unmodified cases
@@ -7480,6 +7900,17 @@ async fn diff_filesystem_directory_walk(
             )
             .await?;
         } else if was_link && is_directory {
+            if staged == StagedEntry::Undeleted {
+                emit_add_node_single(
+                    node_list.repository.clone(),
+                    node_list.state.clone(),
+                    from_named_node.node,
+                    &item_path,
+                    &mut ChangeSink::Vec(&mut *changes),
+                    stats,
+                )
+                .await?;
+            }
             let link = from_node.linked_node();
             let (link_from, state_from) = link
                 .resolve(ctx.from.repository.clone(), ctx.from.state.clone())
@@ -7538,7 +7969,8 @@ async fn diff_filesystem_directory_walk(
             )
             .await?;
         } else if was_directory && is_directory {
-            if ctx.intent.marks_dirty() && !current_node_id.is_valid_node_id() {
+            let uncommitted = ctx.intent.marks_dirty() && !current_node_id.is_valid_node_id();
+            if uncommitted {
                 let probe = nested_probe
                     .get_or_insert_with(|| ctx.filesystem_path.to_absolute_path(repository_root));
                 if is_nested_repository_root(probe, item.name.as_str()).await {
@@ -7546,6 +7978,20 @@ async fn diff_filesystem_directory_walk(
                     node_list_found[current_index] = false;
                     continue;
                 }
+            }
+            if staged == StagedEntry::Undeleted {
+                emit_add_node_single(
+                    node_list.repository.clone(),
+                    node_list.state.clone(),
+                    from_named_node.node,
+                    &item_path,
+                    &mut ChangeSink::Vec(&mut *changes),
+                    stats,
+                )
+                .await?;
+            } else if staged == StagedEntry::Settled {
+                // The node already carries its staged action; the descent below still runs.
+            } else if uncommitted {
                 emit_dirty_add_node_single(
                     node_list.repository.clone(),
                     node_list.state.clone(),
@@ -7578,6 +8024,17 @@ async fn diff_filesystem_directory_walk(
                     &mut ChangeSink::Vec(&mut *changes),
                     ctx.filter_mode,
                     item_states,
+                )
+                .await?;
+            } else if matches!(staged, StagedEntry::Compare { insisted: true }) {
+                settle_insisted_directory(
+                    node_list,
+                    from_named_node.node,
+                    &from_node,
+                    &item_path,
+                    &mut ChangeSink::Vec(&mut *changes),
+                    ctx.intent,
+                    ctx.filter_mode,
                 )
                 .await?;
             }
@@ -7651,6 +8108,7 @@ async fn diff_filesystem_directory_walk(
                 intent: ctx.intent,
                 states: item_states,
                 observed: FileInfo::from_metadata(&item.metadata),
+                insists: false,
             };
 
             // Determine the type change direction
@@ -7666,7 +8124,7 @@ async fn diff_filesystem_directory_walk(
                 item_path
             );
 
-            handle_single_file_compare_result(
+            let replacement = handle_single_file_compare_result(
                 &file_ctx,
                 compare_result,
                 &item_path,
@@ -7677,6 +8135,39 @@ async fn diff_filesystem_directory_walk(
                 ctx.filter_mode,
             )
             .await?;
+
+            // A directory that replaced a file is walked against the node the replacement
+            // minted, so the content it holds is staged with it. A file that replaced a
+            // directory holds none.
+            if is_directory && replacement.is_valid_node_id() {
+                diff_filesystem_subtree_dispatch(
+                    FilesystemDiffContext {
+                        from: FilesystemTraversal {
+                            repository: ctx.from.repository.clone(),
+                            state: ctx.from.state.clone(),
+                            node_path: item_path.clone(),
+                            root_node: replacement,
+                        },
+                        current: FilesystemTraversal {
+                            repository: ctx.current.repository.clone(),
+                            state: ctx.current.state.clone(),
+                            node_path: RelativePath::new(),
+                            root_node: INVALID_NODE,
+                        },
+                        filesystem_path: item_path,
+                        states: item_states,
+                        from_states: item_states,
+                        filter_mode: ctx.filter_mode,
+                        intent: ctx.intent,
+                        layer_mounts: ctx.layer_mounts.clone(),
+                        link_mounts: ctx.link_mounts.clone(),
+                    },
+                    tasks,
+                    changes,
+                    stats,
+                )
+                .await?;
+            }
         }
     }
 
@@ -7697,6 +8188,12 @@ async fn diff_filesystem_directory_walk(
         else {
             continue;
         };
+
+        // A staging walk sees the nodes already staged for delete, and the file system
+        // still not holding one says nothing new about it.
+        if staging && from_node.node.is_staged_delete() {
+            continue;
+        }
 
         if ctx.intent.marks_dirty() && from_node.node.is_directory() {
             let in_current = current_node_list
@@ -7854,6 +8351,13 @@ async fn diff_filesystem_directory_walk(
                 .iter()
                 .find(|m| m.target_path == child_file_path.as_str())
             {
+                // A staging walk leaves the mount alone: the layer's own tree is staged by
+                // its own walk against its own state, and staging it from here as well
+                // would settle the same nodes twice.
+                if staging {
+                    lore_trace!("Filesystem path {child_file_path} is a layer mount, skipping");
+                    continue 'new_file_iter;
+                }
                 lore_trace!(
                     "Filesystem path {child_file_path} is a layer mount, recursing into layer state"
                 );
@@ -8006,6 +8510,7 @@ async fn diff_filesystem_directory_walk(
             intent: ctx.intent,
             states: child_states,
             observed: FileInfo::from_metadata(&file.metadata),
+            insists: false,
         };
 
         lore_trace!("Filesystem has new item in path {child_file_path}, add add change");
@@ -8133,6 +8638,43 @@ async fn diff_filesystem_single_file(
         None
     };
 
+    let observed = FileInfo::from_metadata(&file_item.metadata);
+
+    // Staging decides on a node the tree holds before anything is compared, as the directory
+    // walk does.
+    let mut insisted = false;
+    if let Some(stage) = ctx.intent.stage()
+        && file_item.metadata.is_file()
+        && let Some(node) = from_node
+        && node.is_file()
+    {
+        match staged_entry(
+            &ctx.from.state,
+            &ctx.from.repository,
+            ctx.from.root_node,
+            &node,
+            stage,
+            execution_context().globals().force(),
+        )
+        .await?
+        {
+            StagedEntry::Settled => return Ok((changes, stats)),
+            StagedEntry::Undeleted => {
+                emit_add_node_single(
+                    ctx.from.repository.clone(),
+                    ctx.from.state.clone(),
+                    ctx.from.root_node,
+                    &ctx.filesystem_path,
+                    &mut ChangeSink::Vec(&mut changes),
+                    &stats,
+                )
+                .await?;
+                return Ok((changes, stats));
+            }
+            StagedEntry::Compare { insisted: asked } => insisted = asked,
+        }
+    }
+
     // A node in state_from but not in state_current is an unstaged add —
     // the file's presence on disk is the add. Skip the compare and emit
     // Add+Dirty directly.
@@ -8149,6 +8691,7 @@ async fn diff_filesystem_single_file(
             ctx.from.root_node,
             node,
             &ctx.filesystem_path,
+            &observed,
             &mut ChangeSink::Vec(&mut changes),
             &stats,
             ctx.filter_mode,
@@ -8159,7 +8702,6 @@ async fn diff_filesystem_single_file(
         return Ok((changes, stats));
     }
 
-    let observed = FileInfo::from_metadata(&file_item.metadata);
     let compare_result = compare_single_file_against_state(
         ctx.from.repository.clone(),
         from_node.as_ref(),
@@ -8180,6 +8722,7 @@ async fn diff_filesystem_single_file(
         intent: ctx.intent,
         states: ctx.states,
         observed,
+        insists: insisted,
     };
 
     handle_single_file_compare_result(

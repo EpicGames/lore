@@ -316,6 +316,30 @@ pub trait InstanceOperation: Send + Sync {
         path: FilesystemPath<'_>,
     ) -> impl Future<Output = Result<FileInfo, FsError>> + Send;
 
+    /// Whether the directory holding `path` holds a child named exactly as `path` spells it.
+    ///
+    /// The question a case resolution nearly always has, and one lookup answers it: no
+    /// directory read and no string to hold the answer. `Some(false)` says the name is not
+    /// held in this spelling rather than that it is absent, and `None` is the filesystem
+    /// declining to say — macOS for every name, Windows past its path limit — which only
+    /// [`names_folding_to`](Self::names_folding_to) answers.
+    fn holds_name_exactly(
+        &self,
+        path: FilesystemPath<'_>,
+    ) -> impl Future<Output = Option<bool>> + Send;
+
+    /// Every spelling of `name` the directory at `path` holds that folds to the same name:
+    /// the exact one alone where it is there, and empty where no spelling is.
+    ///
+    /// Reads the directory, which is what answering for a spelling other than the one asked
+    /// about takes. A caller that only needs to know whether its own spelling is the one on
+    /// disk asks [`holds_name_exactly`](Self::holds_name_exactly).
+    fn names_folding_to(
+        &self,
+        path: FilesystemPath<'_>,
+        name: &str,
+    ) -> impl Future<Output = Result<Vec<String>, FsError>> + Send;
+
     /// Gets the hash of a file in the repository, optionally providing the Node if it has
     /// separately been loaded.
     fn file_hash(
@@ -495,6 +519,26 @@ impl InstanceOperation for InstanceOperationImpl {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(this) => this.file_info(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.file_info(path).await,
+        }
+    }
+
+    async fn holds_name_exactly(&self, path: FilesystemPath<'_>) -> Option<bool> {
+        match &self.dispatch {
+            #[cfg(test)]
+            StaticDispatchInstanceOperation::Test(this) => this.holds_name_exactly(path).await,
+            StaticDispatchInstanceOperation::Os(this) => this.holds_name_exactly(path).await,
+        }
+    }
+
+    async fn names_folding_to(
+        &self,
+        path: FilesystemPath<'_>,
+        name: &str,
+    ) -> Result<Vec<String>, FsError> {
+        match &self.dispatch {
+            #[cfg(test)]
+            StaticDispatchInstanceOperation::Test(this) => this.names_folding_to(path, name).await,
+            StaticDispatchInstanceOperation::Os(this) => this.names_folding_to(path, name).await,
         }
     }
 
@@ -701,24 +745,31 @@ pub mod tests {
     pub struct TestFilesystemProvider {
         pub begin_count: Arc<AtomicUsize>,
         pub file_info_count: Arc<AtomicUsize>,
+        pub holds_name_count: Arc<AtomicUsize>,
+        pub names_folding_count: Arc<AtomicUsize>,
         pub finalize_events: Arc<Mutex<Vec<bool>>>,
         finalize_fails: bool,
+        holds_paths: bool,
     }
 
     impl TestFilesystemProvider {
         pub fn new() -> TestFilesystemProvider {
-            Self {
-                begin_count: Arc::new(AtomicUsize::new(0)),
-                file_info_count: Arc::new(AtomicUsize::new(0)),
-                finalize_events: Arc::new(Mutex::new(Vec::new())),
-                finalize_fails: false,
-            }
+            Self::default()
         }
 
         /// A provider whose operations record the finalize and then report it failed.
         pub fn failing_finalize() -> TestFilesystemProvider {
             Self {
                 finalize_fails: true,
+                ..Self::new()
+            }
+        }
+
+        /// A provider that reports every path as a file it holds, spelled as asked, which is
+        /// what a caller resolving a path that exists reads.
+        pub fn holding_every_path() -> TestFilesystemProvider {
+            Self {
+                holds_paths: true,
                 ..Self::new()
             }
         }
@@ -730,6 +781,15 @@ pub mod tests {
         /// How many paths were looked up through operations this provider began.
         pub fn file_infos(&self) -> usize {
             self.file_info_count.load(Ordering::Acquire)
+        }
+
+        /// How many single-name lookups and directory reads a case resolution cost.
+        pub fn name_lookups(&self) -> usize {
+            self.holds_name_count.load(Ordering::Acquire)
+        }
+
+        pub fn directory_reads(&self) -> usize {
+            self.names_folding_count.load(Ordering::Acquire)
         }
     }
 
@@ -750,8 +810,11 @@ pub mod tests {
             Ok(Arc::new(InstanceOperationImpl::new(
                 StaticDispatchInstanceOperation::Test(TestOperation {
                     file_info_count: self.file_info_count.clone(),
+                    holds_name_count: self.holds_name_count.clone(),
+                    names_folding_count: self.names_folding_count.clone(),
                     finalize_events: self.finalize_events.clone(),
                     finalize_fails: self.finalize_fails,
+                    holds_paths: self.holds_paths,
                 }),
             )))
         }
@@ -759,8 +822,11 @@ pub mod tests {
 
     pub struct TestOperation {
         file_info_count: Arc<AtomicUsize>,
+        holds_name_count: Arc<AtomicUsize>,
+        names_folding_count: Arc<AtomicUsize>,
         finalize_events: Arc<Mutex<Vec<bool>>>,
         finalize_fails: bool,
+        holds_paths: bool,
     }
 
     impl InstanceOperation for TestOperation {
@@ -782,11 +848,40 @@ pub mod tests {
             panic!("Test operation unimplemented except finalize")
         }
 
-        /// Counts the lookup and reports a path the filesystem does not hold, which is
-        /// what a caller acts on without needing content behind it.
+        /// Counts the lookup and reports what the provider was told to hold, which for the
+        /// default is a path the filesystem does not hold — what a caller acts on without
+        /// needing content behind it.
         async fn file_info(&self, _path: FilesystemPath<'_>) -> Result<FileInfo, FsError> {
             self.file_info_count.fetch_add(1, Ordering::AcqRel);
-            Ok(FileInfo::default())
+            Ok(if self.holds_paths {
+                FileInfo {
+                    exists: true,
+                    is_file: true,
+                    ..Default::default()
+                }
+            } else {
+                FileInfo::default()
+            })
+        }
+
+        /// Counts the lookup and reports the spelling asked about as the one held, so a
+        /// resolver reading through this one settles a path without reading a directory.
+        async fn holds_name_exactly(&self, _path: FilesystemPath<'_>) -> Option<bool> {
+            self.holds_name_count.fetch_add(1, Ordering::AcqRel);
+            Some(self.holds_paths)
+        }
+
+        async fn names_folding_to(
+            &self,
+            _path: FilesystemPath<'_>,
+            name: &str,
+        ) -> Result<Vec<String>, FsError> {
+            self.names_folding_count.fetch_add(1, Ordering::AcqRel);
+            Ok(if self.holds_paths {
+                vec![name.to_string()]
+            } else {
+                vec![]
+            })
         }
 
         async fn file_hash(

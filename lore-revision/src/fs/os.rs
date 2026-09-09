@@ -100,6 +100,18 @@ impl InstanceOperation for OsOperation {
         }
     }
 
+    async fn holds_name_exactly(&self, path: FilesystemPath<'_>) -> Option<bool> {
+        crate::util::fs::holds_name_exactly(path.as_absolute_path()).await
+    }
+
+    async fn names_folding_to(
+        &self,
+        path: FilesystemPath<'_>,
+        name: &str,
+    ) -> Result<Vec<String>, FsError> {
+        Ok(crate::util::fs::names_folding_to(path.as_absolute_path(), name).await?)
+    }
+
     async fn file_hash(
         &self,
         repository: Arc<RepositoryContext>,

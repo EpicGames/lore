@@ -599,7 +599,7 @@ mod tests {
 
                 // Verify the file system was updated
                 let updated_name =
-                    lore_revision::util::fs::filesystem_names(path.as_path(), "Test.file")
+                    lore_revision::util::fs::names_folding_to(path.as_path(), "Test.file")
                         .await
                         .expect("Failed to get updated file name");
                 assert_eq!(updated_name.len(), 1);
@@ -623,7 +623,7 @@ mod tests {
 
                 // Verify the file system was updated
                 let updated_name =
-                    lore_revision::util::fs::filesystem_names(path.as_path(), "Test.file")
+                    lore_revision::util::fs::names_folding_to(path.as_path(), "Test.file")
                         .await
                         .expect("Failed to get updated file name");
                 assert_eq!(updated_name.len(), 1);
@@ -750,7 +750,7 @@ mod tests {
 
                 // Verify the file system was updated
                 let updated_name =
-                    lore_revision::util::fs::filesystem_names(path.as_path(), "testdir")
+                    lore_revision::util::fs::names_folding_to(path.as_path(), "testdir")
                         .await
                         .expect("Failed to get updated directory name");
                 assert_eq!(updated_name.len(), 1);
@@ -774,13 +774,13 @@ mod tests {
 
                 // Verify the file system was updated
                 let updated_directory_name =
-                    lore_revision::util::fs::filesystem_names(path.as_path(), "testdir")
+                    lore_revision::util::fs::names_folding_to(path.as_path(), "testdir")
                         .await
                         .expect("Failed to get updated directory name");
                 assert_eq!(updated_directory_name.len(), 1);
                 let updated_directory_name = updated_directory_name[0].clone();
                 assert_eq!(updated_directory_name, "testDir");
-                let updated_file_name = lore_revision::util::fs::filesystem_names(
+                let updated_file_name = lore_revision::util::fs::names_folding_to(
                     first_directory_path.as_path(),
                     "test.file",
                 )
@@ -902,7 +902,7 @@ mod tests {
 
                 // Verify the file system was updated
                 let updated_name =
-                    lore_revision::util::fs::filesystem_names(path.as_path(), "Test.file")
+                    lore_revision::util::fs::names_folding_to(path.as_path(), "Test.file")
                         .await
                         .expect("Failed to get updated file name");
                 assert_eq!(updated_name.len(), 1);
@@ -926,7 +926,7 @@ mod tests {
 
                 // Verify the file system was maintained
                 let updated_name =
-                    lore_revision::util::fs::filesystem_names(path.as_path(), "Test.file")
+                    lore_revision::util::fs::names_folding_to(path.as_path(), "Test.file")
                         .await
                         .expect("Failed to get updated file name");
                 assert_eq!(updated_name.len(), 1);
@@ -1099,7 +1099,7 @@ mod tests {
                         }
                     }
                 }
-                let names = lore_revision::util::fs::filesystem_names(path.as_path(), "assets")
+                let names = lore_revision::util::fs::names_folding_to(path.as_path(), "assets")
                     .await
                     .expect("the directory must still be there");
                 assert_eq!(names, vec!["Assets".to_string()]);

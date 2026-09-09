@@ -371,17 +371,18 @@ pub(crate) async fn stage_filesystem_path(
         relative_path.as_str(),
     );
 
-    let (mut relative_path, resolved_metadata) = if relative_path.is_empty() {
+    let (mut relative_path, resolved_info) = if relative_path.is_empty() {
         (relative_path, None)
     } else {
-        let resolved = util::fs::filesystem_path_and_metadata(
+        let resolved = util::fs::filesystem_path_and_info(
+            &operation,
             base_absolute_path.as_path(),
             &relative_path,
             prefixes.as_deref(),
         )
         .await;
         match resolved {
-            Ok((resolved, resolved_metadata)) => (resolved, resolved_metadata),
+            Ok((resolved, resolved_info)) => (resolved, resolved_info),
             Err(_) => (relative_path, None),
         }
     };
@@ -404,8 +405,8 @@ pub(crate) async fn stage_filesystem_path(
         return Ok(NodeLink::invalid());
     }
 
-    let staged_info = if let Some(metadata) = &resolved_metadata {
-        Some(FileInfo::from_metadata(metadata))
+    let staged_info = if let Some(info) = resolved_info {
+        Some(info)
     } else {
         let staged_path = RepositoryPath::from_relative_and_root(
             base_absolute_path.as_path(),

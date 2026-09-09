@@ -139,6 +139,93 @@ mod tests {
             .expect("Test task failed");
     }
 
+    /// A repository whose ignore filter excludes `excluded`, so a walk has content the view
+    /// leaves out to answer for.
+    async fn test_repository_excluding(
+        immutable_store: std::sync::Arc<dyn lore_storage::ImmutableStore>,
+        mutable_store: std::sync::Arc<dyn lore_storage::MutableStore>,
+        repository_id: RepositoryId,
+        excluded: &str,
+    ) -> TestRepository {
+        let tempdir = generate_tempdir();
+        let path = tempdir.to_path_buf();
+        let write_token =
+            lore_revision::repository::RepositoryWriteToken::acquire(path.as_path()).await;
+        let default_branch_id = lore_base::types::Context::from(uuid::Uuid::now_v7());
+        let created = lore_revision::repository::create_local(
+            path.as_path(),
+            &write_token,
+            repository_id,
+            default_branch_id,
+            lore_revision::branch::DEFAULT_DEFAULT_NAME.to_string(),
+            lore_revision::repository::RepositoryConfig::default(),
+            false,
+        )
+        .await
+        .expect("Failed to initialize repository");
+
+        let mut filter = lore_revision::filter::Filter::default();
+        filter
+            .ignore
+            .add_exclusion(excluded)
+            .expect("exclusion rule");
+        let repository = std::sync::Arc::new(
+            lore_revision::repository::RepositoryContext::new(
+                default_repository_creation_args(immutable_store, mutable_store)
+                    .with_path(&path)
+                    .with_id(repository_id)
+                    .with_instance_id(created.instance_id)
+                    .with_filter(std::sync::Arc::new(filter)),
+            )
+            .with_write_token(write_token.share()),
+        );
+        lore_revision::instance::store_current_anchor_branch(&repository, default_branch_id)
+            .await
+            .expect("Failed to store anchor branch");
+
+        TestRepository {
+            repository,
+            write_token,
+            path,
+            _tempdir: tempdir,
+        }
+    }
+
+    /// Stage and commit the whole fixture under force, which is what puts a path the filter
+    /// excludes into the tree.
+    async fn force_commit_fixture(fixture: &TestRepository) {
+        LORE_CONTEXT
+            .scope(
+                forced_execution(),
+                lore_revision::file::stage::stage(
+                    fixture.repository.clone(),
+                    &fixture.write_token,
+                    lore_revision::interface::LoreArray::from_vec(vec![
+                        lore_revision::interface::LoreString::from(&fixture.path),
+                    ]),
+                    lore_revision::stage::StageOptions {
+                        scan: true,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .expect("Failed to stage the fixture");
+        Box::pin(lore_revision::commit::commit(
+            fixture.repository.clone(),
+            &fixture.write_token,
+            lore_revision::commit::CommitOptions {
+                message: String::new(),
+                link_messages: std::collections::HashMap::new(),
+                link: None,
+                layer_messages: std::collections::HashMap::new(),
+                layer: None,
+            },
+        ))
+        .await
+        .expect("Failed to commit the fixture");
+    }
+
     /// A staged delete settles the whole tree subtree, so a commit built from it removes
     /// what the view leaves out too. `MarkDirty` answers for the view alone and leaves an
     /// excluded node untouched.
@@ -151,90 +238,20 @@ mod tests {
 
         runtime()
             .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
-                let tempdir = generate_tempdir();
-                let path = tempdir.to_path_buf();
-                std::fs::create_dir_all(path.join("dir")).expect("Create directory failed");
-                let write_token =
-                    lore_revision::repository::RepositoryWriteToken::acquire(path.as_path()).await;
-                let default_branch_id = lore_base::types::Context::from(uuid::Uuid::now_v7());
-                let created = lore_revision::repository::create_local(
-                    path.as_path(),
-                    &write_token,
+                let fixture = test_repository_excluding(
+                    immutable_store,
+                    mutable_store,
                     repository_id,
-                    default_branch_id,
-                    lore_revision::branch::DEFAULT_DEFAULT_NAME.to_string(),
-                    lore_revision::repository::RepositoryConfig::default(),
-                    false,
+                    "dir/hidden.txt",
                 )
-                .await
-                .expect("Failed to initialize repository");
+                .await;
+                let repository = fixture.repository.clone();
+                std::fs::create_dir_all(fixture.path.join("dir")).expect("Create directory failed");
+                test_file_write(&fixture.path.join("dir/shown.txt"), b"in view");
+                test_file_write(&fixture.path.join("dir/hidden.txt"), b"out of view");
+                force_commit_fixture(&fixture).await;
 
-                let mut filter = lore_revision::filter::Filter::default();
-                filter
-                    .ignore
-                    .add_exclusion("dir/hidden.txt")
-                    .expect("exclusion rule");
-                let repository = std::sync::Arc::new(
-                    lore_revision::repository::RepositoryContext::new(
-                        default_repository_creation_args(immutable_store, mutable_store)
-                            .with_path(&path)
-                            .with_id(repository_id)
-                            .with_instance_id(created.instance_id)
-                            .with_filter(std::sync::Arc::new(filter)),
-                    )
-                    .with_write_token(write_token.share()),
-                );
-                lore_revision::instance::store_current_anchor_branch(
-                    &repository,
-                    default_branch_id,
-                )
-                .await
-                .expect("Failed to store anchor branch");
-
-                test_file_write(&path.join("dir/shown.txt"), b"in view");
-                test_file_write(&path.join("dir/hidden.txt"), b"out of view");
-
-                // Stage and commit both files, so the tree holds the excluded one too.
-                let force =
-                    std::sync::Arc::new(lore_revision::interface::ExecutionContext::new_client(
-                        lore_revision::interface::LoreGlobalArgs {
-                            force: 1,
-                            ..Default::default()
-                        },
-                        lore_revision::relay::EventDispatcher::no_dispatch(),
-                    ));
-                LORE_CONTEXT
-                    .scope(
-                        force,
-                        lore_revision::file::stage::stage(
-                            repository.clone(),
-                            &write_token,
-                            lore_revision::interface::LoreArray::from_vec(vec![
-                                lore_revision::interface::LoreString::from(&path),
-                            ]),
-                            lore_revision::stage::StageOptions {
-                                scan: true,
-                                ..Default::default()
-                            },
-                        ),
-                    )
-                    .await
-                    .expect("Failed to stage the fixture");
-                Box::pin(lore_revision::commit::commit(
-                    repository.clone(),
-                    &write_token,
-                    lore_revision::commit::CommitOptions {
-                        message: String::new(),
-                        link_messages: std::collections::HashMap::new(),
-                        link: None,
-                        layer_messages: std::collections::HashMap::new(),
-                        layer: None,
-                    },
-                ))
-                .await
-                .expect("Failed to commit the fixture");
-
-                std::fs::remove_dir_all(path.join("dir")).expect("Remove directory failed");
+                std::fs::remove_dir_all(fixture.path.join("dir")).expect("Remove directory failed");
 
                 let (current, staged) = test_anchor_states(&repository).await;
                 let hidden = staged
@@ -406,6 +423,599 @@ mod tests {
                     flags.contains(NodeFlags::StagedMove),
                     "a reported move must be settled as one, flags {:x}",
                     node.flags
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Stage and commit the whole fixture, so the tree holds a committed base for the walk
+    /// to compare a replacement against.
+    async fn commit_fixture(fixture: &TestRepository) {
+        lore_revision::file::stage::stage(
+            fixture.repository.clone(),
+            &fixture.write_token,
+            lore_revision::interface::LoreArray::from_vec(vec![
+                lore_revision::interface::LoreString::from(&fixture.path),
+            ]),
+            lore_revision::stage::StageOptions {
+                scan: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to stage the fixture");
+        Box::pin(lore_revision::commit::commit(
+            fixture.repository.clone(),
+            &fixture.write_token,
+            lore_revision::commit::CommitOptions {
+                message: String::new(),
+                link_messages: std::collections::HashMap::new(),
+                link: None,
+                layer_messages: std::collections::HashMap::new(),
+                layer: None,
+            },
+        ))
+        .await
+        .expect("Failed to commit the fixture");
+    }
+
+    /// The staged flags `node` carries.
+    async fn staged_flags(
+        repository: &std::sync::Arc<lore_revision::repository::RepositoryContext>,
+        state: &std::sync::Arc<lore_revision::state::State>,
+        node: lore_revision::node::NodeID,
+    ) -> NodeFlags {
+        let node = state
+            .node(repository.clone(), node)
+            .await
+            .expect("the node must read back");
+        NodeFlags::from_bits_retain(node.flags)
+    }
+
+    /// A file the file system replaced with a directory stages as both halves of the
+    /// replacement: the displaced node carries the delete a commit needs to drop the old
+    /// content, and the directory that took its place is staged along with what it holds.
+    #[tokio::test]
+    async fn a_staged_file_replaced_by_a_directory_settles_both() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+
+                test_file_write(&fixture.path.join("thing"), b"a file first");
+                commit_fixture(&fixture).await;
+
+                std::fs::remove_file(fixture.path.join("thing")).expect("Remove file failed");
+                std::fs::create_dir_all(fixture.path.join("thing"))
+                    .expect("Create directory failed");
+                test_file_write(&fixture.path.join("thing/inner.txt"), b"content below");
+
+                let (current, staged) = test_anchor_states(&repository).await;
+                let displaced = staged
+                    .find_node_link(repository.clone(), "thing")
+                    .await
+                    .expect("the tree must hold the committed file")
+                    .node;
+                let changes = test_scan_with_intent(
+                    repository.clone(),
+                    staged.clone(),
+                    current,
+                    FilesystemDiffIntent::Stage(StageIntent::default()),
+                )
+                .await;
+
+                let flags = staged_flags(&repository, &staged, displaced).await;
+                assert!(
+                    flags.contains(NodeFlags::StagedDelete),
+                    "the displaced file must be staged for delete, flags {flags:?}"
+                );
+
+                let inner = changes
+                    .iter()
+                    .find(|change| change.path.as_str() == "thing/inner.txt")
+                    .expect("the walk must descend into the directory that replaced the file");
+                assert_eq!(FileAction::Add, inner.action);
+                let flags = staged_flags(&repository, &staged, inner.to.node).await;
+                assert!(
+                    flags.contains(NodeFlags::StagedAdd),
+                    "content below the replacement must be staged, flags {flags:?}"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A staged replacement sits in the tree beside the node it displaced, both spelled the
+    /// same. A second pass has to claim the replacement rather than the node carrying the
+    /// delete, or it replaces the replacement.
+    #[tokio::test]
+    async fn staging_a_replacement_twice_replaces_it_once() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+
+                test_file_write(&fixture.path.join("thing"), b"a file first");
+                commit_fixture(&fixture).await;
+
+                std::fs::remove_file(fixture.path.join("thing")).expect("Remove file failed");
+                std::fs::create_dir_all(fixture.path.join("thing"))
+                    .expect("Create directory failed");
+                test_file_write(&fixture.path.join("thing/inner.txt"), b"content below");
+
+                let (current, staged) = test_anchor_states(&repository).await;
+                test_scan_with_intent(
+                    repository.clone(),
+                    staged.clone(),
+                    current.clone(),
+                    FilesystemDiffIntent::Stage(StageIntent::default()),
+                )
+                .await;
+                let replacement = staged
+                    .find_node_link(repository.clone(), "thing")
+                    .await
+                    .expect("the walk must mint the replacement")
+                    .node;
+
+                test_scan_with_intent(
+                    repository.clone(),
+                    staged.clone(),
+                    current,
+                    FilesystemDiffIntent::Stage(StageIntent::default()),
+                )
+                .await;
+
+                let after = staged
+                    .find_node_link(repository.clone(), "thing")
+                    .await
+                    .expect("the replacement must still be there")
+                    .node;
+                assert_eq!(
+                    replacement, after,
+                    "the second pass must claim the replacement, not the node it displaced"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A directory the file system replaced with a file stages the whole displaced subtree
+    /// for delete, and the file that took its place as an add carrying its identity.
+    #[tokio::test]
+    async fn a_staged_directory_replaced_by_a_file_settles_both() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+
+                std::fs::create_dir_all(fixture.path.join("thing"))
+                    .expect("Create directory failed");
+                test_file_write(&fixture.path.join("thing/inner.txt"), b"content below");
+                commit_fixture(&fixture).await;
+
+                std::fs::remove_dir_all(fixture.path.join("thing"))
+                    .expect("Remove directory failed");
+                test_file_write(&fixture.path.join("thing"), b"a file now");
+
+                let (current, staged) = test_anchor_states(&repository).await;
+                let displaced = staged
+                    .find_node_link(repository.clone(), "thing")
+                    .await
+                    .expect("the tree must hold the committed directory")
+                    .node;
+                let displaced_child = staged
+                    .find_node_link(repository.clone(), "thing/inner.txt")
+                    .await
+                    .expect("the tree must hold the committed file below it")
+                    .node;
+                let changes = test_scan_with_intent(
+                    repository.clone(),
+                    staged.clone(),
+                    current,
+                    FilesystemDiffIntent::Stage(StageIntent::default()),
+                )
+                .await;
+
+                let flags = staged_flags(&repository, &staged, displaced).await;
+                assert!(
+                    flags.contains(NodeFlags::StagedDelete),
+                    "the displaced directory must be staged for delete, flags {flags:?}"
+                );
+                let flags = staged_flags(&repository, &staged, displaced_child).await;
+                assert!(
+                    flags.contains(NodeFlags::StagedDelete),
+                    "the whole displaced subtree must be staged for delete, flags {flags:?}"
+                );
+
+                let added = changes
+                    .iter()
+                    .find(|change| {
+                        change.path.as_str() == "thing" && change.action == FileAction::Add
+                    })
+                    .expect("the walk must report the file that replaced the directory");
+                let node = staged
+                    .node(repository.clone(), added.to.node)
+                    .await
+                    .expect("the replacement must read back");
+                let flags = NodeFlags::from_bits_retain(node.flags);
+                assert!(
+                    flags.contains(NodeFlags::StagedAdd),
+                    "the replacement must be staged as an add, flags {flags:?}"
+                );
+                assert!(
+                    node.is_file(),
+                    "the replacement must take the type the file system holds, flags {flags:?}"
+                );
+                assert!(
+                    !node.address.context.is_zero(),
+                    "a staged file node must carry an identity"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Force reports what the view leaves out, all the way down a subtree it is reporting
+    /// the delete of. A forced walk consults no filter slot, so the hierarchy under a change
+    /// is reported whole rather than folded against rules force put it past.
+    #[tokio::test]
+    async fn force_reports_an_excluded_path_under_a_deleted_subtree() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture = test_repository_excluding(
+                    immutable_store,
+                    mutable_store,
+                    repository_id,
+                    "thing/hidden.txt",
+                )
+                .await;
+                let repository = fixture.repository.clone();
+                std::fs::create_dir_all(fixture.path.join("thing"))
+                    .expect("Create directory failed");
+                test_file_write(&fixture.path.join("thing/shown.txt"), b"in view");
+                test_file_write(&fixture.path.join("thing/hidden.txt"), b"out of view");
+                force_commit_fixture(&fixture).await;
+
+                // A file where the directory was, so the whole subtree is reported deleted
+                // through the change hierarchy rather than through the walk.
+                std::fs::remove_dir_all(fixture.path.join("thing"))
+                    .expect("Remove directory failed");
+                test_file_write(&fixture.path.join("thing"), b"a file now");
+
+                let (current, staged) = test_anchor_states(&repository).await;
+                let changes = LORE_CONTEXT
+                    .scope(
+                        forced_execution(),
+                        test_scan_with_intent(
+                            repository.clone(),
+                            staged,
+                            current,
+                            FilesystemDiffIntent::Stage(StageIntent::default()),
+                        ),
+                    )
+                    .await;
+
+                for path in ["thing/shown.txt", "thing/hidden.txt"] {
+                    assert!(
+                        changes.iter().any(|change| change.path.as_str() == path
+                            && change.action == FileAction::Delete),
+                        "a forced walk must report {path} as deleted, reported {:?}",
+                        changes
+                            .iter()
+                            .map(|change| (change.path.as_str(), change.action))
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A node already carrying its staged action is left alone, so staging the same tree
+    /// twice reports the second pass as staging nothing.
+    #[tokio::test]
+    async fn staging_a_tree_twice_settles_it_once() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                test_file_write(&fixture.path.join("script.sh"), b"staged once");
+
+                let (current, staged) = test_anchor_states(&repository).await;
+                let first = test_scan_with_intent(
+                    repository.clone(),
+                    staged.clone(),
+                    current.clone(),
+                    FilesystemDiffIntent::Stage(StageIntent::default()),
+                )
+                .await;
+                assert!(
+                    first
+                        .iter()
+                        .any(|change| change.path.as_str() == "script.sh"),
+                    "the first pass must stage the file"
+                );
+
+                let second = test_scan_with_intent(
+                    repository.clone(),
+                    staged,
+                    current,
+                    FilesystemDiffIntent::Stage(StageIntent::default()),
+                )
+                .await;
+                assert!(
+                    !second
+                        .iter()
+                        .any(|change| change.path.as_str() == "script.sh"),
+                    "a node already staged must not be staged again, reported {:?}",
+                    second.iter().map(|c| c.path.as_str()).collect::<Vec<_>>()
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A file the tree holds staged for delete and the file system still has is taken back:
+    /// a staged delete the working tree contradicts would drop the file on commit.
+    #[tokio::test]
+    async fn staging_a_file_the_tree_holds_deleted_takes_the_delete_back() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+
+                let script = fixture.path.join("script.sh");
+                test_file_write(&script, b"committed");
+                commit_fixture(&fixture).await;
+
+                let (current, staged) = test_anchor_states(&repository).await;
+                let node_id = staged
+                    .find_node_link(repository.clone(), "script.sh")
+                    .await
+                    .expect("the tree must hold the committed file")
+                    .node;
+
+                std::fs::remove_file(&script).expect("Remove file failed");
+                test_scan_with_intent(
+                    repository.clone(),
+                    staged.clone(),
+                    current.clone(),
+                    FilesystemDiffIntent::Stage(StageIntent::default()),
+                )
+                .await;
+                let flags = staged_flags(&repository, &staged, node_id).await;
+                assert!(
+                    flags.contains(NodeFlags::StagedDelete),
+                    "the fixture must stage the delete first, flags {flags:?}"
+                );
+
+                test_file_write(&script, b"back again");
+                let changes = test_scan_with_intent(
+                    repository.clone(),
+                    staged.clone(),
+                    current,
+                    FilesystemDiffIntent::Stage(StageIntent::default()),
+                )
+                .await;
+
+                let flags = staged_flags(&repository, &staged, node_id).await;
+                assert!(
+                    !flags.contains(NodeFlags::StagedDelete),
+                    "the delete must be taken back, flags {flags:?}"
+                );
+                assert!(
+                    flags.contains(NodeFlags::StagedModify),
+                    "the file must be settled as a modification, flags {flags:?}"
+                );
+                assert!(
+                    changes
+                        .iter()
+                        .any(|change| change.path.as_str() == "script.sh"
+                            && change.action == FileAction::Add),
+                    "the file must be reported back"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// An execution context whose global force flag is set, which is what `--force` gives a
+    /// command.
+    fn forced_execution() -> std::sync::Arc<lore_revision::interface::ExecutionContext> {
+        std::sync::Arc::new(lore_revision::interface::ExecutionContext::new_client(
+            lore_revision::interface::LoreGlobalArgs {
+                force: 1,
+                ..Default::default()
+            },
+            lore_revision::relay::EventDispatcher::no_dispatch(),
+        ))
+    }
+
+    /// Force stages what the working copy already matches, the directory included: the user
+    /// asked for those nodes to carry the action, and a walk that reported nothing would
+    /// leave the ask unanswered.
+    #[tokio::test]
+    async fn force_stages_what_the_working_copy_already_matches() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+
+                std::fs::create_dir_all(fixture.path.join("dir")).expect("Create directory failed");
+                test_file_write(&fixture.path.join("dir/script.sh"), b"unchanged");
+                commit_fixture(&fixture).await;
+
+                let (current, staged) = test_anchor_states(&repository).await;
+                let node_id = staged
+                    .find_node_link(repository.clone(), "dir/script.sh")
+                    .await
+                    .expect("the tree must hold the committed file")
+                    .node;
+                let directory_id = staged
+                    .find_node_link(repository.clone(), "dir")
+                    .await
+                    .expect("the tree must hold the committed directory")
+                    .node;
+
+                let changes = LORE_CONTEXT
+                    .scope(
+                        forced_execution(),
+                        test_scan_with_intent(
+                            repository.clone(),
+                            staged.clone(),
+                            current,
+                            FilesystemDiffIntent::Stage(StageIntent::default()),
+                        ),
+                    )
+                    .await;
+
+                let flags = staged_flags(&repository, &staged, node_id).await;
+                assert!(
+                    flags.contains(NodeFlags::StagedModify),
+                    "force must settle the file it was asked to stage, flags {flags:?}"
+                );
+                let flags = staged_flags(&repository, &staged, directory_id).await;
+                assert!(
+                    flags.contains(NodeFlags::StagedModify),
+                    "force must settle the directory too, which holds no content to compare, flags {flags:?}"
+                );
+                for path in ["dir", "dir/script.sh"] {
+                    assert!(
+                        changes.iter().any(|change| change.path.as_str() == path),
+                        "what force staged must be reported, missing {path}"
+                    );
+                }
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// A staged modification records the size and mode the file was measured with, which is
+    /// what a commit reads to realize it.
+    #[tokio::test]
+    async fn a_staged_modification_records_what_the_file_carries() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+
+                let script = fixture.path.join("script.sh");
+                test_file_write(&script, b"short");
+                commit_fixture(&fixture).await;
+
+                let grown = b"a good deal longer than the committed content";
+                test_file_write(&script, grown);
+
+                let (current, staged) = test_anchor_states(&repository).await;
+                test_scan_with_intent(
+                    repository.clone(),
+                    staged.clone(),
+                    current,
+                    FilesystemDiffIntent::Stage(StageIntent::default()),
+                )
+                .await;
+
+                let node_id = staged
+                    .find_node_link(repository.clone(), "script.sh")
+                    .await
+                    .expect("the tree must hold the file")
+                    .node;
+                let node = staged
+                    .node(repository.clone(), node_id)
+                    .await
+                    .expect("the staged node must read back");
+                assert_eq!(
+                    grown.len() as u64,
+                    node.size,
+                    "the node must record the size the file was measured with"
+                );
+            }))
+            .await
+            .expect("Test task failed");
+    }
+
+    /// Staging leaves a merge sibling alone, which a resolution has not consumed yet. A
+    /// marking walk reports it, since the working tree does hold it.
+    #[tokio::test]
+    async fn staging_leaves_a_merge_sibling_alone() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository_id = RepositoryId::from(uuid::Uuid::now_v7());
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let fixture =
+                    test_repository_create(immutable_store, mutable_store, repository_id).await;
+                let repository = fixture.repository.clone();
+                let sibling = format!("script.sh{}", lore_revision::repository::THEIRS_SUFFIX);
+                test_file_write(&fixture.path.join(&sibling), b"their version");
+
+                let (current, staged) = test_anchor_states(&repository).await;
+                let staged_changes = test_scan_with_intent(
+                    repository.clone(),
+                    staged,
+                    current.clone(),
+                    FilesystemDiffIntent::Stage(StageIntent::default()),
+                )
+                .await;
+                assert!(
+                    !staged_changes
+                        .iter()
+                        .any(|change| change.path.as_str() == sibling),
+                    "staging must leave the merge sibling alone"
+                );
+
+                let (_, staged) = test_anchor_states(&repository).await;
+                let marked = test_scan_with_intent(
+                    repository.clone(),
+                    staged,
+                    current,
+                    FilesystemDiffIntent::MarkDirty,
+                )
+                .await;
+                assert!(
+                    marked.iter().any(|change| change.path.as_str() == sibling),
+                    "a marking walk must report what the working tree holds"
                 );
             }))
             .await

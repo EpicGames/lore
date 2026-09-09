@@ -22,6 +22,8 @@ use crate::file::unstage;
 use crate::file::unstage::UnstageOptions;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::with_operation;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreFileAction;
@@ -45,13 +47,13 @@ use crate::repository::DOT_URC;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::revision;
-use crate::revision::sync;
 use crate::revision::sync::SyncRealizeStats;
 use crate::runtime::execution_context;
 use crate::state;
 use crate::state::State;
 use crate::util;
 use crate::util::path::RelativePath;
+use crate::util::path::RepositoryPath;
 
 /// Data for the event emitted when a reset operation begins.
 #[repr(C)]
@@ -214,12 +216,125 @@ pub struct ResetOptions {
 /// Shared context passed through reset walk functions.
 #[derive(Clone)]
 struct ResetContext {
+    operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     state_target: Arc<State>,
     state_staged: Arc<State>,
     options: ResetOptions,
     stats: Arc<ResetStats>,
     file_tx: mpsc::Sender<ResetFileWorkItem>,
+}
+
+/// The revision a reset takes each path back to: one for every path, or the point each path
+/// was last merged from a branch, which is resolved per path.
+enum ResetTarget {
+    Revision(Arc<State>),
+    LastMergedFrom {
+        state_current: Arc<State>,
+        branch: BranchId,
+        branch_point: Hash,
+    },
+}
+
+impl ResetTarget {
+    /// The tree `path` is reset against.
+    async fn state_for(
+        &self,
+        repository: &Arc<RepositoryContext>,
+        path: &RelativePath,
+    ) -> Result<Arc<State>, ResetError> {
+        match self {
+            ResetTarget::Revision(state) => Ok(state.clone()),
+            // Find the start state where the node exists, then iterate its history back from
+            // there to the last point it was merged from the branch.
+            ResetTarget::LastMergedFrom {
+                state_current,
+                branch,
+                branch_point,
+            } => {
+                resolve_last_merged_target(
+                    repository.clone(),
+                    state_current.clone(),
+                    *branch,
+                    *branch_point,
+                    path,
+                )
+                .await
+            }
+        }
+    }
+}
+
+/// What walking every path a reset names needs.
+struct ResetWalk {
+    operation: Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    target: ResetTarget,
+    state_staged: Arc<State>,
+    paths: LoreArray<LoreString>,
+    options: ResetOptions,
+    stats: Arc<ResetStats>,
+    file_tx: mpsc::Sender<ResetFileWorkItem>,
+}
+
+/// Walk each path in turn, handing every file it reaches to the consumer.
+///
+/// Reports the first failure, having stopped at it: a path the user named and a target that
+/// cannot be resolved are both refusals, and the paths after one are left alone rather than
+/// half-applied. A path that does not name anything inside the repository is reported
+/// ignored and skipped.
+async fn reset_walk_each_path(walk: ResetWalk) -> Option<ResetError> {
+    let repository_root = match walk.repository.require_path() {
+        Ok(path) => path.to_path_buf(),
+        Err(err) => return Some(ResetError::from(err)),
+    };
+
+    for path in walk.paths.as_slice().iter() {
+        let Ok(relative_path) =
+            RelativePath::new_from_user_path(repository_root.as_path(), path.as_str())
+        else {
+            emit_path_ignore(path.as_str()).await;
+            lore_trace!("Ignoring invalid path: {path}");
+            continue;
+        };
+
+        lore_debug!(
+            "User path [{}] transformed to relative path [{}] in repository {}",
+            path.as_str(),
+            relative_path.as_str(),
+            walk.repository.path_for_display()
+        );
+
+        let walked = match walk
+            .target
+            .state_for(&walk.repository, &relative_path)
+            .await
+        {
+            Ok(state_target) => {
+                reset_walk_path(
+                    ResetContext {
+                        operation: walk.operation.clone(),
+                        repository: walk.repository.clone(),
+                        state_target,
+                        state_staged: walk.state_staged.clone(),
+                        options: walk.options,
+                        stats: walk.stats.clone(),
+                        file_tx: walk.file_tx.clone(),
+                    },
+                    relative_path.clone(),
+                )
+                .await
+            }
+            Err(err) => Err(err),
+        };
+
+        if let Err(err) = walked {
+            return wrap_path_error(walk.repository.clone(), &relative_path, path.as_str(), err)
+                .await
+                .err();
+        }
+    }
+    None
 }
 
 fn count_data(stats: &ResetStats) -> LoreFileResetCountData {
@@ -330,59 +445,27 @@ pub async fn reset(
 
     let target_revision = state_target.revision();
     let modified_times = Arc::new(crate::state::RecordedModifiedTimes::default());
-    let result = run_reset_pipeline(
-        stats.clone(),
-        modified_times.clone(),
-        |file_tx| async move {
-            let mut producer_failure: Option<ResetError> = None;
-            let repository_root = match producer_repository.require_path() {
-                Ok(p) => p.to_path_buf(),
-                Err(e) => return Some(ResetError::from(e)),
-            };
-            for path in paths.as_slice().iter() {
-                let Ok(relative_path) =
-                    RelativePath::new_from_user_path(repository_root.as_path(), path.as_str())
-                else {
-                    emit_path_ignore(path.as_str()).await;
-                    lore_trace!("Ignoring invalid path: {path}");
-                    continue;
-                };
-
-                lore_debug!(
-                    "User path [{}] transformed to relative path [{}] in repository {}",
-                    path.as_str(),
-                    relative_path.as_str(),
-                    producer_repository.path_for_display()
-                );
-
-                let walk_result = reset_walk_path(
-                    ResetContext {
-                        repository: producer_repository.clone(),
-                        state_target: state_target.clone(),
-                        state_staged: state_staged.clone(),
-                        options,
-                        stats: producer_stats.clone(),
-                        file_tx: file_tx.clone(),
-                    },
-                    relative_path.clone(),
-                )
-                .await;
-
-                if let Err(err) = walk_result {
-                    producer_failure = wrap_path_error(
-                        producer_repository.clone(),
-                        &relative_path,
-                        path.as_str(),
-                        err,
-                    )
-                    .await
-                    .err();
-                    break;
-                }
-            }
-            producer_failure
-        },
-    )
+    // One operation covers the whole reset: it resolves the case each path is held in and
+    // writes every file, and one opened per file would freeze a filesystem per file.
+    let result = with_operation(repository.file_system(), true, async |operation| {
+        let producer_operation = operation.clone();
+        let walked = run_reset_pipeline(operation.clone(), stats.clone(), |file_tx| async move {
+            reset_walk_each_path(ResetWalk {
+                operation: producer_operation,
+                repository: producer_repository,
+                target: ResetTarget::Revision(state_target),
+                state_staged,
+                paths,
+                options,
+                stats: producer_stats,
+                file_tx,
+            })
+            .await
+        })
+        .await;
+        modified_times.absorb(operation.take_modified_times());
+        walked
+    })
     .await;
 
     let counts = count_data(&outer_stats);
@@ -542,86 +625,30 @@ pub async fn reset_to_last_merged(
     let branch_id = branch.id;
 
     let modified_times = Arc::new(crate::state::RecordedModifiedTimes::default());
-    let result = run_reset_pipeline(
-        stats.clone(),
-        modified_times.clone(),
-        |file_tx| async move {
-            let mut producer_failure: Option<ResetError> = None;
-            let repository_root = match producer_repository.require_path() {
-                Ok(p) => p.to_path_buf(),
-                Err(e) => return Some(ResetError::from(e)),
-            };
-            for path in paths.as_slice().iter() {
-                let Ok(relative_path) =
-                    RelativePath::new_from_user_path(repository_root.as_path(), path.as_str())
-                else {
-                    emit_path_ignore(path.as_str()).await;
-                    lore_trace!("Ignoring invalid path: {path}");
-                    continue;
-                };
-
-                lore_debug!(
-                    "User path [{}] transformed to relative path [{}] in repository {}",
-                    path.as_str(),
-                    relative_path.as_str(),
-                    producer_repository.path_for_display()
-                );
-
-                // Resolve the revision to reset to. First find that start state where the node exist.
-                // Then iterate file history from that point backwards and find the last merge point
-                // from the given branch.
-                let target_result = resolve_last_merged_target(
-                    producer_repository.clone(),
-                    state_current.clone(),
-                    branch_id,
+    // One operation covers the whole reset, as it does for a reset to a named revision.
+    let result = with_operation(repository.file_system(), true, async |operation| {
+        let producer_operation = operation.clone();
+        let walked = run_reset_pipeline(operation.clone(), stats.clone(), |file_tx| async move {
+            reset_walk_each_path(ResetWalk {
+                operation: producer_operation,
+                repository: producer_repository,
+                target: ResetTarget::LastMergedFrom {
+                    state_current,
+                    branch: branch_id,
                     branch_point,
-                    &relative_path,
-                )
-                .await;
-
-                let state_target = match target_result {
-                    Ok(state) => state,
-                    Err(err) => {
-                        producer_failure = wrap_path_error(
-                            producer_repository.clone(),
-                            &relative_path,
-                            path.as_str(),
-                            err,
-                        )
-                        .await
-                        .err();
-                        break;
-                    }
-                };
-
-                let walk_result = reset_walk_path(
-                    ResetContext {
-                        repository: producer_repository.clone(),
-                        state_target,
-                        state_staged: state_staged.clone(),
-                        options,
-                        stats: producer_stats.clone(),
-                        file_tx: file_tx.clone(),
-                    },
-                    relative_path.clone(),
-                )
-                .await;
-
-                if let Err(err) = walk_result {
-                    producer_failure = wrap_path_error(
-                        producer_repository.clone(),
-                        &relative_path,
-                        path.as_str(),
-                        err,
-                    )
-                    .await
-                    .err();
-                    break;
-                }
-            }
-            producer_failure
-        },
-    )
+                },
+                state_staged,
+                paths,
+                options,
+                stats: producer_stats,
+                file_tx,
+            })
+            .await
+        })
+        .await;
+        modified_times.absorb(operation.take_modified_times());
+        walked
+    })
     .await;
 
     event::LoreEvent::FileResetEnd(LoreFileResetEndEventData {
@@ -802,8 +829,8 @@ async fn resolve_last_merged_target(
 /// `file_inflight` semaphore. A ticker emits progress events at 1Hz until
 /// both halves complete.
 async fn run_reset_pipeline<P, Fut>(
+    operation: Arc<InstanceOperationImpl>,
     stats: Arc<ResetStats>,
-    modified_times: Arc<crate::state::RecordedModifiedTimes>,
     producer: P,
 ) -> Result<(), ResetError>
 where
@@ -813,11 +840,8 @@ where
     let (file_tx, file_rx) = mpsc::channel::<ResetFileWorkItem>(DEFAULT_WORK_CHANNEL_CAPACITY);
 
     let consumer_stats = stats.clone();
-    let consumer_times = modified_times.clone();
     let mut consumer =
-        lore_spawn!(
-            async move { reset_file_consume(file_rx, consumer_stats, consumer_times).await }
-        );
+        lore_spawn!(async move { reset_file_consume(operation, file_rx, consumer_stats).await });
 
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
 
@@ -974,6 +998,7 @@ fn reset_walk_directory_recurse(
 /// recurse via the same scheme.
 async fn reset_walk_path(ctx: ResetContext, relative_path: RelativePath) -> Result<(), ResetError> {
     let ResetContext {
+        operation,
         repository,
         state_target,
         state_staged,
@@ -994,7 +1019,8 @@ async fn reset_walk_path(ctx: ResetContext, relative_path: RelativePath) -> Resu
         relative_path
     } else {
         let repository_path = repository.require_path()?;
-        let resolved = util::fs::filesystem_path(repository_path, &relative_path, None).await;
+        let resolved =
+            util::fs::filesystem_path(&operation, repository_path, &relative_path, None).await;
         resolved.unwrap_or(relative_path)
     };
 
@@ -1012,6 +1038,7 @@ async fn reset_walk_path(ctx: ResetContext, relative_path: RelativePath) -> Resu
 
         return reset_walk_directory(
             ResetContext {
+                operation: operation.clone(),
                 repository,
                 state_target,
                 state_staged,
@@ -1061,6 +1088,7 @@ async fn reset_walk_path(ctx: ResetContext, relative_path: RelativePath) -> Resu
 
             reset_walk_node(
                 ResetContext {
+                    operation: operation.clone(),
                     repository: target_repository,
                     state_target: target_state_current,
                     state_staged: current_state_staged,
@@ -1210,6 +1238,7 @@ async fn reset_walk_node(
     parent_states: FilterStates,
 ) -> Result<(), ResetError> {
     let ResetContext {
+        operation,
         repository,
         state_target,
         state_staged,
@@ -1327,6 +1356,7 @@ async fn reset_walk_node(
 
         return reset_walk_directory_recurse(
             ResetContext {
+                operation: operation.clone(),
                 repository: linked_repository,
                 state_target: linked_state_current,
                 state_staged: linked_state_staged,
@@ -1352,6 +1382,7 @@ async fn reset_walk_node(
 
         return reset_walk_directory_recurse(
             ResetContext {
+                operation: operation.clone(),
                 repository,
                 state_target,
                 state_staged,
@@ -1397,6 +1428,7 @@ async fn reset_walk_directory(
     states: FilterStates,
 ) -> Result<(), ResetError> {
     let ResetContext {
+        operation,
         repository,
         state_target,
         state_staged,
@@ -1477,6 +1509,7 @@ async fn reset_walk_directory(
             let inflight = stats.directory_inflight.fetch_add(1, Ordering::Relaxed);
 
             let task_ctx = ResetContext {
+                operation: operation.clone(),
                 repository: repository.clone(),
                 state_target: state_target.clone(),
                 state_staged: state_staged.clone(),
@@ -1517,6 +1550,7 @@ async fn reset_walk_directory(
             // File / other leaf: walking is cheap (filter + staged + push to channel).
             let result = reset_walk_node(
                 ResetContext {
+                    operation: operation.clone(),
                     repository: repository.clone(),
                     state_target: state_target.clone(),
                     state_staged: state_staged.clone(),
@@ -1633,9 +1667,9 @@ async fn reset_walk_directory(
 /// loop and ultimately the directory walker producing the items. Permits
 /// grow with queue backlog up to `RESET_FILE_MAX`, mirroring clone.
 async fn reset_file_consume(
+    operation: Arc<InstanceOperationImpl>,
     mut rx: mpsc::Receiver<ResetFileWorkItem>,
     stats: Arc<ResetStats>,
-    modified_times: Arc<crate::state::RecordedModifiedTimes>,
 ) -> Result<(), ResetError> {
     let mut tasks: JoinSet<Result<(), ResetError>> = JoinSet::new();
     let mut current_permits = stats.file_inflight.available_permits();
@@ -1655,13 +1689,13 @@ async fn reset_file_consume(
             .expect("file_inflight semaphore closed unexpectedly");
 
         let task_stats = stats.clone();
-        let task_times = modified_times.clone();
+        let task_operation = operation.clone();
         lore_spawn!(tasks, async move {
             let _permit = permit;
             task_stats
                 .file_inflight_count
                 .fetch_add(1, Ordering::Relaxed);
-            let result = reset_file_realize(item, task_stats.clone(), task_times).await;
+            let result = reset_file_realize(task_operation, item, task_stats.clone()).await;
             task_stats
                 .file_inflight_count
                 .fetch_sub(1, Ordering::Relaxed);
@@ -1697,12 +1731,12 @@ async fn reset_file_consume(
 }
 
 /// Per-file reset work: stat, modified-check (vs. node hash), case-rename if
-/// needed, otherwise realize via `sync::realize_file`. Filter and staged
+/// needed, otherwise realize through the operation the reset holds. Filter and staged
 /// checks were already done by the walker.
 async fn reset_file_realize(
+    operation: Arc<InstanceOperationImpl>,
     item: ResetFileWorkItem,
     stats: Arc<ResetStats>,
-    modified_times: Arc<crate::state::RecordedModifiedTimes>,
 ) -> Result<(), ResetError> {
     let ResetFileWorkItem {
         repository,
@@ -1713,8 +1747,10 @@ async fn reset_file_realize(
         node,
     } = item;
 
-    let node_path = relative_path.to_absolute_path(repository.require_path()?);
-    let metadata = lore_io::IoDriver::global().metadata(&node_path).await;
+    let node_path = RepositoryPath::from_relative(&repository, relative_path.clone())?;
+    let metadata = lore_io::IoDriver::global()
+        .metadata(node_path.absolute())
+        .await;
 
     let force = execution_context().globals().force();
 
@@ -1763,7 +1799,7 @@ async fn reset_file_realize(
                 .send();
 
                 let to_path = to_path.to_absolute_path(repository.require_path()?);
-                util::fs::unify_name_case_rename(node_path.as_path(), to_path.as_path())
+                util::fs::unify_name_case_rename(node_path.absolute(), to_path.as_path())
                     .await
                     .internal("Failed renaming file")?;
             } else {
@@ -1794,15 +1830,13 @@ async fn reset_file_realize(
     })
     .send();
 
-    sync::realize_file(
+    crate::fs::realize::realize_file(
         repository.clone(),
-        relative_path,
+        operation,
+        &node_path,
         node,
         Arc::new(SyncRealizeStats::default()),
-        &modified_times,
     )
     .await
-    .forward::<ResetError>("Unable to restore path to selected state")?;
-
-    Ok(())
+    .forward::<ResetError>("Unable to restore path to selected state")
 }

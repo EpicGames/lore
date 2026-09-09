@@ -27,6 +27,8 @@ use crate::event::EventError;
 use crate::filter::Filter;
 use crate::filter::FilterMode;
 use crate::find;
+use crate::fs::filesystem_provider::InstanceOperationImpl;
+use crate::fs::filesystem_provider::with_operation;
 use crate::infer;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
@@ -1885,6 +1887,232 @@ async fn apply_graft_copy(
     Ok(counts.touched())
 }
 
+/// Check every path the diff touches against the working copy, refusing the merge where a
+/// local modification would be overwritten.
+///
+/// The conflicts are checked after the changes, so the failure reported is the earliest one
+/// the merge would have hit.
+async fn verify_diff_against_filesystem(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    state_current: &Arc<State>,
+    changes: &Arc<Vec<NodeChange>>,
+    conflicts: &Arc<Vec<(NodeChange, NodeChange)>>,
+    merge_type: MergeType,
+) -> Result<(), MergeError> {
+    verify_changes_against_filesystem(
+        operation,
+        repository,
+        state_current,
+        changes.iter(),
+        merge_type,
+    )
+    .await?;
+    verify_changes_against_filesystem(
+        operation,
+        repository,
+        state_current,
+        conflicts.iter().map(|(_, change_to)| change_to),
+        merge_type,
+    )
+    .await?;
+    lore_debug!("File system verification complete");
+    Ok(())
+}
+
+/// Verify one set of changes, reporting the first failure once every task in flight has
+/// drained: a task is reading the working copy and has to finish reading it.
+async fn verify_changes_against_filesystem<'a>(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    state_current: &Arc<State>,
+    changes: impl Iterator<Item = &'a NodeChange>,
+    merge_type: MergeType,
+) -> Result<(), MergeError> {
+    fn collect(
+        joined: Result<Result<Option<NodeChange>, MergeError>, tokio::task::JoinError>,
+        failure: &mut Option<MergeError>,
+    ) {
+        let result = joined
+            .map_err(|e| MergeError::internal_with_context(e, "task failure"))
+            .and_then(|result| result);
+        if let Err(err) = result {
+            *failure = failure.take().or(Some(err));
+        }
+    }
+
+    let stats = Arc::new(sync::SyncVerifyStats::default());
+    let mut tasks = JoinSet::new();
+    let mut failure = None;
+    for change in changes {
+        lore_spawn!(tasks, {
+            let stats = stats.clone();
+            let change = change.clone();
+            let repository = repository.clone();
+            let operation = operation.clone();
+            let state_current = state_current.clone();
+            async move {
+                let no_forward_changes = matches!(merge_type, MergeType::CherryPick);
+                let no_force_hash_check = false;
+                Box::pin(crate::fs::realize::verify_filesystem(
+                    change,
+                    repository,
+                    operation,
+                    state_current,
+                    no_forward_changes,
+                    no_force_hash_check,
+                    stats,
+                    FilterMode::Full,
+                ))
+                .await
+                .forward::<MergeError>("verifying filesystem for change")
+            }
+        });
+        while tasks.len() > MAX_CONCURRENT_TREE_TASKS
+            && let Some(joined) = tasks.join_next().await
+        {
+            collect(joined, &mut failure);
+        }
+    }
+    while let Some(joined) = tasks.join_next().await {
+        collect(joined, &mut failure);
+    }
+    match failure {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// Copy the subtrees the target branch never touched into the staged tree.
+///
+/// Node operations only, the filter playing no part, and the subtrees sit at disjoint paths
+/// so they need no ordering between them.
+async fn apply_diff_grafts(
+    repository: &Arc<RepositoryContext>,
+    state_staged: &Arc<State>,
+    grafts: &[NodeChange],
+) -> Result<(), MergeError> {
+    if grafts.is_empty() {
+        return Ok(());
+    }
+
+    let graft_repository = full_tree_context(repository);
+    let mut graft_tasks = JoinSet::new();
+    for graft in grafts.iter() {
+        let graft_repository = graft_repository.clone();
+        let state_staged = state_staged.clone();
+        let graft = graft.clone();
+        lore_spawn!(graft_tasks, async move {
+            apply_graft_copy(graft_repository, state_staged, &graft).await
+        });
+    }
+
+    let mut adopted_nodes = 0usize;
+    let mut graft_failure = None;
+    while let Some(joined) = graft_tasks.join_next().await {
+        match joined
+            .internal("Graft task failed")
+            .map_err(MergeError::from)
+        {
+            Ok(Ok(nodes)) => adopted_nodes += nodes,
+            Ok(Err(err)) | Err(err) => graft_failure = graft_failure.or(Some(err)),
+        }
+    }
+    if let Some(err) = graft_failure {
+        return Err(err);
+    }
+
+    lore_info!(
+        "Grafted {} out-of-view subtrees, {} nodes touched",
+        grafts.len(),
+        adopted_nodes
+    );
+    Ok(())
+}
+
+/// Write each conflicting path back to the version the merge started from, which is what
+/// leaves the three sides in place for the three-way merge that follows.
+async fn restart_reset_conflicts(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    conflicts: &[(NodeChange, NodeChange)],
+    dry_run: bool,
+) -> Result<(), MergeError> {
+    if conflicts.is_empty() {
+        return Ok(());
+    }
+
+    let changes = conflicts.iter().map(|tuple| tuple.1.clone()).collect();
+    crate::fs::realize::realize_changes(
+        repository.clone(),
+        operation.clone(),
+        Arc::new(changes),
+        None,
+        dry_run,
+        false, /* is merge */
+        Arc::new(sync::SyncRealizeStats::default()),
+    )
+    .await
+    .forward::<MergeError>("realizing reset changes")
+}
+
+/// What realizing a diff writes with: the trees the three-way merge reads and the staged
+/// tree it records into.
+struct RealizeDiff<'a> {
+    operation: &'a Arc<InstanceOperationImpl>,
+    repository: &'a Arc<RepositoryContext>,
+    state_staged: &'a Arc<State>,
+    state_base: &'a Arc<State>,
+    state_from: &'a Arc<State>,
+    state_to: &'a Arc<State>,
+    changes: &'a Arc<Vec<NodeChange>>,
+    conflicts: &'a Arc<Vec<(NodeChange, NodeChange)>>,
+    merge_type: MergeType,
+    stats: &'a Arc<sync::SyncRealizeStats>,
+    /// Record the changes in the staged tree without writing the working copy, which a dry
+    /// run asks for and a linked context requires.
+    skip_filesystem: bool,
+}
+
+/// Write the diff over the working copy, non-conflicting changes first so a conflict's
+/// siblings land beside content already in place.
+///
+/// The times the writes land with are dropped: a merge leaves a staged tree rather than the
+/// current revision, so nothing they would vouch for holds yet.
+async fn realize_diff_over_filesystem(args: RealizeDiff<'_>) -> Result<(), MergeError> {
+    crate::fs::realize::realize_changes(
+        args.repository.clone(),
+        args.operation.clone(),
+        args.changes.clone(),
+        Some(args.state_staged.clone()),
+        args.skip_filesystem,
+        true, /* is merge */
+        args.stats.clone(),
+    )
+    .await
+    .forward::<MergeError>("realizing non-conflict changes")?;
+    lore_debug!("Realized non-conflict changes");
+
+    crate::fs::realize::realize_conflicts(
+        args.repository.clone(),
+        args.operation.clone(),
+        args.state_base.clone(),
+        args.state_from.clone(),
+        args.state_to.clone(),
+        Some(args.state_staged.clone()),
+        args.conflicts.clone(),
+        args.skip_filesystem,
+        args.stats.clone(),
+        args.merge_type,
+    )
+    .await
+    .forward::<MergeError>("realizing conflict changes")?;
+    lore_debug!("Realized conflict changes");
+
+    args.operation.take_modified_times().discard();
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn apply_diff(
     repository: Arc<RepositoryContext>,
@@ -1940,9 +2168,6 @@ pub async fn apply_diff(
         .extract_if(.., |change| change.action == FileAction::Graft)
         .collect();
 
-    let stats = Arc::new(sync::SyncVerifyStats::default());
-    let mut changes = vec![];
-
     let state_from = state::State::deserialize(repository.clone(), diff.source)
         .await
         .forward::<MergeError>("deserializing diff source state")?;
@@ -1953,147 +2178,10 @@ pub async fn apply_diff(
         .await
         .forward::<MergeError>("deserializing diff base state")?;
 
-    let mut tasks = JoinSet::new();
-    let mut failure = None;
-    for change in diff.changes.iter() {
-        lore_spawn!(tasks, {
-            let stats = stats.clone();
-            let change = change.clone();
-            let repository = repository.clone();
-            let state_current = state_current.clone();
-            async move {
-                let no_forward_changes = matches!(merge_type, MergeType::CherryPick);
-                let no_force_hash_check = false;
-                Box::pin(sync::verify_filesystem(
-                    change,
-                    repository,
-                    state_current,
-                    no_forward_changes,
-                    no_force_hash_check,
-                    stats,
-                    FilterMode::Full,
-                ))
-                .await
-                .forward::<MergeError>("verifying filesystem for change")
-            }
-        });
-        while tasks.len() > MAX_CONCURRENT_TREE_TASKS
-            && let Some(result) = tasks.join_next().await
-        {
-            let result = result
-                .map_err(|e| MergeError::internal_with_context(e, "task failure"))
-                .and_then(|r| r);
-            match result {
-                Ok(Some(change)) => {
-                    changes.push(change);
-                }
-                _ => {
-                    failure = failure.or(result.err());
-                }
-            }
-        }
-    }
-    // Wait for the remaining tasks
-    while let Some(result) = tasks.join_next().await {
-        let result = result
-            .map_err(|e| MergeError::internal_with_context(e, "task failure"))
-            .and_then(|r| r);
-        match result {
-            Ok(Some(change)) => {
-                changes.push(change);
-            }
-            _ => {
-                failure = failure.or(result.err());
-            }
-        }
-    }
-    if let Some(err) = failure {
-        return Err(err);
-    }
-
-    for conflict in diff.conflicts.iter() {
-        let (_, change_to) = &conflict;
-        lore_spawn!(tasks, {
-            let change_to = change_to.clone();
-            let stats = stats.clone();
-            let repository = repository.clone();
-            let state_current = state_current.clone();
-            async move {
-                let no_forward_changes = matches!(merge_type, MergeType::CherryPick);
-                let no_force_hash_check = false;
-                Box::pin(sync::verify_filesystem(
-                    change_to,
-                    repository,
-                    state_current,
-                    no_forward_changes,
-                    no_force_hash_check,
-                    stats,
-                    FilterMode::Full,
-                ))
-                .await
-                .forward::<MergeError>("verifying filesystem for conflict")
-            }
-        });
-        while tasks.len() > MAX_CONCURRENT_TREE_TASKS
-            && let Some(result) = tasks.join_next().await
-        {
-            let result = result
-                .map_err(|e| MergeError::internal_with_context(e, "task failure"))
-                .and_then(|r| r);
-            failure = failure.or(result.err());
-        }
-    }
-    // Wait for the remaining tasks
-    while let Some(result) = tasks.join_next().await {
-        let result = result
-            .map_err(|e| MergeError::internal_with_context(e, "task failure"))
-            .and_then(|r| r);
-        failure = failure.or(result.err());
-    }
-    if let Some(err) = failure {
-        return Err(err);
-    }
-
-    lore_debug!("File system verification complete");
-
     // Prepare the merged staged state
     let state_staged = state::State::deserialize(repository.clone(), diff.target)
         .await
         .forward::<MergeError>("deserializing target state for staging")?;
-
-    if !grafts.is_empty() {
-        // Node operations only; the filter plays no part here.
-        let graft_repository = full_tree_context(&repository);
-        // Grafted subtrees sit at disjoint paths, so they need no ordering.
-        let mut graft_tasks = JoinSet::new();
-        for graft in grafts.iter() {
-            let graft_repository = graft_repository.clone();
-            let state_staged = state_staged.clone();
-            let graft = graft.clone();
-            lore_spawn!(graft_tasks, async move {
-                apply_graft_copy(graft_repository, state_staged, &graft).await
-            });
-        }
-        let mut adopted_nodes = 0usize;
-        let mut graft_failure = None;
-        while let Some(joined) = graft_tasks.join_next().await {
-            match joined
-                .internal("Graft task failed")
-                .map_err(MergeError::from)
-            {
-                Ok(Ok(nodes)) => adopted_nodes += nodes,
-                Ok(Err(err)) | Err(err) => graft_failure = graft_failure.or(Some(err)),
-            }
-        }
-        if let Some(err) = graft_failure {
-            return Err(err);
-        }
-        lore_info!(
-            "Grafted {} out-of-view subtrees, {} nodes touched",
-            grafts.len(),
-            adopted_nodes
-        );
-    }
 
     // When applying a diff to a linked repository context, skip filesystem
     // realization. The link's repository context shares `path` with the parent,
@@ -2110,39 +2198,41 @@ pub async fn apply_diff(
     // diff paths are link-root-relative.
     let stats = Arc::new(sync::SyncRealizeStats::default());
     let changes = Arc::new(diff.changes);
-
-    link::check_incoming_mount_overlaps(repository.clone(), &state_current, &changes)
-        .await
-        .forward::<MergeError>("checking incoming link source paths")?;
-
-    let dry_run = execution_context().globals().dry_run();
-    sync::realize_changes(
-        repository.clone(),
-        changes.clone(),
-        Some(state_staged.clone()),
-        dry_run || skip_filesystem,
-        true, /* is merge */
-        stats.clone(),
-    )
-    .await
-    .forward::<MergeError>("realizing non-conflict changes")?;
-    lore_debug!("Realized non-conflict changes");
-
     let conflicts = Arc::new(diff.conflicts);
-    sync::realize_conflicts(
-        repository.clone(),
-        state_base.clone(),
-        state_from.clone(),
-        state_to.clone(),
-        Some(state_staged.clone()),
-        conflicts.clone(),
-        dry_run || skip_filesystem,
-        stats.clone(),
-        merge_type,
-    )
-    .await
-    .forward::<MergeError>("realizing conflict changes")?;
-    lore_debug!("Realized conflict changes");
+    let dry_run = execution_context().globals().dry_run();
+
+    // One operation covers the whole diff: every path it verifies and realizes is in the
+    // same filesystem, and one opened per change would freeze and thaw it once per file.
+    with_operation(repository.file_system(), true, async |operation| {
+        verify_diff_against_filesystem(
+            &operation,
+            &repository,
+            &state_current,
+            &changes,
+            &conflicts,
+            merge_type,
+        )
+        .await?;
+        apply_diff_grafts(&repository, &state_staged, &grafts).await?;
+        link::check_incoming_mount_overlaps(repository.clone(), &state_current, &changes)
+            .await
+            .forward::<MergeError>("checking incoming link source paths")?;
+        realize_diff_over_filesystem(RealizeDiff {
+            operation: &operation,
+            repository: &repository,
+            state_staged: &state_staged,
+            state_base: &state_base,
+            state_from: &state_from,
+            state_to: &state_to,
+            changes: &changes,
+            conflicts: &conflicts,
+            merge_type,
+            stats: &stats,
+            skip_filesystem: dry_run || skip_filesystem,
+        })
+        .await
+    })
+    .await?;
 
     event::LoreEvent::RevisionSyncProgress(LoreRevisionSyncProgressEventData::new(&stats)).send();
 
@@ -2997,51 +3087,29 @@ pub async fn apply_restart_diff(
             .await
             .forward::<MergeError>("deserializing diff base state")?;
 
-        // Reset conflicts to the original version to facilitate 3-way merge later
-        if !conflicts.is_empty() {
-            let changes = conflicts.iter().map(|tuple| tuple.1.clone()).collect();
-
-            let stats = Arc::new(sync::SyncRealizeStats::default());
-            sync::realize_changes(
-                repository.clone(),
-                Arc::new(changes),
-                None,
-                dry_run,
-                false, /* is merge */
-                stats,
-            )
-            .await
-            .forward::<MergeError>("realizing reset changes")?;
-        }
-
-        // Perform all changes
         let stats = Arc::new(sync::SyncRealizeStats::default());
-        sync::realize_changes(
-            repository.clone(),
-            Arc::new(changes),
-            Some(state_staged.clone()),
-            dry_run,
-            true, /* is merge */
-            stats.clone(),
-        )
-        .await
-        .forward::<MergeError>("realizing non-conflict changes")?;
-        lore_debug!("Realized non-conflict changes");
+        let changes = Arc::new(changes);
+        let conflicts = Arc::new(conflicts);
 
-        sync::realize_conflicts(
-            repository.clone(),
-            state_base.clone(),
-            state_from.clone(),
-            state_to.clone(),
-            Some(state_staged.clone()),
-            Arc::new(conflicts),
-            dry_run,
-            stats.clone(),
-            merge_type,
-        )
-        .await
-        .forward::<MergeError>("realizing conflict changes")?;
-        lore_debug!("Realized conflict changes");
+        // One operation covers the restart, as it covers a whole diff application.
+        with_operation(repository.file_system(), true, async |operation| {
+            restart_reset_conflicts(&operation, &repository, &conflicts, dry_run).await?;
+            realize_diff_over_filesystem(RealizeDiff {
+                operation: &operation,
+                repository: &repository,
+                state_staged: &state_staged,
+                state_base: &state_base,
+                state_from: &state_from,
+                state_to: &state_to,
+                changes: &changes,
+                conflicts: &conflicts,
+                merge_type,
+                stats: &stats,
+                skip_filesystem: dry_run,
+            })
+            .await
+        })
+        .await?;
 
         if !dry_run {
             let signature = state_staged

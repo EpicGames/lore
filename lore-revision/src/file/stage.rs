@@ -312,6 +312,34 @@ impl StageWalk {
     }
 }
 
+/// Resolve the case of every directory the targets share once, so no target under them
+/// resolves it again.
+///
+/// Nothing is resolved under `Keep`, which stages by renaming the file system to match the
+/// tree: the first such rename would leave the map naming a directory that is no longer
+/// there.
+async fn resolve_shared_prefixes(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: &Arc<RepositoryContext>,
+    shared_ancestors: &[DepthPath],
+    options: StageOptions,
+) -> Result<Option<Arc<crate::util::fs::ResolvedPrefixes>>, StageError> {
+    if matches!(options.case_change, stage::StageCaseChange::Keep) {
+        return Ok(None);
+    }
+
+    let prefixes = Arc::new(
+        crate::util::fs::resolve_prefixes(operation, repository.require_path()?, shared_ancestors)
+            .await,
+    );
+    lore_debug!(
+        "Resolved {} of {} shared ancestor prefixes",
+        prefixes.len(),
+        shared_ancestors.len()
+    );
+    Ok(Some(prefixes))
+}
+
 /// Create the node for every directory the targets share, a depth level at a time.
 ///
 /// A level's nodes are the next level's parents, so each level is drained before the
@@ -603,24 +631,6 @@ pub async fn stage(
     let shared_ancestors = shared_ancestors(&antichain);
     let precreate_count = shared_ancestors.len();
 
-    // Resolve the case of those directories once, so no target under them
-    // resolves them again. Not under `Keep`, which stages by renaming the file
-    // system to match the tree - the first such rename would leave the map
-    // naming a directory that is no longer there.
-    let prefixes = if matches!(options.case_change, stage::StageCaseChange::Keep) {
-        None
-    } else {
-        let prefixes = Arc::new(
-            crate::util::fs::resolve_prefixes(repository.require_path()?, &shared_ancestors).await,
-        );
-        lore_debug!(
-            "Resolved {} of {} shared ancestor prefixes",
-            prefixes.len(),
-            precreate_count
-        );
-        Some(prefixes)
-    };
-
     let main_count = antichain_len + precreate_count;
     // A layer may be targeted by several paths; serialize each only once.
     let staged_layers: std::collections::BTreeSet<usize> = layer_paths
@@ -632,13 +642,14 @@ pub async fn stage(
     // is a subtree of the same filesystem and takes the operation its parent holds.
     with_operation(repository.file_system(), true, async |operation| {
         let walk = StageWalk {
+            prefixes: resolve_shared_prefixes(&operation, &repository, &shared_ancestors, options)
+                .await?,
             operation,
             repository: repository.clone(),
             state: state.clone(),
             stats: stats.clone(),
             link_tracker: link_tracker.clone(),
             global_mask: global_mask.clone(),
-            prefixes: prefixes.clone(),
             options,
             repository_root: repository.require_path()?.to_path_buf(),
         };
