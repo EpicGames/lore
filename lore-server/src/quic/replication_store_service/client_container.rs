@@ -45,6 +45,7 @@ pub struct QuicClientFactory {
     pub transport_config: TransportConfig,
     pub quic_max_reconnects: Option<u32>,
     pub sni_override: Option<String>,
+    pub user_agent: Option<String>,
 }
 
 impl QuicClientFactory {
@@ -64,6 +65,7 @@ impl QuicClientFactory {
             },
             quic_max_reconnects: None,
             sni_override: None,
+            user_agent: None,
         }
     }
 }
@@ -85,7 +87,7 @@ impl ClientFactory for QuicClientFactory {
             transport_config,
             self.command_behavior.clone(),
             self.quic_max_reconnects,
-            None,
+            self.user_agent.clone(),
         )
         .await?;
         Ok(client)

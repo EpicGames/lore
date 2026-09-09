@@ -16,9 +16,11 @@ use lore_revision::store::composite::ReplicationTarget;
 use lore_revision::store::composite::replica_factory::ReplicaFactory;
 use lore_revision::store::composite::replica_factory::ReplicaTargets;
 use lore_revision::util::time::RetryPolicy;
+use lore_transport::make_user_agent_with_component;
 use lore_transport::quic::client::CertificateSettings as QuicCertificateSettings;
 use lore_transport::quic::client::CongestionAlgorithm;
 use lore_transport::quic::client::DEFAULT_EXPECTED_RTT_MS;
+use lore_transport::user_agent_product;
 use opentelemetry::KeyValue;
 use serde::Deserialize;
 use smallvec::smallvec;
@@ -157,7 +159,7 @@ impl ReplicationStoreTargetFactory {
             None
         };
 
-        let (rtt_ms, congestion_algorithm) = match peer_info.locality {
+        let (rtt_ms, congestion_algorithm, user_agent_component) = match peer_info.locality {
             // Communication within a region will have no packet loss
             // so we don't need to worry about Cubic's aggressive ramp down
             // of cwnd in the event of packet loss - we don't see it happening.
@@ -165,14 +167,18 @@ impl ReplicationStoreTargetFactory {
             // packet loss. So quiet periods of time don't inadvertently scale down
             // the cwnd then get blindsided by a large get/put message causing latency spikes.
             // We want same region replication to be as fast as possible
-            Locality::SameRegion => (10, CongestionAlgorithm::Cubic),
+            Locality::SameRegion => (10, CongestionAlgorithm::Cubic, "replication-same-region"),
             // todo(plockhart) configure expected_rtt_ms based off latency to replication target
             //
             // We see packet loss in cross region communication. Bbr readjusts the cwnd within
             // a few cycles of RTT, much faster than Cubic at recoverying from packet loss, at
             // the expensive that periodically the internals of the algorithm ramp down cwnd
             // based off bandwidth usage (which means quiet periods inadvertently reduce cwnd)
-            Locality::OtherRegion => (DEFAULT_EXPECTED_RTT_MS, CongestionAlgorithm::Bbr),
+            Locality::OtherRegion => (
+                DEFAULT_EXPECTED_RTT_MS,
+                CongestionAlgorithm::Bbr,
+                "replication-other-region",
+            ),
         };
 
         let mut factory =
@@ -183,6 +189,10 @@ impl ReplicationStoreTargetFactory {
         factory.sni_override = sni_override;
         factory.transport_config.expected_rtt_ms = rtt_ms;
         factory.transport_config.congestion_algorithm = congestion_algorithm;
+        factory.user_agent = Some(make_user_agent_with_component(
+            user_agent_product(),
+            user_agent_component,
+        ));
 
         let container_config = ClientContainerConfig {
             regenerate_retry_policy: RetryPolicy::builder()
