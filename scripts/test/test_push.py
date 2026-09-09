@@ -4,6 +4,7 @@ import logging
 import os
 
 import pytest
+from lore_parsers import parse_push_stats_json, parse_revision_list_json
 
 from lore import Lore
 
@@ -424,3 +425,285 @@ def test_push_non_current_branch_preserves_anchor(new_lore_repo):
         f"got {branch_c_branch_point} "
         f"(matches branch-a's leaked head: {branch_c_branch_point == branch_a_head})"
     )
+
+
+_OFFLINE_FILE = "offline.txt"
+
+
+def _revision_info(repo: Lore, revision: str | None = None, **kwargs) -> dict:
+    """The one revision a `revision info` reports, with the metadata keys it records."""
+    revisions = parse_revision_list_json(
+        repo.revision_info(revision, json=True, **kwargs)
+    )
+    assert len(revisions) == 1, (
+        f"revision info reported {len(revisions)} revision(s) for {revision}"
+    )
+    return revisions[0]
+
+
+def _offline_line_against_an_advancing_remote(repo: Lore) -> tuple[Lore, list[str]]:
+    """Leave a clone holding three revisions committed offline while the remote moved on
+    two revisions underneath it, and answer with that clone and the signatures it
+    committed.
+
+    The signatures have to be captured as they are made. Whichever way the two lines are
+    joined, the merge reaches the offline ones through its second parent, which the
+    history walk does not follow, so afterwards there is nowhere to read them back from.
+    """
+    offline = repo.clone()
+    advancing = repo.clone()
+
+    offline_revisions = []
+    for index in range(3):
+        with offline.open_file(_OFFLINE_FILE, "w+") as output_file:
+            output_file.write(f"offline change {index}\n")
+        offline.stage(_OFFLINE_FILE, offline=True)
+        offline.commit(f"Offline commit {index}", offline=True)
+        offline_revisions.append(_revision_info(offline, offline=True)["revision"])
+
+    for index in range(2):
+        with advancing.open_file("advancing.txt", "w+") as output_file:
+            output_file.write(f"remote change {index}\n")
+        advancing.stage("advancing.txt", offline=True)
+        advancing.commit(f"Remote commit {index}", offline=True)
+        advancing.push()
+
+    return offline, offline_revisions
+
+
+def _assert_offline_line_is_readable(
+    reader: Lore, offline_revisions: list[str]
+) -> None:
+    """Every revision of the offline line has to be readable from a clone that has only
+    ever talked to the server.
+
+    The signature alone does not tell whether it arrived: a revision whose metadata blob
+    never reached the peer still reports its signature and its parent. So this reads the
+    branch, timestamp and message, which come from that blob, and then syncs to each
+    revision, which needs its tree.
+    """
+    for index, revision in enumerate(offline_revisions):
+        info = _revision_info(reader, revision)
+        assert info["revision"] == revision, (
+            f"revision info reported {info['revision']} for {revision}"
+        )
+        assert info["metadata"].get("branch"), f"revision {revision} reports no branch"
+        assert info["metadata"].get("timestamp"), (
+            f"revision {revision} reports no timestamp"
+        )
+        assert info["metadata"].get("message") == f"Offline commit {index}", (
+            f"revision {revision} reports message {info['metadata'].get('message')!r}"
+        )
+
+    for index, revision in enumerate(offline_revisions):
+        reader.sync(revision)
+        with reader.open_file(_OFFLINE_FILE, "r") as input_file:
+            assert input_file.read() == f"offline change {index}\n", (
+                f"revision {revision} realized the wrong content"
+            )
+
+
+@pytest.mark.smoke
+def test_push_uploads_the_line_a_sync_merged(new_lore_repo):
+    """A line committed offline reaches the peer only through the merge a later sync
+    builds, which names it as its second parent instead of putting it on the branch
+    history a push walks. An online commit uploads what it writes as it writes it, so it
+    is the offline case that leaves the whole line to the push, and nothing else uploads
+    it.
+    """
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Shared base", {"shared.txt": ["base\n"]})
+
+    offline, offline_revisions = _offline_line_against_an_advancing_remote(repo)
+
+    offline.sync()
+    offline.push()
+
+    _assert_offline_line_is_readable(repo.clone(), offline_revisions)
+
+
+@pytest.mark.smoke
+def test_push_uploads_the_line_a_server_merge_joined(new_lore_repo):
+    """The same offline line, joined the other way: rather than a sync building the merge
+    locally, the push hands the line to the server and the server merges.
+
+    Nothing merged the line before it was pushed, so it arrives as the branch history the
+    push walks from the local latest, and the merge naming it is one the server builds
+    afterwards. That is a route of its own rather than the one a line reached only through
+    a merge takes, and what it has to leave behind is the same: every revision of the line
+    readable from a clone that has only ever talked to the server.
+    """
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Shared base", {"shared.txt": ["base\n"]})
+
+    offline, offline_revisions = _offline_line_against_an_advancing_remote(repo)
+
+    offline.push(fast_forward_merge=True)
+
+    reader = repo.clone()
+
+    # What followed the merge the server made was rebased onto it and answers to a new
+    # signature, so the line is picked back up off the branch history, oldest first
+    history = parse_revision_list_json(reader.history(json=True))
+    landed = [
+        info["revision"]
+        for info in reversed(history)
+        if info["metadata"].get("message", "").startswith("Offline commit ")
+    ]
+    assert len(landed) == 3, f"the offline line landed as {len(landed)} revision(s)"
+
+    _assert_offline_line_is_readable(reader, landed)
+
+    # The revision the server merged in kept the signature it was committed with, and is
+    # reachable only through the second parent of that merge — where a sync leaves the
+    # whole line
+    merged_in = _revision_info(reader, offline_revisions[0])
+    assert merged_in["metadata"].get("message") == "Offline commit 0", (
+        f"the merged-in revision reports message {merged_in['metadata'].get('message')!r}"
+    )
+
+
+_MERGED_BRANCH_FILE = "feature.txt"
+_MERGED_BRANCH_REVISIONS = 16
+# The merge carries one file's content over from the line it joins, which the peer holds
+# already. Walking the line adds about one fragment per revision on it to that, so a count
+# in this range says the line was left alone and one past it says it was walked.
+_MERGED_LINE_HELD_FRAGMENTS = 6
+
+
+@pytest.mark.smoke
+def test_push_leaves_a_merged_line_the_peer_holds_alone(new_lore_repo):
+    """A merge whose second parent is a branch the peer carries in full leaves that line
+    alone.
+
+    The walk of a merged line stops where the peer's latest for the branch that line
+    belongs to sits, so a line pushed revision by revision is walked no further. Walking
+    it queries the peer for what every revision on it names, which the peer answers that
+    it holds, so the fragments a push reports as deduplicated grow with the length of the
+    line rather than staying with what the merge itself carries over.
+    """
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Shared base", {"shared.txt": ["base\n"]})
+
+    repo.branch_create("feature")
+    for index in range(_MERGED_BRANCH_REVISIONS):
+        repo.write_commit_push(
+            f"Feature commit {index}",
+            {_MERGED_BRANCH_FILE: [f"feature change {index}\n"]},
+        )
+
+    repo.branch_switch("main")
+    repo.branch_merge("feature", message="Merge feature")
+
+    stats = parse_push_stats_json(repo.push(json=True, stats=True))
+    assert stats is not None, "the push reported no statistics"
+    assert stats["deduplicated"] <= _MERGED_LINE_HELD_FRAGMENTS, (
+        f"the push accounted for {stats['deduplicated']} fragment(s) the peer already "
+        f"holds against a merged line of {_MERGED_BRANCH_REVISIONS} revision(s): {stats}"
+    )
+
+    with repo.open_file(_MERGED_BRANCH_FILE, "r") as input_file:
+        assert (
+            input_file.read() == f"feature change {_MERGED_BRANCH_REVISIONS - 1}\n"
+        ), "the merge did not carry the line's last change"
+
+
+_UNSEEN_BRANCH_FILE = "unpushed.txt"
+_UNSEEN_HISTORY_REVISIONS = 12
+
+
+@pytest.mark.smoke
+def test_push_bounds_a_merged_line_the_peer_never_saw(new_lore_repo):
+    """A merge whose second parent is a branch the peer never saw walks that branch's own
+    revisions and stops there, rather than carrying on into the history behind it.
+
+    The peer names no latest for a branch it does not have, so the walk of the line falls
+    back on where the line meets the one the merge sits on. Without that fallback it
+    reaches the branch point and keeps going, taking every revision back to the root with
+    it - all of which the peer holds, which is what the count of deduplicated fragments
+    exposes.
+    """
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Shared base", {"shared.txt": ["base\n"]})
+    for index in range(_UNSEEN_HISTORY_REVISIONS):
+        repo.write_commit_push(
+            f"Main commit {index}", {"main.txt": [f"main change {index}\n"]}
+        )
+
+    repo.branch_create("unpushed", offline=True)
+    repo.write_commit_push(
+        "Unpushed commit", {_UNSEEN_BRANCH_FILE: ["unpushed\n"]}, offline=True
+    )
+
+    repo.branch_switch("main")
+    repo.branch_merge("unpushed", message="Merge the unpushed branch")
+
+    stats = parse_push_stats_json(repo.push(json=True, stats=True))
+    assert stats is not None, "the push reported no statistics"
+    assert stats["deduplicated"] <= _MERGED_LINE_HELD_FRAGMENTS, (
+        f"the push accounted for {stats['deduplicated']} fragment(s) the peer already "
+        f"holds against a line of one revision, behind which the branch carries "
+        f"{_UNSEEN_HISTORY_REVISIONS} pushed revision(s): {stats}"
+    )
+
+    with repo.open_file(_UNSEEN_BRANCH_FILE, "r") as input_file:
+        assert input_file.read() == "unpushed\n", (
+            "the merge did not carry the unpushed branch's file"
+        )
+
+
+_NESTED_BRANCH_FILE = "nested.txt"
+
+
+@pytest.mark.smoke
+def test_push_uploads_a_line_merged_into_a_merged_line(new_lore_repo):
+    """A merge on a line that is itself reached only through a merge has its own second
+    line uploaded too.
+
+    The walk follows the second parent of every merge it reaches, including the ones on the
+    lines it is already following, so a branch merged into a line committed offline travels
+    with it. Nothing else uploads either: both sit behind the merge a sync builds, which is
+    not on the branch history a push walks.
+    """
+    repo: Lore = new_lore_repo()
+    repo.write_commit_push("Shared base", {"shared.txt": ["base\n"]})
+
+    # The remote moves on, so the sync below has a line of its own to join
+    advancing = repo.clone()
+    advancing.write_commit_push("Remote commit", {"advancing.txt": ["remote\n"]})
+
+    repo.write_commit_push(
+        "Offline commit", {"offline.txt": ["offline\n"]}, offline=True
+    )
+    offline_commit = _revision_info(repo, offline=True)["revision"]
+
+    # A branch the peer never saw, merged into that offline line
+    repo.branch_create("side", offline=True)
+    repo.write_commit_push(
+        "Side commit", {_NESTED_BRANCH_FILE: ["side\n"]}, offline=True
+    )
+    side_commit = _revision_info(repo, offline=True)["revision"]
+
+    repo.branch_switch("main", local=True)
+    repo.branch_merge("side", message="Merge side into the offline line", offline=True)
+    merge_commit = _revision_info(repo, offline=True)["revision"]
+
+    repo.sync()
+    repo.push()
+
+    reader = repo.clone()
+    for revision, message in (
+        (offline_commit, "Offline commit"),
+        (side_commit, "Side commit"),
+        (merge_commit, "Merge side into the offline line"),
+    ):
+        info = _revision_info(reader, revision)
+        assert info["metadata"].get("message") == message, (
+            f"revision {revision} reports message {info['metadata'].get('message')!r}"
+        )
+
+    reader.sync(side_commit)
+    with reader.open_file(_NESTED_BRANCH_FILE, "r") as input_file:
+        assert input_file.read() == "side\n", (
+            f"revision {side_commit} realized the wrong content"
+        )

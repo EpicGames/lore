@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -10,6 +11,7 @@ use bytes::Bytes;
 use lore_base::lore_spawn;
 use lore_base::types::BranchPoint;
 use lore_error_set::prelude::*;
+use lore_transport::Connection;
 use lore_transport::ProtocolError;
 use lore_transport::StorageSession;
 use lore_transport::quic::storage_service::QueryStatus;
@@ -565,6 +567,132 @@ pub async fn push(
     Ok(())
 }
 
+/// The revision the peer holds as latest for `branch`, remembered in `known`, or zero when
+/// the peer names none.
+///
+/// A zero branch is no branch to ask about, which a revision whose metadata cannot be read
+/// answers with. A push carries a line or two, so the answers are kept in a list rather
+/// than a map.
+async fn peer_latest_for_branch(
+    remote: Arc<Connection>,
+    repository: RepositoryId,
+    branch: BranchId,
+    known: &mut Vec<(BranchId, Hash)>,
+) -> Hash {
+    if branch.is_zero() {
+        return Hash::default();
+    }
+
+    if let Some((_branch, latest)) = known.iter().find(|(known, _)| *known == branch) {
+        return *latest;
+    }
+
+    let latest = branch::load_remote_latest(remote, repository, branch)
+        .await
+        .unwrap_or_default();
+    known.push((branch, latest));
+    latest
+}
+
+/// The revisions `history` reaches only through the second parent of a merge, newest first.
+///
+/// A merge sets `parent_self` to the revision the peer already had and `parent_other` to
+/// the line merged into it, so the branch history walk that produced `history` reaches a
+/// merge revision and stops. The revisions on that second line still have to be readable
+/// on the peer, which names them through the merge, and nothing else uploads them: an
+/// online commit uploads what it writes as it writes it, so it is a line committed offline
+/// that arrives here with nothing of it on the peer.
+///
+/// [`history::find_branch_point`] is what says where a line left the history the peer
+/// holds, and what it walks against decides how much of the line it reports. The peer's
+/// latest for the branch the line belongs to is the bound where the peer names one - the
+/// same bound the branch history walk applies to the branch being pushed, so a line the
+/// peer carries already is walked no further than the revisions it is missing, and
+/// `branch` with `remote_latest` name it for the branch being pushed. A branch the peer
+/// has never seen it names nothing for, and a walk against nothing runs to the root of the
+/// line, so those fall back on the merge's own first parent: a line and the line it was
+/// merged into meet at the branch point, which is as far as the line reaches.
+///
+/// A revision on the line may be a merge in its own right, and its second line is just as
+/// unreachable, so those are followed the same way.
+///
+/// The result is ordered to be walked in reverse, which visits each line oldest revision
+/// first. What each revision owns is collected against its own first parent whatever the
+/// order, so this is what the order buys: a fragment an older revision registers counts as
+/// durably stored before a newer revision holding the same one is collected, and drops out
+/// of that collection. Completeness does not rest on the order - every line is walked back
+/// to a revision the peer holds, so a fragment is offered by the oldest revision on the
+/// line that holds it.
+async fn collect_divergent_history(
+    repository: Arc<RepositoryContext>,
+    remote: Arc<Connection>,
+    branch: BranchId,
+    remote_latest: Hash,
+    history: &[Hash],
+) -> Result<Vec<Hash>, PushError> {
+    let mut pending = vec![];
+
+    for revision in history {
+        let state = State::deserialize(repository.clone(), *revision)
+            .await
+            .forward::<PushError>("deserializing revision state")?;
+        if !state.parent_other().is_zero() {
+            pending.push((state.parent_self(), state.parent_other()));
+        }
+    }
+
+    if pending.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut visited: HashSet<Hash> = history.iter().copied().collect();
+    let mut peer_latest = vec![(branch, remote_latest)];
+    let mut divergent = vec![];
+
+    while let Some((parent_self, parent_other)) = pending.pop() {
+        let line_branch = State::deserialize(repository.clone(), parent_other)
+            .await
+            .forward::<PushError>("deserializing merged line state")?
+            .branch(repository.clone())
+            .await;
+        let line_base =
+            peer_latest_for_branch(remote.clone(), repository.id, line_branch, &mut peer_latest)
+                .await;
+        let line_base = if line_base.is_zero() {
+            parent_self
+        } else {
+            line_base
+        };
+
+        let (_branch_point, _peer_history, line_history) =
+            history::find_branch_point(repository.clone(), line_base, parent_other)
+                .await
+                .forward::<PushError>("reconciling divergent history")?;
+
+        lore_debug!(
+            "Found {} revision(s) on the line merged from {parent_other}, against {line_base} on branch {line_branch}",
+            line_history.len()
+        );
+
+        for revision in line_history {
+            if !visited.insert(revision) {
+                continue;
+            }
+
+            let state = State::deserialize(repository.clone(), revision)
+                .await
+                .forward::<PushError>("deserializing divergent revision state")?;
+            if !state.parent_other().is_zero() {
+                pending.push((state.parent_self(), state.parent_other()));
+            }
+
+            divergent.push(revision);
+        }
+    }
+
+    Ok(divergent)
+}
+
 async fn collect_fragments_and_push(
     repository: Arc<RepositoryContext>,
     token: &RepositoryWriteToken,
@@ -867,6 +995,31 @@ async fn collect_fragments_and_push(
         .send();
     }
 
+    let divergent_revisions = collect_divergent_history(
+        repository.clone(),
+        remote.clone(),
+        branch,
+        remote_latest,
+        &full_local_history,
+    )
+    .await?;
+
+    for revision in divergent_revisions.iter().rev() {
+        let state = State::deserialize(repository.clone(), *revision)
+            .await
+            .forward::<PushError>("deserializing divergent revision state")?;
+
+        push_revision_links(&repository, token, &options, &state, branch).await?;
+        upload_revision_fragments(
+            &repository,
+            &storage_protocol,
+            remote.environment.max_query_batch(),
+            &state,
+            dry_run,
+        )
+        .await?;
+    }
+
     let mut current_latest = Hash::default();
     let mut fast_forward_merged = false;
     for current_revision in full_local_history.iter().rev() {
@@ -876,40 +1029,7 @@ async fn collect_fragments_and_push(
             .await
             .forward::<PushError>("deserializing revision state")?;
 
-        // Push links
-        if let Ok(link_list) = state.link_list(repository.clone()).await {
-            // TODO(vri): UCS-17135 - Push links in individual tasks
-            for link_reference in link_list.iter() {
-                let link_id = link_reference.repository;
-                let link_repository = Arc::new(repository.to_link_context(link_id).await);
-                let link_signature = link_reference.signature;
-                let link_state = State::deserialize(link_repository.clone(), link_signature)
-                    .await
-                    .forward::<PushError>("deserializing link state")?;
-
-                let link_branch_id = link_reference.resolve_branch(branch);
-
-                lore_debug!(
-                    "Pushing link changes for link ID {link_id} on branch {link_branch_id} at revision {link_signature}"
-                );
-
-                if collect_fragments_and_push_recurse(
-                    link_repository,
-                    token.share(),
-                    options.clone(),
-                    link_state,
-                    link_branch_id,
-                    link_reference.signature,
-                )
-                .await
-                .is_err()
-                {
-                    return Err(PushError::internal(format!(
-                        "Failed to push link with ID {link_id}"
-                    )));
-                }
-            }
-        }
+        push_revision_links(&repository, token, &options, &state, branch).await?;
 
         if !current_latest.is_zero() && state.parent_self() != current_latest {
             // Rebase on new latest revision
@@ -940,81 +1060,17 @@ async fn collect_fragments_and_push(
             .send();
         }
 
-        // Load parent state
-        let state_parent = State::deserialize(repository.clone(), state.parent_self())
-            .await
-            .forward::<PushError>("deserializing parent state")?;
-
-        // Check missing fragments on server
-        lore_debug!(
-            "Calculating new fragments from {} to {}",
-            state_parent.revision(),
-            state.revision()
-        );
-        let mut fragments = state::collect_new_fragments(
-            repository.clone(),
-            state_parent.clone(),
-            state.clone(),
-            true, /* Ignore already durably stored fragments */
-        )
-        .await
-        .forward::<PushError>("collecting new fragments")?;
-
-        if !state.parent_other().is_zero() {
-            fragments.push(Address::zero_context_hash(state.parent_other()));
-        }
-
-        let push_stats = execution_context().push_stats().clone();
-        let progress = Arc::new(PushProgress::new(push_stats.clone()));
-        let fragments = push_query(
-            storage_protocol.clone(),
-            fragments,
+        upload_revision_fragments(
+            &repository,
+            &storage_protocol,
             remote.environment.max_query_batch(),
-            &push_stats,
+            &state,
+            dry_run,
         )
         .await?;
 
-        event::LoreEvent::BranchPushFragmentBegin(LoreBranchPushFragmentBeginEventData {
-            fragments: fragments.len() as u64,
-            bytes_total: 0,
-        })
-        .send();
-
-        let ticker_progress = progress.clone();
-        let progress_interval = execution_context().globals().event_interval();
-        let ticker = AbortOnDropHandle::new(lore_spawn!(async move {
-            let mut ticker = tokio::time::interval(progress_interval);
-            loop {
-                ticker.tick().await;
-                event::LoreEvent::BranchPushFragmentProgress(ticker_progress.event()).send();
-            }
-        }));
-
-        if !dry_run {
-            push_fragments(
-                repository.clone(),
-                storage_protocol.clone(),
-                fragments,
-                progress.clone(),
-            )
-            .await?;
-        }
-
-        drop(ticker);
-
-        // Emit a final progress event with the completed values now that the
-        // ticker has been dropped and push_fragments has finished.
-        let final_progress = progress.event();
-        event::LoreEvent::BranchPushFragmentProgress(final_progress.clone()).send();
-
-        event::LoreEvent::BranchPushFragmentEnd(LoreBranchPushFragmentEndEventData {
-            fragments: final_progress.complete,
-            bytes_transferred: final_progress.bytes_transferred,
-        })
-        .send();
-
-        // We don't want to push revisions from any other branch than the current one,
-        // so we will early out here
+        // A revision from another branch belongs to that branch's own push. Its fragments
+        // are what the peer needs of it, and they are now up.
         if state.branch(repository.clone()).await != branch {
             continue;
         };
@@ -1558,6 +1614,150 @@ pub(crate) async fn push_fragments(
     }
 
     lore_debug!("Pushed {} fragments", fragment_count);
+
+    Ok(())
+}
+
+/// Push the revisions the links `state` holds name, each to the branch its reference
+/// resolves against.
+///
+/// A link travels with the revision that names it, so the linked repository is pushed
+/// before the fragments of the revision naming it go up.
+async fn push_revision_links(
+    repository: &Arc<RepositoryContext>,
+    token: &RepositoryWriteToken,
+    options: &PushOptions,
+    state: &Arc<State>,
+    branch: BranchId,
+) -> Result<(), PushError> {
+    let Ok(link_list) = state.link_list(repository.clone()).await else {
+        return Ok(());
+    };
+
+    // TODO(vri): UCS-17135 - Push links in individual tasks
+    for link_reference in link_list.iter() {
+        let link_id = link_reference.repository;
+        let link_repository = Arc::new(repository.to_link_context(link_id).await);
+        let link_signature = link_reference.signature;
+        let link_state = State::deserialize(link_repository.clone(), link_signature)
+            .await
+            .forward::<PushError>("deserializing link state")?;
+
+        let link_branch_id = link_reference.resolve_branch(branch);
+
+        lore_debug!(
+            "Pushing link changes for link ID {link_id} on branch {link_branch_id} at revision {link_signature}"
+        );
+
+        if collect_fragments_and_push_recurse(
+            link_repository,
+            token.share(),
+            options.clone(),
+            link_state,
+            link_branch_id,
+            link_reference.signature,
+        )
+        .await
+        .is_err()
+        {
+            return Err(PushError::internal(format!(
+                "Failed to push link with ID {link_id}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Upload what `state` holds that its first parent does not, and the revision the second
+/// parent of a merge names.
+///
+/// The peer needs this of every revision a push reaches, whether the revision goes on to
+/// be offered as a new latest revision or sits on a line that is only named by a merge.
+async fn upload_revision_fragments(
+    repository: &Arc<RepositoryContext>,
+    storage: &Arc<StorageSession>,
+    max_query_batch: Option<usize>,
+    state: &Arc<State>,
+    dry_run: bool,
+) -> Result<(), PushError> {
+    let state_parent = State::deserialize(repository.clone(), state.parent_self())
+        .await
+        .forward::<PushError>("deserializing parent state")?;
+
+    lore_debug!(
+        "Calculating new fragments from {} to {}",
+        state_parent.revision(),
+        state.revision()
+    );
+    let mut fragments = state::collect_new_fragments(
+        repository.clone(),
+        state_parent,
+        state.clone(),
+        true, /* Ignore already durably stored fragments */
+    )
+    .await
+    .forward::<PushError>("collecting new fragments")?;
+
+    if !state.parent_other().is_zero() {
+        fragments.push(Address::zero_context_hash(state.parent_other()));
+    }
+
+    query_and_push_fragments(
+        repository.clone(),
+        storage.clone(),
+        max_query_batch,
+        fragments,
+        dry_run,
+    )
+    .await
+}
+
+/// Upload those of `fragments` the peer answers that it is missing, reporting progress
+/// while the upload runs. A dry run stops once the peer has answered.
+async fn query_and_push_fragments(
+    repository: Arc<RepositoryContext>,
+    storage: Arc<StorageSession>,
+    max_query_batch: Option<usize>,
+    fragments: Vec<Address>,
+    dry_run: bool,
+) -> Result<(), PushError> {
+    let push_stats = execution_context().push_stats().clone();
+    let progress = Arc::new(PushProgress::new(push_stats.clone()));
+    let fragments = push_query(storage.clone(), fragments, max_query_batch, &push_stats).await?;
+
+    event::LoreEvent::BranchPushFragmentBegin(LoreBranchPushFragmentBeginEventData {
+        fragments: fragments.len() as u64,
+        bytes_total: 0,
+    })
+    .send();
+
+    let ticker_progress = progress.clone();
+    let progress_interval = execution_context().globals().event_interval();
+    let ticker = AbortOnDropHandle::new(lore_spawn!(async move {
+        let mut ticker = tokio::time::interval(progress_interval);
+        loop {
+            ticker.tick().await;
+            event::LoreEvent::BranchPushFragmentProgress(ticker_progress.event()).send();
+        }
+    }));
+
+    if !dry_run {
+        push_fragments(repository, storage, fragments, progress.clone()).await?;
+    }
+
+    drop(ticker);
+
+    // Emit a final progress event with the completed values now that the
+    // ticker has been dropped and push_fragments has finished.
+    let final_progress = progress.event();
+    event::LoreEvent::BranchPushFragmentProgress(final_progress.clone()).send();
+
+    event::LoreEvent::BranchPushFragmentEnd(LoreBranchPushFragmentEndEventData {
+        fragments: final_progress.complete,
+        bytes_transferred: final_progress.bytes_transferred,
+    })
+    .send();
 
     Ok(())
 }

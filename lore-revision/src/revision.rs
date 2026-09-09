@@ -195,6 +195,33 @@ pub struct Diff3Summary {
 /// the caller to fall back to the unfiltered walk. The pre-streaming
 /// implementation absorbed these errors silently into a boolean —
 /// the explicit `Option` keeps that fallback path observable.
+/// The metadata `metadata_hash` names, or `None` where there is none to read.
+///
+/// That blob carries the branch, date and message of the revision naming it, so a report
+/// without it is a report without those, and the warning is what says so. A zero hash names
+/// none, and a blob that cannot be read is warned about rather than failing the caller: a
+/// revision list leaves the states of a segment in the local store without the metadata they
+/// name, so a revision read out of that cache offline has nothing to take those fields from,
+/// which is ordinary rather than damage.
+pub(crate) async fn reported_metadata(
+    repository: Arc<RepositoryContext>,
+    metadata_hash: Hash,
+) -> Option<Metadata> {
+    if metadata_hash.is_zero() {
+        return None;
+    }
+
+    match Metadata::deserialize(repository, metadata_hash).await {
+        Ok(metadata) => Some(metadata),
+        Err(err) => {
+            lore_warn!(
+                "Reporting revision without branch, date and message, metadata {metadata_hash} could not be read: {err}"
+            );
+            None
+        }
+    }
+}
+
 fn filter_from_source_changes(source_changes: &[NodeChange]) -> Option<Filter> {
     let mut filter = Filter::default();
     if let Err(err) = filter.view.add_exclusion("**") {

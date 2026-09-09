@@ -395,19 +395,16 @@ pub async fn push(
                 Status::internal(format!("Failed to load incoming state: {err}"))
             })?;
 
-        // Verify that all new fragments exist
-        let mut state_other = None;
-        if !state.parent_other().is_zero() {
-            let state_parent = State::deserialize(repository.clone(), state.parent_other())
-                .await
-                .filter_slow_down()?
-                .warn_map_err(|err| {
-                    Status::internal(format!("Failed to load other parent state: {err}"))
-                })?;
-            state_other = Some(state_parent);
-        }
+        let state_other = load_other_parent_state(repository.clone(), &state).await?;
 
-        verify_fragments(repository.clone(), state_parent.clone(), state.clone()).await?;
+        // Verify that all new fragments exist
+        verify_fragments(
+            repository.clone(),
+            state_parent.clone(),
+            state_other.clone(),
+            state.clone(),
+        )
+        .await?;
 
         // Verify that the revision number is valid
         let revision_number = next_revision_number(
@@ -507,7 +504,15 @@ async fn try_fast_forward_merge(
             ))
         })?;
 
-    verify_fragments(repository.clone(), base_state, incoming_state.clone()).await?;
+    let other_parent_state = load_other_parent_state(repository.clone(), &incoming_state).await?;
+
+    verify_fragments(
+        repository.clone(),
+        base_state,
+        other_parent_state,
+        incoming_state.clone(),
+    )
+    .await?;
 
     loop {
         // Three-way diff: base=original merge target, source=incoming merge, target=current head
@@ -704,9 +709,47 @@ fn first_missing_fragment(batch: &[Address], answers: &[StoreMatchResult]) -> Op
     Some(address)
 }
 
+/// The state of the second parent `state` names, or `None` when it names none.
+///
+/// Only a merge revision names one, and both the revision number the merge takes and the
+/// fragments it is verified against come from that parent. A parent the store cannot
+/// answer for is reported as `FAILED_PRECONDITION` naming its address, as a missing
+/// fragment is. The address is the one the load asked for, since a state the store cannot
+/// answer for is reported as a plain absence carrying no address of its own.
+async fn load_other_parent_state(
+    repository: Arc<RepositoryContext>,
+    state: &State,
+) -> Result<Option<Arc<State>>, Status> {
+    if state.parent_other().is_zero() {
+        return Ok(None);
+    }
+
+    let address = Address::zero_context_hash(state.parent_other());
+    let other_parent_state = State::deserialize(repository, state.parent_other())
+        .await
+        .filter_slow_down()?
+        .warn_map_err(|err| {
+            if err.is_not_found() {
+                return address_not_found_status(
+                    &AddressNotFound::from(address),
+                    format!("Missing fragment '{address}'"),
+                );
+            }
+
+            Status::internal(format!("Failed to load other parent state: {err}"))
+        })?;
+
+    Ok(Some(other_parent_state))
+}
+
 /// Verify that all new fragments between `parent_state` and `state` exist in the
 /// immutable store. Also includes the other parent hash if the state is a merge.
 /// Returns an error if any fragment is missing.
+///
+/// A merge revision joins two lines of history, and what it names is new to this
+/// branch against either of them, so `other_parent_state` is collected against as well.
+/// Reading that parent's own tree is what refuses a peer that pushed the merge without
+/// the tip of the line it merged.
 ///
 /// A missing fragment is reported as `FAILED_PRECONDITION` naming the address,
 /// whether the walk cannot read it or the store answers that it is absent.
@@ -714,32 +757,38 @@ fn first_missing_fragment(batch: &[Address], answers: &[StoreMatchResult]) -> Op
 async fn verify_fragments(
     repository: Arc<RepositoryContext>,
     parent_state: Arc<State>,
+    other_parent_state: Option<Arc<State>>,
     state: Arc<State>,
 ) -> Result<(), Status> {
-    let mut new_fragments = state::collect_new_fragments(
-        repository.clone(),
-        parent_state.clone(),
-        state.clone(),
-        true, /* Ignore already durably stored fragments */
-    )
-    .instrument(span!(Level::DEBUG, "collect_new_fragments"))
-    .await
-    .warn_map_err(|err| {
-        if let Some(converted_error) = err.as_address_not_found() {
-            return address_not_found_status(
-                converted_error,
-                format!(
-                    "Failed to collect new fragments for verification. Missing address '{converted_error}'"
-                ),
-            );
-        }
+    let collect = async |parent_state: Arc<State>| {
+        state::collect_new_fragments(
+            repository.clone(),
+            parent_state,
+            state.clone(),
+            true, /* Ignore already durably stored fragments */
+        )
+        .instrument(span!(Level::DEBUG, "collect_new_fragments"))
+        .await
+        .warn_map_err(|err| {
+            if let Some(converted_error) = err.as_address_not_found() {
+                return address_not_found_status(
+                    converted_error,
+                    format!(
+                        "Failed to collect new fragments for verification. Missing address '{converted_error}'"
+                    ),
+                );
+            }
 
-        Status::internal(format!(
-            "Failed to collect new fragments for verification: {err}"
-        ))
-    })?;
+            Status::internal(format!(
+                "Failed to collect new fragments for verification: {err}"
+            ))
+        })
+    };
 
-    if !state.parent_other().is_zero() {
+    let mut new_fragments = collect(parent_state).await?;
+
+    if let Some(other_parent_state) = other_parent_state {
+        new_fragments.append(&mut collect(other_parent_state).await?);
         new_fragments.push(Address::zero_context_hash(state.parent_other()));
     }
 
@@ -1344,6 +1393,144 @@ mod tests {
                     status.message(),
                     format!("Missing fragment '{payload}'"),
                     "the absent payload has to be the fragment named"
+                );
+                let error = lore_transport::ProtocolError::from(status);
+                assert!(error.is_address_not_found(), "{error:?}");
+            }))
+            .await;
+        }
+
+        /// A merge whose second parent the store cannot answer for is refused as the
+        /// missing fragment it is.
+        ///
+        /// The merge and the blob holding its metadata are handed over, so what stays
+        /// absent is the line the merge joins. That parent carries what the merge is
+        /// verified against, so it is read rather than only queried, and the read has to
+        /// report the address as a missing fragment like the query does.
+        #[tokio::test]
+        async fn a_merge_missing_its_other_parent_names_that_address() {
+            let repository_id = random::<RepositoryId>();
+
+            let (peer_store, peer_mutable, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let (store, mutable_store, _) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let peer = Arc::new(RepositoryContext::new_server_context(
+                    peer_store.clone(),
+                    peer_mutable,
+                    repository_id,
+                ));
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    store.clone(),
+                    mutable_store,
+                    repository_id,
+                ));
+
+                let branch = create_test_branch(&repository).await;
+                let other =
+                    serialize_revision(&peer, branch, Hash::default(), Hash::default(), 1).await;
+                let merge =
+                    serialize_revision(&peer, branch, Hash::default(), other.revision(), 2).await;
+
+                hand_over_fragment(&peer_store, &store, repository_id, merge.revision()).await;
+                hand_over_fragment(&peer_store, &store, repository_id, merge.metadata_hash()).await;
+
+                let Err(status) = push(
+                    repository,
+                    branch,
+                    merge.revision(),
+                    true,
+                    true,
+                    false,
+                    DEFAULT_HISTORY_STEP_SIZE,
+                    RevisionListAcceleration::default(),
+                )
+                .await
+                else {
+                    panic!("a merge missing the line it joins cannot be pushed");
+                };
+
+                assert_eq!(status.code(), Code::FailedPrecondition);
+                assert_eq!(
+                    status.message(),
+                    format!(
+                        "Missing fragment '{}'",
+                        Address::zero_context_hash(other.revision())
+                    ),
+                    "the absent parent has to be the fragment named"
+                );
+                let error = lore_transport::ProtocolError::from(status);
+                assert!(error.is_address_not_found(), "{error:?}");
+            }))
+            .await;
+        }
+
+        /// A merge is verified against its second parent as well as its first, so a
+        /// second parent the store cannot walk refuses the push.
+        ///
+        /// That parent and the blob holding its metadata are handed over, leaving the tree
+        /// it names absent. The merge itself holds no file, so collecting it against its
+        /// first parent reads nothing of that tree: what reaches it is the collection
+        /// against the second parent, which is the one this covers.
+        #[tokio::test]
+        async fn a_merge_is_verified_against_the_tree_of_its_other_parent() {
+            let repository_id = random::<RepositoryId>();
+
+            let (peer_store, peer_mutable, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let (store, mutable_store, _) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let peer = Arc::new(RepositoryContext::new_server_context(
+                    peer_store.clone(),
+                    peer_mutable,
+                    repository_id,
+                ));
+                let repository = Arc::new(RepositoryContext::new_server_context(
+                    store.clone(),
+                    mutable_store,
+                    repository_id,
+                ));
+
+                let branch = create_test_branch(&repository).await;
+                let other = serialize_revision_with_a_file(&peer, branch).await;
+                let merge =
+                    serialize_revision(&peer, branch, Hash::default(), other.revision(), 2).await;
+
+                for hash in [
+                    merge.revision(),
+                    merge.metadata_hash(),
+                    other.revision(),
+                    other.metadata_hash(),
+                ] {
+                    hand_over_fragment(&peer_store, &store, repository_id, hash).await;
+                }
+
+                let Err(status) = push(
+                    repository,
+                    branch,
+                    merge.revision(),
+                    true,
+                    true,
+                    false,
+                    DEFAULT_HISTORY_STEP_SIZE,
+                    RevisionListAcceleration::default(),
+                )
+                .await
+                else {
+                    panic!("a merge whose other parent cannot be walked cannot be pushed");
+                };
+
+                assert_eq!(status.code(), Code::FailedPrecondition);
+                assert!(
+                    status
+                        .message()
+                        .starts_with("Failed to collect new fragments"),
+                    "{}",
+                    status.message()
                 );
                 let error = lore_transport::ProtocolError::from(status);
                 assert!(error.is_address_not_found(), "{error:?}");

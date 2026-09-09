@@ -470,6 +470,33 @@ def parse_revision_list(revision_output: str, oneline: bool) -> list[RevisionInf
     return revisions
 
 
+def parse_revision_list_json(output: str) -> list[dict]:
+    """Parse `--json` revision output into one dict per revision, in the order the
+    events arrive: newest first for `history`.
+
+    A revision arrives as a `revisionInfo` or `revisionHistoryEntry` event carrying its
+    signature, number and parents, followed by one `metadata` event per key it records.
+    Those go under `metadata` on the revision they followed, keyed as they are recorded -
+    `branch`, `timestamp` and `message` among them - rather than beside the event's own
+    fields, which a metadata key is free to be named the same as.
+    """
+    revisions = []
+    for line in output.strip().split("\n"):
+        try:
+            parsed = json.loads(line.strip())
+        except json.JSONDecodeError:
+            # Skip non-JSON lines (headers, etc.)
+            continue
+        data = parsed.get("data")
+        if not isinstance(data, dict):
+            continue
+        if parsed.get("tagName") in ("revisionInfo", "revisionHistoryEntry"):
+            revisions.append(dict(data) | {"metadata": {}})
+        elif parsed.get("tagName") == "metadata" and revisions:
+            revisions[-1]["metadata"][data["key"]] = data["value"]["data"]
+    return revisions
+
+
 def parse_revision_bisect(output: str):
     is_done = len(BISECT_DONE_PATTERN.findall(output)) > 0
     if is_done:

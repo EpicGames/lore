@@ -14,8 +14,8 @@ use crate::lore::Context;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
 use crate::lore_debug;
-use crate::metadata::Metadata;
 use crate::repository::RepositoryContext;
+use crate::revision;
 use crate::runtime::execution_context;
 use crate::state::State;
 
@@ -255,13 +255,11 @@ pub async fn history(
             .await
             .forward::<RevisionHistoryError>("deserializing state")?;
 
-        let metadata_hash = state.metadata_hash();
-        let metadata = Metadata::deserialize(repository.clone(), metadata_hash)
-            .await
-            .forward::<RevisionHistoryError>("deserializing metadata")?;
+        let metadata = revision::reported_metadata(repository.clone(), state.metadata_hash()).await;
 
         // Check if we've crossed a date boundary
         if options.date != 0
+            && let Some(metadata) = &metadata
             && let Ok(ts) = metadata.get_timestamp()
             && ts < options.date
         {
@@ -270,6 +268,7 @@ pub async fn history(
 
         // Check if we've crossed a branch boundary
         let crossed_branch = if options.only_branch
+            && let Some(metadata) = &metadata
             && let Ok(branch) = metadata.get_branch()
         {
             if let Some(ref start) = start_branch {
@@ -291,11 +290,13 @@ pub async fn history(
                 )
                 .await
                 .forward::<RevisionHistoryError>("loading branch name")?
-            } else {
+            } else if let Some(metadata) = &metadata {
                 // Take branch from top revision.
                 metadata
                     .get_branch()
                     .forward::<RevisionHistoryError>("getting branch from metadata")?
+            } else {
+                BranchId::default()
             };
 
             event::LoreEvent::RevisionHistory(LoreRevisionHistoryEventData::new(
@@ -310,8 +311,8 @@ pub async fn history(
         ))
         .send();
 
-        if !metadata_hash.is_zero() {
-            event::metadata::send(&metadata);
+        if let Some(metadata) = &metadata {
+            event::metadata::send(metadata);
         }
 
         if crossed_branch {

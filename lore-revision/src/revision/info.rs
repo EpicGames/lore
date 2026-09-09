@@ -164,6 +164,12 @@ pub struct InfoOptions {
     pub metadata: bool,
 }
 
+/// Report the revision `options` names, the metadata it records, and the delta it
+/// carries when asked for.
+///
+/// A revision naming metadata that cannot be read is reported without the branch, date and
+/// message that blob carries, and warned about, rather than leaving those fields silently
+/// empty.
 pub async fn info(
     repository: Arc<RepositoryContext>,
     options: InfoOptions,
@@ -191,11 +197,8 @@ pub async fn info(
     event::LoreEvent::RevisionInfo(LoreRevisionInfoEventData::new(repository.id, state.clone()))
         .send();
 
-    let metadata_hash = state.metadata_hash();
-    if !metadata_hash.is_zero()
-        && let Ok(metadata) = Metadata::deserialize(repository.clone(), metadata_hash)
-            .await
-            .forward::<InfoError>("deserializing revision metadata")
+    if let Some(metadata) =
+        revision::reported_metadata(repository.clone(), state.metadata_hash()).await
     {
         event::metadata::send(&metadata);
     }
