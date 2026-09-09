@@ -125,6 +125,7 @@ pub async fn remove(
         stage::stage_delete(
             inner_repository.clone(),
             inner_state.clone(),
+            link_path.clone(),
             node_link.node,
             NodeFlags::NoFlags,
             Arc::default(),

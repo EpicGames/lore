@@ -53,7 +53,6 @@ use crate::node::NodeID;
 use crate::node::NodeIDExt;
 use crate::node::NodeLink;
 use crate::node::ROOT_NODE;
-use crate::node::SiblingCycleGuard;
 use crate::path::emit_path_ignore;
 use crate::progress::max_concurrent_stage_directory_tasks;
 use crate::repository::BASE_SUFFIX;
@@ -172,9 +171,9 @@ pub struct LoreFileStageRevisionEventData {
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreFileStageFileEventData {
-    /// Previous path of the file, when it was moved.
+    /// Previous path of the file, when it was moved, relative to the root of the working tree.
     pub from_path: LoreString,
-    /// Path of the file.
+    /// Path of the file, relative to the root of the working tree.
     pub path: LoreString,
     /// Action applied to the file.
     pub action: LoreFileAction,
@@ -614,12 +613,10 @@ pub(crate) async fn stage_filesystem_path(
         repository.path_for_display(),
         full_relative_path.as_str(),
     );
-    // TODO(mjansson): Find node link could return the found case aware path of the node
     if let Ok(node_link) = state
         .find_node_link(repository.clone(), full_relative_path.as_str())
         .await
     {
-        // Check if case of repository path matches the given path
         let mut current_repository = repository.clone();
         let node_state = if node_link.repository != repository.id {
             current_repository = repository.to_link_context(node_link.repository).await;
@@ -651,40 +648,20 @@ pub(crate) async fn stage_filesystem_path(
                 .await;
         }
 
-        let node_path = node_state
-            .node_path(current_repository.clone(), node_link.node)
-            .await
-            .forward::<StageError>("Failed to resolve node path in state")?;
-        if node_path == full_relative_path.as_str() {
-            lore_debug!(
-                "Path {} exist in repository with matching case, stage deletion",
-                full_relative_path
-            );
-            stage_delete(
-                current_repository.clone(),
-                node_state,
-                node_link.node,
-                options.node_flags,
-                stats.clone(),
-                link_tracker.clone(),
-            )
-            .await?;
-        } else {
-            lore_debug!(
-                "Path {} exist in repository with different case {}",
-                full_relative_path,
-                node_path
-            );
-            stage_delete(
-                current_repository.clone(),
-                node_state,
-                node_link.node,
-                options.node_flags,
-                stats.clone(),
-                link_tracker.clone(),
-            )
-            .await?;
-        }
+        lore_debug!(
+            "Path {} exist in repository, stage deletion",
+            full_relative_path
+        );
+        stage_delete(
+            current_repository.clone(),
+            node_state,
+            full_relative_path.clone(),
+            node_link.node,
+            options.node_flags,
+            stats.clone(),
+            link_tracker.clone(),
+        )
+        .await?;
     } else {
         lore_debug!("Path {} does not exist in repository", full_relative_path);
         if !force {
@@ -828,6 +805,7 @@ pub(crate) async fn stage_single_node(
             stage_delete(
                 repository.clone(),
                 state.clone(),
+                relative_path.clone(),
                 found_node,
                 node_flags.bitand(NodeFlags::StagedBits),
                 stats.clone(),
@@ -996,6 +974,7 @@ async fn mark_staged_node_dirty(
 pub(crate) async fn stage_delete(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
+    relative_path: RelativePath,
     node_id: NodeID,
     node_flags: NodeFlags,
     stats: Arc<StageStats>,
@@ -1026,14 +1005,9 @@ pub(crate) async fn stage_delete(
             .fetch_add(1, Ordering::Relaxed);
     } else {
         stats.file_delete_count.fetch_add(1, Ordering::Relaxed);
-        let node_path = state
-            .node_path(repository.clone(), node_id)
-            .await
-            .unwrap_or_default();
-
         event::LoreEvent::FileStageFile(LoreFileStageFileEventData {
             from_path: LoreString::default(),
-            path: node_path.into(),
+            path: LoreString::from(&relative_path),
             action: LoreFileAction::Delete,
         })
         .send();
@@ -1068,27 +1042,30 @@ pub(crate) async fn stage_delete(
     // Note that links do not need to recurse into directory, as the subtree exist in
     // the link state tree and not this state tree
     if node.is_directory() {
-        let mut child_node_iter = node.child();
-        let mut cycle = SiblingCycleGuard::new(node_id);
-        while let Some(child_node_id) = child_node_iter {
+        let mut children =
+            StateNodeChildrenWithNameIterator::new(state.clone(), repository.clone(), node_id)
+                .await
+                .forward::<StageError>("Failed to list directory node children")?;
+
+        while let Some((child_node_id, _child_node, child_name)) =
+            children
+                .next()
+                .await
+                .forward::<StageError>("Failed to list directory node children")?
+        {
+            // Takes the name by value so its block read lock ends here, rather than reaching the
+            // delete of the child below (see NodeNameLock docs).
+            let child_path = relative_path.join(child_name);
             stage_delete_recurse(
                 repository.clone(),
                 state.clone(),
+                child_path,
                 child_node_id,
                 node_flags,
                 stats.clone(),
                 link_tracker.clone(),
             )
             .await?;
-
-            let child_node = state
-                .node(repository.clone(), child_node_id)
-                .await
-                .forward::<StageError>("Failed deserializing state node block")?;
-            child_node
-                .walk_step(child_node_id, node_id, &mut cycle)
-                .forward::<StageError>("Invalid node hierarchy in stage delete walk")?;
-            child_node_iter = child_node.sibling();
         }
     }
 
@@ -1098,6 +1075,7 @@ pub(crate) async fn stage_delete(
 fn stage_delete_recurse(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
+    relative_path: RelativePath,
     node_id: NodeID,
     node_flags: NodeFlags,
     stats: Arc<StageStats>,
@@ -1106,6 +1084,7 @@ fn stage_delete_recurse(
     Box::pin(stage_delete(
         repository,
         state,
+        relative_path,
         node_id,
         node_flags,
         stats,
@@ -1687,6 +1666,7 @@ pub(crate) async fn stage_directory(
         let result = stage_delete(
             repository.clone(),
             state.clone(),
+            filter_path.clone().freeze(),
             child,
             options.node_flags,
             stats.clone(),
@@ -2004,6 +1984,7 @@ pub(crate) async fn stage_node_from_metadata(
                 stage_delete(
                     repository.clone(),
                     state.clone(),
+                    relative_path.clone(),
                     found_node_id,
                     options.node_flags,
                     stats.clone(),
@@ -3518,6 +3499,7 @@ async fn stage_realized_delete(
     stage_delete(
         repository,
         state,
+        path.clone(),
         node_link.node,
         options.node_flags,
         stats,

@@ -1261,6 +1261,7 @@ pub async fn stage_move(
         stage::stage_delete(
             repository.clone(),
             state.clone(),
+            to_path.clone(),
             to_node_link.node,
             options.node_flags,
             stats.clone(),

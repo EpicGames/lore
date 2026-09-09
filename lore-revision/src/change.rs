@@ -179,7 +179,10 @@ pub struct NodeChange {
     pub flags: Flags,
     pub from: NodeChangeState,
     pub to: NodeChangeState,
+    /// Path of the node, relative to the root of the working tree.
     pub path: RelativePath,
+    /// Path the node was at before a move, relative to the root of the working tree. `None` for
+    /// a change that is not a move, and for a move whose old path the walk cannot spell.
     pub from_path: Option<RelativePath>,
     /// What a filesystem diff measured at `path`, so a consumer does not re-stat
     /// it. `None` for a change between two revisions, which consulted no filesystem.

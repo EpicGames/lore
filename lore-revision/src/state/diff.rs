@@ -481,12 +481,18 @@ async fn add_change_for_solo_to_node(
         lore_trace!("Node {} deleted", to_named_node.node);
         (change::FileAction::Delete, None)
     } else if to_node.is_staged_move() {
-        // Look up the original path from the from state
-        let original_path = from_nodes
-            .state
-            .node_path(from_nodes.repository.clone(), to_named_node.node)
-            .await
-            .ok();
+        // TODO(mjansson): A node moved within a repository the working tree materializes below
+        //                 its root needs the path of the mount to spell where it was, which the
+        //                 walk does not carry. Such a move is realized as a delete and an add.
+        let original_path = if from_nodes.repository.id == from_nodes.repository.root_id() {
+            from_nodes
+                .state
+                .node_path(from_nodes.repository.clone(), to_named_node.node)
+                .await
+                .ok()
+        } else {
+            None
+        };
         lore_trace!(
             "Node {} moved from {:?} to {}",
             to_named_node.node,
@@ -1057,7 +1063,7 @@ async fn get_node_and_path(
             return Ok(None);
         }
     };
-    let path = path.push_into_buf(&name).freeze();
+    let path = path.push_into_buf(name).freeze();
 
     Ok(Some(NodeSearchResult { node, path }))
 }

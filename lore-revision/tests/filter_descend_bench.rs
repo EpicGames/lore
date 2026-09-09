@@ -204,6 +204,7 @@ fn timed_warm(
 }
 
 #[test]
+#[ignore = "benchmark: run on demand with --ignored"]
 fn descend_large_tree() {
     // At scale 8 this is roughly a quarter of a million nodes.
     let nodes = tree(12 * scale(), 4 * scale());
@@ -351,6 +352,7 @@ fn concurrent(
 }
 
 #[test]
+#[ignore = "benchmark: run on demand with --ignored"]
 fn descend_large_tree_in_parallel() {
     let nodes = tree(12 * scale(), 4 * scale());
     let units = units(&nodes, 3);
@@ -421,6 +423,7 @@ fn chain_tree(chains: usize, depth: usize, files: usize) -> Vec<TreeNode> {
 /// walks one step per ancestor component on a memo miss, a threaded walk one
 /// step per node whatever the depth.
 #[test]
+#[ignore = "benchmark: run on demand with --ignored"]
 fn descend_by_depth() {
     const ROUNDS: usize = 2;
     let target = 3_000 * scale();
@@ -454,6 +457,7 @@ fn descend_by_depth() {
 /// a directory with sixty-four spreads it. This is why a broad tree narrows the
 /// gap and a sparse one widens it.
 #[test]
+#[ignore = "benchmark: run on demand with --ignored"]
 fn descend_by_fanout() {
     const ROUNDS: usize = 2;
     const DEPTH: usize = 12;
@@ -482,6 +486,7 @@ fn descend_by_fanout() {
 /// The same comparison over a deep, narrow tree, where a whole-path query's
 /// ancestor fold is longest and a walk's single step is not.
 #[test]
+#[ignore = "benchmark: run on demand with --ignored"]
 fn descend_deep_tree() {
     // One chain 40 deep, fanning out to files only at the bottom, repeated wide
     // enough to time. Each level is a directory matching nothing, so a

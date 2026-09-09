@@ -1481,9 +1481,9 @@ typedef struct lore_file_stage_revision_event_data_t {
 
 // Data for the event emitted for each file affected by a stage operation.
 typedef struct lore_file_stage_file_event_data_t {
-  // Previous path of the file, when it was moved.
+  // Previous path of the file, when it was moved, relative to the root of the working tree.
   struct lore_string_t from_path;
-  // Path of the file.
+  // Path of the file, relative to the root of the working tree.
   struct lore_string_t path;
   // Action applied to the file.
   enum lore_file_action_t action;
@@ -1531,7 +1531,7 @@ typedef struct lore_file_unstage_revision_event_data_t {
 
 // Data for the event emitted for each file affected by an unstage operation.
 typedef struct lore_file_unstage_file_event_data_t {
-  // Path of the file.
+  // Path of the file, relative to the root of the working tree.
   struct lore_string_t path;
   // Action applied to the file.
   enum lore_file_action_t action;

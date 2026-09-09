@@ -1367,6 +1367,7 @@ async fn realize_changes_delete(
                 stage::stage_delete(
                     change.from.repository.clone(),
                     state_stage.clone(),
+                    change.path.clone(),
                     node_link.node,
                     if is_merge {
                         NodeFlags::StagedMerge

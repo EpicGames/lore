@@ -4598,8 +4598,9 @@ async fn push_dirty_child_name(
     child_id: NodeID,
 ) -> Result<bool, StateError> {
     let child_name = state.node_name_ref(repository, child_id).await?;
-    path.push(&*child_name);
-    Ok(!child_name.is_empty())
+    let named = !child_name.is_empty();
+    path.push(child_name);
+    Ok(named)
 }
 
 /// One directory on the way down, and where the walk left off in its children.
@@ -4897,13 +4898,15 @@ async fn gather_tree_paths_node(
     let node = block.node(node_index);
     node.walk_step(node_id, expected_parent, cycle)?;
 
-    let node_name = block
-        .node_name_ref(node_index)
-        .forward::<StateError>("Node name")?;
-    let node_path = if parent_path.is_empty() {
-        RelativePath::new_from_initial_path(node_name).unwrap_or_default()
-    } else {
-        parent_path.push_into_buf(node_name).freeze()
+    let node_path = {
+        let node_name = block
+            .node_name_ref(node_index)
+            .forward::<StateError>("Node name")?;
+        if parent_path.is_empty() {
+            RelativePath::new_from_initial_path(&*node_name).unwrap_or_default()
+        } else {
+            parent_path.push_into_buf(&node_name).freeze()
+        }
     };
     let address = if node.is_directory() {
         None
@@ -9511,9 +9514,15 @@ async fn verify_node_name_case_impl(
                 delete_node
             );
 
+            let delete_path = if delete_node.node == next_named_node.node {
+                &second_path
+            } else {
+                &first_path
+            };
             stage_delete(
                 nodes.repository.clone(),
                 nodes.state.clone(),
+                RelativePath::new_from_initial_path(delete_path).unwrap_or_default(),
                 delete_node.node,
                 NodeFlags::NoFlags,
                 Arc::default(),
@@ -10507,6 +10516,7 @@ pub async fn apply_tree_changes(
             crate::stage::stage_delete(
                 repository.clone(),
                 target_state.clone(),
+                change.path.clone(),
                 node_link.node,
                 NodeFlags::StagedMerge,
                 stats.clone(),
@@ -10540,6 +10550,7 @@ pub async fn apply_tree_changes(
                 crate::stage::stage_delete(
                     repository.clone(),
                     target_state.clone(),
+                    from_path.clone(),
                     node_link.node,
                     NodeFlags::StagedMerge,
                     stats.clone(),

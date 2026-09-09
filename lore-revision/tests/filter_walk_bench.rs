@@ -34,6 +34,7 @@ fn build() -> FilterInstance {
 /// `excludes` is a single pass over the line list and never looks at ancestors --
 /// so main's `excludes` number is the like-for-like comparison.
 #[test]
+#[ignore = "benchmark: run on demand with --ignored"]
 fn child_exclusion_state_throughput() {
     use lore_revision::filter::FilterState;
 

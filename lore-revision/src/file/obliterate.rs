@@ -165,6 +165,7 @@ pub async fn obliterate_file(
     stage_delete(
         repository.clone(),
         state.clone(),
+        relative_path.clone(),
         node_link.node,
         NodeFlags::NoFlags,
         stage_stats,
