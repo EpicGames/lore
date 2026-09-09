@@ -9,8 +9,13 @@ telemetry integration, or replication is configured.
 
 Both `linux/amd64` and `linux/arm64` build. `.cargo/config.toml` pins `aarch64-unknown-linux-gnu`
 to Graviton3+ via `-C target-cpu=neoverse-512tvb`, which faults on older arm64 parts, so the
-Dockerfile assembles `RUSTFLAGS` itself and leaves that tuning off by default. The arm64 image
-therefore runs on any armv8-a host, Apple Silicon included.
+Dockerfile assembles `RUSTFLAGS` itself and leaves that tuning off by default. An arm64 image you
+build here therefore runs on any armv8-a host, Apple Silicon included.
+
+`lore-server/Dockerfile` is the one to build from source, and is what the rest of this section
+describes. `lore-server/Dockerfile.release` packages a binary already published as a release asset
+and compiles nothing; it is used only by the publish workflow, and needs that asset unpacked into
+`dist/<arch>/` beside it.
 
 ## Building
 
@@ -32,20 +37,27 @@ docker build -f lore-server/Dockerfile --build-arg ARM64_TARGET_CPU=neoverse-512
 
 ## Published images
 
-The publish workflow ships both variants to `ghcr.io/epicgames/lore/loreserver`:
+The publish workflow packages the `loreserver` binaries from a published release — it compiles
+nothing — and pushes them to `ghcr.io/epicgames/lore/loreserver`:
 
 | Tag | arm64 build |
 | --- | --- |
-| `X.Y.Z`, `X.Y`, `latest` | baseline `armv8-a` — runs on any arm64 host |
 | `X.Y.Z-graviton`, `X.Y-graviton`, `latest-graviton` | tuned for Graviton3+ — faults on older arm64 |
 
-`linux/amd64` is baseline in both, and is the same image in each manifest list.
+`linux/amd64` is baseline.
 
-Every tag is signed keylessly with cosign, and the build summary for a release prints the
-`cosign verify` invocation for the digest it published. A `sha-<commit>` tag appears alongside each
-release, on the same digest: the signature is made against it before any release tag is pointed at
-that digest, so no release tag is ever briefly unsigned. It stays afterwards as a record of which
-commit built which image.
+There is currently no unsuffixed tag and no plain `latest`. Releases ship exactly one arm64 Linux
+binary and it is tuned for Graviton3+, so an unsuffixed tag would hand that binary to Apple
+Silicon and Ampere hosts, which fault on it. For a portable arm64 image, build from source as
+above; otherwise run the amd64 image. When releases start shipping a baseline `armv8-a` binary,
+the portable stream will take the unsuffixed tags.
+
+Every tag is signed keylessly with cosign, and the run summary prints the `cosign verify`
+invocation for the digest it published, along with the release assets packaged and their SHA-256 —
+the releases carry no checksums of their own, so that is what ties an image back to exact bytes. A
+`sha-<commit>-graviton` tag appears alongside each release, on the same digest: the signature is
+made against that digest before any release tag is pointed at it, so no release tag is ever briefly
+unsigned. It stays afterwards as a record of which commit published which image.
 
 ## Running
 

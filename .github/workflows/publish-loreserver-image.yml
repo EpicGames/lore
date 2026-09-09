@@ -375,4 +375,12 @@ jobs:
             echo "- \`${IMAGE}:${STAGING_TAG}\` (staging tag the signature was made against)"
             echo ""
             echo "No unsuffixed tag is published: the only released arm64 binary is tuned for Graviton3+."
+            echo ""
+            echo "Verify the signature with:"
+            echo ""
+            echo '```sh'
+            echo "cosign verify ${IMAGE}@${DIGEST} \\"
+            echo "  --certificate-identity-regexp '${IDENTITY_REGEXP}' \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
