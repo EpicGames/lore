@@ -221,10 +221,15 @@ jobs:
             echo "${asset} sha256=${sha}"
             tar -xzf "${asset}" -C "dist/${arch}"
             rm -f "${asset}"
-            if [ ! -x "dist/${arch}/loreserver" ]; then
-              echo "::error::${asset} did not contain an executable ./loreserver"
+            if [ ! -f "dist/${arch}/loreserver" ]; then
+              echo "::error::${asset} did not contain ./loreserver"
               exit 1
             fi
+            # The release archive stores the binary 0644, so the execute bit
+            # has to be added here: COPY carries the context's mode into the
+            # image, and a loreserver that cannot be executed fails the
+            # container at startup rather than at build.
+            chmod +x "dist/${arch}/loreserver"
           done
 
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
