@@ -12,7 +12,7 @@ Operational defaults for the rules a writer actually controls when accessibility
 - Embedded video requires captions or a transcript.
 
 ```markdown
-![The Lore commit graph after merging feature/auth into main](images/commit-graph.png)
+![The Lore revision graph after merging feature/auth into main](images/revision-graph.png)
 ```
 
 ## Don't use color alone

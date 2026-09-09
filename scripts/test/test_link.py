@@ -5538,7 +5538,7 @@ def test_link_scoped_commit_consecutive(new_lore_repo):
     output = repo.commit("First link commit", link=link_path)
     assert "Commit succeeded" in output
 
-    # Second file change inside the link — no parent commit in between
+    # Second file change inside the link — no parent revision in between
     with repo.open_file(f"{link_path}/second.txt", "w+") as f:
         f.writelines(["second file\n"])
     repo.stage(f"{link_path}/second.txt")
@@ -6182,7 +6182,7 @@ def test_link_merge_all_file_conflict_resolve_in_place(new_lore_repo):
     urc.branch_merge_resolve(conflict_file)
 
     # Commit finishes the merge: link committed first (commit_link_node),
-    # then parent commit incorporates the new link pin.
+    # then committing in the parent incorporates the new link pin.
     urc.commit("Merge feature-branch with resolved link conflict")
     urc.push()
 

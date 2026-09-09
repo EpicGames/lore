@@ -1485,7 +1485,7 @@ mod aws_store_tests {
 
     /// Regression test for a silent push failure on newly created repositories.
     ///
-    /// `branch::create` for a default branch (no commits yet) calls
+    /// `branch::create` for a default branch (no revisions yet) calls
     /// `store_latest(prev=0, latest=0)`, which goes through
     /// `compare_and_swap(expected=0, value=0)` and writes a `{value=0000…}` row
     /// to `DynamoDB`. Previously the zero-expected CAS condition was

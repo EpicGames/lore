@@ -5089,7 +5089,7 @@ pub extern "C" fn lore_revision_find_async(
 
 pub type LoreRevisionHistoryArgs = crate::revision::LoreRevisionHistoryArgs;
 
-/// Retrieve the commit history of the current branch.
+/// Retrieve the revision history of the current branch.
 ///
 /// # Events
 ///

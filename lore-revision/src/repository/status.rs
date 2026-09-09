@@ -1200,7 +1200,7 @@ pub async fn status(
         .await
         .unwrap_or_default();
 
-    // Authoritative answer to "does local have commits not on remote history?":
+    // Authoritative answer to "does local have revisions not on remote history?":
     // the LATEST_STATUS flag set by commit/push/sync/clone/restore. When
     // Convergent, local_latest is guaranteed to be on the remote history line —
     // any difference can only mean remote moved past us.
@@ -1222,7 +1222,7 @@ pub async fn status(
         } else if local_n > remote_n {
             local_ahead = true;
             // Refine with last_sync: if remote has moved beyond the last
-            // recorded sync point, it has commits we don't have.
+            // recorded sync point, it has revisions we don't have.
             if last_sync != remote_latest.unwrap_or_default() {
                 remote_ahead = true;
             }

@@ -681,7 +681,7 @@ pub async fn commit_impl(
     lore_debug!("Collected {} dirty paths", dirty_paths.len());
 
     // Capture the merge parents now — `finalize_commit` will overwrite
-    // `parent_self` with the new commit signature, which would prevent us
+    // `parent_self` with the new revision hash signature, which would prevent us
     // from matching against a `merge_carry` blob below.
     let merge_parent_self = state_staged.parent_self();
     let merge_parent_other = state_staged.parent_other();

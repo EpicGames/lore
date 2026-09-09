@@ -551,7 +551,7 @@ mod tests {
     }
 
     /// Stage `SEED_FILE_COUNT` files filled with `byte` and commit them.
-    /// Returns the commit signature.
+    /// Returns the revision hash signature.
     async fn seed_commit(
         repository: &Arc<RepositoryContext>,
         path: &std::path::Path,

@@ -188,11 +188,11 @@ Decision tree, top-down:
 
 ```markdown
 > [!TIP]
-> Use `lore log --graph` to see branch topology at a glance.
+> Use `lore history --oneline` to scan a branch's recent revisions.
 
 > [!NOTE]
-> Lore commits are content-addressed. The commit hash is computed from
-> the content, so two identical commits have the same hash.
+> Lore revisions are content-addressed. The hash signature is computed
+> from the content, so two identical revisions share one signature.
 
 > [!IMPORTANT]
 > Run `lore sync` before branching, or your new branch will start from

@@ -32,11 +32,11 @@ Write the headword exactly as it should appear in prose: correct capitalization,
 When the form depends on usage, add a part-of-speech tag in parentheses and list each form as its own entry on consecutive lines:
 
 ```markdown
-### Commit (n)
-A snapshot of the working tree...
+### Stage (n)
+The set of file paths marked...
 
-### Commit (v)
-To record the staged changes...
+### Stage (v)
+To record the intent to include...
 ```
 
 Within each letter section, sort entries alphabetically, case-insensitive. Acronyms sort by their letters, not their expansion. Part-of-speech tags don't affect sort order.
@@ -47,14 +47,14 @@ Lead with what the term **is**. No preamble. No "this term refers to."
 
 ```markdown
 <!-- correct -->
-### Commit (n)
-A snapshot of the working tree at a point in time. Each commit has a unique ID and a parent commit.
+### Revision
+A frozen snapshot of the entire repository tree. Each revision has a hash signature and a parent revision.
 ```
 
 ```markdown
 <!-- incorrect -->
-### Commit (n)
-This term refers to the act of saving changes to the repository.
+### Revision
+This term refers to a snapshot that Lore saves in the repository.
 ```
 
 Use plain present tense, third person. Don't address the reader as `you` inside a glossary entry.
@@ -83,11 +83,11 @@ A change request (CR) is a proposed set of revisions submitted for review before
 If a term has two senses (verb vs noun, lowercase generic vs uppercase named feature), give each sense its own entry on consecutive lines.
 
 ```markdown
-### Commit (v)
-To record a snapshot of the staged changes as a new commit (`lore commit`).
+### Stage (v)
+To record the intent to include a file's change in the next revision (`lore stage <path>`).
 
-### Commit (n)
-A snapshot of the working tree at a point in time. Each commit has a unique ID and a parent commit.
+### Stage (n)
+The set of file paths marked for inclusion in the next revision.
 ```
 
 ### Cite authority for contested rules
@@ -120,8 +120,8 @@ Also see: latest, working tree.
 Use **Compare to** when two entries are distinguishable and the reader benefits from contrasting them:
 
 ```markdown
-### Commit (n)
-A snapshot of the working tree at a point in time.
+### Latest
+The pointer to the most recent revision on a branch, held in the mutable store.
 
 Compare to: revision.
 ```

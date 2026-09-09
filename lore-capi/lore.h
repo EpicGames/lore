@@ -10025,7 +10025,7 @@ void lore_revision_find_async(const struct lore_global_args_t *globals,
                               const struct lore_revision_find_args_t *args,
                               struct lore_event_callback_config_t callback);
 
-// Retrieve the commit history of the current branch.
+// Retrieve the revision history of the current branch.
 //
 // # Events
 //

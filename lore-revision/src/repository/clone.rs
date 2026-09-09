@@ -902,7 +902,7 @@ pub async fn clone(
         // server's auth_url. `remote.identity()` is that resolved user_id —
         // the same form (JWT `sub`) that production commits use for
         // `created-by`/`committed-by`, so the display layer's user_id
-        // → name lookup in `lore log` still works.
+        // → name lookup in `lore history` still works.
         let resolved = remote.identity();
         (!resolved.is_empty()).then(|| resolved.to_string())
     };

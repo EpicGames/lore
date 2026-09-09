@@ -187,7 +187,7 @@ def test_history_only_branch(new_lore_repo):
         "Case 5: First entry (branch point) should match main head"
     )
 
-    # --- Case 6: Empty branch (no commits, anchor at branch point) ---
+    # --- Case 6: Empty branch (no revisions, anchor at branch point) ---
     repo.branch_create("empty-branch")
     repo.branch_switch("empty-branch")
 

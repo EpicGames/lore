@@ -578,7 +578,7 @@ pub async fn warn_branch_multiple_instance(
 ///
 /// The revision comes from `ANCHOR_CURRENT`, the branch from
 /// `ANCHOR_CURRENT_BRANCH`. If the branch key exists but the revision
-/// is zero, the repository has no commits yet (fresh repo after create).
+/// is zero, the repository has no revisions yet (fresh repo after create).
 pub async fn load_current_anchor(
     repository: &Arc<RepositoryContext>,
 ) -> Result<(Hash, BranchId), AnchorError> {

@@ -1042,7 +1042,7 @@ def test_sync_locally_advanced_remains_divergent(new_lore_repo):
     # Instance B syncs — fast-forwards to A's unpushed commit
     repo_b.sync()
 
-    # Instance B should see isLocalAhead=1 — local branch has commits remote doesn't
+    # Instance B should see isLocalAhead=1 — local branch has revisions remote doesn't
     status_b = parse_jsonl(repo_b.status(json=True), "repositoryStatusRevision")
     assert status_b[0]["isLocalAhead"] == 1, (
         "After local sync, branch should be ahead of remote (isLocalAhead=1)"
