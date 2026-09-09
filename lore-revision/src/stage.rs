@@ -542,7 +542,7 @@ pub(crate) async fn stage_filesystem_path(
                 );
 
                 let linked_repository =
-                    Arc::new(current_repository.to_link_context(link_repository_id).await);
+                    current_repository.to_link_context(link_repository_id).await;
                 let mut linked_state =
                     State::deserialize(current_repository.clone(), link_revision)
                         .await
@@ -622,7 +622,7 @@ pub(crate) async fn stage_filesystem_path(
         // Check if case of repository path matches the given path
         let mut current_repository = repository.clone();
         let node_state = if node_link.repository != repository.id {
-            current_repository = Arc::new(repository.to_link_context(node_link.repository).await);
+            current_repository = repository.to_link_context(node_link.repository).await;
             State::deserialize(current_repository.clone(), node_link.revision)
                 .await
                 .forward::<StageError>("Failed to deserialize revision state")?
@@ -1742,7 +1742,7 @@ async fn stage_child_directory(
     if from_node.is_link() {
         let link = from_node.linked_node();
 
-        let linked_repository = Arc::new(repository.to_link_context(link.repository).await);
+        let linked_repository = repository.to_link_context(link.repository).await;
         let mut linked_state = State::deserialize(linked_repository.clone(), link.revision)
             .await
             .forward::<StageError>("Failed to deserialize linked state")?;
@@ -3210,7 +3210,7 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
         let group = if let Some(idx) = group_index {
             &mut groups[idx]
         } else {
-            let link_context = Arc::new(repository.to_link_context(link_ref.repository).await);
+            let link_context = repository.to_link_context(link_ref.repository).await;
             let link_state_staged =
                 state::State::deserialize(link_context.clone(), link_ref.signature)
                     .await

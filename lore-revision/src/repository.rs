@@ -603,10 +603,6 @@ impl RepositoryPaths {
     pub fn new(path: PathBuf, dot_path: PathBuf) -> Self {
         Self { path, dot_path }
     }
-
-    pub fn with_link_path(self, link_path: &Path) -> Self {
-        Self::new(self.path.join(link_path), self.dot_path)
-    }
 }
 
 pub struct RepositoryContext {
@@ -620,6 +616,8 @@ pub struct RepositoryContext {
     mutable_store: Arc<dyn MutableStore>,
     file_system: Arc<dyn FilesystemProvider>,
     pub id: RepositoryId,
+    /// The root top level repository ID.
+    root_id: RepositoryId,
     pub instance_id: crate::instance::InstanceId,
     remote: Arc<tokio::sync::RwLock<RemoteState>>,
     pub filter: Arc<Filter>,
@@ -718,6 +716,7 @@ impl RepositoryContext {
             immutable_store,
             mutable_store,
             id,
+            root_id: id,
             instance_id,
             remote: remote_arc(remote),
             filter,
@@ -775,6 +774,11 @@ impl RepositoryContext {
         self.path()
             .unwrap_or_else(|| Path::new("<unset>"))
             .display()
+    }
+
+    /// The root top level repository ID.
+    pub fn root_id(&self) -> RepositoryId {
+        self.root_id
     }
 
     pub fn salt(&self) -> &'static [u8] {
@@ -948,6 +952,7 @@ impl RepositoryContext {
             immutable_store,
             mutable_store,
             id,
+            root_id: id,
             instance_id: crate::instance::InstanceId::default(),
             remote: remote_arc(RemoteState::Offline),
             filter: Arc::default(),
@@ -968,6 +973,7 @@ impl RepositoryContext {
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
             id,
+            root_id: id,
             instance_id: self.instance_id,
             remote: remote_arc(RemoteState::Offline),
             filter: self.filter.clone(),
@@ -993,6 +999,7 @@ impl RepositoryContext {
             immutable_store,
             mutable_store,
             id: RepositoryId::default(),
+            root_id: RepositoryId::default(),
             instance_id: crate::instance::InstanceId::default(),
             remote: remote_arc(RemoteState::Offline),
             filter: Arc::default(),
@@ -1013,6 +1020,7 @@ impl RepositoryContext {
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
             id: RepositoryId::default(),
+            root_id: RepositoryId::default(),
             instance_id: self.instance_id,
             remote: remote_arc(RemoteState::Offline),
             filter: self.filter.clone(),
@@ -1047,6 +1055,7 @@ impl RepositoryContext {
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
             id: self.id,
+            root_id: self.root_id,
             instance_id: self.instance_id,
             remote: remote_arc(RemoteState::from_result(remote)),
             filter,
@@ -1061,7 +1070,16 @@ impl RepositoryContext {
         }
     }
 
-    pub async fn to_link_context(&self, id: RepositoryId) -> Self {
+    /// This context aimed at the repository a link mounts, keeping the working tree it is
+    /// materialized into.
+    ///
+    /// The mounted repository holds its own tree of nodes, and a node in it is named by the
+    /// state and node id a caller already holds. Every path in a working tree is spelled
+    /// relative to the root this keeps, so the paths a walk carries across a mount stay the
+    /// paths the filesystem, the filter and the modified-time keys answer for. A path within
+    /// the mounted tree is derived from its node where one is called for, by
+    /// [`State::node_path`](crate::state::State::node_path).
+    pub async fn to_link_context(&self, id: RepositoryId) -> Arc<Self> {
         let remote = self.remote().await;
         let remote = if let Ok(remote) = remote {
             remote.connect_module(id).await
@@ -1069,12 +1087,13 @@ impl RepositoryContext {
             remote
         };
         let settings = self.settings.clone();
-        RepositoryContext {
+        Arc::new(RepositoryContext {
             link_read: self.link_read.clone(),
             paths: self.paths.clone(),
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
             id,
+            root_id: self.root_id,
             instance_id: self.instance_id,
             remote: remote_arc(RemoteState::from_result(remote)),
             filter: self.filter.clone(),
@@ -1086,9 +1105,11 @@ impl RepositoryContext {
             session_pool: Default::default(),
             lazy_session: Default::default(),
             file_system: self.file_system.clone(),
-        }
+        })
     }
 
+    /// This context aimed at the repository a layer draws from, keeping the working tree it is
+    /// materialized into, as [`Self::to_link_context`] does for a link.
     pub async fn to_layer_context(&self, id: RepositoryId) -> Self {
         let remote = self.remote().await;
         let remote = if let Ok(remote) = remote {
@@ -1103,6 +1124,7 @@ impl RepositoryContext {
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
             id,
+            root_id: self.root_id,
             instance_id: self.instance_id,
             remote: remote_arc(RemoteState::from_result(remote)),
             filter: self.filter.clone(),
@@ -1124,6 +1146,7 @@ impl RepositoryContext {
             immutable_store: self.immutable_store.clone(),
             mutable_store: self.mutable_store.clone(),
             id: self.id,
+            root_id: self.root_id,
             instance_id: self.instance_id,
             remote: self.remote.clone(),
             filter,

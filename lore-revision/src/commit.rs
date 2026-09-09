@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -701,8 +700,9 @@ pub async fn commit_impl(
             token.share(),
             state_current.clone(),
             state_staged.clone(),
+            RelativePath::new(),
+            ROOT_NODE,
             metadata.clone(),
-            None,
             link_messages.clone(),
             current_branch,
             reporting.clone(),
@@ -778,17 +778,21 @@ pub async fn commit_impl(
         } else {
             metadata.clone()
         };
+        let (layer_node, layer_path) = layer_commit_root(
+            &layer_repository,
+            &layer_state.state_staged,
+            layer.source_path.as_str(),
+            layer.target_path.as_str(),
+        )
+        .await?;
         let layer_result = commit_staged_revision(
             layer_repository.clone(),
             token.share(),
             layer_state.state_current.clone(),
             layer_state.state_staged.clone(),
+            layer_path,
+            layer_node,
             layer_metadata.clone(),
-            if !layer.source_path.is_empty() || !layer.target_path.is_empty() {
-                Some((layer.source_path.clone(), layer.target_path.clone()))
-            } else {
-                None
-            },
             Arc::new(HashMap::new()),
             current_branch,
             reporting.clone(),
@@ -955,18 +959,21 @@ async fn commit_layer_only(
     )
     .await?;
 
+    let (layer_node, layer_path) = layer_commit_root(
+        &layer_state.repository,
+        &layer_state.state_staged,
+        layer.source_path.as_str(),
+        layer.target_path.as_str(),
+    )
+    .await?;
     let (layer_signature, layer_modified_times) = commit_staged_revision(
         layer_state.repository.clone(),
         token.share(),
         layer_state.state_current.clone(),
         layer_state.state_staged.clone(),
+        layer_path,
+        layer_node,
         metadata,
-        // Same path-remap guard as the auto-bundle layer commit.
-        if !layer.source_path.is_empty() || !layer.target_path.is_empty() {
-            Some((layer.source_path.clone(), layer.target_path.clone()))
-        } else {
-            None
-        },
         Arc::new(HashMap::new()),
         parent_current_branch,
         reporting.clone(),
@@ -1098,17 +1105,9 @@ async fn commit_link_only(
         return Err(NothingStaged.into());
     }
 
-    // Create link repository context with the correct filesystem path
-    let mut link_context = repository
+    let link_repository = repository
         .to_link_context(resolved_staged.link_context.id)
         .await;
-    link_context.paths = Some(
-        link_context
-            .paths
-            .ok_or(CommitError::internal("Repository context missing a path"))?
-            .with_link_path(link_path.as_ref()),
-    );
-    let link_repository = Arc::new(link_context);
 
     // Determine the effective current revision for the link. The parent's
     // committed pin (`link_current_revision`) may be stale if a prior --link
@@ -1164,23 +1163,15 @@ async fn commit_link_only(
         link_state_staged.revision()
     );
 
-    let source_path = link_state_staged
-        .node_path(link_repository.clone(), resolved_staged.link_node.child)
-        .await
-        .forward::<CommitError>("Failed to resolve link source path")?;
-    let path_remap = if source_path.is_empty() {
-        None
-    } else {
-        Some((source_path, String::new()))
-    };
-
+    let Ok(link_mount_path) = RelativePath::from_str(&link_path);
     let (link_signature, link_modified_times) = commit_staged_revision(
         link_repository.clone(),
         token.share(),
         link_state_current.clone(),
         link_state_staged.clone(),
+        link_mount_path,
+        resolved_staged.link_node.child,
         metadata,
-        path_remap,
         Arc::new(HashMap::new()),
         link_branch,
         reporting.clone(),
@@ -1280,8 +1271,9 @@ async fn commit_link_only(
             token.share(),
             child_current.clone(),
             child_state.clone(),
+            RelativePath::new(),
+            ROOT_NODE,
             child_metadata,
-            None,
             Arc::new(HashMap::new()),
             level.branch,
             reporting.clone(),
@@ -1457,14 +1449,49 @@ async fn finalize_commit(
     Ok(())
 }
 
+/// Where a layer's commit starts: the node its configured source path names in the state being
+/// committed, and the path the layer is materialized at in the working tree.
+///
+/// A layer draws a subtree of the repository it names, and that source path is configuration
+/// naming a node of that repository's own tree — resolving it is the one place the drawn-from
+/// tree's spelling of a path is read. A layer that draws a whole repository into the root of
+/// the working tree starts at the root of both.
+async fn layer_commit_root(
+    repository: &Arc<RepositoryContext>,
+    state_staged: &Arc<State>,
+    source_path: &str,
+    target_path: &str,
+) -> Result<(NodeID, RelativePath), CommitError> {
+    let relative_path = RelativePath::new_from_initial_path(target_path)
+        .forward::<CommitError>("Invalid layer target path")?;
+    if source_path.is_empty() {
+        return Ok((ROOT_NODE, relative_path));
+    }
+
+    let node_link = state_staged
+        .find_node_link(repository.clone(), source_path)
+        .await
+        .unwrap_or_default();
+    if !node_link.is_valid() {
+        return Err(CommitError::internal("Invalid subpath"));
+    }
+    if node_link.repository != repository.id {
+        // TODO(mjansson): Layers that specify a path living inside a link need
+        //                 special snowflake care here to commit from the link and down
+        return Err(CommitError::internal("Not supported"));
+    }
+    Ok((node_link.node, relative_path))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn commit_staged_revision(
     repository: Arc<RepositoryContext>,
     token: RepositoryWriteToken,
     state_current: Arc<State>,
     state_staged: Arc<State>,
+    relative_path: RelativePath,
+    node_id: NodeID,
     metadata: Arc<Metadata>,
-    path_remap: Option<(String, String)>,
     link_messages: Arc<HashMap<String, String>>,
     parent_branch: BranchId,
     reporting: CommitReporting,
@@ -1511,9 +1538,9 @@ async fn commit_staged_revision(
             repository.clone(),
             token.share(),
             state_staged.clone(),
-            repository.require_path()?,
+            relative_path,
+            node_id,
             metadata.clone(),
-            path_remap,
             link_messages,
             parent_branch,
             work_tracker.clone(),
@@ -1617,14 +1644,19 @@ pub async fn store_branch_latest_and_make_current(
     Ok(())
 }
 
+/// Fragments every file the state holds and rehashes the directories the changes reach.
+///
+/// The walk starts at `node_id`, which `relative_path` is the working-tree path of: the root of
+/// the repository for a commit that covers the whole of one, and the path a link or layer is
+/// materialized at for a commit that covers what it draws in.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_files_and_rehash(
     repository: Arc<RepositoryContext>,
     token: RepositoryWriteToken,
     state: Arc<State>,
-    repository_root_path: &Path,
+    relative_path: RelativePath,
+    node_id: NodeID,
     metadata: Arc<Metadata>,
-    path_remap: Option<(String, String)>,
     link_messages: Arc<HashMap<String, String>>,
     parent_branch: BranchId,
     tracker: Arc<lore_storage::write_tracker::WriteTracker>,
@@ -1634,39 +1666,11 @@ pub(crate) async fn commit_files_and_rehash(
 ) -> Result<(), CommitError> {
     lore_info!("Fragmenting files and updating tree hashes");
 
-    let mut relative_path = RelativePath::new();
-
     let delta = Arc::new(parking_lot::RwLock::new(BytesMut::new()));
     let discard = Arc::new(parking_lot::RwLock::new(vec![]));
     let subnodes_to_discard = Arc::new(parking_lot::RwLock::new(vec![]));
 
     event::LoreEvent::RevisionCommitBegin(LoreRevisionCommitBeginEventData::default()).send();
-
-    let mut root_path = repository_root_path.to_path_buf();
-    let mut root_node = ROOT_NODE;
-
-    if let Some((source_path, target_path)) = path_remap {
-        if !target_path.is_empty() {
-            root_path.push(target_path);
-        }
-        if !source_path.is_empty() {
-            let node_link = state
-                .find_node_link(repository.clone(), source_path.as_str())
-                .await
-                .unwrap_or_default();
-            if !node_link.is_valid() {
-                return Err(CommitError::internal("Invalid subpath"));
-            }
-            if node_link.repository != repository.id {
-                // TODO(mjansson): Layers that specify a path living inside a link need
-                //                 special snowflake care here to commit from the link and down
-                return Err(CommitError::internal("Not supported"));
-            }
-            root_node = node_link.node;
-            relative_path = RelativePath::new_from_initial_path(source_path.as_str())
-                .forward::<CommitError>("Invalid subpath")?;
-        }
-    }
 
     let (file_tx, file_rx) = mpsc::channel(DEFAULT_WORK_CHANNEL_CAPACITY);
 
@@ -1700,9 +1704,8 @@ pub(crate) async fn commit_files_and_rehash(
                 repository,
                 token,
                 state,
-                root_path,
                 relative_path,
-                root_node,
+                node_id,
                 delta,
                 discard,
                 subnodes_to_discard,
@@ -1798,7 +1801,6 @@ pub(crate) async fn commit_files_and_rehash(
 
 struct FileToCommit {
     node_id: NodeID,
-    absolute_path: PathBuf,
     relative_path: RelativePath,
 }
 
@@ -1807,7 +1809,6 @@ async fn commit_directory(
     repository: Arc<RepositoryContext>,
     token: RepositoryWriteToken,
     state: Arc<State>,
-    absolute_path: PathBuf,
     relative_path: RelativePath,
     node_id: NodeID,
     delta: Arc<parking_lot::RwLock<BytesMut>>,
@@ -1868,11 +1869,12 @@ async fn commit_directory(
             continue;
         }
 
+        // Takes the name by value so its block read lock ends here, rather than reaching the
+        // commit of the child below (see NodeNameLock docs).
+        let relative_path = relative_path.push_into_buf(node_name).freeze();
+
         debug_assert!(node.is_directory());
         lore_trace!("Committing directory node {node_id} child {child_node_id}");
-
-        let relative_path = relative_path.push_into_buf(&node_name).freeze();
-        let absolute_path = absolute_path.join(node_name);
 
         if child_node.is_staged_delete() {
             if child_node.is_directory() {
@@ -1930,7 +1932,6 @@ async fn commit_directory(
                                 repository,
                                 token,
                                 state,
-                                absolute_path,
                                 relative_path,
                                 child_node_id,
                                 delta,
@@ -1953,7 +1954,6 @@ async fn commit_directory(
                         repository.clone(),
                         token.share(),
                         state.clone(),
-                        absolute_path,
                         relative_path,
                         child_node_id,
                         delta.clone(),
@@ -1999,7 +1999,6 @@ async fn commit_directory(
                         token,
                         state,
                         child_node_id,
-                        absolute_path,
                         relative_path,
                         delta,
                         metadata,
@@ -2014,7 +2013,6 @@ async fn commit_directory(
         } else if child_node.is_file() {
             if let Err(err) = collect_file(
                 child_node_id,
-                absolute_path,
                 relative_path,
                 &file_tx,
                 &stats,
@@ -2066,7 +2064,6 @@ fn commit_directory_recurse(
     repository: Arc<RepositoryContext>,
     token: RepositoryWriteToken,
     state: Arc<State>,
-    absolute_path: PathBuf,
     relative_path: RelativePath,
     node_id: NodeID,
     delta: Arc<parking_lot::RwLock<BytesMut>>,
@@ -2084,7 +2081,6 @@ fn commit_directory_recurse(
         repository,
         token,
         state,
-        absolute_path,
         relative_path,
         node_id,
         delta,
@@ -2277,7 +2273,6 @@ async fn commit_discard(
 
 async fn collect_file(
     node_id: NodeID,
-    absolute_path: PathBuf,
     relative_path: RelativePath,
     file_tx: &mpsc::Sender<FileToCommit>,
     stats: &CommitStats,
@@ -2292,7 +2287,6 @@ async fn collect_file(
     if file_tx
         .send(FileToCommit {
             node_id,
-            absolute_path,
             relative_path,
         })
         .await
@@ -2353,7 +2347,6 @@ async fn commit_execute(
                     block,
                     block_index,
                     node_index,
-                    file_to_commit.absolute_path,
                     file_to_commit.relative_path,
                     delta,
                     stats,
@@ -2411,7 +2404,6 @@ async fn commit_file(
     block: Arc<NodeBlock>,
     block_index: usize,
     node_index: usize,
-    absolute_path: PathBuf,
     relative_path: RelativePath,
     delta: Arc<parking_lot::RwLock<BytesMut>>,
     stats: Arc<CommitStats>,
@@ -2431,6 +2423,7 @@ async fn commit_file(
             .into());
         }
         // Check if file has conflict markers remaining
+        let absolute_path = relative_path.to_absolute_path(repository.require_path()?);
         if infer::infer_is_conflicted_by_path(absolute_path.as_path())
             .await
             .internal_with(|| format!("Failed reading file {}", relative_path.as_str()))?
@@ -2477,6 +2470,7 @@ async fn commit_file(
                 );
             }
 
+            let absolute_path = relative_path.to_absolute_path(repository.require_path()?);
             let metadata = metadata_before_fragmenting(absolute_path.as_path()).await?;
 
             let (address, size_content) = immutable::write_from_file_with_tracker(
@@ -2581,7 +2575,6 @@ async fn commit_link_node(
     token: RepositoryWriteToken,
     state: Arc<State>,
     node_id: NodeID,
-    absolute_path: PathBuf,
     relative_path: RelativePath,
     delta: Arc<parking_lot::RwLock<BytesMut>>,
     metadata: Arc<Metadata>,
@@ -2623,7 +2616,7 @@ async fn commit_link_node(
     // target repository hash and potentially target node index in this node data
 
     let link = node.linked_node();
-    let link_repository = Arc::new(repository.to_link_context(link.repository).await);
+    let link_repository = repository.to_link_context(link.repository).await;
     let signature = link.revision;
     let link_node = link.node;
     let link_state = State::deserialize(link_repository.clone(), signature)
@@ -2651,7 +2644,6 @@ async fn commit_link_node(
         link_repository.clone(),
         token,
         link_state,
-        absolute_path,
         relative_path,
         link_node,
         branch_id,
@@ -2720,7 +2712,6 @@ async fn commit_link(
     repository: Arc<RepositoryContext>,
     token: RepositoryWriteToken,
     state: Arc<State>,
-    absolute_path: PathBuf,
     relative_path: RelativePath,
     node_id: NodeID,
     branch: BranchId,
@@ -2737,17 +2728,7 @@ async fn commit_link(
     // tracker.await_all succeeds AND the branch pointer is updated.
     let link_tracker = Arc::new(parent_tracker.new_like());
 
-    let node_path = state
-        .node_path(repository.clone(), node_id)
-        .await
-        .forward::<CommitError>("Failed to get link node path")?;
-
-    lore_debug!(
-        "Committing link node_id {node_id} at relpath {}, abspath {}, nodepath {}",
-        relative_path.to_string(),
-        absolute_path.to_str().unwrap_or_default(),
-        node_path
-    );
+    lore_debug!("Committing link node {node_id} at {relative_path}");
 
     prune_dirty_for_commit(state.clone(), repository.clone()).await?;
 
@@ -2800,7 +2781,6 @@ async fn commit_link(
                         repository,
                         token,
                         state,
-                        absolute_path,
                         relative_path,
                         node_id,
                         delta,
@@ -2963,14 +2943,9 @@ async fn commit_link(
     })
     .send();
 
-    let node_link = state
-        .find_node_link(repository.clone(), &node_path)
-        .await
-        .forward::<CommitError>("Failed to find link node")?;
-
     link_modified_times.store(repository).await;
 
-    Ok((signature, node_link.node))
+    Ok((signature, node_id))
 }
 
 #[repr(C)]

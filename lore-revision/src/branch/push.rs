@@ -539,8 +539,7 @@ pub async fn push(
         .forward::<PushError>("re-deserializing current state for links")?;
     if let Ok(link_list) = state_current.link_list(repository.clone()).await {
         for link_reference in link_list.iter() {
-            let link_repository =
-                Arc::new(repository.to_link_context(link_reference.repository).await);
+            let link_repository = repository.to_link_context(link_reference.repository).await;
             let link_branch_id = link_reference.resolve_branch(branch);
             let link_local_latest = branch::load_latest(link_repository.clone(), link_branch_id)
                 .await
@@ -1637,7 +1636,7 @@ async fn push_revision_links(
     // TODO(vri): UCS-17135 - Push links in individual tasks
     for link_reference in link_list.iter() {
         let link_id = link_reference.repository;
-        let link_repository = Arc::new(repository.to_link_context(link_id).await);
+        let link_repository = repository.to_link_context(link_id).await;
         let link_signature = link_reference.signature;
         let link_state = State::deserialize(link_repository.clone(), link_signature)
             .await

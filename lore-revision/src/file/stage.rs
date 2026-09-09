@@ -984,8 +984,7 @@ async fn resolve_stage_target(
             let (resolved_repository, resolved_state) = if node_link.repository == repository.id {
                 (repository.clone(), state.clone())
             } else {
-                let linked_repository =
-                    Arc::new(repository.to_link_context(node_link.repository).await);
+                let linked_repository = repository.to_link_context(node_link.repository).await;
                 let linked_state =
                     State::deserialize(linked_repository.clone(), node_link.revision)
                         .await

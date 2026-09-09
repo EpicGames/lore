@@ -973,7 +973,7 @@ pub mod tests {
             default_repository_creation_args(immutable_store, mutable_store)
                 .with_filesystem_provider(filesystem.clone()),
         ));
-        let link = Arc::new(parent.to_link_context(RepositoryId::from([1; 16])).await);
+        let link = parent.to_link_context(RepositoryId::from([1; 16])).await;
 
         assert!(
             Arc::ptr_eq(&parent.file_system(), &link.file_system()),

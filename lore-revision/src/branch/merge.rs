@@ -55,6 +55,7 @@ use crate::node::NodeFileMetadataBlock;
 use crate::node::NodeFlags;
 use crate::node::NodeID;
 use crate::node::NodeLink;
+use crate::node::ROOT_NODE;
 use crate::path::emit_path_ignore;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
@@ -1047,11 +1048,9 @@ async fn enumerate_eligible_links(
             .node(repository.clone(), link_reference.local_node)
             .await
             .forward::<MergeError>("loading link node")?;
-        let link_context = Arc::new(
-            repository
-                .to_link_context(link_node.address.context.into())
-                .await,
-        );
+        let link_context = repository
+            .to_link_context(link_node.address.context.into())
+            .await;
 
         match link::check_link_merge_eligible(&link_context, link_reference, branch).await {
             link::LinkMergeEligibility::Eligible => {
@@ -1125,11 +1124,9 @@ async fn seed_resumed_merged_links(
             .node(repository.clone(), staged_ref.local_node)
             .await
             .forward::<MergeError>("loading staged link node")?;
-        let link_context = Arc::new(
-            repository
-                .to_link_context(link_node.address.context.into())
-                .await,
-        );
+        let link_context = repository
+            .to_link_context(link_node.address.context.into())
+            .await;
         merged_links.push(MergedLink {
             link_path,
             link_path_rel,
@@ -3627,8 +3624,7 @@ pub async fn merge_resolve(
             let touched = match touched_links.entry(node_link.repository) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    let link_context =
-                        Arc::new(repository.to_link_context(node_link.repository).await);
+                    let link_context = repository.to_link_context(node_link.repository).await;
                     let link_state =
                         state::State::deserialize(link_context.clone(), node_link.revision)
                             .await
@@ -4048,9 +4044,9 @@ async fn merge_into_link(
         repository.clone(),
         token.share(),
         state_staged.clone(),
-        repository.require_path()?,
+        RelativePath::new(),
+        ROOT_NODE,
         metadata.clone(),
-        None,
         std::sync::Arc::new(std::collections::HashMap::new()),
         target_branch,
         rehash_tracker.clone(),
@@ -4407,9 +4403,9 @@ pub async fn merge_into(
         repository.clone(),
         token.share(),
         state_staged.clone(),
-        repository.require_path()?,
+        RelativePath::new(),
+        ROOT_NODE,
         metadata.clone(),
-        None,
         std::sync::Arc::new(std::collections::HashMap::new()),
         current_branch,
         rehash_tracker.clone(),

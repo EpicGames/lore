@@ -1497,7 +1497,7 @@ async fn clone_discover_link(
     let link_node = link.node;
 
     lore_debug!("Resolve link {linked_repository_id} node {link_node}");
-    let linked_repository = Arc::new(ctx.repository.to_link_context(linked_repository_id).await);
+    let linked_repository = ctx.repository.to_link_context(linked_repository_id).await;
     if let Ok(link_remote) = linked_repository.remote().await {
         let correlation_id = execution_context().globals().correlation_id.to_string();
         if link_remote
@@ -1673,7 +1673,9 @@ pub(crate) async fn clone_node(
         if child_name.is_empty() {
             return Err(CloneError::internal("Failed to deserialize node name"));
         }
-        let child_repository_path = repository_path.join(&child_name);
+        // Takes the name by value so its block read lock ends here, rather than reaching the
+        // clone of the child below (see NodeNameLock docs).
+        let child_repository_path = repository_path.join(child_name);
 
         let (child_states, excluded) = repository.filter.child_emit_excludes(
             states,
@@ -1983,8 +1985,7 @@ fn spawn_clone_link(
         let link_node = link.node;
 
         lore_debug!("Resolve link {linked_repository_id} node {link_node}");
-        let linked_repository =
-            Arc::new(ctx.repository.to_link_context(linked_repository_id).await);
+        let linked_repository = ctx.repository.to_link_context(linked_repository_id).await;
         if let Ok(link_remote) = linked_repository.remote().await {
             let correlation_id = execution_context().globals().correlation_id.to_string();
             if let Ok(link_storage) = link_remote

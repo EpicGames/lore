@@ -90,7 +90,7 @@ pub async fn add(
     let state_staged = state_staged.unwrap_or_else(|| state_current.clone());
 
     lore_debug!("Resolve link {link} {source_path}");
-    let link = Arc::new(repository.to_link_context(link).await);
+    let link = repository.to_link_context(link).await;
 
     let link_remote = link.remote().await.forward::<LinkError>("Not connected")?;
 

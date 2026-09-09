@@ -1787,7 +1787,7 @@ async fn create_linked_branches(
 
     for (link_id, mounts) in link_groups {
         lore_spawn!(link_tasks, {
-            let link = Arc::new(repository.to_link_context(link_id).await);
+            let link = repository.to_link_context(link_id).await;
             let link_remote = link.remote().await.forward_with::<BranchError, _>(|| {
                 format!("Failed to connect to link repository {link_id}")
             })?;

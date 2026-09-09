@@ -718,7 +718,7 @@ async fn add_change_for_paired_nodes(
                         false
                     } else {
                         let linked_repository =
-                            Arc::new(to.repository.to_link_context(link_repository_id).await);
+                            to.repository.to_link_context(link_repository_id).await;
                         let linked_state =
                             State::deserialize(linked_repository.clone(), to_node.address.hash)
                                 .await

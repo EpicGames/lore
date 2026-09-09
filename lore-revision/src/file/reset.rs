@@ -1324,7 +1324,7 @@ async fn reset_walk_node(
         }
 
         let link = node.linked_node();
-        let linked_repository = Arc::new(repository.to_link_context(link.repository).await);
+        let linked_repository = repository.to_link_context(link.repository).await;
         let linked_state_current =
             state::State::deserialize(linked_repository.clone(), link.revision)
                 .await

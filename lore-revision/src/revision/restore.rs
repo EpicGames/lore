@@ -32,10 +32,12 @@ use crate::metadata::MetadataType;
 use crate::metadata::RESTORED_FROM;
 use crate::node::Node;
 use crate::node::NodeBlock;
+use crate::node::ROOT_NODE;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::revision::sync;
 use crate::state;
+use crate::util::path::RelativePath;
 use crate::util::serde::u8_as_bool;
 
 /// Event data reported at the start of the file phase of a restore.
@@ -449,9 +451,9 @@ pub async fn restore(
         repository.clone(),
         token.share(),
         state_staged.clone(),
-        repository.require_path()?,
+        RelativePath::new(),
+        ROOT_NODE,
         metadata.clone(),
-        None,
         std::sync::Arc::new(std::collections::HashMap::new()),
         current_branch,
         rehash_tracker.clone(),

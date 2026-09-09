@@ -809,12 +809,11 @@ async fn sync_layers(
 ) -> Result<(), SyncError> {
     for (layer, layer_revision) in layer_revisions {
         lore_debug!("Synchronizing layer {layer:?}");
-        let layer_repository = Arc::new(repository.to_layer_context(layer.repository).await);
-
         let target_path = RelativePath::new_from_initial_path(layer.target_path.as_str())
             .forward::<SyncError>("Invalid layer path configuration")?;
         let source_path = RelativePath::new_from_initial_path(layer.source_path.as_str())
             .forward::<SyncError>("Invalid layer path configuration")?;
+        let layer_repository = Arc::new(repository.to_layer_context(layer.repository).await);
 
         // TODO(mjansson): Emit as events
         lore_info!("Sync layer {} in {}", layer_repository.id, target_path);

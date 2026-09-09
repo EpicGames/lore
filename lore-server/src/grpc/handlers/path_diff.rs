@@ -769,7 +769,7 @@ mod tests {
         let state = Arc::new(state::State::new());
 
         let linked_repository_id = RepositoryId::from(uuid::Uuid::now_v7());
-        let linked_repository = Arc::new(repository.to_link_context(linked_repository_id).await);
+        let linked_repository = repository.to_link_context(linked_repository_id).await;
 
         let hash_from = Hash::hash_buffer(&[50, 51, 52, 53]);
         let hash_to = Hash::hash_buffer(&[54, 55, 56, 57]);
@@ -831,7 +831,7 @@ mod tests {
         let state = Arc::new(state::State::new());
 
         let linked_repository_id = RepositoryId::from(uuid::Uuid::now_v7());
-        let linked_repository = Arc::new(repository.to_link_context(linked_repository_id).await);
+        let linked_repository = repository.to_link_context(linked_repository_id).await;
 
         let deletion = NodeChange {
             action: lore_revision::change::FileAction::Delete,

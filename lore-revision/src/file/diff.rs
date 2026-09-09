@@ -1140,7 +1140,7 @@ async fn diff_read_file(
         })?;
 
     let (repository, state) = if node_link.repository != repository.id {
-        let repository = Arc::new(repository.to_link_context(node_link.repository).await);
+        let repository = repository.to_link_context(node_link.repository).await;
         let state = state::State::deserialize(repository.clone(), node_link.revision)
             .await
             .forward::<DiffError>("Failed deserializing revision state")?;

@@ -136,7 +136,7 @@ async fn resolve_listing_target(
         }
         link_depth += 1;
         let link = node.linked_node();
-        repository = Arc::new(repository.to_link_context(link.repository).await);
+        repository = repository.to_link_context(link.repository).await;
         state = State::deserialize(repository.clone(), link.revision)
             .await
             .map_err(|error| {

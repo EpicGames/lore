@@ -1855,7 +1855,7 @@ impl NodeLink {
         if self.is_valid_or_root()
             && (repository.id != self.repository || state.revision() != self.revision)
         {
-            let repository = Arc::new(repository.to_link_context(self.repository).await);
+            let repository = repository.to_link_context(self.repository).await;
             let state = State::deserialize(repository.clone(), self.revision).await?;
             Ok((repository, state))
         } else {

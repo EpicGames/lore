@@ -1678,7 +1678,7 @@ async fn realize_change_modify_add(
             let link_id = node.address.context;
             let link_revision = node.address.hash;
 
-            let link = Arc::new(repository.to_link_context(link_id.into()).await);
+            let link = repository.to_link_context(link_id.into()).await;
             let link_remote = link
                 .remote()
                 .await

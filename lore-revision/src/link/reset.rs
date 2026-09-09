@@ -114,7 +114,7 @@ pub(crate) async fn reset_staged_remove_link(
         .await
         .forward::<LinkError>("Failed to find link registry entry")?;
 
-    let linked_repository = Arc::new(repository.to_link_context(link_id).await);
+    let linked_repository = repository.to_link_context(link_id).await;
 
     // A mount added while this removal was staged can overlap the one being
     // restored.
@@ -180,7 +180,7 @@ pub(crate) async fn reset_staged_update_link(
         .await
         .forward::<LinkError>("Failed to find link registry entry")?;
 
-    let linked_repository = Arc::new(repository.to_link_context(link_id).await);
+    let linked_repository = repository.to_link_context(link_id).await;
     link::realize_link_pin_change(
         repository.clone(),
         linked_repository,

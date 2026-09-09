@@ -761,14 +761,14 @@ pub async fn list_with_context(
     repository: Arc<RepositoryContext>,
 ) -> Result<Vec<(Layer, Arc<RepositoryContext>)>, LayerError> {
     let layers = list(repository.clone()).await?;
-    Ok(futures::future::join_all(layers.into_iter().map(|layer| {
+    futures::future::try_join_all(layers.into_iter().map(|layer| {
         let repository = repository.clone();
         async move {
             let context = Arc::new(repository.to_layer_context(layer.repository).await);
-            (layer, context)
+            Ok((layer, context))
         }
     }))
-    .await)
+    .await
 }
 
 /// Information about a layer with staged changes, including the count of files

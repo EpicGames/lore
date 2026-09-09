@@ -3025,7 +3025,7 @@ impl State {
             Ok(children)
         } else if node.is_link() {
             let link = node.linked_node();
-            let linked_repository = Arc::new(repository.to_link_context(link.repository).await);
+            let linked_repository = repository.to_link_context(link.repository).await;
             let link_state = State::deserialize(linked_repository.clone(), link.revision).await?;
             Box::pin(link_state.node_children_map(linked_repository.clone(), link.node, extract))
                 .await
@@ -3564,7 +3564,7 @@ impl State {
 
                 if node.is_link() {
                     let link = node.linked_node();
-                    repository = Arc::new(repository.to_link_context(link.repository).await);
+                    repository = repository.to_link_context(link.repository).await;
                     let link_state = State::deserialize(repository.clone(), link.revision).await?;
                     return Box::pin(link_state.find_relative_node_link(
                         repository,
@@ -3636,7 +3636,7 @@ impl State {
             let block_reader = block.read();
             Ok(*block_reader.node(inode))
         } else {
-            let repository = Arc::new(repository.to_link_context(node_link.repository).await);
+            let repository = repository.to_link_context(node_link.repository).await;
             let state = State::deserialize(repository.clone(), node_link.revision).await?;
             let block = state.block(repository, iblock).await?;
             let block_reader = block.read();
@@ -3739,10 +3739,10 @@ impl State {
             }
 
             let link = node.linked_node();
-            let linked_repository = link.repository;
+            let linked_repository_id = link.repository;
             let signature = link.revision;
             let link_node = link.node;
-            let linked_repository = Arc::new(repository.to_link_context(linked_repository).await);
+            let linked_repository = repository.to_link_context(linked_repository_id).await;
             let link_state = State::deserialize(linked_repository.clone(), signature)
                 .await
                 .forward::<StateError>("Link error")?;
@@ -3814,10 +3814,10 @@ impl State {
             }
 
             let link = node.linked_node();
-            let linked_repository = link.repository;
+            let linked_repository_id = link.repository;
             let signature = link.revision;
             let link_node = link.node;
-            let linked_repository = Arc::new(repository.to_link_context(linked_repository).await);
+            let linked_repository = repository.to_link_context(linked_repository_id).await;
             let link_state = State::deserialize(linked_repository.clone(), signature)
                 .await
                 .forward::<StateError>("Link error")?;
@@ -4794,7 +4794,7 @@ pub async fn gather_tree_paths(
         if node_link.revision == state.revision() {
             (state, repository, node_link.node)
         } else {
-            let linked_repo = Arc::new(repository.to_link_context(node_link.repository).await);
+            let linked_repo = repository.to_link_context(node_link.repository).await;
             let linked_state = State::deserialize(linked_repo.clone(), node_link.revision).await?;
             (linked_state, linked_repo, node_link.node)
         }
@@ -4961,7 +4961,7 @@ async fn gather_tree_paths_node(
                 link.repository,
             );
         } else {
-            let linked_repo = Arc::new(repository.to_link_context(link.repository).await);
+            let linked_repo = repository.to_link_context(link.repository).await;
             match State::deserialize(linked_repo.clone(), link.revision).await {
                 Ok(linked_state) => {
                     if let Err(err) = enumerate_children(
@@ -5894,18 +5894,17 @@ pub async fn diff(
             .unwrap_or(NodeLink::invalid());
 
         let mut repository_from = repository_from;
-        let state_from = if !from_link.repository.is_zero()
-            && from_link.repository != repository_from.id
-        {
-            repository_from = Arc::new(repository_from.to_link_context(from_link.repository).await);
-            State::deserialize(repository_from.clone(), from_link.revision).await?
-        } else {
-            state_from
-        };
+        let state_from =
+            if !from_link.repository.is_zero() && from_link.repository != repository_from.id {
+                repository_from = repository_from.to_link_context(from_link.repository).await;
+                State::deserialize(repository_from.clone(), from_link.revision).await?
+            } else {
+                state_from
+            };
 
         let mut repository_to = repository_to;
         let state_to = if !to_link.repository.is_zero() && to_link.repository != repository_to.id {
-            repository_to = Arc::new(repository_to.to_link_context(to_link.repository).await);
+            repository_to = repository_to.to_link_context(to_link.repository).await;
             State::deserialize(repository_to.clone(), to_link.revision).await?
         } else {
             state_to
@@ -9151,7 +9150,7 @@ impl RecordedModifiedTimes {
             }
             lore_spawn!(tasks, {
                 let store = store.clone();
-                let partition = repository.id;
+                let partition = repository.root_id();
                 async move {
                     file_modified_time_store_group(store, partition, items).await;
                 }
@@ -9307,7 +9306,7 @@ pub async fn file_modified_time(repository: Arc<RepositoryContext>, path: &impl 
     let key = file_modified_time_key(repository.salt(), repository.instance_id, path);
     let mtime = if let Ok(value) = repository
         .read_mutable_store()
-        .load(repository.id, key, KeyType::Untyped)
+        .load(repository.root_id(), key, KeyType::Untyped)
         .await
     {
         u64::from_ne_bytes(
@@ -9340,7 +9339,12 @@ pub async fn file_modified_time_store(
     };
     let key = file_modified_time_key(repository.salt(), repository.instance_id, path);
     let _ = handle
-        .store(repository.id, key, Hash::from_u64(mtime), KeyType::Untyped)
+        .store(
+            repository.root_id(),
+            key,
+            Hash::from_u64(mtime),
+            KeyType::Untyped,
+        )
         .await;
 }
 
@@ -9367,7 +9371,7 @@ pub async fn file_modified_time_clear(repository: Arc<RepositoryContext>, path: 
     };
     let key = file_modified_time_key(repository.salt(), repository.instance_id, path);
     let _ = handle
-        .store(repository.id, key, Hash::default(), KeyType::Untyped)
+        .store(repository.root_id(), key, Hash::default(), KeyType::Untyped)
         .await;
 }
 

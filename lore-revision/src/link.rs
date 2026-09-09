@@ -487,14 +487,15 @@ async fn collect_with_context(
                 .await
                 .unwrap_or_default();
 
+            let full_path = if path_prefix.is_empty() {
+                local_path.clone()
+            } else {
+                format!("{path_prefix}/{local_path}")
+            };
             let target = LinkTarget {
-                path: if path_prefix.is_empty() {
-                    local_path
-                } else {
-                    format!("{path_prefix}/{local_path}")
-                },
+                path: full_path,
                 repository: link_id,
-                context: Arc::new(repository.to_link_context(link_id).await),
+                context: repository.to_link_context(link_id).await,
             };
 
             (target, mounts[0].signature)
@@ -684,11 +685,9 @@ pub async fn reserialize_tracked_link(
     parent_signature: Hash,
     branch: BranchId,
 ) -> Result<Hash, StateError> {
-    let linked_repository = Arc::new(
-        repository
-            .to_link_context(link_context.link_repository_id)
-            .await,
-    );
+    let linked_repository = repository
+        .to_link_context(link_context.link_repository_id)
+        .await;
 
     let linked_state = link_context.link_state.clone();
     linked_state.set_parent_self(parent_signature);
@@ -825,8 +824,7 @@ pub async fn resolve_link_chain(
                 Err(_) => link_reference.signature,
             };
 
-            let child_repository =
-                Arc::new(cur_repository.to_link_context(child_repository_id).await);
+            let child_repository = cur_repository.to_link_context(child_repository_id).await;
             let child_state = State::deserialize(child_repository.clone(), link.revision)
                 .await
                 .forward::<LinkError>("Failed deserializing state")?;
@@ -1041,11 +1039,9 @@ pub async fn drain_link_tracker(
                 .iter()
                 .find(|other| other.link_repository_id == link_context.parent_repository_id)
             {
-                let parent_repository = Arc::new(
-                    repository
-                        .to_link_context(parent_ctx.link_repository_id)
-                        .await,
-                );
+                let parent_repository = repository
+                    .to_link_context(parent_ctx.link_repository_id)
+                    .await;
                 (parent_ctx.link_state.clone(), parent_repository)
             } else {
                 (state.clone(), repository.clone())
@@ -1321,7 +1317,7 @@ pub async fn is_staged_pin_change(
     }
 
     let link = staged_node.linked_node();
-    let linked_repository = Arc::new(parent_repository.to_link_context(link.repository).await);
+    let linked_repository = parent_repository.to_link_context(link.repository).await;
     let linked_state = State::deserialize(linked_repository.clone(), link.revision)
         .await
         .forward::<LinkError>("Failed deserializing linked state")?;
@@ -1544,7 +1540,7 @@ pub async fn check_incoming_mount_overlaps(
         }
 
         let link_id: RepositoryId = node.address.context.into();
-        let link_context = Arc::new(repository.to_link_context(link_id).await);
+        let link_context = repository.to_link_context(link_id).await;
         let source_path = pinned_source_path(link_context.clone(), &node).await?;
 
         check_source_path_overlap(
@@ -1676,7 +1672,7 @@ async fn resolve_link_node_at_path(
     let (parent_repository, parent_state) = if node_link.repository == repository.id {
         (repository.clone(), state.clone())
     } else {
-        let owning = Arc::new(repository.to_link_context(node_link.repository).await);
+        let owning = repository.to_link_context(node_link.repository).await;
         let owning_state = State::deserialize(owning.clone(), node_link.revision)
             .await
             .forward::<LinkError>("Failed deserializing state")?;
@@ -1695,11 +1691,9 @@ async fn resolve_link_node_at_path(
         .into());
     }
 
-    let link_context = Arc::new(
-        parent_repository
-            .to_link_context(link_node.address.context.into())
-            .await,
-    );
+    let link_context = parent_repository
+        .to_link_context(link_node.address.context.into())
+        .await;
 
     Ok(LinkNodeAtPath {
         parent_repository,
@@ -2071,14 +2065,12 @@ pub async fn apply_link_pins(
             branch,
         } = planned_pin;
 
-        let link_context = Arc::new(
-            repository
-                .to_link_context(link_node.address.context.into())
-                .await,
-        );
-
         let link_path_rel = RelativePath::from_str(&link_path)
             .internal_with(|| format!("Invalid link path {link_path}"))?;
+
+        let link_context = repository
+            .to_link_context(link_node.address.context.into())
+            .await;
 
         lore_info!("Link {link_path} pin {target_pin} -> {incoming_pin} from merged branch");
 

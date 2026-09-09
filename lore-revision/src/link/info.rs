@@ -80,11 +80,9 @@ pub async fn info(
         .into());
     }
 
-    let link_context = Arc::new(
-        owner_repository
-            .to_link_context(link_node.address.context.into())
-            .await,
-    );
+    let link_context = owner_repository
+        .to_link_context(link_node.address.context.into())
+        .await;
 
     // Staging a removal drops the registry entry but leaves the node in the
     // tree, so fall back to the committed registry to describe a link on its

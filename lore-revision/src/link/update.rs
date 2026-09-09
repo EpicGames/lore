@@ -123,11 +123,9 @@ pub async fn update(
         }
     }
 
-    let link = Arc::new(
-        repository
-            .to_link_context(link_node.address.context.into())
-            .await,
-    );
+    let link = repository
+        .to_link_context(link_node.address.context.into())
+        .await;
     let link_remote = link.remote().await.forward::<LinkError>("Not connected")?;
     let link_reference = inner_state
         .link_find(inner_repository.clone(), link.id, node_link.node)

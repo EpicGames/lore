@@ -42,7 +42,7 @@ pub async fn dump(
         let node_link = state
             .find_node_link(repository.clone(), path.as_str())
             .await?;
-        let link_repository = Arc::new(repository.to_link_context(node_link.repository).await);
+        let link_repository = repository.to_link_context(node_link.repository).await;
         let entry_node = state.node(link_repository.clone(), node_link.node).await?;
         let mut cycle = SiblingCycleGuard::new(entry_node.parent);
         dump_node(
@@ -138,7 +138,7 @@ pub async fn dump_node(
     }
     if node.is_link() && ((max_depth == 0) || (depth + 1 < max_depth)) {
         let link_node = node.linked_node();
-        let linked_repository = Arc::new(repository.to_link_context(link_node.repository).await);
+        let linked_repository = repository.to_link_context(link_node.repository).await;
         let link_state = State::deserialize(linked_repository.clone(), link_node.revision).await?;
         let link_entry_id = link_node.node as NodeID;
         let link_entry = link_state

@@ -1100,11 +1100,9 @@ async fn unstage_node(
 
                 let link_metadata = node.linked_node();
 
-                let linked_repository = Arc::new(
-                    current_repository
-                        .to_link_context(link_metadata.repository)
-                        .await,
-                );
+                let linked_repository = current_repository
+                    .to_link_context(link_metadata.repository)
+                    .await;
 
                 let linked_state =
                     State::deserialize(linked_repository.clone(), link_metadata.revision)
@@ -1391,8 +1389,7 @@ async fn discard_nodes(
         } else {
             // Get linked state from link tracker
             if let Some(linked_context) = link_tracker.find_link_context(*repository_id) {
-                let linked_repository =
-                    Arc::new(base_repository.to_link_context(*repository_id).await);
+                let linked_repository = base_repository.to_link_context(*repository_id).await;
 
                 discard_nodes_for_repository(
                     linked_repository,
