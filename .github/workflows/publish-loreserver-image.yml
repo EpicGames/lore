@@ -26,7 +26,9 @@ name: Publish loreserver image
 # or days later: the tag exists long before the assets are complete and long
 # before the release is public. `workflow_dispatch` covers backfilling a
 # release that predates this workflow, and re-publishing an image without
-# touching a release.
+# touching a release. A dispatch from a branch other than the default one
+# publishes only its `tag` input, so proving the workflow cannot move a
+# release tag onto an image built from unreviewed code.
 #
 # `meta` resolves tags and labels once, so the later jobs cannot disagree.
 # `build` packages both platforms in a single pass and pushes the index by
@@ -50,7 +52,9 @@ on:
       tag:
         description: >-
           Extra tag to publish, for proving the workflow (for example "edge").
-          The -graviton suffix applies to it like any other tag.
+          The -graviton suffix applies to it like any other tag. Required when
+          dispatching from a branch other than the default one, which
+          publishes this tag alone and no release tags.
         type: string
         required: false
 
@@ -77,6 +81,12 @@ jobs:
       json: ${{ steps.meta.outputs.json }}
       labels: ${{ steps.meta.outputs.labels }}
       annotations: ${{ steps.meta.outputs.annotations }}
+    env:
+      # Whether this run is allowed to attach the release tags, as opposed to
+      # only the `tag` input. True for a release, and for a dispatch from the
+      # default branch; false for a dispatch from any other branch, which is
+      # what makes proving the workflow safe.
+      RELEASE_TAGS: ${{ github.event_name == 'release' || github.ref_name == github.event.repository.default_branch }}
     steps:
       # The version is interpolated into asset names and into an image
       # reference below, so hold it to the shape a release tag actually has
@@ -131,11 +141,19 @@ jobs:
           flavor: |
             latest=auto
             suffix=-graviton,onlatest=true
-          # From `value=` rather than the ref: a dispatch run starts from a
-          # branch, whose ref carries no version at all.
+          # The version comes from `value=` rather than the ref, because a
+          # dispatch run starts from a branch whose ref carries no version.
+          #
+          # That is also why the release tags are gated: taking the version
+          # from an input means a dispatch could otherwise resolve `0.9.0`,
+          # `0.9` and `latest`, and proving the workflow from a pull request
+          # branch would move the real release tags onto an image built from
+          # unreviewed code. A dispatch from a branch publishes only the `tag`
+          # input; dispatching from the default branch is how a release that
+          # predates this workflow gets backfilled.
           tags: |
-            type=semver,pattern={{version}},value=${{ steps.version.outputs.version }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }}
+            type=semver,pattern={{version}},value=${{ steps.version.outputs.version }},enable=${{ env.RELEASE_TAGS }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }},enable=${{ env.RELEASE_TAGS }}
             type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
 
       # An empty list has to fail here, not as an invalid reference in
@@ -147,7 +165,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "$(jq -r '.tags[0] // empty' <<< "${JSON}")" ]; then
-            echo "::error::no image tags resolved for ${VERSION}"
+            echo "::error::no image tags resolved for ${VERSION}; a dispatch from a branch publishes only the 'tag' input, so pass one"
             exit 1
           fi
 
