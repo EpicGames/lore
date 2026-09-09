@@ -2253,7 +2253,7 @@ typedef struct lore_revision_info_delta_event_data_t {
 
 // Details of a single file that differs between two revisions.
 typedef struct lore_revision_diff_file_event_data_t {
-  // Path of the file relative to the repository root.
+  // Path of the file, relative to the root of the working tree.
   struct lore_string_t path;
   // Action applied to the file.
   enum lore_file_action_t action;
@@ -2265,7 +2265,8 @@ typedef struct lore_revision_diff_file_event_data_t {
   struct lore_address_t old_address;
   // Address of the file content on the target side.
   struct lore_address_t new_address;
-  // Previous path of the file when it was moved or copied. Empty otherwise.
+  // Previous path of the file when it was moved or copied, relative to the root of the
+  // working tree. Empty otherwise.
   struct lore_string_t from_path;
 } lore_revision_diff_file_event_data_t;
 
@@ -2408,7 +2409,7 @@ typedef struct lore_revision_sync_target_event_data_t {
 
 // Details of a single file changed by a sync.
 typedef struct lore_revision_sync_file_event_data_t {
-  // Path of the file relative to the repository root.
+  // Path of the file, relative to the root of the working tree.
   struct lore_string_t path;
   // Size of the file in bytes.
   uint64_t size;

@@ -598,29 +598,32 @@ pub async fn resolve_pin(
     Ok((pin_signature, pin_metadata.branch))
 }
 
-/// Remaps change paths from the linked repository's source subtree to the
-/// local link mount point. Strips the `source_path` prefix from each change
-/// and replaces it with `link_path`.
-pub fn remap_changes(
-    link_path: RelativePath,
-    source_path: RelativePath,
-    changes: Vec<NodeChange>,
-) -> Arc<Vec<NodeChange>> {
-    let mut changes = changes;
-    let prefix_len = source_path.len();
+/// The node the subtree a link exposes sits at in each of two revisions it pins.
+///
+/// A link names that subtree by the path it exposes, which is the one thing the linked
+/// repository's own spelling of a path is read for: a revision numbers its nodes as it pleases,
+/// so the same subtree is a different node in each. The path reaches no further, and what the
+/// diff of the two reports is spelled from the mount.
+async fn pinned_subtree_nodes(
+    link_context: &Arc<RepositoryContext>,
+    state_current: &Arc<State>,
+    state_target: &Arc<State>,
+    linked_node: NodeID,
+) -> Result<(NodeID, NodeID), LinkError> {
+    let source_path = state_current
+        .node_path(link_context.clone(), linked_node)
+        .await
+        .forward::<LinkError>("Failed resolving link node")?;
 
-    let remap = |path: &RelativePath| -> RelativePath {
-        RelativePath::new_from_clean_parts(link_path.as_str(), &path.as_str()[prefix_len..])
+    let node_of = async |state: &Arc<State>| -> Result<NodeID, LinkError> {
+        state
+            .find_node_link(link_context.clone(), source_path.as_str())
+            .await
+            .map(|node_link| node_link.node)
+            .forward::<LinkError>("Failed resolving the subtree a link exposes")
     };
 
-    for change in changes.iter_mut() {
-        change.path = remap(&change.path);
-        if let Some(from_path) = change.from_path.as_mut() {
-            *from_path = remap(from_path);
-        }
-    }
-
-    Arc::new(changes)
+    Ok((node_of(state_current).await?, node_of(state_target).await?))
 }
 
 /// Updates a link pin in the block tree and link registry for a pre-resolved node.
@@ -1351,26 +1354,23 @@ pub async fn realize_link_pin_change(
         .forward::<LinkError>("Failed deserializing state")?;
 
     lore_debug!("Find link target node");
-    let linked_node_path = link_state_current
-        .node_path(link_context.clone(), linked_node)
-        .await
-        .forward::<LinkError>("Failed resolving link node")?;
+    let (node_current, node_target) = pinned_subtree_nodes(
+        &link_context,
+        &link_state_current,
+        &link_state_target,
+        linked_node,
+    )
+    .await?;
 
-    let Ok(linked_node_path) = RelativePath::from_str(&linked_node_path);
-
-    let changes = state::diff_collect(
-        link_context.clone(),
-        link_state_current.clone(),
-        link_context.clone(),
-        link_state_target.clone(),
-        Some(linked_node_path.clone()),
+    let changes = state::diff_collect_subtree(
+        state::node_change_state(&link_context, &link_state_current, node_current).await,
+        state::node_change_state(&link_context, &link_state_target, node_target).await,
+        link_path,
         FilterMode::View,
     )
     .await
     .forward::<LinkError>("Failed syncing target link")?;
-
-    lore_debug!("Remap changes to link path {}", link_path.as_str());
-    let changes = remap_changes(link_path, linked_node_path, changes);
+    let changes = Arc::new(changes);
 
     let operation = repository
         .file_system()

@@ -28,7 +28,7 @@ use crate::util::path::RelativePath;
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoreRevisionDiffFileEventData {
-    /// Path of the file relative to the repository root.
+    /// Path of the file, relative to the root of the working tree.
     pub path: LoreString,
     /// Action applied to the file.
     pub action: LoreFileAction,
@@ -40,7 +40,8 @@ pub struct LoreRevisionDiffFileEventData {
     pub old_address: Address,
     /// Address of the file content on the target side.
     pub new_address: Address,
-    /// Previous path of the file when it was moved or copied. Empty otherwise.
+    /// Previous path of the file when it was moved or copied, relative to the root of the
+    /// working tree. Empty otherwise.
     pub from_path: LoreString,
 }
 

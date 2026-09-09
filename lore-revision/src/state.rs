@@ -5913,26 +5913,8 @@ pub async fn diff(
             state_to
         };
 
-        async fn make_node_change_state(
-            repository: &Arc<RepositoryContext>,
-            state: &Arc<State>,
-            node_id: NodeID,
-        ) -> NodeChangeState {
-            let (address, flags) = if let Ok(node) = state.node(repository.clone(), node_id).await {
-                (node.address, NodeFlags::from_bits_retain(node.flags))
-            } else {
-                (Address::default(), NodeFlags::NoFlags)
-            };
-            NodeChangeState {
-                repository: repository.clone(),
-                state: state.clone(),
-                node: node_id,
-                flags,
-                address,
-            }
-        }
-        let from = make_node_change_state(&repository_from, &state_from, from_link.node).await;
-        let to = make_node_change_state(&repository_to, &state_to, to_link.node).await;
+        let from = node_change_state(&repository_from, &state_from, from_link.node).await;
+        let to = node_change_state(&repository_to, &state_to, to_link.node).await;
 
         diff::diff_subtree(from, to, path, 0, graft, sink, filter_mode).await?;
     } else {
@@ -5961,6 +5943,48 @@ pub async fn diff(
     }
 
     Ok(())
+}
+
+/// The node `node_id` of `state` as one side of a change, carrying the flags and address it
+/// holds. A node the state does not hold is one side of an add or a delete, and carries none.
+pub(crate) async fn node_change_state(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    node_id: NodeID,
+) -> NodeChangeState {
+    let (address, flags) = if let Ok(node) = state.node(repository.clone(), node_id).await {
+        (node.address, NodeFlags::from_bits_retain(node.flags))
+    } else {
+        (Address::default(), NodeFlags::NoFlags)
+    };
+    NodeChangeState {
+        repository: repository.clone(),
+        state: state.clone(),
+        node: node_id,
+        flags,
+        address,
+    }
+}
+
+/// The changes between the subtree `from` names and the subtree `to` names, spelled from `path`.
+///
+/// A subtree a working copy materializes somewhere other than where the repository holding it
+/// spells it from — what a link mounts — is diffed by naming its node in each revision and
+/// reporting at the path it is materialized at, so no change carries the other spelling.
+pub async fn diff_collect_subtree(
+    from: NodeChangeState,
+    to: NodeChangeState,
+    path: RelativePath,
+    filter_mode: FilterMode,
+) -> Result<Vec<NodeChange>, StateError> {
+    let mut changes: Vec<NodeChange> = Vec::new();
+    {
+        let mut sink = ChangeSink::Vec(&mut changes);
+        diff::diff_subtree(from, to, path, 0, None, &mut sink, filter_mode).await?;
+    }
+    detect_and_coalesce_moves(&mut changes);
+    crate::change::sort_by_path(&mut changes);
+    Ok(changes)
 }
 
 /// Collect the set of changes between two revision states into a `Vec`,

@@ -10268,3 +10268,131 @@ def test_link_add_accepts_a_scoped_bare_name(new_lore_repo, lore_remote_url):
     assert link_repo.get_id() in repo.link_list(), (
         f"link add should have resolved {scoped_name!r} against this repository's remote"
     )
+
+
+@pytest.mark.smoke
+def test_link_update_of_a_subtree_reports_paths_at_the_mount(new_lore_repo):
+    """A link exposing a subtree reports its changes at the mount it is materialized at.
+
+    The exposed subtree and the mount share no prefix, so a path spelled from the linked
+    repository's own root names nothing in the working tree.
+    """
+    repo: Lore = new_lore_repo()
+    source_repo = new_lore_repo()
+
+    source_dir = "content/assets"
+    kept_file = f"{source_dir}/rock.mesh"
+    added_file = f"{source_dir}/tree.mesh"
+    unexposed_file = "docs/readme.md"
+
+    source_repo.make_dirs(source_dir)
+    source_repo.make_dirs("docs")
+    with source_repo.open_file(kept_file, "w+") as output_file:
+        output_file.writelines(["rock\n"])
+    with source_repo.open_file(unexposed_file, "w+") as output_file:
+        output_file.writelines(["readme\n"])
+    source_repo.stage(scan=True)
+    source_repo.commit("Seed the exposed subtree")
+    source_repo.push()
+    pinned = source_repo.branch_info().local_latest
+
+    with source_repo.open_file(added_file, "w+") as output_file:
+        output_file.writelines(["tree\n"])
+    source_repo.stage(scan=True)
+    source_repo.commit("Add a mesh to the exposed subtree")
+    source_repo.push()
+    updated = source_repo.branch_info().local_latest
+
+    mount = "linked/meshes"
+    repo.link_add(mount, source_repo.get_id(), source_dir, pin=pinned)
+    repo.commit("Add the link")
+    repo.push()
+    before_update = repo.branch_info().local_latest
+
+    assert repo.compare_file(source_repo, f"{mount}/rock.mesh", kept_file), (
+        "the exposed subtree's file belongs at the mount"
+    )
+
+    output = repo.link_update(mount, pin=updated, json=True)
+    realized = [entry["path"] for entry in parse_jsonl(output, "revisionSyncFile")]
+
+    assert realized, "updating the pin should report the files it realized"
+    assert f"{mount}/tree.mesh" in realized, (
+        f"the added file should be reported at the mount, got {realized}"
+    )
+    for path in realized:
+        assert path.startswith(f"{mount}/"), (
+            f"every reported path belongs under the mount, got {path!r}"
+        )
+        assert source_dir not in path, (
+            f"no reported path carries the linked repository's own spelling, got {path!r}"
+        )
+
+    staged = [
+        entry.get("path", "") for entry in parse_status_json(repo.status(json=True))
+    ]
+    assert mount in staged, f"the mount should be staged after the update, got {staged}"
+    for path in staged:
+        assert source_dir not in path, (
+            f"no staged path carries the linked repository's own spelling, got {path!r}"
+        )
+
+    repo.commit("Update the link pin")
+    repo.push()
+
+    # The diff of the two revisions crosses the mount, so every path it reports is spelled from
+    # the working tree root rather than from the linked repository's own.
+    diffed = [
+        entry["path"]
+        for entry in parse_jsonl(
+            repo.revision_diff(before_update, json=True),
+            "revisionDiffFile",
+        )
+    ]
+    assert diffed, "diffing across the pin change should report the files that differ"
+    for path in diffed:
+        assert source_dir not in path, (
+            f"no diffed path carries the linked repository's own spelling, got {path!r}"
+        )
+    assert f"{mount}/tree.mesh" in diffed, (
+        f"the added file should be diffed at the mount, got {diffed}"
+    )
+
+    assert repo.compare_file(source_repo, f"{mount}/tree.mesh", added_file), (
+        "the added file belongs at the mount"
+    )
+    assert not repo.path_exists(f"{mount}/{source_dir}"), (
+        "the linked repository's own spelling should reach no path on disk"
+    )
+    assert not repo.path_exists(f"{mount}/docs"), (
+        "a path outside the exposed subtree should reach no path on disk"
+    )
+
+    # A file changed on disk inside the mount is reached by the walk of the working tree rather
+    # than by the diff of two revisions, and is reported at the mount just the same.
+    with repo.open_file(f"{mount}/rock.mesh", "w+") as output_file:
+        output_file.writelines(["rock, modified\n"])
+
+    scanned = [
+        entry.get("path", "")
+        for entry in parse_status_json(repo.status(json=True, scan=True))
+    ]
+    assert f"{mount}/rock.mesh" in scanned, (
+        f"a file changed inside the mount is scanned at the mount, got {scanned}"
+    )
+    for path in scanned:
+        assert source_dir not in path, (
+            f"no scanned path carries the linked repository's own spelling, got {path!r}"
+        )
+
+    staged_inside = [
+        entry["path"]
+        for entry in parse_jsonl(repo.stage(f"{mount}/rock.mesh", json=True), "fileStageFile")
+    ]
+    assert f"{mount}/rock.mesh" in staged_inside, (
+        f"staging inside the mount reports at the mount, got {staged_inside}"
+    )
+    for path in staged_inside:
+        assert source_dir not in path, (
+            f"no staged path carries the linked repository's own spelling, got {path!r}"
+        )
