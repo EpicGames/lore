@@ -142,11 +142,11 @@ jobs:
 
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        env:
-          # The index is what gets signed and what a puller resolves, so it
-          # needs the annotations too, not just the per-platform manifests.
-          # Harmless on the default variant, which has no index.
-          DOCKER_METADATA_ANNOTATIONS_LEVELS: index,manifest
+        # Manifest-level annotations only, which is the action's default. This
+        # variant exports a single platform as a plain manifest, and buildx
+        # rejects index annotations outright for such an export ("index
+        # annotations not supported for single platform export") rather than
+        # ignoring them.
         with:
           images: ${{ env.IMAGE }}
           # Only a stable semver moves `latest`; a prerelease publishes its own
