@@ -980,7 +980,65 @@ pub struct NodeSearchResult {
     pub path: RelativePath,
 }
 
-pub async fn get_node_and_path(
+/// The node a walk matched against an entry on disk.
+pub struct NodeMatch {
+    pub node: Node,
+    /// The node's own path, present only where the state spells its name differently from
+    /// the entry. Names are matched by a case-folded hash, so every other node is spelled
+    /// exactly by the entry and its path is built from that instead.
+    pub renamed_path: Option<RelativePath>,
+}
+
+impl NodeMatch {
+    /// The node's own path, for a change to record or a recursion to walk below.
+    ///
+    /// `parent` must be the one [`get_node_match`] was given and `name` the entry it was
+    /// matched against: a renamed node already carries a path built under that parent, and
+    /// answers with it whatever is passed here.
+    pub fn path(&self, parent: &RelativePath, name: &str) -> RelativePath {
+        match &self.renamed_path {
+            Some(path) => path.clone(),
+            None => parent.push_into_buf(name).freeze(),
+        }
+    }
+
+    /// Whether the state spells the node's name differently from the entry on disk.
+    pub fn renamed(&self) -> bool {
+        self.renamed_path.is_some()
+    }
+}
+
+/// The node `node_id` holds, matched against the entry named `name` in `parent`, or nothing
+/// where the node's name is unusable.
+///
+/// A walk matches far more nodes than it records, so no path is built for a node the state
+/// spells as the entry does; [`NodeMatch::path`] builds one where it is needed.
+pub async fn get_node_match(
+    nodes: &StateChildrenNodes,
+    node_id: NodeID,
+    name: &str,
+    parent: &RelativePath,
+) -> Result<Option<NodeMatch>, StateError> {
+    let block_index = NodeBlock::index(node_id);
+    let node_index = Node::index(node_id);
+    let block = nodes
+        .state
+        .block_with_nametable(nodes.repository.clone(), block_index)
+        .await?;
+    let node = block.node(node_index);
+    let node_name = match block.node_name_ref(node_index) {
+        Ok(node_name) => node_name,
+        Err(err) => {
+            lore_warn!("Skipping node {} with invalid name: {err}", node_id);
+            return Ok(None);
+        }
+    };
+    let renamed_path = (*node_name != *name).then(|| parent.push_into_buf(&node_name).freeze());
+
+    Ok(Some(NodeMatch { node, renamed_path }))
+}
+
+async fn get_node_and_path(
     nodes: &StateChildrenNodes,
     node_id: NodeID,
     path: &RelativePath,

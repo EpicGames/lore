@@ -530,9 +530,8 @@ async fn unstage_path(
     let relative_path = if relative_path.is_empty() {
         relative_path
     } else {
-        let repository_root = repository.require_path()?;
-        let resolved =
-            util::fs::filesystem_path(&operation, repository_root, &relative_path, None).await;
+        repository.require_path()?;
+        let resolved = util::fs::filesystem_path(&operation, "", &relative_path, None).await;
         resolved.unwrap_or(relative_path)
     };
 

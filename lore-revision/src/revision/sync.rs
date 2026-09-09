@@ -53,7 +53,6 @@ use crate::state::RecordedModifiedTimes;
 use crate::state::State;
 use crate::util;
 use crate::util::path::RelativePath;
-use crate::util::path::RepositoryPath;
 use crate::util::serde::u8_as_bool;
 
 /// Source and target revisions selected for a sync.
@@ -1061,7 +1060,6 @@ pub async fn realize_file(
     stats: Arc<SyncRealizeStats>,
     modified_times: &RecordedModifiedTimes,
 ) -> Result<(), SyncError> {
-    let path = RepositoryPath::from_relative(&repository, path)?;
     let (result, realized_times) =
         shim_with_operation(repository.file_system(), true, async |operation| {
             crate::fs::realize::realize_file(repository, operation, &path, node, stats).await
@@ -1077,11 +1075,7 @@ pub async fn realize_scratch_file(
     node: Node,
     stats: Arc<SyncRealizeStats>,
 ) -> Result<(), SyncError> {
-    shim_with_operation(repository.file_system(), true, async |operation| {
-        crate::fs::realize::realize_scratch_file(repository, operation, path, node, stats).await
-    })
-    .await
-    .map(discard_modified_times)?
+    crate::fs::realize::realize_scratch_file(repository, path, node, stats).await
 }
 
 pub async fn exist_merge_mine_theirs_base(absolute_path: impl AsRef<Path>) -> bool {

@@ -43,7 +43,6 @@ use crate::revision::sync::SyncRealizeStats;
 use crate::state;
 use crate::state::State;
 use crate::util::path::RelativePath;
-use crate::util::path::RepositoryPath;
 
 #[error_set]
 pub enum LayerError {
@@ -413,8 +412,6 @@ pub async fn add(
         staged: Hash::default(),
     });
 
-    let target_path = RepositoryPath::from_relative(&repository, target_path)?;
-
     // Materialize layer
     lore_debug!("Connecting remote storage");
     let correlation_id = crate::lore::execution_context()
@@ -427,7 +424,7 @@ pub async fn add(
         .forward::<LayerError>("Not connected")?;
 
     event::LoreEvent::LayerAdd(LoreLayerAddEventData {
-        target_path: LoreString::from(target_path.relative().clone()),
+        target_path: LoreString::from(&target_path.clone()),
         source_repository: layer_repository.id,
         source_path: LoreString::from(&source_path),
         metadata: metadata.into(),
@@ -437,7 +434,7 @@ pub async fn add(
 
     // Ensure the target path exist to clone into
     lore_io::IoDriver::global()
-        .create_dir_all(target_path.absolute())
+        .create_dir_all(target_path.to_absolute_path(repository.require_path()?))
         .await
         .internal("Failed to create the target directory for layer")?;
 
@@ -457,7 +454,7 @@ pub async fn add(
         stats: Arc::default(),
         modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
     };
-    let target_states = layer_repository.filter.mount_states(target_path.relative());
+    let target_states = layer_repository.filter.mount_states(&target_path);
     clone::clone_node(
         clone_ctx,
         layer_storage,

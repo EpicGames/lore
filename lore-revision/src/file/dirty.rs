@@ -935,7 +935,8 @@ fn dirty_directory<'a>(
             let entry = entry.map_err(|e| {
                 DirtyError::internal_with_context(e, "Failed to read directory entry")
             })?;
-            let name_str = entry.file_name.to_string_lossy();
+            let name_str = crate::util::fs::entry_name(entry.file_name)
+                .forward::<DirtyError>("Unusable directory entry")?;
             let child_path = dir_path.push_into_buf(&name_str).freeze();
 
             let force = execution_context().globals().force();
@@ -955,7 +956,7 @@ fn dirty_directory<'a>(
                 state_current.clone(),
                 state_staged.clone(),
                 &child_path,
-                &absolute_path.join(name_str.as_ref()),
+                &absolute_path.join(name_str.as_str()),
                 entry
                     .metadata
                     .map_or(DiskState::Unknown, DiskState::Present),

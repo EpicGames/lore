@@ -548,7 +548,9 @@ fn calculate_local_size_recurse(
                     .internal_with(|| format!("Failed to list directory: {relative_path}"))?;
 
                 while let Some(entry) = list.next().await {
-                    let Some(item) = util::fs::file_list_item(entry) else {
+                    let Some(item) = util::fs::file_list_item(entry)
+                        .forward::<InfoError>("Unusable directory entry")?
+                    else {
                         continue;
                     };
                     let repository = repository.clone();

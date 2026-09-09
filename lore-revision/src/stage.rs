@@ -27,7 +27,6 @@ use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
-use crate::fs::filesystem_provider::FilesystemPath;
 use crate::fs::filesystem_provider::FilesystemTraversal;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
@@ -73,7 +72,6 @@ use crate::state::file_modified_against_node;
 use crate::util;
 use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
-use crate::util::path::RepositoryPath;
 
 /// Data for the event emitted when a stage operation begins.
 #[repr(C)]
@@ -350,11 +348,15 @@ async fn is_uncommitted_child(
 /// The base directory is the point where the relative path starts
 /// Only the relative path will be checked for case consistency
 #[allow(clippy::too_many_arguments)]
+/// `base_on_disk` is where the base sits under the root the operation names paths from, which
+/// a link or layer mount makes different from `base_relative_path`: that one is the offset into
+/// the state being staged, and a mount's state starts at its own root.
 pub(crate) async fn stage_filesystem_path(
     operation: Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     base_absolute_path: PathBuf,
+    base_on_disk: RelativePath,
     base_relative_path: RelativePathBuf,
     base_node: NodeID,
     relative_path: RelativePath,
@@ -376,7 +378,7 @@ pub(crate) async fn stage_filesystem_path(
     } else {
         let resolved = util::fs::filesystem_path_and_info(
             &operation,
-            base_absolute_path.as_path(),
+            base_on_disk.as_str(),
             &relative_path,
             prefixes.as_deref(),
         )
@@ -408,12 +410,10 @@ pub(crate) async fn stage_filesystem_path(
     let staged_info = if let Some(info) = resolved_info {
         Some(info)
     } else {
-        let staged_path = RepositoryPath::from_relative_and_root(
-            base_absolute_path.as_path(),
-            relative_path.clone(),
-        );
+        let staged_path =
+            RelativePath::new_from_clean_parts(base_on_disk.as_str(), relative_path.as_str());
         operation
-            .file_info(FilesystemPath::Repository(&staged_path))
+            .file_info(&staged_path)
             .await
             .ok()
             .filter(|info| info.exists)
@@ -1406,7 +1406,9 @@ pub(crate) async fn stage_directory(
     // result depending on iteration order.
     let mut items: Vec<util::fs::FileListItem> = Vec::new();
     while let Some(entry) = file_list.next().await {
-        let Some(item) = util::fs::file_list_item(entry) else {
+        let Some(item) =
+            util::fs::file_list_item(entry).forward::<StageError>("Unusable directory entry")?
+        else {
             continue;
         };
         if item.metadata.is_dir() || item.metadata.is_file() {
@@ -2872,6 +2874,7 @@ async fn stage_from_parent_revision_in_operation(
                     repository.clone(),
                     state.clone(),
                     repository.require_path()?.to_path_buf(),
+                    RelativePath::new(),
                     RelativePathBuf::new(),
                     ROOT_NODE,
                     relative_path.clone(),
@@ -3022,8 +3025,7 @@ async fn stage_from_parent_revision_in_operation(
                 // Restoring to a merge parent leaves content the current revision does not
                 // hold, so the times it lands with state nothing and are left to drop with
                 // the operation.
-                let restore_path =
-                    RepositoryPath::from_relative(&repository, relative_path.clone())?;
+                let restore_path = relative_path.clone();
                 crate::fs::realize::realize_file(
                     repository.clone(),
                     operation.clone(),
@@ -3039,6 +3041,7 @@ async fn stage_from_parent_revision_in_operation(
                     repository.clone(),
                     state.clone(),
                     repository.require_path()?.to_path_buf(),
+                    RelativePath::new(),
                     RelativePathBuf::new(),
                     ROOT_NODE,
                     relative_path.clone(),
@@ -3396,6 +3399,7 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
                     group.link_context.clone(),
                     group.link_state_staged.clone(),
                     mount_base_absolute.clone(),
+                    group.link_path_rel.clone(),
                     RelativePathBuf::new(),
                     ROOT_NODE,
                     link_relative.clone(),
@@ -3425,8 +3429,7 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
                 // `link_context.path` shares the parent's path and
                 // `mount_path` is parent-relative, so realizing through the
                 // link context writes to `<parent>/<mount>/<file>`.
-                let restore_path =
-                    RepositoryPath::from_relative(&group.link_context, mount_path.clone())?;
+                let restore_path = mount_path.clone();
                 crate::fs::realize::realize_file(
                     group.link_context.clone(),
                     operation.clone(),
@@ -3442,6 +3445,7 @@ pub(crate) async fn stage_link_paths_from_parent_revision(
                     group.link_context.clone(),
                     group.link_state_staged.clone(),
                     mount_base_absolute.clone(),
+                    group.link_path_rel.clone(),
                     RelativePathBuf::new(),
                     ROOT_NODE,
                     link_relative.clone(),
@@ -3656,10 +3660,8 @@ pub(crate) async fn stage_from_parent_state(
             let relative_path = change.path.clone();
             let operation = operation.clone();
             lore_spawn!(tasks, async move {
-                let staged_path =
-                    RepositoryPath::from_relative(&repository, relative_path.clone())?;
                 let info = operation
-                    .file_info(FilesystemPath::Repository(&staged_path))
+                    .file_info(&relative_path)
                     .await
                     .forward::<StageError>("Failed to query file information")?;
                 if !info.exists {

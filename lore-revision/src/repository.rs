@@ -583,6 +583,22 @@ pub struct RepositoryPaths {
     dot_path: PathBuf,
 }
 
+/// Refuses a working-copy root that is not valid text.
+///
+/// Every path Lore reports, resolves from a user argument or keys a cache on is built from
+/// this root, and each of those needs one spelling that survives a round trip. A root
+/// without one could only be spelled approximately, so a path parsed back from a report
+/// could name a different file than the one on disk. Refusing once, where a working copy is
+/// opened or created, is what lets every path built from it be spelled losslessly.
+pub fn require_text_root(path: &Path) -> Result<(), RepositoryError> {
+    if path.to_str().is_some() {
+        return Ok(());
+    }
+    Err(RepositoryError::from(InvalidPath {
+        path: path.to_string_lossy().into_owned(),
+    }))
+}
+
 impl RepositoryPaths {
     pub fn new(path: PathBuf, dot_path: PathBuf) -> Self {
         Self { path, dot_path }
@@ -2018,6 +2034,7 @@ pub async fn load_and_connect_with_token(
     access: RepositoryAccess,
     write_token: Option<RepositoryWriteToken>,
 ) -> Result<Arc<RepositoryContext>, RepositoryError> {
+    require_text_root(path)?;
     debug_assert!(
         matches!(
             (&access, &write_token),
@@ -2427,6 +2444,7 @@ pub async fn create_local(
     config: RepositoryConfig,
     no_tracking: bool,
 ) -> Result<Arc<RepositoryContext>, RepositoryError> {
+    require_text_root(path)?;
     let instance_id = InstanceId::generate();
 
     let dotpath = if config
@@ -4136,6 +4154,31 @@ mod path_optional_tests {
             .require_path()
             .expect("path-bearing context should return path");
         assert_eq!(got, path.as_path());
+    }
+}
+
+#[cfg(test)]
+mod root_text_tests {
+    //! Coverage for [`require_text_root`], the one place a working copy whose path has no
+    //! text spelling is refused.
+    use super::require_text_root;
+
+    #[test]
+    fn a_root_that_is_text_is_accepted() {
+        assert!(require_text_root(std::path::Path::new("/work/repository")).is_ok());
+    }
+
+    /// A root without a text spelling is refused where the working copy is opened, so no
+    /// path built from it is ever reported in a spelling it cannot be parsed back from.
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn a_root_that_is_not_text_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = std::path::Path::new(std::ffi::OsStr::from_bytes(b"/work/\xff\xfe"));
+        assert!(
+            require_text_root(root).is_err(),
+            "a root with no text spelling must be refused"
+        );
     }
 }
 

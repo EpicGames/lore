@@ -14,7 +14,6 @@ use crate::errors::SlowDown;
 use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
 use crate::fs::filesystem_provider::FilesystemDiffTree;
-use crate::fs::filesystem_provider::FilesystemPath;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
@@ -25,7 +24,6 @@ use crate::state;
 use crate::state::ChangeSink;
 use crate::state::State;
 use crate::util::path::RelativePath;
-use crate::util::path::RepositoryPath;
 
 #[error_set]
 pub enum DiffError {
@@ -181,9 +179,9 @@ async fn diff_filesystem_paths_in(
             if node_link.is_valid() {
                 exists_in_state = true;
             } else {
-                let repository_path = RepositoryPath::from_relative(&repository, path.clone())?;
+                let repository_path = path.clone();
                 exists_in_filesystem = operation
-                    .file_info(FilesystemPath::Repository(&repository_path))
+                    .file_info(&repository_path)
                     .await
                     .is_ok_and(|info| info.exists);
             }

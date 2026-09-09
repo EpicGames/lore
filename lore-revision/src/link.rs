@@ -47,7 +47,6 @@ use crate::state::State;
 use crate::state::StateError;
 use crate::util::path::RelativePath;
 use crate::util::path::RelativePathBuf;
-use crate::util::path::RepositoryPath;
 use crate::util::serde::u8_as_bool;
 
 pub mod add;
@@ -1140,9 +1139,11 @@ pub async fn restore_link_paths_from_state(
         .forward::<LinkError>("Failed starting filesystem operation")?;
 
     for link_relative in paths {
-        let mount_path =
-            RepositoryPath::from_relative(&repository, link_path.join(link_relative.as_str()))?;
-        sync::unlink_merge_mine_theirs_base(mount_path.absolute()).await;
+        let mount_path = link_path.join(link_relative.as_str());
+        sync::unlink_merge_mine_theirs_base(
+            mount_path.to_absolute_path(repository.require_path()?),
+        )
+        .await;
 
         let node_link = link_state
             .find_node_link(link_context.clone(), link_relative.as_str())

@@ -142,6 +142,28 @@ pub trait FilterPath {
     fn split_lowercase(&self) -> (&str, &str);
 }
 
+/// A path a walk asks its questions about: the filter matches it, a cache keys on it, a
+/// message spells it, and a change records a path taken from it.
+///
+/// Taking a path is free where the value already is one and one path where it is a buffer the
+/// walk reuses, so asking costs nothing and only recording pays.
+pub trait WalkPath: FilterPath + std::fmt::Display {
+    /// A path of its own, for recording or walking below.
+    fn to_path(&self) -> RelativePath;
+}
+
+impl WalkPath for RelativePath {
+    fn to_path(&self) -> RelativePath {
+        self.clone()
+    }
+}
+
+impl WalkPath for RelativePathBuf {
+    fn to_path(&self) -> RelativePath {
+        self.clone().freeze()
+    }
+}
+
 impl FilterPath for RelativePath {
     fn is_empty(&self) -> bool {
         RelativePath::is_empty(self)
@@ -1061,7 +1083,7 @@ impl Filter {
     pub fn child_emit_excludes(
         &self,
         parent: FilterStates,
-        path: &RelativePath,
+        path: &impl FilterPath,
         is_directory: bool,
         mode: FilterMode,
     ) -> (FilterStates, bool) {
@@ -1101,7 +1123,7 @@ impl Filter {
         &self,
         force: bool,
         parent: FilterStates,
-        path: &RelativePath,
+        path: &impl FilterPath,
         is_directory: bool,
         mode: FilterMode,
     ) -> (FilterStates, bool) {
@@ -1326,12 +1348,12 @@ impl Filter {
 
     /// Reports the path that was asked about, not the ancestor that matched: it
     /// is what the caller named, and the ancestor is only available lowercased.
-    fn emit(path: &RelativePath, reason: Option<FilterReason>) -> bool {
+    fn emit(path: &impl FilterPath, reason: Option<FilterReason>) -> bool {
         match reason {
             Some(reason) => {
                 LoreEvent::FilterExclude(LoreFilterExcludeEventData {
                     reason: reason as u8,
-                    path: path.into(),
+                    path: path.as_str().into(),
                 })
                 .send();
                 true

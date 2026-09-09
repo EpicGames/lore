@@ -7,11 +7,9 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use lore_base::error::InvalidArguments;
 use lore_error_set::prelude::*;
 
 use crate::errors::InvalidPath;
-use crate::repository::RepositoryContext;
 
 #[error_set]
 pub enum PathError {
@@ -432,13 +430,20 @@ pub struct RelativePath {
     end_lower: usize,   // View end offset into path_lower
 }
 
+/// The shared data an empty path views, so naming one costs an atomic rather than an
+/// allocation. A walk reaches for an empty path per entry the other side does not hold.
+static EMPTY_PATH_DATA: std::sync::LazyLock<Arc<RelativePathData>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(RelativePathData {
+            path: String::new(),
+            path_lower: String::new(),
+        })
+    });
+
 impl RelativePath {
     pub fn new() -> Self {
         RelativePath {
-            data: Arc::new(RelativePathData {
-                path: String::new(),
-                path_lower: String::new(),
-            }),
+            data: EMPTY_PATH_DATA.clone(),
             start: 0,
             end: 0,
             start_lower: 0,
@@ -504,6 +509,33 @@ impl RelativePath {
         self
     }
 
+    /// Narrow the view to what stands above the last component, leaving nothing where the
+    /// path holds only one.
+    ///
+    /// The counterpart of [`pop_root`](Self::pop_root), and like it the data is shared and
+    /// only the view moves, so this costs no allocation. Both views are searched for their
+    /// own separator: a path folds character for character except where a general mapping
+    /// widens it, so the two offsets need not agree.
+    pub fn pop_name(&mut self) {
+        let separator = self.as_str().rfind('/');
+        let separator_lower = self.as_lowercase_str().rfind('/');
+        if let (Some(separator), Some(separator_lower)) = (separator, separator_lower) {
+            self.end = self.start + separator;
+            self.end_lower = self.start_lower + separator_lower;
+        } else {
+            self.end = self.start;
+            self.end_lower = self.start_lower;
+        }
+    }
+
+    /// What stands above the last component, which is the empty path where the path holds
+    /// only one. See [`pop_name`](Self::pop_name).
+    pub fn parent_path(&self) -> Self {
+        let mut parent = self.clone();
+        parent.pop_name();
+        parent
+    }
+
     pub fn name(&self) -> &str {
         name_impl(self.as_str())
     }
@@ -529,15 +561,6 @@ impl RelativePath {
     pub fn split_lowercase(&self) -> (&str, &str) {
         let lowercase = self.as_lowercase_str();
         lowercase.rsplit_once('/').unwrap_or(("", lowercase))
-    }
-
-    /// xxh3 digest of the lowercase form -- the identity a node lookup matches
-    /// on, see [`Node::name_hash`](crate::node::Node::name_hash).
-    ///
-    /// Hashes the stored lowercase form in place, so nothing is folded or
-    /// allocated a second time.
-    pub fn lowercase_hash(&self) -> u64 {
-        lowercase_hash(self.as_lowercase_str())
     }
 
     pub fn len(&self) -> usize {
@@ -613,6 +636,29 @@ impl RelativePath {
                 RelativePathBuf { path, path_lower }
             }
         }
+    }
+
+    /// Room a buffer keeps beyond the path it holds, so appending a name does not grow it.
+    ///
+    /// Long enough for the names a tree holds in practice. A longer one costs the growth it
+    /// would have cost anyway.
+    pub(crate) const COMPONENT_ROOM: usize = 64;
+
+    /// This path in a buffer holding `room` bytes beyond it, for a caller that will push and
+    /// pop names onto the buffer rather than read it.
+    ///
+    /// Sized so the first name pushed grows neither string: an exact-sized buffer reallocates
+    /// both, which for a walk holding one buffer per directory is two allocations a directory.
+    /// Both views are copied rather than the lowercase one refolded, which the path already
+    /// carries.
+    pub fn to_buf_with_capacity(&self, room: usize) -> RelativePathBuf {
+        let view = self.as_str();
+        let view_lower = self.as_lowercase_str();
+        let mut buffer =
+            RelativePathBuf::with_capacity(view.len().max(view_lower.len()) + 1 + room);
+        buffer.path.push_str(view);
+        buffer.path_lower.push_str(view_lower);
+        buffer
     }
 
     /// Efficiently append a suffix to this path, returning a new `RelativePathBuf`.
@@ -829,63 +875,6 @@ fn compare_subtree_order(left: &str, right: &str) -> std::cmp::Ordering {
         }
     }
     left.len().cmp(&right.len())
-}
-
-#[derive(Clone)]
-pub struct RepositoryPath {
-    relative: RelativePath,
-    absolute: PathBuf,
-}
-
-impl RepositoryPath {
-    pub fn from_relative(
-        repository: &Arc<RepositoryContext>,
-        relative_path: RelativePath,
-    ) -> Result<Self, InvalidArguments> {
-        Ok(Self::from_relative_and_root(
-            repository.require_path()?,
-            relative_path,
-        ))
-    }
-
-    pub fn from_relative_and_root(root: &Path, relative: RelativePath) -> Self {
-        Self {
-            absolute: relative.to_absolute_path(root),
-            relative,
-        }
-    }
-
-    pub fn relative(&self) -> &RelativePath {
-        &self.relative
-    }
-
-    pub fn absolute(&self) -> &Path {
-        self.absolute.as_path()
-    }
-
-    pub fn get_child(&self, child: &str) -> Self {
-        RepositoryPath {
-            relative: self.relative.clone().push_into_buf(child).freeze(),
-            absolute: self.absolute.join(child),
-        }
-    }
-
-    pub fn get_parent(&self) -> Option<Self> {
-        let mut relative_parent = self.relative.clone();
-        relative_parent.pop();
-        if relative_parent == self.relative {
-            return None;
-        }
-        let mut absolute_parent = self.absolute.clone();
-        if absolute_parent.pop() {
-            Some(RepositoryPath {
-                relative: relative_parent,
-                absolute: absolute_parent,
-            })
-        } else {
-            None
-        }
-    }
 }
 
 /// Returns `true` if `parent` equals `child`, or is a strict path-ancestor of
@@ -1235,12 +1224,6 @@ impl RelativePathBuf {
         lowercase.rsplit_once('/').unwrap_or(("", lowercase))
     }
 
-    /// xxh3 digest of the lowercase form. See
-    /// [`RelativePath::lowercase_hash`].
-    pub fn lowercase_hash(&self) -> u64 {
-        lowercase_hash(self.as_lowercase_str())
-    }
-
     /// Returns the length of the path string.
     pub fn len(&self) -> usize {
         self.path.len()
@@ -1301,6 +1284,41 @@ impl RelativePathBuf {
             start_lower: 0,
             end_lower,
         }
+    }
+}
+
+/// The child a walk is looking at, appended to the buffer its directory carries and taken
+/// off again when the look is over.
+///
+/// A directory's entries are asked about one at a time, so one buffer answers for all of
+/// them and an entry the walk reports nothing about costs no path of its own. Taking the
+/// name off on drop is what leaves the buffer holding the directory's own path however the
+/// walk leaves the entry.
+pub struct EntryPath<'a> {
+    buffer: &'a mut RelativePathBuf,
+}
+
+impl<'a> EntryPath<'a> {
+    /// Append `name` to `buffer`, to be taken off again when the result is dropped.
+    pub fn enter(buffer: &'a mut RelativePathBuf, name: &str) -> Self {
+        buffer.push(name);
+        Self { buffer }
+    }
+
+    /// The path as it stands, for asking a question about it.
+    pub fn path(&self) -> &RelativePathBuf {
+        self.buffer
+    }
+
+    /// A path of its own, for recording it or walking below it.
+    pub fn to_path(&self) -> RelativePath {
+        self.buffer.clone().freeze()
+    }
+}
+
+impl Drop for EntryPath<'_> {
+    fn drop(&mut self) {
+        self.buffer.pop();
     }
 }
 
@@ -1600,38 +1618,25 @@ mod tests {
         }
     }
 
+    /// The lowercase view has to narrow with the one it mirrors, or a filter would fold a
+    /// parent against a name the path no longer holds.
     #[test]
-    fn repository_path_parent() {
-        let nested_children = RepositoryPath::from_relative_and_root(
-            Path::new("/a/b/c"),
-            RelativePath::new_from_initial_path("d/e").unwrap(),
-        );
-        let nested_children_parent = nested_children
-            .get_parent()
-            .expect("Parent should be constructable");
-        assert_eq!(nested_children_parent.absolute(), PathBuf::from("/a/b/c/d"));
-        assert_eq!(
-            *nested_children_parent.relative(),
-            RelativePath::new_from_initial_path("d").unwrap()
-        );
+    fn a_parent_path_narrows_both_views() {
+        let nested = RelativePath::new_from_initial_path("A/B/C").unwrap();
+        let parent = nested.parent_path();
+        assert_eq!(parent.as_str(), "A/B");
+        assert_eq!(parent.as_lowercase_str(), "a/b");
 
-        let single_child = RepositoryPath::from_relative_and_root(
-            Path::new("/a/b/c"),
-            RelativePath::new_from_initial_path("d").unwrap(),
-        );
-        let single_child_parent = single_child
-            .get_parent()
-            .expect("Parent should be constructable");
-        assert_eq!(single_child_parent.absolute(), PathBuf::from("/a/b/c"));
-        assert_eq!(
-            *single_child_parent.relative(),
-            RelativePath::new_from_initial_path("").unwrap()
-        );
+        let single = RelativePath::new_from_initial_path("D").unwrap();
+        let single_parent = single.parent_path();
+        assert!(single_parent.is_empty());
+        assert_eq!(single_parent.as_lowercase_str(), "");
 
-        let no_children = RepositoryPath::from_relative_and_root(
-            Path::new("/a/b/c"),
-            RelativePath::new_from_initial_path("").unwrap(),
-        );
-        assert!(no_children.get_parent().is_none());
+        let empty = RelativePath::new();
+        assert!(empty.parent_path().is_empty());
+
+        let grandparent = nested.parent_path().parent_path();
+        assert_eq!(grandparent.as_str(), "A");
+        assert_eq!(grandparent.as_lowercase_str(), "a");
     }
 }

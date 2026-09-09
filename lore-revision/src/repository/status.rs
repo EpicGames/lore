@@ -27,7 +27,6 @@ use crate::filter::FilterStates;
 use crate::find;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
 use crate::fs::filesystem_provider::FilesystemDiffTree;
-use crate::fs::filesystem_provider::FilesystemPath;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
@@ -50,7 +49,6 @@ use crate::node::ROOT_NODE;
 use crate::path::emit_path_ignore;
 use crate::state;
 use crate::util::path::RelativePath;
-use crate::util::path::RepositoryPath;
 use crate::util::serde::u8_as_bool;
 
 /// Revision status of a repository, describing the current, local, and remote
@@ -479,7 +477,7 @@ async fn file_size_from_node_change_id(change: &NodeChange) -> Result<u64, Statu
 /// walk and here — is size 0, matching a delete.
 async fn file_size_from_node_change_path(
     operation: &InstanceOperationImpl,
-    repository: &Arc<RepositoryContext>,
+    _repository: &Arc<RepositoryContext>,
     change: &NodeChange,
 ) -> Result<u64, StatusError> {
     if change.action == FileAction::Delete {
@@ -488,9 +486,9 @@ async fn file_size_from_node_change_path(
     if let Some(observed) = &change.observed {
         return Ok(observed.size);
     }
-    let repository_path = RepositoryPath::from_relative(repository, change.path.clone())?;
+    let repository_path = change.path.clone();
     let info = operation
-        .file_info(FilesystemPath::Repository(&repository_path))
+        .file_info(&repository_path)
         .await
         .forward::<StatusError>("accessing metadata for file")?;
     Ok(info.size)
@@ -922,9 +920,9 @@ async fn scan_paths(
             if node_link.is_valid() {
                 exists_in_state = true;
             } else {
-                let repository_path = RepositoryPath::from_relative(&repository, path.clone())?;
+                let repository_path = path.clone();
                 exists_in_filesystem = operation
-                    .file_info(FilesystemPath::Repository(&repository_path))
+                    .file_info(&repository_path)
                     .await
                     .is_ok_and(|info| info.exists);
             }

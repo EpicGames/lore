@@ -6,7 +6,6 @@
 //! (freeze for SWFS) from actual file operations (work against frozen snapshot).
 
 use std::fs::Metadata;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -36,7 +35,6 @@ use crate::state::NodeComparison;
 use crate::state::RecordedModifiedTimes;
 use crate::state::State;
 use crate::util::path::RelativePath;
-use crate::util::path::RepositoryPath;
 
 #[error_set]
 pub enum FsError {
@@ -257,35 +255,6 @@ where
     Ok(value)
 }
 
-/// A path that can be either relative to the repository root or an absolute scratch path.
-///
-/// Use `Repository` for paths within the working directory, and `Scratch` for temporary
-/// paths outside the repository (e.g., diff scratch directories).
-#[derive(Clone, Copy)]
-pub enum FilesystemPath<'a> {
-    /// A path relative to the repository root.
-    Repository(&'a RepositoryPath),
-    /// An absolute path outside the repository (scratch/temp files).
-    Scratch(&'a Path),
-}
-
-impl<'a> FilesystemPath<'a> {
-    pub fn from_repository(path: &'a RepositoryPath) -> Self {
-        FilesystemPath::Repository(path)
-    }
-
-    pub fn from_scratch_path(absolute_path: &'a Path) -> Self {
-        Self::Scratch(absolute_path)
-    }
-
-    pub fn as_absolute_path(&self) -> &Path {
-        match self {
-            FilesystemPath::Repository(path) => path.absolute(),
-            FilesystemPath::Scratch(abs) => abs,
-        }
-    }
-}
-
 /// Instance operation trait - performs file operations within a context.
 ///
 /// Operations are performed against a consistent snapshot (for SWFS) or directly
@@ -313,7 +282,7 @@ pub trait InstanceOperation: Send + Sync {
     /// content modification against a node.
     fn file_info(
         &self,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
     ) -> impl Future<Output = Result<FileInfo, FsError>> + Send;
 
     /// Whether the directory holding `path` holds a child named exactly as `path` spells it.
@@ -323,10 +292,7 @@ pub trait InstanceOperation: Send + Sync {
     /// held in this spelling rather than that it is absent, and `None` is the filesystem
     /// declining to say — macOS for every name, Windows past its path limit — which only
     /// [`names_folding_to`](Self::names_folding_to) answers.
-    fn holds_name_exactly(
-        &self,
-        path: FilesystemPath<'_>,
-    ) -> impl Future<Output = Option<bool>> + Send;
+    fn holds_name_exactly(&self, path: &RelativePath) -> impl Future<Output = Option<bool>> + Send;
 
     /// Every spelling of `name` the directory at `path` holds that folds to the same name:
     /// the exact one alone where it is there, and empty where no spelling is.
@@ -336,7 +302,7 @@ pub trait InstanceOperation: Send + Sync {
     /// disk asks [`holds_name_exactly`](Self::holds_name_exactly).
     fn names_folding_to(
         &self,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
         name: &str,
     ) -> impl Future<Output = Result<Vec<String>, FsError>> + Send;
 
@@ -345,7 +311,7 @@ pub trait InstanceOperation: Send + Sync {
     fn file_hash(
         &self,
         repository: Arc<RepositoryContext>,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
         node_hint: Option<&Node>,
     ) -> impl Future<Output = Result<Hash, FsError>> + Send;
 
@@ -371,53 +337,65 @@ pub trait InstanceOperation: Send + Sync {
     /// On Windows, this is a no-op.
     fn make_executable(
         &self,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
         executable: bool,
     ) -> impl Future<Output = Result<(), FsError>> + Send;
 
     /// Create a directory if it doesn't exist (mkdir -p behavior).
     fn create_dir_all(
         &self,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
     ) -> impl Future<Output = Result<(), FsError>> + Send;
 
     /// Create an empty file.
-    fn create_file(
-        &self,
-        path: FilesystemPath<'_>,
-    ) -> impl Future<Output = Result<(), FsError>> + Send;
+    fn create_file(&self, path: &RelativePath) -> impl Future<Output = Result<(), FsError>> + Send;
 
     /// Changes the casing of a file from `from` to `to` based on various OS and command argument
     /// settings. `to` must be identical to `from` other than case differences.
     fn unify_case_rename(
         &self,
-        from: FilesystemPath<'_>,
-        to: FilesystemPath<'_>,
+        from: &RelativePath,
+        to: &RelativePath,
     ) -> impl Future<Output = Result<(), FsError>> + Send;
 
     /// Delete a file or empty directory.
-    fn remove(&self, path: FilesystemPath<'_>) -> impl Future<Output = Result<(), FsError>> + Send;
+    fn remove(&self, path: &RelativePath) -> impl Future<Output = Result<(), FsError>> + Send;
 
     /// Delete a directory and all contents.
     fn remove_recursive(
         &self,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
     ) -> impl Future<Output = Result<(), FsError>> + Send;
+
+    /// Write `node`'s content to `path`, creating the directory above it, applying the node's
+    /// mode, and reporting what the file looks like once written.
+    ///
+    /// One call rather than four because the steps are never useful apart, and each one asked
+    /// separately resolves the same name against the root again.
+    ///
+    /// A path that cannot be read back once written is an error: what the file looks like is
+    /// the point of the call, and a caller records a modified time from it.
+    fn write_node(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: &Node,
+        path: &RelativePath,
+    ) -> impl Future<Output = Result<FileInfo, FsError>> + Send;
 
     /// Sets the file at `path` to be the contents of `Node`.
     fn set_file_to_immutable_store_contents(
         &self,
         repository: Arc<RepositoryContext>,
         node: &Node,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
     ) -> impl Future<Output = Result<(Fragment, Option<FileInfo>), FsError>> + Send;
 
     /// Copy the contents of `source_path` to `destination_path`, with the destination being a
     /// scratch file that is not expected to be part of the repository even if it's in its path.
-    fn copy_to_scratch_file(
+    fn copy_file(
         &self,
-        source_path: FilesystemPath<'_>,
-        destination_path: impl AsRef<Path> + Send,
+        source_path: &RelativePath,
+        destination_path: &RelativePath,
     ) -> impl Future<Output = Result<(), FsError>> + Send;
 
     /// Merge 3 files that exist on the file system.
@@ -433,7 +411,7 @@ pub trait InstanceOperation: Send + Sync {
     /// Load the contents of `path` to see if it can be diffed or must only be opaquely compared.
     fn infer_is_diffable(
         &self,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
     ) -> impl Future<Output = Result<bool, FsError>> + Send;
 
     /// Finalize the operation.
@@ -514,7 +492,7 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn file_info(&self, path: FilesystemPath<'_>) -> Result<FileInfo, FsError> {
+    async fn file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(this) => this.file_info(path).await,
@@ -522,7 +500,7 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn holds_name_exactly(&self, path: FilesystemPath<'_>) -> Option<bool> {
+    async fn holds_name_exactly(&self, path: &RelativePath) -> Option<bool> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(this) => this.holds_name_exactly(path).await,
@@ -532,7 +510,7 @@ impl InstanceOperation for InstanceOperationImpl {
 
     async fn names_folding_to(
         &self,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
         name: &str,
     ) -> Result<Vec<String>, FsError> {
         match &self.dispatch {
@@ -545,7 +523,7 @@ impl InstanceOperation for InstanceOperationImpl {
     async fn file_hash(
         &self,
         repository: Arc<RepositoryContext>,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
         node_hint: Option<&Node>,
     ) -> Result<Hash, FsError> {
         match &self.dispatch {
@@ -575,11 +553,7 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn make_executable(
-        &self,
-        path: FilesystemPath<'_>,
-        executable: bool,
-    ) -> Result<(), FsError> {
+    async fn make_executable(&self, path: &RelativePath, executable: bool) -> Result<(), FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -589,7 +563,7 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn create_dir_all(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
+    async fn create_dir_all(&self, path: &RelativePath) -> Result<(), FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -597,7 +571,7 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn create_file(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
+    async fn create_file(&self, path: &RelativePath) -> Result<(), FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -607,8 +581,8 @@ impl InstanceOperation for InstanceOperationImpl {
 
     async fn unify_case_rename(
         &self,
-        from: FilesystemPath<'_>,
-        to: FilesystemPath<'_>,
+        from: &RelativePath,
+        to: &RelativePath,
     ) -> Result<(), FsError> {
         match &self.dispatch {
             #[cfg(test)]
@@ -617,7 +591,7 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn remove(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
+    async fn remove(&self, path: &RelativePath) -> Result<(), FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -625,7 +599,7 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn remove_recursive(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
+    async fn remove_recursive(&self, path: &RelativePath) -> Result<(), FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -633,11 +607,26 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
+    async fn write_node(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: &Node,
+        path: &RelativePath,
+    ) -> Result<FileInfo, FsError> {
+        match &self.dispatch {
+            #[cfg(test)]
+            StaticDispatchInstanceOperation::Test(_this) => panic!(),
+            StaticDispatchInstanceOperation::Os(this) => {
+                this.write_node(repository, node, path).await
+            }
+        }
+    }
+
     async fn set_file_to_immutable_store_contents(
         &self,
         repository: Arc<RepositoryContext>,
         node: &Node,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
     ) -> Result<(Fragment, Option<FileInfo>), FsError> {
         match &self.dispatch {
             #[cfg(test)]
@@ -649,17 +638,16 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn copy_to_scratch_file(
+    async fn copy_file(
         &self,
-        source_path: FilesystemPath<'_>,
-        destination_path: impl AsRef<Path> + Send,
+        source_path: &RelativePath,
+        destination_path: &RelativePath,
     ) -> Result<(), FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => {
-                this.copy_to_scratch_file(source_path, destination_path)
-                    .await
+                this.copy_file(source_path, destination_path).await
             }
         }
     }
@@ -682,7 +670,7 @@ impl InstanceOperation for InstanceOperationImpl {
         }
     }
 
-    async fn infer_is_diffable(&self, path: FilesystemPath<'_>) -> Result<bool, FsError> {
+    async fn infer_is_diffable(&self, path: &RelativePath) -> Result<bool, FsError> {
         match &self.dispatch {
             #[cfg(test)]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
@@ -721,7 +709,6 @@ pub mod tests {
     use crate::fs::filesystem_provider::FilesystemDiffContext;
     use crate::fs::filesystem_provider::FilesystemDiffIntent;
     use crate::fs::filesystem_provider::FilesystemDiffTree;
-    use crate::fs::filesystem_provider::FilesystemPath;
     use crate::fs::filesystem_provider::FilesystemProvider;
     use crate::fs::filesystem_provider::FsError;
     use crate::fs::filesystem_provider::InstanceOperation;
@@ -739,7 +726,6 @@ pub mod tests {
     use crate::state::NodeComparison;
     use crate::state::State;
     use crate::util::path::RelativePath;
-    use crate::util::path::RepositoryPath;
 
     #[derive(Default)]
     pub struct TestFilesystemProvider {
@@ -851,7 +837,7 @@ pub mod tests {
         /// Counts the lookup and reports what the provider was told to hold, which for the
         /// default is a path the filesystem does not hold — what a caller acts on without
         /// needing content behind it.
-        async fn file_info(&self, _path: FilesystemPath<'_>) -> Result<FileInfo, FsError> {
+        async fn file_info(&self, _path: &RelativePath) -> Result<FileInfo, FsError> {
             self.file_info_count.fetch_add(1, Ordering::AcqRel);
             Ok(if self.holds_paths {
                 FileInfo {
@@ -866,14 +852,14 @@ pub mod tests {
 
         /// Counts the lookup and reports the spelling asked about as the one held, so a
         /// resolver reading through this one settles a path without reading a directory.
-        async fn holds_name_exactly(&self, _path: FilesystemPath<'_>) -> Option<bool> {
+        async fn holds_name_exactly(&self, _path: &RelativePath) -> Option<bool> {
             self.holds_name_count.fetch_add(1, Ordering::AcqRel);
             Some(self.holds_paths)
         }
 
         async fn names_folding_to(
             &self,
-            _path: FilesystemPath<'_>,
+            _path: &RelativePath,
             name: &str,
         ) -> Result<Vec<String>, FsError> {
             self.names_folding_count.fetch_add(1, Ordering::AcqRel);
@@ -887,7 +873,7 @@ pub mod tests {
         async fn file_hash(
             &self,
             _repository: Arc<RepositoryContext>,
-            _path: FilesystemPath<'_>,
+            _path: &RelativePath,
             _node_hint: Option<&Node>,
         ) -> Result<Hash, FsError> {
             panic!("Test operation unimplemented except finalize")
@@ -906,33 +892,42 @@ pub mod tests {
 
         async fn make_executable(
             &self,
-            _path: FilesystemPath<'_>,
+            _path: &RelativePath,
             _executable: bool,
         ) -> Result<(), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn create_dir_all(&self, _path: FilesystemPath<'_>) -> Result<(), FsError> {
+        async fn create_dir_all(&self, _path: &RelativePath) -> Result<(), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn create_file(&self, _path: FilesystemPath<'_>) -> Result<(), FsError> {
+        async fn create_file(&self, _path: &RelativePath) -> Result<(), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 
         async fn unify_case_rename(
             &self,
-            _from: FilesystemPath<'_>,
-            _to: FilesystemPath<'_>,
+            _from: &RelativePath,
+            _to: &RelativePath,
         ) -> Result<(), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn remove(&self, _path: FilesystemPath<'_>) -> Result<(), FsError> {
+        async fn remove(&self, _path: &RelativePath) -> Result<(), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn remove_recursive(&self, _path: FilesystemPath<'_>) -> Result<(), FsError> {
+        async fn remove_recursive(&self, _path: &RelativePath) -> Result<(), FsError> {
+            panic!("Test operation unimplemented except finalize")
+        }
+
+        async fn write_node(
+            &self,
+            _repository: Arc<RepositoryContext>,
+            _node: &Node,
+            _path: &RelativePath,
+        ) -> Result<FileInfo, FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 
@@ -940,15 +935,15 @@ pub mod tests {
             &self,
             _repository: Arc<RepositoryContext>,
             _node: &Node,
-            _path: FilesystemPath<'_>,
+            _path: &RelativePath,
         ) -> Result<(Fragment, Option<FileInfo>), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn copy_to_scratch_file(
+        async fn copy_file(
             &self,
-            _source_path: FilesystemPath<'_>,
-            _destination_path: impl AsRef<Path>,
+            _source_path: &RelativePath,
+            _destination_path: &RelativePath,
         ) -> Result<(), FsError> {
             panic!("Test operation unimplemented except finalize")
         }
@@ -964,7 +959,7 @@ pub mod tests {
             panic!("Test operation unimplemented except finalize")
         }
 
-        async fn infer_is_diffable(&self, _path: FilesystemPath<'_>) -> Result<bool, FsError> {
+        async fn infer_is_diffable(&self, _path: &RelativePath) -> Result<bool, FsError> {
             panic!("Test operation unimplemented except finalize")
         }
     }
@@ -1174,13 +1169,10 @@ pub mod tests {
     async fn a_lookup_through_an_operation_is_counted() {
         let filesystem = Arc::new(TestFilesystemProvider::new());
         let operation = filesystem.begin_operation().await.expect("an operation");
-        let path = RepositoryPath::from_relative_and_root(
-            Path::new("/repository"),
-            RelativePath::new_from_initial_path("a/b").expect("path"),
-        );
+        let path = RelativePath::new_from_initial_path("a/b").expect("path");
 
         let info = operation
-            .file_info(FilesystemPath::Repository(&path))
+            .file_info(&path)
             .await
             .expect("a lookup is answered");
 

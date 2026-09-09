@@ -16,6 +16,10 @@ thread_local! {
     pub(crate) static IN_ALLOCATOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// How many frames of the allocating callstack a record carries.
+///
+/// A debug build inlines none of the tracking plumbing, which spends six of them before the
+/// code that asked for the memory, so charging an allocation to its source needs this raised.
 const MAX_CALLSTACK_FRAMES: usize = 8;
 
 type Callstack = [u64; MAX_CALLSTACK_FRAMES];

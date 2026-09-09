@@ -53,7 +53,6 @@ use crate::state;
 use crate::state::State;
 use crate::util;
 use crate::util::path::RelativePath;
-use crate::util::path::RepositoryPath;
 
 /// Data for the event emitted when a reset operation begins.
 #[repr(C)]
@@ -1018,9 +1017,7 @@ async fn reset_walk_path(ctx: ResetContext, relative_path: RelativePath) -> Resu
     let relative_path = if relative_path.is_empty() {
         relative_path
     } else {
-        let repository_path = repository.require_path()?;
-        let resolved =
-            util::fs::filesystem_path(&operation, repository_path, &relative_path, None).await;
+        let resolved = util::fs::filesystem_path(&operation, "", &relative_path, None).await;
         resolved.unwrap_or(relative_path)
     };
 
@@ -1615,7 +1612,9 @@ async fn reset_walk_directory(
     let force = execution_context().globals().force();
     let mut tasks = JoinSet::new();
     while let Some(entry) = filesystem_children.next().await {
-        let Some(filesystem_child) = util::fs::file_list_item(entry) else {
+        let Some(filesystem_child) =
+            util::fs::file_list_item(entry).forward::<ResetError>("Unusable directory entry")?
+        else {
             continue;
         };
         if filesystem_child.name == DOT_URC || filesystem_child.name == DOT_LORE {
@@ -1747,10 +1746,9 @@ async fn reset_file_realize(
         node,
     } = item;
 
-    let node_path = RepositoryPath::from_relative(&repository, relative_path.clone())?;
-    let metadata = lore_io::IoDriver::global()
-        .metadata(node_path.absolute())
-        .await;
+    let node_path = relative_path.clone();
+    let node_absolute = node_path.to_absolute_path(repository.require_path()?);
+    let metadata = lore_io::IoDriver::global().metadata(&node_absolute).await;
 
     let force = execution_context().globals().force();
 
@@ -1799,7 +1797,7 @@ async fn reset_file_realize(
                 .send();
 
                 let to_path = to_path.to_absolute_path(repository.require_path()?);
-                util::fs::unify_name_case_rename(node_path.absolute(), to_path.as_path())
+                util::fs::unify_name_case_rename(&node_absolute, to_path.as_path())
                     .await
                     .internal("Failed renaming file")?;
             } else {

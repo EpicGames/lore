@@ -22,12 +22,12 @@ use crate::errors::WriteRequired;
 use crate::event;
 use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
-use crate::fs::filesystem_provider::FilesystemPath;
 use crate::fs::filesystem_provider::FilesystemTraversal;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::MeasuredNode;
 use crate::hash;
+use crate::immutable;
 use crate::interface::LoreString;
 use crate::link::LinkFlags;
 use crate::lore::BranchId;
@@ -67,7 +67,6 @@ use crate::state::NodeComparison;
 use crate::state::State;
 use crate::util;
 use crate::util::path::RelativePath;
-use crate::util::path::RepositoryPath;
 use crate::util::path::expand_path_ancestors;
 
 pub async fn realize_state(
@@ -396,12 +395,10 @@ async fn modification_against_measured_node(
     change: &NodeChange,
     state_current: &Arc<State>,
     force_full_check: bool,
-    repository_path: &RepositoryPath,
+    repository_path: &RelativePath,
     content: &lore_storage::ContentHashMemo<'_>,
 ) -> Result<crate::fs::filesystem_provider::FileModifiedCheck, SyncError> {
-    let info = operation
-        .file_info(FilesystemPath::Repository(repository_path))
-        .await?;
+    let info = operation.file_info(repository_path).await?;
     if !info.exists {
         return Ok(crate::fs::filesystem_provider::FileModifiedCheck {
             info,
@@ -496,8 +493,9 @@ pub async fn verify_filesystem(
     filter_mode: FilterMode,
 ) -> Result<Option<NodeChange>, SyncError> {
     lore_trace!("Verify path: {change:?}");
-    let repository_path = RepositoryPath::from_relative(&repository, change.path.clone())?;
-    let content = lore_storage::ContentHashMemo::new(repository_path.absolute());
+    let repository_path = change.path.clone();
+    let absolute_path = repository_path.to_absolute_path(repository.require_path()?);
+    let content = lore_storage::ContentHashMemo::new(&absolute_path);
     let modifications = modification_against_measured_node(
         &operation,
         repository.clone(),
@@ -755,8 +753,7 @@ pub async fn verify_filesystem(
             if !directory_changes.is_empty() {
                 let mut has_modified_file = false;
                 for subchange in directory_changes {
-                    let subchange_path =
-                        RepositoryPath::from_relative(&repository, subchange.path.clone())?;
+                    let subchange_path = subchange.path.clone();
 
                     if subchange.action == change::FileAction::Add {
                         // Allow locally added files to remain and keep directory
@@ -770,10 +767,7 @@ pub async fn verify_filesystem(
                         continue;
                     }
 
-                    let file_info = operation
-                        .file_info(FilesystemPath::Repository(&subchange_path))
-                        .await
-                        .ok();
+                    let file_info = operation.file_info(&subchange_path).await.ok();
 
                     // A tracked entry that is already missing on disk is
                     // effectively pre-aligned with the directory delete the
@@ -809,7 +803,7 @@ pub async fn verify_filesystem(
                             let file_hash = operation
                                 .file_hash(
                                     change.from.repository.clone(),
-                                    FilesystemPath::Repository(&subchange_path),
+                                    &subchange_path,
                                     from_node.as_ref().ok(),
                                 )
                                 .await
@@ -1077,51 +1071,82 @@ pub async fn realize_conflicts(
     Ok(())
 }
 
+/// Whether `path` names something in the tree `repository` tracks, which an operation has to
+/// mediate because the provider behind it may be virtualizing the tree.
+///
+/// A repository with no working tree has nothing for a path to be inside.
+fn is_inside_repository(repository: &RepositoryContext, path: &Path) -> bool {
+    repository
+        .require_path()
+        .is_ok_and(|root| path.starts_with(root))
+}
+
+/// Writes `node`'s content to `path`, which names a file the repository does not track: the
+/// three versions an automatic merge attempt writes to the temporary directory to run a
+/// three-way merge over, and unlinks after.
+///
+/// Reaches the filesystem directly rather than through an operation, which is what the
+/// callers already do to probe and unlink these paths. An operation names paths relative to
+/// the tracked tree's root and may be virtualizing what is under it, so a path inside that
+/// tree is refused here rather than written behind the provider's back. The copies a
+/// conflicted merge leaves beside the file are in the tree and go through
+/// [`realize_sidecar_file`].
 pub async fn realize_scratch_file(
     repository: Arc<RepositoryContext>,
-    operation: Arc<InstanceOperationImpl>,
     path: impl AsRef<Path>,
     node: Node,
     stats: Arc<SyncRealizeStats>,
 ) -> Result<(), SyncError> {
     let path = path.as_ref();
-    if let Some(parent_path) = path.parent() {
-        operation
-            .create_dir_all(FilesystemPath::Scratch(parent_path))
-            .await?;
+    if is_inside_repository(&repository, path) {
+        return Err(SyncError::internal(format!(
+            "Refusing to write scratch file {} inside the repository root",
+            path.to_string_lossy()
+        )));
     }
-    let scratch_path = FilesystemPath::Scratch(path);
+    if let Some(parent_path) = path.parent() {
+        lore_io::IoDriver::global()
+            .create_dir_all(parent_path)
+            .await
+            .map_err(|err| {
+                SyncError::internal(format!("Failed to create scratch directory: {err}"))
+            })?;
+    }
 
     if node.size > 0 {
-        operation
-            .set_file_to_immutable_store_contents(repository.clone(), &node, scratch_path)
+        let options = immutable::read_options_from_repository(&repository);
+        immutable::read_into_file(repository, node.address, path, None, options)
             .await
-            .forward_with::<SyncError, _>(|| {
-                format!("Failed to sync file {}", path.to_string_lossy())
+            .map_err(|err| {
+                SyncError::internal(format!(
+                    "Failed to sync file {}: {err}",
+                    path.to_string_lossy()
+                ))
             })?;
     } else {
-        operation
-            .create_file(scratch_path)
+        lore_io::IoDriver::global()
+            .write_file_bytes(path, bytes::Bytes::new(), false)
             .await
-            .forward_with::<SyncError, _>(|| {
-                format!("Failed to sync file {}", path.to_string_lossy())
+            .map_err(|err| {
+                SyncError::internal(format!(
+                    "Failed to sync file {}: {err}",
+                    path.to_string_lossy()
+                ))
             })?;
     }
 
-    let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
-    if node_executable {
-        operation
-            .make_executable(scratch_path, node_executable)
-            .await?;
+    let metadata = lore_io::IoDriver::global().metadata(path).await.ok();
+    if node.mode & NodeFileMode::Executable == NodeFileMode::Executable
+        && let Some(metadata) = &metadata
+    {
+        util::fs::metadata_set_executable(path, metadata, true).await;
     }
-
-    let info = operation.file_info(scratch_path).await?;
 
     lore_trace!(
         "Realized file {} {} bytes (target file {} bytes) {}",
         path.display(),
         node.size,
-        info.size,
+        metadata.map_or(0, |metadata| metadata.len()),
         node.address.hash
     );
 
@@ -1142,12 +1167,12 @@ pub async fn realize_scratch_file(
 pub async fn realize_file(
     repository: Arc<RepositoryContext>,
     operation: Arc<InstanceOperationImpl>,
-    path: &RepositoryPath,
+    path: &RelativePath,
     node: Node,
     stats: Arc<SyncRealizeStats>,
 ) -> Result<(), SyncError> {
     let info = write_node_to_path(&repository, &operation, path, &node, &stats).await?;
-    operation.record_modified_time(&repository, path.relative(), info.mtime);
+    operation.record_modified_time(&repository, path, info.mtime);
     Ok(())
 }
 
@@ -1159,7 +1184,7 @@ pub async fn realize_file(
 pub async fn realize_sidecar_file(
     repository: Arc<RepositoryContext>,
     operation: Arc<InstanceOperationImpl>,
-    path: &RepositoryPath,
+    path: &RelativePath,
     node: Node,
     stats: Arc<SyncRealizeStats>,
 ) -> Result<(), SyncError> {
@@ -1172,49 +1197,18 @@ pub async fn realize_sidecar_file(
 async fn write_node_to_path(
     repository: &Arc<RepositoryContext>,
     operation: &Arc<InstanceOperationImpl>,
-    path: &RepositoryPath,
+    path: &RelativePath,
     node: &Node,
     stats: &Arc<SyncRealizeStats>,
 ) -> Result<super::filesystem_provider::FileInfo, SyncError> {
-    let mut parent_path = path.relative().clone();
-    parent_path.pop();
-    if parent_path != *path.relative() {
-        operation
-            .create_dir_all(FilesystemPath::Repository(&RepositoryPath::from_relative(
-                repository,
-                parent_path,
-            )?))
-            .await?;
-    }
-
-    if node.size > 0 {
-        operation
-            .set_file_to_immutable_store_contents(
-                repository.clone(),
-                node,
-                FilesystemPath::Repository(path),
-            )
-            .await
-            .forward_with::<SyncError, _>(|| format!("Failed to sync file {}", path.relative()))?;
-    } else {
-        operation
-            .create_file(FilesystemPath::Repository(path))
-            .await
-            .forward_with::<SyncError, _>(|| format!("Failed to sync file {}", path.relative()))?;
-    }
-
-    let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
-    operation
-        .make_executable(FilesystemPath::Repository(path), node_executable)
-        .await?;
-
     let info = operation
-        .file_info(FilesystemPath::Repository(path))
-        .await?;
+        .write_node(repository.clone(), node, path)
+        .await
+        .forward_with::<SyncError, _>(|| format!("Failed to sync file {path}"))?;
 
     lore_trace!(
         "Realized file {} {} bytes (target file {} bytes) {}",
-        path.relative(),
+        &path,
         node.size,
         info.size,
         node.address.hash
@@ -1275,10 +1269,7 @@ async fn realize_changes_delete(
         }
         */
 
-        let change_path = FilesystemPath::Repository(&RepositoryPath::from_relative(
-            &change.from.repository,
-            change.path.clone(),
-        )?);
+        let change_path = change.path.clone();
 
         let is_link = change.from.flags.bits() & NodeFlags::Link != 0;
 
@@ -1298,7 +1289,7 @@ async fn realize_changes_delete(
         } else {
             // This can happen if a local path needs to be deleted as a
             // result of a <state> vs <filesystem> diff.
-            operation.file_info(change_path).await?.is_file
+            operation.file_info(&change_path).await?.is_file
         };
 
         lore_trace!("D {}", change.path);
@@ -1307,37 +1298,35 @@ async fn realize_changes_delete(
             let mut retry = util::fs::file_unlink_retry();
             loop {
                 if is_link {
-                    if let Err(err) = operation.remove_recursive(change_path).await {
+                    if let Err(err) = operation.remove_recursive(&change_path).await {
                         lore_debug!(
                             "Unable to unlink linked repository files at {}: {} (attempt {} of {}",
-                            change_path.as_absolute_path().display(),
+                            change_path,
                             err,
                             retry.counter() + 1,
                             retry.limit()
                         );
                         if !retry.wait().await {
                             return Err(SyncError::internal(format!(
-                                "Failed to remove file or directory from local file system {}",
-                                change_path.as_absolute_path().display(),
+                                "Failed to remove file or directory from local file system {change_path}",
                             )));
                         }
                     } else {
                         break;
                     }
-                } else if let Err(err) = operation.remove(change_path).await {
+                } else if let Err(err) = operation.remove(&change_path).await {
                     // Retry if it is a file, otherwise assume the directory has local files
                     if is_file {
                         lore_trace!(
                             "Unable to unlink local path {}: {} (attempt {} of {})",
-                            change_path.as_absolute_path().display(),
+                            change_path,
                             err,
                             retry.counter() + 1,
                             retry.limit()
                         );
                         if !retry.wait().await {
                             return Err(SyncError::internal(format!(
-                                "Failed to remove file or directory from local file system {}",
-                                change_path.as_absolute_path().display(),
+                                "Failed to remove file or directory from local file system {change_path}",
                             )));
                         }
                     } else {
@@ -1650,24 +1639,21 @@ async fn realize_change_modify_add(
     event::LoreEvent::RevisionSyncFile(LoreRevisionSyncFileEventData::new(&change, size, is_file))
         .send();
 
-    let to_path = RepositoryPath::from_relative(&repository, path.clone())?;
+    let to_path = path.clone();
 
     if !dry_run
         && change.action == change::FileAction::Move
         && let Some(from_path) = change.from_path.as_ref()
     {
-        let from_path = RepositoryPath::from_relative(&repository, from_path.clone())?;
+        let from_path = from_path.clone();
         if operation
-            .unify_case_rename(
-                FilesystemPath::Repository(&from_path),
-                FilesystemPath::Repository(&to_path),
-            )
+            .unify_case_rename(&from_path, &to_path)
             .await
             .is_err()
         {
             lore_trace!("Failed renaming move node, fall back to deleting and recreating");
             operation
-                .remove_recursive(FilesystemPath::Repository(&to_path))
+                .remove_recursive(&to_path)
                 .await
                 .forward::<SyncError>("Failed to realize move/rename")?;
         }
@@ -1675,12 +1661,9 @@ async fn realize_change_modify_add(
 
     if (node.is_directory() || node.is_link()) && write_to_disk {
         if !dry_run
+            && operation.create_dir_all(&to_path).await.is_err()
             && operation
-                .create_dir_all(FilesystemPath::Repository(&to_path))
-                .await
-                .is_err()
-            && operation
-                .file_info(FilesystemPath::Repository(&to_path))
+                .file_info(&to_path)
                 .await
                 .is_ok_and(|info| !info.is_dir)
         {
@@ -1711,7 +1694,7 @@ async fn realize_change_modify_add(
                     format!("Failed to deserialize state {link_revision}")
                 })?;
 
-            let clone_path = RepositoryPath::from_relative(&link, change.path.clone())?;
+            let clone_path = change.path.clone();
 
             let clone_ctx = CloneContext {
                 repository: link.clone(),
@@ -1721,7 +1704,7 @@ async fn realize_change_modify_add(
                 stats: Arc::default(),
                 modified_times: Arc::new(crate::state::RecordedModifiedTimes::default()),
             };
-            let clone_states = link.filter.mount_states(clone_path.relative());
+            let clone_states = link.filter.mount_states(&clone_path);
             clone::clone_node(
                 clone_ctx,
                 link_storage,
@@ -1742,7 +1725,7 @@ async fn realize_change_modify_add(
                 let repository = repository.clone();
                 let operation = operation.clone();
                 let stats = stats.clone();
-                let change_path = RepositoryPath::from_relative(&repository, change.path.clone())?;
+                let change_path = change.path.clone();
                 async move { realize_file(repository, operation, &change_path, node, stats).await }
             });
         }
@@ -2039,26 +2022,17 @@ async fn realize_file_merge(
     if change_from.path == change_to.path {
         // Fetch base / theirs version for conflicting files and try to text merge,
         // if that fails fall back to leaving mine/theirs/base in the file system
-        let mine_path = RepositoryPath::from_relative(
-            &repository,
-            change_from.path.append_into_buf(MINE_SUFFIX).freeze(),
-        )?;
-        let theirs_path = RepositoryPath::from_relative(
-            &repository,
-            change_from.path.append_into_buf(THEIRS_SUFFIX).freeze(),
-        )?;
-        let base_path = RepositoryPath::from_relative(
-            &repository,
-            change_from.path.append_into_buf(BASE_SUFFIX).freeze(),
-        )?;
-        let change_to_path = RepositoryPath::from_relative(&repository, change_to.path.clone())?;
+        let mine_path = change_from.path.append_into_buf(MINE_SUFFIX).freeze();
+        let theirs_path = change_from.path.append_into_buf(THEIRS_SUFFIX).freeze();
+        let base_path = change_from.path.append_into_buf(BASE_SUFFIX).freeze();
+        let change_to_path = change_to.path.clone();
 
         if in_view {
             let mut has_theirs = false;
             if change_from.to.node.is_valid_node_id() {
                 lore_trace!(
                     "Change from has valid to node, realize theirs file {}",
-                    theirs_path.relative()
+                    &theirs_path
                 );
                 let node_to = state_from
                     .block(repository.clone(), NodeBlock::index(change_from.to.node))
@@ -2094,11 +2068,7 @@ async fn realize_file_merge(
                 let absolute_path = change_from
                     .path
                     .to_absolute_path(repository.require_path()?);
-                if has_theirs
-                    && operation
-                        .infer_is_diffable(FilesystemPath::Repository(&change_to_path))
-                        .await?
-                {
+                if has_theirs && operation.infer_is_diffable(&change_to_path).await? {
                     lore_trace!(
                         "Merge identified text file for merge: {}",
                         absolute_path.display()
@@ -2107,7 +2077,7 @@ async fn realize_file_merge(
                     if change_from.from.node.is_valid_node_id() {
                         lore_trace!(
                             "Change from has valid from node, realize base file {}",
-                            base_path.relative()
+                            &base_path
                         );
                         let node_from = state_base
                             .block(repository.clone(), NodeBlock::index(change_from.from.node))
@@ -2124,20 +2094,15 @@ async fn realize_file_merge(
                         .await?;
                     } else {
                         lore_trace!("Change from has no valid from node, empty base file");
-                        let _ = operation
-                            .create_file(FilesystemPath::Repository(&base_path))
-                            .await;
+                        let _ = operation.create_file(&base_path).await;
                     }
 
                     // Realize the "mine" file as the current file
                     operation
-                        .copy_to_scratch_file(
-                            FilesystemPath::Repository(&change_to_path),
-                            mine_path.absolute(),
-                        )
+                        .copy_file(&change_to_path, &mine_path)
                         .await
                         .forward_with::<SyncError, _>(|| {
-                            format!("Failed to sync file {}", mine_path.relative())
+                            format!("Failed to sync file {mine_path}")
                         })?;
 
                     // Try performing a text merge
@@ -2151,10 +2116,10 @@ async fn realize_file_merge(
                     };
                     let merged = match operation
                         .merge3_text_by_path(
-                            base_path.relative(),
-                            mine_path.relative(),
-                            theirs_path.relative(),
-                            change_to_path.relative(),
+                            &base_path,
+                            &mine_path,
+                            &theirs_path,
+                            &change_to_path,
                             mode,
                         )
                         .await
@@ -2164,9 +2129,9 @@ async fn realize_file_merge(
                             // mine/theirs conflict handling
                             lore_debug!(
                                 "Merge as text failed base {}, mine {}, theirs {} - fallback to binary file conflict to {}: {}",
-                                base_path.relative(),
-                                change_to_path.relative(),
-                                theirs_path.relative(),
+                                &base_path,
+                                &change_to_path,
+                                &theirs_path,
                                 absolute_path.display(),
                                 err
                             );
@@ -2176,9 +2141,9 @@ async fn realize_file_merge(
                             // Merged with conflict markers
                             lore_debug!(
                                 "Merged as text with conflict markers, base {}, mine {}, theirs {}: {}",
-                                base_path.relative(),
-                                change_to_path.relative(),
-                                theirs_path.relative(),
+                                &base_path,
+                                &change_to_path,
+                                &theirs_path,
                                 absolute_path.display()
                             );
                             true
@@ -2196,15 +2161,9 @@ async fn realize_file_merge(
                     };
 
                     if merged && !conflict {
-                        let _ = operation
-                            .remove(FilesystemPath::Repository(&base_path))
-                            .await;
-                        let _ = operation
-                            .remove(FilesystemPath::Repository(&theirs_path))
-                            .await;
-                        let _ = operation
-                            .remove(FilesystemPath::Repository(&mine_path))
-                            .await;
+                        let _ = operation.remove(&base_path).await;
+                        let _ = operation.remove(&theirs_path).await;
+                        let _ = operation.remove(&mine_path).await;
                     }
                 } else {
                     lore_debug!(
@@ -2214,10 +2173,7 @@ async fn realize_file_merge(
 
                     // Realize the base file for binary conflicts so users can compare
                     if change_from.from.node.is_valid_node_id() {
-                        lore_trace!(
-                            "Realize base file for binary conflict {}",
-                            base_path.relative()
-                        );
+                        lore_trace!("Realize base file for binary conflict {}", &base_path);
                         let node_from = state_base
                             .block(repository.clone(), NodeBlock::index(change_from.from.node))
                             .await
@@ -2240,15 +2196,9 @@ async fn realize_file_merge(
             }
 
             if dry_run {
-                let _ = operation
-                    .remove(FilesystemPath::Repository(&base_path))
-                    .await;
-                let _ = operation
-                    .remove(FilesystemPath::Repository(&theirs_path))
-                    .await;
-                let _ = operation
-                    .remove(FilesystemPath::Repository(&mine_path))
-                    .await;
+                let _ = operation.remove(&base_path).await;
+                let _ = operation.remove(&theirs_path).await;
+                let _ = operation.remove(&mine_path).await;
             }
         }
 
@@ -2288,9 +2238,7 @@ async fn realize_file_merge(
             } else if conflict && !change_to.to.node.is_valid_node_id() {
                 node.flags |= NodeFlags::StagedDelete;
 
-                operation
-                    .remove(FilesystemPath::Repository(&change_to_path))
-                    .await?;
+                operation.remove(&change_to_path).await?;
             }
 
             node.flags = NodeFlags::from_bits_truncate(node.flags)
@@ -2426,8 +2374,7 @@ async fn realize_file_merge(
                 return Err(SyncError::internal("Invalid change data"));
             };
 
-            let change_from_path =
-                RepositoryPath::from_relative(&repository, change_from.path.clone())?;
+            let change_from_path = change_from.path.clone();
 
             // Realize the source file content on disk at the source move destination
             if !dry_run && node.is_file() {
@@ -2451,7 +2398,7 @@ async fn realize_file_merge(
             stage::stage_single_node(
                 repository.clone(),
                 state_stage.clone(),
-                change_from_path.relative().clone(),
+                change_from_path.clone(),
                 node,
                 Arc::default(),
                 None, // TODO(vri): UCS-17955 - Merging and conflict resolution for links
@@ -2679,17 +2626,42 @@ mod tests {
             .begin_operation()
             .await
             .expect("filesystem operation");
-        let repository_path =
-            RepositoryPath::from_relative(repository, path.clone()).expect("path");
-        let info = operation
-            .file_info(FilesystemPath::Repository(&repository_path))
-            .await
-            .expect("file info");
+        let info = operation.file_info(path).await.expect("file info");
         state::file_modified_time_store(repository.clone(), path, info.mtime).await;
     }
 
     /// A file the branch never touched, holding what the current revision says it should.
     /// The merge has to be free to overwrite it.
+    /// A scratch write reaches the filesystem directly, so a path in the tracked tree has to
+    /// be refused: the provider may be virtualizing what is under the root, and a direct
+    /// write would go behind it.
+    ///
+    /// The node is empty so that it is written without reading the store, which leaves the
+    /// refusal as the only thing that can fail the call.
+    #[tokio::test]
+    async fn a_scratch_path_inside_the_repository_is_refused() {
+        Box::pin(with_execution(async {
+            let dir = lore_base::test_util::TempDir::new("lore-realize-test-");
+            let repository = working_tree_repository(dir.path()).await;
+
+            let inside = dir.path().join("inside.bin");
+            assert!(
+                realize_scratch_file(repository.clone(), &inside, file_node(&[]), Arc::default())
+                    .await
+                    .is_err(),
+                "A path under the repository root has to go through an operation"
+            );
+            assert!(!inside.exists(), "The refused path must not be written");
+
+            let outside = util::fs::generate_temppath("outside");
+            assert!(
+                !is_inside_repository(&repository, &outside),
+                "A generated scratch path is outside the tree the repository tracks"
+            );
+        }))
+        .await;
+    }
+
     #[tokio::test]
     async fn a_clean_file_is_overwritten() {
         Box::pin(with_execution(async {

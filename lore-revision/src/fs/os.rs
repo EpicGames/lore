@@ -16,7 +16,6 @@ use lore_error_set::prelude::*;
 
 use super::filesystem_provider::FileInfo;
 use super::filesystem_provider::FilesystemDiffContext;
-use super::filesystem_provider::FilesystemPath;
 use super::filesystem_provider::FilesystemProvider;
 use super::filesystem_provider::FsError;
 use super::filesystem_provider::InstanceOperation;
@@ -27,6 +26,7 @@ use crate::immutable;
 use crate::merge::MergeTextMode;
 use crate::merge::merge3_text_by_path;
 use crate::node::Node;
+use crate::node::NodeFileMode;
 use crate::repository::RepositoryContext;
 use crate::state::FilesystemDiffStats;
 use crate::state::NodeComparison;
@@ -69,6 +69,14 @@ pub struct OsOperation {
     filesystem_root: PathBuf,
 }
 
+impl OsOperation {
+    /// Where `path` is on disk, under the root the operation was opened on -- the top-level
+    /// repository every link and layer in it shares.
+    fn absolute(&self, path: &RelativePath) -> PathBuf {
+        path.to_absolute_path(&self.filesystem_root)
+    }
+}
+
 /// All operations delegate to the regular OS file system.
 impl InstanceOperation for OsOperation {
     async fn changes_from_filesystem_to_state(
@@ -83,11 +91,9 @@ impl InstanceOperation for OsOperation {
 
     /// A path mid-deletion stats as `PermissionDenied` on Windows rather than
     /// `NotFound`, so both report a non-existent path.
-    async fn file_info(&self, path: FilesystemPath<'_>) -> Result<FileInfo, FsError> {
-        match lore_io::IoDriver::global()
-            .metadata(path.as_absolute_path())
-            .await
-        {
+    async fn file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
+        let path = self.absolute(path);
+        match lore_io::IoDriver::global().metadata(path).await {
             Ok(metadata) => Ok(FileInfo::from_metadata(&metadata)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileInfo::default()),
             Err(e)
@@ -100,27 +106,29 @@ impl InstanceOperation for OsOperation {
         }
     }
 
-    async fn holds_name_exactly(&self, path: FilesystemPath<'_>) -> Option<bool> {
-        crate::util::fs::holds_name_exactly(path.as_absolute_path()).await
+    async fn holds_name_exactly(&self, path: &RelativePath) -> Option<bool> {
+        let path = self.absolute(path);
+        crate::util::fs::holds_name_exactly(path).await
     }
 
     async fn names_folding_to(
         &self,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
         name: &str,
     ) -> Result<Vec<String>, FsError> {
-        Ok(crate::util::fs::names_folding_to(path.as_absolute_path(), name).await?)
+        let path = self.absolute(path);
+        Ok(crate::util::fs::names_folding_to(path, name).await?)
     }
 
     async fn file_hash(
         &self,
         repository: Arc<RepositoryContext>,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
         node_hint: Option<&Node>,
     ) -> Result<Hash, FsError> {
         Ok(immutable::hash_file(
             repository.clone(),
-            path.as_absolute_path(),
+            self.absolute(path),
             node_hint.and_then(|node| {
                 if !node.address.is_zero() {
                     Some(node.address)
@@ -153,14 +161,11 @@ impl InstanceOperation for OsOperation {
             .forward_any::<FsError>("Failed to compare file to node")
     }
 
-    async fn make_executable(
-        &self,
-        path: FilesystemPath<'_>,
-        executable: bool,
-    ) -> Result<(), FsError> {
+    async fn make_executable(&self, path: &RelativePath, executable: bool) -> Result<(), FsError> {
+        let path = self.absolute(path);
         #[cfg(unix)]
         {
-            let absolute_path = path.as_absolute_path();
+            let absolute_path = &path;
             use std::os::unix::fs::PermissionsExt;
             let metadata = lore_io::IoDriver::global().metadata(&absolute_path).await?;
             let mut permissions = metadata.permissions();
@@ -186,65 +191,94 @@ impl InstanceOperation for OsOperation {
         Ok(())
     }
 
-    async fn create_dir_all(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
-        lore_io::IoDriver::global()
-            .create_dir_all(path.as_absolute_path())
-            .await?;
+    async fn create_dir_all(&self, path: &RelativePath) -> Result<(), FsError> {
+        let path = self.absolute(path);
+        lore_io::IoDriver::global().create_dir_all(path).await?;
         Ok(())
     }
 
-    async fn create_file(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
+    async fn create_file(&self, path: &RelativePath) -> Result<(), FsError> {
+        let path = self.absolute(path);
         lore_io::IoDriver::global()
-            .write_file_bytes(path.as_absolute_path(), bytes::Bytes::new(), false)
+            .write_file_bytes(path, bytes::Bytes::new(), false)
             .await?;
         Ok(())
     }
 
     async fn unify_case_rename(
         &self,
-        from: FilesystemPath<'_>,
-        to: FilesystemPath<'_>,
+        from: &RelativePath,
+        to: &RelativePath,
     ) -> Result<(), FsError> {
-        util::fs::unify_name_case_rename(from.as_absolute_path(), to.as_absolute_path()).await?;
+        let (from, to) = (self.absolute(from), self.absolute(to));
+        util::fs::unify_name_case_rename(&from, &to).await?;
         Ok(())
     }
 
-    async fn remove(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
-        util::fs::unlink(path.as_absolute_path()).await?;
+    async fn remove(&self, path: &RelativePath) -> Result<(), FsError> {
+        let path = self.absolute(path);
+        util::fs::unlink(path).await?;
         Ok(())
     }
 
-    async fn remove_recursive(&self, path: FilesystemPath<'_>) -> Result<(), FsError> {
-        util::fs::unlink_recursive(path.as_absolute_path()).await?;
+    async fn remove_recursive(&self, path: &RelativePath) -> Result<(), FsError> {
+        let path = self.absolute(path);
+        util::fs::unlink_recursive(path).await?;
         Ok(())
+    }
+
+    async fn write_node(
+        &self,
+        repository: Arc<RepositoryContext>,
+        node: &Node,
+        path: &RelativePath,
+    ) -> Result<FileInfo, FsError> {
+        let path = self.absolute(path);
+        if let Some(parent) = path.parent() {
+            lore_io::IoDriver::global().create_dir_all(parent).await?;
+        }
+
+        if node.size > 0 {
+            let options = immutable::read_options_from_repository(&repository);
+            immutable::read_into_file(repository, node.address, &path, None, options)
+                .await
+                .forward_any::<FsError>("Failed to read file")?;
+        } else {
+            lore_io::IoDriver::global()
+                .write_file_bytes(&path, bytes::Bytes::new(), false)
+                .await?;
+        }
+
+        let written = lore_io::IoDriver::global().metadata(&path).await?;
+        let executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
+        util::fs::metadata_set_executable(&path, &written, executable).await;
+        Ok(FileInfo::from_metadata(
+            &lore_io::IoDriver::global().metadata(&path).await?,
+        ))
     }
 
     async fn set_file_to_immutable_store_contents(
         &self,
         repository: Arc<RepositoryContext>,
         node: &Node,
-        path: FilesystemPath<'_>,
+        path: &RelativePath,
     ) -> Result<(Fragment, Option<FileInfo>), FsError> {
         let options = immutable::read_options_from_repository(&repository);
-        let (fragment, metadata) = immutable::read_into_file(
-            repository,
-            node.address,
-            path.as_absolute_path(),
-            None,
-            options,
-        )
-        .await
-        .forward_any::<FsError>("Failed to read file")?;
+        let path = self.absolute(path);
+        let (fragment, metadata) =
+            immutable::read_into_file(repository, node.address, &path, None, options)
+                .await
+                .forward_any::<FsError>("Failed to read file")?;
         Ok((fragment, metadata.as_ref().map(FileInfo::from_metadata)))
     }
 
-    async fn copy_to_scratch_file(
+    async fn copy_file(
         &self,
-        source_path: FilesystemPath<'_>,
-        destination_path: impl AsRef<Path> + Send,
+        source_path: &RelativePath,
+        destination_path: &RelativePath,
     ) -> Result<(), FsError> {
         lore_io::IoDriver::global()
-            .copy(source_path.as_absolute_path(), destination_path.as_ref())
+            .copy(self.absolute(source_path), self.absolute(destination_path))
             .await?;
         Ok(())
     }
@@ -260,12 +294,11 @@ impl InstanceOperation for OsOperation {
         Ok(merge3_text_by_path(&self.filesystem_root, base, mine, theirs, result, mode).await?)
     }
 
-    async fn infer_is_diffable(&self, path: FilesystemPath<'_>) -> Result<bool, FsError> {
-        Ok(
-            crate::infer::infer_is_diffable_by_path(path.as_absolute_path())
-                .await
-                .unwrap_or(false),
-        )
+    async fn infer_is_diffable(&self, path: &RelativePath) -> Result<bool, FsError> {
+        let path = self.absolute(path);
+        Ok(crate::infer::infer_is_diffable_by_path(&path)
+            .await
+            .unwrap_or(false))
     }
 
     async fn finalize(&self, _success: bool) -> Result<(), FsError> {
