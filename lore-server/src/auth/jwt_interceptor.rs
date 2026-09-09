@@ -11,6 +11,7 @@ use tracing::debug;
 use super::jwt::JwtVerifier;
 use super::jwt::verify_authorization;
 use crate::auth::jwt::AuthorizationToken;
+use crate::authnz::repository_authorizer::RawToken;
 use crate::grpc::get_repository;
 
 fn add_auth_fields_to_current_span(auth: &AuthorizationToken) {
@@ -71,6 +72,7 @@ impl Interceptor for JWTInterceptor {
         verify_authorization(&authorization, repository)
             .map_err(|_err| crate::grpc::no_repository_access_status())?;
 
+        request.extensions_mut().insert(RawToken(token));
         request.extensions_mut().insert(authorization);
 
         Ok(request)
@@ -103,6 +105,7 @@ impl Interceptor for JWTAuthnInterceptor {
         let authorization = authorize(&self.jwt_verifier, &token)?;
         add_auth_fields_to_current_span(&authorization);
 
+        request.extensions_mut().insert(RawToken(token));
         request.extensions_mut().insert(authorization);
 
         Ok(request)

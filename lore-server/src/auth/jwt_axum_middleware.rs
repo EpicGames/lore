@@ -17,6 +17,7 @@ use tracing::Span;
 
 use super::jwt;
 use crate::auth::jwt::AuthorizationToken;
+use crate::authnz::repository_authorizer::RawToken;
 use crate::http::server::ServerState;
 
 #[derive(Deserialize)]
@@ -40,6 +41,7 @@ pub async fn jwt_axum_verify_authorization(
                 if jwt::verify_authorization(&user_info, repository).is_ok() {
                     Span::current().record(USER_ID, &user_info.user_id);
                     // Set `user_info` as a request extension so it can be used down the stack
+                    request.extensions_mut().insert(RawToken(accesstoken));
                     request.extensions_mut().insert(Some(user_info));
 
                     return next.run(request).await;

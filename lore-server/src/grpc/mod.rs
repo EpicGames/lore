@@ -69,6 +69,8 @@ use tracing::warn;
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::ResourcePermission;
 use crate::auth::jwt::verify_authorization;
+use crate::authnz::repository_authorizer::RawToken;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::hooks::traits::HookError;
 use crate::hooks::traits::StatusCode;
 use crate::protocol::attribute_map::AttributeMap;
@@ -208,6 +210,18 @@ pub fn get_authorization(extensions: &Extensions) -> Result<AuthorizationToken, 
         Some(auth) => Ok(auth.clone()),
         None => Err(Status::unauthenticated("Missing authorization")),
     }
+}
+
+/// Rebuild the interceptor-verified token from request extensions. `None`
+/// when no interceptor ran (no verifier configured) or when either half is
+/// missing.
+pub fn get_verified_token(extensions: &Extensions) -> Option<VerifiedToken<'_>> {
+    let claims = extensions.get::<AuthorizationToken>()?;
+    let raw = extensions.get::<RawToken>()?;
+    Some(VerifiedToken {
+        raw: &raw.0,
+        claims,
+    })
 }
 
 pub fn link_read_authorizer(

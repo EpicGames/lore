@@ -21,7 +21,6 @@ use tracing::info;
 use tracing::warn;
 
 use crate::authnz::repository_authorizer::AuthClientAuthorizer;
-use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
@@ -215,6 +214,6 @@ pub(crate) async fn check_repository_query_authorization(
     repository_id: RepositoryId,
 ) -> Result<(), Status> {
     AuthClientAuthorizer::new(auth_url)
-        .check_repository_access(authorization, repository_id)
+        .check_access_with_header(authorization, repository_id, None)
         .await
 }
