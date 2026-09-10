@@ -398,7 +398,7 @@ Delete a repository
 
 ###### **Arguments:**
 
-* `<url>` — URL of repository
+* `<url>` — URL of repository, or a bare name or ID resolved against this repository's remote
 
 
 
@@ -2018,7 +2018,8 @@ Display identity information for the current user or specified user IDs
 
 ###### **Options:**
 
-* `--with-token` — Include cached tokens in the output
+* `--with-identity-token` — Include cached identity tokens in the output
+* `--with-access-token` — Include the current repository's access token in the output
 
 
 

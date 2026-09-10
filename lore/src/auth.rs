@@ -35,6 +35,7 @@ use lore_revision::repository::RepositoryContext;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::call::repository_call_no_store;
 use crate::call::repository_call_read;
 use crate::call::setup_execution;
 use crate::call_delegation::dispatch_call;
@@ -123,7 +124,8 @@ async fn resolve_user_info_local(
         let local_args = LoreAuthLocalUserInfoArgs {
             auth_endpoint: LoreString::default(),
             user_ids: LoreArray::default(),
-            with_token: 0,
+            with_identity_token: 0,
+            with_access_token: 0,
         };
         return local_user_info_impl(globals, local_args, callback).await;
     }
@@ -609,8 +611,13 @@ pub struct LoreAuthLocalUserInfoArgs {
     pub auth_endpoint: LoreString,
     /// User identities to resolve; empty resolves the current user
     pub user_ids: LoreArray<LoreString>,
-    /// Emit cached token details for identities with a local token
-    pub with_token: u8,
+    /// Emit cached identity token details for identities with a local token
+    #[serde(alias = "with_token")]
+    pub with_identity_token: u8,
+    /// Emit the repository's authorization (access) token. Requires running
+    /// inside a repository
+    #[serde(default)]
+    pub with_access_token: u8,
 }
 
 /// Resolves user identities to user information using locally stored JWT tokens.
@@ -623,9 +630,14 @@ pub struct LoreAuthLocalUserInfoArgs {
 /// `auth_endpoint` is empty, resolves it from the repository's remote
 /// environment configuration.
 ///
-/// When `with_token` is set, emits `AuthUserToken` events (including the
-/// cached token string) for identities that have a locally stored token,
-/// and `AuthUserInfo` events for others.
+/// When `with_identity_token` is set, emits `AuthUserToken` events (including
+/// the cached identity token string) for identities that have a locally stored
+/// token, and `AuthUserInfo` events for others.
+///
+/// When `with_access_token` is set, the call requires a repository and
+/// additionally emits an `AuthIdentity` event carrying the repository-scoped
+/// authorization (access) token for the current user, performing a token
+/// exchange when no valid cached token exists.
 ///
 /// For remote resolution of user IDs with proper authorization, use
 /// [`resolve_user_info`] which queries the remote authentication service.
@@ -648,7 +660,8 @@ pub struct LoreAuthLocalUserInfoArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::AuthUserInfo`](crate::interface::LoreEvent::AuthUserInfo) | Emitted once per resolved identity with user id and display name |
-/// | [`LoreEvent::AuthUserToken`](crate::interface::LoreEvent::AuthUserToken) | Emitted instead of `AuthUserInfo` when `with_token` is set and a cached token is available, includes full token details |
+/// | [`LoreEvent::AuthUserToken`](crate::interface::LoreEvent::AuthUserToken) | Emitted instead of `AuthUserInfo` when `with_identity_token` is set and a cached token is available, includes full token details |
+/// | [`LoreEvent::AuthIdentity`](crate::interface::LoreEvent::AuthIdentity) | Emitted when `with_access_token` is set, carries the repository-scoped authorization token for the current user |
 pub async fn local_user_info(
     globals: LoreGlobalArgs,
     args: LoreAuthLocalUserInfoArgs,
@@ -707,79 +720,97 @@ async fn local_user_info_impl(
     args: LoreAuthLocalUserInfoArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    let repository_path = globals.repository_path.to_string();
-    let identity = globals.identity().unwrap_or_default().to_string();
+    // The access token is scoped to a repository, so that variant runs as a
+    // repository call. Plain identity resolution stays repository-free.
+    if args.with_access_token != 0 {
+        return repository_call_no_store(
+            globals,
+            callback,
+            args,
+            local_user_info,
+            |repository, args| async move {
+                emit_local_user_info(&args).await?;
+                auth::userinfo::repository_access_token(repository)
+                    .await
+                    .forward::<AuthStoreError>("resolving the repository access token")
+            },
+        )
+        .await;
+    }
 
     let execution = setup_execution(globals, callback);
 
-    let include_token = args.with_token != 0;
-
     LORE_CONTEXT
         .scope(execution, async move {
-            let result = async move {
-                let auth_endpoint =
-                    resolve_auth_endpoint(args.auth_endpoint.as_str(), &repository_path, &identity)
-                        .await?;
-
-                let mut user_ids: Vec<String> = args
-                    .user_ids
-                    .as_slice()
-                    .iter()
-                    .map(|s| s.as_str().to_string())
-                    .collect();
-
-                // When no user IDs are provided, resolve the current user: the
-                // identity this call acts as, which is what a supplied token
-                // names. Only without one does the store decide, since a caller
-                // working from supplied tokens may have no store at all -- and
-                // whichever identity it holds first need not be this caller.
-                if user_ids.is_empty() {
-                    if !identity.is_empty() {
-                        user_ids.push(identity.clone());
-                    } else {
-                        let identities =
-                            lore_credential::token_store::load_identities(&auth_endpoint)
-                                .await
-                                .forward::<AuthStoreError>("accessing token store")?;
-                        if let Some(first) = identities.into_iter().next() {
-                            user_ids.push(first);
-                        }
-                    }
-                }
-
-                let resolved = lore_revision::auth::userinfo::resolve_local_user_info(
-                    &auth_endpoint,
-                    &user_ids,
-                )
-                .await;
-
-                for entry in &resolved {
-                    if include_token && let Some(user_info) = &entry.local_user_info {
-                        LoreEvent::AuthUserToken(LoreAuthUserTokenEventData {
-                            id: user_info.id.clone().into(),
-                            name: user_info.name.clone().into(),
-                            token: user_info.token.clone().into(),
-                            preferred_username: user_info.preferred_username.clone().into(),
-                            flag_service_account: user_info.is_service_account.into(),
-                            expires: user_info.expires,
-                        })
-                        .send();
-                        continue;
-                    }
-
-                    LoreEvent::AuthUserInfo(LoreAuthUserInfoEventData {
-                        id: entry.id.clone().into(),
-                        name: entry.name.clone().into(),
-                    })
-                    .send();
-                }
-
-                Ok::<(), AuthStoreError>(())
-            }
-            .await;
+            let result = emit_local_user_info(&args).await;
             execution_context().dispatcher.complete_result(result).await
         })
         .await
+}
+
+/// Resolves the requested identities from locally stored tokens and emits one
+/// `AuthUserInfo` or `AuthUserToken` event per identity. Runs inside an
+/// execution scope. The caller dispatches completion.
+async fn emit_local_user_info(args: &LoreAuthLocalUserInfoArgs) -> Result<(), AuthStoreError> {
+    let execution = execution_context();
+    let globals = execution.globals();
+    let repository_path = globals.repository_path.to_string();
+    let identity = globals.identity().unwrap_or_default().to_string();
+    let include_identity_token = args.with_identity_token != 0;
+
+    let auth_endpoint =
+        resolve_auth_endpoint(args.auth_endpoint.as_str(), &repository_path, &identity).await?;
+
+    let mut user_ids: Vec<String> = args
+        .user_ids
+        .as_slice()
+        .iter()
+        .map(|s| s.as_str().to_string())
+        .collect();
+
+    // When no user IDs are provided, resolve the current user: the
+    // identity this call acts as, which is what a supplied token
+    // names. Only without one does the store decide, since a caller
+    // working from supplied tokens may have no store at all -- and
+    // whichever identity it holds first need not be this caller.
+    if user_ids.is_empty() {
+        if !identity.is_empty() {
+            user_ids.push(identity.clone());
+        } else {
+            let identities = lore_credential::token_store::load_identities(&auth_endpoint)
+                .await
+                .forward::<AuthStoreError>("accessing token store")?;
+            if let Some(first) = identities.into_iter().next() {
+                user_ids.push(first);
+            }
+        }
+    }
+
+    let resolved =
+        lore_revision::auth::userinfo::resolve_local_user_info(&auth_endpoint, &user_ids).await;
+
+    for entry in &resolved {
+        if include_identity_token && let Some(user_info) = &entry.local_user_info {
+            LoreEvent::AuthUserToken(LoreAuthUserTokenEventData {
+                id: user_info.id.clone().into(),
+                name: user_info.name.clone().into(),
+                token: user_info.token.clone().into(),
+                preferred_username: user_info.preferred_username.clone().into(),
+                flag_service_account: user_info.is_service_account.into(),
+                expires: user_info.expires,
+            })
+            .send();
+            continue;
+        }
+
+        LoreEvent::AuthUserInfo(LoreAuthUserInfoEventData {
+            id: entry.id.clone().into(),
+            name: entry.name.clone().into(),
+        })
+        .send();
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

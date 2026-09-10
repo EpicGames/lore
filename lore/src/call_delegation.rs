@@ -251,7 +251,8 @@ mod tests {
         let args = crate::auth::LoreAuthLocalUserInfoArgs {
             auth_endpoint: LoreString::default(),
             user_ids: lore_revision::interface::LoreArray::default(),
-            with_token: 0,
+            with_identity_token: 0,
+            with_access_token: 0,
         };
 
         // The async entry point returns `()`; the failing handler's code can

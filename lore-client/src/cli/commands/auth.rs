@@ -89,9 +89,12 @@ pub struct AuthInfoCliArgs {
     /// User IDs to resolve (omit for current user)
     #[clap(value_name = "user-id")]
     user_ids: Vec<String>,
-    /// Include cached tokens in the output
-    #[clap(long = "with-token")]
-    with_token: bool,
+    /// Include cached identity tokens in the output
+    #[clap(long = "with-identity-token", alias = "with-token")]
+    with_identity_token: bool,
+    /// Include the current repository's access token in the output
+    #[clap(long = "with-access-token")]
+    with_access_token: bool,
 }
 
 #[derive(Subcommand)]
@@ -205,7 +208,8 @@ fn resolve_identity_names(
             user_ids: LoreArray::from_vec(
                 ids.iter().map(|s| LoreString::from(s.as_str())).collect(),
             ),
-            with_token: 0,
+            with_identity_token: 0,
+            with_access_token: 0,
         };
 
         runtime().block_on(auth::local_user_info(globals.clone(), args, callback));
@@ -428,6 +432,14 @@ pub fn handle_info_command(globals: LoreGlobalArgs, args: &AuthInfoCliArgs) -> u
                     user_token.token.as_str()
                 );
             }
+            LoreEvent::AuthIdentity(data) => {
+                println!(
+                    "{}Access Token:{} {}",
+                    CommonStyles::HEADERS,
+                    anstyle::Reset,
+                    data.token.as_str()
+                );
+            }
             LoreEvent::Complete(_) => {}
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);
@@ -445,7 +457,8 @@ pub fn handle_info_command(globals: LoreGlobalArgs, args: &AuthInfoCliArgs) -> u
                 .map(|s| LoreString::from(s.as_str()))
                 .collect(),
         ),
-        with_token: u8::from(args.with_token),
+        with_identity_token: u8::from(args.with_identity_token),
+        with_access_token: u8::from(args.with_access_token),
     };
 
     runtime().block_on(auth::local_user_info(globals, api_args, callback)) as u8

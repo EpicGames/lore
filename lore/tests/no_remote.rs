@@ -284,7 +284,8 @@ mod tests {
             lore::auth::LoreAuthLocalUserInfoArgs {
                 auth_endpoint: LoreString::default(),
                 user_ids: LoreArray::default(),
-                with_token: 0,
+                with_identity_token: 0,
+                with_access_token: 0,
             },
             callback_capturing(outcome.clone()),
         )

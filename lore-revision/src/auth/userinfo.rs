@@ -212,6 +212,57 @@ pub async fn resolve_user_info(
     Ok(())
 }
 
+/// Emits the authorization (access) token for the repository as an
+/// [`LoreEvent::AuthIdentity`] event.
+pub async fn repository_access_token(
+    repository: Arc<RepositoryContext>,
+) -> Result<(), UserInfoError> {
+    let remote = repository
+        .remote()
+        .await
+        .forward::<UserInfoError>("Not connected")?;
+    let auth_url = remote.auth_url().to_string();
+    let remote_domain = get_domain_or_empty(remote.remote_url());
+
+    let execution = execution_context();
+    let globals = execution.globals();
+    let user_id = execution.user_id().await;
+
+    lore_debug!("Get authorization token for identity {user_id} using auth url {auth_url}");
+    let token = lore_transport::auth::exchange::exchange(
+        auth_url.as_str(),
+        user_id.as_str(),
+        repository.id,
+        remote_domain,
+        globals.identity_token(),
+        globals.access_token(),
+    )
+    .await
+    .forward::<UserInfoError>("Failed authorization token exchange")?;
+
+    // Expiry and authorized domains come from the token itself, matching what
+    // `auth list` reports for stored authorization entries.
+    let (authorized_domains, expires) = match lore_credential::insecure_decode_token(&token) {
+        Ok(decoded) => (
+            decoded.claims.acceptable_root_domains().join(", "),
+            decoded.claims.expires * 1000,
+        ),
+        Err(_) => (String::new(), 0),
+    };
+
+    LoreEvent::AuthIdentity(LoreAuthIdentityEventData {
+        auth_url: auth_url.into(),
+        resource: repository.id.to_string().into(),
+        user_id: user_id.into(),
+        authorized_domains: authorized_domains.into(),
+        expires,
+        token: token.into(),
+    })
+    .send();
+
+    Ok(())
+}
+
 /// Strip every occurrence of the current-user id from the input list.
 /// Returns whether the current user was present (so the fast path should
 /// run once) and the remaining ids (preserving input order).
