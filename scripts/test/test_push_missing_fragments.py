@@ -18,8 +18,8 @@ logger = logging.getLogger(__name__)
 # Hashes are tied to the byte sequences this test commits below; change them
 # together if you change either.
 DROPPED_FRAGMENT_HASHES = (
-    "9d3f226e7cb165563394906ba32e9fc3a6d0f9721287a9485d1e0533112bdd01,"
-    "df80769bd5cdcb27d9073fb6cca35737e0a0d7d4d6306971923efff5b77b717f"
+    "9d3f226e7cb165563394906ba32e9fc3a6d0f9721287a9485d1e0533112bdd01",
+    "df80769bd5cdcb27d9073fb6cca35737e0a0d7d4d6306971923efff5b77b717f",
 )
 
 
@@ -39,7 +39,7 @@ def missing_fragments_remote_url(
         "internal": allocate_free_port(),
     }
     server_root, server_env = generate_server_config(request, tmp_path_factory, ports)
-    server_env["LORE_MISS_FRAGMENT_WRITES"] = DROPPED_FRAGMENT_HASHES
+    server_env["LORE_MISS_FRAGMENT_WRITES"] = ",".join(DROPPED_FRAGMENT_HASHES)
     proc, log_path, log_fd = launch_lore_server(
         server_root, server_env, lore_server_executable_path
     )
@@ -96,7 +96,15 @@ def test_push_missing_fragments(new_lore_repo, missing_fragments_remote_url):
     # Push main branch
     output = repo.push(check=False).strip()
 
-    assert "Missing fragment" in output, "Push failed for unrelated reason"
+    # The peer carries the address in the status details rather than its message, so
+    # what reaches the output is the address the push names alongside it. Both writes
+    # above are dropped and the peer stops at the first fragment it finds missing, so
+    # which of the two it names is its own business; the push failing for an unrelated
+    # reason, or naming neither, is what this catches. The address is reported as
+    # `<hash>-<context>`, of which only the hash is fixed by the bytes committed here.
+    assert any(
+        f"missing fragment {dropped}" in output for dropped in DROPPED_FRAGMENT_HASHES
+    ), "Push did not report an injected fragment as missing"
 
     # Create source repository
     repo = new_lore_repo(remote_url=missing_fragments_remote_url)

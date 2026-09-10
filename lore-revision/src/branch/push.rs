@@ -1124,14 +1124,18 @@ async fn collect_fragments_and_push(
                     )
                     .send();
 
-                    revision_protocol
-                        .branch_push(branch, current_revision, force, options.fast_forward_merge)
-                        .await
-                        .forward::<PushError>("pushing branch to remote")?
+                    forward_branch_push(
+                        revision_protocol
+                            .branch_push(
+                                branch,
+                                current_revision,
+                                force,
+                                options.fast_forward_merge,
+                            )
+                            .await,
+                    )?
                 }
-                Err(err @ ProtocolError::AddressNotFound(_)) => Err(err)
-                    .forward::<PushError>("pushing branch to remote, peer is missing a fragment")?,
-                result => result.forward::<PushError>("pushing branch to remote")?,
+                result => forward_branch_push(result)?,
             };
             if response.fast_forward_merged {
                 // Server performed a fast-forward merge — push succeeded with a new revision.
@@ -1249,6 +1253,26 @@ async fn collect_fragments_and_push(
     }
 
     Ok(())
+}
+
+/// Forward what the peer answered a branch push with, naming the fragment where it refused for
+/// a missing one.
+///
+/// A push reaches the peer twice where the branch was deleted under it: the attempt that finds
+/// it gone and the one that follows recreating it. Either can be refused for a fragment the peer
+/// does not hold, and the address is the peer's answer rather than anything the attempt decides,
+/// so both report it the same way.
+#[track_caller]
+fn forward_branch_push<T>(result: Result<T, ProtocolError>) -> Result<T, PushError> {
+    match result {
+        Err(ProtocolError::AddressNotFound(missing)) => {
+            let address = Address::from(&missing.address[..]);
+            Err(ProtocolError::AddressNotFound(missing)).forward_with::<PushError, _>(|| {
+                format!("pushing branch to remote, missing fragment {address}")
+            })
+        }
+        result => result.forward::<PushError>("pushing branch to remote"),
+    }
 }
 
 fn collect_fragments_and_push_recurse(
@@ -1800,7 +1824,7 @@ mod tests {
             Err(ProtocolError::from(AddressNotFound { address: [7u8; 48] }));
 
         let error = result
-            .forward::<PushError>("pushing branch to remote, peer is missing a fragment")
+            .forward::<PushError>("pushing branch to remote, missing fragment")
             .expect_err("an error was forwarded");
 
         assert!(error.is_address_not_found(), "{error:?}");

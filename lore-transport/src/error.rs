@@ -26,10 +26,10 @@ impl From<tonic::Status> for ProtocolError {
             tonic::Code::Unavailable | tonic::Code::Unknown => ProtocolError::from(Disconnected),
             tonic::Code::PermissionDenied => ProtocolError::from(NotAuthorized),
             tonic::Code::NotFound => ProtocolError::from(NotFound),
-            tonic::Code::FailedPrecondition => address_not_found_details(&value).map_or_else(
-                || ProtocolError::internal(value.to_string()),
-                ProtocolError::from,
-            ),
+            tonic::Code::FailedPrecondition => match address_not_found_details(&value) {
+                Some(error) => ProtocolError::from(error),
+                None => ProtocolError::internal_with_context(value, "remote rejected the request"),
+            },
             tonic::Code::ResourceExhausted => ProtocolError::from(SlowDown),
             tonic::Code::OutOfRange => ProtocolError::from(Oversized {
                 context: value.message().to_string(),
