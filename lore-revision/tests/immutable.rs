@@ -905,16 +905,18 @@ mod tests {
                 // heal=true with corruption should heal
                 assert!(result.healed);
 
-                // Verify once more, now the verification should succeed, but the packfile should be
-                // set to 0
+                // Verify once more. Healing dropped the association that named the corrupt
+                // payload rather than clearing its pack file, so there is nothing left to verify
+                // and the store answers absence - which is what has the content offered again.
                 let result = store
                     .clone()
                     .verify_fragment(address, repository, StoreMatch::MatchFull, false)
-                    .await
-                    .expect("verify_fragment failed");
+                    .await;
 
-                assert_eq!(result.matches.len(), 1);
-                assert_eq!(result.matches[0].data.pack_file, 0);
+                assert!(
+                    result.is_err_and(|error| error.is_address_not_found()),
+                    "healing left behind an association naming a payload the store cannot serve"
+                );
             })
             .await;
     }
