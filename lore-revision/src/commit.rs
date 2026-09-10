@@ -1200,6 +1200,7 @@ async fn commit_link_only(
         repository.clone(),
         state_parent_staged.clone(),
         state_parent_current.clone(),
+        link::LinkChainBase::root(),
         RelativePath::from_str(&link_path).unwrap_or_default(),
         current_branch,
     )
@@ -1213,7 +1214,7 @@ async fn commit_link_only(
     let link_local_node = owner_state
         .find_relative_node_link(
             owner_repository.clone(),
-            chain.innermost_base_node,
+            chain.innermost_base.node,
             chain.remainder_path.as_str(),
         )
         .await

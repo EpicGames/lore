@@ -8881,6 +8881,48 @@ def test_nested_link_stage_delete_deep(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_link_stage_delete_below_a_precreated_ancestor(new_lore_repo):
+    """Staging a DELETE inside a link whose walk starts below the repository root.
+
+    Two targets sharing a directory the parent owns make that directory a
+    pre-created ancestor, so the walk for each target starts there rather than at
+    the root and names its target from there. The delete has to resolve the link
+    it crosses from that base to fold the linked repository's new pin upwards.
+    """
+    link_path = "vendor/b"
+    deleted_file = f"{link_path}/f1.txt"
+    sibling_file = "vendor/other.txt"
+    parent_repo, _link_repo = _make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {"f1.txt": "linked content\n"},
+        {sibling_file: "parent content\n"},
+    )
+
+    parent_repo.remove_file(deleted_file)
+    parent_repo.write_files({sibling_file: "edited alongside the delete\n"})
+
+    output = parent_repo.stage([deleted_file, sibling_file])
+    status = parent_repo.status()
+    assert f"D {deleted_file}" in status, (
+        f"Delete inside the link should stage.\nStage:\n{output}\nStatus:\n{status}"
+    )
+    assert f"M {sibling_file}" in status, (
+        "Both targets should stage, which is what makes their directory a shared "
+        f"ancestor.\nStage:\n{output}\nStatus:\n{status}"
+    )
+
+    parent_repo.commit("Delete a linked file alongside a parent-owned edit")
+    parent_repo.push()
+
+    fresh = parent_repo.clone()
+    assert not fresh.file_exists(deleted_file), (
+        "The delete should reach a fresh clone, which it only does if the linked "
+        "repository was repinned"
+    )
+
+
+@pytest.mark.smoke
 def test_nested_link_reset_deep(new_lore_repo):
     """`reset` of a modified file two levels deep restores committed content."""
     repo_a, _repo_b, _repo_c, _b_mount, nested_mount = _build_nested_link_repos_at(

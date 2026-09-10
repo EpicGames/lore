@@ -724,6 +724,27 @@ pub struct LinkChainLevel {
     pub old_signature: Hash,
 }
 
+/// A node a link-chain walk descends from, and the working-tree path that node sits at.
+///
+/// Both ends of [`resolve_link_chain`] take this shape: it consumes a base and the remainder below
+/// it, and answers with the deepest base it reached and the remainder below that one. A base plus
+/// its remainder is the working-tree path throughout, so a walk starting below the repository root
+/// answers with the same paths one starting at it does.
+pub struct LinkChainBase {
+    pub node: NodeID,
+    pub path: RelativePath,
+}
+
+impl LinkChainBase {
+    /// The repository root, for a caller holding a path spelled from it.
+    pub fn root() -> Self {
+        LinkChainBase {
+            node: crate::node::ROOT_NODE,
+            path: RelativePath::new(),
+        }
+    }
+}
+
 /// A link path resolved through zero or more link boundaries. `levels` is empty
 /// for a plain top-level path, in which case `innermost_state` is the caller's
 /// top-level staged state.
@@ -735,23 +756,25 @@ pub struct ResolvedLinkChain {
     /// The innermost repository's committed state. Carries registry entries that
     /// the staged state has already dropped, such as a link staged for removal.
     pub innermost_current_state: Arc<State>,
-    /// Node the `remainder_path` is rooted at in the innermost repository.
-    pub innermost_base_node: NodeID,
-    /// `link_path` minus `remainder_path`; empty for the top level.
-    pub innermost_mount_path: RelativePathBuf,
-    /// Target path within the innermost repository.
+    /// The deepest base reached: the innermost mount crossed, or the base the walk started from
+    /// where it crossed none.
+    pub innermost_base: LinkChainBase,
+    /// What the walk did not consume, named from `innermost_base`. The path asked for where no
+    /// link was crossed, and what stands below the innermost mount where one was.
     pub remainder_path: RelativePathBuf,
 }
 
-/// Resolve `link_path` down through any link boundaries into the crossed links
-/// and the innermost containing repo, state and remainder path. Like
-/// `find_relative_node_link` but records each crossed link. Bounded by
-/// `MAX_LINK_DEPTH` and a visited-repository set.
+/// Resolve `remainder_path`, which names a path below `base`, down through any
+/// link boundaries into the crossed links and the innermost containing repo,
+/// state and what is left unconsumed there. Like `find_relative_node_link` but
+/// records each crossed link. Bounded by `MAX_LINK_DEPTH` and a visited-repository
+/// set.
 pub async fn resolve_link_chain(
     repository: Arc<RepositoryContext>,
     state_staged: Arc<State>,
     state_current: Arc<State>,
-    link_path: RelativePath,
+    base: LinkChainBase,
+    mut remainder_path: RelativePath,
     parent_branch: BranchId,
 ) -> Result<ResolvedLinkChain, LinkError> {
     let mut levels: Vec<LinkChainLevel> = Vec::new();
@@ -762,18 +785,15 @@ pub async fn resolve_link_chain(
     let mut cur_state = state_staged;
     let mut cur_current_state = state_current;
     let mut cur_branch = parent_branch;
-    let mut remaining = RelativePath::from_str(link_path.as_str()).unwrap_or_default();
-    let mut cur_node = crate::node::ROOT_NODE;
-    let mut base_node = crate::node::ROOT_NODE;
-    let mut mount_prefix = RelativePathBuf::new();
-    let mut consumed = RelativePathBuf::new();
-    let mut remainder = RelativePathBuf::new();
+    let mut cur_node = base.node;
+    let mut base_node = base.node;
+    let mut mount_path = base.path.into_buf();
+    let mut below_mount = RelativePathBuf::new();
 
-    while !remaining.is_empty() {
-        let name = remaining.pop_root();
+    while !remainder_path.is_empty() {
+        let name = remainder_path.pop_root();
         let name_hash = crate::hash::hash_string(name);
-        remainder.push(name);
-        consumed.push(name);
+        below_mount.push(name);
 
         // A segment that does not resolve is the boundary of what exists: the
         // current level is innermost and the rest is the target to create. This
@@ -784,13 +804,13 @@ pub async fn resolve_link_chain(
         {
             cur_node = node_id;
         } else {
-            while !remaining.is_empty() {
-                remainder.push(remaining.pop_root());
+            while !remainder_path.is_empty() {
+                below_mount.push(remainder_path.pop_root());
             }
             break;
         }
 
-        if remaining.is_empty() {
+        if remainder_path.is_empty() {
             break;
         }
 
@@ -850,8 +870,8 @@ pub async fn resolve_link_chain(
             cur_branch = resolved_branch;
             cur_node = link.node;
             base_node = link.node;
-            mount_prefix = consumed.clone();
-            remainder = RelativePathBuf::new();
+            mount_path.push(below_mount.as_str());
+            below_mount.clear();
         }
     }
 
@@ -860,9 +880,11 @@ pub async fn resolve_link_chain(
         innermost_repository: cur_repository,
         innermost_state: cur_state,
         innermost_current_state: cur_current_state,
-        innermost_base_node: base_node,
-        innermost_mount_path: mount_prefix,
-        remainder_path: remainder,
+        innermost_base: LinkChainBase {
+            node: base_node,
+            path: mount_path.freeze(),
+        },
+        remainder_path: below_mount,
     })
 }
 

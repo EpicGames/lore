@@ -634,7 +634,11 @@ pub(crate) async fn stage_filesystem_path(
                 repository.clone(),
                 state.clone(),
                 state.clone(),
-                full_relative_path.clone(),
+                crate::link::LinkChainBase {
+                    node: base_node,
+                    path: base_relative_path.clone(),
+                },
+                relative_path.clone(),
                 BranchId::default(),
             )
             .await

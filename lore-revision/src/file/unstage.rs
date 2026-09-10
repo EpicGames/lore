@@ -609,6 +609,7 @@ async fn resolve_unstage_target(
         repository.clone(),
         state_staged.clone(),
         state_current,
+        crate::link::LinkChainBase::root(),
         node_path.clone(),
         crate::lore::BranchId::default(),
     )
@@ -633,7 +634,7 @@ async fn resolve_unstage_target(
     let node_id = state_staged
         .find_relative_node_link(
             repository.clone(),
-            chain.innermost_base_node,
+            chain.innermost_base.node,
             chain.remainder_path.as_str(),
         )
         .await

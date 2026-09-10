@@ -45,6 +45,7 @@ pub async fn update(
         repository.clone(),
         state_staged.clone(),
         state_current.clone(),
+        link::LinkChainBase::root(),
         link_path.clone(),
         parent_branch,
     )
@@ -55,7 +56,7 @@ pub async fn update(
     let node_link = inner_state
         .find_relative_node_link(
             inner_repository.clone(),
-            chain.innermost_base_node,
+            chain.innermost_base.node,
             chain.remainder_path.as_str(),
         )
         .await

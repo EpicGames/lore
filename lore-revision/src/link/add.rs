@@ -271,6 +271,7 @@ pub async fn add(
         repository.clone(),
         state_staged.clone(),
         state_current.clone(),
+        link::LinkChainBase::root(),
         link_path.clone(),
         current_branch,
     )
@@ -299,7 +300,7 @@ pub async fn add(
     if let Ok(node_link) = inner_state
         .find_relative_node_link(
             inner_repository.clone(),
-            chain.innermost_base_node,
+            chain.innermost_base.node,
             remainder_path.as_str(),
         )
         .await
@@ -354,7 +355,7 @@ pub async fn add(
     if !remainder_parent.is_empty() {
         let inner_base_absolute = repository
             .require_path()?
-            .join(chain.innermost_mount_path.as_str());
+            .join(chain.innermost_base.path.as_str());
 
         lore_debug!("Staging link parent path in innermost repository");
         with_operation(repository.file_system(), true, async |operation| {
@@ -363,8 +364,8 @@ pub async fn add(
                 inner_repository.clone(),
                 inner_state.clone(),
                 inner_base_absolute,
-                chain.innermost_mount_path.clone().freeze(),
-                chain.innermost_base_node,
+                chain.innermost_base.path.clone(),
+                chain.innermost_base.node,
                 remainder_parent.freeze(),
                 Arc::default(),
                 StageOptions {
