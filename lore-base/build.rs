@@ -28,16 +28,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .define("ENABLE_OVERRIDE", "0")
         .includes(Some(native_dir.join("thirdparty")));
 
-    // Mirrors the -C target-cpu .cargo/config.toml pins, and settable to empty
-    // for a baseline build: neoverse-512tvb raises the architecture floor too,
-    // emitting stlur (armv8.4) that is undefined on Neoverse N1 (Ampere Altra).
-    println!("cargo:rerun-if-env-changed=LORE_ARM64_TARGET_CPU");
     if platform == "linux" && arch == "aarch64" {
-        let target_cpu =
-            env::var("LORE_ARM64_TARGET_CPU").unwrap_or_else(|_| "neoverse-512tvb".to_string());
-        if !target_cpu.is_empty() {
-            cc_builder.flag(format!("-mcpu={target_cpu}"));
-        }
+        cc_builder.flag("-mcpu=neoverse-512tvb");
     }
 
     if cc_builder.get_compiler().is_like_msvc() {

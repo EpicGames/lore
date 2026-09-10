@@ -8,28 +8,10 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /build
 COPY . .
 
-# Which arm64 microarchitecture to tune for. Empty is baseline armv8-a, which
-# runs anywhere. Ignored on amd64.
-ARG TARGETARCH
-ARG ARM64_TARGET_CPU=""
-
-# RUSTFLAGS is restated in full because .cargo/config.toml pins Graviton3+ for
-# this target and cargo *joins* config arrays: only RUSTFLAGS replaces [build]
-# and [target.*] outright, so anything less leaves a baseline build SIGILLing.
-# LORE_ARM64_TARGET_CPU carries the same choice to lore-base's cc build of
-# rpmalloc, which RUSTFLAGS cannot reach.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    set -eu; \
-    RUSTFLAGS="--cfg tokio_unstable --cfg uuid_unstable -C force-unwind-tables=yes -C force-frame-pointers=yes"; \
-    if [ "${TARGETARCH}" = "arm64" ] && [ -n "${ARM64_TARGET_CPU}" ]; then \
-      RUSTFLAGS="${RUSTFLAGS} -C target-cpu=${ARM64_TARGET_CPU}"; \
-    fi; \
-    export RUSTFLAGS; \
-    export LORE_ARM64_TARGET_CPU="${ARM64_TARGET_CPU}"; \
-    echo "building with RUSTFLAGS=${RUSTFLAGS} LORE_ARM64_TARGET_CPU=${ARM64_TARGET_CPU}"; \
-    cargo build --release --bin loreserver; \
+    cargo build --release --bin loreserver && \
     cp /build/target/release/loreserver /build/loreserver-bin
 
 FROM debian:trixie-slim
@@ -60,7 +42,7 @@ ENV RUST_LOG=info
 RUN mkdir -p /data
 VOLUME /data
 
-# 41337 carries gRPC over TCP and QUIC over UDP; both are needed.
-EXPOSE 41337/tcp 41337/udp 41339/tcp
+# QUIC + gRPC: 41337, HTTP: 41339
+EXPOSE 41337 41339
 
 ENTRYPOINT ["loreserver"]

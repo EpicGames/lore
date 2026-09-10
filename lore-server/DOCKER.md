@@ -6,11 +6,8 @@ telemetry integration, or replication is configured.
 ## Prerequisites
 
 - Docker with BuildKit support
-
-Both `linux/amd64` and `linux/arm64` build. `.cargo/config.toml` pins `aarch64-unknown-linux-gnu`
-to Graviton3+ via `-C target-cpu=neoverse-512tvb`, which faults on older arm64 parts, so the
-Dockerfile assembles `RUSTFLAGS` itself and leaves that tuning off by default. An arm64 image you
-build here therefore runs on any armv8-a host, Apple Silicon included.
+- On Apple Silicon (M-series Macs), builds must target `linux/amd64` due to Graviton-specific
+  compiler flags in `.cargo/config.toml` for `aarch64-unknown-linux-gnu`
 
 `lore-server/Dockerfile` is the one to build from source, and is what the rest of this section
 describes. `lore-server/Dockerfile.release` packages a binary already published as a release asset
@@ -22,18 +19,11 @@ and compiles nothing; it is used only by the publish workflow, and needs that as
 From the repository root:
 
 ```sh
-docker build -f lore-server/Dockerfile -t loreserver .
+docker build --platform linux/amd64 -f lore-server/Dockerfile -t loreserver .
 ```
 
-Pass `--platform linux/amd64` or `--platform linux/arm64` to cross-build; expect it to be slow,
-since a release Rust build under emulation is far slower than a native one.
-
-To tune arm64 for Graviton3 and newer, as Lore is deployed, pass the microarchitecture. The
-resulting binary will not run on older arm64 hardware:
-
-```sh
-docker build -f lore-server/Dockerfile --build-arg ARM64_TARGET_CPU=neoverse-512tvb -t loreserver .
-```
+The build compiles the `loreserver` binary and generates self-signed TLS certificates for QUIC
+using `scripts/server/make-certs.sh`.
 
 ## Published images
 
@@ -66,9 +56,9 @@ under emulation with a warning. It is the reason that variant carries no build p
 attestation — buildx attaches provenance as a second manifest, and two manifests make an index.
 Both variants are signed regardless.
 
-For a native arm64 image on Apple Silicon, build from source as above, or skip Docker and run the
-release's `aarch64-apple-darwin` binary directly. When releases start shipping a baseline
-`armv8-a` Linux binary, the unsuffixed variant can carry `linux/arm64` too.
+On Apple Silicon, run the release's `aarch64-apple-darwin` binary directly rather than reaching for
+a container. When releases start shipping a baseline `armv8-a` Linux binary, the unsuffixed variant
+can carry `linux/arm64` too.
 
 The `default.toml` baked in comes from the release tag rather than from the branch the workflow ran
 from, since config keys move between releases and an older binary can fail to start on a newer
