@@ -6,10 +6,6 @@ telemetry integration, or replication is configured.
 ## Prerequisites
 
 - Docker with BuildKit support
-- Around 16 GB of memory available to Docker, for building from source. The image builds the
-  `release-lto` profile, whose fat LTO link holds the whole dependency graph at once; the same link
-  was OOM-killed on a 16 GB runner until the Dockerfile dropped debug info from it. Docker Desktop
-  caps its VM well below host memory by default, so this is worth checking rather than assuming.
 
 Both `linux/amd64` and `linux/arm64` build. `.cargo/config.toml` pins `aarch64-unknown-linux-gnu`
 to Graviton3+ via `-C target-cpu=neoverse-512tvb`, which faults on older arm64 parts, so the
@@ -47,7 +43,7 @@ nothing — and pushes two variants to `ghcr.io/epicgames/lore/loreserver`:
 | Tag | Platforms |
 | --- | --- |
 | `X.Y.Z`, `X.Y`, `latest` | `linux/amd64` only |
-| `X.Y.Z-graviton`, `X.Y-graviton`, `latest-graviton` | `linux/amd64`, and `linux/arm64` tuned for Graviton3+ |
+| `X.Y.Z-graviton`, `X.Y-graviton`, `latest-graviton` | `linux/arm64` tuned for Graviton3+ |
 
 **On Graviton3 or newer**, pull `-graviton` for a native arm64 image. **Anywhere else**, pull the
 unsuffixed tag.

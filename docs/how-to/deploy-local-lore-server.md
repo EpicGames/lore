@@ -193,7 +193,7 @@ The binary and Docker paths are mutually exclusive, and each is complete on its 
 
 1. **Build the image.**
 
-    This needs Docker (and WSL2 on Windows) and the Lore repository cloned locally. Building the image compiles the server with fat LTO, so give Docker around 16 GB of memory — Docker Desktop caps its VM well below host memory by default. From the repository root:
+    This needs Docker (and WSL2 on Windows) and the Lore repository cloned locally. Building the image compiles the server, so it needs several GB of free RAM. From the repository root:
 
     ```bash
     docker build -f lore-server/Dockerfile -t lore-server .

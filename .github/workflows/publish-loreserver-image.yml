@@ -5,8 +5,8 @@ name: Publish loreserver image
 
 # Packages the loreserver binaries from a published release into signed images
 # at ghcr.io/epicgames/lore/loreserver; nothing is compiled here. `:X.Y.Z` is
-# amd64 alone as a plain manifest, `:X.Y.Z-graviton` adds arm64 tuned for
-# Graviton3+; lore-server/DOCKER.md says why. On `published` rather than the
+# amd64 as a plain manifest, `:X.Y.Z-graviton` is arm64 tuned for Graviton3+;
+# lore-server/DOCKER.md says why. On `published` rather than the
 # tag push, because assets are uploaded to a draft and published by hand.
 on:
   release:
@@ -272,10 +272,9 @@ jobs:
         with:
           context: .
           file: lore-server/Dockerfile.release
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/arm64
           labels: |
             ${{ needs.meta.outputs.graviton-labels }}
-            com.epicgames.lore.asset.amd64.sha256=${{ steps.fetch.outputs.amd64-sha256 }}
             com.epicgames.lore.asset.arm64.sha256=${{ steps.fetch.outputs.arm64-sha256 }}
           annotations: ${{ needs.meta.outputs.graviton-annotations }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=true
@@ -339,7 +338,7 @@ jobs:
             platforms: linux/amd64
           - variant: graviton
             media: application/vnd.oci.image.index.v1+json
-            platforms: linux/amd64,linux/arm64
+            platforms: linux/arm64
     env:
       JSON: ${{ matrix.variant == 'graviton' && needs.meta.outputs.graviton-json || needs.meta.outputs.json }}
       DIGEST: ${{ matrix.variant == 'graviton' && needs.build.outputs.graviton-digest || needs.build.outputs.digest }}
@@ -455,10 +454,9 @@ jobs:
             echo "Digest: \`${DIGEST}\`"
             echo ""
             if [ "${VARIANT}" = "graviton" ]; then
-              echo "Platforms: linux/amd64 (baseline), linux/arm64 (tuned for Graviton3+ — will not run on older arm64)"
+              echo "Platforms: linux/arm64 only, tuned for Graviton3+ — will not run on older arm64"
               echo ""
               echo "Release assets packaged:"
-              echo "- \`loreserver-${VERSION}-x86_64-unknown-linux-gnu.tar.gz\` (sha256 \`${AMD64_SHA256}\`)"
               echo "- \`loreserver-${VERSION}-aarch64-unknown-linux-gnu-${ARM64_TUNING}.tar.gz\` (sha256 \`${ARM64_SHA256}\`)"
             else
               echo "Platforms: linux/amd64 only, as a plain manifest so an arm64 host emulates it rather than failing the pull"
