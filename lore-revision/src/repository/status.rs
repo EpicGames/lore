@@ -38,6 +38,7 @@ use crate::layer;
 use crate::lore::BranchId;
 use crate::lore::Hash;
 use crate::lore::RepositoryId;
+use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_drain_tasks;
 use crate::lore_trace;
@@ -611,6 +612,86 @@ fn reported_by_state_diff(change: &NodeChange, show_scan: bool) -> bool {
         && change.flags.is_dirty()
         && !change.flags.is_stage()
         && change.action != FileAction::Move)
+}
+
+/// Report every change the diff against the staged state answers for.
+///
+/// A dirty node is verified against the file on disk when asked for, and one that turns out
+/// unmodified has its flag cleared and is reported without it — or dropped, where the flag was
+/// all it had. A node still dirty once verified counts toward `summary`; a purely staged one
+/// does not.
+///
+/// `repository` is the one holding the nodes, which for a layer is the layer's own. The working
+/// tree is the parent's either way, since a layer context keeps it.
+async fn report_staged_changes(
+    repository: &Arc<RepositoryContext>,
+    changes: &[NodeChange],
+    summary: &StatusSummaryStats,
+    show_scan: bool,
+    check_dirty: bool,
+) -> Result<(), StatusError> {
+    for change in changes {
+        if !reported_by_state_diff(change, show_scan) {
+            continue;
+        }
+
+        let mut cleared_dirty = false;
+        if check_dirty
+            && change.flags.is_dirty()
+            && !dirty_change_is_modified(repository.clone(), change, summary).await?
+        {
+            if !change.flags.is_stage() {
+                continue;
+            }
+            cleared_dirty = true;
+        }
+
+        if change.flags.is_dirty() && !cleared_dirty {
+            summary.classify(change);
+        }
+
+        let size = file_size_from_node_change_id(change).await?;
+        let mut data = LoreRepositoryStatusFileEventData::from_node_change(change, size);
+        if cleared_dirty {
+            data.flag_dirty = 0;
+        }
+        event::LoreEvent::RepositoryStatusFile(data).send();
+    }
+    Ok(())
+}
+
+/// Whether a layer's staged state still holds anything worth pinning: a dirty marker or a staged
+/// node anywhere in the subtree the layer draws.
+///
+/// Asked of the drawn subtree rather than the whole state, the same way `layer::list_staged`
+/// counts, because everything outside it belongs to the drawn-from repository and not the layer.
+/// Dirty flags propagate to a node's parents and clearing one propagates the clear back up, so
+/// the source node's children answer for the whole subtree. On any error the answer is "holds
+/// staging": dropping a pin on a question that could not be answered loses staged work.
+async fn layer_holds_staging(layer: &layer::Layer, layer_state: &layer::LayerState) -> bool {
+    let state = &layer_state.state_staged;
+    let repository = &layer_state.repository;
+
+    let Ok(source_node_link) = state
+        .find_node_link(repository.clone(), &layer.source_path)
+        .await
+    else {
+        return true;
+    };
+    let source_node = source_node_link.node;
+    if !source_node.is_valid_or_root_node_id() {
+        return true;
+    }
+
+    if state
+        .node_has_dirty_children(repository.clone(), source_node)
+        .await
+        .unwrap_or(true)
+    {
+        return true;
+    }
+
+    state::count_staged_files(repository.clone(), state.clone(), source_node).await > 0
 }
 
 /// What a request for a path selects of a layer: where the selection sits in the working tree,
@@ -1418,40 +1499,8 @@ pub async fn status(
                     .forward::<StatusError>("computing diff against staged state")?;
                     lore_debug!("Found {} changes in staged revision", changes.len());
 
-                    for change in changes.iter() {
-                        if !reported_by_state_diff(change, show_scan) {
-                            continue;
-                        }
-
-                        let mut cleared_dirty = false;
-                        if check_dirty
-                            && change.flags.is_dirty()
-                            && !dirty_change_is_modified(repository.clone(), change, &summary)
-                                .await?
-                        {
-                            if !change.flags.is_stage() {
-                                continue;
-                            }
-                            cleared_dirty = true;
-                        }
-
-                        // Count nodes that remain dirty (verify did not clear
-                        // them) toward the summary; purely-staged changes are
-                        // not part of the dirty tracking count.
-                        if change.flags.is_dirty() && !cleared_dirty {
-                            summary.classify(change);
-                        }
-
-                        let size = file_size_from_node_change_id(change).await?;
-                        let mut data =
-                            LoreRepositoryStatusFileEventData::from_node_change(change, size);
-                        if cleared_dirty {
-                            data.flag_dirty = 0;
-                        }
-                        event::LoreEvent::RepositoryStatusFile(data).send();
-                    }
-
-                    Ok(())
+                    report_staged_changes(&repository, &changes, &summary, show_scan, check_dirty)
+                        .await
                 }
             });
 
@@ -1463,6 +1512,7 @@ pub async fn status(
                     let repository = layer_state.repository.clone();
                     let state_current = layer_state.state_current.clone();
                     let state_staged = layer_state.state_staged.clone();
+                    let summary = summary.clone();
                     async move {
                         let changes = state::diff_collect_subtree(
                             layer::drawn_subtree_state(
@@ -1488,18 +1538,14 @@ pub async fn status(
                             selection.mount_path,
                         );
 
-                        for change in changes.iter() {
-                            if !reported_by_state_diff(change, show_scan) {
-                                continue;
-                            }
-                            let size = file_size_from_node_change_id(change).await?;
-                            event::LoreEvent::RepositoryStatusFile(
-                                LoreRepositoryStatusFileEventData::from_node_change(change, size),
-                            )
-                            .send();
-                        }
-
-                        Ok(())
+                        report_staged_changes(
+                            &repository,
+                            &changes,
+                            &summary,
+                            show_scan,
+                            check_dirty,
+                        )
+                        .await
                     }
                 });
             }
@@ -1575,6 +1621,67 @@ pub async fn status(
         crate::instance::store_staged_anchor(&repository, signature)
             .await
             .forward::<StatusError>("serializing staged revision anchor")?;
+    }
+
+    // A layer's nodes live in the layer's own staged state, so a reconciling status mutates that
+    // state and not the parent's: `--check-dirty` clears a marker verification found stale, and
+    // `--scan` sets and clears markers as it walks across a mount. The parent's anchor names the
+    // parent's revision alone, so neither mutation survives the call unless the layer's state is
+    // serialized and its own pin moved to it — a marker cleared without that is reported again by
+    // every later status. Opportunistic in the same way as the parent's flush above: a read-only
+    // invocation leaves the state for the next write command.
+    if let Some(token) = repository.try_write_token() {
+        let dry_run = execution_context().globals().dry_run();
+        for (layer, layer_state) in layers.iter() {
+            let state_staged = &layer_state.state_staged;
+            if !state_staged.is_dirty() {
+                continue;
+            }
+
+            if !layer_holds_staging(layer, layer_state).await {
+                if layer.staged_revision().is_some() && !dry_run {
+                    layer::store_layer_staged(
+                        repository.clone(),
+                        token,
+                        layer.target_path.as_str(),
+                        layer.repository,
+                        Hash::default(),
+                    )
+                    .await
+                    .forward::<StatusError>("clearing layer staged revision pin")?;
+
+                    lore_debug!(
+                        "Cleared staged pin for emptied layer at {}",
+                        layer.target_path
+                    );
+                }
+                continue;
+            }
+
+            state_staged.reparent_onto(layer_state.state_current.revision());
+
+            let signature = state_staged
+                .serialize(layer_state.repository.clone(), token)
+                .await
+                .forward::<StatusError>("serializing layer staged revision state")?;
+
+            if signature != layer.current && !dry_run {
+                layer::store_layer_staged(
+                    repository.clone(),
+                    token,
+                    layer.target_path.as_str(),
+                    layer.repository,
+                    signature,
+                )
+                .await
+                .forward::<StatusError>("storing layer staged revision pin")?;
+
+                lore_debug!(
+                    "Stored staged state {signature} for layer at {}",
+                    layer.target_path
+                );
+            }
+        }
     }
 
     Ok(())

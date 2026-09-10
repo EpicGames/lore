@@ -13,6 +13,7 @@ from lore_parsers import (
     parse_layer_list_json,
     parse_layer_remove_json,
     parse_status_json,
+    parse_status_summary_json,
 )
 
 
@@ -1407,6 +1408,38 @@ THR_MOUNT_FILE = os.path.join("thr", "third_repo.txt")
 THR_MOUNT_PATH = "thr/third_repo.txt"
 THR_SOURCE_PATH = "third/third_repo.txt"
 
+# A second file below the same mount, so one marker can be real while the other is stale.
+THR_OTHER_MOUNT_FILE = os.path.join("thr", "other_repo.txt")
+THR_OTHER_MOUNT_PATH = "thr/other_repo.txt"
+THR_OTHER_SOURCE_PATH = "third/other_repo.txt"
+
+
+def _setup_repo_with_two_layer_files(new_lore_repo):
+    """`_setup_repo_with_two_layers`, with a second committed file below the `thr` mount.
+
+    A reconciling status has to keep one marker and drop the other, which two files tell apart
+    from one that keeps or drops everything. The file is committed in the layer's own repository
+    and reaches the mount by syncing, so both files are the layer's rather than the parent's.
+
+    Returns `(repo, third_repo, originals)`, with `originals` holding the committed bytes of each
+    file keyed by its mount path.
+    """
+    repo, _second_repo, third_repo = _setup_repo_with_two_layers(new_lore_repo)
+
+    with third_repo.open_file(THR_OTHER_SOURCE_PATH, mode="w+b") as out:
+        out.write(os.urandom(1000))
+    third_repo.stage(scan=True)
+    third_repo.commit()
+    third_repo.push()
+    repo.sync(force=True)
+
+    originals = {}
+    for mount_file in (THR_MOUNT_FILE, THR_OTHER_MOUNT_FILE):
+        with repo.open_file(mount_file, mode="rb") as out:
+            originals[mount_file] = out.read()
+
+    return repo, third_repo, originals
+
 
 @pytest.mark.smoke
 def test_layer_stage_reports_paths_at_the_mount(new_lore_repo):
@@ -1506,6 +1539,162 @@ def test_layer_dirty_is_not_filtered_by_the_layers_own_spelling(new_lore_repo):
     assert [e.get("path") for e in status_entries] == [THR_MOUNT_PATH], (
         "Expected a rule matching only the layer's own spelling to exclude nothing, got: "
         f"{status_entries}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_check_dirty_persists_verified_markers_at_the_mount(new_lore_repo):
+    """`status --check-dirty` verifies a layer's dirty markers and persists what it settled.
+
+    Two committed files below a layer mounted away from its source are both marked dirty; one
+    keeps its new content and one is restored, so one marker is real and one is stale. The nodes
+    live in the layer's repository while the files sit at the parent's mount, which is what the
+    verification has to reconcile: it must report the survivor at the mount, drop the stale
+    marker, and count only the survivor as a change.
+
+    The cleared flag lives in the layer's own staged state rather than the parent's, so it
+    survives the call only if that state is serialized and the layer's pin moved to it. A later
+    plain `status` verifies nothing and reads the flags as they were left, which is what tells a
+    persisted result apart from one discarded when the first call returned.
+    """
+    repo, _third_repo, originals = _setup_repo_with_two_layer_files(new_lore_repo)
+
+    # Both overwrites keep the file's size, so neither marker can be settled by size alone and the
+    # verification has to read the bytes at the mount to tell the two apart.
+    for mount_file, original in originals.items():
+        with repo.open_file(mount_file, mode="wb") as out:
+            out.write(os.urandom(len(original)))
+    repo.dirty([THR_MOUNT_FILE, THR_OTHER_MOUNT_FILE])
+
+    marked = parse_status_json(repo.status(json=True))
+    assert sorted(e.get("path") for e in marked) == [
+        THR_OTHER_MOUNT_PATH,
+        THR_MOUNT_PATH,
+    ], f"Expected both marked files reported before either is restored, got: {marked}"
+
+    # Restore one file's committed bytes, which makes its marker stale.
+    with repo.open_file(THR_OTHER_MOUNT_FILE, mode="wb") as out:
+        out.write(originals[THR_OTHER_MOUNT_FILE])
+
+    output = repo.status(json=True, check_dirty=True)
+    entries = parse_status_json(output)
+    assert [e.get("path") for e in entries] == [THR_MOUNT_PATH], (
+        f"Expected only the modified file, reported at {THR_MOUNT_PATH} and not "
+        f"{THR_SOURCE_PATH}, got: {entries}"
+    )
+    assert entries[0].get("flagDirty") is True, (
+        f"Expected the modified file to stay dirty, got: {entries[0]}"
+    )
+
+    summary = parse_status_summary_json(output)
+    assert summary is not None, "check-dirty must emit a repositoryStatusSummary event"
+    assert summary.get("hashChecks") == 2, (
+        f"Expected both same-size markers settled by a content comparison, got: {summary}"
+    )
+    assert summary.get("modifies") == 1, (
+        f"Expected only the surviving marker counted as a change, got: {summary}"
+    )
+
+    # The cleared flag may not come back, and the surviving one may not be lost with it.
+    persisted = parse_status_json(repo.status(json=True))
+    assert [e.get("path") for e in persisted] == [THR_MOUNT_PATH], (
+        f"Expected the stale marker to stay cleared and {THR_MOUNT_PATH} to stay dirty, "
+        f"got: {persisted}"
+    )
+    assert persisted[0].get("flagDirty") is True, (
+        f"Expected the surviving marker persisted as dirty, got: {persisted[0]}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_check_dirty_clearing_the_only_marker_clears_the_pin(new_lore_repo):
+    """Verifying away a layer's only dirty marker empties the layer's staging.
+
+    The sister tests above always leave a second marker behind, so the layer keeps staging either
+    way. Here the cleared marker is the only one, which empties the staged state the layer's pin
+    names. A pin still naming the state that carried the marker reports it again, so what a later
+    plain status finds is the whole question.
+    """
+    repo, _second_repo, _third_repo = _setup_repo_with_two_layers(new_lore_repo)
+
+    with repo.open_file(THR_MOUNT_FILE, mode="rb") as out:
+        original = out.read()
+    with repo.open_file(THR_MOUNT_FILE, mode="wb") as out:
+        out.write(os.urandom(len(original)))
+    repo.dirty(THR_MOUNT_FILE)
+
+    marker_pin = _assert_layer_staged_advanced(repo, "thr")
+    assert [e.get("path") for e in parse_status_json(repo.status(json=True))] == [
+        THR_MOUNT_PATH
+    ], "Expected the marked file reported before it is restored"
+
+    with repo.open_file(THR_MOUNT_FILE, mode="wb") as out:
+        out.write(original)
+
+    checked = parse_status_json(repo.status(json=True, check_dirty=True))
+    assert checked == [], f"Expected the only marker verified away, got: {checked}"
+
+    # The pin may not still name the state that carried the marker, and it may not name a staged
+    # revision holding nothing either: `commit` aborts with `NothingStaged` on a pin like that
+    # once the parent has committed, and `branch switch` then refuses to sync the layer.
+    assert _layer_config_staged(repo, "thr") != marker_pin, (
+        "Expected the layer pin moved off the state that carried the cleared marker"
+    )
+    _assert_layer_nothing_staged(repo, "thr")
+
+    persisted = parse_status_json(repo.status(json=True))
+    assert persisted == [], (
+        f"Expected nothing marked once the only marker was cleared, got: {persisted}"
+    )
+
+
+@pytest.mark.smoke
+def test_layer_scan_persists_reconciled_markers_at_the_mount(new_lore_repo):
+    """`status --scan` reconciles a layer's markers against the working tree and persists them.
+
+    Sister of `test_layer_check_dirty_persists_verified_markers_at_the_mount` for the other
+    reconciling route. The scan walks the filesystem rather than the markers, so it discovers the
+    modified file below the mount without it having been marked at all, and clears the marker on
+    the file still holding its committed content. Both results land in the layer's own staged
+    state, not the parent's, so a later plain `status` — which walks nothing and reports the flags
+    as it finds them — is what says the scan's work outlived the call that did it.
+    """
+    repo, _third_repo, originals = _setup_repo_with_two_layer_files(new_lore_repo)
+
+    # Never marked: the scan has to find this one by walking the tree at the mount.
+    with repo.open_file(THR_MOUNT_FILE, mode="wb") as out:
+        out.write(os.urandom(len(originals[THR_MOUNT_FILE])))
+
+    # Marked but untouched, so it still matches its committed content and the scan clears it.
+    repo.dirty(THR_OTHER_MOUNT_FILE)
+
+    output = repo.status(json=True, scan=True)
+    entries = parse_status_json(output)
+    assert [e.get("path") for e in entries] == [THR_MOUNT_PATH], (
+        f"Expected the scan to report only the modified file, at {THR_MOUNT_PATH} and not "
+        f"{THR_SOURCE_PATH}, got: {entries}"
+    )
+    assert entries[0].get("flagDirty") is True, (
+        f"Expected the discovered file to be reported dirty, got: {entries[0]}"
+    )
+
+    # The scan sweeps the whole tree, so the comparison counts cover the parent's files too and
+    # only the per-action counts say what it settled on.
+    summary = parse_status_summary_json(output)
+    assert summary is not None, "scan must emit a repositoryStatusSummary event"
+    assert summary.get("modifies") == 1, (
+        f"Expected the discovered file as the only change, got: {summary}"
+    )
+    assert summary.get("adds") == 0 and summary.get("deletes") == 0, (
+        f"Expected the scan to read the mount as neither an add nor a delete, got: {summary}"
+    )
+
+    persisted = parse_status_json(repo.status(json=True))
+    assert [e.get("path") for e in persisted] == [THR_MOUNT_PATH], (
+        f"Expected the discovered marker kept and the stale one cleared, got: {persisted}"
+    )
+    assert persisted[0].get("flagDirty") is True, (
+        f"Expected the discovered marker persisted as dirty, got: {persisted[0]}"
     )
 
 
@@ -2004,6 +2193,22 @@ def _assert_layer_staged_advanced(repo: Lore, target_path: str) -> str:
     assert staged != current, (
         f"Layer at {target_path} pinned staged equal to current {current!r}, "
         "which reads as nothing staged"
+    )
+    return staged
+
+
+def _assert_layer_nothing_staged(repo: Lore, target_path: str) -> str:
+    """Assert the layer at `target_path` pins no staged revision.
+
+    The inverse of `_assert_layer_staged_advanced`. Two pins read as nothing staged: zero, for a
+    layer never staged, and one equal to `current`, for staging since committed or reverted. Any
+    other pin names a staged revision the layer will be asked to commit.
+    """
+    staged = _layer_config_staged(repo, target_path)
+    current = _layer_config_current(repo, target_path)
+    assert staged in ("", ZERO_HASH, current), (
+        f"Layer at {target_path} still pins staged revision {staged!r} against current "
+        f"{current!r}, which reads as staging left behind"
     )
     return staged
 
