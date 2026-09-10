@@ -3,17 +3,11 @@
 
 name: Publish loreserver image
 
-# Packages the loreserver binaries from a published GitHub release into signed
-# images at ghcr.io/epicgames/lore/loreserver. Nothing is compiled here.
-#
-#   :X.Y.Z            linux/amd64 alone, as a plain manifest
-#   :X.Y.Z-graviton   linux/amd64 plus linux/arm64 tuned for Graviton3+
-#
-# Releases ship no baseline armv8-a Linux binary, so arm64 goes only under the
-# suffixed tag. lore-server/DOCKER.md has the reasoning and which tag to pull.
-#
-# On `release: published` rather than the tag push, because assets are uploaded
-# to a draft and published by hand hours or days later.
+# Packages the loreserver binaries from a published release into signed images
+# at ghcr.io/epicgames/lore/loreserver; nothing is compiled here. `:X.Y.Z` is
+# amd64 alone as a plain manifest, `:X.Y.Z-graviton` adds arm64 tuned for
+# Graviton3+; lore-server/DOCKER.md says why. On `published` rather than the
+# tag push, because assets are uploaded to a draft and published by hand.
 on:
   release:
     types: [published]
@@ -61,10 +55,9 @@ jobs:
       graviton-labels: ${{ steps.meta-graviton.outputs.labels }}
       graviton-annotations: ${{ steps.meta-graviton.outputs.annotations }}
     env:
-      # The version comes from an input, so without this a dispatch from a pull
-      # request branch would move the real release tags onto unreviewed code.
-      # Open for a release, and for a dispatch from the default branch, which
-      # is how a release predating this workflow gets backfilled.
+      # The version is an input, so without this a dispatch from a PR branch
+      # would move real release tags onto unreviewed code. Open for a release,
+      # and for the default-branch dispatch that backfills an old one.
       RELEASE_TAGS: ${{ github.event_name == 'release' || github.ref_name == github.event.repository.default_branch }}
     steps:
       - id: version
@@ -82,16 +75,13 @@ jobs:
             exit 1
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          # `+` is legal in a semver tag and illegal in an image tag. The
-          # staging tag below is assembled by hand rather than by
-          # metadata-action, so sanitize here instead of failing after signing.
+          # `+` is legal in a semver tag and illegal in an image tag, and the
+          # staging tag below is assembled by hand rather than sanitized.
           echo "version-tag=$(printf '%s' "${VERSION}" | tr '+' '-')" >> "$GITHUB_OUTPUT"
 
-      # `latest` and `X.Y` move, so publishing an older release must not claim
-      # them: `latest=auto` would hand `latest` to any non-prerelease, and a
-      # backfill or an older hotfix would drag both backwards. Only the newest
-      # release overall takes `latest`, and only the newest of a series takes
-      # that series' `X.Y`. `X.Y.Z` is exact and needs no gate.
+      # `latest` and `X.Y` move, so an older release must not claim them: a
+      # backfill or an older hotfix would otherwise drag both backwards.
+      # `X.Y.Z` is exact and needs no gate.
       - id: moving
         name: Decide which moving tags this release may take
         env:
@@ -102,14 +92,13 @@ jobs:
           set -euo pipefail
           latest=false
           minor=false
-          # Anything carrying a prerelease or build suffix is never a candidate.
+          # A prerelease or build suffix is never a candidate.
           if printf '%s' "${VERSION}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
             stable=$(gh release list --exclude-drafts --exclude-pre-releases --limit 100 \
               --json tagName --jq '.[].tagName' \
               | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; })
-            # Equality, not "sorts highest": a release GitHub flags as a
-            # prerelease is absent from that list whatever its tag looks like,
-            # and must not take a moving tag by outranking what is in it.
+            # Equality, not "sorts highest": a GitHub-flagged prerelease is
+            # absent from this list and must not outrank what is in it.
             newest=$(printf '%s\n' "${stable}" | sort -V | tail -1)
             if [ "${newest}" = "${VERSION}" ]; then
               latest=true
@@ -129,8 +118,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "latest=${latest} minor=${minor}"
 
-      # The input lands verbatim in the `tags` lists below, where a newline
-      # would smuggle in a further directive.
+      # The input lands verbatim in the `tags` lists below.
       - name: Validate the tag input
         env:
           TAG: ${{ inputs.tag }}
@@ -147,10 +135,8 @@ jobs:
             echo "::error::the 'tag' input is longer than the 128 characters a tag allows"
             exit 1
           fi
-          # Otherwise the gate above is trivially sidestepped: it withholds the
-          # resolved release tags, but this input reaches the same tag list, so
-          # a dispatch from any branch could publish `latest` from unreviewed
-          # code under the name consumers pull.
+          # Else the gate above is sidestepped: this input reaches the same
+          # tag list, so any branch could publish `latest` from unreviewed code.
           if [ "${RELEASE_TAGS}" != "true" ]; then
             case "${TAG}" in
               latest | latest-* | v[0-9]* | [0-9]*)
@@ -160,8 +146,7 @@ jobs:
             esac
           fi
 
-      # Manifest-level annotations only, the action's default: buildx rejects
-      # index annotations on this variant's single-platform export.
+      # Manifest-level annotations only: buildx rejects index ones here.
       - id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
@@ -173,8 +158,7 @@ jobs:
             type=raw,value=latest,enable=${{ env.RELEASE_TAGS == 'true' && steps.moving.outputs.latest == 'true' }}
             type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
 
-      # The suffix reaches every tag including the raw `latest`, so the tuned
-      # stream gets its own moving tag rather than taking that one.
+      # The suffix reaches the raw `latest` too, hence `latest-graviton`.
       - id: meta-graviton
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         env:
@@ -190,7 +174,7 @@ jobs:
             type=raw,value=latest,enable=${{ env.RELEASE_TAGS == 'true' && steps.moving.outputs.latest == 'true' }}
             type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
 
-      # Here, not as an invalid reference once the images are already pushed.
+      # Here, not as an invalid reference once the images are pushed.
       - name: Require at least one tag
         env:
           JSON: ${{ steps.meta.outputs.json }}
@@ -220,17 +204,14 @@ jobs:
     env:
       VERSION: ${{ needs.meta.outputs.version }}
     steps:
-      # No `ref`: the packaging must come from the ref this workflow ran from.
-      # A release predating this workflow has no Dockerfile.release at its tag,
-      # and backfilling one is a supported dispatch.
+      # No `ref`: a release predating this workflow has no Dockerfile.release
+      # at its tag, and backfilling one is a supported dispatch.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # The config does come from the release tag, since keys move between
-      # releases — main has renamed and added some since v0.9.0 — and a
-      # dispatch checks out whatever ref it was dispatched from. On a release
-      # run this rewrites the file with itself.
+      # The config does, though: keys move between releases, and a dispatch
+      # checks out whatever ref it came from. A release run rewrites it as-is.
       - name: Take default.toml from the release tag
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -264,8 +245,7 @@ jobs:
               echo "::error::could not download ${asset} from release ${VERSION}; check the release has that asset attached"
               exit 1
             fi
-            # The release publishes no checksums, so record what arrived; it is
-            # carried into the image labels below.
+            # The release publishes no checksums, so record what arrived.
             sha="$(sha256sum "${asset}" | cut -d' ' -f1)"
             echo "${arch}-sha256=${sha}" >> "$GITHUB_OUTPUT"
             echo "${asset} sha256=${sha}"
@@ -285,9 +265,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # push-by-digest pushes under no tag, which is what leaves each variant
-      # unnamed until its signature exists. Annotations must land here: they
-      # are part of the digest, and promotion must not alter it.
+      # push-by-digest leaves each variant unnamed until its signature exists.
+      # Annotations must land here: they are part of the digest.
       - id: build-graviton
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -301,10 +280,9 @@ jobs:
           annotations: ${{ needs.meta.outputs.graviton-annotations }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=true
 
-      # provenance=false keeps this a plain manifest: buildx attaches
-      # provenance as a second manifest, and an index listing only linux/amd64
-      # makes an arm64 host fail the pull instead of emulating. The cost is
-      # that this variant carries no provenance attestation.
+      # provenance=false keeps this a plain manifest: provenance would be a
+      # second manifest, and an amd64-only index fails an arm64 pull outright
+      # rather than emulating. The cost is no provenance attestation here.
       - id: build
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
@@ -323,10 +301,8 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: docker run --rm --platform linux/amd64 "${IMAGE}@${DIGEST}" --version
 
-  # Native, not QEMU: the released arm64 binary is tuned past baseline and
-  # emulation need not implement what it was tuned for. This runner reports
-  # SVE, so it does not prove the binary runs on older arm64 — nothing does,
-  # which is what the tag says.
+  # Native, not QEMU: the binary is tuned past baseline and emulation need not
+  # implement that. This runner has SVE, so it proves nothing about older arm64.
   smoke-arm64:
     name: smoke test arm64
     needs: build
@@ -345,8 +321,7 @@ jobs:
           DIGEST: ${{ needs.build.outputs.graviton-digest }}
         run: docker run --rm --platform linux/arm64 "${IMAGE}@${DIGEST}" --version
 
-  # smoke-arm64 gates both variants, the amd64-only one included: a release
-  # whose arm64 binary does not run is one to fix, not to publish half of.
+  # smoke-arm64 gates both variants: a bad release is one to fix, not half-publish.
   publish:
     name: sign and tag (${{ matrix.variant }})
     needs: [meta, build, smoke-arm64]
@@ -355,7 +330,7 @@ jobs:
       packages: write # Push the cosign signature and the release tags
       id-token: write # Federate to Fulcio for keyless signing
     strategy:
-      # Signing or tagging failing for one variant should not cancel the other.
+      # One variant failing should not cancel the other.
       fail-fast: false
       matrix:
         include:
@@ -371,13 +346,10 @@ jobs:
       VERSION: ${{ needs.meta.outputs.version }}
       EXPECT_MEDIA: ${{ matrix.media }}
       EXPECT_PLATFORMS: ${{ matrix.platforms }}
-      # Carries the release as well as the commit: every backfill dispatch from
-      # the default branch shares that branch's SHA, so the commit alone would
-      # have two of them overwriting each other's staging tag and reading back
-      # the other's digest, after signing and before any release tag moves.
+      # Version too, not just the commit: every backfill runs from the default
+      # branch and shares its SHA, so two would clobber each other's tag.
       STAGING_TAG: sha-${{ github.sha }}-${{ needs.meta.outputs.version-tag }}${{ matrix.variant == 'graviton' && '-graviton' || '' }}
-      # Anchored on this workflow's path: a bare repository prefix would accept
-      # a certificate minted by any workflow here.
+      # Anchored on this workflow's path, not merely the repository.
       IDENTITY_REGEXP: '^https://github\.com/${{ github.repository }}/\.github/workflows/publish-loreserver-image\.yml@'
     steps:
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
@@ -391,8 +363,7 @@ jobs:
       - name: Inspect what was pushed
         run: docker buildx imagetools inspect "${IMAGE}@${DIGEST}"
 
-      # Every step after this one passes just as happily with the wrong shape,
-      # and the wrong shape is what makes an arm64 host fail the pull.
+      # Every step after this passes just as happily with the wrong shape.
       - name: Check the variant is the shape it claims
         run: |
           set -euo pipefail
@@ -403,7 +374,7 @@ jobs:
             exit 1
           fi
           if [ "${media}" = "application/vnd.oci.image.index.v1+json" ]; then
-            # Attestations ride along as unknown/unknown, and are not platforms.
+            # Attestations ride along as unknown/unknown.
             platforms=$(jq -r '[.manifests[] | select(.platform.os != "unknown") | "\(.platform.os)/\(.platform.architecture)"] | sort | join(",")' <<< "${manifest}")
           else
             platforms=$(docker buildx imagetools inspect "${IMAGE}@${DIGEST}" --format '{{json .Image}}' \
@@ -417,7 +388,7 @@ jobs:
 
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      # By digest, not by tag: a tag can later be moved, a digest cannot.
+      # By digest: a tag can later be moved, a digest cannot.
       - name: Sign the image with cosign
         run: cosign sign --yes "${IMAGE}@${DIGEST}"
 
@@ -430,11 +401,9 @@ jobs:
             > /dev/null
           echo "signature verified"
 
-      # --prefer-index=false is load-bearing: given a lone plain manifest,
-      # `imagetools create` otherwise rewraps it in an index and the digest
-      # changes with it. Rehearsed on the staging tag, which nothing consumes,
-      # so a buildx that stops preserving the digest moves that tag and not
-      # `latest`.
+      # --prefer-index=false is load-bearing: imagetools otherwise rewraps a
+      # lone plain manifest in an index, changing the digest. Rehearsed on the
+      # staging tag, so a buildx that stops preserving it moves nothing real.
       - name: Prove the copy preserves the digest
         run: |
           set -euo pipefail

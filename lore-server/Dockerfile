@@ -9,35 +9,19 @@ WORKDIR /build
 COPY . .
 
 # Which arm64 microarchitecture to tune for. Empty is baseline armv8-a, which
-# runs anywhere — Apple Silicon, Ampere, any non-Graviton host — and is what
-# the default image ships. The publish workflow passes neoverse-512tvb for the
-# separate -graviton tag, matching how Lore is built and deployed on
-# Graviton3+. Ignored on amd64, which is baseline either way.
+# runs anywhere; the -graviton image passes neoverse-512tvb. Ignored on amd64.
 ARG TARGETARCH
 ARG ARM64_TARGET_CPU=""
 
-# The flags are assembled here rather than left to .cargo/config.toml, whose
-# [target.aarch64-unknown-linux-gnu] table pins Graviton3+ unconditionally.
-# Overriding that needs RUSTFLAGS specifically, not
-# CARGO_TARGET_<triple>_RUSTFLAGS: the latter is only another source for the
-# same config key and cargo *joins* config arrays, so the config's
-# -C target-cpu would survive and a baseline build would still SIGILL off
-# Graviton. RUSTFLAGS replaces [build] and [target.*] outright, hence the
-# repetition. The --cfg values are load-bearing, the clippy lints are not.
-#
+# RUSTFLAGS is restated in full because .cargo/config.toml pins Graviton3+ for
+# this target and cargo *joins* config arrays: only RUSTFLAGS replaces [build]
+# and [target.*] outright, so anything less leaves a baseline build SIGILLing.
 # LORE_ARM64_TARGET_CPU carries the same choice to lore-base's cc build of
-# rpmalloc, which pins the same -mcpu of its own accord; RUSTFLAGS does not
-# reach a C compiler, so without it a baseline build still ships armv8.4
-# instructions in the allocator.
+# rpmalloc, which RUSTFLAGS cannot reach.
 #
-# Not `--release`: that profile is Cargo.toml's local-development build, with
-# debug-assertions and so overflow-checks left on. release-lto is the real one.
-#
-# release-lto also asks for `debug = 2`, which a fat-LTO link cannot afford: it
-# holds the whole dependency graph's DWARF at once and gets OOM-killed on a
-# 16 GB runner. `strip --strip-debug` below would have discarded all of it in
-# the next breath, so -C debuginfo=0 costs nothing observable — tracing's
-# file/line fields come from compile-time macros, not from DWARF.
+# Not `--release`: that profile is local development, debug-assertions on.
+# release-lto asks for `debug = 2`, which a fat-LTO link gets OOM-killed for on
+# a 16 GB runner; `strip --strip-debug` below would discard it regardless.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \

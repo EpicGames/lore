@@ -1,22 +1,19 @@
 # SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 # SPDX-License-Identifier: MIT
 
-# Packages a loreserver binary already published as a release asset, which the
-# publish workflow unpacks into dist/<arch>/. Nothing is compiled here; use
-# lore-server/Dockerfile to build from source.
+# Packages a released loreserver asset, which the publish workflow unpacks
+# into dist/<arch>/. Nothing is compiled; Dockerfile builds from source.
 FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# amd64 or arm64, matching the directory the workflow unpacked that platform's
-# asset into.
+# amd64 or arm64, naming the directory the asset was unpacked into.
 ARG TARGETARCH
 
 COPY dist/${TARGETARCH}/loreserver /usr/local/bin/loreserver
-# The release archive stores it 0644 and COPY carries the context's mode
-# through, so without this every container dies at startup.
+# The archive stores it 0644 and COPY carries that mode through.
 RUN chmod 0755 /usr/local/bin/loreserver
 COPY dist/${TARGETARCH}/LICENSE.txt /usr/share/doc/loreserver/LICENSE.txt
 COPY dist/${TARGETARCH}/THIRD-PARTY-NOTICES.txt /usr/share/doc/loreserver/THIRD-PARTY-NOTICES.txt
