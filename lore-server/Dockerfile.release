@@ -15,6 +15,9 @@ RUN apt-get update && apt-get install -y \
 ARG TARGETARCH
 
 COPY dist/${TARGETARCH}/loreserver /usr/local/bin/loreserver
+# The release archive stores it 0644 and COPY carries the context's mode
+# through, so without this every container dies at startup.
+RUN chmod 0755 /usr/local/bin/loreserver
 COPY dist/${TARGETARCH}/LICENSE.txt /usr/share/doc/loreserver/LICENSE.txt
 COPY dist/${TARGETARCH}/THIRD-PARTY-NOTICES.txt /usr/share/doc/loreserver/THIRD-PARTY-NOTICES.txt
 

@@ -81,10 +81,11 @@ file. Only the packaging — the Dockerfile — comes from the workflow's own re
 Every tag is signed keylessly with cosign, and the run summary prints the `cosign verify`
 invocation for the digest it published, along with the release assets packaged and their SHA-256 —
 the releases carry no checksums of their own, so that is what ties an image back to exact bytes. A
-`sha-<commit>` tag (and `sha-<commit>-graviton`) appears alongside each release, on the same
-digest: the signature is made against that digest before any release tag is pointed at it, so no
-release tag is ever briefly unsigned. It stays afterwards as a record of which commit published
-which image.
+`sha-<commit>-<version>` tag (and `-graviton`) appears alongside each release, on the same digest:
+the signature is made against that digest before any release tag is pointed at it, so no release
+tag is ever briefly unsigned. It stays afterwards as a record of which commit published which
+image. The version is part of the name because a backfill runs from the default branch, so the
+commit alone would not tell two backfills apart.
 
 ## Running
 

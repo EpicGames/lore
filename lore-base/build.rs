@@ -28,8 +28,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .define("ENABLE_OVERRIDE", "0")
         .includes(Some(native_dir.join("thirdparty")));
 
+    // Matches the -C target-cpu that .cargo/config.toml pins for this target,
+    // so the C and Rust halves agree. Overridable, and settable to empty for a
+    // baseline armv8-a build: neoverse-512tvb raises the architecture floor as
+    // well as the tuning, and GCC then emits stlur (FEAT_LRCPC2, armv8.4) into
+    // rpmalloc, which is undefined on Neoverse N1 parts such as Ampere Altra.
+    println!("cargo:rerun-if-env-changed=LORE_ARM64_TARGET_CPU");
     if platform == "linux" && arch == "aarch64" {
-        cc_builder.flag("-mcpu=neoverse-512tvb");
+        let target_cpu =
+            env::var("LORE_ARM64_TARGET_CPU").unwrap_or_else(|_| "neoverse-512tvb".to_string());
+        if !target_cpu.is_empty() {
+            cc_builder.flag(format!("-mcpu={target_cpu}"));
+        }
     }
 
     if cc_builder.get_compiler().is_like_msvc() {

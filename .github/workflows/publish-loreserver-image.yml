@@ -53,6 +53,7 @@ jobs:
       contents: read # metadata-action reads repository metadata for OCI labels
     outputs:
       version: ${{ steps.version.outputs.version }}
+      version-tag: ${{ steps.version.outputs.version-tag }}
       json: ${{ steps.meta.outputs.json }}
       labels: ${{ steps.meta.outputs.labels }}
       annotations: ${{ steps.meta.outputs.annotations }}
@@ -81,12 +82,18 @@ jobs:
             exit 1
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          # `+` is legal in a semver tag and illegal in an image tag. The
+          # staging tag below is assembled by hand rather than by
+          # metadata-action, so sanitize here instead of failing after signing.
+          echo "version-tag=$(printf '%s' "${VERSION}" | tr '+' '-')" >> "$GITHUB_OUTPUT"
 
-      # `latest=auto` hands `latest` to any non-prerelease without consulting
-      # what is already published, so a backfill or a hotfix of an older line
-      # would move it backwards. Hence latest=false below and this gate.
-      - id: latest
-        name: Decide whether this is the newest release
+      # `latest` and `X.Y` move, so publishing an older release must not claim
+      # them: `latest=auto` would hand `latest` to any non-prerelease, and a
+      # backfill or an older hotfix would drag both backwards. Only the newest
+      # release overall takes `latest`, and only the newest of a series takes
+      # that series' `X.Y`. `X.Y.Z` is exact and needs no gate.
+      - id: moving
+        name: Decide which moving tags this release may take
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
@@ -94,20 +101,33 @@ jobs:
         run: |
           set -euo pipefail
           latest=false
-          # Anything carrying a prerelease or build suffix never takes `latest`.
+          minor=false
+          # Anything carrying a prerelease or build suffix is never a candidate.
           if printf '%s' "${VERSION}" | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
-            newest=$(gh release list --exclude-drafts --exclude-pre-releases --limit 100 \
+            stable=$(gh release list --exclude-drafts --exclude-pre-releases --limit 100 \
               --json tagName --jq '.[].tagName' \
-              | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } \
-              | sort -V | tail -1)
-            # Ties count: the release being published is itself in that list.
-            if [ "$(printf '%s\n%s\n' "${VERSION}" "${newest}" | sort -V | tail -1)" = "${VERSION}" ]; then
+              | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; })
+            # Equality, not "sorts highest": a release GitHub flags as a
+            # prerelease is absent from that list whatever its tag looks like,
+            # and must not take a moving tag by outranking what is in it.
+            newest=$(printf '%s\n' "${stable}" | sort -V | tail -1)
+            if [ "${newest}" = "${VERSION}" ]; then
               latest=true
             fi
-            echo "newest released is '${newest}'"
+            series="${VERSION%.*}"
+            series_re="^$(printf '%s' "${series}" | sed 's/\./\\./g')\.[0-9]+$"
+            newest_in_series=$(printf '%s\n' "${stable}" \
+              | { grep -E "${series_re}" || true; } | sort -V | tail -1)
+            if [ "${newest_in_series}" = "${VERSION}" ]; then
+              minor=true
+            fi
+            echo "newest stable '${newest}', newest in ${series} '${newest_in_series}'"
           fi
-          echo "latest=${latest}" >> "$GITHUB_OUTPUT"
-          echo "latest=${latest}"
+          {
+            echo "latest=${latest}"
+            echo "minor=${minor}"
+          } >> "$GITHUB_OUTPUT"
+          echo "latest=${latest} minor=${minor}"
 
       # The input lands verbatim in the `tags` lists below, where a newline
       # would smuggle in a further directive.
@@ -127,6 +147,18 @@ jobs:
             echo "::error::the 'tag' input is longer than the 128 characters a tag allows"
             exit 1
           fi
+          # Otherwise the gate above is trivially sidestepped: it withholds the
+          # resolved release tags, but this input reaches the same tag list, so
+          # a dispatch from any branch could publish `latest` from unreviewed
+          # code under the name consumers pull.
+          if [ "${RELEASE_TAGS}" != "true" ]; then
+            case "${TAG}" in
+              latest | latest-* | v[0-9]* | [0-9]*)
+                echo "::error::'${TAG}' looks like a release tag; a dispatch from this ref may not publish one"
+                exit 1
+                ;;
+            esac
+          fi
 
       # Manifest-level annotations only, the action's default: buildx rejects
       # index annotations on this variant's single-platform export.
@@ -137,8 +169,8 @@ jobs:
           flavor: latest=false
           tags: |
             type=semver,pattern={{version}},value=${{ steps.version.outputs.version }},enable=${{ env.RELEASE_TAGS }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }},enable=${{ env.RELEASE_TAGS }}
-            type=raw,value=latest,enable=${{ env.RELEASE_TAGS == 'true' && steps.latest.outputs.latest == 'true' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }},enable=${{ env.RELEASE_TAGS == 'true' && steps.moving.outputs.minor == 'true' }}
+            type=raw,value=latest,enable=${{ env.RELEASE_TAGS == 'true' && steps.moving.outputs.latest == 'true' }}
             type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
 
       # The suffix reaches every tag including the raw `latest`, so the tuned
@@ -154,8 +186,8 @@ jobs:
             suffix=-graviton
           tags: |
             type=semver,pattern={{version}},value=${{ steps.version.outputs.version }},enable=${{ env.RELEASE_TAGS }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }},enable=${{ env.RELEASE_TAGS }}
-            type=raw,value=latest,enable=${{ env.RELEASE_TAGS == 'true' && steps.latest.outputs.latest == 'true' }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }},enable=${{ env.RELEASE_TAGS == 'true' && steps.moving.outputs.minor == 'true' }}
+            type=raw,value=latest,enable=${{ env.RELEASE_TAGS == 'true' && steps.moving.outputs.latest == 'true' }}
             type=raw,value=${{ inputs.tag }},enable=${{ inputs.tag != '' }}
 
       # Here, not as an invalid reference once the images are already pushed.
@@ -243,9 +275,6 @@ jobs:
               echo "::error::${asset} did not contain ./loreserver"
               exit 1
             fi
-            # The archive stores it 0644 and COPY carries the context's mode
-            # into the image, so without this every container dies at startup.
-            chmod +x "dist/${arch}/loreserver"
           done
 
       - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
@@ -270,7 +299,7 @@ jobs:
             com.epicgames.lore.asset.amd64.sha256=${{ steps.fetch.outputs.amd64-sha256 }}
             com.epicgames.lore.asset.arm64.sha256=${{ steps.fetch.outputs.arm64-sha256 }}
           annotations: ${{ needs.meta.outputs.graviton-annotations }}
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=true
 
       # provenance=false keeps this a plain manifest: buildx attaches
       # provenance as a second manifest, and an index listing only linux/amd64
@@ -287,7 +316,7 @@ jobs:
             ${{ needs.meta.outputs.labels }}
             com.epicgames.lore.asset.amd64.sha256=${{ steps.fetch.outputs.amd64-sha256 }}
           annotations: ${{ needs.meta.outputs.annotations }}
-          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true,oci-mediatypes=true
 
       - name: Smoke test the amd64 image
         env:
@@ -342,9 +371,11 @@ jobs:
       VERSION: ${{ needs.meta.outputs.version }}
       EXPECT_MEDIA: ${{ matrix.media }}
       EXPECT_PLATFORMS: ${{ matrix.platforms }}
-      # Commit-addressed, so it never moves; kept as a record of which commit
-      # published which digest.
-      STAGING_TAG: sha-${{ github.sha }}${{ matrix.variant == 'graviton' && '-graviton' || '' }}
+      # Carries the release as well as the commit: every backfill dispatch from
+      # the default branch shares that branch's SHA, so the commit alone would
+      # have two of them overwriting each other's staging tag and reading back
+      # the other's digest, after signing and before any release tag moves.
+      STAGING_TAG: sha-${{ github.sha }}-${{ needs.meta.outputs.version-tag }}${{ matrix.variant == 'graviton' && '-graviton' || '' }}
       # Anchored on this workflow's path: a bare repository prefix would accept
       # a certificate minted by any workflow here.
       IDENTITY_REGEXP: '^https://github\.com/${{ github.repository }}/\.github/workflows/publish-loreserver-image\.yml@'

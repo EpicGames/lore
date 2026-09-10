@@ -25,6 +25,11 @@ ARG ARM64_TARGET_CPU=""
 # Graviton. RUSTFLAGS replaces [build] and [target.*] outright, hence the
 # repetition. The --cfg values are load-bearing, the clippy lints are not.
 #
+# LORE_ARM64_TARGET_CPU carries the same choice to lore-base's cc build of
+# rpmalloc, which pins the same -mcpu of its own accord; RUSTFLAGS does not
+# reach a C compiler, so without it a baseline build still ships armv8.4
+# instructions in the allocator.
+#
 # Not `--release`: that profile is Cargo.toml's local-development build, with
 # debug-assertions and so overflow-checks left on. release-lto is the real one.
 #
@@ -43,7 +48,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
       RUSTFLAGS="${RUSTFLAGS} -C target-cpu=${ARM64_TARGET_CPU}"; \
     fi; \
     export RUSTFLAGS; \
-    echo "building with RUSTFLAGS=${RUSTFLAGS}"; \
+    export LORE_ARM64_TARGET_CPU="${ARM64_TARGET_CPU}"; \
+    echo "building with RUSTFLAGS=${RUSTFLAGS} LORE_ARM64_TARGET_CPU=${ARM64_TARGET_CPU}"; \
     cargo build --profile release-lto --bin loreserver; \
     cp /build/target/release-lto/loreserver /build/loreserver-bin; \
     strip --strip-debug /build/loreserver-bin
