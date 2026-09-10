@@ -450,6 +450,12 @@ impl IoDriver {
         }
     }
 
+    /// Creates `path` and any missing ancestors. Succeeds if `path` is already a directory,
+    /// even when the underlying `mkdir` fails to say so: a Windows container bind-mount root
+    /// answers `PermissionDenied` rather than `AlreadyExists` for a directory it will not let
+    /// the caller create, which `std::fs::create_dir_all` alone no longer forgives (Rust 1.94,
+    /// rust-lang/rust#148196). The postcondition is what every caller here relies on: success
+    /// means the directory exists, however that came to be true.
     pub async fn create_dir_all(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let path = path.as_ref().to_path_buf();
         match &*self.inner {
