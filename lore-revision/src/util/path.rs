@@ -743,6 +743,20 @@ impl RelativePath {
         covers_impl(self.as_lowercase_str(), child.as_lowercase_str())
     }
 
+    /// The names of this path below `ancestor`, or `None` where `ancestor` does not cover it.
+    ///
+    /// Both are spelled from the same root, so this is what a walk rooted at `ancestor` would have
+    /// accumulated to reach here. An empty `ancestor` is that root and answers for every path;
+    /// `ancestor` itself yields the empty string. Names are compared as spelled, so one differing
+    /// in case is not below it.
+    pub fn below(&self, ancestor: &RelativePath) -> Option<&str> {
+        if ancestor.is_empty() {
+            return Some(self.as_str());
+        }
+        covers_impl(ancestor.as_str(), self.as_str())
+            .then(|| self.as_str()[ancestor.len()..].trim_start_matches('/'))
+    }
+
     /// [`overlaps`](Self::overlaps) on the lowercased form, for the same reason
     /// as [`covers_ignore_case`](Self::covers_ignore_case).
     pub fn overlaps_ignore_case(&self, other: &RelativePath) -> bool {
@@ -1343,6 +1357,35 @@ impl AsRef<str> for RelativePathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_below_an_ancestor_is_the_names_between_them() {
+        let path = RelativePath::new_from_clean_parts("thr/sub/file.txt", "");
+        assert_eq!(
+            path.below(&RelativePath::new_from_clean_parts("thr", "")),
+            Some("sub/file.txt")
+        );
+        assert_eq!(path.below(&RelativePath::new()), Some("thr/sub/file.txt"));
+        assert_eq!(path.below(&path), Some(""));
+    }
+
+    /// A name the ancestor merely shares a prefix with is not below it, so the answer is nothing
+    /// rather than a suffix of the wrong name.
+    #[test]
+    fn a_path_below_a_partial_name_match_is_nothing() {
+        let path = RelativePath::new_from_clean_parts("third/file.txt", "");
+        assert_eq!(
+            path.below(&RelativePath::new_from_clean_parts("thr", "")),
+            None
+        );
+        assert_eq!(
+            path.below(&RelativePath::new_from_clean_parts(
+                "third/file.txt/deeper",
+                ""
+            )),
+            None
+        );
+    }
 
     #[test]
     fn a_pushed_component_carries_into_the_lowercase_form() {

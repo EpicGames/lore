@@ -26,6 +26,7 @@ use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::stage;
 use crate::state;
+use crate::state::NodeMapping;
 use crate::state::State;
 use crate::util::path::RelativePath;
 
@@ -44,21 +45,19 @@ pub async fn remove(
 
     // Resolve through any parent links so mutations target the owning repo.
     let chain = crate::link::resolve_link_chain(
-        repository.clone(),
-        state_staged.clone(),
+        NodeMapping::root(repository.clone(), state_staged.clone()),
         state_current.clone(),
-        crate::link::LinkChainBase::root(),
         link_path.clone(),
         parent_branch,
     )
     .await?;
-    let inner_repository = chain.innermost_repository.clone();
-    let inner_state = chain.innermost_state.clone();
+    let inner_repository = chain.innermost.repository.clone();
+    let inner_state = chain.innermost.state.clone();
 
     let node_link = inner_state
         .find_relative_node_link(
             inner_repository.clone(),
-            chain.innermost_base.node,
+            chain.innermost.node,
             chain.remainder_path.as_str(),
         )
         .await

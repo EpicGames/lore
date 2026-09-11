@@ -22,7 +22,6 @@ use crate::errors::WriteRequired;
 use crate::event;
 use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
-use crate::fs::filesystem_provider::FilesystemTraversal;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::MeasuredNode;
@@ -64,6 +63,7 @@ use crate::revision::sync::SyncVerifyStats;
 use crate::stage;
 use crate::state;
 use crate::state::NodeComparison;
+use crate::state::NodeMapping;
 use crate::state::State;
 use crate::util;
 use crate::util::path::RelativePath;
@@ -142,17 +142,17 @@ pub async fn realize_state(
         let mut changes = Vec::new();
         state::diff_filesystem_subtree(
             &operation,
-            FilesystemTraversal {
+            NodeMapping {
                 repository: repository.clone(),
                 state: state_target.clone(),
-                node_path: RelativePath::new(),
-                root_node: ROOT_NODE,
+                path: RelativePath::new(),
+                node: ROOT_NODE,
             },
-            FilesystemTraversal {
+            NodeMapping {
                 repository: repository.clone(),
                 state: state_current.clone(),
-                node_path: RelativePath::new(),
-                root_node: ROOT_NODE,
+                path: RelativePath::new(),
+                node: ROOT_NODE,
             },
             RelativePath::new(),
             options.filter_mode | FilterMode::Ignore,
@@ -224,7 +224,7 @@ pub async fn realize_state(
             changes: changes.clone(),
             repository_current: repository.clone(),
             operation: operation.clone(),
-            state_current: state_current.clone(),
+            current: NodeMapping::root(repository.clone(), state_current.clone()),
             options: options.clone(),
         }))
         .await?
@@ -255,14 +255,14 @@ pub async fn verify_filesystem_for_changes(
             let change = change.clone();
             let repository_current = args.repository_current.clone();
             let operation = args.operation.clone();
-            let state_current = args.state_current.clone();
+            let current = args.current.clone();
             let stats = stats.clone();
             async move {
                 Box::pin(verify_filesystem(
                     change,
                     repository_current,
                     operation,
-                    state_current,
+                    current,
                     forward_changes,
                     force_hash_check,
                     stats,
@@ -393,7 +393,7 @@ async fn modification_against_measured_node(
     operation: &Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     change: &NodeChange,
-    state_current: &Arc<State>,
+    current: &NodeMapping,
     force_full_check: bool,
     repository_path: &RelativePath,
     content: &lore_storage::ContentHashMemo<'_>,
@@ -407,19 +407,16 @@ async fn modification_against_measured_node(
         });
     }
 
-    let from_is_current = change.from.state.revision() == state_current.revision();
+    let from_is_current = change.from.state.revision() == current.state.revision();
     let node_link = if from_is_current {
         NodeLink::invalid()
     } else {
-        state_current
-            .find_node_link(repository.clone(), change.path.as_str())
-            .await
-            .unwrap_or_default()
+        current.node_at(&change.path).await
     };
 
     let (node, repository_measured, is_current) = if node_link.node.is_valid_node_id() {
         let (repository_current, state_node) = node_link
-            .resolve(repository.clone(), state_current.clone())
+            .resolve(repository.clone(), current.state.clone())
             .await
             .forward_with::<SyncError, _>(|| {
                 format!("Failed to deserialize state {}", node_link.revision)
@@ -486,7 +483,7 @@ pub async fn verify_filesystem(
     change: NodeChange,
     repository: Arc<RepositoryContext>,
     operation: Arc<InstanceOperationImpl>,
-    state_current: Arc<State>,
+    current: NodeMapping,
     forward_changes: bool,
     force_full_check: bool,
     stats: Arc<SyncVerifyStats>,
@@ -500,7 +497,7 @@ pub async fn verify_filesystem(
         &operation,
         repository.clone(),
         &change,
-        &state_current,
+        &current,
         force_full_check,
         &repository_path,
         &content,
@@ -713,12 +710,9 @@ pub async fn verify_filesystem(
         }
 
         if is_delete {
-            let current_node_link = state_current
-                .find_node_link(repository.clone(), change.path.as_str())
-                .await
-                .unwrap_or_default();
+            let current_node_link = current.node_at(&change.path).await;
             let (repository_current, state_current) = current_node_link
-                .resolve(repository.clone(), state_current.clone())
+                .resolve(repository.clone(), current.state.clone())
                 .await
                 .forward_with::<SyncError, _>(|| {
                     format!("Failed to deserialize state {}", current_node_link.revision)
@@ -728,17 +722,17 @@ pub async fn verify_filesystem(
             let mut directory_changes = Vec::new();
             state::diff_filesystem_subtree(
                 &operation,
-                FilesystemTraversal {
+                NodeMapping {
                     repository: change.from.repository.clone(),
                     state: state_from.clone(),
-                    node_path: change.path.clone(),
-                    root_node: change.from.node,
+                    path: change.path.clone(),
+                    node: change.from.node,
                 },
-                FilesystemTraversal {
+                NodeMapping {
                     repository: repository_current,
                     state: state_current.clone(),
-                    node_path: change.path.clone(),
-                    root_node: subnode_current,
+                    path: change.path.clone(),
+                    node: subnode_current,
                 },
                 change.path.clone(),
                 filter_mode,
@@ -2610,7 +2604,7 @@ mod tests {
             change,
             repository.clone(),
             operation,
-            current.state.clone(),
+            NodeMapping::root(repository.clone(), current.state.clone()),
             false,
             false,
             Arc::default(),

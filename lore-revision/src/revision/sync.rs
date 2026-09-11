@@ -940,7 +940,7 @@ pub struct SyncVerifyArgs {
     pub changes: Arc<Vec<NodeChange>>,
     pub repository_current: Arc<RepositoryContext>,
     pub operation: Arc<InstanceOperationImpl>,
-    pub state_current: Arc<State>,
+    pub current: crate::state::NodeMapping,
     pub options: Arc<SyncOptions>,
 }
 

@@ -26,12 +26,12 @@ use crate::lore::Hash;
 use crate::merge::MergeTextMode;
 use crate::node::Node;
 use crate::node::NodeFlags;
-use crate::node::NodeID;
 use crate::repository::RepositoryContext;
 use crate::state::FilesystemDiffStats;
 use crate::state::LayerMountInfo;
 use crate::state::LinkMountInfo;
 use crate::state::NodeComparison;
+use crate::state::NodeMapping;
 use crate::state::RecordedModifiedTimes;
 use crate::state::State;
 use crate::util::path::RelativePath;
@@ -98,18 +98,8 @@ impl FileInfo {
     }
 }
 
-/// One side of a filesystem diff: which tree, rooted where. `node_path` is the working-tree path
-/// of `root_node`, as the tree spells it — which differs from `filesystem_path` only where the two
-/// spell a name with different case.
-pub struct FilesystemTraversal {
-    pub repository: Arc<RepositoryContext>,
-    pub state: Arc<State>,
-    pub node_path: RelativePath,
-    pub root_node: NodeID,
-}
-
 /// A tree to diff against, before a path in it is resolved to a root. Resolving one
-/// yields the [`FilesystemTraversal`] the diff walks.
+/// yields the [`NodeMapping`] the diff walks.
 pub struct FilesystemDiffTree {
     pub repository: Arc<RepositoryContext>,
     pub state: Arc<State>,
@@ -162,8 +152,10 @@ impl FilesystemDiffIntent {
 /// `current` is what the working copy last held, which is how an unstaged add is told
 /// apart from a tracked file.
 pub struct FilesystemDiffContext {
-    pub from: FilesystemTraversal,
-    pub current: FilesystemTraversal,
+    pub from: NodeMapping,
+    pub current: NodeMapping,
+    /// The path as the file system spells it, which parts from the mappings' own spelling only
+    /// where the two name a component with different case.
     pub filesystem_path: RelativePath,
     /// The filter's verdict at `filesystem_path`, which each child steps from rather
     /// than refolding the ancestors it already accounts for.

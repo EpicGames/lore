@@ -56,7 +56,6 @@ use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::FilesystemDiffContext;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
 use crate::fs::filesystem_provider::FilesystemDiffTree;
-use crate::fs::filesystem_provider::FilesystemTraversal;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::StageIntent;
@@ -3398,7 +3397,7 @@ impl State {
         &self,
         repository: Arc<RepositoryContext>,
         root_node: NodeID,
-        base_path: RelativePathBuf,
+        base_path: RelativePath,
     ) -> Result<Vec<RelativePath>, StateError> {
         let mut result = Vec::new();
         let force = execution_context().globals().force();
@@ -3408,7 +3407,7 @@ impl State {
         // borrows it without an extra allocation.
         let base_states = repository.filter.exclusion_states(&base_path);
         let mut stack: Vec<(NodeID, RelativePath, FilterStates)> =
-            vec![(root_node, base_path.freeze(), base_states)];
+            vec![(root_node, base_path, base_states)];
 
         while let Some((node_id, path, states)) = stack.pop() {
             let children = self
@@ -6055,6 +6054,63 @@ pub async fn diff_collect(
     Ok(changes)
 }
 
+/// A state's node mapped to its path in the repository instance's file system.
+///
+/// `path` is as seen from the top-level repository instance root, which every repository context
+/// shares, while `node` names the same subtree in `state`'s own repository tree. The two part
+/// wherever a link or layer mount draws its subtree from a path other than the one it is mounted
+/// at. An invalid `node` is one side of an add or a delete, where the state holds nothing and the
+/// path answers for nothing either.
+///
+/// As an example, a link mounting a linked repository at `mount`, for the file that repository
+/// holds at `dir/file.txt`:
+///
+/// - `repository`: a context whose root is the top-level repository instance root and whose
+///   repository ID is the linked repository's
+/// - `state`: the linked repository's revision state
+/// - `path`: `mount/dir/file.txt`
+/// - `node`: the node ID for `dir/file.txt` in `state`, loaded from `repository`
+#[derive(Clone)]
+pub struct NodeMapping {
+    /// The repository `node` and its content exist in.
+    pub repository: Arc<RepositoryContext>,
+    /// The revision holding `node`.
+    pub state: Arc<State>,
+    /// The path of `node` as a relative path from the top-level repository instance root.
+    pub path: RelativePath,
+    /// The node in `state`'s own tree.
+    pub node: NodeID,
+}
+
+impl NodeMapping {
+    /// A state's own root, for a caller whose paths are spelled from the top-level repository
+    /// instance root.
+    pub fn root(repository: Arc<RepositoryContext>, state: Arc<State>) -> Self {
+        NodeMapping {
+            repository,
+            state,
+            path: RelativePath::new(),
+            node: ROOT_NODE,
+        }
+    }
+
+    /// The node this mapping holds at `path`, or an invalid link where it holds none.
+    ///
+    /// `path` is spelled from the top-level repository instance root, as every change is, and the
+    /// names below this mapping's own path are walked from `node`. Both are the tree's own
+    /// spelling: a path taken from the file system answers for nothing where the two name a
+    /// component with different case.
+    pub async fn node_at(&self, path: &RelativePath) -> NodeLink {
+        let Some(below) = path.below(&self.path) else {
+            return NodeLink::invalid();
+        };
+        self.state
+            .find_relative_node_link(self.repository.clone(), self.node, below)
+            .await
+            .unwrap_or_default()
+    }
+}
+
 #[derive(Default)]
 pub struct FilesystemDiffStats {
     pub file_add: AtomicU64,
@@ -6221,17 +6277,17 @@ pub async fn diff_filesystem(
         return diff_with(
             operation,
             FilesystemDiffContext {
-                from: FilesystemTraversal {
+                from: NodeMapping {
                     repository: repository_from,
                     state: state_from,
-                    node_path: RelativePath::new(),
-                    root_node: ROOT_NODE,
+                    path: RelativePath::new(),
+                    node: ROOT_NODE,
                 },
-                current: FilesystemTraversal {
+                current: NodeMapping {
                     repository: repository_current,
                     state: state_current,
-                    node_path: RelativePath::new(),
-                    root_node: ROOT_NODE,
+                    path: RelativePath::new(),
+                    node: ROOT_NODE,
                 },
                 filesystem_path: RelativePath::new(),
                 states,
@@ -6273,17 +6329,17 @@ pub async fn diff_filesystem(
     diff_with(
         operation,
         FilesystemDiffContext {
-            from: FilesystemTraversal {
+            from: NodeMapping {
                 repository: repository_from,
                 state: state_from,
-                node_path: path.clone(),
-                root_node: node_link_from.node,
+                path: path.clone(),
+                node: node_link_from.node,
             },
-            current: FilesystemTraversal {
+            current: NodeMapping {
                 repository: repository_current,
                 state: state_current,
-                node_path: path.clone(),
-                root_node: node_link_to.node,
+                path: path.clone(),
+                node: node_link_to.node,
             },
             filesystem_path: path,
             states,
@@ -6387,8 +6443,8 @@ pub(crate) async fn apply_pending_discards(
 #[allow(clippy::too_many_arguments)]
 pub async fn diff_filesystem_subtree(
     operation: &InstanceOperationImpl,
-    from: FilesystemTraversal,
-    current: FilesystemTraversal,
+    from: NodeMapping,
+    current: NodeMapping,
     filesystem_path: RelativePath,
     filter_mode: FilterMode,
     intent: FilesystemDiffIntent,
@@ -6496,7 +6552,7 @@ async fn diff_filesystem_subtree_impl(
             // absent from state_from (an untracked add). Create its dirty-add
             // node chain so adds discovered inside resolve their parent node.
             if ctx.intent.marks_dirty()
-                && !ctx.from.root_node.is_valid_or_root_node_id()
+                && !ctx.from.node.is_valid_or_root_node_id()
                 && !ctx.filesystem_path.is_empty()
             {
                 let entry_node = ensure_scan_dir_chain(
@@ -6505,7 +6561,7 @@ async fn diff_filesystem_subtree_impl(
                     ctx.filesystem_path.as_str(),
                 )
                 .await?;
-                ctx.from.root_node = entry_node;
+                ctx.from.node = entry_node;
             }
             diff_filesystem_directory(ctx, listing).await
         }
@@ -6513,7 +6569,7 @@ async fn diff_filesystem_subtree_impl(
             // A path-filtered scan of a new file: ensure its parent directory
             // chain exists so the add resolves its parent node.
             if ctx.intent.marks_dirty()
-                && !ctx.from.root_node.is_valid_node_id()
+                && !ctx.from.node.is_valid_node_id()
                 && let Some(parent) = ctx.filesystem_path.parent()
                 && !parent.is_empty()
             {
@@ -7384,13 +7440,13 @@ async fn diff_filesystem_directory(
     /// A staging walk includes the children staged for delete, so a path the file system
     /// still holds takes its delete back rather than being added a second time beside it.
     async fn collect_node_list(
-        traversal: &FilesystemTraversal,
+        traversal: &NodeMapping,
         include_deleted: bool,
     ) -> Result<StateChildrenNodes, StateError> {
-        let FilesystemTraversal {
+        let NodeMapping {
             repository,
             state,
-            root_node: node_id,
+            node: node_id,
             ..
         } = traversal;
         Ok(if node_id.is_valid_or_root_node_id() {
@@ -7861,7 +7917,7 @@ async fn diff_filesystem_directory_walk(
                     current_node_list,
                     current_node_id,
                     item.name.as_str(),
-                    &ctx.current.node_path,
+                    &ctx.current.path,
                 )
                 .await?
                 .map(|matched| (current_node_id, matched))
@@ -7879,7 +7935,7 @@ async fn diff_filesystem_directory_walk(
             node_list,
             from_named_node.node,
             item.name.as_str(),
-            &ctx.from.node_path,
+            &ctx.from.path,
         )
         .await?
         else {
@@ -7974,7 +8030,7 @@ async fn diff_filesystem_directory_walk(
                 state_from: node_list.state.clone(),
                 from_node_id: from_named_node.node,
                 from_node: Some(from_node),
-                parent_node_id: Some(ctx.from.root_node),
+                parent_node_id: Some(ctx.from.node),
                 intent: ctx.intent,
                 states: item_states,
                 observed,
@@ -7994,11 +8050,11 @@ async fn diff_filesystem_directory_walk(
             .await?;
         } else if was_link && is_directory {
             let item_path = entry.to_path();
-            let from_path = from_match.path(&ctx.from.node_path, item.name.as_str());
+            let from_path = from_match.path(&ctx.from.path, item.name.as_str());
             let current_path = current_match
                 .as_ref()
                 .map_or_else(RelativePath::new, |(_, matched)| {
-                    matched.path(&ctx.current.node_path, item.name.as_str())
+                    matched.path(&ctx.current.path, item.name.as_str())
                 });
             if staged == StagedEntry::Undeleted {
                 emit_add_node_single(
@@ -8038,17 +8094,17 @@ async fn diff_filesystem_directory_walk(
                 .0;
             diff_filesystem_subtree_dispatch(
                 FilesystemDiffContext {
-                    from: FilesystemTraversal {
+                    from: NodeMapping {
                         repository: link_from,
                         state: state_from,
-                        node_path: from_path,
-                        root_node: subnode_from,
+                        path: from_path,
+                        node: subnode_from,
                     },
-                    current: FilesystemTraversal {
+                    current: NodeMapping {
                         repository: link_current,
                         state: state_current,
-                        node_path: current_path,
-                        root_node: subnode_current,
+                        path: current_path,
+                        node: subnode_current,
                     },
                     filesystem_path: item_path,
                     states: item_states,
@@ -8067,11 +8123,11 @@ async fn diff_filesystem_directory_walk(
             .await?;
         } else if was_directory && is_directory {
             let item_path = entry.to_path();
-            let from_path = from_match.path(&ctx.from.node_path, item.name.as_str());
+            let from_path = from_match.path(&ctx.from.path, item.name.as_str());
             let current_path = current_match
                 .as_ref()
                 .map_or_else(RelativePath::new, |(_, matched)| {
-                    matched.path(&ctx.current.node_path, item.name.as_str())
+                    matched.path(&ctx.current.path, item.name.as_str())
                 });
             let uncommitted = ctx.intent.marks_dirty() && !current_node_id.is_valid_node_id();
             if uncommitted {
@@ -8173,17 +8229,17 @@ async fn diff_filesystem_directory_walk(
             };
             diff_filesystem_subtree_dispatch(
                 FilesystemDiffContext {
-                    from: FilesystemTraversal {
+                    from: NodeMapping {
                         repository: repository_from,
                         state: state_from,
-                        node_path: from_path,
-                        root_node: subnode_from,
+                        path: from_path,
+                        node: subnode_from,
                     },
-                    current: FilesystemTraversal {
+                    current: NodeMapping {
                         repository: repository_current,
                         state: state_current,
-                        node_path: current_path,
-                        root_node: subnode_current,
+                        path: current_path,
+                        node: subnode_current,
                     },
                     filesystem_path: item_path,
                     states: item_states,
@@ -8205,7 +8261,7 @@ async fn diff_filesystem_directory_walk(
                 state_from: node_list.state.clone(),
                 from_node_id: from_named_node.node,
                 from_node: Some(from_node),
-                parent_node_id: Some(ctx.from.root_node),
+                parent_node_id: Some(ctx.from.node),
                 intent: ctx.intent,
                 states: item_states,
                 observed: FileInfo::from_metadata(&item.metadata),
@@ -8244,17 +8300,17 @@ async fn diff_filesystem_directory_walk(
                 let item_path = entry.to_path();
                 diff_filesystem_subtree_dispatch(
                     FilesystemDiffContext {
-                        from: FilesystemTraversal {
+                        from: NodeMapping {
                             repository: ctx.from.repository.clone(),
                             state: ctx.from.state.clone(),
-                            node_path: item_path.clone(),
-                            root_node: replacement,
+                            path: item_path.clone(),
+                            node: replacement,
                         },
-                        current: FilesystemTraversal {
+                        current: NodeMapping {
                             repository: ctx.current.repository.clone(),
                             state: ctx.current.state.clone(),
-                            node_path: RelativePath::new(),
-                            root_node: INVALID_NODE,
+                            path: RelativePath::new(),
+                            node: INVALID_NODE,
                         },
                         filesystem_path: item_path,
                         states: item_states,
@@ -8282,7 +8338,7 @@ async fn diff_filesystem_directory_walk(
         let Some((from_node, from_node_states)) = get_filtered_node_and_path(
             node_list,
             from_named_node.node,
-            &ctx.from.node_path,
+            &ctx.from.path,
             ctx.from_states,
             ctx.filter_mode,
         )
@@ -8468,17 +8524,17 @@ async fn diff_filesystem_directory_walk(
                 let layer_source_node = mount.source_node;
                 diff_filesystem_subtree_dispatch(
                     FilesystemDiffContext {
-                        from: FilesystemTraversal {
+                        from: NodeMapping {
                             repository: layer_repository.clone(),
                             state: layer_state.clone(),
-                            node_path: child_file_path.clone(),
-                            root_node: layer_source_node,
+                            path: child_file_path.clone(),
+                            node: layer_source_node,
                         },
-                        current: FilesystemTraversal {
+                        current: NodeMapping {
                             repository: layer_repository,
                             state: layer_state,
-                            node_path: child_file_path.clone(),
-                            root_node: layer_source_node,
+                            path: child_file_path.clone(),
+                            node: layer_source_node,
                         },
                         filesystem_path: child_file_path,
                         states: child_states,
@@ -8520,7 +8576,7 @@ async fn diff_filesystem_directory_walk(
                 // The new directory is a child of the directory currently being
                 // walked; its node is the correct parent even across link/layer
                 // boundaries (resolving by parent path would not match there).
-                let dir_parent_node = ctx.from.root_node;
+                let dir_parent_node = ctx.from.node;
                 let dir_node = Node {
                     flags: NodeFlags::DirtyAdd.bits(),
                     name_hash: crate::hash::hash_string(file.name.as_str()),
@@ -8567,17 +8623,17 @@ async fn diff_filesystem_directory_walk(
             let state_current = ctx.current.state.clone();
             diff_filesystem_subtree_dispatch(
                 FilesystemDiffContext {
-                    from: FilesystemTraversal {
+                    from: NodeMapping {
                         repository: repository_from,
                         state: state_from,
-                        node_path: dir_from_path,
-                        root_node: dir_from_root,
+                        path: dir_from_path,
+                        node: dir_from_root,
                     },
-                    current: FilesystemTraversal {
+                    current: NodeMapping {
                         repository: repository_current,
                         state: state_current,
-                        node_path: RelativePath::new(),
-                        root_node: INVALID_NODE,
+                        path: RelativePath::new(),
+                        node: INVALID_NODE,
                     },
                     filesystem_path: child_file_path.clone(),
                     states: child_states,
@@ -8606,7 +8662,7 @@ async fn diff_filesystem_directory_walk(
             state_from: ctx.from.state.clone(),
             from_node_id: INVALID_NODE,
             from_node: None,
-            parent_node_id: Some(ctx.from.root_node),
+            parent_node_id: Some(ctx.from.node),
             intent: ctx.intent,
             states: child_states,
             observed: FileInfo::from_metadata(&file.metadata),
@@ -8718,20 +8774,20 @@ async fn diff_filesystem_single_file(
     // No path manipulation needed!
 
     // Get the state nodes for comparison
-    let from_node = if ctx.from.root_node.is_valid_node_id() {
+    let from_node = if ctx.from.node.is_valid_node_id() {
         ctx.from
             .state
-            .node(ctx.from.repository.clone(), ctx.from.root_node)
+            .node(ctx.from.repository.clone(), ctx.from.node)
             .await
             .ok()
     } else {
         None
     };
 
-    let current_node = if ctx.current.root_node.is_valid_node_id() {
+    let current_node = if ctx.current.node.is_valid_node_id() {
         ctx.current
             .state
-            .node(ctx.current.repository.clone(), ctx.current.root_node)
+            .node(ctx.current.repository.clone(), ctx.current.node)
             .await
             .ok()
     } else {
@@ -8751,7 +8807,7 @@ async fn diff_filesystem_single_file(
         match staged_entry(
             &ctx.from.state,
             &ctx.from.repository,
-            ctx.from.root_node,
+            ctx.from.node,
             &node,
             stage,
             execution_context().globals().force(),
@@ -8763,7 +8819,7 @@ async fn diff_filesystem_single_file(
                 emit_add_node_single(
                     ctx.from.repository.clone(),
                     ctx.from.state.clone(),
-                    ctx.from.root_node,
+                    ctx.from.node,
                     &ctx.filesystem_path,
                     &mut ChangeSink::Vec(&mut changes),
                     &stats,
@@ -8780,15 +8836,15 @@ async fn diff_filesystem_single_file(
     // Add+Dirty directly.
     if ctx.intent.marks_dirty()
         && file_item.metadata.is_file()
-        && ctx.from.root_node.is_valid_node_id()
-        && !ctx.current.root_node.is_valid_node_id()
+        && ctx.from.node.is_valid_node_id()
+        && !ctx.current.node.is_valid_node_id()
         && let Some(node) = from_node
         && node.is_file()
     {
         emit_unstaged_add(
             ctx.from.repository.clone(),
             ctx.from.state.clone(),
-            ctx.from.root_node,
+            ctx.from.node,
             node,
             &ctx.filesystem_path,
             &observed,
@@ -8816,7 +8872,7 @@ async fn diff_filesystem_single_file(
     let file_ctx = FileDiffContext {
         repository_from: ctx.from.repository.clone(),
         state_from: ctx.from.state.clone(),
-        from_node_id: ctx.from.root_node,
+        from_node_id: ctx.from.node,
         from_node,
         parent_node_id: None,
         intent: ctx.intent,
@@ -8843,8 +8899,8 @@ async fn diff_filesystem_single_file(
 /// Handle diff when filesystem path doesn't exist.
 /// Everything in state under this path is considered deleted.
 async fn diff_filesystem_missing(
-    from: FilesystemTraversal,
-    node_path: RelativePath,
+    from: NodeMapping,
+    filesystem_path: RelativePath,
     states: FilterStates,
     filter_mode: FilterMode,
     intent: FilesystemDiffIntent,
@@ -8852,17 +8908,14 @@ async fn diff_filesystem_missing(
     let mut changes = vec![];
     let stats = FilesystemDiffStats::default();
 
-    // Add delete changes for all nodes under root_node_from
-    if from.root_node.is_valid_node_id() {
-        let from_node = from
-            .state
-            .node(from.repository.clone(), from.root_node)
-            .await?;
+    // Add delete changes for all nodes under the from node
+    if from.node.is_valid_node_id() {
+        let from_node = from.state.node(from.repository.clone(), from.node).await?;
 
         lore_trace!(
             "Filesystem path {} does not exist, marking state node {} as deleted",
-            node_path,
-            from.root_node
+            filesystem_path,
+            from.node
         );
 
         // Scan: mark missing file as Dirty+Delete
@@ -8870,7 +8923,7 @@ async fn diff_filesystem_missing(
             mark_settled(
                 &from.state,
                 &from.repository,
-                from.root_node,
+                from.node,
                 SettledAction::Delete,
                 intent,
             )
@@ -8881,7 +8934,7 @@ async fn diff_filesystem_missing(
             NodeChangeState {
                 repository: from.repository.clone(),
                 state: from.state.clone(),
-                node: from.root_node,
+                node: from.node,
                 flags: NodeFlags::from_bits_retain(from_node.flags),
                 address: from_node.address,
             },
@@ -8893,7 +8946,7 @@ async fn diff_filesystem_missing(
                 address: Address::default(),
             },
             FileAction::Delete,
-            &node_path,
+            &filesystem_path,
             None,
             &mut ChangeSink::Vec(&mut changes),
             filter_mode,

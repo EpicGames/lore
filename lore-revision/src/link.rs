@@ -43,6 +43,7 @@ use crate::revision::sync::sync_verify_filesystem;
 use crate::stage;
 use crate::state;
 use crate::state::LinkReference;
+use crate::state::NodeMapping;
 use crate::state::State;
 use crate::state::StateError;
 use crate::util::path::RelativePath;
@@ -724,65 +725,43 @@ pub struct LinkChainLevel {
     pub old_signature: Hash,
 }
 
-/// A node a link-chain walk descends from, and the working-tree path that node sits at.
-///
-/// Both ends of [`resolve_link_chain`] take this shape: it consumes a base and the remainder below
-/// it, and answers with the deepest base it reached and the remainder below that one. A base plus
-/// its remainder is the working-tree path throughout, so a walk starting below the repository root
-/// answers with the same paths one starting at it does.
-pub struct LinkChainBase {
-    pub node: NodeID,
-    pub path: RelativePath,
-}
-
-impl LinkChainBase {
-    /// The repository root, for a caller holding a path spelled from it.
-    pub fn root() -> Self {
-        LinkChainBase {
-            node: crate::node::ROOT_NODE,
-            path: RelativePath::new(),
-        }
-    }
-}
-
 /// A link path resolved through zero or more link boundaries. `levels` is empty
-/// for a plain top-level path, in which case `innermost_state` is the caller's
+/// for a plain top-level path, in which case `innermost` maps the caller's
 /// top-level staged state.
 pub struct ResolvedLinkChain {
     /// Ordered outer -> inner.
     pub levels: Vec<LinkChainLevel>,
-    pub innermost_repository: Arc<RepositoryContext>,
-    pub innermost_state: Arc<State>,
+    /// The deepest mapping reached: the innermost mount crossed, or the base the walk started from
+    /// where it crossed none.
+    pub innermost: NodeMapping,
     /// The innermost repository's committed state. Carries registry entries that
     /// the staged state has already dropped, such as a link staged for removal.
     pub innermost_current_state: Arc<State>,
-    /// The deepest base reached: the innermost mount crossed, or the base the walk started from
-    /// where it crossed none.
-    pub innermost_base: LinkChainBase,
-    /// What the walk did not consume, named from `innermost_base`. The path asked for where no
+    /// What the walk did not consume, named from `innermost`. The path asked for where no
     /// link was crossed, and what stands below the innermost mount where one was.
     pub remainder_path: RelativePathBuf,
 }
 
 /// Resolve `remainder_path`, which names a path below `base`, down through any
-/// link boundaries into the crossed links and the innermost containing repo,
-/// state and what is left unconsumed there. Like `find_relative_node_link` but
-/// records each crossed link. Bounded by `MAX_LINK_DEPTH` and a visited-repository
-/// set.
+/// link boundaries into the crossed links, the innermost mapping and what is left
+/// unconsumed there. Like `find_relative_node_link` but records each crossed link.
+/// Bounded by `MAX_LINK_DEPTH` and a visited-repository set.
+///
+/// Both ends take the same shape: a mapping plus the remainder below it is the path in the
+/// repository instance's file system throughout, so a walk starting below the repository root
+/// answers with the same paths one starting at it does.
 pub async fn resolve_link_chain(
-    repository: Arc<RepositoryContext>,
-    state_staged: Arc<State>,
+    base: NodeMapping,
     state_current: Arc<State>,
-    base: LinkChainBase,
     mut remainder_path: RelativePath,
     parent_branch: BranchId,
 ) -> Result<ResolvedLinkChain, LinkError> {
     let mut levels: Vec<LinkChainLevel> = Vec::new();
     let mut seen: std::collections::HashSet<RepositoryId> = std::collections::HashSet::new();
-    seen.insert(repository.id);
+    seen.insert(base.repository.id);
 
-    let mut cur_repository = repository;
-    let mut cur_state = state_staged;
+    let mut cur_repository = base.repository;
+    let mut cur_state = base.state;
     let mut cur_current_state = state_current;
     let mut cur_branch = parent_branch;
     let mut cur_node = base.node;
@@ -877,21 +856,21 @@ pub async fn resolve_link_chain(
 
     Ok(ResolvedLinkChain {
         levels,
-        innermost_repository: cur_repository,
-        innermost_state: cur_state,
-        innermost_current_state: cur_current_state,
-        innermost_base: LinkChainBase {
-            node: base_node,
+        innermost: NodeMapping {
+            repository: cur_repository,
+            state: cur_state,
             path: mount_path.freeze(),
+            node: base_node,
         },
+        innermost_current_state: cur_current_state,
         remainder_path: below_mount,
     })
 }
 
 impl ResolvedLinkChain {
     /// The child (state, repository) mounted by level `index`: the next level's
-    /// parent for an intermediate level, or the innermost state/repository for
-    /// the last level. Used by the inner -> outer folding passes.
+    /// parent for an intermediate level, or `innermost`'s for the last level.
+    /// Used by the inner -> outer folding passes.
     pub fn child_at(&self, index: usize) -> (Arc<State>, Arc<RepositoryContext>) {
         if index + 1 < self.levels.len() {
             (
@@ -900,8 +879,8 @@ impl ResolvedLinkChain {
             )
         } else {
             (
-                self.innermost_state.clone(),
-                self.innermost_repository.clone(),
+                self.innermost.state.clone(),
+                self.innermost.repository.clone(),
             )
         }
     }
@@ -1368,6 +1347,13 @@ pub async fn realize_link_pin_change(
     )
     .await?;
 
+    let current_tree = crate::state::NodeMapping {
+        repository: link_context.clone(),
+        state: link_state_current.clone(),
+        path: link_path.clone(),
+        node: node_current,
+    };
+
     let changes = state::diff_collect_subtree(
         state::node_change_state(&link_context, &link_state_current, node_current).await,
         state::node_change_state(&link_context, &link_state_target, node_target).await,
@@ -1401,7 +1387,7 @@ pub async fn realize_link_pin_change(
                 changes: changes.clone(),
                 repository_current: link_context.clone(),
                 operation: operation.clone(),
-                state_current: link_state_current.clone(),
+                current: current_tree,
                 options: options.clone(),
             }),
         )

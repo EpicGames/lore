@@ -44,6 +44,7 @@ use crate::repository::DOT_URC;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryWriteToken;
 use crate::state;
+use crate::state::NodeMapping;
 use crate::state::State;
 use crate::state::StateNodeChildrenWithNameIterator;
 use crate::util;
@@ -515,11 +516,13 @@ async fn unstage_path(
         lore_debug!("Unstaging the repository from root");
 
         return unstage_directory(
-            repository.clone(),
+            NodeMapping {
+                repository: repository.clone(),
+                state: state_staged.clone(),
+                path: relative_path.clone(),
+                node: ROOT_NODE,
+            },
             state_current.clone(),
-            state_staged.clone(),
-            relative_path.clone(),
-            ROOT_NODE,
             discard.clone(),
             options,
             stats.clone(),
@@ -543,11 +546,13 @@ async fn unstage_path(
     };
 
     unstage_node(
-        target.repository,
+        NodeMapping {
+            repository: target.repository,
+            state: target.state_staged,
+            path: relative_path,
+            node: target.node_id,
+        },
         target.state_current,
-        target.state_staged,
-        relative_path,
-        target.node_id,
         discard,
         options,
         stats,
@@ -606,21 +611,19 @@ async fn resolve_unstage_target(
     // Resolve the chain so every crossed link is tracked and the
     // mutated node lives in the shared innermost state.
     let chain = crate::link::resolve_link_chain(
-        repository.clone(),
-        state_staged.clone(),
+        NodeMapping::root(repository.clone(), state_staged.clone()),
         state_current,
-        crate::link::LinkChainBase::root(),
         node_path.clone(),
         crate::lore::BranchId::default(),
     )
     .await
     .forward::<UnstageError>("Failed to resolve link chain")?;
 
-    let innermost_state = chain.innermost_state.clone();
+    let innermost_state = chain.innermost.state.clone();
     chain.record_tracker_contexts(link_tracker, &innermost_state);
 
-    let repository = chain.innermost_repository.clone();
-    let state_staged = chain.innermost_state.clone();
+    let repository = chain.innermost.repository.clone();
+    let state_staged = chain.innermost.state.clone();
     let state_current = State::deserialize(
         repository.clone(),
         chain
@@ -634,7 +637,7 @@ async fn resolve_unstage_target(
     let node_id = state_staged
         .find_relative_node_link(
             repository.clone(),
-            chain.innermost_base.node,
+            chain.innermost.node,
             chain.remainder_path.as_str(),
         )
         .await
@@ -649,20 +652,23 @@ async fn resolve_unstage_target(
     }))
 }
 
-/// Each child of `directory_path` steps from the verdict `states` carries.
+/// Each child of `at`'s path steps from the verdict `states` carries.
 #[allow(clippy::too_many_arguments)]
 async fn unstage_directory(
-    repository: Arc<RepositoryContext>,
+    at: NodeMapping,
     state_current: Arc<State>,
-    state_staged: Arc<State>,
-    directory_path: RelativePath,
-    directory_node: NodeID,
     discard: Arc<DashMap<RepositoryId, Vec<u32>>>,
     options: UnstageOptions,
     stats: Arc<UnstageStats>,
     link_tracker: Arc<LinkTracker>,
     states: FilterStates,
 ) -> Result<(), UnstageError> {
+    let NodeMapping {
+        repository,
+        state: state_staged,
+        path: directory_path,
+        node: directory_node,
+    } = at;
     lore_trace!(
         "Unstaging directory: path='{}', node={}, repository={}",
         directory_path.as_str(),
@@ -696,11 +702,13 @@ async fn unstage_directory(
         );
 
         unstage_node_recurse(
-            repository.clone(),
+            NodeMapping {
+                repository: repository.clone(),
+                state: state_staged.clone(),
+                path: child_node_path,
+                node: child_node_id,
+            },
             state_current.clone(),
-            state_staged.clone(),
-            child_node_path,
-            child_node_id,
             discard.clone(),
             options,
             stats.clone(),
@@ -771,23 +779,26 @@ async fn unstage_parent_chain(
     Ok(())
 }
 
-/// Unstages `node_id`, which lives in `state_staged` and is materialized at `node_path`.
+/// Unstages the node `at` maps.
 ///
 /// `states` carries the verdict this node's own query steps from, which the query asks about
-/// `node_path` from.
+/// `at`'s path from.
 #[allow(clippy::too_many_arguments)]
 async fn unstage_node(
-    repository: Arc<RepositoryContext>,
+    at: NodeMapping,
     state_current: Arc<State>,
-    state_staged: Arc<State>,
-    node_path: RelativePath,
-    node_id: NodeID,
     discard: Arc<DashMap<RepositoryId, Vec<u32>>>,
     options: UnstageOptions,
     stats: Arc<UnstageStats>,
     link_tracker: Arc<LinkTracker>,
     states: FilterStates,
 ) -> Result<(), UnstageError> {
+    let NodeMapping {
+        repository,
+        state: state_staged,
+        path: node_path,
+        node: node_id,
+    } = at;
     let name = node_path.name();
     if name.is_empty() || name == "." {
         return Ok(());
@@ -844,12 +855,14 @@ async fn unstage_node(
             lore_debug!("Discarding staged-add link {node_id}");
 
             link::reset::reset_staged_add_link(
-                repository.clone(),
+                NodeMapping {
+                    repository: repository.clone(),
+                    state: state_staged.clone(),
+                    path: node_path.clone(),
+                    node: node_id,
+                },
                 state_current.clone(),
-                state_staged.clone(),
-                node_id,
                 node,
-                node_path.clone(),
             )
             .await
             .forward::<UnstageError>("Failed to reset staged-add link")?;
@@ -1133,11 +1146,13 @@ async fn unstage_node(
                     .forward::<UnstageError>("Failed to unstage link nodes")?;
 
             unstage_directory(
-                linked_repository.clone(),
+                NodeMapping {
+                    repository: linked_repository.clone(),
+                    state: linked_state.clone(),
+                    path: node_path.clone(),
+                    node: node.child,
+                },
                 linked_state_current.clone(),
-                linked_state.clone(),
-                node_path.clone(),
-                node.child,
                 discard.clone(),
                 options,
                 stats.clone(),
@@ -1152,11 +1167,13 @@ async fn unstage_node(
         }
 
         unstage_directory(
-            repository.clone(),
+            NodeMapping {
+                repository: repository.clone(),
+                state: state_staged.clone(),
+                path: node_path.clone(),
+                node: node_id,
+            },
             state_current.clone(),
-            state_staged.clone(),
-            node_path.clone(),
-            node_id,
             discard.clone(),
             options,
             stats.clone(),
@@ -1182,11 +1199,8 @@ async fn unstage_node(
 
 #[allow(clippy::too_many_arguments)]
 fn unstage_node_recurse<'a>(
-    repository: Arc<RepositoryContext>,
+    at: NodeMapping,
     state_current: Arc<State>,
-    state_staged: Arc<State>,
-    node_path: RelativePath,
-    node_id: NodeID,
     discard: Arc<DashMap<RepositoryId, Vec<u32>>>,
     options: UnstageOptions,
     stats: Arc<UnstageStats>,
@@ -1194,11 +1208,8 @@ fn unstage_node_recurse<'a>(
     states: FilterStates,
 ) -> Pin<Box<dyn Future<Output = Result<(), UnstageError>> + Send + 'a>> {
     Box::pin(unstage_node(
-        repository,
+        at,
         state_current,
-        state_staged,
-        node_path,
-        node_id,
         discard,
         options,
         stats,

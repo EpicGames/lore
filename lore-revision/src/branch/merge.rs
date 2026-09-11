@@ -2036,9 +2036,9 @@ async fn verify_changes_against_filesystem<'a>(
                 let no_force_hash_check = false;
                 Box::pin(crate::fs::realize::verify_filesystem(
                     change,
-                    repository,
+                    repository.clone(),
                     operation,
-                    state_current,
+                    crate::state::NodeMapping::root(repository, state_current),
                     no_forward_changes,
                     no_force_hash_check,
                     stats,

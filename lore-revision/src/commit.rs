@@ -74,6 +74,7 @@ use crate::repository::RepositoryWriteToken;
 use crate::repository::verify::verify_state_for_commit;
 use crate::revision::sync;
 use crate::state;
+use crate::state::NodeMapping;
 use crate::state::RecordedModifiedTimes;
 use crate::state::State;
 use crate::state::StateNodeChildrenIterator;
@@ -1197,24 +1198,22 @@ async fn commit_link_only(
     // state. `resolve_link_chain` gives one shared mutable state per level so
     // the pin write and the propagation see the same objects.
     let chain = link::resolve_link_chain(
-        repository.clone(),
-        state_parent_staged.clone(),
+        NodeMapping::root(repository.clone(), state_parent_staged.clone()),
         state_parent_current.clone(),
-        link::LinkChainBase::root(),
         RelativePath::from_str(&link_path).unwrap_or_default(),
         current_branch,
     )
     .await
     .forward::<CommitError>("Failed to resolve link chain")?;
 
-    let owner_repository = chain.innermost_repository.clone();
-    let owner_state = chain.innermost_state.clone();
+    let owner_repository = chain.innermost.repository.clone();
+    let owner_state = chain.innermost.state.clone();
 
     // Locate the link node within the owning repo's staged state.
     let link_local_node = owner_state
         .find_relative_node_link(
             owner_repository.clone(),
-            chain.innermost_base.node,
+            chain.innermost.node,
             chain.remainder_path.as_str(),
         )
         .await

@@ -12,18 +12,22 @@ use crate::node::Node;
 use crate::node::NodeBlock;
 use crate::node::NodeID;
 use crate::repository::RepositoryContext;
+use crate::state::NodeMapping;
 use crate::state::State;
 use crate::util;
 use crate::util::path::RelativePath;
 
 pub(crate) async fn reset_staged_add_link(
-    repository: Arc<RepositoryContext>,
+    at: NodeMapping,
     state_current: Arc<State>,
-    state_staged: Arc<State>,
-    link_node_id: NodeID,
     staged_link_node: Node,
-    link_path: RelativePath,
 ) -> Result<(), LinkError> {
+    let NodeMapping {
+        repository,
+        state: state_staged,
+        path: link_path,
+        node: link_node_id,
+    } = at;
     let link_id = staged_link_node.linked_node().repository;
     let absolute_path = link_path.to_absolute_path(repository.require_path()?);
 

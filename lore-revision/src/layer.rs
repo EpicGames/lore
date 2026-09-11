@@ -17,7 +17,6 @@ use crate::event;
 use crate::event::EventError;
 use crate::find;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
-use crate::fs::filesystem_provider::FilesystemTraversal;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
@@ -44,6 +43,7 @@ use crate::revision::sync;
 use crate::revision::sync::SyncOptions;
 use crate::revision::sync::SyncRealizeStats;
 use crate::state;
+use crate::state::NodeMapping;
 use crate::state::State;
 use crate::util::path::RelativePath;
 
@@ -910,6 +910,12 @@ async fn sync_in_operation(
     let stats: Arc<SyncRealizeStats> = Arc::default();
     let current = drawn_subtree_state(&repository, &state_current, &source_path).await;
     let target = drawn_subtree_state(&repository, &state_target, &source_path).await;
+    let current_tree = NodeMapping {
+        repository: current.repository.clone(),
+        state: current.state.clone(),
+        path: target_path.clone(),
+        node: current.node,
+    };
 
     let changes = if !options.reset {
         lore_info!(
@@ -930,17 +936,17 @@ async fn sync_in_operation(
         let mut changes = Vec::new();
         state::diff_filesystem_subtree(
             &operation,
-            FilesystemTraversal {
+            NodeMapping {
                 repository: target.repository,
                 state: target.state,
-                node_path: target_path.clone(),
-                root_node: target.node,
+                path: target_path.clone(),
+                node: target.node,
             },
-            FilesystemTraversal {
+            NodeMapping {
                 repository: current.repository,
                 state: current.state,
-                node_path: target_path.clone(),
-                root_node: current.node,
+                path: target_path.clone(),
+                node: current.node,
             },
             target_path,
             options.filter_mode,
@@ -969,7 +975,7 @@ async fn sync_in_operation(
                 changes: changes.clone(),
                 repository_current: repository.clone(),
                 operation: operation.clone(),
-                state_current: state_current.clone(),
+                current: current_tree,
                 options: options.clone(),
             }),
         )

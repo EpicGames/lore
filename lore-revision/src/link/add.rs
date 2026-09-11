@@ -32,6 +32,7 @@ use crate::repository::clone::LoreRepositoryCloneCountData;
 use crate::repository::clone::LoreRepositoryCloneEndEventData;
 use crate::stage;
 use crate::stage::StageOptions;
+use crate::state::NodeMapping;
 use crate::state::State;
 use crate::state::StateNodeChildrenIterator;
 use crate::util::path::RelativePath;
@@ -268,17 +269,15 @@ pub async fn add(
     // Resolve through any parent links so the link lands in the innermost
     // containing repository (empty chain for a plain top-level link).
     let chain = link::resolve_link_chain(
-        repository.clone(),
-        state_staged.clone(),
+        NodeMapping::root(repository.clone(), state_staged.clone()),
         state_current.clone(),
-        link::LinkChainBase::root(),
         link_path.clone(),
         current_branch,
     )
     .await?;
 
-    let inner_repository = chain.innermost_repository.clone();
-    let inner_state = chain.innermost_state.clone();
+    let inner_repository = chain.innermost.repository.clone();
+    let inner_state = chain.innermost.state.clone();
     let remainder_path = chain.remainder_path.clone();
 
     // The stored path rather than the argument, which resolved case-insensitively.
@@ -300,7 +299,7 @@ pub async fn add(
     if let Ok(node_link) = inner_state
         .find_relative_node_link(
             inner_repository.clone(),
-            chain.innermost_base.node,
+            chain.innermost.node,
             remainder_path.as_str(),
         )
         .await
@@ -353,19 +352,11 @@ pub async fn add(
     }
 
     if !remainder_parent.is_empty() {
-        let inner_base_absolute = repository
-            .require_path()?
-            .join(chain.innermost_base.path.as_str());
-
         lore_debug!("Staging link parent path in innermost repository");
         with_operation(repository.file_system(), true, async |operation| {
             Box::pin(stage::stage_filesystem_path(
                 operation,
-                inner_repository.clone(),
-                inner_state.clone(),
-                inner_base_absolute,
-                chain.innermost_base.path.clone(),
-                chain.innermost_base.node,
+                chain.innermost.clone(),
                 remainder_parent.freeze(),
                 Arc::default(),
                 StageOptions {
