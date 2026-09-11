@@ -1,0 +1,44 @@
+# SPDX-FileCopyrightText: 2026 Epic Games, Inc.
+# SPDX-License-Identifier: MIT
+
+# Packages a released loreserver asset, which the publish workflow unpacks
+# into dist/<arch>/. Nothing is compiled; Dockerfile builds from source.
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# amd64 or arm64, naming the directory the asset was unpacked into.
+ARG TARGETARCH
+
+COPY dist/${TARGETARCH}/loreserver /usr/local/bin/loreserver
+# The archive stores it 0644 and COPY carries that mode through.
+RUN chmod 0755 /usr/local/bin/loreserver
+COPY dist/${TARGETARCH}/LICENSE.txt /usr/share/doc/loreserver/LICENSE.txt
+COPY dist/${TARGETARCH}/THIRD-PARTY-NOTICES.txt /usr/share/doc/loreserver/THIRD-PARTY-NOTICES.txt
+
+# From the checkout; the release archive does not carry it.
+COPY lore-server/config/default.toml /etc/lore/config/default.toml
+
+# Local stores at /data, and no QUIC certificate, which is what leaves the
+# server generating an ephemeral self-signed one at startup.
+RUN cat <<'EOF' > /etc/lore/config/docker.toml
+[immutable_store.local]
+path = "/data"
+
+[mutable_store.local]
+path = "/data"
+EOF
+
+ENV LORE_CONFIG_PATH=/etc/lore/config
+ENV LORE_ENV=docker
+ENV RUST_LOG=info
+
+RUN mkdir -p /data
+VOLUME /data
+
+# 41337 carries gRPC over TCP and QUIC over UDP; both are needed.
+EXPOSE 41337/tcp 41337/udp 41339/tcp
+
+ENTRYPOINT ["loreserver"]
