@@ -5,7 +5,7 @@ authors:
   - Hannes Muurinen
 status: Approved
 created: 2026-08-20
-updated: 2026-09-08
+updated: 2026-09-11
 discussion: https://crowd.urc.internal.epicgames.net/epic/Lore/change-request/412
 ---
 
@@ -639,7 +639,7 @@ where a CI instance authenticates with a client id and secret.
 
 | Custom claim | Replacement |
 | --- | --- |
-| `resources: [{resource_id, permission}]` | A namespaced custom claim carrying `{resource, actions}` entries, the same structure under a name a provider can be configured to emit. `resource_claim` names the claim and `permission_claim` names the actions within it. The same two settings answer the Tier 1 case, where actions are read without a resource beside them (D8). See below. |
+| `resources: [{resource_id, permission}]` | A namespaced custom claim carrying `{resource, actions}` entries, the same structure under names a provider can be configured to emit. `resource_claim` names the claim, `resource_id_claim` names the resource field within an entry (`resource_id` by default) and `permission_claim` names the actions (`permission` by default). All three field names are configuration because some providers cannot change their entry shape — Keycloak's UMA `permissions` entries carry `rsname` and `scopes` — and configuring only some of the shape would be worse than configuring none of it. `permission_claim` also answers the Tier 1 case, where actions are read without a resource beside them (D8). See below. |
 | `is_service_account` | Dropped from the server's decision path. Every reader becomes an action check through `RepositoryAuthorizer` (D8), the way obliterate already works. See below. |
 | `name`, `preferred_username` | Already standard OIDC claims. Made optional (D6). |
 | `env` | Unused in any decision path. Dropped. |
@@ -912,12 +912,12 @@ that. So when `jwt_issuer` holds an https URL the server fetches
 non-standard discovery.
 
 `[server.auth]` therefore gains `permission_claim`, `baseline_access`, `resource_claim`,
-`resource_id_template`, `resource_wildcard` and `identity_claim` (D7, `sub` by default, compared
-wherever the server checks a recorded identity). `permission_claim` is exercised from phase 2
-onwards, because it is what Tier 1 runs on. `baseline_access` steers only what the default
-`RepositoryDirectory` lists (D7), never an access decision. The other three only matter
-once a per-partition claim is in play, so phase 4 for a new deployment and immediately for a
-`UrcAuthApi` one. There is no service-account setting, because D4 turned that check into two
+`resource_id_claim`, `resource_id_template`, `resource_wildcard` and `identity_claim` (D7, `sub`
+by default, compared wherever the server checks a recorded identity). `permission_claim` is
+exercised from phase 2 onwards, because it is what Tier 1 runs on. `baseline_access` steers only
+what the default `RepositoryDirectory` lists (D7), never an access decision. The other four only
+matter once a per-partition claim is in play, so phase 4 for a new deployment and immediately for
+a `UrcAuthApi` one. There is no service-account setting, because D4 turned that check into two
 ordinary actions.
 
 #### `RepositoryAuthorizer` answers every partition question
@@ -979,9 +979,10 @@ flowchart TD
 
 The decision rule is D4's claim model applied per call. `check_repository_access(token, p,
 action)` reads the claim named by `resource_claim` and looks for an entry matching partition
-`p`. An entry matches when its resource equals what `resource_id_template` renders for `p`, or
-equals the configured `resource_wildcard`. No matching entry means denied. When the call names
-an action, the matching entry's `permission_claim` values must also include that action.
+`p`. An entry matches when its resource — the entry field named by `resource_id_claim`,
+`resource_id` by default — equals what `resource_id_template` renders for `p`, or equals the
+configured `resource_wildcard`. No matching entry means denied. When the call names an action,
+the matching entries' `permission_claim` values, merged, must also include that action.
 
 Under Tier 2 access to all partitions needs to be allowed explicitly. A token with no entry
 for a partition cannot touch it, plain reads included. A client that has not exchanged for a

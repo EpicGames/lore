@@ -261,6 +261,11 @@ pub struct AuthSettings {
     /// Dotted path of the claim carrying per-repository resource grants.
     /// If this is set, enables the granular `ResourceGrantsAuthorizer`.
     pub resource_claim: Option<String>,
+    /// The field inside each resource entry naming the resource, for
+    /// providers whose entry shape cannot be changed (Keycloak's UMA
+    /// `permissions` entries carry `rsname`, for example).
+    #[serde(default = "AuthSettings::default_resource_id_claim")]
+    pub resource_id_claim: String,
     /// Template that renders a repository id into the corresponding resource
     /// name.
     #[serde(default = "AuthSettings::default_resource_id_template")]
@@ -280,11 +285,15 @@ pub struct AuthSettings {
 
 impl AuthSettings {
     fn default_resource_id_template() -> String {
-        "urc-{id}".to_string()
+        crate::auth::jwt::DEFAULT_RESOURCE_ID_TEMPLATE.to_string()
+    }
+
+    fn default_resource_id_claim() -> String {
+        "resource_id".to_string()
     }
 
     fn default_resource_wildcard() -> String {
-        "urc-*".to_string()
+        crate::auth::jwt::DEFAULT_RESOURCE_WILDCARD.to_string()
     }
 
     fn default_identity_claim() -> String {
@@ -725,6 +734,7 @@ mod tests {
             jwt_audience = ["lore"]
             permission_claim = "realm_access.roles"
             resource_claim = "resources"
+            resource_id_claim = "rsname"
             resource_id_template = "repo:{id}"
             resource_wildcard = "urc-*"
             identity_claim = "preferred_username"
@@ -735,6 +745,7 @@ mod tests {
 
         assert_eq!(auth.permission_claim.as_deref(), Some("realm_access.roles"));
         assert_eq!(auth.resource_claim.as_deref(), Some("resources"));
+        assert_eq!(auth.resource_id_claim, "rsname");
         assert_eq!(auth.resource_id_template, "repo:{id}");
         assert_eq!(auth.resource_wildcard, "urc-*");
         assert_eq!(auth.identity_claim, "preferred_username");
@@ -756,6 +767,7 @@ mod tests {
 
         assert_eq!(auth.resource_id_template, "urc-{id}");
         assert_eq!(auth.resource_wildcard, "urc-*");
+        assert_eq!(auth.resource_id_claim, "resource_id");
         assert_eq!(auth.baseline_access, BaselineAccess::Denied);
         assert_eq!(auth.permission_claim, None);
         assert_eq!(auth.resource_claim, None);

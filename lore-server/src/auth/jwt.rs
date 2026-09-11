@@ -35,6 +35,13 @@ impl ResourcePermission {
     }
 }
 
+/// The legacy `UrcAuthApi` resource shape: the default for the
+/// `resource_id_template` setting and for the fixed matcher the legacy
+/// readers use.
+pub const DEFAULT_RESOURCE_ID_TEMPLATE: &str = "urc-{id}";
+/// The legacy wildcard, the `resource_wildcard` setting's default.
+pub const DEFAULT_RESOURCE_WILDCARD: &str = "urc-*";
+
 /// Renders repository ids into resource names and matches grant entries
 /// against them. The defaults reproduce the legacy `UrcAuthApi` shape for
 /// backwards compatibility.
@@ -46,10 +53,10 @@ pub struct ResourceMatcher {
 
 impl Default for ResourceMatcher {
     fn default() -> Self {
-        Self {
-            resource_id_template: "urc-{id}".to_string(),
-            resource_wildcard: "urc-*".to_string(),
-        }
+        Self::new(
+            DEFAULT_RESOURCE_ID_TEMPLATE.to_string(),
+            DEFAULT_RESOURCE_WILDCARD.to_string(),
+        )
     }
 }
 
