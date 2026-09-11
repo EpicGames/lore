@@ -6,6 +6,7 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 use tracing::instrument;
+use tracing::warn;
 
 use crate::legacy::rpc::environment_service_server::EnvironmentService;
 
@@ -33,7 +34,10 @@ fn proto_from_config(
             CompressionMode::NotSpecified => lore_proto::CompressionMode::NotSpecified as i32,
             CompressionMode::NoCompression => lore_proto::CompressionMode::NoCompression as i32,
             CompressionMode::Lz4 => lore_proto::CompressionMode::Lz4 as i32,
-            CompressionMode::Oodle => lore_proto::CompressionMode::Oodle as i32,
+            CompressionMode::Oodle => {
+                warn!("Env config compression mode overridden from Oodle to Zstd");
+                lore_proto::CompressionMode::Zstd as i32
+            }
             CompressionMode::Zstd => lore_proto::CompressionMode::Zstd as i32,
         }),
     })

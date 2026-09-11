@@ -28,8 +28,12 @@ mod tests {
                     size_content: payload.len() as u64,
                 };
 
-                compress::compress(fragment, &payload, CompressionMode::Oodle)
-                    .expect_err("Undersized fragment compress did not fail as expected");
+                compress::compress_without_deprecation_checks(
+                    fragment,
+                    &payload,
+                    CompressionMode::Oodle,
+                )
+                .expect_err("Undersized fragment compress did not fail as expected");
             })
             .await;
     }
@@ -51,8 +55,12 @@ mod tests {
                     size_content: 4 * payload.len() as u64,
                 };
 
-                compress::compress(fragment, &payload, CompressionMode::Oodle)
-                    .expect_err("Compressed fragment compress did not fail as expected");
+                compress::compress_without_deprecation_checks(
+                    fragment,
+                    &payload,
+                    CompressionMode::Oodle,
+                )
+                .expect_err("Compressed fragment compress did not fail as expected");
             })
             .await;
     }
@@ -77,8 +85,12 @@ mod tests {
                 };
 
                 let (compressed_fragment, compressed_buffer) =
-                    compress::compress(fragment, &data, CompressionMode::Oodle)
-                        .expect("Compression failed");
+                    compress::compress_without_deprecation_checks(
+                        fragment,
+                        &data,
+                        CompressionMode::Oodle,
+                    )
+                    .expect("Compression failed");
 
                 let (decompressed_fragment, decompressed_data) =
                     compress::decompress(compressed_fragment, compressed_buffer.as_ref())

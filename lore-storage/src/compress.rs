@@ -865,6 +865,20 @@ pub fn compress(
     payload: &[u8],
     mode: CompressionMode,
 ) -> Result<(Fragment, Bytes), CompressFragmentError> {
+    // put deprecated compression mode guards here
+    if matches!(mode, CompressionMode::Oodle) {
+        return Err(CompressFragmentError::from(NotSupported {
+            operation: "Oodle compression requested but this mode is being deprecated".to_string(),
+        }));
+    }
+    compress_without_deprecation_checks(fragment, payload, mode)
+}
+
+pub fn compress_without_deprecation_checks(
+    fragment: Fragment,
+    payload: &[u8],
+    mode: CompressionMode,
+) -> Result<(Fragment, Bytes), CompressFragmentError> {
     let output_buffer =
         BytesMut::with_capacity(compress_bound(fragment.size_payload as usize, mode));
     compress_into(fragment, payload, mode, output_buffer)
@@ -1428,5 +1442,69 @@ mod tests {
         // Safety: Pure query on the return value, no pointer dereference.
         assert!(unsafe { zstd_sys::ZSTD_isError(code) } != 0);
         assert!(zstd_compress_failure(&zstd_error_name(code)).is_internal());
+    }
+
+    /// New Oodle compressed fragments are refused, so no new Oodle fragments
+    /// can be generated for a local store.
+    ///
+    /// Existing Oodle fragments can be read so they can be migrated off Oodle.
+    #[cfg(feature = "oodle")]
+    mod oodle_deprecation {
+        use super::*;
+
+        #[test]
+        fn compress_refuses_oodle() {
+            let length = FRAGMENT_SIZE_EXPECTED;
+            let source = payload(length);
+
+            let error = compress(
+                raw_fragment(length),
+                source.as_slice(),
+                CompressionMode::Oodle,
+            )
+            .expect_err("Oodle is refused");
+
+            let not_supported = error
+                .as_not_supported()
+                .unwrap_or_else(|| panic!("refused as {error:?}, not as unsupported"));
+            assert!(
+                not_supported
+                    .operation
+                    .contains("this mode is being deprecated"),
+                "refused for a reason other than the deprecation: {}",
+                not_supported.operation
+            );
+        }
+
+        // Until Local Immutable Stores are migrated off Oodle, storage
+        // should still be able to read Oodle
+        #[test]
+        fn decompress_can_read_an_oodle_fragment() {
+            let length = FRAGMENT_SIZE_EXPECTED;
+            let source = payload(length);
+
+            let (compressed_fragment, compressed) = compress_without_deprecation_checks(
+                raw_fragment(length),
+                source.as_slice(),
+                CompressionMode::Oodle,
+            )
+            .expect("Oodle compresses");
+            assert_ne!(
+                compressed_fragment.flags & FragmentFlags::PayloadCompressedOodle2,
+                0,
+                "fragment was not marked as Oodle"
+            );
+
+            let (decompressed_fragment, decompressed) =
+                decompress(compressed_fragment, compressed.as_ref()).expect("Oodle decompresses");
+
+            assert_eq!(decompressed.as_ref(), source.as_slice());
+            assert_eq!(decompressed_fragment.size_content, length as u64);
+            assert_eq!(
+                decompressed_fragment.flags & FragmentFlags::PayloadCompressed,
+                0,
+                "the decompressed fragment still carries a compression flag"
+            );
+        }
     }
 }

@@ -114,8 +114,12 @@ mod tests {
             size_content: content.len() as u64,
         };
         let (oodle_fragment, oodle_payload) =
-            lore_storage::compress(base, content.as_slice(), CompressionMode::Oodle)
-                .expect("payload should Oodle-compress");
+            lore_storage::compress::compress_without_deprecation_checks(
+                base,
+                content.as_slice(),
+                CompressionMode::Oodle,
+            )
+            .expect("payload should Oodle-compress");
         assert_ne!(
             oodle_fragment.flags & FragmentFlags::PayloadCompressedOodle2,
             0,
