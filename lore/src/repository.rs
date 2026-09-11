@@ -389,7 +389,6 @@ async fn dump_impl(
         revision::resolve(
             repository.clone(),
             args.revision.as_str(),
-            execution_context().globals().search_limit(),
             execution_context().globals().search_location(),
         )
         .await

@@ -553,7 +553,6 @@ pub async fn resolve_revision_number(
     revision::resolve(
         repository.clone(),
         format!("{branch}@{revision_number}"),
-        None,
         ResolveSearchLocation::Local,
     )
     .await

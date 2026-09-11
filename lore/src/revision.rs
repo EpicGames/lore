@@ -769,7 +769,7 @@ pub struct LoreRevisionSyncArgs {
 /// | [`LoreEvent::RevisionSyncFile`](crate::interface::LoreEvent::RevisionSyncFile) | Emitted for each file deleted, modified, added, or merged during sync |
 /// | [`LoreEvent::RevisionSyncProgress`](crate::interface::LoreEvent::RevisionSyncProgress) | Emitted periodically during file realization and once at completion with cumulative counts |
 /// | [`LoreEvent::RevisionSyncRevision`](crate::interface::LoreEvent::RevisionSyncRevision) | Emitted with the resulting revision when a merge occurs and at the end of sync |
-/// | [`LoreEvent::RevisionResolve`](crate::interface::LoreEvent::RevisionResolve) | Emitted when resolving a partial or numbered revision reference |
+/// | [`LoreEvent::RevisionResolve`](crate::interface::LoreEvent::RevisionResolve) | Emitted when resolving a revision number |
 /// | [`LoreEvent::FilterExclude`](crate::interface::LoreEvent::FilterExclude) | Emitted for each path excluded by view or ignore filters |
 /// | [`LoreEvent::FileStageFile`](crate::interface::LoreEvent::FileStageFile) | Emitted for each file staged for deletion during merge realization |
 ///
@@ -972,7 +972,7 @@ pub struct LoreRevisionDiffArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::RevisionDiffFile`](crate::interface::LoreEvent::RevisionDiffFile) | Emitted for each file that differs between the two revisions |
-/// | [`LoreEvent::RevisionResolve`](crate::interface::LoreEvent::RevisionResolve) | Emitted when resolving a partial or numbered revision reference |
+/// | [`LoreEvent::RevisionResolve`](crate::interface::LoreEvent::RevisionResolve) | Emitted when resolving a revision number |
 pub async fn diff(
     globals: LoreGlobalArgs,
     args: LoreRevisionDiffArgs,
@@ -1005,7 +1005,6 @@ async fn diff_impl(
     let source_hash = revision::resolve(
         repository.clone(),
         args.revision_source.as_str(),
-        execution_context().globals().search_limit(),
         execution_context().globals().search_location(),
     )
     .await
@@ -1021,7 +1020,6 @@ async fn diff_impl(
         revision::resolve(
             repository.clone(),
             args.revision_target.as_str(),
-            execution_context().globals().search_limit(),
             execution_context().globals().search_location(),
         )
         .await
@@ -1071,7 +1069,6 @@ pub async fn cherry_pick_local(
             let target_revision = revision::resolve(
                 repository.clone(),
                 args.revision.as_str(),
-                execution_context().globals().search_limit(),
                 execution_context().globals().search_location(),
             )
             .await
@@ -1368,7 +1365,6 @@ pub async fn revert_local(
             let target_revision = revision::resolve(
                 repository.clone(),
                 args.revision.as_str(),
-                execution_context().globals().search_limit(),
                 execution_context().globals().search_location(),
             )
             .await

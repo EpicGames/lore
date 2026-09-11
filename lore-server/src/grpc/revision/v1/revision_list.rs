@@ -268,7 +268,7 @@ async fn resolve_start(
 ) -> Result<ResolveStart, Status> {
     match start {
         Start::Signature(signature) => {
-            let hash = Hash::from(signature);
+            let hash = crate::grpc::revision_signature(signature)?;
             debug!({REVISION} = %hash, "resolve_start - Signature");
             if acceleration.list_cache
                 && let Some(cached) =
@@ -369,15 +369,11 @@ async fn resolve_start(
                 })
             } else {
                 let signature = format!("{branch}@{}", identifier.number);
-                let hash = revision::resolve(
-                    repository.clone(),
-                    signature,
-                    None,
-                    ResolveSearchLocation::Local,
-                )
-                .await
-                .filter_slow_down()?
-                .map_err(|err| Status::not_found(format!("Revision not found: {err}")))?;
+                let hash =
+                    revision::resolve(repository.clone(), signature, ResolveSearchLocation::Local)
+                        .await
+                        .filter_slow_down()?
+                        .map_err(|err| Status::not_found(format!("Revision not found: {err}")))?;
                 Ok(ResolveStart::Walk {
                     start: hash,
                     strategy: RevisionListStrategy::FullIteration,
@@ -868,7 +864,7 @@ async fn forward_target(
 /// along `parent_self`, so this always terminates at `first_number` or the
 /// root, bounded only by the branch's real history depth — the same
 /// guarantee `resolve_start`'s `FullIteration` fallback already relies on
-/// via `revision::resolve(..., None, ...)` when no acceleration is
+/// via `revision::resolve` when no acceleration is
 /// available. An item-count cap here would fail requests anchored deep in
 /// a long, legitimately un-accelerated history — worse, retrying such a
 /// request would fail identically every time, since this always restarts

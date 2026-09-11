@@ -412,6 +412,7 @@ include = [
 "LoreRevisionMetadataListArgs" = "lore_revision_metadata_list_args_t"
 "LoreRevisionMetadataSetArgs" = "lore_revision_metadata_set_args_t"
 "LoreRevisionResolveEventData" = "lore_revision_resolve_event_data_t"
+"LoreRevisionResolveTarget" = "lore_revision_resolve_target_t"
 "LoreRevisionSyncArgs" = "lore_revision_sync_args_t"
 "LoreRevisionSyncFileEventData" = "lore_revision_sync_file_event_data_t"
 "LoreRevisionSyncProgressEventData" = "lore_revision_sync_progress_event_data_t"

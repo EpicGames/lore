@@ -31,6 +31,7 @@ pub mod tower;
 pub use admin_service::LoreAdminService;
 pub use grpc_internal_server::GrpcInternalServerBuilder;
 use lore_base::types::Context;
+use lore_base::types::Hash;
 use lore_revision::branch::BranchError;
 use lore_revision::diff::DiffError;
 use lore_revision::find::FindError;
@@ -501,12 +502,72 @@ where
     }
 }
 
+/// Reads a revision hash out of a request's `signature` field, refusing a
+/// signature that is not a whole one.
+///
+/// A partial hash signature is a request the server cannot act on rather than a
+/// revision it looked for and did not find, so it is refused as
+/// `FAILED_PRECONDITION`: retrying it unchanged fails the same way.
+///
+/// An empty field is not a partial signature but an unset one, and is left to
+/// the zero hash its callers already handle.
+pub fn revision_signature(signature: Bytes) -> Result<Hash, Status> {
+    if !signature.is_empty() && signature.len() != size_of::<Hash>() {
+        return Err(Status::failed_precondition(format!(
+            "partial revision hash signature of {} byte(s) - give the whole {} byte signature, or a branch and revision number",
+            signature.len(),
+            size_of::<Hash>(),
+        )));
+    }
+
+    Ok(Hash::from(signature))
+}
+
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
 
     use super::*;
     use crate::auth::jwt::ResourcePermission;
+
+    #[test]
+    fn revision_signature_reads_a_whole_signature() {
+        let hash = Hash::hash_buffer(&[1, 2, 3]);
+        let read = revision_signature(Bytes::from(hash)).expect("a whole signature is read");
+        assert_eq!(read, hash);
+    }
+
+    // Not a partial signature but an unset one, which the callers already answer
+    // for as a revision that does not exist.
+    #[test]
+    fn revision_signature_reads_an_absent_signature_as_zero() {
+        let read = revision_signature(Bytes::new()).expect("an unset signature is read");
+        assert!(read.is_zero());
+    }
+
+    // Both directions of wrong: a prefix of a hash, and a hash with anything
+    // trailing it.
+    #[test]
+    fn revision_signature_refuses_a_signature_that_is_not_whole() {
+        let hash = Hash::hash_buffer(&[1, 2, 3]);
+        for length in [1, 8, size_of::<Hash>() - 1, size_of::<Hash>() + 1] {
+            let mut signature = Vec::from(Bytes::from(hash));
+            signature.resize(length, 0);
+
+            let status = revision_signature(Bytes::from(signature))
+                .expect_err("a signature that is not whole is refused");
+            assert_eq!(
+                status.code(),
+                tonic::Code::FailedPrecondition,
+                "a {length} byte signature was not refused as a failed precondition",
+            );
+            assert!(
+                status.message().contains("partial revision hash signature"),
+                "the refusal does not say what was wrong: {}",
+                status.message(),
+            );
+        }
+    }
 
     #[test]
     fn get_authorization_extracts_auth() {

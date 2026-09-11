@@ -17,6 +17,8 @@ use lore::interface::LoreEventCallback;
 use lore::interface::LoreGlobalArgs;
 use lore::interface::LoreMaintenanceEventData;
 use lore::interface::LorePathIgnoreEventData;
+use lore::interface::LoreRevisionResolveEventData;
+use lore::interface::LoreRevisionResolveTarget;
 use lore::interface::LoreRevisionSyncProgressEventData;
 use lore::interface::LoreString;
 use lore::runtime;
@@ -234,6 +236,22 @@ pub fn handle_maintenance_event(event: &LoreMaintenanceEventData) {
 
 pub fn handle_path_ignore_event(event: &LorePathIgnoreEventData) {
     println!("Ignoring invalid path: {}", event.path);
+}
+
+pub fn handle_revision_resolve_event(event: &LoreRevisionResolveEventData) {
+    match event.target {
+        LoreRevisionResolveTarget::Number => println!(
+            "Resolving revision number {} on branch {}",
+            event.revision_number, event.branch
+        ),
+        LoreRevisionResolveTarget::Latest => {
+            println!("Resolving latest revision on branch {}", event.branch);
+        }
+        LoreRevisionResolveTarget::Signature => println!(
+            "Resolving revision {} on branch {}",
+            event.revision, event.branch
+        ),
+    }
 }
 
 /// A byte count in the largest unit that leaves it above one.

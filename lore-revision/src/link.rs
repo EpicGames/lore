@@ -573,30 +573,21 @@ pub async fn resolve_pin(
     link: Arc<RepositoryContext>,
     pin: String,
 ) -> Result<(Hash, Context), LinkError> {
-    let pin_signature = revision::resolve(
+    let resolved = revision::resolve_in_branch(
         link.clone(),
         pin,
-        execution_context().globals().search_limit(),
         execution_context().globals().search_location(),
     )
     .await
     .forward::<LinkError>("Invalid pin specified")?;
 
-    let pin_state = State::deserialize(link.clone(), pin_signature)
-        .await
-        .forward::<LinkError>("Failed deserializing state")?;
+    // A caller that tracks a branch of its own overrides the branch pinned here.
+    let pin_signature = resolved.revision;
+    let pin_branch = resolved.branch;
 
-    let pin_metadata = pin_state
-        .revision_metadata(link.clone())
-        .await
-        .forward::<LinkError>("Failed getting revision metadata")?;
+    lore_debug!("Resolved link pin with revision {pin_signature} on branch {pin_branch}");
 
-    lore_debug!(
-        "Resolved link pin with revision {pin_signature} on branch {}",
-        pin_metadata.branch
-    );
-
-    Ok((pin_signature, pin_metadata.branch))
+    Ok((pin_signature, pin_branch))
 }
 
 /// The node the subtree a link exposes sits at in each of two revisions it pins.

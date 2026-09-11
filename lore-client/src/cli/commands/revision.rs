@@ -189,9 +189,12 @@ pub struct RevisionAmendArgs {
 
 #[derive(Args)]
 pub struct RevisionSyncArgs {
-    /// Revision hash signature to synchronize to. Can be a signature on any
-    /// branch — if the target revision is on a different branch, the current
-    /// branch is updated accordingly. Can be a partial hash signature.
+    /// Revision to synchronize to: a whole hash signature, `[branch]@<number>`,
+    /// `[branch]@LATEST`, or `<branch>@<hash>`. The `@` is optional, a target
+    /// given without it applying to the branch you are on. A revision identifies
+    /// the branch it was created on, and syncing moves onto that branch. A
+    /// branch point can also identify the child branch by naming that child
+    /// branch.
     #[clap(value_name = "revision")]
     revision: Option<String>,
 
@@ -1461,19 +1464,7 @@ pub fn handle_sync_event(event: &LoreEvent, progress_bar: &ProgressBar, debug: b
                 println!("  {}({id}) {path}{}", LogStyles::WARNING, anstyle::Reset);
             }
         }
-        LoreEvent::RevisionResolve(data) => {
-            if data.revision_number != 0 {
-                println!(
-                    "Resolving revision number {} on branch {}",
-                    data.revision_number, data.branch
-                );
-            } else {
-                println!(
-                    "Resolving revision partial hash signature {}",
-                    data.revision
-                );
-            }
-        }
+        LoreEvent::RevisionResolve(data) => util::handle_revision_resolve_event(data),
         LoreEvent::Complete(_) if !debug => {
             println!();
         }

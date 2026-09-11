@@ -1064,32 +1064,16 @@ pub async fn clone(
         None
     };
 
-    let revision = if let Some(revision) = revision {
-        revision::resolve(
-            repository.clone(),
-            revision,
-            call.search_limit(),
-            call.search_location(),
-        )
-        .await
-        .forward::<CloneError>("Invalid revision signature")?
+    // A revision names the branch to clone, and the default branch is cloned
+    // where no revision was given.
+    let (revision, branch_id) = if let Some(revision) = revision {
+        let resolved =
+            revision::resolve_in_branch(repository.clone(), revision, call.search_location())
+                .await
+                .forward::<CloneError>("Invalid revision signature")?;
+        (resolved.revision, resolved.branch)
     } else {
-        Hash::default()
-    };
-
-    // If a revision was given, make sure it's on the expected branch
-    let branch_id = if !revision.is_zero() {
-        let state = state::State::deserialize(repository.clone(), revision)
-            .await
-            .forward::<CloneError>("Failed to load revision state")?;
-        let metadata = metadata::Metadata::deserialize(repository.clone(), state.metadata_hash())
-            .await
-            .forward::<CloneError>("Failed to load revision metadata")?;
-        metadata
-            .get_branch()
-            .forward::<CloneError>("Failed to load revision metadata")?
-    } else {
-        repository_metadata.default_branch
+        (Hash::default(), repository_metadata.default_branch)
     };
 
     let branch = if let Some(branch) = prefetched_branch {

@@ -90,7 +90,7 @@ pub(super) async fn resolve_signature(
     acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<Hash, Status> {
     match spec {
-        RevisionSpec::Signature(signature) => Ok(Hash::from(signature)),
+        RevisionSpec::Signature(signature) => crate::grpc::revision_signature(signature),
         RevisionSpec::Identifier(identifier) => {
             let branch_id = BranchId::from(&identifier.branch_id);
             if identifier.number == 0 {

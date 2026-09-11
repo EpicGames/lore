@@ -178,6 +178,23 @@ def revision_info(
     )
 
 
+def revision_info_raw_signature(
+    target: str, repo_id_hex: str, signature: bytes
+) -> tuple[grpc.StatusCode, bytes, str]:
+    """Ask for a revision by a signature of any length, whole or not.
+
+    `revision_info` goes through `_signature_bytes`, which refuses anything but a
+    whole signature. This is the way to put a partial one on the wire and read
+    what the server answers to it.
+    """
+    return call(
+        target,
+        REVISION_INFO,
+        encode_bytes_field(2, signature),
+        repository_metadata(repo_id_hex),
+    )
+
+
 def revision_tree(
     target: str, repo_id_hex: str, signature_hex: str
 ) -> tuple[grpc.StatusCode, list[bytes], str]:

@@ -4,7 +4,7 @@ The `lore` command-line client drives every local and remote Lore operation: cre
 
 This page documents the command surface only. For a guided first run, see the [Quickstart](../tutorials/quickstart.md); to install the client, see [Install the Lore CLI](../how-to/install-lore-cli.md).
 
-This page is generated from `lore --markdown-help` (CLI `0.9.1-nightly+803`). Everything below the marker is generated — change the CLI, not this section. To regenerate in place (preserving this header), run from the repository root:
+This page is generated from `lore --markdown-help` (CLI `0.9.1-nightly+1031`). Everything below the marker is generated — change the CLI, not this section. To regenerate in place (preserving this header), run from the repository root:
 
 ```bash
 printf '%s\n' "$( { sed '/^<!-- BEGIN generated/q' docs/reference/lore-cli-commands.md; lore --markdown-help | tail -n +4; } )" > docs/reference/.cli.tmp && mv docs/reference/.cli.tmp docs/reference/lore-cli-commands.md
@@ -1165,7 +1165,7 @@ Synchronize to a given state of a repository
 
 ###### **Arguments:**
 
-* `<revision>` — Revision hash signature to synchronize to. Can be a signature on any branch — if the target revision is on a different branch, the current branch is updated accordingly. Can be a partial hash signature
+* `<revision>` — Revision to synchronize to: a whole hash signature, `[branch]@<number>`, `[branch]@LATEST`, or `<branch>@<hash>`. The `@` is optional, a target given without it applying to the branch you are on. A revision identifies the branch it was created on, and syncing moves onto that branch. A branch point can also identify the child branch by naming that child branch
 
 ###### **Options:**
 
@@ -2544,7 +2544,7 @@ Synchronize to a repository state
 
 ###### **Arguments:**
 
-* `<revision>` — Revision hash signature to synchronize to. Can be a signature on any branch — if the target revision is on a different branch, the current branch is updated accordingly. Can be a partial hash signature
+* `<revision>` — Revision to synchronize to: a whole hash signature, `[branch]@<number>`, `[branch]@LATEST`, or `<branch>@<hash>`. The `@` is optional, a target given without it applying to the branch you are on. A revision identifies the branch it was created on, and syncing moves onto that branch. A branch point can also identify the child branch by naming that child branch
 
 ###### **Options:**
 

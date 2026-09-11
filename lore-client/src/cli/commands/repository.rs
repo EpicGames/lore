@@ -1080,19 +1080,7 @@ pub fn handle_repository_clone(globals: LoreGlobalArgs, args: &RepositoryCloneAr
                 );
                 println!("Clone complete in {:.2}s", start.elapsed().as_secs_f32());
             }
-            LoreEvent::RevisionResolve(data) => {
-                if data.revision_number != 0 {
-                    println!(
-                        "Resolving revision number {} on branch {}",
-                        data.revision_number, data.branch
-                    );
-                } else {
-                    println!(
-                        "Resolving revision partial hash signature {}",
-                        data.revision
-                    );
-                }
-            }
+            LoreEvent::RevisionResolve(data) => util::handle_revision_resolve_event(data),
             LoreEvent::Complete(_) => {}
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);

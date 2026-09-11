@@ -27,6 +27,7 @@ from grpc_probe import (
     response_carries_a_revision,
     revision_diff,
     revision_info,
+    revision_info_raw_signature,
     revision_tree,
 )
 from lore import Lore
@@ -374,6 +375,31 @@ class TestThinClientServesData:
             "revision, so the successful lookup above proves nothing. "
             f"known={known_status} {len(known_body)}B {known_details} "
             f"unknown={unknown_status} {len(unknown_body)}B"
+        )
+
+    def test_a_partial_signature_is_refused_as_a_failed_precondition(
+        self, thin_services_in_effect, thin_target, pushed_revisions
+    ):
+        """A signature shorter than a whole one is a request the server cannot
+        act on, not a revision it looked for and did not find. FAILED_PRECONDITION
+        says retrying it unchanged fails the same way, and is distinguishable
+        from the NOT_FOUND a whole but unknown signature answers.
+        """
+        repo_id, _first, signature = pushed_revisions
+        # Poll on the whole signature so the push has certainly landed, which
+        # keeps the refusal below from passing for want of the revision.
+        until_found(lambda: revision_info(thin_target, repo_id, signature))
+
+        partial = bytes.fromhex(signature)[:8]
+        status, _body, details = revision_info_raw_signature(
+            thin_target, repo_id, partial
+        )
+
+        assert status == grpc.StatusCode.FAILED_PRECONDITION, (
+            f"expected FAILED_PRECONDITION for a partial signature, got {status} {details}"
+        )
+        assert "partial revision hash signature" in details, (
+            f"the refusal does not say what was wrong with the request: {details}"
         )
 
     def test_the_thin_server_walks_the_revision_tree(

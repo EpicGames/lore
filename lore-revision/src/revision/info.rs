@@ -178,7 +178,6 @@ pub async fn info(
         revision::resolve(
             repository.clone(),
             signature,
-            execution_context().globals().search_limit(),
             execution_context().globals().search_location(),
         )
         .await

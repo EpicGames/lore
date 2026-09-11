@@ -137,6 +137,16 @@ typedef enum lore_node_type_t {
   LORE_NODE_TYPE_LINK = 2,
 } lore_node_type_t;
 
+// What a revision specifier names on a branch.
+typedef enum lore_revision_resolve_target_t {
+  // A revision by its number on the branch.
+  LORE_REVISION_RESOLVE_TARGET_NUMBER = 1,
+  // The latest revision of the branch.
+  LORE_REVISION_RESOLVE_TARGET_LATEST = 2,
+  // A revision by its whole hash signature, taken on the branch.
+  LORE_REVISION_RESOLVE_TARGET_SIGNATURE = 3,
+} lore_revision_resolve_target_t;
+
 // Small discriminator enum for per-item terminal events in the
 // content-addressed storage API.
 //
@@ -2363,16 +2373,22 @@ typedef struct lore_revision_restore_sync_end_event_data_t {
   uintptr_t count;
 } lore_revision_restore_sync_end_event_data_t;
 
-// Information about a revision being resolved from a signature.
+// Information about a revision being resolved on a branch.
+//
+// Reported before the lookup runs, since finding a revision by number can walk
+// a long stretch of history. A specifier that names no branch resolves to
+// itself and reports nothing.
 typedef struct lore_revision_resolve_event_data_t {
   // Repository identifier in which repository
   lore_repository_id_t repository;
   // Identifier of the branch on which resolution is being done
   lore_branch_id_t branch;
-  // If set to non-empty, the partial hash being resolved
-  struct lore_string_t revision;
-  // If set to non-zero, the revision number being resolved
+  // What the specifier names on the branch
+  enum lore_revision_resolve_target_t target;
+  // The revision number being resolved, zero unless `target` is `Number`
   uint64_t revision_number;
+  // The revision being resolved, zero unless `target` is `Signature`
+  struct lore_hash_t revision;
   // Resolving using remote data
   uint8_t remote;
   // Resolving using local data
@@ -7157,7 +7173,7 @@ void lore_branch_merge_start_async(const struct lore_global_args_t *globals,
 // | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during file realization |
 // | `LORE_EVENT_REVISION_SYNC_REVISION` | `lore_revision_sync_revision_event_data_t` | Emitted with the resulting revision after switch |
 // | `LORE_EVENT_FILTER_EXCLUDE` | `lore_filter_exclude_event_data_t` | Emitted for each path excluded by view or ignore filters |
-// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a partial revision reference |
+// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a revision number |
 int32_t lore_branch_switch(const struct lore_global_args_t *globals,
                            const struct lore_branch_switch_args_t *args,
                            struct lore_event_callback_config_t callback);
@@ -7190,7 +7206,7 @@ int32_t lore_branch_switch(const struct lore_global_args_t *globals,
 // | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during file realization |
 // | `LORE_EVENT_REVISION_SYNC_REVISION` | `lore_revision_sync_revision_event_data_t` | Emitted with the resulting revision after switch |
 // | `LORE_EVENT_FILTER_EXCLUDE` | `lore_filter_exclude_event_data_t` | Emitted for each path excluded by view or ignore filters |
-// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a partial revision reference |
+// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a revision number |
 void lore_branch_switch_async(const struct lore_global_args_t *globals,
                               const struct lore_branch_switch_args_t *args,
                               struct lore_event_callback_config_t callback);
@@ -9957,7 +9973,7 @@ void lore_revision_info_async(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_REVISION_DIFF_FILE` | `lore_revision_diff_file_event_data_t` | Emitted for each file that differs between the two revisions |
-// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a partial or numbered revision reference |
+// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a revision number |
 int32_t lore_revision_diff(const struct lore_global_args_t *globals,
                            const struct lore_revision_diff_args_t *args,
                            struct lore_event_callback_config_t callback);
@@ -9984,7 +10000,7 @@ int32_t lore_revision_diff(const struct lore_global_args_t *globals,
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
 // | `LORE_EVENT_REVISION_DIFF_FILE` | `lore_revision_diff_file_event_data_t` | Emitted for each file that differs between the two revisions |
-// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a partial or numbered revision reference |
+// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a revision number |
 void lore_revision_diff_async(const struct lore_global_args_t *globals,
                               const struct lore_revision_diff_args_t *args,
                               struct lore_event_callback_config_t callback);
@@ -10398,7 +10414,7 @@ void lore_revision_metadata_set_async(const struct lore_global_args_t *globals,
 // | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file deleted, modified, added, or merged during sync |
 // | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during file realization and once at completion with cumulative update/delete/automerge/conflict counts |
 // | `LORE_EVENT_REVISION_SYNC_REVISION` | `lore_revision_sync_revision_event_data_t` | Emitted once at the end with the resulting revision, branch, and merge/conflict flags |
-// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a partial or numbered revision reference |
+// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a revision number |
 // | `LORE_EVENT_FILTER_EXCLUDE` | `lore_filter_exclude_event_data_t` | Emitted for each path excluded by view or ignore filters |
 // | `LORE_EVENT_BRANCH_MERGE_START_BEGIN` | `lore_branch_merge_start_begin_event_data_t` | Emitted when an auto-merge is initiated (diverged branches) |
 // | `LORE_EVENT_BRANCH_MERGE_START_END` | `lore_branch_merge_start_end_event_data_t` | Emitted when the auto-merge operation completes |
@@ -10439,7 +10455,7 @@ int32_t lore_revision_sync(const struct lore_global_args_t *globals,
 // | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file deleted, modified, added, or merged during sync |
 // | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during file realization and once at completion with cumulative update/delete/automerge/conflict counts |
 // | `LORE_EVENT_REVISION_SYNC_REVISION` | `lore_revision_sync_revision_event_data_t` | Emitted once at the end with the resulting revision, branch, and merge/conflict flags |
-// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a partial or numbered revision reference |
+// | `LORE_EVENT_REVISION_RESOLVE` | `lore_revision_resolve_event_data_t` | Emitted when resolving a revision number |
 // | `LORE_EVENT_FILTER_EXCLUDE` | `lore_filter_exclude_event_data_t` | Emitted for each path excluded by view or ignore filters |
 // | `LORE_EVENT_BRANCH_MERGE_START_BEGIN` | `lore_branch_merge_start_begin_event_data_t` | Emitted when an auto-merge is initiated (diverged branches) |
 // | `LORE_EVENT_BRANCH_MERGE_START_END` | `lore_branch_merge_start_end_event_data_t` | Emitted when the auto-merge operation completes |

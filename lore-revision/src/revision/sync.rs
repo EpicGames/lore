@@ -212,7 +212,7 @@ pub struct LoreRevisionSyncFileEventData {
 
 #[derive(Clone, Debug)]
 pub struct SyncOptions {
-    /// Optional partial revision signature to sync to
+    /// Optional revision specifier to sync to
     pub revision: Option<String>,
     /// Keep local changes
     pub forward_changes: bool,
@@ -258,7 +258,9 @@ pub async fn sync(
         .await
         .forward::<SyncError>("Failed to deserialize current revision anchor")?;
 
-    let branch_id = if current_branch.is_zero() {
+    // The branch the instance is on, which the source revision belongs to and
+    // which every branch latest below is read for.
+    let anchor_branch = if current_branch.is_zero() {
         let repository_metadata = repository::metadata_hash(repository.clone())
             .await
             .forward::<SyncError>("Failed to load repository metadata")?;
@@ -277,7 +279,7 @@ pub async fn sync(
     lore_debug!(
         "Current revision is {} on branch {}",
         current_revision,
-        branch_id
+        anchor_branch
     );
 
     let force = execution_context().globals().force();
@@ -309,21 +311,46 @@ pub async fn sync(
         }
     }
 
-    let local_latest = branch::load_latest(repository.clone(), branch_id)
+    // Resolved before anything is read for a branch, since a specifier binding
+    // the revision to a branch names the branch being synced to.
+    let (requested_revision, requested_branch) = match options.revision.as_ref() {
+        Some(revision_string) => {
+            let resolved = revision::resolve_in_branch(
+                repository.clone(),
+                revision_string,
+                execution_context().globals().search_location(),
+            )
+            .await
+            .forward::<SyncError>("Failed to find revision")?;
+            lore_debug!("Sync resolved revision target is {}", resolved.revision);
+            (Some(resolved.revision), Some(resolved.branch))
+        }
+        None => (None, None),
+    };
+
+    // The branch being synced to, which the layer revisions and the resulting
+    // anchor follow. It differs from `anchor_branch` only where the revision is
+    // taken on another branch.
+    let target_branch = requested_branch
+        .filter(|branch| !branch.is_zero())
+        .unwrap_or(anchor_branch);
+
+    let local_latest = branch::load_latest(repository.clone(), anchor_branch)
         .await
         .unwrap_or_default();
     let mut remote_latest = Hash::default();
     let mut remote_available = false;
     let mut remote_authorized = false;
 
-    let mut local_latest_diverged = branch::load_latest_divergent(repository.clone(), branch_id)
-        .await
-        .unwrap_or_default();
+    let mut local_latest_diverged =
+        branch::load_latest_divergent(repository.clone(), anchor_branch)
+            .await
+            .unwrap_or_default();
 
     match repository.remote().await {
         Ok(remote) => {
             remote_available = true;
-            match branch::load_remote(remote.clone(), repository.id, branch_id).await {
+            match branch::load_remote(remote.clone(), repository.id, anchor_branch).await {
                 Ok(status) => {
                     remote_latest = status.latest;
                     remote_authorized = true;
@@ -347,16 +374,8 @@ pub async fn sync(
     }
 
     let mut revision;
-    if let Some(revision_string) = options.revision.as_ref() {
-        revision = revision::resolve(
-            repository.clone(),
-            revision_string,
-            execution_context().globals().search_limit(),
-            execution_context().globals().search_location(),
-        )
-        .await
-        .forward::<SyncError>("Failed to find revision")?;
-        lore_debug!("Sync resolved revision target is {revision}");
+    if let Some(requested_revision) = requested_revision {
+        revision = requested_revision;
     } else {
         // If there is no revision given, then we determine if the local and remote
         // latest revisions are in line or divergent.
@@ -455,7 +474,7 @@ pub async fn sync(
 
     let (layer_revisions, nearest_revision) = Box::pin(sync_load_layer_list(
         repository.clone(),
-        branch_id,
+        target_branch,
         revision,
         state_current.clone(),
     ))
@@ -475,9 +494,11 @@ pub async fn sync(
         .map(|remote| remote.remote_url.to_string())
         .unwrap_or_default();
 
-    let (branch_name, at_latest) = if branch_id.is_zero() {
+    // Named for the branch the instance is on, which the source revision below
+    // belongs to.
+    let (branch_name, at_latest) = if anchor_branch.is_zero() {
         (String::default(), false)
-    } else if let Ok(metadata) = branch::metadata(repository.clone(), branch_id)
+    } else if let Ok(metadata) = branch::metadata(repository.clone(), anchor_branch)
         .await
         .inspect_err(|err| lore_debug!("Failed to load branch metadata: {err}"))
     {
@@ -488,7 +509,7 @@ pub async fn sync(
         let at_latest = (local_latest == revision) || (remote_latest == revision);
         (name, at_latest)
     } else {
-        (branch_id.to_string(), false)
+        (anchor_branch.to_string(), false)
     };
 
     let state_target = state::State::deserialize(repository.clone(), revision)
@@ -507,7 +528,7 @@ pub async fn sync(
     LoreEvent::RevisionSyncTarget(LoreRevisionSyncTargetEventData {
         remote: remote_url.into(),
         repository: repository.id,
-        branch: branch_id,
+        branch: anchor_branch,
         branch_name: branch_name.into(),
         source_revision: state_current.revision(),
         source_revision_number: state_current.revision_number(),
@@ -520,7 +541,11 @@ pub async fn sync(
     })
     .send();
 
-    if revision == current_revision && !force && !options.reset {
+    let moves_branch = requested_branch
+        .filter(|branch| !branch.is_zero())
+        .is_some_and(|branch| branch != anchor_branch);
+
+    if revision == current_revision && !force && !options.reset && !moves_branch {
         return Ok(());
     }
 
@@ -580,7 +605,7 @@ pub async fn sync(
                 })?;
 
             LoreEvent::RevisionSyncRevision(LoreRevisionSyncRevisionEventData {
-                branch: branch_id,
+                branch: target_branch,
                 revision: state_staged.revision(),
                 revision_number: state_staged.revision_number(),
                 flag_merge: state_staged.is_merge_or_cherry_pick_or_revert().into(),
@@ -627,19 +652,24 @@ pub async fn sync(
     }
 
     if !execution_context().globals().dry_run() {
-        // If the target revision is on a different branch, update the current
-        // branch. This allows sync to transparently switch branches.
-        // Exception: if the target revision is the branch point where the
-        // current branch was created, stay on the current branch.
-        let synced_branch = state_synced
-            .revision_metadata(repository.clone())
-            .await
-            .ok()
-            .map(|m| m.branch)
-            .filter(|b| !b.is_zero())
-            .unwrap_or(branch_id);
-        if synced_branch != branch_id {
-            let is_branch_point = branch::metadata(repository.clone(), branch_id)
+        // If the target revision is taken on a different branch, update the
+        // current branch. This allows sync to transparently switch branches.
+        let synced_branch = match requested_branch.filter(|branch| !branch.is_zero()) {
+            Some(branch) => branch,
+            None => state_synced
+                .revision_metadata(repository.clone())
+                .await
+                .ok()
+                .map(|m| m.branch)
+                .filter(|b| !b.is_zero())
+                .unwrap_or(anchor_branch),
+        };
+        if synced_branch != anchor_branch {
+            // The revision the current branch was created at belongs to the
+            // branch it was created from, and the current branch holds it too,
+            // so it is no reason on its own to leave. Naming that branch resolves
+            // the revision onto it instead, which never reaches here.
+            let is_branch_point = branch::metadata(repository.clone(), anchor_branch)
                 .await
                 .ok()
                 .map(|m| branch::stack(&m))
@@ -667,12 +697,12 @@ pub async fn sync(
         // If we synced to a local revision keep the branch LATEST to not lose
         // any local history when going backwards
         if location == LoreBranchLocation::Remote {
-            let local_latest = branch::load_latest(repository.clone(), branch_id)
+            let local_latest = branch::load_latest(repository.clone(), target_branch)
                 .await
                 .unwrap_or_default();
             branch::store_latest(
                 repository.clone(),
-                branch_id,
+                target_branch,
                 local_latest,
                 revision,
                 BranchLatestStatus::Convergent,
@@ -680,12 +710,12 @@ pub async fn sync(
             .await
             .forward::<SyncError>("Failed to store revision as current branch latest")?;
 
-            branch::store_last_sync(repository, branch_id, revision).await;
+            branch::store_last_sync(repository, target_branch, revision).await;
         }
     }
 
     LoreEvent::RevisionSyncRevision(LoreRevisionSyncRevisionEventData {
-        branch: branch_id,
+        branch: target_branch,
         revision,
         revision_number,
         flag_merge: 0,

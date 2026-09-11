@@ -2762,14 +2762,11 @@ pub async fn branch_switch(
 
     let (branch_latest_local, branch_latest_remote, branch_location, branch_signature) = {
         let signature = if let Some(revision) = options.signature.as_ref() {
-            let revision = revision::resolve(
-                repository.clone(),
-                revision,
-                global.search_limit(),
-                global.search_location(),
-            )
-            .await
-            .forward::<RepositoryError>("Invalid revision")?;
+            let resolved =
+                revision::resolve_in_branch(repository.clone(), revision, global.search_location())
+                    .await
+                    .forward::<RepositoryError>("Invalid revision")?;
+            let revision = resolved.revision;
 
             let state = state::State::deserialize(repository.clone(), revision)
                 .await

@@ -123,7 +123,6 @@ async fn bisect_impl(
     let start_revision = revision::resolve(
         repository.clone(),
         &start,
-        execution_context().globals().search_limit(),
         execution_context().globals().search_location(),
     )
     .await
@@ -134,7 +133,6 @@ async fn bisect_impl(
     let end_revision = revision::resolve(
         repository.clone(),
         &end,
-        execution_context().globals().search_limit(),
         execution_context().globals().search_location(),
     )
     .await

@@ -7,7 +7,6 @@ use lore_error_set::prelude::*;
 use lore_storage::options::ReadOptions;
 use serde::Deserialize;
 use serde::Serialize;
-use tokio_stream::StreamExt;
 
 use crate::branch;
 use crate::errors::SlowDown;
@@ -250,120 +249,6 @@ pub async fn revision_by_number(
                     FindMatchResult::Continue
                 }
             }
-        },
-    )
-    .await
-}
-
-/// Find revision in any branch, or orphaned, by (partial) revision string.
-///
-/// `search_remote` extends the search to the branches only the remote knows,
-/// which costs a connect. A caller resolving from local data alone passes
-/// `false` so a miss fails on local data rather than waiting for one.
-pub async fn revision_by_string(
-    repository: Arc<RepositoryContext>,
-    current_branch: BranchId,
-    signature: &str,
-    search_limit: Option<usize>,
-    search_remote: bool,
-) -> Result<Hash, FindError> {
-    if !current_branch.is_zero()
-        && let Some(revision) = absent_unless::<_, _, FindError>(
-            crate::find::revision_by_string_in_branch(
-                repository.clone(),
-                signature,
-                current_branch,
-                search_limit,
-            )
-            .await,
-            FindError::is_slow_down,
-            "searching current branch",
-        )?
-    {
-        return Ok(revision);
-    }
-
-    // TODO(mjansson): This should use partial match in immutable store instead
-    // TODO(mjansson): Default branch first
-    let local_branches = absent_unless::<_, _, FindError>(
-        branch::list(repository.clone()).await,
-        branch::BranchError::is_slow_down,
-        "listing branches",
-    )?;
-    if let Some(mut list) = local_branches {
-        while let Some(branch) = list.next().await {
-            if branch == current_branch {
-                continue;
-            }
-
-            if let Some(revision) = absent_unless::<_, _, FindError>(
-                revision_by_string_in_branch(repository.clone(), signature, branch, search_limit)
-                    .await,
-                FindError::is_slow_down,
-                "searching branch",
-            )? {
-                return Ok(revision);
-            }
-        }
-    }
-
-    if search_remote && let Ok(remote) = repository.remote().await {
-        let list = absent_unless::<_, _, FindError>(
-            branch::list_remote(remote, repository.id).await,
-            branch::BranchError::is_slow_down,
-            "listing remote branches",
-        )?
-        .unwrap_or_default();
-        for branch in &list {
-            if let Some(revision) = absent_unless::<_, _, FindError>(
-                revision_by_string_in_branch(
-                    repository.clone(),
-                    signature,
-                    branch.id,
-                    search_limit,
-                )
-                .await,
-                FindError::is_slow_down,
-                "searching remote branch",
-            )? {
-                return Ok(revision);
-            }
-        }
-    }
-
-    Err(FindError::internal("no revision found"))
-}
-
-/// Find revision in specific branch by (partial) revision string
-pub async fn revision_by_string_in_branch(
-    repository: Arc<RepositoryContext>,
-    signature: &str,
-    branch: BranchId,
-    search_limit: Option<usize>,
-) -> Result<Hash, FindError> {
-    if signature.is_empty() {
-        return Err(FindError::internal("signature too short"));
-    }
-    if signature.len() > 64 {
-        return Err(FindError::internal("signature too long"));
-    }
-
-    let signature = signature.to_lowercase();
-
-    find_revision(
-        repository.clone(),
-        branch,
-        Hash::default(),
-        false, /* Without metadata */
-        search_limit,
-        |state, _metadata| {
-            // Does signature string (partially) match against revision hash?
-            let state_revision = state.revision().to_string().to_ascii_lowercase();
-            if state_revision.starts_with(&signature) {
-                return FindMatchResult::Match;
-            }
-
-            FindMatchResult::Continue
         },
     )
     .await

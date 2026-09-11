@@ -373,11 +373,6 @@ async fn find_start_revision(
         return revision::resolve(
             repository.clone(),
             revision_spec.as_str(),
-            if options.depth > 0 {
-                Some(options.depth as usize)
-            } else {
-                None
-            },
             execution_context().globals().search_location(),
         )
         .await

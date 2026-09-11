@@ -139,7 +139,6 @@ pub async fn diff(
         revision::resolve(
             repository.clone(),
             signature.as_str(),
-            execution_context().globals().search_limit(),
             execution_context().globals().search_location(),
         )
         .await
@@ -164,7 +163,6 @@ pub async fn diff(
             revision::resolve(
                 repository.clone(),
                 signature.as_str(),
-                execution_context().globals().search_limit(),
                 execution_context().globals().search_location(),
             )
             .await

@@ -169,20 +169,21 @@ async fn resolve_start(
                 (hash, RevisionListStrategy::HistoryStep)
             } else {
                 let signature = format!("{}@{}", branch, identifier.number);
-                let hash = revision::resolve(
-                    repository.clone(),
-                    signature,
-                    None,
-                    ResolveSearchLocation::Local,
-                )
-                .await
-                .filter_slow_down()?
-                .map_err(|err| Status::invalid_argument(format!("invalid identifier {err}")))?;
+                let hash =
+                    revision::resolve(repository.clone(), signature, ResolveSearchLocation::Local)
+                        .await
+                        .filter_slow_down()?
+                        .map_err(|err| {
+                            Status::invalid_argument(format!("invalid identifier {err}"))
+                        })?;
 
                 (hash, RevisionListStrategy::FullIteration)
             }
         }
-        Start::Signature(signature) => (Hash::from(signature), RevisionListStrategy::Direct),
+        Start::Signature(signature) => (
+            crate::grpc::revision_signature(signature)?,
+            RevisionListStrategy::Direct,
+        ),
     };
 
     Ok(start_info)

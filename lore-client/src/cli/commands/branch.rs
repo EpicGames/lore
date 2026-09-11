@@ -783,19 +783,7 @@ fn handle_branch_switch(globals: LoreGlobalArgs, args: &BranchSwitchArgs) -> u8 
                     println!("  {}({id}) {path}{}", LogStyles::WARNING, anstyle::Reset);
                 }
             }
-            LoreEvent::RevisionResolve(data) => {
-                if data.revision_number != 0 {
-                    println!(
-                        "Resolving revision number {} on branch {}",
-                        data.revision_number, data.branch
-                    );
-                } else {
-                    println!(
-                        "Resolving revision partial hash signature {}",
-                        data.revision
-                    );
-                }
-            }
+            LoreEvent::RevisionResolve(data) => util::handle_revision_resolve_event(data),
             LoreEvent::Complete(_) => {}
             LoreEvent::Maintenance(data) => {
                 util::handle_maintenance_event(data);

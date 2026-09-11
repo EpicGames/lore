@@ -140,36 +140,18 @@ async fn find_start_revision(
     }
 
     if let Some(revision) = options.revision {
-        // Extract branch from "branch@number" or "branch@head" specifier
-        let branch = if let Some((prefix, _)) = revision.split_once('@') {
-            if prefix.is_empty() {
-                // "@number" uses the current anchor branch
-                crate::instance::load_current_anchor(&repository)
-                    .await
-                    .ok()
-                    .map(|(_revision, branch)| branch)
-            } else {
-                branch::resolve(repository.clone(), prefix)
-                    .await
-                    .ok()
-                    .map(|b| b.id)
-            }
-        } else {
-            // Raw hash — no branch information available
-            None
-        };
-
-        let resolved_revision = super::resolve(
+        let resolved = super::resolve_in_branch(
             repository.clone(),
             revision,
-            execution_context().globals().search_limit(),
             execution_context().globals().search_location(),
         )
-        .await;
-        return Ok((
-            resolved_revision.forward::<RevisionHistoryError>("resolving revision for history")?,
-            branch,
-        ));
+        .await
+        .forward::<RevisionHistoryError>("resolving revision for history")?;
+
+        // A bare hash signature names no branch, which leaves `only_branch`
+        // nothing to stop at and reports the whole line of history.
+        let branch = Some(resolved.branch).filter(|branch| !branch.is_zero());
+        return Ok((resolved.revision, branch));
     }
 
     if let Some(target_branch) = options.branch {

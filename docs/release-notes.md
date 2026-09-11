@@ -7,6 +7,12 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Breaking changes
 
+- Partial hash revision identifiers are refused as `NotSupported`. A revision is named by its whole 64-character hash signature, by `[branch]@<number>`, by `[branch]@LATEST`, or by `<branch>@<hash>`. Three consequences:
+  - The `@` is optional, a target given without it applying to the branch the instance is on: `lore sync 42` is `lore sync @42` and `lore sync LATEST` is `lore sync @LATEST`. Digits alone are a revision number at every length but 64, where they are a signature
+  - A revision identifies the branch it was created on. A branch point can also identify the child branch by naming that child branch, which `<branch>@<hash>`, `[branch]@<number>` and `[branch]@LATEST` all do. `lore sync`, `lore clone --revision`, `lore history`, `lore link update --pin` and `lore link add --disable-branching --pin` follow it, and a sync moves onto that branch together with its layers
+  - `--search-limit` bounds `lore revision bisect` and layer revision matching alone
+- `lore-server`: a `signature` field that is not a whole hash is answered `FAILED_PRECONDITION` on `RevisionInfo`, `RevisionTree`, `RevisionDiff` and `RevisionList`, retrying it unchanged failing the same way. An unset (empty) field is unaffected
+- C API: `lore_revision_resolve_event_data_t` replaces its `revision` string with a `target` naming what is being resolved (`NUMBER`, `LATEST` or `SIGNATURE`) and a `revision` hash carrying the signature for `SIGNATURE`. The event now reports every form resolved on a branch, not the numbered one alone. Rebuild against the new `lore.h`
 - C API: `LoreGlobalArgs.no_atime` is removed. Nothing set it and nothing read it — the accessor it gated was never wired to the store settings, so the flag named a behavior that did not exist. Rebuild against the new `lore.h`; a caller that zero-initializes the struct needs no other change
 - C API: `lore_auth_local_user_info_args_t` renames `with_token` to `with_identity_token` and appends `with_access_token`, which emits the repository's authorization (access) token as an `AuthIdentity` event. The struct's size and the offsets of the surviving fields are unchanged — the new flag occupies what was tail padding
 - `lore-server`: `connection_message_limit` under `[server.quic]` / `[server.quic_internal]` is renamed `stream_message_limit` and applies per stream rather than per connection, so with `max_bidi_streams = 8` a value of 500 allows 4000 requests in flight per connection instead of 500

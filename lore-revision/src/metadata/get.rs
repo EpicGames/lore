@@ -21,7 +21,6 @@ pub async fn get_revision(
         revision::resolve(
             repository.clone(),
             revision,
-            execution_context().globals().search_limit(),
             execution_context().globals().search_location(),
         )
         .await
@@ -54,7 +53,6 @@ pub async fn get_file(
         revision::resolve(
             repository.clone(),
             revision,
-            execution_context().globals().search_limit(),
             execution_context().globals().search_location(),
         )
         .await

@@ -408,7 +408,6 @@ pub async fn reset(
         let resolved = revision::resolve(
             repository.clone(),
             revision.as_str(),
-            execution_context().globals().search_limit(),
             execution_context().globals().search_location(),
         )
         .await

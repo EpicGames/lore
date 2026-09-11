@@ -1721,6 +1721,42 @@ def test_layer_dirty_add_and_delete_report_paths_at_the_mount(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_layer_sync_follows_a_branch_named_at_its_branch_point(new_lore_repo):
+    """Syncing to `<branch>@<hash>` resolves layers on the branch that was named.
+
+    The revision a branch was created at belongs to the branch it was created
+    from, so the specifier is the only thing naming the branch to take the layers
+    on. A layer holds its own revisions per branch, so resolving them on the
+    branch left behind realizes the wrong content at the mount.
+    """
+    repo, _layer_repo = _setup_repo_with_layer(new_lore_repo)
+
+    branch_point = repo.revision_info().signature
+
+    # Creates the branch in the layer too, under the parent's branch id
+    repo.branch_create("feature")
+
+    # A layer-only commit advances the layer alone, leaving the branch point as
+    # the parent's latest on both branches
+    repo.write_files({LAYER_FILE: b"layer content on feature"})
+    repo.stage(LAYER_FILE)
+    repo.commit("Layer content for feature", layer="lay")
+
+    repo.branch_switch("main")
+    with repo.open_file(LAYER_FILE, "rb") as f:
+        assert f.read() == b"layer content v1", "setup: expected main's layer content"
+
+    repo.sync(f"feature@{branch_point}")
+
+    assert "On branch feature" in repo.status(), "Naming feature did not move onto it"
+    with repo.open_file(LAYER_FILE, "rb") as f:
+        content = f.read()
+    assert content == b"layer content on feature", (
+        f"Layers were resolved on the branch left behind, got: {content}"
+    )
+
+
+@pytest.mark.smoke
 def test_layer_sync_advances_a_layer_mounted_away_from_its_source(new_lore_repo):
     """Syncing a layer mounted away from its source realizes the new content at the mount.
 

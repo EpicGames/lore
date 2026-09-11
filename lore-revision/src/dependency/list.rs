@@ -67,7 +67,6 @@ pub async fn list_file_dependencies(
         revision::resolve(
             repository.clone(),
             rev,
-            execution_context().globals().search_limit(),
             execution_context().globals().search_location(),
         )
         .await

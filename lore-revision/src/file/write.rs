@@ -144,7 +144,6 @@ pub async fn write_file(
         revision::resolve(
             repository.clone(),
             revision.as_str(),
-            execution_context().globals().search_limit(),
             execution_context().globals().search_location(),
         )
         .await

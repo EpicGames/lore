@@ -172,14 +172,14 @@ pub async fn reset(
         branch_stack[0].revision
     };
 
-    let revision = revision::resolve(
+    let resolved = revision::resolve_in_branch(
         repository.clone(),
         revision.as_str(),
-        global.search_limit(),
         global.search_location(),
     )
     .await
     .forward::<ResetError>("resolving revision")?;
+    let revision = resolved.revision;
 
     let state = state::State::deserialize(repository.clone(), revision)
         .await
