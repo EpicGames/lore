@@ -12,6 +12,7 @@ use lore_proto::lore::revision::v1::RevisionListResponse;
 use lore_proto::lore::revision::v1::revision_list_request::Start;
 use lore_revision::branch;
 use lore_revision::lore::BranchId;
+use lore_revision::metadata::BRANCH;
 use lore_revision::metadata::Metadata;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
@@ -24,6 +25,7 @@ use lore_telemetry::LabelArray;
 use lore_telemetry::observe::Observe;
 use lore_telemetry::observe::ObserveResult;
 use lore_telemetry::observe::observe_result;
+use lore_telemetry::tracing::fields::BRANCH_ID;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use lore_telemetry::tracing::fields::REVISION;
 use lore_transport::grpc::REVISION_LIST_STRATEGY_HEADER;
@@ -208,7 +210,7 @@ pub async fn handler(
                     )
                 }
                 ResolveStart::Walk { start, strategy } => {
-                    debug!({REVISION} = %start, %strategy, "Listing revisions");
+                    debug!({REVISION} = %start, %strategy, "Walking revisions");
                     let walked = walk_revisions(
                         start,
                         &strategy,
@@ -226,6 +228,8 @@ pub async fn handler(
                     (walked, strategy)
                 }
             };
+
+            debug!(walked_items = walked.items.len(), %strategy, "Finished walk");
 
             let signature_forward =
                 forward_cursor(&repository, &walked, history_step_size, acceleration).await?;
@@ -265,6 +269,7 @@ async fn resolve_start(
     match start {
         Start::Signature(signature) => {
             let hash = Hash::from(signature);
+            debug!({REVISION} = %hash, "resolve_start - Signature");
             if acceleration.list_cache
                 && let Some(cached) =
                     try_serve_signature_from_cache(repository, hash, history_step_size).await?
@@ -278,6 +283,7 @@ async fn resolve_start(
         }
         Start::Identifier(identifier) => {
             let branch = BranchId::from(&identifier.branch_id);
+            debug!({BRANCH_ID} = %branch, revision_number = identifier.number, "resolve_start - Identifier");
             if identifier.number == 0 {
                 let hash = branch::load_latest(repository.clone(), branch)
                     .await
@@ -968,6 +974,7 @@ async fn forward_cursor(
     // write"). `latest` is the only anchor available; descend from it
     // directly, same as `resolve_start` falling through to `FullIteration`.
     if !acceleration.step_keys {
+        debug!({BRANCH} = %branch, first_number, "forward_cursor - descend_unverified_gap");
         return descend_unverified_gap(
             repository,
             branch,
@@ -980,6 +987,7 @@ async fn forward_cursor(
         .map(Some);
     }
 
+    debug!({BRANCH} = %branch, first_number, "forward_cursor - find forward anchor");
     let anchor = forward_anchor(
         repository,
         branch,
@@ -992,6 +1000,7 @@ async fn forward_cursor(
 
     let target = match anchor {
         ForwardAnchor::Sealed { anchor, boundary } => {
+            debug!({BRANCH} = %branch, boundary, "forward_cursor - calculating from sealed");
             forward_target(
                 repository,
                 branch,
@@ -1004,6 +1013,7 @@ async fn forward_cursor(
             .await?
         }
         ForwardAnchor::LatestBand { anchor } => {
+            debug!({BRANCH} = %branch, "forward_cursor - calculating from latest band");
             forward_target(
                 repository,
                 branch,
@@ -1016,6 +1026,7 @@ async fn forward_cursor(
             .await?
         }
         ForwardAnchor::UnverifiedGap { anchor } => {
+            debug!({BRANCH} = %branch, "forward_cursor - calculating from unverified gap");
             descend_unverified_gap(
                 repository,
                 branch,
