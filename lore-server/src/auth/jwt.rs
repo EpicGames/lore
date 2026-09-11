@@ -26,12 +26,72 @@ pub struct ResourcePermission {
 }
 
 impl ResourcePermission {
-    pub fn is_wildcard_resource(&self) -> bool {
-        self.resource_id == "urc-*"
+    pub fn is_wildcard_resource(&self, wildcard: &str) -> bool {
+        self.resource_id == wildcard
     }
 
-    pub fn matches_repository(&self, repository_id: &String) -> bool {
-        self.resource_id == *repository_id || self.is_wildcard_resource()
+    pub fn matches_resource(&self, resource_id: &str, wildcard: &str) -> bool {
+        self.resource_id == resource_id || self.is_wildcard_resource(wildcard)
+    }
+}
+
+/// Renders repository ids into resource names and matches grant entries
+/// against them. The defaults reproduce the legacy `UrcAuthApi` shape for
+/// backwards compatibility.
+#[derive(Clone, Debug)]
+pub struct ResourceMatcher {
+    resource_id_template: String,
+    resource_wildcard: String,
+}
+
+impl Default for ResourceMatcher {
+    fn default() -> Self {
+        Self {
+            resource_id_template: "urc-{id}".to_string(),
+            resource_wildcard: "urc-*".to_string(),
+        }
+    }
+}
+
+impl ResourceMatcher {
+    pub fn new(resource_id_template: String, resource_wildcard: String) -> Self {
+        Self {
+            resource_id_template,
+            resource_wildcard,
+        }
+    }
+
+    /// The resource name `repository` renders to under the template.
+    pub fn resource_for(&self, repository: lore_base::types::RepositoryId) -> String {
+        self.resource_id_template
+            .replace("{id}", &repository.to_string())
+    }
+
+    /// Whether any entry matches `repository`, wildcard included.
+    pub fn any_match(
+        &self,
+        resources: &[ResourcePermission],
+        repository: lore_base::types::RepositoryId,
+    ) -> bool {
+        let resource_id = self.resource_for(repository);
+        resources
+            .iter()
+            .any(|entry| entry.matches_resource(&resource_id, &self.resource_wildcard))
+    }
+
+    /// The actions granted on `repository`, merged across every matching
+    /// entry, wildcard included.
+    pub fn merged_permissions(
+        &self,
+        resources: &[ResourcePermission],
+        repository: lore_base::types::RepositoryId,
+    ) -> Vec<String> {
+        let resource_id = self.resource_for(repository);
+        resources
+            .iter()
+            .filter(|entry| entry.matches_resource(&resource_id, &self.resource_wildcard))
+            .flat_map(|entry| entry.permission.iter().cloned())
+            .collect()
     }
 }
 
@@ -236,13 +296,10 @@ pub fn verify_authorization(
     authorization: &AuthorizationToken,
     repository: lore_revision::lore::RepositoryId,
 ) -> Result<(), JwtVerifierError> {
-    if let Some(resources) = authorization.resources.as_ref() {
-        let checked_repository = format!("urc-{repository}");
-        for authorized_resource in resources.iter() {
-            if authorized_resource.matches_repository(&checked_repository) {
-                return Ok(());
-            }
-        }
+    if let Some(resources) = authorization.resources.as_ref()
+        && ResourceMatcher::default().any_match(resources, repository)
+    {
+        return Ok(());
     }
 
     Err(JwtVerifierError::NotAuthorized)
@@ -269,8 +326,10 @@ mod tests {
             permission: vec![],
             resource_id: "urc-123456".to_string(),
         };
-        assert!(wildcard_resource_permission.is_wildcard_resource());
-        assert!(!non_wildcard_resource_permission.is_wildcard_resource());
+        assert!(wildcard_resource_permission.is_wildcard_resource("urc-*"));
+        assert!(!non_wildcard_resource_permission.is_wildcard_resource("urc-*"));
+        // The wildcard is configuration, not a literal.
+        assert!(non_wildcard_resource_permission.is_wildcard_resource("urc-123456"));
     }
 
     #[test]
@@ -285,10 +344,74 @@ mod tests {
             permission: vec![],
             resource_id: test_repository_id.clone(),
         };
-        assert!(wildcard_resource_permission.matches_repository(&test_repository_id));
-        assert!(wildcard_resource_permission.matches_repository(&unrelated_repository_id));
-        assert!(regular_resource_permission.matches_repository(&test_repository_id));
-        assert!(!regular_resource_permission.matches_repository(&unrelated_repository_id));
+        assert!(wildcard_resource_permission.matches_resource(&test_repository_id, "urc-*"));
+        assert!(wildcard_resource_permission.matches_resource(&unrelated_repository_id, "urc-*"));
+        assert!(regular_resource_permission.matches_resource(&test_repository_id, "urc-*"));
+        assert!(!regular_resource_permission.matches_resource(&unrelated_repository_id, "urc-*"));
+    }
+
+    mod resource_matcher {
+        use super::*;
+
+        fn repository(id: &str) -> RepositoryId {
+            Context::from_str(id).unwrap().into()
+        }
+
+        fn entry(resource_id: &str, permissions: &[&str]) -> ResourcePermission {
+            ResourcePermission {
+                resource_id: resource_id.to_string(),
+                permission: permissions.iter().map(ToString::to_string).collect(),
+            }
+        }
+
+        #[test]
+        fn default_template_reproduces_the_legacy_matching() {
+            let repository_id = "0194b726b34e72b0b45550b88a967076";
+            let matcher = ResourceMatcher::default();
+            assert_eq!(
+                matcher.resource_for(repository(repository_id)),
+                format!("urc-{repository_id}")
+            );
+            let resources = vec![entry(&format!("urc-{repository_id}"), &["push"])];
+            assert!(matcher.any_match(&resources, repository(repository_id)));
+            assert!(!matcher.any_match(&resources, repository("0192ae48ccf17060bc1ba9d04f6acb2f")));
+        }
+
+        #[test]
+        fn a_configured_template_and_wildcard_are_honoured() {
+            let repository_id = "0194b726b34e72b0b45550b88a967076";
+            let matcher = ResourceMatcher::new("repo:{id}".to_string(), "repo:all".to_string());
+            let resources = vec![entry("repo:all", &["read"])];
+            assert!(matcher.any_match(&resources, repository(repository_id)));
+            assert_eq!(
+                matcher.merged_permissions(&resources, repository(repository_id)),
+                vec!["read".to_string()]
+            );
+            // The legacy literal is just another resource id under this config.
+            let legacy = vec![entry("urc-*", &["read"])];
+            assert!(!matcher.any_match(&legacy, repository(repository_id)));
+        }
+
+        #[test]
+        fn permissions_merge_across_all_matching_entries() {
+            let repository_id = "0194b726b34e72b0b45550b88a967076";
+            let matcher = ResourceMatcher::default();
+            let resources = vec![
+                entry(&format!("urc-{repository_id}"), &["push"]),
+                entry("urc-*", &["migrate"]),
+                entry(&format!("urc-{repository_id}"), &["obliterate"]),
+                entry("urc-0192ae48ccf17060bc1ba9d04f6acb2f", &["unrelated"]),
+            ];
+            let merged = matcher.merged_permissions(&resources, repository(repository_id));
+            assert_eq!(
+                merged,
+                vec![
+                    "push".to_string(),
+                    "migrate".to_string(),
+                    "obliterate".to_string()
+                ]
+            );
+        }
     }
 
     #[test]

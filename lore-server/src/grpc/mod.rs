@@ -19,7 +19,6 @@ pub mod storage;
 pub mod storage_service;
 pub mod thinclient;
 
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,7 +66,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
-use crate::auth::jwt::ResourcePermission;
+use crate::auth::jwt::ResourceMatcher;
 use crate::auth::jwt::verify_authorization;
 use crate::authnz::repository_authorizer::RawToken;
 use crate::authnz::repository_authorizer::VerifiedToken;
@@ -317,52 +316,12 @@ pub fn can_obliterate(extensions: &Extensions, repository: RepositoryId) -> bool
 }
 
 pub fn can_admin_lock(extensions: &Extensions, repository: RepositoryId) -> bool {
-    has_required_permission(extensions, repository, "migrate")
-}
-
-pub fn get_matching_permissions(
-    extensions: &Extensions,
-    repository: RepositoryId,
-) -> Vec<ResourcePermission> {
-    let user_resources = resources_from_token(get_authorization(extensions).ok());
-    let repository_to_match = format!("urc-{repository}");
-
-    user_resources
-        .into_iter()
-        .filter(|resource| resource.matches_repository(&repository_to_match))
-        .collect()
-}
-
-pub fn has_required_permission(
-    extensions: &Extensions,
-    repository_to_check: RepositoryId,
-    permission_to_check: &str,
-) -> bool {
-    get_matching_permissions(extensions, repository_to_check)
-        .into_iter()
-        .any(|resource_permission| {
-            resource_permission
-                .permission
-                .contains(&permission_to_check.to_string())
-        })
+    user_permissions(extensions, repository).contains(&"migrate".to_string())
 }
 
 pub fn user_permissions(extensions: &Extensions, repository: RepositoryId) -> Vec<String> {
     let user_resources = resources_from_token(get_authorization(extensions).ok());
-    for resource in user_resources {
-        let resource_repository = resource
-            .resource_id
-            .strip_prefix("urc-")
-            .unwrap_or_default();
-        let resource_repository: RepositoryId = Context::from_str(resource_repository)
-            .unwrap_or_default()
-            .into();
-        if resource_repository == repository {
-            return resource.permission;
-        }
-    }
-
-    Vec::new()
+    ResourceMatcher::default().merged_permissions(&user_resources, repository)
 }
 
 pub fn extract_correlation_id<B>(request: &tonic::Request<B>) -> Option<String> {
@@ -544,7 +503,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::str::FromStr;
+
     use super::*;
+    use crate::auth::jwt::ResourcePermission;
 
     #[test]
     fn get_authorization_extracts_auth() {
@@ -557,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn get_matching_permissions_includes_matched_repo_permissions() {
+    fn user_permissions_includes_matched_repo_permissions() {
         let mut extensions = Extensions::new();
         let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
         let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
@@ -579,15 +541,15 @@ mod tests {
             Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
                 .unwrap()
                 .into();
-        let matched_resources = get_matching_permissions(&extensions, test_repository_context);
-        let no_matched_resources =
-            get_matching_permissions(&extensions, test_unrelated_repository_context);
-        assert_eq!(matched_resources, vec![test_resource_permission]);
-        assert_eq!(no_matched_resources, vec![]);
+        let matched_permissions = user_permissions(&extensions, test_repository_context);
+        let no_matched_permissions =
+            user_permissions(&extensions, test_unrelated_repository_context);
+        assert_eq!(matched_permissions, vec!["test_permission".to_string()]);
+        assert_eq!(no_matched_permissions, Vec::<String>::new());
     }
 
     #[test]
-    fn get_matching_permissions_includes_wildcard_resource() {
+    fn user_permissions_includes_wildcard_resource() {
         let mut extensions = Extensions::new();
         let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
         let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
@@ -616,19 +578,19 @@ mod tests {
             Context::from_str(unrelated_repository_id.strip_prefix("urc-").unwrap())
                 .unwrap()
                 .into();
-        let matched_resources = get_matching_permissions(&extensions, test_repository_context);
-        let no_matched_resources =
-            get_matching_permissions(&extensions, test_unrelated_repository_context);
+        let matched_permissions = user_permissions(&extensions, test_repository_context);
+        let no_matched_permissions =
+            user_permissions(&extensions, test_unrelated_repository_context);
         assert_eq!(
-            matched_resources,
+            matched_permissions,
             vec![
-                test_resource_permission,
-                test_wildcard_resource_permission.clone()
+                "test_permission".to_string(),
+                "test_wildcard_permission".to_string()
             ]
         );
         assert_eq!(
-            no_matched_resources,
-            vec![test_wildcard_resource_permission]
+            no_matched_permissions,
+            vec!["test_wildcard_permission".to_string()]
         );
     }
 
@@ -660,35 +622,30 @@ mod tests {
                 .into();
 
         // user has test_permission for a given repo in their token
-        assert!(has_required_permission(
-            &extensions,
-            test_repository_context,
-            "test_permission"
-        ));
+        assert!(
+            user_permissions(&extensions, test_repository_context)
+                .contains(&"test_permission".to_string())
+        );
         // user has other_permission for a given repo in their token
-        assert!(has_required_permission(
-            &extensions,
-            test_repository_context,
-            "other_permission"
-        ));
+        assert!(
+            user_permissions(&extensions, test_repository_context)
+                .contains(&"other_permission".to_string())
+        );
         // user doesn't have test_permission2 for a given repo in their token
-        assert!(!has_required_permission(
-            &extensions,
-            test_repository_context,
-            "test_permission2"
-        ),);
+        assert!(
+            !user_permissions(&extensions, test_repository_context)
+                .contains(&"test_permission2".to_string())
+        );
         // user doesn't have test_permission for an unrelated repository
-        assert!(!has_required_permission(
-            &extensions,
-            test_unrelated_repository_context,
-            "test_permission"
-        ),);
+        assert!(
+            !user_permissions(&extensions, test_unrelated_repository_context)
+                .contains(&"test_permission".to_string())
+        );
         // user doesn't have other_permission for an unrelated repository
-        assert!(!has_required_permission(
-            &extensions,
-            test_unrelated_repository_context,
-            "other_permission"
-        ));
+        assert!(
+            !user_permissions(&extensions, test_unrelated_repository_context)
+                .contains(&"other_permission".to_string())
+        );
     }
 
     #[test]
@@ -730,36 +687,31 @@ mod tests {
                 .into();
 
         // user has test_permission for a given repo in their token
-        assert!(has_required_permission(
-            &extensions,
-            test_repository_context,
-            "test_permission"
-        ));
+        assert!(
+            user_permissions(&extensions, test_repository_context)
+                .contains(&"test_permission".to_string())
+        );
         // user has unique_permission for a given repo in their token
-        assert!(has_required_permission(
-            &extensions,
-            test_repository_context,
-            "unique_permission"
-        ));
+        assert!(
+            user_permissions(&extensions, test_repository_context)
+                .contains(&"unique_permission".to_string())
+        );
         // user has test_wildcard_permission for a given repo — through the wildcard resource
-        assert!(has_required_permission(
-            &extensions,
-            test_repository_context,
-            "test_wildcard_permission"
-        ));
+        assert!(
+            user_permissions(&extensions, test_repository_context)
+                .contains(&"test_wildcard_permission".to_string())
+        );
         // user also has test_permission for an unrelated repository — through the wildcard resource
-        assert!(has_required_permission(
-            &extensions,
-            test_unrelated_repository_context,
-            "test_permission"
-        ));
+        assert!(
+            user_permissions(&extensions, test_unrelated_repository_context)
+                .contains(&"test_permission".to_string())
+        );
 
         // user doesn't have unique_permission for an unrelated repository
-        assert!(!has_required_permission(
-            &extensions,
-            test_unrelated_repository_context,
-            "unique_permission"
-        ));
+        assert!(
+            !user_permissions(&extensions, test_unrelated_repository_context)
+                .contains(&"unique_permission".to_string())
+        );
     }
 
     #[test]
@@ -840,6 +792,100 @@ mod tests {
             &extensions,
             test_unrelated_repository_context
         ));
+    }
+
+    /// Regression: two entries matching the same partition merge
+    /// their permission lists. The old reader stopped at the first matching
+    /// entry, so whichever permission sat in a later entry was lost.
+    #[test]
+    fn user_permissions_merge_across_matching_entries() {
+        let mut extensions = Extensions::new();
+        let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
+        let mut test_authz_token = AuthorizationToken::default();
+
+        let test_resource_permissions = vec![
+            ResourcePermission {
+                resource_id: test_repository_id.clone(),
+                permission: vec!["push".to_string()],
+            },
+            ResourcePermission {
+                resource_id: "urc-*".to_string(),
+                permission: vec!["migrate".to_string()],
+            },
+            ResourcePermission {
+                resource_id: test_repository_id.clone(),
+                permission: vec!["obliterate".to_string()],
+            },
+        ];
+
+        test_authz_token.resources = Some(test_resource_permissions);
+        extensions.insert(test_authz_token.clone());
+
+        let test_repository_context: RepositoryId =
+            Context::from_str(test_repository_id.strip_prefix("urc-").unwrap())
+                .unwrap()
+                .into();
+
+        assert_eq!(
+            user_permissions(&extensions, test_repository_context),
+            vec![
+                "push".to_string(),
+                "migrate".to_string(),
+                "obliterate".to_string()
+            ]
+        );
+    }
+
+    /// Regression: a `urc-*` grant now satisfies `can_obliterate`
+    /// and `is_owner_or_admin`, not just `can_admin_lock`. The old
+    /// `user_permissions` reader never looked at the wildcard entry, so the
+    /// three checks disagreed about one token.
+    #[test]
+    fn wildcard_grant_satisfies_every_action_check() {
+        let mut extensions = Extensions::new();
+        let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
+        let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
+        let mut test_authz_token = AuthorizationToken::default();
+
+        let test_wildcard_resource_permission = ResourcePermission {
+            resource_id: "urc-*".to_string(),
+            permission: vec![
+                "obliterate".to_string(),
+                "admin".to_string(),
+                "migrate".to_string(),
+            ],
+        };
+
+        test_authz_token.resources = Some(vec![test_wildcard_resource_permission]);
+        extensions.insert(test_authz_token.clone());
+
+        for repository_id in [test_repository_id, unrelated_repository_id] {
+            let repository_context: RepositoryId =
+                Context::from_str(repository_id.strip_prefix("urc-").unwrap())
+                    .unwrap()
+                    .into();
+            assert!(can_obliterate(&extensions, repository_context));
+            assert!(is_owner_or_admin(&extensions, repository_context));
+            assert!(can_admin_lock(&extensions, repository_context));
+        }
+    }
+
+    #[test]
+    fn no_grant_denies_every_action_check() {
+        let mut extensions = Extensions::new();
+        let mut test_authz_token = AuthorizationToken::default();
+        let test_resource_permissions = Vec::new();
+        test_authz_token.resources = Some(test_resource_permissions);
+        extensions.insert(test_authz_token.clone());
+
+        let test_repository_context: RepositoryId =
+            Context::from_str("0194b726b34e72b0b45550b88a967076")
+                .unwrap()
+                .into();
+
+        assert!(!is_owner_or_admin(&extensions, test_repository_context));
+        assert!(!can_obliterate(&extensions, test_repository_context));
+        assert!(!can_admin_lock(&extensions, test_repository_context));
     }
 
     mod timeout_grpc_tests {
