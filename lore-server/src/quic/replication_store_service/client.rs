@@ -35,6 +35,7 @@ use lore_transport::quic::client::ServiceClient;
 use lore_transport::quic::client::TransportConfig;
 use lore_transport::quic::client::connect;
 use lore_transport::quic::client::send_client_identify;
+use lore_transport::quic::client::send_high_priority_with_reconnect;
 use lore_transport::quic::client::send_normal_with_reconnect;
 use opentelemetry::KeyValue;
 use thiserror::Error;
@@ -304,7 +305,7 @@ impl ReplicationStoreClient {
     ) -> Result<StoreGetData, ReplicationStoreClientError> {
         let quic_chunks = request.to_quic_chunks();
         let response_bytes =
-            send_normal_with_reconnect(self, command, 0, || quic_chunks.clone()).await?;
+            send_high_priority_with_reconnect(self, command, 0, || quic_chunks.clone()).await?;
         get_metadata::parse_response(response_bytes)
     }
 
@@ -316,7 +317,7 @@ impl ReplicationStoreClient {
         let num_input_addresses = request.addresses.len();
         let quic_chunks = request.to_quic_chunks();
         let response_bytes =
-            send_normal_with_reconnect(self, command, 0, || quic_chunks.clone()).await?;
+            send_high_priority_with_reconnect(self, command, 0, || quic_chunks.clone()).await?;
         let response = QueryResponse::parse(response_bytes)?;
         if num_input_addresses != response.results.len() {
             return Err(ReplicationStoreClientError::ResponseError(

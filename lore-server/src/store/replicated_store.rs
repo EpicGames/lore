@@ -30,7 +30,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::task::AbortOnDropHandle;
 use tracing::Instrument;
 use tracing::error;
-use tracing::instrument;
+use tracing::info_span;
 use tracing::warn;
 
 use crate::protocol::replication_store::copy::ImmutableCopy;
@@ -221,6 +221,7 @@ where
                 .get_labels_for_operation_context("query"),
             observe_client_interaction(),
         )
+        .instrument(info_span!("ReplicatedStore::Query"))
         .await
         .output;
 
@@ -244,7 +245,6 @@ where
     }
 
     #[lore_macro::lore_instrument]
-    #[instrument(name = "ReplicatedStore::Query", skip_all)]
     async fn query(
         self: Arc<Self>,
         partition: Partition,
@@ -287,7 +287,6 @@ where
     }
 
     #[lore_macro::lore_instrument]
-    #[instrument(name = "ReplicatedStore::GetMetadata", skip_all)]
     async fn get_metadata(
         self: Arc<Self>,
         partition: Partition,
@@ -323,6 +322,7 @@ where
                 .get_labels_for_operation_context("get_metadata"),
             observe_client_interaction(),
         )
+        .instrument(info_span!("ReplicatedStore::GetMetadata"))
         .await
         .output;
 
@@ -330,7 +330,6 @@ where
     }
 
     #[lore_macro::lore_instrument]
-    #[instrument(name = "ReplicatedStore::Get", skip_all)]
     async fn get(
         self: Arc<Self>,
         partition: Partition,
@@ -366,6 +365,7 @@ where
                 .get_labels_for_operation_context("get"),
             observe_client_interaction(),
         )
+        .instrument(info_span!("ReplicatedStore::Get"))
         .await
         .output;
 
@@ -373,7 +373,6 @@ where
     }
 
     #[lore_macro::lore_instrument]
-    #[instrument(name = "ReplicatedStore::Put", skip_all)]
     async fn put(
         self: Arc<Self>,
         partition: Partition,
@@ -407,6 +406,7 @@ where
                 .get_labels_for_operation_context("put"),
             observe_client_interaction(),
         )
+        .instrument(info_span!("ReplicatedStore::Put"))
         .await
         .output;
 
@@ -414,7 +414,6 @@ where
     }
 
     #[lore_macro::lore_instrument]
-    #[instrument(name = "ReplicatedStore::Obliterate", skip_all)]
     async fn obliterate(
         self: Arc<Self>,
         partition: Partition,
@@ -451,6 +450,7 @@ where
                 .get_labels_for_operation_context("obliterate"),
             observe_client_interaction(),
         )
+        .instrument(info_span!("ReplicatedStore::Obliterate"))
         .await
         .output;
 
@@ -502,7 +502,6 @@ where
     }
 
     #[lore_macro::lore_instrument]
-    #[instrument(name = "ReplicatedStore::Copy", skip_all)]
     async fn copy(
         self: Arc<Self>,
         source_partition: Partition,
@@ -544,6 +543,7 @@ where
                 .get_labels_for_operation_context("copy"),
             observe_client_interaction(),
         )
+        .instrument(info_span!("ReplicatedStore::Copy"))
         .await
         .output;
 
