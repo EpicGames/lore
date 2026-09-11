@@ -175,6 +175,7 @@ pub mod tests {
     use lore_storage::MutableStore;
     use lore_transport::quic::client::ServiceClient;
 
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::protocol::attribute_map::AttributeMap;
     use crate::quic::StreamHandlerFactory;
     use crate::quic::quinn::service_store::ServiceStore;
@@ -262,6 +263,7 @@ pub mod tests {
                         contexts.lock().push(context.clone());
                         let storage_protocol = StorageService::new(
                             Arc::new(None),
+                            Arc::new(AllowAllRepositoryAuthorizer),
                             immutable_store.clone(),
                             immutable_store.clone(),
                             mutable_store.clone(),
@@ -289,6 +291,7 @@ pub mod tests {
                         contexts.lock().push(context.clone());
                         let v4_service = StorageServiceV4::new(
                             Arc::new(None),
+                            Arc::new(AllowAllRepositoryAuthorizer),
                             immutable_store.clone(),
                             immutable_store.clone(),
                             mutable_store.clone(),

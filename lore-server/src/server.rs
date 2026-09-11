@@ -67,6 +67,7 @@ use tracing::warn;
 
 use crate::auth::jwk::JwkServiceImpl;
 use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::GrpcInternalServerBuilder;
 use crate::grpc::GrpcServerBuilder;
 use crate::grpc::forwarded_requests::ForwardedRequests;
@@ -438,6 +439,7 @@ async fn launch_grpc_server(
     mutable_store: Arc<dyn MutableStore>,
     lock_store: Option<Arc<dyn LockStore>>,
     jwt_verifier: Option<JwtVerifier>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     settings: Settings,
     notification_sender: Arc<dyn NotificationSender>,
     notification_service: Option<NotificationService>,
@@ -519,7 +521,7 @@ async fn launch_grpc_server(
             user_agent_filter,
             forwarded_requests,
         )
-        .with_jwt_verifier(jwt_verifier)?
+        .with_jwt_verifier(jwt_verifier, repository_authorizer)?
         .serve(addr, async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
         })
@@ -669,6 +671,7 @@ async fn launch_http_server(
     immutable_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
     jwt_verifier: Option<JwtVerifier>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     LoreHttpServer::serve(
@@ -676,6 +679,7 @@ async fn launch_http_server(
         immutable_store,
         mutable_store,
         jwt_verifier,
+        repository_authorizer,
         async move {
             let _ = shutdown_rx.wait_for(|&v| v).await;
         },
@@ -739,6 +743,7 @@ impl QuicPublicStreamHandler {
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
         jwt_verifier: Option<JwtVerifier>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         limits: AdmissionLimits,
         user_agent_filter: Arc<UserAgentFilter>,
     ) -> Self {
@@ -748,10 +753,12 @@ impl QuicPublicStreamHandler {
             |immutable_store: Arc<dyn ImmutableStore>,
              local_store: Arc<dyn ImmutableStore>,
              mutable_store: Arc<dyn MutableStore>,
-             jwt_verifier: Option<JwtVerifier>| {
+             jwt_verifier: Option<JwtVerifier>,
+             repository_authorizer: Arc<dyn RepositoryAuthorizer>| {
                 Box::new(move |context: Arc<AttributeMap>| {
                     let storage_protocol = StorageService::new(
                         Arc::new(jwt_verifier.clone()),
+                        repository_authorizer.clone(),
                         immutable_store.clone(),
                         local_store.clone(),
                         mutable_store.clone(),
@@ -771,6 +778,7 @@ impl QuicPublicStreamHandler {
                 local_store.clone(),
                 mutable_store.clone(),
                 jwt_verifier.clone(),
+                repository_authorizer.clone(),
             ),
         );
         {
@@ -778,12 +786,14 @@ impl QuicPublicStreamHandler {
             let local_store = local_store.clone();
             let mutable_store = mutable_store.clone();
             let jwt_verifier = jwt_verifier.clone();
+            let repository_authorizer = repository_authorizer.clone();
             let user_agent_filter = user_agent_filter.clone();
             service_store.add_service(
                 StorageClient::ALPN,
                 Box::new(move |context: Arc<AttributeMap>| {
                     let v4_service = crate::quic::storage_service_v4::StorageServiceV4::new(
                         Arc::new(jwt_verifier.clone()),
+                        repository_authorizer.clone(),
                         immutable_store.clone(),
                         local_store.clone(),
                         mutable_store.clone(),
@@ -1836,6 +1846,17 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         None => None,
     };
 
+    // One shared authorizer, selected by the configuration (D8's four-way
+    // flowchart), threaded into the gRPC, QUIC and HTTP servers.
+    let repository_authorizer = crate::authnz::repository_authorizer::repository_authorizer(
+        settings.server.auth.as_ref(),
+        settings
+            .environment
+            .as_ref()
+            .and_then(|environment| environment.endpoint.as_ref())
+            .and_then(|endpoint| endpoint.auth_url.clone()),
+    )?;
+
     let forwarded_requests: Option<Arc<dyn ForwardedRequests>> =
         if let Some(forwarded_requests_settings) =
             &settings.server.grpc_public_services.forwarded_requests
@@ -1888,6 +1909,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let mutable_store = mutable_store.clone();
             let lock_store = lock_store.clone();
             let jwt_verifier = jwt_verifier.clone();
+            let repository_authorizer = repository_authorizer.clone();
             let settings = settings.clone();
             let notification = notification.clone();
             let user_agent_filter = user_agent_filter.clone();
@@ -1905,6 +1927,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 mutable_store,
                 lock_store,
                 jwt_verifier,
+                repository_authorizer,
                 settings,
                 notification,
                 notification_service,
@@ -1985,6 +2008,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let mutable_store = mutable_store.clone();
             let settings = settings.clone();
             let jwt_verifier = jwt_verifier.clone();
+            let repository_authorizer = repository_authorizer.clone();
             let user_agent_filter = user_agent_filter.clone();
             let shutdown_rx = _shutdown_rx.clone();
 
@@ -2026,6 +2050,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     local_immutable_store,
                     mutable_store,
                     jwt_verifier,
+                    repository_authorizer,
                     limits,
                     user_agent_filter,
                 )),
@@ -2128,6 +2153,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                     immutable_store,
                     mutable_store,
                     jwt_verifier,
+                    repository_authorizer,
                     shutdown_rx,
                 )
             );

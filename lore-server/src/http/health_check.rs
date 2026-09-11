@@ -26,6 +26,7 @@ mod tests {
     use axum::routing;
     use axum_test::TestServer;
 
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::http::server::LoreHttpServerSettings;
     use crate::http::server::ServerHealth;
     use crate::http::server::ServerState;
@@ -43,6 +44,7 @@ mod tests {
             immutable_store,
             mutable_store,
             jwt_verifier: None,
+            repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
             max_file_size: 100,
             presign_config: None,
         };
@@ -71,6 +73,7 @@ mod tests {
             immutable_store,
             mutable_store,
             jwt_verifier: None,
+            repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
             max_file_size: 100,
             presign_config: None,
         };

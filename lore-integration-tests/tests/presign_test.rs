@@ -9,6 +9,7 @@ mod presign_tests {
     use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::Partition;
     use lore_revision::fragment;
+    use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use lore_server::http::server::LoreHttpServerSettings;
     use lore_server::http::server::PresignConfig;
     use lore_server::http::server::ServerHealth;
@@ -106,6 +107,7 @@ mod presign_tests {
             immutable_store,
             mutable_store,
             jwt_verifier: None,
+            repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
             max_file_size: 10 * 1024 * 1024,
             presign_config: Some(test_presign_config()),
         };

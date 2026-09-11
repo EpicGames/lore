@@ -30,6 +30,7 @@ use tracing::info_span;
 
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
@@ -439,6 +440,9 @@ pub fn is_internal_error(error: &MessageHandleError) -> bool {
 
 pub struct StorageService {
     jwt_verifier: Arc<Option<JwtVerifier>>,
+    // TODO(UCS-23410): read by the partition check at connect.
+    #[allow(dead_code)]
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
@@ -447,12 +451,14 @@ pub struct StorageService {
 impl StorageService {
     pub fn new(
         jwt_verifier: Arc<Option<JwtVerifier>>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
     ) -> Self {
         Self {
             jwt_verifier,
+            repository_authorizer,
             immutable_store,
             local_store,
             mutable_store,

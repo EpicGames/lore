@@ -231,6 +231,8 @@ pub async fn handler(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use axum::http::StatusCode;
     use axum_test::TestServer;
     use lore_base::runtime::LORE_CONTEXT;
@@ -239,6 +241,7 @@ mod tests {
 
     use super::call_is_service_account;
     use crate::auth::jwt::AuthorizationToken;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::http::security_headers::ContentTypePolicy;
     use crate::http::server::LoreHttpServerSettings;
     use crate::http::server::ServerHealth;
@@ -305,6 +308,7 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     jwt_verifier: None,
+                    repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
                     max_file_size: 100,
                     presign_config: Some(presign_config_with_policy(policy)),
                 };

@@ -44,6 +44,7 @@ use super::lock_service::LoreLockService;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_interceptor::JWTAuthnInterceptor;
 use crate::auth::jwt_interceptor::JWTInterceptor;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::correlation::layer::CorrelationIdLayer;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::correlation::layer::TraceLayerConfig;
@@ -602,6 +603,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
     pub fn with_jwt_verifier(
         self,
         jwt_verifier: Option<JwtVerifier>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Result<GrpcServerBuilder<WantsAddress>> {
         let rpc_timeout = self.0.request_handler_timeout;
         let services = &self.0.service_settings;
@@ -697,6 +699,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         );
         let repository_svc = LoreRepositoryService::new(
             self.0.environment.clone(),
+            repository_authorizer.clone(),
             self.0.immutable_store.clone(),
             self.0.mutable_store.clone(),
             self.0.hook_dispatcher.clone(),
@@ -704,6 +707,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         );
         let repository_v1_svc = LoreRepositoryV1Service::new(
             self.0.environment.clone(),
+            repository_authorizer.clone(),
             self.0.immutable_store.clone(),
             self.0.mutable_store.clone(),
             self.0.hook_dispatcher.clone(),

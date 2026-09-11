@@ -19,6 +19,7 @@ use tracing::Span;
 use tracing::debug;
 
 use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
 use crate::protocol::client_identify::ClientIdentify;
@@ -89,6 +90,9 @@ fn quic_error_v4(error: &MessageHandleError) -> QuicServiceError {
 
 pub struct StorageServiceV4 {
     jwt_verifier: Arc<Option<JwtVerifier>>,
+    // TODO(UCS-23410): read by the partition check at session start.
+    #[allow(dead_code)]
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
@@ -99,6 +103,7 @@ pub struct StorageServiceV4 {
 impl StorageServiceV4 {
     pub fn new(
         jwt_verifier: Arc<Option<JwtVerifier>>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
@@ -106,6 +111,7 @@ impl StorageServiceV4 {
     ) -> Self {
         Self {
             jwt_verifier,
+            repository_authorizer,
             immutable_store,
             local_store,
             mutable_store,
@@ -510,6 +516,7 @@ mod tests {
     ) -> StorageServiceV4 {
         StorageServiceV4::new(
             Arc::new(None),
+            Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
             immutable_store.clone(),
             immutable_store.clone(),
             mutable_store,

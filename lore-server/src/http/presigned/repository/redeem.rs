@@ -211,6 +211,7 @@ mod tests {
     use lore_revision::lore::RepositoryId;
     use rand::random;
 
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::http::presign_token::CURRENT_TOKEN_VERSION;
     use crate::http::presign_token::PresignTokenPayload;
     use crate::http::presign_token::sign;
@@ -263,6 +264,7 @@ mod tests {
             immutable_store,
             mutable_store,
             jwt_verifier: None,
+            repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
             max_file_size: 100,
             presign_config: Some(config),
         };

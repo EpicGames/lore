@@ -16,6 +16,7 @@ mod remote_store_tests {
     use lore_revision::lore::RepositoryId;
     use lore_revision::store::remote::RemoteImmutableStore;
     use lore_revision::store::remote::RemoteMutableStore;
+    use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use lore_server::grpc::server::FeatureSettings;
     use lore_server::grpc::server::GrpcServerBuilder;
     use lore_server::hooks::HookDispatcher;
@@ -111,7 +112,7 @@ mod remote_store_tests {
                     Default::default(),
                     None,
                 )
-                .with_jwt_verifier(None)
+                .with_jwt_verifier(None, Arc::new(AllowAllRepositoryAuthorizer))
                 .unwrap()
                 .serve_with_listener(listener, signal)
                 .await;

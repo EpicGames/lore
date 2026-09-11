@@ -30,7 +30,7 @@ use super::repository_get;
 use super::repository_list;
 use super::repository_metadata_get;
 use super::repository_metadata_set;
-use crate::authnz::repository_authorizer::repository_authorizer;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
@@ -56,6 +56,7 @@ impl InstrumentProvider for RepositoryServiceInstrumentProvider {
 #[derive(Clone)]
 pub struct LoreRepositoryV1Service {
     environment: EnvironmentConfig,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: Arc<HookDispatcher>,
@@ -68,6 +69,7 @@ impl LoreRepositoryV1Service {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         environment: EnvironmentConfig,
+        authorizer: Arc<dyn RepositoryAuthorizer>,
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         hook_dispatcher: Arc<HookDispatcher>,
@@ -76,6 +78,7 @@ impl LoreRepositoryV1Service {
     ) -> Self {
         Self {
             environment,
+            authorizer,
             immutable_store,
             mutable_store,
             hook_dispatcher,
@@ -172,7 +175,7 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_metadata_get::handler(
                 request,
-                repository_authorizer(self.auth_url()),
+                self.authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
@@ -188,7 +191,7 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_metadata_set::handler(
                 request,
-                repository_authorizer(self.auth_url()),
+                self.authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
