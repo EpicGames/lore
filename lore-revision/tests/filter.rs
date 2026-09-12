@@ -1063,4 +1063,62 @@ mod tests {
             true
         ));
     }
+
+    /// A rule the filter cannot express must not take the rest of the file with
+    /// it. Regression for the `.loreignore` that stopped ignoring anything at
+    /// all because one line held an unanchored multi-component re-inclusion.
+    #[test]
+    fn unsupported_rule_fails_the_load_and_names_the_line() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(".loreignore");
+        let mut file = std::fs::File::create(&path).expect("create");
+        // Line 2 is valid .gitignore but unsupported by lore: an unanchored
+        // multi-component re-inclusion, refused by `add_inclusion`. Line 3 is
+        // valid and sits after it, so a load that reports success would have to
+        // have carried on past the refusal.
+        file.write_all(b"**/DerivedDataCache/\n!**/Plugins/*/Binaries/\n**/Intermediate/\n")
+            .expect("write");
+        drop(file);
+
+        let error = lore_revision::filter::load_filter(&path)
+            .expect_err("an unsupported rule must fail the load, not be skipped");
+
+        // The message has to be enough to fix the file without bisecting it:
+        // which file, which line, and the rule as the author wrote it.
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("{}:2:", path.display())),
+            "error must name the file and the 1-based line: {message}"
+        );
+        assert!(
+            message.contains("!**/Plugins/*/Binaries/"),
+            "error must quote the rule as written: {message}"
+        );
+    }
+
+    #[test]
+    fn a_file_of_supported_rules_still_loads() {
+        use std::io::Write as _;
+
+        // Positive control for the test above: the failure has to come from the
+        // unsupported rule, not from every load of a file.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(".loreignore");
+        let mut file = std::fs::File::create(&path).expect("create");
+        file.write_all(b"**/DerivedDataCache/\n**/Intermediate/\n")
+            .expect("write");
+        drop(file);
+
+        let filter = lore_revision::filter::load_filter(&path).expect("load");
+        assert!(filter.excludes(
+            &RelativePath::new_from_initial_path("Unreal/DerivedDataCache").expect("Path create"),
+            true
+        ));
+        assert!(filter.excludes(
+            &RelativePath::new_from_initial_path("Unreal/Intermediate").expect("Path create"),
+            true
+        ));
+    }
 }
