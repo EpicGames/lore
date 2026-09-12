@@ -2112,7 +2112,7 @@ pub async fn merge_link_pins(
     )
     .await?;
 
-    apply_link_pins(repository, state_staged, planned, realize).await
+    Box::pin(apply_link_pins(repository, state_staged, planned, realize)).await
 }
 
 /// Result of checking whether a link is eligible for a merge operation.

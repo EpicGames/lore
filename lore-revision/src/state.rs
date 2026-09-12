@@ -5461,15 +5461,11 @@ fn named_node_sort(node: &mut [StateNamedNode]) {
     node.sort_unstable_by_key(|lhs| lhs.name);
 }
 
-/// Compute change flags from node state and action context.
-/// This is a pure function that extracts flag computation logic.
-pub fn compute_change_flags(node: &Node, action: FileAction, to_node_valid: bool) -> change::Flags {
+/// The flags `node` carries into a change: what it is staged for, and what a merge left on it.
+///
+/// What a walk measured is the walk's to state, not the node's, and is joined by the caller.
+pub fn compute_change_flags(node: &Node) -> change::Flags {
     let mut flags = change::Flags::None;
-
-    // If this change represents revision -> filesystem change, set modified flag for keep action
-    if !to_node_valid && action == FileAction::Keep {
-        flags |= change::Flags::Modify;
-    }
 
     if node.is_staged() {
         flags |= change::Flags::Staged;
@@ -5547,6 +5543,7 @@ async fn emit_change(
     from: NodeChangeState,
     to: NodeChangeState,
     action: change::FileAction,
+    measured: change::Flags,
     sink: &mut ChangeSink<'_>,
     filter_mode: FilterMode,
 ) -> Result<(), StateError> {
@@ -5554,7 +5551,16 @@ async fn emit_change(
         !matches!(action, FileAction::Delete | FileAction::Add),
         "{action:?} walks the hierarchy and needs a verdict"
     );
-    add_change(from, to, action, sink, filter_mode, FilterStates::ROOT).await
+    add_change(
+        from,
+        to,
+        action,
+        measured,
+        sink,
+        filter_mode,
+        FilterStates::ROOT,
+    )
+    .await
 }
 
 /// `states` is the filter's verdict for `path`, which the hierarchy walk below
@@ -5564,6 +5570,7 @@ async fn add_change(
     from: NodeChangeState,
     to: NodeChangeState,
     action: change::FileAction,
+    measured: change::Flags,
     sink: &mut ChangeSink<'_>,
     filter_mode: FilterMode,
     states: FilterStates,
@@ -5600,14 +5607,13 @@ async fn add_change(
         let recursion_node = recursion_node_storage.as_ref().unwrap_or(&node);
 
         // Compute flags and create change record
-        let flags = compute_change_flags(&node, action, to.mapping.node.is_valid_node_id());
+        let flags = compute_change_flags(&node) | measured;
 
         sink.emit(NodeChange {
             action,
             flags,
             from: from.clone(),
             to: to.clone(),
-            observed: None,
         })
         .await?;
 
@@ -5725,6 +5731,7 @@ async fn add_hierarchy_delete(
             child_from,
             to.invalid(child_path),
             FileAction::Delete,
+            change::Flags::None,
             sink,
             filter_mode,
             child_states,
@@ -5794,6 +5801,7 @@ async fn add_hierarchy_add(
             from.invalid(child_path),
             child_to,
             FileAction::Add,
+            change::Flags::None,
             sink,
             filter_mode,
             child_states,
@@ -5839,6 +5847,9 @@ pub fn detect_and_coalesce_moves(changes: &mut Vec<NodeChange>) {
 
                     changes[index].action = FileAction::Move;
                     changes[index].from = from_state;
+                    if changes[index].from.differs_from(&changes[index].to) {
+                        changes[index].flags |= change::Flags::Modify;
+                    }
 
                     coalesced.push(delete_index);
                 } else {
@@ -5868,6 +5879,9 @@ pub fn detect_and_coalesce_moves(changes: &mut Vec<NodeChange>) {
 
                     changes[add_index].action = FileAction::Move;
                     changes[add_index].from = from_state;
+                    if changes[add_index].from.differs_from(&changes[add_index].to) {
+                        changes[add_index].flags |= change::Flags::Modify;
+                    }
 
                     coalesced.push(index);
                 } else {
@@ -5947,8 +5961,10 @@ pub async fn diff(
                     path: RelativePath::new(),
                     node: ROOT_NODE,
                 },
+                observed: None,
                 flags: NodeFlags::NoFlags,
                 address: Address::default(),
+                mode: 0,
             },
             NodeChangeState {
                 mapping: NodeMapping {
@@ -5957,8 +5973,10 @@ pub async fn diff(
                     path: RelativePath::new(),
                     node: ROOT_NODE,
                 },
+                observed: None,
                 flags: NodeFlags::NoFlags,
                 address: Address::default(),
+                mode: 0,
             },
             RelativePath::new(),
             0,
@@ -5981,10 +5999,14 @@ pub(crate) async fn node_change_state(
     node_id: NodeID,
     path: RelativePath,
 ) -> NodeChangeState {
-    let (address, flags) = if let Ok(node) = state.node(repository.clone(), node_id).await {
-        (node.address, NodeFlags::from_bits_retain(node.flags))
+    let (address, mode, flags) = if let Ok(node) = state.node(repository.clone(), node_id).await {
+        (
+            node.address,
+            node.mode,
+            NodeFlags::from_bits_retain(node.flags),
+        )
     } else {
-        (Address::default(), NodeFlags::NoFlags)
+        (Address::default(), 0, NodeFlags::NoFlags)
     };
     NodeChangeState {
         mapping: NodeMapping {
@@ -5993,8 +6015,10 @@ pub(crate) async fn node_change_state(
             path,
             node: node_id,
         },
+        observed: None,
         flags,
         address,
+        mode,
     }
 }
 
@@ -6710,10 +6734,12 @@ impl FileDiffContext {
                 path,
                 node: self.from_node_id,
             },
+            observed: None,
             flags: self
                 .from_node
                 .map_or(NodeFlags::NoFlags, |n| NodeFlags::from_bits_retain(n.flags)),
             address: self.from_node.map_or_else(Address::default, |n| n.address),
+            mode: self.from_node.map_or(0, |n| n.mode),
         }
     }
 
@@ -6726,8 +6752,10 @@ impl FileDiffContext {
                 path,
                 node: INVALID_NODE,
             },
+            observed: None,
             flags: NodeFlags::NoFlags,
             address: Address::default(),
+            mode: 0,
         }
     }
 
@@ -6740,8 +6768,10 @@ impl FileDiffContext {
                 path,
                 node: INVALID_NODE,
             },
+            observed: Some(self.observed),
             flags: NodeFlags::File,
             address: Address::default(),
+            mode: 0,
         }
     }
 
@@ -6754,8 +6784,10 @@ impl FileDiffContext {
                 path,
                 node: INVALID_NODE,
             },
+            observed: Some(self.observed),
             flags: NodeFlags::NoFlags,
             address: Address::default(),
+            mode: 0,
         }
     }
 
@@ -6777,8 +6809,10 @@ impl FileDiffContext {
                 path,
                 node: node_id,
             },
+            observed: None,
             flags: NodeFlags::from_bits_retain(node.flags),
             address: node.address,
+            mode: node.mode,
         })
     }
 
@@ -6986,6 +7020,7 @@ async fn settle_insisted_modification(
         ctx.create_from_change_state(file_path.clone()),
         ctx.new_file_change_state(file_path.clone()),
         FileAction::Keep,
+        change::Flags::Modify,
         sink,
         filter_mode,
     )
@@ -6997,15 +7032,15 @@ async fn settle_insisted_modification(
 /// A directory holds no content to compare, so it is settled on being asked rather than on
 /// anything the walk found. The descent below it runs either way.
 ///
-/// The keep it emits holds no node on its `to` side, which is what marks a change as measured
-/// against the file system rather than another revision and what [`compute_change_flags`] reports
-/// as a modification.
+/// The keep it emits stands between the revision and the file system, so its `to` side states
+/// `observed` rather than a node.
 #[allow(clippy::too_many_arguments)]
 async fn settle_insisted_directory(
     node_list: &StateChildrenNodes,
     node_id: NodeID,
     node: &Node,
     path: &RelativePath,
+    observed: FileInfo,
     sink: &mut ChangeSink<'_>,
     intent: FilesystemDiffIntent,
     filter_mode: FilterMode,
@@ -7025,11 +7060,24 @@ async fn settle_insisted_directory(
             path: path.clone(),
             node: node_id,
         },
+        observed: None,
         flags: NodeFlags::from_bits_retain(node.flags),
         address: node.address,
+        mode: node.mode,
     };
-    let to = from.invalid(path.clone());
-    emit_change(from, to, FileAction::Keep, sink, filter_mode).await
+    let to = NodeChangeState {
+        observed: Some(observed),
+        ..from.invalid(path.clone())
+    };
+    emit_change(
+        from,
+        to,
+        FileAction::Keep,
+        change::Flags::Modify,
+        sink,
+        filter_mode,
+    )
+    .await
 }
 
 /// Report the delete of the node a type change displaced and the add of what replaced it,
@@ -7062,6 +7110,7 @@ async fn emit_type_replacement(
         ctx.create_from_change_state(file_path.clone()),
         ctx.invalid_change_state(file_path.clone()),
         FileAction::Delete,
+        change::Flags::None,
         sink,
         filter_mode,
         ctx.states,
@@ -7086,6 +7135,7 @@ async fn emit_type_replacement(
         ctx.invalid_change_state(file_path.clone()),
         to_state,
         FileAction::Add,
+        change::Flags::None,
         sink,
         filter_mode,
         ctx.states,
@@ -7150,8 +7200,10 @@ async fn emit_unstaged_add(
                 path: file_path.clone(),
                 node: INVALID_NODE,
             },
+            observed: None,
             flags: NodeFlags::NoFlags,
             address: Address::default(),
+            mode: 0,
         },
         NodeChangeState {
             mapping: NodeMapping {
@@ -7160,10 +7212,13 @@ async fn emit_unstaged_add(
                 path: file_path.clone(),
                 node: from_node_id,
             },
+            observed: None,
             flags: NodeFlags::from_bits_retain(node.flags),
             address: node.address,
+            mode: node.mode,
         },
         change::FileAction::Add,
+        change::Flags::None,
         sink,
         filter_mode,
         states,
@@ -7240,7 +7295,7 @@ async fn emit_add_node_single(
     let node = block.node(Node::index(node_id));
     sink.emit(NodeChange {
         action: change::FileAction::Add,
-        flags: compute_change_flags(&node, change::FileAction::Add, true),
+        flags: compute_change_flags(&node),
         from: NodeChangeState {
             mapping: NodeMapping {
                 repository: repository.clone(),
@@ -7248,8 +7303,10 @@ async fn emit_add_node_single(
                 path: path.clone(),
                 node: INVALID_NODE,
             },
+            observed: None,
             flags: NodeFlags::NoFlags,
             address: Address::default(),
+            mode: 0,
         },
         to: NodeChangeState {
             mapping: NodeMapping {
@@ -7258,10 +7315,11 @@ async fn emit_add_node_single(
                 path: path.clone(),
                 node: node_id,
             },
+            observed: None,
             flags: NodeFlags::from_bits_retain(node.flags),
             address: node.address,
+            mode: node.mode,
         },
-        observed: None,
     })
     .await?;
     stats.file_add.fetch_add(1, Ordering::Relaxed);
@@ -7330,6 +7388,7 @@ async fn handle_single_file_compare_result(
                     ),
                     ctx.new_file_change_state(item_path.clone()),
                     change::FileAction::Move,
+                    change::Flags::None,
                     sink,
                     filter_mode,
                     ctx.states,
@@ -7398,6 +7457,7 @@ async fn handle_single_file_compare_result(
                 ),
                 ctx.new_file_change_state(item_path.clone()),
                 action,
+                change::Flags::Modify,
                 sink,
                 filter_mode,
                 ctx.states,
@@ -7419,8 +7479,10 @@ async fn handle_single_file_compare_result(
                         path: file_path.to_path(),
                         node: ctx.add_new_node(&file_path.to_path(), false).await?,
                     },
+                    observed: None,
                     flags: NodeFlags::File | NodeFlags::DirtyAdd,
                     address: Address::default(),
+                    mode: 0,
                 }
             } else if is_filesystem_directory {
                 ctx.new_directory_change_state(file_path.to_path())
@@ -7432,6 +7494,7 @@ async fn handle_single_file_compare_result(
                 ctx.invalid_change_state(file_path.to_path()),
                 to_state,
                 FileAction::Add,
+                change::Flags::None,
                 sink,
                 filter_mode,
                 ctx.states,
@@ -7566,7 +7629,7 @@ async fn emit_single_delete(
         .block(repository.clone(), NodeBlock::index(node_id))
         .await?;
     let node = block.node(Node::index(node_id));
-    let flags = compute_change_flags(&node, FileAction::Delete, false);
+    let flags = compute_change_flags(&node);
     let from = NodeChangeState {
         mapping: NodeMapping {
             repository,
@@ -7574,8 +7637,10 @@ async fn emit_single_delete(
             path: path.clone(),
             node: node_id,
         },
+        observed: None,
         flags: NodeFlags::from_bits_retain(node.flags),
         address: node.address,
+        mode: node.mode,
     };
     let to = from.invalid(path.clone());
     sink.emit(NodeChange {
@@ -7583,7 +7648,6 @@ async fn emit_single_delete(
         flags,
         from,
         to,
-        observed: None,
     })
     .await
 }
@@ -8193,6 +8257,13 @@ async fn diff_filesystem_directory_walk(
                 )
                 .await?;
             } else if is_rename {
+                let measured = if from_node.address == current_node.address
+                    && from_node.mode == current_node.mode
+                {
+                    change::Flags::None
+                } else {
+                    change::Flags::Modify
+                };
                 add_change(
                     NodeChangeState {
                         mapping: NodeMapping {
@@ -8201,8 +8272,10 @@ async fn diff_filesystem_directory_walk(
                             path: from_path.clone(),
                             node: from_named_node.node,
                         },
+                        observed: None,
                         flags: NodeFlags::from_bits_retain(from_node.flags),
                         address: from_node.address,
+                        mode: from_node.mode,
                     },
                     NodeChangeState {
                         mapping: NodeMapping {
@@ -8211,10 +8284,13 @@ async fn diff_filesystem_directory_walk(
                             path: item_path.clone(),
                             node: current_node_id,
                         },
+                        observed: None,
                         flags: NodeFlags::from_bits_retain(current_node.flags),
                         address: current_node.address,
+                        mode: current_node.mode,
                     },
                     FileAction::Move,
+                    measured,
                     &mut ChangeSink::Vec(&mut *changes),
                     ctx.filter_mode,
                     item_states,
@@ -8226,6 +8302,7 @@ async fn diff_filesystem_directory_walk(
                     from_named_node.node,
                     &from_node,
                     &item_path,
+                    FileInfo::from_metadata(&item.metadata),
                     &mut ChangeSink::Vec(&mut *changes),
                     ctx.intent,
                     ctx.filter_mode,
@@ -8472,8 +8549,10 @@ async fn diff_filesystem_directory_walk(
                     path: from_node.path.clone(),
                     node: from_named_node.node,
                 },
+                observed: None,
                 flags: NodeFlags::from_bits_retain(from_node.node.flags),
                 address: from_node.node.address,
+                mode: from_node.node.mode,
             },
             NodeChangeState {
                 mapping: NodeMapping {
@@ -8482,10 +8561,13 @@ async fn diff_filesystem_directory_walk(
                     path: from_node.path.clone(),
                     node: INVALID_NODE,
                 },
+                observed: None,
                 flags: NodeFlags::NoFlags,
                 address: Address::default(),
+                mode: 0,
             },
             FileAction::Delete,
+            change::Flags::None,
             &mut ChangeSink::Vec(&mut *changes),
             ctx.filter_mode,
             from_node_states,
@@ -8976,8 +9058,10 @@ async fn diff_filesystem_missing(
                     path: from.path.clone(),
                     node: from.node,
                 },
+                observed: None,
                 flags: NodeFlags::from_bits_retain(from_node.flags),
                 address: from_node.address,
+                mode: from_node.mode,
             },
             NodeChangeState {
                 mapping: NodeMapping {
@@ -8986,10 +9070,13 @@ async fn diff_filesystem_missing(
                     path: from.path,
                     node: INVALID_NODE,
                 },
+                observed: None,
                 flags: NodeFlags::NoFlags,
                 address: Address::default(),
+                mode: 0,
             },
             FileAction::Delete,
+            change::Flags::None,
             &mut ChangeSink::Vec(&mut changes),
             filter_mode,
             states,

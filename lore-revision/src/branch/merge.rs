@@ -1459,7 +1459,7 @@ async fn merge_start_all(
         return Ok(signature);
     }
 
-    finalize_main_merge(
+    Box::pin(finalize_main_merge(
         repository,
         token,
         branch,
@@ -1469,7 +1469,7 @@ async fn merge_start_all(
         &merged_links,
         &link_merge_entries,
         dry_run,
-    )
+    ))
     .await
 }
 

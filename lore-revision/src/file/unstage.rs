@@ -545,7 +545,7 @@ async fn unstage_path(
         return Ok(());
     };
 
-    unstage_node(
+    Box::pin(unstage_node(
         NodeMapping {
             repository: target.repository,
             state: target.state_staged,
@@ -558,7 +558,7 @@ async fn unstage_path(
         stats,
         link_tracker,
         parent_states,
-    )
+    ))
     .await
 }
 

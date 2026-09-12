@@ -3582,7 +3582,8 @@ pub(crate) async fn stage_from_parent_state(
     // Unstage nodes that were already staged but whose disk state had to change to have them included in output
     for change in changes.iter().rev() {
         if !change.to.mapping.node.is_valid_node_id() {
-            // Change is a new file in file system, ignore
+            // The reverse above puts the state's side on `to`, so one holding no node stands
+            // where the state held nothing and has no staged flags to clear.
             continue;
         }
 

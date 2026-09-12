@@ -73,6 +73,8 @@ mod tests {
                     node: 1,
                 },
                 address: Address::zero_context_hash(hashes[0]),
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::NoFlags,
             },
             to: NodeChangeState {
@@ -83,10 +85,11 @@ mod tests {
                     node: 2,
                 },
                 address: Address::default(),
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::NoFlags,
             },
             flags: change::Flags::None,
-            observed: None,
         });
 
         changes.push(NodeChange {
@@ -99,6 +102,8 @@ mod tests {
                     node: 4,
                 },
                 address: Address::default(),
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::NoFlags,
             },
             to: NodeChangeState {
@@ -109,10 +114,11 @@ mod tests {
                     node: 3,
                 },
                 address: Address::zero_context_hash(hashes[1]),
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::NoFlags,
             },
             flags: change::Flags::Modify | change::Flags::Conflict,
-            observed: None,
         });
 
         changes.push(NodeChange {
@@ -125,6 +131,8 @@ mod tests {
                     node: 5,
                 },
                 address: Address::zero_context_hash(hashes[3]),
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::NoFlags,
             },
             to: NodeChangeState {
@@ -135,10 +143,11 @@ mod tests {
                     node: 6,
                 },
                 address: Address::zero_context_hash(hashes[2]),
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::NoFlags,
             },
             flags: change::Flags::Merge,
-            observed: None,
         });
 
         let changes_ref = changes.clone();
@@ -400,6 +409,8 @@ mod tests {
                 hash: Hash::from(rand::random::<[u8; 32]>()),
                 context: target.id.into(),
             },
+            observed: None,
+            mode: 0,
             flags: NodeFlags::Link,
         };
         let file_side = || NodeChangeState {
@@ -410,6 +421,8 @@ mod tests {
                 node: 2,
             },
             address: Address::zero_context_hash(Hash::from(rand::random::<[u8; 32]>())),
+            observed: None,
+            mode: 0,
             flags: NodeFlags::File,
         };
 
@@ -418,7 +431,6 @@ mod tests {
             from: file_side(),
             to: link_side(&mounted),
             flags: change::Flags::None,
-            observed: None,
         };
         assert_eq!(
             added_link.content_repository_id(),
@@ -431,7 +443,6 @@ mod tests {
             from: link_side(&unmounted),
             to: file_side(),
             flags: change::Flags::None,
-            observed: None,
         };
         assert_eq!(
             removed_link.content_repository_id(),
@@ -444,7 +455,6 @@ mod tests {
             from: file_side(),
             to: file_side(),
             flags: change::Flags::None,
-            observed: None,
         };
         assert_eq!(
             file_change.content_repository_id(),
@@ -466,6 +476,8 @@ mod tests {
                 node: 1,
             },
             address: Address::default(),
+            observed: None,
+            mode: 0,
             flags: NodeFlags::File,
         };
         let change = |action| NodeChange {
@@ -473,7 +485,6 @@ mod tests {
             from: side("source.txt"),
             to: side("destination.txt"),
             flags: change::Flags::None,
-            observed: None,
         };
 
         assert_eq!(

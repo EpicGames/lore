@@ -379,7 +379,6 @@ mod tests {
         };
         NodeChange {
             action,
-            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 mapping: lore_revision::state::NodeMapping {
@@ -389,6 +388,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address,
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::File,
             },
             to: NodeChangeState {
@@ -399,6 +400,8 @@ mod tests {
                     state,
                 },
                 address,
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::File,
             },
         }

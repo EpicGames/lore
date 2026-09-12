@@ -286,9 +286,9 @@ pub struct StatusSummaryStats {
 }
 
 impl StatusSummaryStats {
-    /// Increment the counter matching a reported change's action. `Keep` is a
-    /// content modification (a filesystem/state diff has no separate "modify"
-    /// action — modified files surface as `Keep` with the modify flag set).
+    /// Increment the counter matching a reported change's action, which states where the node
+    /// went rather than what became of its content. A node that stayed in place is counted as a
+    /// modification, being reported at all only because something about it changed.
     fn classify(&self, change: &NodeChange) {
         let counter = match change.action {
             FileAction::Add => &self.adds,
@@ -485,7 +485,7 @@ async fn file_size_from_node_change_path(
     if change.action == FileAction::Delete {
         return Ok(0);
     }
-    if let Some(observed) = &change.observed {
+    if let Some(observed) = &change.resolved_side().observed {
         return Ok(observed.size);
     }
     let repository_path = change.path().clone();

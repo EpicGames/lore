@@ -438,14 +438,17 @@ async fn add_change_for_solo_from_node(
                 path: from_path.clone(),
                 node: from_named_node.node,
             },
+            observed: None,
             flags: NodeFlags::from_bits_retain(from_node.flags),
             address: from_node.address,
+            mode: from_node.mode,
         };
 
         add_change(
             from,
             to.invalid(from_path.clone()),
             change::FileAction::Delete,
+            change::Flags::None,
             sink,
             filter_mode,
             from_node_states,
@@ -526,8 +529,10 @@ async fn add_change_for_solo_to_node(
             path: subpath.clone(),
             node: to_named_node.node,
         },
+        observed: None,
         flags: NodeFlags::from_bits_retain(to_node.flags),
         address: to_node.address,
+        mode: to_node.mode,
     };
 
     let from = from.invalid(match file_action {
@@ -536,7 +541,16 @@ async fn add_change_for_solo_to_node(
         _ => subpath.clone(),
     });
 
-    add_change(from, to, file_action, sink, filter_mode, to_node_states).await?;
+    add_change(
+        from,
+        to,
+        file_action,
+        change::Flags::None,
+        sink,
+        filter_mode,
+        to_node_states,
+    )
+    .await?;
     Ok(())
 }
 
@@ -611,6 +625,13 @@ async fn add_change_for_paired_nodes(
     let to_mode = to_node.mode;
     let mode_equal = from_mode == to_mode;
     let is_modify = !hash_equal || !mode_equal;
+    // What the walk measured of the content, which the action states nothing about: a node can be
+    // moved and modified at once, or moved with the content it had.
+    let measured = if is_modify {
+        change::Flags::Modify
+    } else {
+        change::Flags::None
+    };
     let is_staged = to_node.is_staged();
     let is_staged_delete = to_node.is_staged_delete();
     let is_staged_merge = to_node.is_staged_merge();
@@ -624,8 +645,10 @@ async fn add_change_for_paired_nodes(
             path: from_path.clone(),
             node: to_named_node.node,
         },
+        observed: None,
         flags: NodeFlags::from_bits_retain(to_node.flags),
         address: to_node.address,
+        mode: to_node.mode,
     };
 
     let from = NodeChangeState {
@@ -635,8 +658,10 @@ async fn add_change_for_paired_nodes(
             path: from_path.clone(),
             node: from_node_id,
         },
+        observed: None,
         flags: NodeFlags::from_bits_retain(from_node.flags),
         address: from_node.address,
+        mode: from_node.mode,
     };
 
     if is_staged_delete || is_dirty_delete {
@@ -646,6 +671,7 @@ async fn add_change_for_paired_nodes(
             from,
             to,
             change::FileAction::Delete,
+            change::Flags::None,
             sink,
             filter_mode,
             from_node_states,
@@ -692,7 +718,15 @@ async fn add_change_for_paired_nodes(
                     "Diff node {subpath} file modified {from_address} size {from_size} to {to_address} size {to_size}, mode {from_mode} to {to_mode} - {action:?}"
                 );
 
-                emit_change(from.clone(), to.clone(), action, sink, filter_mode).await?;
+                emit_change(
+                    from.clone(),
+                    to.clone(),
+                    action,
+                    measured,
+                    sink,
+                    filter_mode,
+                )
+                .await?;
             }
         } else if !was_file && !is_file {
             let child_states = DiffStates {
@@ -715,7 +749,15 @@ async fn add_change_for_paired_nodes(
                 lore_trace!(
                     "Diff node {subpath} directory mode change from {from_mode} to {to_mode}, {action:?}|modify"
                 );
-                emit_change(from.clone(), to.clone(), action, sink, filter_mode).await?;
+                emit_change(
+                    from.clone(),
+                    to.clone(),
+                    action,
+                    measured,
+                    sink,
+                    filter_mode,
+                )
+                .await?;
             }
             if !hash_equal || is_staged || is_staged_merge || is_dirty {
                 if to_node.is_link() {
@@ -753,7 +795,15 @@ async fn add_change_for_paired_nodes(
                                  for linked repository {link_repository_id}"
                             );
                         }
-                        emit_change(from.clone(), to.clone(), action, sink, filter_mode).await?;
+                        emit_change(
+                            from.clone(),
+                            to.clone(),
+                            action,
+                            measured,
+                            sink,
+                            filter_mode,
+                        )
+                        .await?;
                     } else {
                         lore_debug!("Diff node {subpath} has linked changes, recurse diff");
                         let from_path = from_path.clone();
@@ -798,6 +848,7 @@ async fn add_change_for_paired_nodes(
                             from.clone(),
                             to.clone(),
                             change::FileAction::Graft,
+                            measured,
                             sink,
                             filter_mode,
                         )
@@ -844,6 +895,7 @@ async fn add_change_for_paired_nodes(
                 from.clone(),
                 to.clone(),
                 change::FileAction::Delete,
+                change::Flags::None,
                 sink,
                 filter_mode,
                 from_node_states,
@@ -853,6 +905,7 @@ async fn add_change_for_paired_nodes(
                 from,
                 to,
                 change::FileAction::Add,
+                change::Flags::None,
                 sink,
                 filter_mode,
                 to_node_states,

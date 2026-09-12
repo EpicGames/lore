@@ -492,76 +492,67 @@ mod tests {
     }
 
     use lore_revision::change;
-    use lore_revision::change::FileAction;
     use lore_revision::state::compute_change_flags;
 
     #[test]
-    fn returns_none_for_default_node_with_valid_to() {
+    fn returns_none_for_a_node_carrying_no_flags() {
         let node = Node::default();
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert_eq!(flags, change::Flags::None);
     }
 
+    /// A modification is what a walk measured against its to state, which no node states about
+    /// itself, so the walk joins it onto the flags the node carries.
     #[test]
-    fn sets_modify_flag_for_keep_action_with_invalid_to_node() {
-        let node = Node::default();
-        let flags = compute_change_flags(&node, FileAction::Keep, false);
-        assert!(flags.contains(change::Flags::Modify));
-    }
-
-    #[test]
-    fn does_not_set_modify_flag_for_add_action_with_invalid_to_node() {
-        let node = Node::default();
-        let flags = compute_change_flags(&node, FileAction::Add, false);
-        assert!(!flags.contains(change::Flags::Modify));
-    }
-
-    #[test]
-    fn does_not_set_modify_flag_for_delete_action_with_invalid_to_node() {
-        let node = Node::default();
-        let flags = compute_change_flags(&node, FileAction::Delete, false);
-        assert!(!flags.contains(change::Flags::Modify));
+    fn a_nodes_flags_never_state_a_modification() {
+        for node in [
+            Node::default(),
+            node_with_flags(NodeFlags::Staged.bits()),
+            node_with_flags(NodeFlags::StagedMergeConflict.bits()),
+        ] {
+            assert!(!compute_change_flags(&node).contains(change::Flags::Modify));
+        }
     }
 
     #[test]
     fn sets_staged_flag_when_node_is_staged() {
         let node = node_with_flags(NodeFlags::Staged.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::Staged));
     }
 
     #[test]
     fn sets_merge_flag_when_node_is_staged_merge() {
         let node = node_with_flags(NodeFlags::StagedMerge.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::Merge));
     }
 
     #[test]
     fn sets_conflict_flag_when_node_is_merge_conflict() {
         let node = node_with_flags(NodeFlags::StagedMergeConflict.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::Conflict));
     }
 
     #[test]
     fn sets_conflict_resolved_flag_when_node_is_merge_resolved() {
         let node = node_with_flags(NodeFlags::StagedMergeResolved.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::ConflictResolved));
     }
 
     #[test]
     fn sets_conflict_mine_flag_when_node_is_merge_mine() {
         let node = node_with_flags(NodeFlags::StagedMergeMine.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::ConflictMine));
     }
 
     #[test]
     fn sets_conflict_theirs_flag_when_node_is_merge_theirs() {
         let node = node_with_flags(NodeFlags::StagedMergeTheirs.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, true);
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::ConflictTheirs));
     }
 
@@ -569,9 +560,7 @@ mod tests {
     fn combines_multiple_flags() {
         // Node that is staged and also a merge conflict
         let node = node_with_flags(NodeFlags::StagedMergeConflict.bits());
-        let flags = compute_change_flags(&node, FileAction::Keep, false);
-        // Should have Modify (from invalid to), Staged, Merge, and Conflict
-        assert!(flags.contains(change::Flags::Modify));
+        let flags = compute_change_flags(&node);
         assert!(flags.contains(change::Flags::Staged));
         assert!(flags.contains(change::Flags::Merge));
         assert!(flags.contains(change::Flags::Conflict));
@@ -1339,6 +1328,8 @@ mod single_file_compare_result_tests {
                 path: RelativePath::new_from_initial_path(path).unwrap_or_default(),
                 node: INVALID_NODE,
             },
+            observed: None,
+            mode: 0,
             flags: NodeFlags::NoFlags,
             address: Address {
                 hash: Hash::default(),
@@ -1361,7 +1352,6 @@ mod single_file_compare_result_tests {
             flags: change::Flags::None,
             from: make_change_state(repository.clone(), from_context, path),
             to: make_change_state(repository, to_context, path),
-            observed: None,
         }
     }
 
@@ -1782,6 +1772,100 @@ mod single_file_compare_result_tests {
         assert_eq!(changes[0].from.address.hash, Hash::from_u64(12345));
         // Also verify the file_id (context) is preserved in the from state
         assert_eq!(changes[0].from.address.context, file_id);
+    }
+
+    /// A move states what became of the content as well as of the location, so one standing at
+    /// content its source did not hold states a modification and one standing at the same content
+    /// states none.
+    #[tokio::test]
+    async fn a_coalesced_move_states_whether_the_content_changed() {
+        let repo = new_test_context().await;
+        let file_id = context_from_u128(43);
+
+        let mut carried = vec![
+            make_change(
+                repo.clone(),
+                FileAction::Delete,
+                "old.txt",
+                file_id,
+                Context::default(),
+            ),
+            make_change(
+                repo.clone(),
+                FileAction::Add,
+                "new.txt",
+                Context::default(),
+                file_id,
+            ),
+        ];
+        detect_and_coalesce_moves(&mut carried);
+        assert_eq!(carried.len(), 1);
+        assert_eq!(carried[0].action, FileAction::Move);
+        assert!(
+            !carried[0].flags.contains(change::Flags::Modify),
+            "a move carrying the content its source held states no modification"
+        );
+
+        let mut edited = vec![
+            make_change(
+                repo.clone(),
+                FileAction::Delete,
+                "old.txt",
+                file_id,
+                Context::default(),
+            ),
+            make_change(
+                repo,
+                FileAction::Add,
+                "new.txt",
+                Context::default(),
+                file_id,
+            ),
+        ];
+        edited[1].to.address.hash = Hash::from_u64(99);
+        detect_and_coalesce_moves(&mut edited);
+        assert_eq!(edited.len(), 1);
+        assert_eq!(edited[0].action, FileAction::Move);
+        assert!(
+            edited[0].flags.contains(change::Flags::Modify),
+            "a move carrying content its source did not hold states a modification"
+        );
+    }
+
+    /// The executable bit is part of what a file is, so a move that changes it is a modification
+    /// even where every byte of the content stands, as a paired walk reports one.
+    #[tokio::test]
+    async fn a_coalesced_move_states_a_mode_change_as_a_modification() {
+        let repo = new_test_context().await;
+        let file_id = context_from_u128(44);
+
+        let mut changes = vec![
+            make_change(
+                repo.clone(),
+                FileAction::Delete,
+                "old.txt",
+                file_id,
+                Context::default(),
+            ),
+            make_change(
+                repo,
+                FileAction::Add,
+                "new.txt",
+                Context::default(),
+                file_id,
+            ),
+        ];
+        changes[1].to.mode = lore_revision::node::NodeFileMode::Executable.bits();
+
+        detect_and_coalesce_moves(&mut changes);
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].action, FileAction::Move);
+        assert_eq!(
+            changes[0].from.address.hash, changes[0].to.address.hash,
+            "the content is meant to stand, so only the mode answers for the modification"
+        );
+        assert!(changes[0].flags.contains(change::Flags::Modify));
     }
 }
 

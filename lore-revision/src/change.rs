@@ -122,22 +122,47 @@ impl Flags {
     }
 }
 
-/// One side of a change: the node it names, mapped to the path it stands at, with what that node
-/// carries.
+/// One end of a change: what stood at a path before it, or what stands there after.
+///
+/// A side is one of three things, which its first two fields tell apart:
+///
+/// - a node in a revision, which `mapping` names and `flags` and `address` describe
+/// - the file system, which holds no node and states `observed` in its place
+/// - nothing at all, which holds neither: the `from` of an add and the `to` of a delete
+///
+/// A change compares two sides, and a walk against the file system is simply one whose `to` side
+/// is the file system. Nothing else distinguishes it.
 #[derive(Clone, Debug)]
 pub struct NodeChangeState {
-    /// Where this side stands, which every change carries on both of its sides.
+    /// The node this side holds, mapped to the path it stands at.
     ///
-    /// The mapping's path is set even where it holds no node: the `from` of an add and the `to` of
-    /// a delete stand at the path the change is made at and hold nothing there. A move records its
-    /// source here, so an empty path on the `from` of a move is a source the walk could not spell.
+    /// The path is set even where the side holds no node, so it always states where the change is
+    /// made. A move records its source path here, so an empty one on the `from` of a move is a
+    /// source the walk could not spell.
     pub mapping: NodeMapping,
+    /// What the file system held at the mapping's path, where this side is the file system.
+    ///
+    /// `None` where the side is a revision's node or nothing at all. A consumer that needs the
+    /// size or the times a walk already measured reads them here rather than reaching for the
+    /// path a second time.
+    pub observed: Option<FileInfo>,
+    /// What the node is and what it is staged for: its type, and the add, delete, move or merge
+    /// a stage left on it. Carries the type alone where the side is the file system.
     pub flags: NodeFlags,
+    /// The content the node holds and the file it is: the hash answers what the content is, and
+    /// the context which file holds it, which a move carries across and a copy mints anew.
+    ///
+    /// Two sides hold the same content where their hashes agree. Default where the side holds no
+    /// node, and where the file system holds content that has not been fragmented and so has no
+    /// address yet.
     pub address: Address,
+    /// The mode the node holds, which is the executable bit and nothing else. Zero where the side
+    /// holds no node, the file system's own being what `observed` answers.
+    pub mode: u16,
 }
 
 impl NodeChangeState {
-    /// The side a change does not have, standing at `path` and holding no node there: an add has
+    /// The side a change does not have, standing at `path` and holding nothing there: an add has
     /// no `from` and a delete no `to`. `path` is the change's own, which is not this side's own
     /// path where it is derived from an ancestor.
     pub fn invalid(&self, path: RelativePath) -> Self {
@@ -148,8 +173,10 @@ impl NodeChangeState {
                 path,
                 node: INVALID_NODE,
             },
+            observed: None,
             flags: NodeFlags::NoFlags,
             address: Address::default(),
+            mode: 0,
         }
     }
 
@@ -162,9 +189,18 @@ impl NodeChangeState {
                 path,
                 node: child_id,
             },
+            observed: None,
             flags: NodeFlags::from_bits_retain(child_node.flags),
             address: child_node.address,
+            mode: child_node.mode,
         }
+    }
+
+    /// Whether the two sides hold the file differently, which is a modification either way: its
+    /// content differs, or its content stands and the executable bit does not.
+    pub fn differs_from(&self, other: &Self) -> bool {
+        self.address.hash != other.address.hash
+            || crate::util::fs::mode_changed(self.mode, other.mode)
     }
 
     pub async fn get_node(&self) -> Result<Node, StateError> {
@@ -175,15 +211,23 @@ impl NodeChangeState {
     }
 }
 
+/// What a walk found at one path between two sides: a node's two ends, and what became of it.
+///
+/// The two answers are independent and are stated separately. `action` says what became of the
+/// node's *location* — added, deleted, kept in place, moved or copied — and `flags` say what
+/// became of its *content* and how it got there. So a file both renamed and edited is a
+/// [`FileAction::Move`] carrying [`Flags::Modify`], and one renamed with its content intact is a
+/// move carrying neither.
 #[derive(Clone, Debug)]
 pub struct NodeChange {
+    /// What became of the node's location.
     pub action: FileAction,
+    /// What became of the node's content, and what a stage or a merge left on it.
     pub flags: Flags,
+    /// What stood at the path before the change, which a walk reads from its source revision.
     pub from: NodeChangeState,
+    /// What stands at the path after it, which is the file system for a walk that measured one.
     pub to: NodeChangeState,
-    /// What a filesystem diff measured at [`Self::path`], so a consumer does not re-stat it.
-    /// `None` for a change between two revisions, which consulted no filesystem.
-    pub observed: Option<FileInfo>,
 }
 
 impl NodeChange {

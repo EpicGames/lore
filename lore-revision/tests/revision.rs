@@ -247,6 +247,8 @@ mod tests {
                 path: RelativePathBuf::new().push_and_freeze(side_path),
                 node,
             },
+            observed: None,
+            mode: 0,
             flags: NodeFlags::NoFlags,
             address: Address::default(),
         };
@@ -255,7 +257,6 @@ mod tests {
             flags: change::Flags::None,
             from: side(1, from_path.unwrap_or_default()),
             to: side(2, path),
-            observed: None,
         }
     }
 

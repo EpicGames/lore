@@ -2910,7 +2910,6 @@ async fn try_auto_resolve_conflict(
             flags: change_to.flags | change::Flags::ConflictAutomerged,
             from: change_to.from.clone(),
             to: change_to.to.clone(),
-            observed: change_to.observed,
         }))
     } else {
         Ok(None)
@@ -4893,15 +4892,16 @@ mod tests {
                 path: RelativePathBuf::new().push_and_freeze(side_path),
                 node,
             },
+            observed: None,
             flags,
             address: Address::default(),
+            mode: 0,
         };
         NodeChange {
             action,
             flags: change::Flags::None,
             from: side(1, from_path.unwrap_or_default()),
             to: side(2, path),
-            observed: None,
         }
     }
 

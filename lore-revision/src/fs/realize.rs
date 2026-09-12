@@ -2559,6 +2559,7 @@ mod tests {
         state: Arc<State>,
         node: NodeID,
         address: crate::lore::Address,
+        mode: u16,
     }
 
     /// A state holding `node` at `path`, under a revision of its own.
@@ -2585,6 +2586,7 @@ mod tests {
             state,
             node: link.node,
             address: node.address,
+            mode: node.mode,
         }
     }
 
@@ -2615,8 +2617,10 @@ mod tests {
                 path,
                 node: staged.node,
             },
+            observed: None,
             flags: NodeFlags::File,
             address: staged.address,
+            mode: staged.mode,
         }
     }
 
@@ -2659,7 +2663,6 @@ mod tests {
             flags: change::Flags::None,
             from: side(repository, base, path.clone()),
             to: side(repository, source, path.clone()),
-            observed: None,
         };
 
         Box::pin(verify_filesystem(

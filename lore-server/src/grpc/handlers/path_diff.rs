@@ -245,7 +245,6 @@ mod tests {
 
         let addition = NodeChange {
             action: lore_revision::change::FileAction::Add,
-            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 mapping: lore_revision::state::NodeMapping {
@@ -255,6 +254,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: Address::default(),
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::NoFlags,
             },
             to: NodeChangeState {
@@ -265,6 +266,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: address_to,
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::File,
             },
         };
@@ -300,7 +303,6 @@ mod tests {
 
         let deletion = NodeChange {
             action: lore_revision::change::FileAction::Delete,
-            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 mapping: lore_revision::state::NodeMapping {
@@ -310,6 +312,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: address_from,
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::File,
             },
             to: NodeChangeState {
@@ -320,6 +324,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: Address::default(),
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::File,
             },
         };
@@ -359,7 +365,6 @@ mod tests {
 
         let modification = NodeChange {
             action: lore_revision::change::FileAction::Keep,
-            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 mapping: lore_revision::state::NodeMapping {
@@ -369,6 +374,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: address_from,
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::File,
             },
             to: NodeChangeState {
@@ -379,6 +386,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: address_to,
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::File,
             },
         };
@@ -419,7 +428,6 @@ mod tests {
 
         let addition = NodeChange {
             action: lore_revision::change::FileAction::Add,
-            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 mapping: lore_revision::state::NodeMapping {
@@ -429,6 +437,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: Address::default(),
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::NoFlags,
             },
             to: NodeChangeState {
@@ -439,6 +449,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: address_to,
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::File,
             },
         };
@@ -474,7 +486,6 @@ mod tests {
 
         let link_addition = NodeChange {
             action: lore_revision::change::FileAction::Add,
-            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 mapping: lore_revision::state::NodeMapping {
@@ -484,6 +495,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: Address::default(),
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::NoFlags,
             },
             to: NodeChangeState {
@@ -494,6 +507,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: address_to,
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::Link,
             },
         };
@@ -529,7 +544,6 @@ mod tests {
 
         let link_deletion = NodeChange {
             action: lore_revision::change::FileAction::Delete,
-            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 mapping: lore_revision::state::NodeMapping {
@@ -539,6 +553,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: address_from,
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::Link,
             },
             to: NodeChangeState {
@@ -549,6 +565,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: Address::default(),
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::Link,
             },
         };
@@ -589,7 +607,6 @@ mod tests {
 
         let link_modification = NodeChange {
             action: lore_revision::change::FileAction::Keep,
-            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 mapping: lore_revision::state::NodeMapping {
@@ -599,6 +616,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: address_from,
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::Link,
             },
             to: NodeChangeState {
@@ -609,6 +628,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: address_to,
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::Link,
             },
         };
@@ -654,7 +675,6 @@ mod tests {
 
         let automerged_change = NodeChange {
             action: lore_revision::change::FileAction::Keep,
-            observed: None,
             flags: Flags::ConflictAutomerged,
             from: NodeChangeState {
                 mapping: lore_revision::state::NodeMapping {
@@ -664,6 +684,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: address_from,
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::File,
             },
             to: NodeChangeState {
@@ -674,6 +696,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: address_to,
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::File,
             },
         };
@@ -716,7 +740,6 @@ mod tests {
 
         let link_addition = NodeChange {
             action: lore_revision::change::FileAction::Add,
-            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 mapping: lore_revision::state::NodeMapping {
@@ -726,6 +749,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: Address::default(),
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::NoFlags,
             },
             to: NodeChangeState {
@@ -736,6 +761,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: address_to,
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::Link,
             },
         };
@@ -767,7 +794,6 @@ mod tests {
 
         let link_addition = NodeChange {
             action: lore_revision::change::FileAction::Add,
-            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 mapping: lore_revision::state::NodeMapping {
@@ -777,6 +803,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: Address::default(),
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::NoFlags,
             },
             to: NodeChangeState {
@@ -787,6 +815,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: address_to,
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::Link,
             },
         };
@@ -817,7 +847,6 @@ mod tests {
 
         let modification = NodeChange {
             action: lore_revision::change::FileAction::Keep,
-            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 mapping: lore_revision::state::NodeMapping {
@@ -830,6 +859,8 @@ mod tests {
                     hash: hash_from,
                     context: file_context,
                 },
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::File,
             },
             to: NodeChangeState {
@@ -843,6 +874,8 @@ mod tests {
                     hash: hash_to,
                     context: file_context,
                 },
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::File,
             },
         };
@@ -879,7 +912,6 @@ mod tests {
 
         let deletion = NodeChange {
             action: lore_revision::change::FileAction::Delete,
-            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 mapping: lore_revision::state::NodeMapping {
@@ -892,6 +924,8 @@ mod tests {
                     hash: Hash::hash_buffer(&[60, 61, 62, 63]),
                     context: Context::default(),
                 },
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::File,
             },
             to: NodeChangeState {
@@ -902,6 +936,8 @@ mod tests {
                     state: state.clone(),
                 },
                 address: Address::default(),
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::NoFlags,
             },
         };
@@ -924,7 +960,6 @@ mod tests {
 
         let modification = NodeChange {
             action: lore_revision::change::FileAction::Keep,
-            observed: None,
             flags: Flags::None,
             from: NodeChangeState {
                 mapping: lore_revision::state::NodeMapping {
@@ -937,6 +972,8 @@ mod tests {
                     hash: Hash::hash_buffer(&[70, 71]),
                     context: Context::default(),
                 },
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::File,
             },
             to: NodeChangeState {
@@ -950,6 +987,8 @@ mod tests {
                     hash: Hash::hash_buffer(&[72, 73]),
                     context: Context::default(),
                 },
+                observed: None,
+                mode: 0,
                 flags: NodeFlags::File,
             },
         };

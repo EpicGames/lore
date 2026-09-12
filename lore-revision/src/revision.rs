@@ -655,8 +655,8 @@ pub async fn diff3_with_source_cap(
                 "Conflict resolved: {:?}",
                 (source_conflict, target_conflict)
             );
-            // If the file was added on source branch and either added or
-            // modified on target branch, show the change as modified.
+            // A file both branches hold stands where it stood, whichever of them added it, so the
+            // change states no move of it.
             if source_conflict.action == FileAction::Add
                 && target_conflict.action != FileAction::Delete
             {
