@@ -430,6 +430,21 @@ pub struct CommitOptions {
     pub layer: Option<String>,
 }
 
+/// Metadata a caller states for the revision a commit creates: the triple
+/// [`commit_with_metadata`] takes, kept together so operations that commit on
+/// the caller's behalf — a merge's auto commit, a sync's divergence merge — can
+/// carry it. [`prepare_commit_metadata`] applies these keys after its own
+/// stamps, so a `created-by` given here is what the revision records, exactly
+/// as for a direct `commit_with_metadata`. Distinct from
+/// [`crate::metadata::MetadataInherit`], which selects keys carried over from
+/// the source revision: these are the caller's own values.
+#[derive(Clone, Debug, Default)]
+pub struct CommitMetadata {
+    pub keys: LoreArray<LoreString>,
+    pub values: LoreArray<LoreString>,
+    pub formats: LoreArray<LoreMetadataType>,
+}
+
 impl CommitOptions {
     pub fn new(message: String) -> Self {
         Self {

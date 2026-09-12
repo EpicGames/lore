@@ -241,6 +241,14 @@ mod tests {
     /// Merge a feature branch whose tip carries [`SOURCE_KEYS`] into main under
     /// `inherit`, answering the merge revision's metadata.
     async fn merge_scenario(inherit: MetadataInherit) -> Option<Metadata> {
+        Box::pin(merge_scenario_with(inherit, Default::default())).await
+    }
+
+    /// [`merge_scenario`] with the caller's own metadata for the auto commit.
+    async fn merge_scenario_with(
+        inherit: MetadataInherit,
+        metadata: lore_revision::commit::CommitMetadata,
+    ) -> Option<Metadata> {
         let fixture = Fixture::new().await;
 
         fixture.write_file("base.txt", b"base\n");
@@ -265,12 +273,61 @@ mod tests {
                 no_commit: false,
                 scope: branch::merge::MergeScope::MainOnly,
                 inherit_metadata: inherit,
+                metadata,
             },
         ))
         .await
         .expect("merge_start failed");
 
         fixture.metadata_of(merged).await
+    }
+
+    /// The caller can state who authored the merge. A client that connects as
+    /// an account id rather than a user name names the author itself, as it
+    /// can for a plain commit through `commit_with_metadata`; the operator
+    /// keys stay the identity's, and the source revision's provenance is
+    /// still not carried.
+    #[tokio::test]
+    async fn a_merge_records_the_authorship_the_caller_states() {
+        let execution = offline_execution().await;
+
+        runtime()
+            .spawn(LORE_CONTEXT.scope(execution.clone(), async move {
+                let authorship = lore_revision::commit::CommitMetadata {
+                    keys: LoreArray::from_vec(vec![LoreString::from(metadata::CREATED_BY)]),
+                    values: LoreArray::from_vec(vec![LoreString::from("Display Name")]),
+                    formats: LoreArray::from_vec(vec![
+                        lore_revision::interface::LoreMetadataType::String,
+                    ]),
+                };
+                let merged =
+                    Box::pin(merge_scenario_with(MetadataInherit::default(), authorship)).await;
+
+                assert_eq!(
+                    string_key(&merged, metadata::CREATED_BY).as_deref(),
+                    Some("Display Name"),
+                    "the stated author is what the merge records"
+                );
+                assert_eq!(
+                    string_key(&merged, metadata::COMMITTED_BY).as_deref(),
+                    Some(OPERATOR),
+                    "the committer stays the operating identity"
+                );
+                assert_eq!(
+                    string_key(&merged, metadata::MERGED_BY).as_deref(),
+                    Some(OPERATOR),
+                    "the merger stays the operating identity"
+                );
+                for (key, value) in SOURCE_KEYS {
+                    assert_ne!(
+                        string_key(&merged, key).as_deref(),
+                        Some(value),
+                        "{key} must still not be carried from the source revision"
+                    );
+                }
+            }))
+            .await
+            .expect("test task panicked");
     }
 
     /// An inherit list naming nothing carries nothing, so none of the source
