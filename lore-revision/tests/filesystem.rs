@@ -165,9 +165,9 @@ mod tests {
                 .file_info(&rel_path)
                 .await
                 .expect("file_info should succeed");
-            assert!(info.exists, "Directory should exist");
-            assert!(info.is_dir, "Should be identified as directory");
-            assert!(!info.is_file, "Should not be identified as file");
+            assert!(info.exists(), "Directory should exist");
+            assert!(info.is_dir(), "Should be identified as directory");
+            assert!(!info.is_file(), "Should not be identified as file");
             true
         })
         .await;
@@ -188,10 +188,10 @@ mod tests {
                 .file_info(&rel_path)
                 .await
                 .expect("file_info should succeed");
-            assert!(info.exists, "File should exist");
-            assert!(info.is_file, "Should be identified as file");
-            assert!(!info.is_dir, "Should not be identified as directory");
-            assert_eq!(info.size, content.len() as u64, "Size should match");
+            assert!(info.exists(), "File should exist");
+            assert!(info.is_file(), "Should be identified as file");
+            assert!(!info.is_dir(), "Should not be identified as directory");
+            assert_eq!(info.size(), content.len() as u64, "Size should match");
             false
         })
         .await;
@@ -205,9 +205,9 @@ mod tests {
                 .file_info(&rel_path)
                 .await
                 .expect("file_info should succeed even for nonexistent path");
-            assert!(!info.exists, "Nonexistent path should have exists=false");
-            assert!(!info.is_file, "Nonexistent path should not be a file");
-            assert!(!info.is_dir, "Nonexistent path should not be a directory");
+            assert!(!info.exists(), "Nonexistent path should have exists=false");
+            assert!(!info.is_file(), "Nonexistent path should not be a file");
+            assert!(!info.is_dir(), "Nonexistent path should not be a directory");
             false
         })
         .await;
@@ -236,7 +236,7 @@ mod tests {
                 .file_info(&rel_path)
                 .await
                 .expect("file_info should succeed");
-            assert_eq!(info.size, 0, "Created file should be empty");
+            assert_eq!(info.size(), 0, "Created file should be empty");
             true
         })
         .await;

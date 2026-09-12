@@ -1743,7 +1743,7 @@ async fn ensure_parent_dir(
         && !operation
             .file_info(&parent)
             .await
-            .is_ok_and(|info| info.is_dir)
+            .is_ok_and(|info| info.is_dir())
     {
         return Err(CloneError::internal_with_context(
             err,
@@ -1764,7 +1764,7 @@ async fn match_node_executable(
 ) -> Result<(), CloneError> {
     let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
     if file_info
-        .executable
+        .executable()
         .is_some_and(|observed| observed != node_executable)
     {
         operation
@@ -1793,7 +1793,7 @@ async fn clone_file(
     let force = call.force();
     let file_info = operation.file_info(&repository_path).await;
     if let Ok(file_info) = file_info
-        && file_info.exists
+        && file_info.exists()
     {
         if options.ignore_existing {
             lore_trace!("Ignore existing file {}", repository_path);
@@ -1807,8 +1807,8 @@ async fn clone_file(
             file_modification(
                 repository.clone(),
                 &node,
-                file_info.mtime,
-                file_info.size,
+                file_info.mtime(),
+                file_info.size(),
                 &repository_path,
                 force,
                 None,
@@ -1826,7 +1826,7 @@ async fn clone_file(
             return Ok(Some(state::file_modified_time_entry(
                 &repository,
                 &repository_path,
-                file_info.mtime,
+                file_info.mtime(),
             )));
         }
         if !force {
@@ -1914,7 +1914,7 @@ async fn clone_file(
         return Ok(Some(state::file_modified_time_entry(
             &repository,
             &repository_path,
-            file_info.mtime,
+            file_info.mtime(),
         )));
     }
 
@@ -2034,7 +2034,7 @@ async fn spawn_clone_directory(
                     .operation
                     .file_info(&repository_path)
                     .await
-                    .is_ok_and(|info| info.is_dir)
+                    .is_ok_and(|info| info.is_dir())
             {
                 stats
                     .directory_inflight

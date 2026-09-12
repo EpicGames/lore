@@ -486,14 +486,14 @@ async fn file_size_from_node_change_path(
         return Ok(0);
     }
     if let Some(observed) = &change.resolved_side().observed {
-        return Ok(observed.size);
+        return Ok(observed.size());
     }
     let repository_path = change.path().clone();
     let info = operation
         .file_info(&repository_path)
         .await
         .forward::<StatusError>("accessing metadata for file")?;
-    Ok(info.size)
+    Ok(info.size())
 }
 
 /// Verify whether a dirty file change reflects a real on-disk modification,
@@ -1057,7 +1057,7 @@ async fn scan_paths(
                 exists_in_filesystem = operation
                     .file_info(&repository_path)
                     .await
-                    .is_ok_and(|info| info.exists);
+                    .is_ok_and(|info| info.exists());
             }
 
             if !exists_in_state && !exists_in_filesystem {

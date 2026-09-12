@@ -95,12 +95,12 @@ impl InstanceOperation for OsOperation {
         let path = self.absolute(path);
         match lore_io::IoDriver::global().metadata(path).await {
             Ok(metadata) => Ok(FileInfo::from_metadata(&metadata)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileInfo::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileInfo::NotExist),
             Err(e)
                 if cfg!(target_family = "windows")
                     && e.kind() == std::io::ErrorKind::PermissionDenied =>
             {
-                Ok(FileInfo::default())
+                Ok(FileInfo::NotExist)
             }
             Err(e) => Err(e.into()),
         }

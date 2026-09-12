@@ -13,6 +13,9 @@ pub struct DirEntry {
     /// resolved: a link whose target is gone, or an entry unlinked between the listing and the
     /// stat. A listing describes what it can rather than failing over one entry.
     pub metadata: Option<std::fs::Metadata>,
+    /// Whether the name is itself a link, which `metadata` describes the target of rather than.
+    /// A caller that tracks what a name holds rather than what it points at reads this first.
+    pub is_symlink: bool,
 }
 
 /// Entries one dispatch resolves.
@@ -87,15 +90,16 @@ fn read_chunk(
 
 /// Describes what a name refers to, following a link to its target.
 fn resolve(entry: std::fs::DirEntry) -> DirEntry {
-    let metadata = match entry.metadata() {
+    let (metadata, is_symlink) = match entry.metadata() {
         // `DirEntry::metadata` does not follow links, so a link is stat'd again by path to
         // describe the target the name stands for.
-        Ok(metadata) if metadata.is_symlink() => std::fs::metadata(entry.path()).ok(),
-        Ok(metadata) => Some(metadata),
-        Err(_) => None,
+        Ok(metadata) if metadata.is_symlink() => (std::fs::metadata(entry.path()).ok(), true),
+        Ok(metadata) => (Some(metadata), false),
+        Err(_) => (None, false),
     };
     DirEntry {
         file_name: entry.file_name(),
         metadata,
+        is_symlink,
     }
 }

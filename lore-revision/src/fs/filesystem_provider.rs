@@ -47,46 +47,82 @@ impl From<std::io::Error> for FsError {
     }
 }
 
-/// Basic file information returned by `InstanceOperation::file_info`.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FileInfo {
-    /// Whether the path exists on the filesystem.
-    pub exists: bool,
-    /// Whether the path is a file (false if directory or doesn't exist).
-    pub is_file: bool,
-    /// Whether the path is a directory.
-    pub is_dir: bool,
-    /// Whether the file carries the executable bit, `None` where the platform has no
-    /// such bit to read. See [`FileInfo::mode`].
-    pub executable: Option<bool>,
-    /// File size in bytes (0 if doesn't exist or is directory).
-    pub size: u64,
-    /// Modification time as Unix timestamp in milliseconds.
-    pub mtime: u64,
+/// What a walk measured at a path, as returned by `InstanceOperation::file_info`.
+///
+/// The repository tracks files and directories. Anything else the file system holds — a device, a
+/// socket — answers as holding nothing, and a directory listing skips a link rather than
+/// describing what it points at. A path named on its own is stat'd through a link, so one naming
+/// a link answers for the target it resolves to. Supporting links means giving them a variant of
+/// their own rather than widening one of these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileInfo {
+    /// The path holds nothing, which a path the walk skipped also answers.
+    NotExist,
+    /// A directory, which stores none of the size, time or mode a file does.
+    Directory,
+    /// A file, with what the walk measured of it.
+    File {
+        /// Whether the file carries the executable bit, `None` where the platform has no
+        /// such bit to read. See [`FileInfo::mode`].
+        executable: Option<bool>,
+        /// File size in bytes.
+        size: u64,
+        /// Modification time as Unix timestamp in milliseconds.
+        mtime: u64,
+    },
 }
 
 impl FileInfo {
-    /// A directory, as every component a walk resolved a path through must be. Carries
-    /// no size, mtime or mode, none of which a directory node stores.
-    pub const DIRECTORY: Self = FileInfo {
-        exists: true,
-        is_file: false,
-        is_dir: true,
-        executable: None,
-        size: 0,
-        mtime: 0,
-    };
-
     pub fn from_metadata(metadata: &Metadata) -> Self {
+        if metadata.is_dir() {
+            return FileInfo::Directory;
+        }
+        if !metadata.is_file() {
+            return FileInfo::NotExist;
+        }
         let (mtime, size) = crate::util::fs::file_mtime_and_size(metadata);
-        let executable = crate::util::fs::file_executable_observed(metadata);
-        FileInfo {
-            exists: true,
-            is_file: metadata.is_file(),
-            is_dir: metadata.is_dir(),
-            executable,
+        FileInfo::File {
+            executable: crate::util::fs::file_executable_observed(metadata),
             size,
             mtime,
+        }
+    }
+
+    /// Whether the file system holds anything here that the repository tracks.
+    pub fn exists(&self) -> bool {
+        !matches!(self, FileInfo::NotExist)
+    }
+
+    pub fn is_file(&self) -> bool {
+        matches!(self, FileInfo::File { .. })
+    }
+
+    pub fn is_dir(&self) -> bool {
+        matches!(self, FileInfo::Directory)
+    }
+
+    /// The size of a file, and zero for anything else, which stores none.
+    pub fn size(&self) -> u64 {
+        match self {
+            FileInfo::File { size, .. } => *size,
+            _ => 0,
+        }
+    }
+
+    /// The modification time of a file, and zero for anything else, which stores none.
+    pub fn mtime(&self) -> u64 {
+        match self {
+            FileInfo::File { mtime, .. } => *mtime,
+            _ => 0,
+        }
+    }
+
+    /// Whether a file carries the executable bit, `None` where the platform has no such bit to
+    /// read and where the path holds no file to read it from.
+    pub fn executable(&self) -> Option<bool> {
+        match self {
+            FileInfo::File { executable, .. } => *executable,
+            _ => None,
         }
     }
 
@@ -94,7 +130,7 @@ impl FileInfo {
     /// [`crate::util::fs::metadata_to_mode`] answers it for the metadata this was read
     /// from.
     pub fn mode(&self, previous: u16) -> u16 {
-        crate::util::fs::mode_from_observed(self.is_file, self.executable, previous)
+        crate::util::fs::mode_from_observed(self.is_file(), self.executable(), previous)
     }
 }
 
@@ -187,7 +223,7 @@ pub struct MeasuredNode {
 }
 
 /// Result of checking whether a file differs from a node.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct FileModifiedCheck {
     /// Basic file information.
     pub info: FileInfo,
@@ -832,13 +868,13 @@ pub mod tests {
         async fn file_info(&self, _path: &RelativePath) -> Result<FileInfo, FsError> {
             self.file_info_count.fetch_add(1, Ordering::AcqRel);
             Ok(if self.holds_paths {
-                FileInfo {
-                    exists: true,
-                    is_file: true,
-                    ..Default::default()
+                FileInfo::File {
+                    executable: None,
+                    size: 0,
+                    mtime: 0,
                 }
             } else {
-                FileInfo::default()
+                FileInfo::NotExist
             })
         }
 
@@ -1103,17 +1139,18 @@ pub mod tests {
     /// a directory that holds nothing a directory node would store.
     #[test]
     fn a_directory_info_is_an_existing_directory_with_no_content() {
-        let info = FileInfo::DIRECTORY;
-        assert!(info.exists);
-        assert!(info.is_dir);
-        assert!(!info.is_file);
-        assert_eq!(0, info.size);
-        assert_eq!(0, info.mtime);
+        let info = FileInfo::Directory;
+        assert!(info.exists());
+        assert!(info.is_dir());
+        assert!(!info.is_file());
+        assert_eq!(0, info.size());
+        assert_eq!(0, info.mtime());
     }
 
     /// A node staged from a `FileInfo` has to land the size, time and mode a node
     /// staged from the metadata itself would, since the two are the same walk before
-    /// and after the file information became the currency between them.
+    /// and after the file information became the currency between them. A directory
+    /// states none of what a file stores, which is none of what a directory node takes.
     #[test]
     fn file_information_answers_what_the_metadata_helpers_answer() {
         let dir = lore_base::test_util::TempDir::new("lore-fs-provider-test-");
@@ -1123,10 +1160,10 @@ pub mod tests {
         let check = |path: &Path| {
             let metadata = std::fs::metadata(path).expect("metadata");
             let info = FileInfo::from_metadata(&metadata);
-            assert_eq!(crate::util::fs::file_size(&metadata), info.size);
-            assert_eq!(crate::util::fs::file_mtime(&metadata), info.mtime);
-            assert_eq!(metadata.is_dir(), info.is_dir);
-            assert_eq!(metadata.is_file(), info.is_file);
+            assert_eq!(crate::util::fs::file_size(&metadata), info.size());
+            assert_eq!(crate::util::fs::file_mtime(&metadata), info.mtime());
+            assert_eq!(metadata.is_dir(), info.is_dir());
+            assert_eq!(metadata.is_file(), info.is_file());
             for previous in [0, crate::node::NodeFileMode::Executable.bits()] {
                 assert_eq!(
                     crate::util::fs::metadata_to_mode(&metadata, previous),
@@ -1138,7 +1175,17 @@ pub mod tests {
         };
 
         check(&path);
-        check(dir.path());
+
+        let metadata = std::fs::metadata(dir.path()).expect("metadata");
+        let directory = FileInfo::from_metadata(&metadata);
+        assert_eq!(FileInfo::Directory, directory);
+        for previous in [0, crate::node::NodeFileMode::Executable.bits()] {
+            assert_eq!(
+                crate::util::fs::metadata_to_mode(&metadata, previous),
+                directory.mode(previous),
+                "mode for a directory from previous {previous}"
+            );
+        }
 
         #[cfg(target_family = "unix")]
         {
@@ -1168,7 +1215,7 @@ pub mod tests {
             .await
             .expect("a lookup is answered");
 
-        assert!(!info.exists);
+        assert!(!info.exists());
         assert_eq!(1, filesystem.file_infos());
     }
 

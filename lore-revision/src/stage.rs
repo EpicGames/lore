@@ -409,13 +409,13 @@ pub(crate) async fn stage_filesystem_path(
             .file_info(&full_relative_path)
             .await
             .ok()
-            .filter(|info| info.exists)
+            .filter(|info| info.exists())
     };
 
     if let Some(info) = staged_info {
-        if info.is_dir {
+        if info.is_dir() {
             lore_trace!("Stage directory: {}", full_relative_path.as_str());
-        } else if info.is_file {
+        } else if info.is_file() {
             lore_trace!("Stage file: {}", full_relative_path.as_str());
         } else {
             return Err(StageError::internal(format!(
@@ -453,13 +453,13 @@ pub(crate) async fn stage_filesystem_path(
             let current_info = if is_final_component {
                 info
             } else {
-                FileInfo::DIRECTORY
+                FileInfo::Directory
             };
 
             // A named path is refused rather than skipped: the caller asked for
             // this path specifically, and staging it into the parent would take
             // content the nested repository owns.
-            if current_info.is_dir {
+            if current_info.is_dir() {
                 let held = current_state
                     .find_subnode(
                         current_repository.clone(),
@@ -569,7 +569,7 @@ pub(crate) async fn stage_filesystem_path(
         }
 
         // Finally, if the given path is a directory we should recurse and stage everything below it
-        if !options.no_children && (current_node == ROOT_NODE || info.is_dir) {
+        if !options.no_children && (current_node == ROOT_NODE || info.is_dir()) {
             stats.task_count.fetch_add(1, Ordering::Release);
 
             let result = stage_directory(
@@ -1980,9 +1980,9 @@ pub(crate) async fn stage_node_from_metadata(
 
             lore_trace!("Found node {} with flags 0x{:x}", found_node_id, node.flags);
 
-            if (node.is_link() && !info.is_dir)
-                || (node.is_directory() && !info.is_dir)
-                || (node.is_file() && info.is_dir)
+            if (node.is_link() && !info.is_dir())
+                || (node.is_directory() && !info.is_dir())
+                || (node.is_file() && info.is_dir())
             {
                 // Type mismatch, stage the current node for delete and add a new new node
                 lore_debug!(
@@ -2022,13 +2022,13 @@ pub(crate) async fn stage_node_from_metadata(
         // Node did not exist, add new node to state
         lore_trace!("Found no existing node for {name}, creating new node");
 
-        let mut node = if info.is_dir {
+        let mut node = if info.is_dir() {
             Node {
                 name_hash,
                 ..Default::default()
             }
         } else {
-            let size = info.size;
+            let size = info.size();
             Node {
                 flags: NodeFlags::File.bits(),
                 mode: info.mode(0),
@@ -2085,7 +2085,7 @@ pub(crate) async fn stage_node_from_metadata(
 
         lore_trace!("Staged new node {node_id} for {name}");
 
-        if info.is_dir {
+        if info.is_dir() {
             stats
                 .directory_checked_count
                 .fetch_add(1, Ordering::Relaxed);
@@ -2296,14 +2296,14 @@ pub(crate) async fn stage_node_from_metadata(
         // the filesystem content compares equal to the node's stored hash.
         let was_dirty_add = node.is_dirty_add();
 
-        if !info.is_dir {
+        if !info.is_dir() {
             let stage_file_node = if !node.is_file() {
                 lore_debug!("Stage node type change to file for node {}", node_link.node);
                 true
             } else {
                 let node_path = relative_path.join(name.as_str());
 
-                let (mtime, size) = (info.mtime, info.size);
+                let (mtime, size) = (info.mtime(), info.size());
                 file_modified_against_node(
                     repository.clone(),
                     &node,
@@ -2322,7 +2322,7 @@ pub(crate) async fn stage_node_from_metadata(
                 node.flags |= NodeFlags::File;
                 node.child = 0;
                 node.mode = info.mode(node.mode);
-                node.size = info.size;
+                node.size = info.size();
                 maybe_content_modified = true;
             } else if was_dirty_add {
                 maybe_content_modified = true;
@@ -3645,7 +3645,7 @@ pub(crate) async fn stage_from_parent_state(
                     .file_info(&file_path)
                     .await
                     .forward::<StageError>("Failed to query file information")?;
-                if !info.exists {
+                if !info.exists() {
                     return stage_realized_delete(repository, state, &file_path, options, stats)
                         .await;
                 }

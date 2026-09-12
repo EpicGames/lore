@@ -6661,7 +6661,7 @@ async fn compare_single_file_against_state(
     let _state_is_link = from_node.is_link();
 
     // Handle type changes
-    let filesystem_is_file = observed.is_file;
+    let filesystem_is_file = observed.is_file();
     if filesystem_is_file && !state_is_file {
         // Filesystem has file, state has directory or link
         return Ok(SingleFileCompareResult::TypeChangedToFile);
@@ -6683,8 +6683,8 @@ async fn compare_single_file_against_state(
         let modification = file_modified_against_node(
             repository,
             from_node,
-            observed.mtime,
-            observed.size,
+            observed.mtime(),
+            observed.size(),
             file_path,
             !force_hash_check,
             None,
@@ -6858,7 +6858,7 @@ impl FileDiffContext {
             && !is_directory
         {
             node.mode = self.observed.mode(0);
-            node.size = self.observed.size;
+            node.size = self.observed.size();
             node.address.context = stage.file_id.unwrap_or_else(|| uuid::Uuid::now_v7().into());
         }
 
@@ -7246,7 +7246,7 @@ async fn record_observed_file(
         let mut locked_block = block.write();
         let node = locked_block.node(node_index);
         node.mode = observed.mode(node.mode);
-        node.size = observed.size;
+        node.size = observed.size();
         locked_block.mark_dirty()
     };
     if dirtied {
